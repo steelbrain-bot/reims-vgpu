@@ -130,6 +130,43 @@ fn exec_summary_names_the_packet_counters_and_lock_hold() {
 }
 
 #[test]
+fn an_accepted_async_exec_withholds_its_exact_stamp_until_ordered_commit() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let stamp_pfn = 0x40u32;
+    let stamp_gpa = state.pfn_gpa(stamp_pfn);
+    host.map_range(stamp_gpa, state.page_size() as usize, 0);
+    state.registers.gfx.fifo_base_page = stamp_pfn;
+    let identity = reims_vgpu_protocol::SubmissionIdentity {
+        id: reims_vgpu_protocol::SubmissionId::new(7),
+        task: reims_vgpu_protocol::TaskId::new(1),
+    };
+    state.pending_exec_publications.insert(
+        identity,
+        crate::runtime::device::PendingExecPublication {
+            channel_id: 2,
+            payload_len: 64,
+            stamp_index: 1,
+            stamp_value: 0x55,
+        },
+    );
+
+    publish_completed_execs(&mut state, &mut host);
+    assert_eq!(host.get_u32(stamp_gpa + 4), 0);
+    assert!(state.pending_exec_publications.contains_key(&identity));
+
+    state
+        .completed_execs
+        .push_back(crate::runtime::exec::CompletedExec {
+            identity,
+            result: crate::runtime::exec::ExecResult::default(),
+        });
+    publish_completed_execs(&mut state, &mut host);
+    assert_eq!(host.get_u32(stamp_gpa + 4), 0x55);
+    assert!(!state.pending_exec_publications.contains_key(&identity));
+}
+
+#[test]
 fn sync_exec_stall_proxy_fires_at_watchdog_scale_only() {
     assert!(!sync_exec_stalled(SYNC_EXEC_STALL_US - 1));
     assert!(sync_exec_stalled(SYNC_EXEC_STALL_US));

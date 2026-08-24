@@ -18,7 +18,7 @@ use crate::runtime::Device;
 use reims_vgpu_core::endian::{ld16, ld32, ld64, st16, st32};
 pub use reims_vgpu_core::{PendingStamp, StampLedger, StampWait, UnmetSource};
 use reims_vgpu_protocol::{
-    decode_mapper_request_entry, MapperRequestKind, MAPPER_REQUEST_ENTRY_LEN,
+    decode_mapper_request_entry, MapperRequestKind, SubmissionIdentity, MAPPER_REQUEST_ENTRY_LEN,
 };
 
 pub(crate) mod census;
@@ -3928,6 +3928,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
 enum ChildPacketDisposition {
     Complete,
     Deferred,
+    AcceptedAsync(SubmissionIdentity),
 }
 
 /// One line per `ExecIndirect2` packet, naming everything the packet executed.
@@ -4236,6 +4237,9 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         "exec_translation_ready ch={channel_id} task={} pending_mask={:#x}",
                         result.task_id, pending_mask
                     ));
+                }
+                if let Some(identity) = result.pending_submission {
+                    return ChildPacketDisposition::AcceptedAsync(identity);
                 }
                 // Failure-carrying packets keep the full per-packet line on the
                 // always-on sink (context for the per-site reason=<slug> lines).
@@ -4716,6 +4720,18 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         // >= 2). Leave head unmoved so body draws on other channels can still
         // land via drain_other; re-enter after note_present_paint_consumed.
         let peek_opcode = ld16(&header[PACKET_OPCODE..]);
+        if peek_opcode != CHILD_OP_EXEC_INDIRECT2
+            && state
+                .pending_exec_publications
+                .values()
+                .any(|publication| publication.channel_id == channel_id)
+        {
+            // Adjacent whole EXECs may fan out through resource admission. A
+            // control/resource packet is the channel's ordered transaction
+            // boundary and cannot overtake an accepted EXEC completion.
+            state.scheduling.pending.request_children(bit);
+            break;
+        }
         if matches!(
             peek_opcode,
             CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
@@ -4755,7 +4771,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 let proc_started = std::time::Instant::now();
                 let disposition = process_child_packet(state, host, channel_id, &packet);
                 census::note_drain_proc(packet.opcode, proc_started.elapsed().as_nanos() as u64);
-                if disposition == ChildPacketDisposition::Deferred {
+                if matches!(disposition, ChildPacketDisposition::Deferred) {
                     // Translation owns only immutable AIR bytes. Keep head and
                     // stamp untouched so retry cannot duplicate any packet
                     // side effect; continue with sibling channels in the
@@ -4804,7 +4820,18 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // an async execution path, that ordering has to come back with
                 // it — and be written against the async model that then exists,
                 // not inherited from an empty queue.
-                if coalesce {
+                if let ChildPacketDisposition::AcceptedAsync(identity) = disposition {
+                    let displaced = state.pending_exec_publications.insert(
+                        identity,
+                        crate::runtime::device::PendingExecPublication {
+                            channel_id,
+                            payload_len: packet.payload.len(),
+                            stamp_index,
+                            stamp_value: packet.completion_stamp,
+                        },
+                    );
+                    debug_assert!(displaced.is_none());
+                } else if coalesce {
                     // Deliberately untimed: the cost this span was measuring is
                     // the submit, and folding a value into a latch is not one.
                     // The submit it defers to is timed where it happens, below.
@@ -6012,7 +6039,46 @@ fn retry_stamp_held_timelines<H: HostMemory + HostOps>(state: &mut Device, host:
     }
 }
 
+fn publish_completed_execs<H: HostMemory + HostOps>(state: &mut Device, host: &mut H) {
+    crate::runtime::exec::collect_exec_recordings(state, host, false);
+    while let Some(completed) = state.completed_execs.pop_front() {
+        let publication = state
+            .pending_exec_publications
+            .remove(&completed.identity)
+            .expect("an accepted async EXEC retains its exact FIFO publication");
+        let packet_failed = completed.result.draws_fail > 0
+            || completed.result.render_icb_fail > 0
+            || completed.result.compute_control_fail > 0
+            || completed.result.compute_icb_fail > 0;
+        if packet_failed {
+            crate::observe::fail(exec_summary(
+                publication.channel_id,
+                &completed.result,
+                publication.payload_len,
+            ));
+        } else if crate::observe::draw_log_enabled() {
+            crate::observe::line(exec_summary(
+                publication.channel_id,
+                &completed.result,
+                publication.payload_len,
+            ));
+        }
+        let stamp_started = std::time::Instant::now();
+        write_stamp(
+            state,
+            host,
+            publication.stamp_index,
+            publication.stamp_value,
+        );
+        census::note_drain_regs(
+            census::RegsOp::Stamp,
+            stamp_started.elapsed().as_nanos() as u64,
+        );
+    }
+}
+
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut Device, host: &mut H) {
+    publish_completed_execs(state, host);
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.

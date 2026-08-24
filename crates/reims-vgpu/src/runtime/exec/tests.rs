@@ -11,6 +11,7 @@ use crate::runtime::decode::render::{
     PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
 };
 use crate::runtime::host::FakeHost;
+use crate::runtime::host::HostControl;
 use reims_vgpu_core::endian::{st16, st32, st64};
 use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
@@ -20,6 +21,71 @@ fn terminal_surface_recording_and_completion_cross_a_worker_boundary_by_ownershi
 
     assert_send::<PreparedSurfaceTransaction>();
     assert_send::<RecordedSurfaceTransaction>();
+}
+
+#[test]
+fn an_async_exec_commits_only_after_its_worker_result_reaches_the_drain_owner() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let identity = state.submissions.next_identity(TaskId::new(1));
+    let context = reims_vgpu_core::SubmissionContext {
+        identity,
+        resources: Arc::from([]),
+        segments: Arc::from([]),
+        segment: None,
+    };
+    assert!(matches!(
+        state
+            .submissions_scheduled
+            .lock()
+            .unwrap()
+            .accept(context.clone(), ())
+            .unwrap(),
+        reims_vgpu_core::SubmissionDispatch::Record(_)
+    ));
+    state.pending_execs.insert(
+        identity,
+        PendingExecState {
+            context,
+            result: ExecResult {
+                task_id: 1,
+                pending_submission: Some(identity),
+                ..Default::default()
+            },
+            started: std::time::Instant::now(),
+            measured_ns: 0,
+            fallback: SurfaceRecordingFallback {
+                task_id: 1,
+                acc: StreamAccum::default(),
+                visibility_counts: Default::default(),
+                saw_backend_unavailable: false,
+            },
+        },
+    );
+    state
+        .surface_recording_workers
+        .dispatch(
+            identity,
+            (),
+            host.worker_wake(),
+            |_| -> Result<
+                RecordedSurfaceTransaction,
+                crate::runtime::executor::ExecutorDiagnostic,
+            > { panic!("synthetic recording panic") },
+        )
+        .unwrap();
+
+    assert!(state.completed_execs.is_empty());
+    collect_exec_recordings(&mut state, &mut host, true);
+    let completed = state
+        .completed_execs
+        .pop_front()
+        .expect("the drain owner receives one ordered completion");
+    assert_eq!(completed.identity, identity);
+    assert_eq!(completed.result.pending_submission, None);
+    assert!(completed.result.draws_fail > 0);
+    assert!(state.pending_execs.is_empty());
+    assert_eq!(state.submissions_scheduled.lock().unwrap().commit_len(), 0);
 }
 
 #[test]

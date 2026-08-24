@@ -17,8 +17,15 @@ pub struct Device {
     pub(crate) executor: Arc<dyn Executor>,
     pub(crate) bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
     pub(crate) submissions_scheduled: std::sync::Mutex<
-        reims_vgpu_core::SubmissionScheduler<(), reims_vgpu_core::SubmissionContext>,
+        reims_vgpu_core::SubmissionScheduler<(), crate::runtime::exec::RecordedExecCommit>,
     >,
+    pub(crate) pending_execs: std::collections::HashMap<
+        reims_vgpu_protocol::SubmissionIdentity,
+        crate::runtime::exec::PendingExecState,
+    >,
+    pub(crate) completed_execs: std::collections::VecDeque<crate::runtime::exec::CompletedExec>,
+    pub(crate) pending_exec_publications:
+        std::collections::HashMap<reims_vgpu_protocol::SubmissionIdentity, PendingExecPublication>,
     pub(crate) surface_recording_workers: crate::runtime::submission_workers::SubmissionWorkers<
         Result<
             crate::runtime::exec::RecordedSurfaceTransaction,
@@ -26,6 +33,14 @@ pub struct Device {
         >,
     >,
     pending_imported_views: Vec<(reims_vgpu_memory::ImportId, usize, usize)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingExecPublication {
+    pub(crate) channel_id: u32,
+    pub(crate) payload_len: usize,
+    pub(crate) stamp_index: u32,
+    pub(crate) stamp_value: u32,
 }
 
 /// Composition result of replacing a task's semantic and host-side lifetime.
@@ -68,6 +83,12 @@ impl std::fmt::Debug for Device {
             .field("bound_buffers", &self.bound_buffers)
             .field("submissions_scheduled", &self.submissions_scheduled)
             .field("surface_recording_workers", &self.surface_recording_workers)
+            .field("pending_execs", &self.pending_execs.len())
+            .field("completed_execs", &self.completed_execs.len())
+            .field(
+                "pending_exec_publications",
+                &self.pending_exec_publications.len(),
+            )
             .finish()
     }
 }
@@ -111,6 +132,9 @@ impl Device {
             bound_buffers: Default::default(),
             submissions_scheduled: Default::default(),
             surface_recording_workers: Default::default(),
+            pending_execs: Default::default(),
+            completed_execs: Default::default(),
+            pending_exec_publications: Default::default(),
             pending_imported_views: Vec::new(),
         }
     }
@@ -175,6 +199,9 @@ impl Device {
         self.retire_all_bound_buffers();
         self.surface_recording_workers.take_finished();
         self.surface_recording_workers.quiesce();
+        self.pending_execs.clear();
+        self.completed_execs.clear();
+        self.pending_exec_publications.clear();
         self.submissions_scheduled
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

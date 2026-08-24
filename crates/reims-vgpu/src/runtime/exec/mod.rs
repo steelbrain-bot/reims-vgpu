@@ -50,7 +50,7 @@ use reims_vgpu_protocol::pass_action::{
 };
 use reims_vgpu_protocol::{
     ObjectTableRef, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind,
-    SubmissionResourceUse, TaskId,
+    SubmissionIdentity, SubmissionResourceUse, TaskId,
 };
 use reims_vgpu_wire::ops::blit as wire_blit;
 use reims_vgpu_wire::ops::render as wire_render;
@@ -808,6 +808,9 @@ pub struct ExecResult {
     /// Immutable shader translation is still running off the FIFO scheduler.
     /// The caller must keep this packet at the channel head and retry it.
     pub deferred: bool,
+    /// Accepted whole-EXEC work whose terminal recording result is not yet
+    /// semantically committed or guest-visible.
+    pub(crate) pending_submission: Option<SubmissionIdentity>,
     pub texture_refs: Vec<u32>,
     pub iosurface_mappings: Vec<u32>,
     pub saw_draw: bool,
@@ -840,6 +843,48 @@ pub struct ExecResult {
     /// device lock past `SYNC_EXEC_STALL_US` starves the guest's read-to-clear
     /// completion registers; the drain reports that as a typed TRANSPORT line.
     pub total_us: u64,
+}
+
+pub(crate) struct PendingExecState {
+    context: reims_vgpu_core::SubmissionContext,
+    result: ExecResult,
+    started: std::time::Instant,
+    measured_ns: u64,
+    fallback: SurfaceRecordingFallback,
+}
+
+pub(crate) enum RecordedExecCommit {
+    Async(Box<AsyncExecCommit>),
+    Synchronous(reims_vgpu_core::SubmissionContext),
+}
+
+pub(crate) struct AsyncExecCommit {
+    pending: PendingExecState,
+    recording: Result<RecordedSurfaceTransaction, crate::runtime::executor::ExecutorDiagnostic>,
+}
+
+impl std::fmt::Debug for RecordedExecCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Async(commit) => f
+                .debug_tuple("Async")
+                .field(&commit.pending.context.identity)
+                .finish(),
+            Self::Synchronous(context) => f.debug_tuple("Synchronous").field(context).finish(),
+        }
+    }
+}
+
+struct SurfaceRecordingFallback {
+    task_id: u32,
+    acc: StreamAccum,
+    visibility_counts: std::collections::BTreeMap<u64, u64>,
+    saw_backend_unavailable: bool,
+}
+
+pub(crate) struct CompletedExec {
+    pub(crate) identity: SubmissionIdentity,
+    pub(crate) result: ExecResult,
 }
 
 pub fn process_exec_indirect2<M: HostMemory + HostOps>(
@@ -1059,10 +1104,16 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .accept(submission_context.clone(), ())
         .expect("fresh packet identities reserve one scheduler position");
-    assert!(
-        matches!(dispatch, reims_vgpu_core::SubmissionDispatch::Record(_)),
-        "the serial packet walker cannot leave an earlier recorder active"
-    );
+    match dispatch {
+        reims_vgpu_core::SubmissionDispatch::Record(_) => {}
+        reims_vgpu_core::SubmissionDispatch::Queued { identity, .. } => {
+            let admitted = collect_exec_recordings(state, host, true);
+            assert!(
+                admitted.contains(&identity),
+                "a declared conflict becomes recordable when active recorders quiesce"
+            );
+        }
+    }
     crate::runtime::drain::note_open_part(
         crate::runtime::drain::OpenPart::Use,
         use_started.elapsed().as_nanos() as u64,
@@ -1103,16 +1154,53 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         .field("task", task_id)
         .fail();
     }
-    if let Some(transaction) = encoders.pending_surface {
-        complete_surface_transaction_sync(state, host, &mut out, transaction);
-    }
     let close_started = std::time::Instant::now();
+    if let Some(transaction) = encoders.pending_surface {
+        let context = state
+            .submissions
+            .finish()
+            .expect("the terminal transaction closes its EXEC envelope");
+        let identity = context.identity;
+        let fallback = SurfaceRecordingFallback {
+            task_id: transaction.completion.core.task_id,
+            acc: transaction.completion.core.acc.clone(),
+            visibility_counts: transaction.completion.visibility_counts.clone(),
+            saw_backend_unavailable: transaction.completion.saw_backend_unavailable,
+        };
+        out.pending_submission = Some(identity);
+        let displaced = state.pending_execs.insert(
+            identity,
+            PendingExecState {
+                context,
+                result: out.clone(),
+                started: exec_started,
+                measured_ns,
+                fallback,
+            },
+        );
+        debug_assert!(displaced.is_none());
+        let executor = Arc::clone(&state.executor);
+        state
+            .surface_recording_workers
+            .dispatch(
+                identity,
+                transaction,
+                host.worker_wake(),
+                move |transaction| transaction.record(executor.as_ref()),
+            )
+            .expect("one EXEC owns one terminal recording worker");
+        return out;
+    }
+    // A non-recording terminal path is an ordered EXEC barrier. Retire older
+    // detached recorders before publishing this packet's synchronous result;
+    // adjacent render EXECs remain free to overlap above.
+    let _ = collect_exec_recordings(state, host, true);
     if let Some(context) = state.submissions.finish() {
         let newly_recordable = state
             .submissions_scheduled
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .record(context.identity, context)
+            .record(context.identity, RecordedExecCommit::Synchronous(context))
             .expect("the active packet owns its reserved commit position");
         assert!(
             newly_recordable.is_empty(),
@@ -1124,8 +1212,11 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take_ready();
-            let Some((identity, context)) = ready else {
+            let Some((identity, commit)) = ready else {
                 break;
+            };
+            let RecordedExecCommit::Synchronous(context) = commit else {
+                unreachable!("an asynchronous predecessor is committed by its worker wake")
             };
             match state.executor.close_submission(identity) {
                 Ok(()) => state.task_objects.resources.complete_submission(
@@ -4857,6 +4948,130 @@ fn complete_surface_transaction_sync<M: HostMemory + HostOps>(
             saw_backend_unavailable,
         ),
     }
+}
+
+fn worker_panic_diagnostic() -> crate::runtime::executor::ExecutorDiagnostic {
+    let error = crate::runtime::executor::DrawError::Facade(
+        crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
+            service: "submission_recording_worker",
+        },
+    );
+    crate::runtime::executor::ExecutorDiagnostic::from_decline(&error)
+}
+
+fn finish_recording_refusal<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    result: &mut ExecResult,
+    fallback: &SurfaceRecordingFallback,
+    error: &crate::runtime::executor::ExecutorDiagnostic,
+) {
+    crate::observe::fail(format!(
+        "draw_submission_fail reason={} task={} detail={error}",
+        crate::observe::Decline::slug(error),
+        fallback.task_id
+    ));
+    result.draws_fail = result.draws_fail.saturating_add(1);
+    finish_render_tail(
+        state,
+        host,
+        fallback.task_id,
+        &fallback.acc,
+        result,
+        &fallback.visibility_counts,
+        fallback.saw_backend_unavailable,
+    );
+}
+
+/// Retire published worker results and apply every guest-order commit now at
+/// the head. `wait` is used only by a declared resource conflict and teardown;
+/// ordinary drain polling never waits for an unrelated recorder.
+pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    wait: bool,
+) -> Vec<SubmissionIdentity> {
+    let worker_results = if wait {
+        state.surface_recording_workers.quiesce()
+    } else {
+        state.surface_recording_workers.take_finished()
+    };
+    let mut newly_recordable = Vec::new();
+    for worker in worker_results {
+        let pending = state
+            .pending_execs
+            .remove(&worker.identity)
+            .expect("every terminal worker retains one EXEC completion owner");
+        let recording = match worker.outcome {
+            crate::runtime::submission_workers::WorkerOutcome::Completed(recording) => recording,
+            crate::runtime::submission_workers::WorkerOutcome::Panicked => {
+                Err(worker_panic_diagnostic())
+            }
+        };
+        let work = state
+            .submissions_scheduled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(
+                worker.identity,
+                RecordedExecCommit::Async(Box::new(AsyncExecCommit { pending, recording })),
+            )
+            .expect("the worker owns its live recording admission");
+        newly_recordable.extend(work.into_iter().map(|work| work.context.identity));
+    }
+
+    loop {
+        let ready = state
+            .submissions_scheduled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_ready();
+        let Some((identity, commit)) = ready else {
+            break;
+        };
+        let RecordedExecCommit::Async(commit) = commit else {
+            unreachable!("synchronous commits are consumed by their packet owner")
+        };
+        let AsyncExecCommit {
+            mut pending,
+            recording,
+        } = *commit;
+        match recording {
+            Ok(recorded) => recorded.complete(state, host, &mut pending.result),
+            Err(ref error) => {
+                finish_recording_refusal(state, host, &mut pending.result, &pending.fallback, error)
+            }
+        }
+        let close_started = std::time::Instant::now();
+        match state.executor.close_submission(identity) {
+            Ok(()) => state.task_objects.resources.complete_submission(
+                identity.id,
+                pending
+                    .context
+                    .resources
+                    .iter()
+                    .filter_map(|use_| use_.resource),
+            ),
+            Err(error) => {
+                pending.result.draws_fail = pending.result.draws_fail.saturating_add(1);
+                crate::observe::Emit::decline("submission_close", &error)
+                    .field("submission", identity.id.get())
+                    .field("task", identity.task.get())
+                    .fail();
+            }
+        }
+        let close_ns = close_started.elapsed().as_nanos() as u64;
+        pending.measured_ns = pending.measured_ns.saturating_add(close_ns);
+        crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Close, close_ns);
+        note_exec_header(pending.started, pending.measured_ns);
+        pending.result.total_us = elapsed_us(pending.started);
+        pending.result.pending_submission = None;
+        state.completed_execs.push_back(CompletedExec {
+            identity,
+            result: pending.result,
+        });
+    }
+    newly_recordable
 }
 
 fn complete_terminal_surface_transaction<M: HostMemory + HostOps>(
