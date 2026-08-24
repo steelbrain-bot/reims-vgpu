@@ -15,6 +15,14 @@ use reims_vgpu_core::endian::{st16, st32, st64};
 use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
 #[test]
+fn terminal_surface_recording_and_completion_cross_a_worker_boundary_by_ownership() {
+    fn assert_send<T: Send>() {}
+
+    assert_send::<PreparedSurfaceTransaction>();
+    assert_send::<RecordedSurfaceTransaction>();
+}
+
+#[test]
 fn a_batched_resident_failure_preserves_the_exact_successful_prefix() {
     let first_identity = crate::model::TargetIdentity::Gva {
         gva: 0x4000,

@@ -4541,11 +4541,64 @@ fn retire_render_barriers_after(
     }
 }
 
+#[derive(Clone)]
 struct PreparedResidentRecord {
     req: draw::DrawEncodeRequest,
     pipeline_ref: u32,
     icb: bool,
     draw_index: usize,
+}
+
+struct SurfaceTransactionCompletion {
+    task_id: u32,
+    records: Vec<PreparedResidentRecord>,
+    final_req: draw::DrawEncodeRequest,
+    acc: StreamAccum,
+    total_draws: usize,
+}
+
+struct PreparedSurfaceTransaction {
+    recording: draw::PreparedM2vExecution,
+    completion: SurfaceTransactionCompletion,
+}
+
+struct RecordedSurfaceTransaction {
+    recording: draw::RecordedM2vSubmission,
+    completion: SurfaceTransactionCompletion,
+}
+
+impl PreparedSurfaceTransaction {
+    fn record(
+        self,
+        executor: &dyn crate::runtime::executor::Executor,
+    ) -> Result<RecordedSurfaceTransaction, crate::runtime::executor::ExecutorDiagnostic> {
+        Ok(RecordedSurfaceTransaction {
+            recording: self.recording.record(executor)?,
+            completion: self.completion,
+        })
+    }
+}
+
+impl RecordedSurfaceTransaction {
+    fn complete<M: HostMemory + HostOps>(
+        self,
+        state: &mut Device,
+        host: &mut M,
+        out: &mut ExecResult,
+        chain_rgba: &mut Option<Vec<u8>>,
+        visibility_counts: &mut std::collections::BTreeMap<u64, u64>,
+    ) -> Result<draw::DrawChainResult, ()> {
+        let progress = self.recording.complete(state);
+        complete_prepared_surface_transaction(
+            state,
+            host,
+            out,
+            progress,
+            self.completion,
+            chain_rgba,
+            visibility_counts,
+        )
+    }
 }
 
 fn apply_prepared_resident_prefix(
@@ -4702,14 +4755,53 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
     visibility_counts: &mut std::collections::BTreeMap<u64, u64>,
     total_draws: usize,
 ) -> Result<draw::DrawChainResult, ()> {
-    let resident_count = records.len();
-    let progress = submission.execute(state).map_err(|error| {
+    let transaction = PreparedSurfaceTransaction {
+        recording: submission.into_execution(),
+        completion: SurfaceTransactionCompletion {
+            task_id,
+            records: std::mem::take(records),
+            final_req: final_req.clone(),
+            acc: acc.clone(),
+            total_draws,
+        },
+    };
+    let executor = std::sync::Arc::clone(&state.executor);
+    let engine_started = std::time::Instant::now();
+    let recorded = transaction.record(executor.as_ref()).map_err(|error| {
         crate::observe::fail(format!(
             "draw_submission_fail reason={} task={task_id} detail={error}",
             crate::observe::Decline::slug(&error)
         ));
         out.draws_fail = out.draws_fail.saturating_add(1);
-    })?;
+    });
+    crate::runtime::chain_phase::note_detached(
+        crate::runtime::chain_phase::Phase::Engine,
+        engine_started.elapsed(),
+    );
+    recorded?.complete(state, host, out, chain_rgba, visibility_counts)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "ordered completion owns semantic publication and failure recovery"
+)]
+fn complete_prepared_surface_transaction<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    out: &mut ExecResult,
+    progress: draw::PreparedM2vProgress,
+    completion: SurfaceTransactionCompletion,
+    chain_rgba: &mut Option<Vec<u8>>,
+    visibility_counts: &mut std::collections::BTreeMap<u64, u64>,
+) -> Result<draw::DrawChainResult, ()> {
+    let SurfaceTransactionCompletion {
+        task_id,
+        records,
+        final_req,
+        acc,
+        total_draws,
+    } = completion;
+    let resident_count = records.len();
     let completed_count = progress.completed.len();
     let mut outputs = progress.completed;
     let final_output = (outputs.len() > resident_count).then(|| outputs.remove(resident_count));
@@ -4722,7 +4814,7 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
     };
     let resident_identity = match apply_prepared_resident_prefix(
         out,
-        records,
+        &records,
         resident_progress,
         visibility_counts,
         total_draws,
@@ -4733,7 +4825,7 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
                 state,
                 host,
                 task_id,
-                acc,
+                &acc,
                 chain_rgba,
                 records.get(failed_index).or_else(|| records.last()),
                 identity.as_ref(),
@@ -4741,8 +4833,6 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
             return Err(());
         }
     };
-    records.clear();
-
     let Some(final_output) = final_output else {
         let reason = progress
             .failure
@@ -4763,8 +4853,8 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
             chain_rgba,
             ChainAbandonContext {
                 task_id,
-                acc,
-                req: final_req,
+                acc: &acc,
+                req: &final_req,
                 resident_identity: resident_identity.as_ref(),
                 end: ChainEnd {
                     cause: draw::ChainAbandonCause::TerminalRefusal,
@@ -4792,7 +4882,7 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
             let completed = draw::complete_surface_store(
                 state,
                 host,
-                final_req,
+                &final_req,
                 submission,
                 identity,
                 draw::SurfaceStorePublication {
