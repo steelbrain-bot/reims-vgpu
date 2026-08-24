@@ -304,9 +304,19 @@ fn two_live_execs_keep_distinct_encoder_state_until_ordered_close() {
         mid.batch_flushes, 0,
         "starting the second EXEC must not flush the first encoder"
     );
+    assert!(
+        !engine::resident_presentable(&first_target, W, H),
+        "recorded content is not presentable before its EXEC is submitted"
+    );
 
     engine::close_submission(first.identity).expect("first EXEC closes in guest order");
+    assert!(
+        !engine::resident_presentable(&first_target, W, H),
+        "another accepted but unsubmitted EXEC still owns the session completion gate"
+    );
     engine::close_submission(second.identity).expect("second EXEC closes in guest order");
+    assert!(engine::resident_presentable(&first_target, W, H));
+    assert!(engine::resident_presentable(&second_target, W, H));
     for target in [&first_target, &second_target] {
         let pixels = engine::read_target(target)
             .expect("each encoder published its own resident")

@@ -2985,6 +2985,13 @@ pub fn close_submission(
 /// build, not only the ones that opened a window.
 pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) -> bool {
     let guard = lock_engine();
+    if current_session_signals()
+        .open_batches
+        .load(std::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        return false;
+    }
     guard
         .resources
         .pools
@@ -3045,6 +3052,13 @@ pub fn prepare_window_resident_present(
     {
         let now_ms = reims_vgpu_observe::elapsed_ms() as u64;
         let mut guard = lock_engine();
+        if current_session_signals()
+            .open_batches
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            return Err(reims_vgpu_core::PresentDecline::ContentNotReady);
+        }
         if guard.resources.window_presenter.is_none() {
             return Err(reims_vgpu_core::PresentDecline::WindowNotAttached);
         }
