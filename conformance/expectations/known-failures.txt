@@ -20,3 +20,14 @@
 # these, which makes it the more serious of the two: guest work is lost with
 # nothing saying so.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# A Store-only multisample colour attachment is not preserved.
+#
+# Native Metal retains four distinct per-sample colours across command buffers.
+# The guest first tries to serialize the unresolved resident through the
+# single-sample target-read rail (`read_target_multisample_image`), then refuses
+# the lawful `texture2d_ms` observer as `unstageable_multisampled`. The render
+# draw is skipped and the observer dispatch produces nothing.
+# ---------------------------------------------------------------------------
+msaa4_color_store_no_resolve

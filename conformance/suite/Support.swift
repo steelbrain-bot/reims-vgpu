@@ -21,6 +21,8 @@ func pipeline(_ name: String) -> MTLComputePipelineState {
 
 let readPipe = pipeline("read_texels")
 
+let readMultisamplePipe = pipeline("read_ms_texels")
+
 let samplePipe = pipeline("sample_texels")
 
 let levelPipe = pipeline("read_level")
@@ -131,6 +133,43 @@ func readBack(_ pipe: MTLComputePipelineState,
     if ran.contents().bindMemory(to: UInt32.self, capacity: 1)[0] == 0 { return nil }
     let p = out.contents().bindMemory(to: UInt32.self, capacity: w * h)
     return Array(UnsafeBufferPointer(start: p, count: w * h))
+}
+
+/// Read every sample of a multisample texture without resolving it.
+///
+/// The output is pixel-major and then sample-major. Slots the bound image does
+/// not expose retain the sentinel, so accidentally binding a single-sample
+/// image cannot look like a valid four-sample store.
+func readBackMultisample(_ tex: MTLTexture,
+                         _ w: Int, _ h: Int,
+                         samples: Int) -> [UInt32]? {
+    let count = w * h * samples
+    let out = dev.makeBuffer(length: count * 4, options: .storageModeShared)!
+    memset(out.contents(), 0xEE, count * 4)
+    let ran = dev.makeBuffer(length: 4, options: .storageModeShared)!
+    memset(ran.contents(), 0, 4)
+    let cb = queue.makeCommandBuffer()!
+    let enc = cb.makeComputeCommandEncoder()!
+    enc.setComputePipelineState(readMultisamplePipe)
+    enc.setTexture(tex, index: 0)
+    enc.setBuffer(out, offset: 0, index: 0)
+    var width = UInt32(w)
+    var sampleCount = UInt32(samples)
+    var extent = SIMD2<UInt32>(UInt32(w), UInt32(h))
+    enc.setBytes(&width, length: 4, index: 1)
+    enc.setBytes(&sampleCount, length: 4, index: 2)
+    enc.setBytes(&extent, length: 8, index: 3)
+    enc.setBuffer(ran, offset: 0, index: 4)
+    let tg = 8
+    enc.dispatchThreadgroups(
+        MTLSize(width: (w + tg - 1) / tg, height: (h + tg - 1) / tg, depth: 1),
+        threadsPerThreadgroup: MTLSize(width: tg, height: tg, depth: 1))
+    enc.endEncoding()
+    cb.commit()
+    cb.waitUntilCompleted()
+    if ran.contents().bindMemory(to: UInt32.self, capacity: 1)[0] == 0 { return nil }
+    let p = out.contents().bindMemory(to: UInt32.self, capacity: count)
+    return Array(UnsafeBufferPointer(start: p, count: count))
 }
 
 /// A case that cannot be evaluated because the run it depends on did not

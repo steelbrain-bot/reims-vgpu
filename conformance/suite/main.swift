@@ -57,6 +57,8 @@ for f in formats {
 
 renderTargetCases()
 
+multisampleStoreCase()
+
 depthStencilIndependenceCases()
 
 stencilIndependenceCases()

@@ -33,6 +33,30 @@ kernel void read_texels(texture2d<float, access::read> tex [[texture(0)]],
     out[gid.y * width + gid.x] = (a << 24) | (b << 16) | (g << 8) | r;
 }
 
+// Preserve each sample separately. Reading through a single-sample texture
+// would make an implicit resolve indistinguishable from a correct multisample
+// store, so the sample index is part of the output address.
+kernel void read_ms_texels(texture2d_ms<float, access::read> tex [[texture(0)]],
+                           device uint *out [[buffer(0)]],
+                           constant uint &width [[buffer(1)]],
+                           constant uint &samples [[buffer(2)]],
+                           constant uint2 &extent [[buffer(3)]],
+                           device uint *ran [[buffer(4)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    ran[0] = 1u;
+    if (gid.x >= extent.x || gid.y >= extent.y) { return; }
+    uint count = min(samples, tex.get_num_samples());
+    for (uint sample = 0; sample < count; ++sample) {
+        float4 v = tex.read(gid, sample);
+        uint r = uint(round(v.r * 255.0));
+        uint g = uint(round(v.g * 255.0));
+        uint b = uint(round(v.b * 255.0));
+        uint a = uint(round(v.a * 255.0));
+        out[(gid.y * width + gid.x) * samples + sample] =
+            (a << 24) | (b << 16) | (g << 8) | r;
+    }
+}
+
 // The sampler path, with nearest filtering and unnormalized coordinates, so the
 // result is still exactly one texel and any difference from `read_texels` is
 // the sampler/view rather than the memory.
@@ -169,6 +193,18 @@ vertex VOut quad_vs(uint vid [[vertex_id]],
 fragment float4 solid_fs(VOut in [[stage_in]],
                          constant float4 &colour [[buffer(0)]]) {
     return colour;
+}
+
+// Every covered pixel receives four distinct, exact unorm samples. A backend
+// that resolves the attachment instead of storing it turns these into one
+// repeated average and cannot pass the per-sample oracle.
+fragment float4 sample_id_fs(VOut in [[stage_in]], uint sample [[sample_id]]) {
+    switch (sample) {
+        case 0: return float4(1.0, 0.0, 0.0, 1.0);
+        case 1: return float4(0.0, 1.0, 0.0, 1.0);
+        case 2: return float4(0.0, 0.0, 1.0, 1.0);
+        default: return float4(1.0, 1.0, 1.0, 1.0);
+    }
 }
 
 // The same flat colour, made expensive on purpose.
