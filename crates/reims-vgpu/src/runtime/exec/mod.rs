@@ -1037,9 +1037,27 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         .into();
     state.submissions.begin(
         submission_identity,
-        submission_resources,
-        submission_segments,
+        Arc::clone(&submission_resources),
+        Arc::clone(&submission_segments),
     );
+    let submission_context = reims_vgpu_core::SubmissionContext {
+        identity: submission_identity,
+        resources: submission_resources,
+        segments: submission_segments,
+        segment: None,
+    };
+    state
+        .submission_admissions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .admit(&submission_context)
+        .expect("the serial packet walker has no earlier active submission");
+    state
+        .submission_commits
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .register(submission_identity)
+        .expect("fresh packet identities reserve one commit position");
     crate::runtime::drain::note_open_part(
         crate::runtime::drain::OpenPart::Use,
         use_started.elapsed().as_nanos() as u64,
@@ -1079,18 +1097,42 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     }
     let close_started = std::time::Instant::now();
     if let Some(context) = state.submissions.finish() {
-        match state.executor.close_submission(context.identity) {
-            Ok(()) => state.task_objects.resources.complete_submission(
-                context.identity.id,
-                context.resources.iter().filter_map(|use_| use_.resource),
-            ),
-            Err(error) => {
-                out.draws_fail = out.draws_fail.saturating_add(1);
-                crate::observe::Emit::decline("submission_close", &error)
-                    .field("submission", context.identity.id.get())
-                    .field("task", context.identity.task.get())
-                    .fail();
+        state
+            .submission_commits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record(context.identity, context)
+            .expect("the active packet owns its reserved commit position");
+        loop {
+            let ready = state
+                .submission_commits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take_ready();
+            let Some((identity, context)) = ready else {
+                break;
+            };
+            match state.executor.close_submission(identity) {
+                Ok(()) => state.task_objects.resources.complete_submission(
+                    identity.id,
+                    context.resources.iter().filter_map(|use_| use_.resource),
+                ),
+                Err(error) => {
+                    out.draws_fail = out.draws_fail.saturating_add(1);
+                    crate::observe::Emit::decline("submission_close", &error)
+                        .field("submission", identity.id.get())
+                        .field("task", identity.task.get())
+                        .fail();
+                }
             }
+            assert!(
+                state
+                    .submission_admissions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retire(identity),
+                "queue acceptance retires the exact recording admission"
+            );
         }
     }
     let close_ns = close_started.elapsed().as_nanos() as u64;
