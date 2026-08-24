@@ -43,6 +43,21 @@ fn wait_error(counters: &EngineCounters, e: vk::Result, op: DeviceLostOp) -> Dra
     }
 }
 
+enum SealedCommit<T, E> {
+    Accepted { sealed: SealedEntry, committed: T },
+    Rejected { sealed: SealedEntry, error: E },
+}
+
+fn attempt_sealed_commit<T, E>(
+    sealed: SealedEntry,
+    commit: impl FnOnce() -> Result<T, E>,
+) -> SealedCommit<T, E> {
+    match commit() {
+        Ok(committed) => SealedCommit::Accepted { sealed, committed },
+        Err(error) => SealedCommit::Rejected { sealed, error },
+    }
+}
+
 /// Wait for one submitted fence to signal.
 ///
 /// [`FENCE_TIMEOUT_NS`] is a diagnostic sampling interval, not a contract
@@ -92,6 +107,24 @@ mod fence_wait_contract_tests {
             classify_fence_wait(Err(vk::Result::ERROR_DEVICE_LOST)),
             FenceWait::Failed(vk::Result::ERROR_DEVICE_LOST)
         );
+    }
+
+    #[test]
+    fn a_rejected_commit_returns_the_exact_sealed_cleanup() {
+        let mut pools = ResourcePools::new();
+        let set = vk::DescriptorSet::from_raw(11);
+        let pool = vk::DescriptorPool::from_raw(12);
+        let sealed = pools.encoder.seal_entry(vec![(set, pool)], Vec::new());
+
+        let (sealed, error) = match attempt_sealed_commit(sealed, || Err::<(), _>(17)) {
+            SealedCommit::Accepted { .. } => panic!("the rejected commit was accepted"),
+            SealedCommit::Rejected { sealed, error } => (sealed, error),
+        };
+
+        assert_eq!(error, 17);
+        assert_eq!(sealed.cleanup.encoder.dsets.len(), 1);
+        assert_eq!(sealed.cleanup.encoder.dsets[0].0.as_raw(), set.as_raw());
+        assert_eq!(sealed.cleanup.encoder.dsets[0].1.as_raw(), pool.as_raw());
     }
 }
 
@@ -1727,6 +1760,35 @@ impl ResourcePools {
         self.admit_recorded_sampled(admissions);
     }
 
+    /// Withdraw a sealed command buffer that the queue rejected.
+    ///
+    /// The driver never accepted the command buffer, so every resource can
+    /// return immediately to the same owners `seal_entry` took it from. The
+    /// recording lease is cancelled rather than submitted, and guest-write
+    /// debt is retired without inventing a fence lifetime.
+    unsafe fn abort_sealed_entry(&mut self, device: &ash::Device, sealed: SealedEntry) {
+        self.encoder.recording.take();
+        let SealedEntry {
+            cleanup,
+            admissions,
+        } = sealed;
+        let PendingGpuCleanup {
+            encoder,
+            visibility,
+            mut shared,
+        } = cleanup;
+        unsafe { self.encoder.reclaim_retired_entry(device, encoder) };
+        super::super::retire_guest_write_pages(&visibility.guest_write_tokens);
+        shared
+            .sampled
+            .extend(admissions.into_iter().map(|(slot, _)| slot));
+        self.drain_shared_cleanup(shared);
+        self.encoder.slots[self.encoder.cur].span = gpu_span::SlotSpan::Idle;
+        self.encoder.slots[self.encoder.cur].readback_span_armed = false;
+        self.encoder.slots[self.encoder.cur].pass_spans = 0;
+        self.release_ready_graveyard(device);
+    }
+
     /// Give the content cache the images a recorded command buffer fills.
     ///
     /// The one admission point, reached from the two places that can be the
@@ -2552,9 +2614,9 @@ impl ResourcePools {
 
     /// Submit the open batch (if any): end its CB, queue it on the batch
     /// fence, and park the accumulated cleanup on its ring slot. No-op when no
-    /// batch is open. On submit failure the descriptor sets are freed
-    /// immediately (the CB never reached the queue) and the pool-slot lives
-    /// stay for the next seal, matching the per-draw submit-error path.
+    /// batch is open. The entry is sealed before queue acceptance; on end or
+    /// submit failure the immutable package is returned immediately to its
+    /// encoder, visibility-ledger, and shared-resource owners.
     pub(crate) unsafe fn batch_flush(
         &mut self,
         ctx: &DeviceContext,
@@ -2591,37 +2653,42 @@ impl ResourcePools {
             close_started.elapsed().as_micros() as u64,
             Ordering::Relaxed,
         );
-        let submit = (|| -> Result<super::super::context::AsyncGuestSubmission, DrawError> {
-            let end_started = std::time::Instant::now();
-            let end_result = ctx.device.end_command_buffer(batch.cb);
-            counters
-                .batch_flush_end_us
-                .fetch_add(end_started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            end_result.map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsEndCbBatch, e)))?;
-            let cbs = [batch.cb];
-            let submit_started = std::time::Instant::now();
-            let result = ctx.submit_guest_work_async(&cbs, batch.fence);
-            counters.batch_flush_submit_us.fetch_add(
-                submit_started.elapsed().as_micros() as u64,
-                Ordering::Relaxed,
-            );
-            match result {
-                Ok(submission) => Ok(submission),
-                Err(e) if e == vk::Result::ERROR_DEVICE_LOST => {
-                    Err(DrawError::DeviceLost(DeviceLostDecline::Driver {
-                        op: DeviceLostOp::PoolsSubmitBatch,
-                        result: e,
-                    }))
-                }
-                Err(e) => Err(DrawError::VkCall(VkCall::new(VkOp::PoolsSubmitBatch, e))),
-            }
-        })();
+        let end_started = std::time::Instant::now();
+        let end_result = ctx.device.end_command_buffer(batch.cb);
+        counters
+            .batch_flush_end_us
+            .fetch_add(end_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Seal before the queue can accept the command buffer. From this point
+        // every referenced object is in one immutable package rather than in
+        // mutable recorder state, which is the handoff a later ordered commit
+        // worker can own without sharing this encoder's live lists.
+        let sealed = self
+            .encoder
+            .seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
+        if let Err(result) = end_result {
+            unsafe { self.abort_sealed_entry(&ctx.device, sealed) };
+            self.discard_sampled_cache(&ctx.device);
+            return Err(DrawError::VkCall(VkCall::new(
+                VkOp::PoolsEndCbBatch,
+                result,
+            )));
+        }
+        let submit_started = std::time::Instant::now();
+        let submit = attempt_sealed_commit(sealed, || {
+            unsafe { ctx.submit_guest_work_async(&[batch.cb], batch.fence) }.map_err(|result| {
+                super::super::guest_submit_error(DeviceLostOp::PoolsSubmitBatch, result)
+            })
+        });
+        counters.batch_flush_submit_us.fetch_add(
+            submit_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
         match submit {
-            Ok(submission) => {
+            SealedCommit::Accepted {
+                sealed,
+                committed: submission,
+            } => {
                 let finish_started = std::time::Instant::now();
-                let sealed = self
-                    .encoder
-                    .seal_entry(std::mem::take(&mut batch.dsets), Vec::new());
                 self.finish_entry_async(sealed, submission.timeline, submission.driver_return);
                 counters.batch_flush_finish_us.fetch_add(
                     finish_started.elapsed().as_micros() as u64,
@@ -2629,9 +2696,8 @@ impl ResourcePools {
                 );
                 Ok(())
             }
-            Err(e) => {
-                self.encoder.desc_arena.free(&ctx.device, &batch.dsets);
-                self.abort_recorded_guest_work();
+            SealedCommit::Rejected { sealed, error: e } => {
+                unsafe { self.abort_sealed_entry(&ctx.device, sealed) };
                 // This batch's draws published sampled images to the content
                 // cache on the promise that this command buffer would fill
                 // them. It never reached the queue, so their contents are
@@ -5861,7 +5927,10 @@ mod recycle_tests {
         type EndOfLife<'a> = (&'a str, &'a dyn Fn(&mut ResourcePools));
         let ends: [EndOfLife<'_>; 2] = [
             ("a seal", &|p| {
-                p.encoder_mut().seal_entry(Vec::new(), Vec::new());
+                // This device-free test installs no native cleanup; explicitly
+                // consume the empty package after observing seal's local
+                // lifetime transition.
+                drop(p.encoder_mut().seal_entry(Vec::new(), Vec::new()));
             }),
             ("a staging recycle", &|p| p.recycle_staging()),
         ];

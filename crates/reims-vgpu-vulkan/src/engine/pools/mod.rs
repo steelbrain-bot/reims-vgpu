@@ -1502,6 +1502,7 @@ struct VisibilityCleanup {
 /// The two halves are separated here rather than at retire because they are due
 /// at different times, and putting them in one bag is what made every admission
 /// a fence-length late.
+#[must_use = "a sealed entry must be submitted or explicitly aborted"]
 pub(crate) struct SealedEntry {
     pub(crate) cleanup: PendingGpuCleanup,
     /// Each entry pairs the image the CB fills with what names it. Empty for
