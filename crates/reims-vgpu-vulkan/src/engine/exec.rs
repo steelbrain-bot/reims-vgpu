@@ -910,7 +910,7 @@ unsafe fn stage_buffer_content(
     // before knowing that would be two atomics per bind per draw, on the path
     // that does no work.
     let key = super::pools::CbBind::key_of(content);
-    if let Some(bound) = pools.cb_bound_buffer(key) {
+    if let Some(bound) = pools.encoder().cb_bound_buffer(key) {
         counters.note_buffer_bind_reused(gather_role);
         return Ok(bound);
     }
@@ -945,7 +945,7 @@ unsafe fn stage_buffer_content(
             if let Some(bound) =
                 unsafe { import_guest_buffer_window(ctx, pools, &transfer, gather_role) }
             {
-                pools.note_guest_read_recorded();
+                pools.encoder_mut().note_guest_read_recorded();
                 counters.note_buffer_guest_import(src.total_len, gather_role);
                 bound
             } else if let Some((bound, pending)) =
@@ -953,7 +953,7 @@ unsafe fn stage_buffer_content(
             {
                 // The copies read guest RAM when the CB executes, exactly as a
                 // direct bind does, so this owes the same quiesce.
-                pools.note_guest_read_recorded();
+                pools.encoder_mut().note_guest_read_recorded();
                 counters.note_buffer_guest_gather(src.total_len, pending.regions(), gather_role);
                 // Counted here and not at the top of this arm, because only a
                 // window that actually gathers is a window a content cache would
@@ -998,9 +998,9 @@ unsafe fn stage_buffer_content(
             }
         }
     };
-    pools.note_cb_bound_buffer(bind, bound);
+    pools.encoder_mut().note_cb_bound_buffer(bind, bound);
     if gather_owed {
-        pools.note_cb_bind_owes_gather(key);
+        pools.encoder_mut().note_cb_bind_owes_gather(key);
     }
     Ok(bound)
 }
@@ -3687,7 +3687,7 @@ unsafe fn prepare_guest_sampled_transfer(
         ..SampledKey::of(resource)
     };
     let reuse = super::pools::CbSampledGuest::image(sampled_key, image_source);
-    if let Some(image) = pools.cb_sampled_guest(&reuse) {
+    if let Some(image) = pools.encoder().cb_sampled_guest(&reuse) {
         sampled.push(PreparedSampled::Cached {
             binding: resource.binding,
             array_element: resource.array_element,
@@ -3700,7 +3700,7 @@ unsafe fn prepare_guest_sampled_transfer(
     let source =
         match unsafe { prepare_guest_texel_window(ctx, pools, counters, src, guest_gathers)? } {
             Some(imported) => {
-                pools.note_guest_read_recorded();
+                pools.encoder_mut().note_guest_read_recorded();
                 counters.note_sampled_guest_import(src.total_len);
                 imported
             }
@@ -5013,7 +5013,7 @@ pub(crate) unsafe fn execute_draw_inner(
             prepare_guest_texel_window(ctx, pools, counters, &seed.source, &mut guest_gathers)?
         } {
             Some(source) => {
-                pools.note_guest_read_recorded();
+                pools.encoder_mut().note_guest_read_recorded();
                 crate::telemetry::note_route("target_seed_guest_import");
                 crate::telemetry::note_route_n(
                     "target_seed_guest_import_bytes",
@@ -5363,7 +5363,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         materialize,
                     })) => {
                         counters.note_sampled_gather_witness(*vouch);
-                        pools.note_guest_read_recorded();
+                        pools.encoder_mut().note_guest_read_recorded();
                         counters.note_sampled_guest_direct(source.transfer.total_len);
                         sampled.push(PreparedSampled::Resident {
                             binding: resource.binding,
@@ -5402,7 +5402,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 counters.note_sampled_gather_witness(*vouch);
                 let sampled_key = SampledKey::of(resource);
                 let reuse = super::pools::CbSampledGuest::runs(sampled_key, src);
-                if let Some(image) = pools.cb_sampled_guest(&reuse) {
+                if let Some(image) = pools.encoder().cb_sampled_guest(&reuse) {
                     sampled.push(PreparedSampled::Cached {
                         binding: resource.binding,
                         array_element: resource.array_element,
@@ -5437,7 +5437,7 @@ pub(crate) unsafe fn execute_draw_inner(
                         // The read is now the command buffer's, at execute time.
                         // `write_stamp` quiesces before telling the guest these
                         // pages are free, which is what keeps that legal.
-                        pools.note_guest_read_recorded();
+                        pools.encoder_mut().note_guest_read_recorded();
                         counters.note_sampled_guest_import(src.total_len);
                         imported
                     }
@@ -6434,7 +6434,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // on one are answerable. Unconditional and outside the `is_empty` guard:
     // a draw with no gathers of its own must still not carry a previous draw's
     // owed list, and the list is empty in that case anyway.
-    pools.note_cb_gathers_recorded();
+    pools.encoder_mut().note_cb_gathers_recorded();
 
     // Guest-page attachment seed. Its source may be a direct RAMBlock import,
     // the device-local result of the gather just recorded, or the exact CPU
@@ -6686,7 +6686,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // not publish any of its images until every owed copy is in the command
     // buffer, or a later draw could bind a recycled image's previous tenant.
     for (source, image) in recorded_sampled_guest {
-        pools.note_cb_sampled_guest(source, &image);
+        pools.encoder_mut().note_cb_sampled_guest(source, &image);
     }
 
     phase.enter(super::draw_phase::Phase::RecBarrierAttachment);

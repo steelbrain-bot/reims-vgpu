@@ -147,6 +147,85 @@ fn pass_spans_probe_enabled() -> bool {
 }
 
 impl EncoderPools {
+    pub(crate) fn note_guest_read_recorded(&mut self) {
+        self.guest_reads_in_flight = true;
+        super::super::publish_guest_read_debt(true);
+    }
+
+    pub(in crate::engine) fn cb_bound_buffer(
+        &self,
+        key: (usize, u64, u64),
+    ) -> Option<super::super::exec::BoundBuffer> {
+        self.cb_bound_buffers
+            .aliases
+            .get(&key)
+            .or_else(|| self.cb_bound_buffers.immutable.get(&key))
+            .or_else(|| self.cb_bound_buffers.guest_snapshots.get(&key))
+            .map(|(bound, _)| *bound)
+    }
+
+    pub(in crate::engine) fn note_cb_bound_buffer(
+        &mut self,
+        bind: super::CbBind,
+        bound: super::super::exec::BoundBuffer,
+    ) {
+        let (key, owner) = bind.into_parts();
+        self.cb_bound_buffers.aliases.remove(&key);
+        self.cb_bound_buffers.immutable.remove(&key);
+        self.cb_bound_buffers.guest_snapshots.remove(&key);
+        if bound.guest_import {
+            self.cb_bound_buffers.aliases.insert(key, (bound, owner));
+        } else if matches!(&owner.allocation, super::CbBindAllocation::Bytes(_)) {
+            self.cb_bound_buffers.immutable.insert(key, (bound, owner));
+        } else {
+            self.cb_bound_buffers
+                .guest_snapshots
+                .insert(key, (bound, owner));
+        }
+    }
+
+    pub(in crate::engine) fn cb_sampled_guest(
+        &self,
+        source: &super::CbSampledGuest,
+    ) -> Option<super::SampledSlot> {
+        let found = self
+            .cb_sampled_guest
+            .get(&source.key)
+            .map(|(slot, _)| slot.handles());
+        if found.is_some() {
+            crate::telemetry::note_route("sampled_guest_cb_reuse");
+        }
+        found
+    }
+
+    pub(in crate::engine) fn note_cb_sampled_guest(
+        &mut self,
+        source: super::CbSampledGuest,
+        image: &super::SampledSlot,
+    ) {
+        self.cb_sampled_guest
+            .insert(source.key, (image.handles(), source.owner));
+    }
+
+    pub(crate) fn note_cb_bind_owes_gather(&mut self, key: (usize, u64, u64)) {
+        self.cb_gather_owed.push(key);
+    }
+
+    pub(crate) fn note_cb_gathers_recorded(&mut self) {
+        self.cb_gather_owed.clear();
+    }
+
+    pub(crate) fn discard_cb_binds_owed_a_gather(&mut self) -> usize {
+        let n = self.cb_gather_owed.len();
+        let keys = std::mem::take(&mut self.cb_gather_owed);
+        for key in keys {
+            self.cb_bound_buffers.aliases.remove(&key);
+            self.cb_bound_buffers.immutable.remove(&key);
+            self.cb_bound_buffers.guest_snapshots.remove(&key);
+        }
+        n
+    }
+
     /// Reset and begin this encoder's current command buffer, arming its GPU
     /// timestamp pair in the same transition.
     ///
@@ -2370,9 +2449,9 @@ impl ResourcePools {
 
     /// Record that the command buffer being built reads guest RAM when it
     /// executes, so the next completion stamp waits for it.
+    #[cfg(test)]
     pub(crate) fn note_guest_read_recorded(&mut self) {
-        self.encoder.guest_reads_in_flight = true;
-        super::super::publish_guest_read_debt(true);
+        self.encoder.note_guest_read_recorded();
     }
 
     /// The buffer this command buffer already staged or gathered for the bind
@@ -2388,17 +2467,12 @@ impl ResourcePools {
     /// under a live entry, and that guarantee belongs to
     /// [`Self::note_cb_bound_buffer`], which still takes the `CbBind` by value.
     /// So the invariant is unchanged and only the miss path pays for it.
+    #[cfg(test)]
     pub(in crate::engine) fn cb_bound_buffer(
         &self,
         key: (usize, u64, u64),
     ) -> Option<super::super::exec::BoundBuffer> {
-        self.encoder
-            .cb_bound_buffers
-            .aliases
-            .get(&key)
-            .or_else(|| self.encoder.cb_bound_buffers.immutable.get(&key))
-            .or_else(|| self.encoder.cb_bound_buffers.guest_snapshots.get(&key))
-            .map(|(b, _)| *b)
+        self.encoder.cb_bound_buffer(key)
     }
 
     /// Remember that `bind`'s bytes are in `bound` for the rest of this command
@@ -2409,56 +2483,30 @@ impl ResourcePools {
     /// address whose allocation has been freed is one the next unrelated bind of
     /// the same length can be handed. Holding it is what makes the key unique
     /// for as long as it is answerable.
+    #[cfg(test)]
     pub(in crate::engine) fn note_cb_bound_buffer(
         &mut self,
         bind: super::CbBind,
         bound: super::super::exec::BoundBuffer,
     ) {
-        let (key, owner) = bind.into_parts();
-        self.encoder.cb_bound_buffers.aliases.remove(&key);
-        self.encoder.cb_bound_buffers.immutable.remove(&key);
-        self.encoder.cb_bound_buffers.guest_snapshots.remove(&key);
-        if bound.guest_import {
-            self.encoder
-                .cb_bound_buffers
-                .aliases
-                .insert(key, (bound, owner));
-        } else if matches!(&owner.allocation, super::CbBindAllocation::Bytes(_)) {
-            self.encoder
-                .cb_bound_buffers
-                .immutable
-                .insert(key, (bound, owner));
-        } else {
-            self.encoder
-                .cb_bound_buffers
-                .guest_snapshots
-                .insert(key, (bound, owner));
-        }
+        self.encoder.note_cb_bound_buffer(bind, bound);
     }
 
+    #[cfg(test)]
     pub(in crate::engine) fn cb_sampled_guest(
         &self,
         source: &super::CbSampledGuest,
     ) -> Option<super::SampledSlot> {
-        let found = self
-            .encoder
-            .cb_sampled_guest
-            .get(&source.key)
-            .map(|(slot, _)| slot.handles());
-        if found.is_some() {
-            crate::telemetry::note_route("sampled_guest_cb_reuse");
-        }
-        found
+        self.encoder.cb_sampled_guest(source)
     }
 
+    #[cfg(test)]
     pub(in crate::engine) fn note_cb_sampled_guest(
         &mut self,
         source: super::CbSampledGuest,
         image: &super::SampledSlot,
     ) {
-        self.encoder
-            .cb_sampled_guest
-            .insert(source.key, (image.handles(), source.owner));
+        self.encoder.note_cb_sampled_guest(source, image);
     }
 
     /// Record that the bind just published is backed by a **recycled slot whose
@@ -2467,8 +2515,9 @@ impl ResourcePools {
     /// Called from the one arm of `stage_buffer_content` that hands back a slot
     /// it has not filled. Everything published without this call is answerable
     /// the moment it is published.
+    #[cfg(test)]
     pub(crate) fn note_cb_bind_owes_gather(&mut self, key: (usize, u64, u64)) {
-        self.encoder.cb_gather_owed.push(key);
+        self.encoder.note_cb_bind_owes_gather(key);
     }
 
     /// The owed gathers have been recorded into the command buffer, so every
@@ -2477,8 +2526,9 @@ impl ResourcePools {
     /// Called at the single point in `execute_draw_inner` that records them,
     /// after both forms — the compute dispatches and the transfer copies — and
     /// after the barrier that orders them before the draw.
+    #[cfg(test)]
     pub(crate) fn note_cb_gathers_recorded(&mut self) {
-        self.encoder.cb_gather_owed.clear();
+        self.encoder.note_cb_gathers_recorded();
     }
 
     /// A draw abandoned before its gathers were recorded: forget exactly the
@@ -2488,15 +2538,9 @@ impl ResourcePools {
     /// that completed is still correct and this rail carries ~4.8 binds a draw.
     /// Returns how many were forgotten so a boot can say whether the window this
     /// closes was ever open.
+    #[cfg(test)]
     pub(crate) fn discard_cb_binds_owed_a_gather(&mut self) -> usize {
-        let n = self.encoder.cb_gather_owed.len();
-        let keys = std::mem::take(&mut self.encoder.cb_gather_owed);
-        for key in keys {
-            self.encoder.cb_bound_buffers.aliases.remove(&key);
-            self.encoder.cb_bound_buffers.immutable.remove(&key);
-            self.encoder.cb_bound_buffers.guest_snapshots.remove(&key);
-        }
-        n
+        self.encoder.discard_cb_binds_owed_a_gather()
     }
 
     /// Remove copied guest snapshots while retaining direct aliases and

@@ -749,7 +749,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 let direct =
                     unsafe { super::exec::import_guest_compute_buffer_window(ctx, pools, source) };
                 if let Some(bound) = direct {
-                    pools.note_guest_read_recorded();
+                    pools.encoder_mut().note_guest_read_recorded();
                     counters.note_compute_buffer_guest_import(source.total_len);
                     (bound, None, resource.writable.then(|| write_pages.clone()))
                 } else {

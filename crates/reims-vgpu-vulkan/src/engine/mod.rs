@@ -1601,7 +1601,7 @@ pub fn execute_draw_request_in_submission(
         // Forget exactly those entries. Counted rather than silent, because a
         // zero here is what says the window was never open on a given workload,
         // and no other counter in this device could see it.
-        let n = pools.discard_cb_binds_owed_a_gather();
+        let n = pools.encoder_mut().discard_cb_binds_owed_a_gather();
         if n > 0 {
             crate::telemetry::note_route_n("cb_bind_dropped_unfilled_gather", n as u64);
         }
