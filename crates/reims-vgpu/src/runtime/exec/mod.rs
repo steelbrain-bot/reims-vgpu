@@ -5539,6 +5539,13 @@ fn apply_clear<M: HostMemory + HostOps>(
         return false;
     };
     let c0 = req.colors.first().unwrap_or_else(|| unreachable!());
+    if !c0.publishes_single_sample() {
+        crate::observe::fail(format!(
+            "render_clear reason=clear_multisample_store_requires_resident source={} samples={}",
+            att.texture_ref, c0.sample_count
+        ));
+        return false;
+    }
     let w = c0.width;
     let h = c0.height;
     let rgba = solid_rgba8(w, h, &att.clear_color);

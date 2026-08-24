@@ -209,11 +209,15 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
     // retired software `src + seed*(1-src.a)` path. Sampled alpha is
     // protocol data and must not be rewritten from an RGB content census;
     // content-gated keep-seed / alpha0-holes composites are retired.
-    let store_is_store = req
+    let store_publishes = req
         .colors
         .first()
-        .map(|c| c.store_action.publishes_single_sample())
+        .map(ColorRtRequest::publishes_single_sample)
         .unwrap_or(true);
+    let store_preserves = req
+        .colors
+        .first()
+        .is_some_and(ColorRtRequest::preserves_attachment_samples);
     resources.target_rgba8 = target_rgba8;
     resources.target_guest = target_guest;
     resources.target_clear = target_clear;
@@ -238,14 +242,15 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
     // Start from the portable Store answer. Target planning may turn readback
     // off only while assigning the matching resident completion route; the
     // executor then reports whether that resident was guest-backed or copied.
-    resources.skip_readback = !store_is_store;
+    resources.skip_readback = !store_publishes;
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::AssembleTarget);
     let completion_route = plan_target_completion(
         state,
         req,
         &mut resources,
         gva_alloc_generation,
-        store_is_store,
+        store_publishes,
+        store_preserves,
         writeback_guest,
         iosurface_texture_resident_target,
         chain_load_from_target,

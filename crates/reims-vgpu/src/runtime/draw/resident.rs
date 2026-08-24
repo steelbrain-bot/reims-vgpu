@@ -152,7 +152,7 @@ pub(super) fn iosurface_texture_render_identity(
     req: &DrawEncodeRequest,
 ) -> Option<crate::model::TargetIdentity> {
     let c0 = req.colors.first()?;
-    if c0.mapping_id() == 0 || !c0.store_action.publishes_single_sample() {
+    if c0.mapping_id() == 0 || !c0.preserves_attachment_samples() {
         return None;
     }
     render_chain_identity(state, req, 0)

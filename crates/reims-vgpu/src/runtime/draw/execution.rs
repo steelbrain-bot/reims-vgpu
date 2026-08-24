@@ -106,7 +106,7 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::PrepSeed);
     if writeback_guest && clear_seed_enabled() {
         for (i, c) in colors.iter().enumerate() {
-            if !c.store_action.publishes_single_sample() {
+            if !c.publishes_single_sample() {
                 continue;
             }
             if !load_action_has_clear_seed(c.load_action) {

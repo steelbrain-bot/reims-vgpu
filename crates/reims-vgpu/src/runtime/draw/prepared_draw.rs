@@ -55,6 +55,7 @@ pub(super) fn plan_target_completion(
     executor_request: &mut reims_vgpu_core::DrawRequest,
     gva_allocation_generation: u64,
     store_publishes: bool,
+    store_preserves: bool,
     writeback_guest: bool,
     surface_target: Option<TargetIdentity>,
     load_from_resident: bool,
@@ -71,14 +72,15 @@ pub(super) fn plan_target_completion(
             .map_err(|conflict| DrawPreparationDecline::CompletionRouteConflict { conflict })
     };
 
-    // Intermediate records use a protocol-keyed resident but leave no
-    // guest-visible GPU-only content: the final record owns publication.
-    if request.chain_from_resident || (store_publishes && !writeback_guest) {
+    // Intermediate records retain their protocol-keyed target for the next
+    // record. A final multisample Store does the same because its named image,
+    // not single-sample guest bytes, is the pass result.
+    if request.chain_from_resident || (store_preserves && (!writeback_guest || !store_publishes)) {
         if let Some(identity) =
             super::render_chain_identity(state, request, gva_allocation_generation)
         {
             executor_request.target_identity = Some(identity.clone());
-            if store_publishes && !writeback_guest {
+            if store_preserves && (!writeback_guest || !store_publishes) {
                 executor_request.skip_readback = true;
                 claim(DrawCompletionRoute::ResidentChain(identity))?;
             }
@@ -289,6 +291,7 @@ mod tests {
             &mut executor_request,
             0,
             false,
+            false,
             true,
             None,
             false,
@@ -359,6 +362,7 @@ mod tests {
             0,
             true,
             true,
+            true,
             Some(surface.clone()),
             false,
             None,
@@ -384,6 +388,7 @@ mod tests {
             &mut executor_request,
             0,
             false,
+            false,
             true,
             None,
             true,
@@ -404,6 +409,7 @@ mod tests {
                 &request,
                 &mut executor_request,
                 0,
+                false,
                 false,
                 true,
                 None,
@@ -464,6 +470,7 @@ mod tests {
             1,
             true,
             true,
+            true,
             None,
             false,
             None,
@@ -473,6 +480,56 @@ mod tests {
         .expect("a GVA Store has one completion route");
 
         assert!(matches!(route, DrawCompletionRoute::ResidentGvaReadback(_)));
+        assert!(executor_request.skip_readback);
+        assert_eq!(executor_request.target_identity, Some(gva(0x1000)));
+    }
+
+    #[test]
+    fn a_multisample_store_retains_samples_without_guest_readback() {
+        use reims_vgpu_protocol::pass_action::StoreAction;
+
+        let state = Device::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let request = super::super::DrawEncodeRequest {
+            colors: vec![super::super::ColorRtRequest {
+                texture_ref: 9,
+                storage: super::super::ColorTargetStorage::Linear(
+                    reims_vgpu_core::LinearColorTarget {
+                        allocation_gva: 0x1000,
+                        allocation_size: 8 * 8 * 4,
+                        plane_offset: 0,
+                        row_stride: 8 * 4,
+                    },
+                ),
+                width: 8,
+                height: 8,
+                format: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                sample_count: 4,
+                store_action: StoreAction::Store,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!request.colors[0].publishes_single_sample());
+        assert!(request.colors[0].preserves_attachment_samples());
+
+        let mut executor_request = reims_vgpu_core::DrawRequest::default();
+        let route = plan_target_completion(
+            &state,
+            &request,
+            &mut executor_request,
+            1,
+            false,
+            true,
+            true,
+            None,
+            false,
+            None,
+            8,
+            8,
+        )
+        .expect("a multisample Store has one resident completion");
+
+        assert!(matches!(route, DrawCompletionRoute::ResidentChain(_)));
         assert!(executor_request.skip_readback);
         assert_eq!(executor_request.target_identity, Some(gva(0x1000)));
     }

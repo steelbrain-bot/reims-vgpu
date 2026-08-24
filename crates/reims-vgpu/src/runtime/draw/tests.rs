@@ -6732,6 +6732,8 @@ fn a_synchronous_gva_store_is_bounded_to_the_pages_the_command_named() {
         .expect("a resolvable GVA target must be bounded");
     let mut resolve = c0.clone();
     resolve.store_action = reims_vgpu_protocol::pass_action::StoreAction::MultisampleResolve;
+    resolve.sample_count = 4;
+    resolve.multisample_source_ref = 8;
     assert!(
         sync_store_allowed_pages(&state, &host, 1, Some(&resolve), true).is_some(),
         "a resolve publishes into the same guest destination and needs the same bound"

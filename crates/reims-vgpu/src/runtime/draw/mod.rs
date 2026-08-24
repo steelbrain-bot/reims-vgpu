@@ -738,6 +738,34 @@ pub enum GvaLoadSource {
 }
 
 impl ColorRtRequest {
+    /// Whether pass completion makes one texel per pixel available in this
+    /// request's target storage.
+    ///
+    /// A multisample `Store` preserves the attachment's samples in the
+    /// attachment itself; it does not collapse them into the linear guest
+    /// allocation. Only a resolve publishes a single-sample destination.
+    pub const fn publishes_single_sample(&self) -> bool {
+        use reims_vgpu_protocol::pass_action::StoreAction;
+
+        match self.store_action {
+            StoreAction::DontCare => false,
+            StoreAction::Store => self.sample_count <= 1,
+            StoreAction::MultisampleResolve | StoreAction::StoreAndMultisampleResolve => {
+                self.multisample_source_ref != 0
+            }
+        }
+    }
+
+    /// Whether pass completion must retain the attachment image and all of
+    /// its samples.
+    pub const fn preserves_attachment_samples(&self) -> bool {
+        matches!(
+            self.store_action,
+            reims_vgpu_protocol::pass_action::StoreAction::Store
+                | reims_vgpu_protocol::pass_action::StoreAction::StoreAndMultisampleResolve
+        )
+    }
+
     pub fn mapping_id(&self) -> u32 {
         self.storage.mapping_id()
     }
@@ -2557,11 +2585,7 @@ pub(crate) fn sync_store_target_pages<M: HostMemory>(
     task_id: u32,
     c: &ColorRtRequest,
 ) -> Option<StoreTargetPages> {
-    if c.target_gva() == 0
-        || !c.store_action.publishes_single_sample()
-        || c.width == 0
-        || c.height == 0
-    {
+    if c.target_gva() == 0 || !c.publishes_single_sample() || c.width == 0 || c.height == 0 {
         return None;
     }
     let span = (c.row_stride() as u64).checked_mul(c.height as u64)?;
