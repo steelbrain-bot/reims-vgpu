@@ -466,6 +466,18 @@ impl crate::runtime::host::HostControl for QemuHost<'_> {
             QemuHostDecline::ScheduleBhCallbackMissing.emit(0);
         }
     }
+
+    fn worker_wake(&self) -> crate::runtime::host::WorkerWake {
+        let wake = self.ops.schedule_bh;
+        let ctx = self.ops.ctx as usize;
+        crate::runtime::host::WorkerWake::new(move || {
+            if let Some(wake) = wake {
+                // SAFETY: the callback contract explicitly permits any thread,
+                // and QEMU retains `ctx` for the device lifetime.
+                unsafe { wake(ctx as *mut c_void) }
+            }
+        })
+    }
 }
 
 impl crate::runtime::host::GuestCpuAccess for QemuHost<'_> {

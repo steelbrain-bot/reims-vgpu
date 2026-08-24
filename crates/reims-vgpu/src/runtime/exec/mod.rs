@@ -390,6 +390,13 @@ enum OpenEncoder {
     Info,
 }
 
+#[derive(Default)]
+struct EncoderWalkState {
+    open: Option<OpenEncoder>,
+    terminal_boundary: Option<SegmentBoundary>,
+    pending_surface: Option<PreparedSurfaceTransaction>,
+}
+
 impl OpenEncoder {
     fn new(type_: u8) -> Option<Self> {
         match type_ {
@@ -1065,7 +1072,10 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     measured_ns += open_ns;
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Open, open_ns);
 
-    let mut open_encoder = None;
+    let mut encoders = EncoderWalkState {
+        terminal_boundary: submission_context.segments.last().copied(),
+        ..Default::default()
+    };
     for (stream_index, stream) in (0u32..).zip(streams) {
         let walk_started = std::time::Instant::now();
         let finish_ns = walk_submitted_stream(
@@ -1075,7 +1085,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             stream_index,
             &stream,
             &mut out,
-            &mut open_encoder,
+            &mut encoders,
         );
         let walk_ns = (walk_started.elapsed().as_nanos() as u64).saturating_sub(finish_ns);
         measured_ns += walk_ns;
@@ -1083,7 +1093,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
     }
-    if let Some(previous) = open_encoder {
+    if let Some(previous) = encoders.open {
         crate::observe::Emit::decline(
             "stream_encoder",
             &EncoderLifetimeRefusal::Unclosed {
@@ -1092,6 +1102,9 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         )
         .field("task", task_id)
         .fail();
+    }
+    if let Some(transaction) = encoders.pending_surface {
+        complete_surface_transaction_sync(state, host, &mut out, transaction);
     }
     let close_started = std::time::Instant::now();
     if let Some(context) = state.submissions.finish() {
@@ -1559,10 +1572,14 @@ fn finish_open_encoder<M: HostMemory + HostOps>(
     task_id: u32,
     out: &mut ExecResult,
     encoder: &mut OpenEncoder,
+    defer_completion: bool,
+    pending: &mut Option<PreparedSurfaceTransaction>,
 ) -> u64 {
     let started = std::time::Instant::now();
     match encoder {
-        OpenEncoder::Render(acc) => finish_stream(state, host, task_id, out, acc),
+        OpenEncoder::Render(acc) => {
+            *pending = finish_stream_owned(state, host, task_id, out, acc, defer_completion);
+        }
         OpenEncoder::Compute(compute) => {
             if let Some(st) = crate::runtime::compute_session::finish_session(
                 &mut compute.session,
@@ -1636,7 +1653,7 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
     stream_index: u32,
     bytes: &[u8],
     out: &mut ExecResult,
-    open: &mut Option<OpenEncoder>,
+    encoders: &mut EncoderWalkState,
 ) -> u64 {
     let segs = match stream::iter_segments(bytes) {
         Ok(s) => s,
@@ -1665,12 +1682,11 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
             continue;
         }
 
-        state
-            .submissions
-            .enter_segment_if_active(semantic_segment_boundary(stream_index, &seg));
+        let boundary = semantic_segment_boundary(stream_index, &seg);
+        state.submissions.enter_segment_if_active(boundary);
 
         let mut encoder = if seg.continues_previous {
-            match open.take() {
+            match encoders.open.take() {
                 Some(encoder) if encoder.type_() == seg.type_ => encoder,
                 Some(previous) => {
                     crate::observe::Emit::decline(
@@ -1695,7 +1711,7 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
                 }
             }
         } else {
-            if let Some(previous) = open.take() {
+            if let Some(previous) = encoders.open.take() {
                 crate::observe::Emit::decline(
                     "stream_encoder",
                     &EncoderLifetimeRefusal::RestartBeforeClose {
@@ -1741,7 +1757,7 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
         }
 
         if seg.continues_next {
-            *open = Some(encoder);
+            encoders.open = Some(encoder);
         } else {
             finish_ns = finish_ns.saturating_add(finish_open_encoder(
                 state,
@@ -1749,6 +1765,8 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
                 task_id,
                 out,
                 &mut encoder,
+                boundary == encoders.terminal_boundary,
+                &mut encoders.pending_surface,
             ));
         }
     }
@@ -4742,11 +4760,8 @@ fn land_prepared_resident_prefix<M: HostMemory + HostOps>(
     clippy::too_many_arguments,
     reason = "the transaction owns execution, ordered publication, and failure recovery"
 )]
-fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
-    state: &mut Device,
-    host: &mut M,
+fn prepare_surface_transaction(
     task_id: u32,
-    out: &mut ExecResult,
     submission: draw::PreparedM2vSubmission,
     records: &mut Vec<PreparedResidentRecord>,
     final_req: &draw::DrawEncodeRequest,
@@ -4758,8 +4773,8 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
     final_icb: bool,
     draw_started: std::time::Instant,
     total_draws: usize,
-) {
-    let transaction = PreparedSurfaceTransaction {
+) -> PreparedSurfaceTransaction {
+    PreparedSurfaceTransaction {
         recording: submission.into_execution(),
         completion: SurfaceTransactionCompletion {
             core: SurfaceCompletionCore {
@@ -4776,15 +4791,30 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
             saw_backend_unavailable,
             draw_started,
         },
-    };
+    }
+}
+
+fn complete_surface_transaction_sync<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    out: &mut ExecResult,
+    transaction: PreparedSurfaceTransaction,
+) {
     let identity = transaction.recording.identity();
+    let task_id = transaction.completion.core.task_id;
+    let acc = transaction.completion.core.acc.clone();
+    let visibility_counts = transaction.completion.visibility_counts.clone();
+    let saw_backend_unavailable = transaction.completion.saw_backend_unavailable;
     let executor = std::sync::Arc::clone(&state.executor);
     let engine_started = std::time::Instant::now();
     state
         .surface_recording_workers
-        .dispatch(identity, transaction, move |transaction| {
-            transaction.record(executor.as_ref())
-        })
+        .dispatch(
+            identity,
+            transaction,
+            host.worker_wake(),
+            move |transaction| transaction.record(executor.as_ref()),
+        )
         .expect("the serial caller owns no duplicate recording worker");
     let mut results = state.surface_recording_workers.quiesce();
     let result = results
@@ -4821,9 +4851,9 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
             state,
             host,
             task_id,
-            acc,
+            &acc,
             out,
-            visibility_counts,
+            &visibility_counts,
             saw_backend_unavailable,
         ),
     }
@@ -5082,6 +5112,7 @@ fn complete_prepared_surface_transaction<M: HostMemory + HostOps>(
     }
 }
 
+#[cfg(test)]
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -5089,6 +5120,18 @@ fn finish_stream<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &StreamAccum,
 ) {
+    let transaction = finish_stream_owned(state, host, task_id, out, acc, false);
+    debug_assert!(transaction.is_none());
+}
+
+fn finish_stream_owned<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    out: &mut ExecResult,
+    acc: &StreamAccum,
+    defer_completion: bool,
+) -> Option<PreparedSurfaceTransaction> {
     // Opens in `Prelude` and is charged to whichever part is open until it
     // drops, so the six tile this function rather than sampling it. See
     // [`finish_phase`] for what the split is for.
@@ -5507,11 +5550,8 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 &mut prepared_resident,
                                 draw::PreparedM2vSubmission::new(submission_context.clone()),
                             );
-                            flush_prepared_surface_transaction(
-                                state,
-                                host,
+                            let transaction = prepare_surface_transaction(
                                 task_id,
-                                out,
                                 submission,
                                 &mut prepared_resident_records,
                                 &req,
@@ -5524,7 +5564,11 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 draw_started,
                                 draw_list.len(),
                             );
-                            return;
+                            if defer_completion {
+                                return Some(transaction);
+                            }
+                            complete_surface_transaction_sync(state, host, out, transaction);
+                            return None;
                         }
                         Ok(None) => {}
                         Err(encode) => prepared_final_refusal = Some(encode),
@@ -5728,6 +5772,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             saw_backend_unavailable,
         );
     }
+    None
 }
 
 fn note_unanswered_visibility(task_id: u32, pipeline_ref: u32, arming: draw::VisibilityArming) {

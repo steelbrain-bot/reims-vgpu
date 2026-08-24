@@ -533,7 +533,7 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
     let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
-    let mut open = None;
+    let mut encoders = EncoderWalkState::default();
 
     walk_submitted_stream(
         &mut state,
@@ -542,7 +542,7 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
         0,
         &render_segment(&set_pipeline, false, true),
         &mut out,
-        &mut open,
+        &mut encoders,
     );
     walk_submitted_stream(
         &mut state,
@@ -551,10 +551,10 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
         1,
         &render_segment(&draw, true, true),
         &mut out,
-        &mut open,
+        &mut encoders,
     );
 
-    let Some(OpenEncoder::Render(acc)) = open.as_ref() else {
+    let Some(OpenEncoder::Render(acc)) = encoders.open.as_ref() else {
         panic!("the continued render encoder must remain open")
     };
     assert_eq!(acc.pipeline_ref, 0x41);
@@ -568,10 +568,10 @@ fn a_render_encoder_continuation_keeps_pipeline_state_across_child_buffers() {
         2,
         &render_segment(&[], true, false),
         &mut out,
-        &mut open,
+        &mut encoders,
     );
     assert!(
-        open.is_none(),
+        encoders.open.is_none(),
         "the closing segment owns encoder retirement"
     );
 }

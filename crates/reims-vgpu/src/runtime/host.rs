@@ -412,10 +412,28 @@ impl crate::observe::Decline for GuestRamRegionsError {
 crate::observe::decline::decline_display!(GuestRamRegionsError);
 
 /// Clock, wake, and typed host-effect delivery.
+#[derive(Clone)]
+pub struct WorkerWake(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl WorkerWake {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(wake))
+    }
+
+    pub fn wake(&self) {
+        (self.0)();
+    }
+}
+
 pub trait HostControl {
     fn mono_ns(&self) -> u64;
     fn enqueue(&mut self, action: HostAction);
     fn schedule_bh(&mut self);
+
+    /// Thread-safe edge used when detached EXEC recording publishes a result.
+    fn worker_wake(&self) -> WorkerWake {
+        WorkerWake::new(|| {})
+    }
 }
 
 /// Directed guest CPU and kernel-virtual-address introspection.

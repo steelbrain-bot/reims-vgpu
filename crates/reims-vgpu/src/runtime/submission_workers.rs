@@ -59,6 +59,7 @@ impl<T: Send + 'static> SubmissionWorkers<T> {
         &mut self,
         identity: SubmissionIdentity,
         work: W,
+        wake: crate::runtime::host::WorkerWake,
         record: F,
     ) -> Result<(), WorkerDispatchError>
     where
@@ -76,6 +77,7 @@ impl<T: Send + 'static> SubmissionWorkers<T> {
             // A dropped receiver means the device lifetime already ended. The
             // worker still owns and drops its recording result correctly.
             let _ = result_tx.send(WorkerResult { identity, outcome });
+            wake.wake();
         });
         let displaced = self.active.insert(identity, handle);
         debug_assert!(displaced.is_none());
@@ -136,11 +138,12 @@ mod tests {
     #[test]
     fn two_admitted_execs_record_at_the_same_time() {
         let mut workers = SubmissionWorkers::default();
+        let wake = crate::runtime::host::WorkerWake::new(|| {});
         let rendezvous = Arc::new(Barrier::new(3));
         for id in [1, 2] {
             let worker_barrier = Arc::clone(&rendezvous);
             workers
-                .dispatch(identity(id), id, move |value| {
+                .dispatch(identity(id), id, wake.clone(), move |value| {
                     worker_barrier.wait();
                     value * 10
                 })
@@ -159,11 +162,12 @@ mod tests {
     fn duplicate_active_identity_is_refused_and_worker_panic_is_terminal() {
         let mut workers = SubmissionWorkers::default();
         let active = identity(3);
+        let wake = crate::runtime::host::WorkerWake::new(|| {});
         workers
-            .dispatch(active, (), |_| panic!("recording failed"))
+            .dispatch(active, (), wake.clone(), |_| panic!("recording failed"))
             .unwrap();
         assert_eq!(
-            workers.dispatch(active, (), |_| ()),
+            workers.dispatch(active, (), wake, |_| ()),
             Err(WorkerDispatchError::AlreadyActive(active))
         );
 
