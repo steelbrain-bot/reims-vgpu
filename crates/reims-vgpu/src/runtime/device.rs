@@ -195,8 +195,7 @@ impl Device {
         self.process_host_release_effects(host, effects)
     }
 
-    fn reset_model(&mut self) {
-        self.retire_all_bound_buffers();
+    fn abort_exec_recordings(&mut self) {
         self.surface_recording_workers.take_finished();
         self.surface_recording_workers.quiesce();
         self.pending_execs.clear();
@@ -207,6 +206,10 @@ impl Device {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .abort_all()
             .for_each(drop);
+    }
+
+    fn reset_model(&mut self) {
+        self.retire_all_bound_buffers();
         let effect = self.state.reset();
         if let Some(hold) = effect.translation_hold {
             crate::observe::fail(format!(
@@ -218,6 +221,7 @@ impl Device {
     }
 
     pub fn reset(&mut self) {
+        self.abort_exec_recordings();
         {
             let executor = Arc::clone(&self.executor);
             let _scope = executor.enter();
@@ -245,6 +249,7 @@ impl Device {
 
     /// Reset after releasing every host page view owned by this guest lifetime.
     pub fn reset_with_host<H: HostOps>(&mut self, host: &mut H) -> usize {
+        self.abort_exec_recordings();
         let executor = Arc::clone(&self.executor);
         let _scope = executor.enter();
         executor.reset();
