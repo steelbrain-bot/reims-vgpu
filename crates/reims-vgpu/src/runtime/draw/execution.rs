@@ -2280,6 +2280,10 @@ impl PreparedM2vSubmission {
 }
 
 impl PreparedM2vExecution {
+    pub(crate) fn identity(&self) -> reims_vgpu_protocol::SubmissionIdentity {
+        self.recording.identity()
+    }
+
     pub(crate) fn record(
         self,
         executor: &dyn crate::runtime::executor::Executor,

@@ -4562,7 +4562,7 @@ struct PreparedSurfaceTransaction {
     completion: SurfaceTransactionCompletion,
 }
 
-struct RecordedSurfaceTransaction {
+pub(crate) struct RecordedSurfaceTransaction {
     recording: draw::RecordedM2vSubmission,
     completion: SurfaceTransactionCompletion,
 }
@@ -4765,9 +4765,34 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
             total_draws,
         },
     };
+    let identity = transaction.recording.identity();
     let executor = std::sync::Arc::clone(&state.executor);
     let engine_started = std::time::Instant::now();
-    let recorded = transaction.record(executor.as_ref()).map_err(|error| {
+    state
+        .surface_recording_workers
+        .dispatch(identity, transaction, move |transaction| {
+            transaction.record(executor.as_ref())
+        })
+        .expect("the serial caller owns no duplicate recording worker");
+    let mut results = state.surface_recording_workers.quiesce();
+    let result = results
+        .pop()
+        .expect("the dispatched terminal transaction returns one result");
+    assert_eq!(result.identity, identity);
+    let recorded = match result.outcome {
+        crate::runtime::submission_workers::WorkerOutcome::Completed(recorded) => recorded,
+        crate::runtime::submission_workers::WorkerOutcome::Panicked => {
+            let error = crate::runtime::executor::DrawError::Facade(
+                crate::runtime::executor::EngineFacadeDecline::ExecutorServiceUnavailable {
+                    service: "submission_recording_worker",
+                },
+            );
+            Err(crate::runtime::executor::ExecutorDiagnostic::from_decline(
+                &error,
+            ))
+        }
+    }
+    .map_err(|error| {
         crate::observe::fail(format!(
             "draw_submission_fail reason={} task={task_id} detail={error}",
             crate::observe::Decline::slug(&error)

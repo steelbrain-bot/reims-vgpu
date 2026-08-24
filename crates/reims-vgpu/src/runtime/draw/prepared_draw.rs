@@ -305,6 +305,13 @@ impl PreparedDrawSubmission {
 }
 
 impl PreparedDrawExecution {
+    pub(super) fn identity(&self) -> reims_vgpu_protocol::SubmissionIdentity {
+        match self {
+            Self::Empty => reims_vgpu_core::SubmissionContext::standalone(0).identity,
+            Self::One { context, .. } | Self::Many { context, .. } => context.identity,
+        }
+    }
+
     /// Perform backend recording without semantic or guest-memory authority.
     pub(super) fn record(
         self,

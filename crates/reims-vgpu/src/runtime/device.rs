@@ -19,6 +19,12 @@ pub struct Device {
     pub(crate) submissions_scheduled: std::sync::Mutex<
         reims_vgpu_core::SubmissionScheduler<(), reims_vgpu_core::SubmissionContext>,
     >,
+    pub(crate) surface_recording_workers: crate::runtime::submission_workers::SubmissionWorkers<
+        Result<
+            crate::runtime::exec::RecordedSurfaceTransaction,
+            crate::runtime::executor::ExecutorDiagnostic,
+        >,
+    >,
     pending_imported_views: Vec<(reims_vgpu_memory::ImportId, usize, usize)>,
 }
 
@@ -61,6 +67,7 @@ impl std::fmt::Debug for Device {
             .field("executor", &self.executor)
             .field("bound_buffers", &self.bound_buffers)
             .field("submissions_scheduled", &self.submissions_scheduled)
+            .field("surface_recording_workers", &self.surface_recording_workers)
             .finish()
     }
 }
@@ -103,6 +110,7 @@ impl Device {
             executor,
             bound_buffers: Default::default(),
             submissions_scheduled: Default::default(),
+            surface_recording_workers: Default::default(),
             pending_imported_views: Vec::new(),
         }
     }
@@ -165,6 +173,8 @@ impl Device {
 
     fn reset_model(&mut self) {
         self.retire_all_bound_buffers();
+        self.surface_recording_workers.take_finished();
+        self.surface_recording_workers.quiesce();
         self.submissions_scheduled
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

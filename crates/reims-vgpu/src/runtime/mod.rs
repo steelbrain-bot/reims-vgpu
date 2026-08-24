@@ -90,6 +90,7 @@ pub mod resource_validity;
 pub mod sampled_phase;
 /// Guest surface → host BGRA8 for the QEMU console.
 pub mod scanout;
+mod submission_workers;
 /// Host surface cache (Linux/Vulkan discrete-GPU present, kb §8.5).
 pub mod surface_cache;
 /// The wire task word a command payload carries → a live task slot.
