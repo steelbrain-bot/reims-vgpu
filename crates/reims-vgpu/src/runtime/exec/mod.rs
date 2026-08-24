@@ -4751,16 +4751,24 @@ fn flush_prepared_surface_transaction<M: HostMemory + HostOps>(
             guest_store_pages,
             guest_store_window,
             visibility_samples,
-        } => Ok(draw::complete_surface_store(
-            state,
-            host,
-            final_req,
-            submission,
-            identity,
-            guest_store_pages,
-            guest_store_window,
-            visibility_samples,
-        )),
+        } => {
+            let store_started = std::time::Instant::now();
+            let completed = draw::complete_surface_store(
+                state,
+                host,
+                final_req,
+                submission,
+                identity,
+                guest_store_pages,
+                guest_store_window,
+                visibility_samples,
+            );
+            crate::runtime::chain_phase::note_detached(
+                crate::runtime::chain_phase::Phase::Store,
+                store_started.elapsed(),
+            );
+            Ok(completed)
+        }
         _ => {
             out.draws_fail = out.draws_fail.saturating_add(1);
             crate::observe::fail(format!(
@@ -5031,6 +5039,8 @@ fn finish_stream<M: HostMemory + HostOps>(
                 if do_writeback {
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
                 }
+                let draw_started = std::time::Instant::now();
+                fin.enter(crate::runtime::drain::FinishPhase::Encode);
                 if !do_writeback {
                     match draw::prepare_intermediate_draw_chain(state, host, &req) {
                         Ok(Some(prepared)) if prepared.resident_chain_identity().is_some() => {
@@ -5043,6 +5053,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 draw_index: di,
                             });
                             pending_render_barriers.clear();
+                            crate::runtime::drain::note_drain_phase(
+                                crate::runtime::drain::DrainPhase::Draw,
+                                draw_started,
+                            );
                             continue;
                         }
                         Ok(Some(prepared)) => {
@@ -5071,6 +5085,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 }
                             }
                             let encode = prepared.execute_intermediate(state);
+                            crate::runtime::drain::note_drain_phase(
+                                crate::runtime::drain::DrainPhase::Draw,
+                                draw_started,
+                            );
                             // This uncommon CPU-chain route cannot be planned
                             // past its pixels. It remains an explicit barrier;
                             // resident draws collected before it are flushed by
@@ -5146,6 +5164,10 @@ fn finish_stream<M: HostMemory + HostOps>(
                                 }
                             }
                             out.draws_fail = out.draws_fail.saturating_add(1);
+                            crate::runtime::drain::note_drain_phase(
+                                crate::runtime::drain::DrainPhase::Draw,
+                                draw_started,
+                            );
                             note_draw_encode_fail(
                                 task_id,
                                 pd.pipeline_ref,
@@ -5229,8 +5251,6 @@ fn finish_stream<M: HostMemory + HostOps>(
                         }
                     }
                 }
-                let draw_started = std::time::Instant::now();
-                fin.enter(crate::runtime::drain::FinishPhase::Encode);
                 let encode = batched_final.or(prepared_final_refusal).unwrap_or_else(|| {
                     draw::encode_draw_chain(state, host, &req, do_writeback, force_full_store)
                 });

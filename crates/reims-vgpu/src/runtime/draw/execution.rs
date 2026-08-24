@@ -2477,7 +2477,10 @@ pub(crate) fn prepare_intermediate_draw_chain<M: HostMemory + HostOps>(
     host: &mut M,
     req: &DrawEncodeRequest,
 ) -> Result<Option<PreparedM2vDraw>, DrawChainResult> {
-    match prepare_metal2vulkan_draw(state, host, req, false) {
+    let _phase = crate::runtime::chain_phase::ChainTimer::start();
+    let result = prepare_metal2vulkan_draw(state, host, req, false);
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
+    match result {
         Ok(prepared) => Ok(prepared),
         Err(error) => {
             let slug = crate::observe::Decline::slug(&error);
@@ -2510,7 +2513,10 @@ pub(crate) fn prepare_surface_store_draw_chain<M: HostMemory + HostOps>(
     if clear_store_precedes_draw {
         return Ok(None);
     }
-    match prepare_metal2vulkan_draw(state, host, req, true) {
+    let _phase = crate::runtime::chain_phase::ChainTimer::start();
+    let result = prepare_metal2vulkan_draw(state, host, req, true);
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
+    match result {
         Ok(Some(prepared)) if prepared.is_surface_store() => Ok(Some(prepared)),
         Ok(_) => Ok(None),
         Err(error) => {

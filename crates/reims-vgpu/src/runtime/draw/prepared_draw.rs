@@ -251,8 +251,14 @@ impl PreparedDrawSubmission {
             requests.push(request);
             completion_plans.push(completion);
         }
+        let engine_started = std::time::Instant::now();
         let progress = executor::execute_draws_progress(executor.as_ref(), self.context, requests)
-            .map_err(|error| ExecutorDiagnostic::from_decline(&error))?;
+            .map_err(|error| ExecutorDiagnostic::from_decline(&error));
+        crate::runtime::chain_phase::note_detached(
+            crate::runtime::chain_phase::Phase::Engine,
+            engine_started.elapsed(),
+        );
+        let progress = progress?;
         state
             .task_objects
             .resources

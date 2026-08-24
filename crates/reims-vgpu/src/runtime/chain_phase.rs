@@ -287,6 +287,16 @@ pub fn enter(next: Phase) {
     });
 }
 
+/// Charge work performed once for an EXEC-owned draw batch without inventing
+/// another draw-chain count.
+///
+/// Each prepared draw owns its normal [`ChainTimer`]. Native execution and
+/// ordered Store publication happen once after those timers have closed, so
+/// their aggregate duration is added to the corresponding phase separately.
+pub fn note_detached(phase: Phase, elapsed: std::time::Duration) {
+    ACC[phase as usize].fetch_add(charge_ns(elapsed), Ordering::Relaxed);
+}
+
 /// Charges one draw chain's wall clock to one phase at a time.
 ///
 /// Held by value in `encode_draw_chain`; [`enter`] closes the open phase and
@@ -451,6 +461,19 @@ mod tests {
         assert!(
             take_window().is_none(),
             "no chain ran, so there is no window"
+        );
+    }
+
+    #[test]
+    fn detached_batch_work_charges_time_without_inventing_an_extra_chain() {
+        let _ = take_window();
+        drop(ChainTimer::start());
+        note_detached(Phase::Engine, std::time::Duration::from_millis(2));
+        let window = take_window().expect("detached engine work is measurable");
+        assert_eq!(window.chains, 1);
+        assert!(
+            window.engine_us >= 1_000,
+            "engine batch was charged: {window:?}"
         );
     }
 
