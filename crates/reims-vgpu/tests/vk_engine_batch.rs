@@ -311,11 +311,11 @@ fn one_recording_retains_unchanged_blend_constants() {
     assert!(pixels.iter().any(|byte| *byte != 0));
 }
 
-/// Decoded submissions own their execution interval but do not dictate Vulkan
-/// queue-submit boundaries. Closing one releases its semantic ownership so the
-/// next can record, while compatible ordered draws remain in one native batch.
+/// Each decoded exec owns one native command buffer. Continuation records may
+/// retain state inside that exec, but its close commits the packet before the
+/// next identity can claim the encoder.
 #[test]
-fn submission_close_releases_ownership_without_splitting_the_native_batch() {
+fn submission_close_commits_each_native_packet() {
     let _guard = engine_test_lock().lock().unwrap();
     engine::flush_batched_draws();
     let (vert, frag) = triangle_spirv();
@@ -350,9 +350,10 @@ fn submission_close_releases_ownership_without_splitting_the_native_batch() {
     engine::close_submission(first_submission.identity).expect("close first submission");
     let first_close = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
-        first_close.batch_flushes, 0,
-        "the submission close must not add a queue submission"
+        first_close.batch_flushes, 1,
+        "the first packet close commits its retained encoder"
     );
+    assert_eq!(first_close.batch_flush_draws, 1);
 
     let right = batch_req(&vert, &frag, &identity, true, half_scissor(false));
     engine::execute_draw_request_in_submission(&second_submission, &right)
@@ -361,18 +362,22 @@ fn submission_close_releases_ownership_without_splitting_the_native_batch() {
 
     let delta = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
-        delta.batch_flushes, 0,
-        "neither semantic close may split the native batch"
+        delta.batch_flushes, 2,
+        "each exact packet owns one native commit"
     );
+    assert_eq!(delta.batch_flush_draws, 2);
 
     let pixels = engine::read_target(&identity)
         .expect("ordered submissions preserve the target")
         .into_rgba8();
     let flushed = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(flushed.batch_flushes, 1, "the read submits the shared tail");
+    assert_eq!(
+        flushed.batch_flushes, 2,
+        "the read finds no cross-packet tail"
+    );
     assert_eq!(
         flushed.batch_flush_draws, 2,
-        "both ordered submissions shared the native command buffer"
+        "each ordered submission retained its own draw"
     );
     for y in [0u32, H / 2, H - 1] {
         for x in [0u32, W / 4, W / 2, 3 * W / 4, W - 1] {

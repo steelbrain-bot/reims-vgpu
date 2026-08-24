@@ -2735,19 +2735,22 @@ pub fn execute_compute_request_in_submission(
 }
 
 /// Close the exact guest submission whose Vulkan commands have finished
-/// recording.
-///
-/// This releases semantic ownership; it does not force a Vulkan queue submit.
-/// Queue submission remains governed by native command-buffer dependencies and
-/// batching, which may preserve ordering for several decoded submissions in one
-/// command buffer.
+/// recording and hand its retained native command buffer to the ordered queue.
 pub fn close_submission(
     identity: reims_vgpu_protocol::SubmissionIdentity,
 ) -> Result<(), DrawError> {
     let mut guard = lock_engine();
     let result = {
-        let EngineState { ref mut pools, .. } = &mut *guard;
-        pools.encoder_mut().close_submission(identity)
+        let EngineState {
+            ref owner,
+            ref mut pools,
+            ref counters,
+            ..
+        } = &mut *guard;
+        match owner.ctx.as_ref() {
+            Some(ctx) => unsafe { pools.close_submission(ctx, counters, identity) },
+            None => pools.encoder_mut().close_submission(identity),
+        }
     };
     match result {
         Ok(()) => Ok(()),

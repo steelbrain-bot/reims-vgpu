@@ -308,13 +308,8 @@ impl EncoderPools {
         self.active_submission = None;
     }
 
-    /// Release the semantic submission after all of its commands have been
-    /// recorded.
-    ///
-    /// A decoded submission boundary orders commands and resource validity; it
-    /// does not require a Vulkan queue submission. Compatible ordered draws may
-    /// therefore remain in the same native command buffer until the batching
-    /// policy reaches one of its real flush conditions.
+    /// Release the semantic submission after its native command buffer has
+    /// been handed off by [`ResourcePools::close_submission`].
     pub(crate) fn close_submission(
         &mut self,
         identity: SubmissionIdentity,
@@ -934,6 +929,28 @@ impl SharedPools {
 }
 
 impl ResourcePools {
+    /// Close one guest exec as one native recording transaction.
+    ///
+    /// Segment continuation may retain the render pass and dynamic state for
+    /// every compatible draw inside the exec, but the exec boundary commits
+    /// that command buffer before another identity can claim the encoder. The
+    /// identity is released even when the driver refuses the commit: callers
+    /// cannot retry a consumed packet, and retaining it would turn the next
+    /// packet into a false overlap refusal.
+    pub(crate) unsafe fn close_submission(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        identity: SubmissionIdentity,
+    ) -> Result<(), DrawError> {
+        if !self.encoder.submission_is_closing(identity)? {
+            return Ok(());
+        }
+        let result = unsafe { self.batch_flush(ctx, counters) };
+        self.encoder.release_submission(identity);
+        result
+    }
+
     /// End one guest allocation's backend lifetime after open submissions.
     pub(crate) unsafe fn retire_guest_import(
         &mut self,
