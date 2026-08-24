@@ -1149,8 +1149,8 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     match dispatch {
         reims_vgpu_core::SubmissionDispatch::Record(work) => {
             let result = execute_prepared_exec(state, host, work);
-            let newly_recordable = commit_ready_execs(state, host);
-            debug_assert!(newly_recordable.is_empty());
+            commit_ready_execs(state, host);
+            debug_assert!(state.ready_execs.is_empty());
             result
         }
         reims_vgpu_core::SubmissionDispatch::Queued { .. } => exposed,
@@ -5035,22 +5035,10 @@ pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
             .expect("the worker owns its live recording admission");
     }
 
-    let mut newly_recordable: std::collections::VecDeque<_> =
-        commit_ready_execs(state, host).into();
-    while let Some(work) = newly_recordable.pop_front() {
-        let _ = execute_prepared_exec(state, host, work);
-        // A synchronous continuation can both complete its own commit and
-        // release another conflicting waiter. Commit first: that waiter's
-        // resource versions are defined by this ordered predecessor.
-        newly_recordable.extend(commit_ready_execs(state, host));
-    }
+    commit_ready_execs(state, host);
 }
 
-fn commit_ready_execs<M: HostMemory + HostOps>(
-    state: &mut Device,
-    host: &mut M,
-) -> Vec<reims_vgpu_core::SubmissionWork<PreparedExecWork>> {
-    let mut newly_recordable = Vec::new();
+fn commit_ready_execs<M: HostMemory + HostOps>(state: &mut Device, host: &mut M) {
     loop {
         let ready = state
             .submissions_scheduled
@@ -5122,9 +5110,34 @@ fn commit_ready_execs<M: HostMemory + HostOps>(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .complete(identity)
             .expect("the guest-order commit owns its live semantic admission");
-        newly_recordable.extend(admitted);
+        state.ready_execs.extend(admitted);
     }
-    newly_recordable
+}
+
+/// Resolve the EXECs which owned admission before this drain interval began.
+///
+/// Completion only enqueues into this owner. Snapshotting the entry width makes
+/// a CPU-only completion hand its newly unblocked successor to the next worker
+/// turn instead of recursively consuming an unbounded conflict chain under one
+/// `DeviceInner` acquisition.
+pub(crate) fn resolve_ready_execs<M: HostMemory + HostOps>(state: &mut Device, host: &mut M) {
+    let wave = state.ready_execs.len();
+    crate::runtime::drain::note_store_route_n("exec_resolve_wave_execs", wave as u64);
+    for _ in 0..wave {
+        let work = state
+            .ready_execs
+            .pop_front()
+            .expect("the entry wave owns this many EXECs");
+        let _ = execute_prepared_exec(state, host, work);
+        commit_ready_execs(state, host);
+    }
+    if !state.ready_execs.is_empty() {
+        crate::runtime::drain::note_store_route_n(
+            "exec_resolve_handoff_execs",
+            state.ready_execs.len() as u64,
+        );
+        host.schedule_bh();
+    }
 }
 
 fn complete_terminal_surface_transaction<M: HostMemory + HostOps>(

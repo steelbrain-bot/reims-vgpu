@@ -218,8 +218,14 @@ fn a_conflicting_exec_parks_its_owned_streams_without_quiescing_the_recorder() {
     rendezvous.wait();
     collect_exec_recordings(&mut state, &mut host, true);
     assert_eq!(state.submissions_scheduled.lock().unwrap().waiting_len(), 0);
+    assert_eq!(state.submissions_scheduled.lock().unwrap().active_len(), 1);
+    assert_eq!(state.completed_execs.len(), 1);
+    assert_eq!(state.ready_execs.len(), 1);
+
+    resolve_ready_execs(&mut state, &mut host);
     assert_eq!(state.submissions_scheduled.lock().unwrap().active_len(), 0);
     assert_eq!(state.completed_execs.len(), 2);
+    assert!(state.ready_execs.is_empty());
 }
 
 #[test]

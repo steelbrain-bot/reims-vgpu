@@ -27,6 +27,9 @@ pub struct Device {
         crate::runtime::exec::PendingExecState,
     >,
     pub(crate) completed_execs: std::collections::VecDeque<crate::runtime::exec::CompletedExec>,
+    pub(crate) ready_execs: std::collections::VecDeque<
+        reims_vgpu_core::SubmissionWork<crate::runtime::exec::PreparedExecWork>,
+    >,
     pub(crate) pending_exec_publications:
         std::collections::HashMap<reims_vgpu_protocol::SubmissionIdentity, PendingExecPublication>,
     pub(crate) surface_recording_workers: crate::runtime::submission_workers::SubmissionWorkers<
@@ -88,6 +91,7 @@ impl std::fmt::Debug for Device {
             .field("surface_recording_workers", &self.surface_recording_workers)
             .field("pending_execs", &self.pending_execs.len())
             .field("completed_execs", &self.completed_execs.len())
+            .field("ready_execs", &self.ready_execs.len())
             .field(
                 "pending_exec_publications",
                 &self.pending_exec_publications.len(),
@@ -137,6 +141,7 @@ impl Device {
             surface_recording_workers: Default::default(),
             pending_execs: Default::default(),
             completed_execs: Default::default(),
+            ready_execs: Default::default(),
             pending_exec_publications: Default::default(),
             pending_imported_views: Vec::new(),
         }
@@ -203,6 +208,7 @@ impl Device {
         self.surface_recording_workers.quiesce();
         self.pending_execs.clear();
         self.completed_execs.clear();
+        self.ready_execs.clear();
         self.pending_exec_publications.clear();
         self.submissions_scheduled
             .get_mut()

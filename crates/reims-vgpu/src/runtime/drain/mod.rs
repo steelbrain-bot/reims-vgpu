@@ -6056,7 +6056,8 @@ fn retry_stamp_held_timelines<H: HostMemory + HostOps>(state: &mut Device, host:
     }
 }
 
-fn publish_completed_execs<H: HostMemory + HostOps>(state: &mut Device, host: &mut H) {
+fn publish_completed_execs<H: HostMemory + HostOps>(state: &mut Device, host: &mut H) -> bool {
+    let ready_before = state.ready_execs.len();
     crate::runtime::exec::collect_exec_recordings(state, host, false);
     while let Some(completed) = state.completed_execs.pop_front() {
         let publication = state
@@ -6092,10 +6093,21 @@ fn publish_completed_execs<H: HostMemory + HostOps>(state: &mut Device, host: &m
             stamp_started.elapsed().as_nanos() as u64,
         );
     }
+    let admitted = state.ready_execs.len() != ready_before;
+    if admitted {
+        host.schedule_bh();
+    }
+    admitted
 }
 
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut Device, host: &mut H) {
-    publish_completed_execs(state, host);
+    if publish_completed_execs(state, host) {
+        // Completion owns semantic commit and stamp publication only. Hand
+        // newly serializable EXECs to a later device-lock interval, matching
+        // the separate serialization and completion queues in the contract.
+        return;
+    }
+    crate::runtime::exec::resolve_ready_execs(state, host);
     // A queued present action is part of the ordered device timeline. QEMU
     // cannot paint it while this worker owns the device lock, so later worker
     // wakeups must leave guest work queued until scanout consumes the action.
