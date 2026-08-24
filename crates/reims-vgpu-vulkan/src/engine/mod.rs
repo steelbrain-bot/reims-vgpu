@@ -155,7 +155,7 @@ impl SessionHandle {
 
 #[derive(Default)]
 struct SessionSignals {
-    batch_open: std::sync::atomic::AtomicBool,
+    open_batches: std::sync::atomic::AtomicUsize,
     last_tail_batch_flush_us: AtomicU64,
     guest_read_debt: std::sync::atomic::AtomicBool,
     guest_write_debt: std::sync::atomic::AtomicBool,
@@ -470,7 +470,7 @@ impl EngineState {
     /// `host_window::present::App::reattach_engine` is what builds it again.
     fn flush_device_derived(&mut self, session_id: SessionId, resources: &mut SessionResources) {
         clear_device_capabilities();
-        publish_batch_open(false);
+        clear_open_batches();
         resources.resident_epoch.fetch_add(1, Ordering::Release);
         let inactive_sessions: Vec<Arc<SessionInner>> = LIVE_SESSIONS
             .lock()
@@ -479,7 +479,7 @@ impl EngineState {
             .filter_map(|(_, session)| session.upgrade())
             .collect();
         for session in &inactive_sessions {
-            session.signals.batch_open.store(false, Ordering::Release);
+            session.signals.open_batches.store(0, Ordering::Release);
             session
                 .resources
                 .lock()
@@ -641,8 +641,13 @@ mod session_slot_tests {
         let second = session(72);
         {
             let _first = enter_session(&first);
-            publish_batch_open(true);
-            assert!(current_session_signals().batch_open.load(Ordering::Acquire));
+            note_batch_opened();
+            assert_eq!(
+                current_session_signals()
+                    .open_batches
+                    .load(Ordering::Acquire),
+                1
+            );
             assert!(
                 completion_work_outstanding(),
                 "an accepted but unsubmitted draw must keep its completion word behind Vulkan"
@@ -650,12 +655,22 @@ mod session_slot_tests {
         }
         {
             let _second = enter_session(&second);
-            assert!(!current_session_signals().batch_open.load(Ordering::Acquire));
+            assert_eq!(
+                current_session_signals()
+                    .open_batches
+                    .load(Ordering::Acquire),
+                0
+            );
             assert!(!completion_work_outstanding());
-            publish_batch_open(true);
+            note_batch_opened();
         }
         let _first = enter_session(&first);
-        assert!(current_session_signals().batch_open.load(Ordering::Acquire));
+        assert_eq!(
+            current_session_signals()
+                .open_batches
+                .load(Ordering::Acquire),
+            1
+        );
     }
 
     #[test]
@@ -760,16 +775,40 @@ impl TailReopenBand {
     }
 }
 
-pub(super) fn publish_batch_open(open: bool) {
+pub(super) fn note_batch_opened() {
     current_session_signals()
-        .batch_open
-        .store(open, std::sync::atomic::Ordering::Release);
+        .open_batches
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+pub(super) fn note_batch_closed() {
+    let result = current_session_signals().open_batches.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |open| open.checked_sub(1),
+    );
+    if result.is_err() {
+        reims_vgpu_observe::fail(
+            "vk_batch_publication_underflow (an encoder closed no published open batch)",
+        );
+    }
+}
+
+fn clear_open_batches() {
+    current_session_signals()
+        .open_batches
+        .store(0, std::sync::atomic::Ordering::Release);
 }
 
 #[cfg(test)]
 pub(super) fn batch_open_for_current_session() -> bool {
+    batch_open_count_for_current_session() != 0
+}
+
+#[cfg(test)]
+pub(super) fn batch_open_count_for_current_session() -> usize {
     current_session_signals()
-        .batch_open
+        .open_batches
         .load(std::sync::atomic::Ordering::Acquire)
 }
 
@@ -1431,7 +1470,7 @@ pub struct GuestResetStats {
 /// immutable content-keyed shader/pipeline caches.
 pub fn reset_guest_state() -> GuestResetStats {
     let mut guard = lock_engine();
-    publish_batch_open(false);
+    clear_open_batches();
     current_session_signals()
         .last_tail_batch_flush_us
         .store(0, std::sync::atomic::Ordering::Release);
@@ -1699,8 +1738,9 @@ fn execute_draw_request_locked(
 pub fn flush_batched_draws() {
     if !end_of_tranche_requires_engine(
         current_session_signals()
-            .batch_open
-            .load(std::sync::atomic::Ordering::Acquire),
+            .open_batches
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0,
         device_lost::device_lost_seen(),
     ) {
         return;
@@ -2396,8 +2436,9 @@ pub fn guest_access_outstanding() -> bool {
 /// let the guest retire their resources before Vulkan has executed them.
 pub fn completion_work_outstanding() -> bool {
     current_session_signals()
-        .batch_open
+        .open_batches
         .load(std::sync::atomic::Ordering::Acquire)
+        != 0
         || guest_access_outstanding()
 }
 

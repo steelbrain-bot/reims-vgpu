@@ -2835,18 +2835,21 @@ where
     fn install_open_batch(&mut self, batch: OpenBatch) {
         debug_assert!(self.encoder.open_batch.is_none(), "replacing an open batch");
         self.encoder.open_batch = Some(batch);
-        super::super::publish_batch_open(true);
+        super::super::note_batch_opened();
     }
 
     fn take_open_batch(&mut self) -> Option<OpenBatch> {
         let batch = self.encoder.open_batch.take();
-        super::super::publish_batch_open(false);
+        if batch.is_some() {
+            super::super::note_batch_closed();
+        }
         batch
     }
 
     pub(super) fn discard_open_batch(&mut self) {
-        self.encoder.open_batch = None;
-        super::super::publish_batch_open(false);
+        if self.encoder.open_batch.take().is_some() {
+            super::super::note_batch_closed();
+        }
     }
 
     /// Record a batch-deferred draw's completion: open the batch on its ring
@@ -7085,6 +7088,54 @@ mod encoder_submission_ownership {
             &[default_bind.key()],
             "the default encoder's unfinished gather remains its own debt"
         );
+    }
+
+    #[test]
+    fn closing_one_live_exec_does_not_withdraw_another_open_batch() {
+        let mut pools = ResourcePools::new();
+        let first = identity(40, 6);
+        let second = identity(41, 6);
+        let batch = |slot| OpenBatch {
+            cb: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            stamp_recording: None,
+            target: BatchTarget {
+                identity: TargetIdentity::Anonymous { slot },
+                width: 16,
+                height: 16,
+                bgra: false,
+            },
+            draws: 1,
+            dsets: Vec::new(),
+        };
+
+        pools
+            .recording_for_submission(first)
+            .unwrap()
+            .install_open_batch(batch(1));
+        pools
+            .recording_for_submission(second)
+            .unwrap()
+            .install_open_batch(batch(2));
+        assert_eq!(crate::engine::batch_open_count_for_current_session(), 2);
+
+        assert!(pools
+            .recording_for_submission(first)
+            .unwrap()
+            .take_open_batch()
+            .is_some());
+        assert_eq!(crate::engine::batch_open_count_for_current_session(), 1);
+        assert!(
+            crate::engine::completion_work_outstanding(),
+            "the second EXEC is still accepted but unsubmitted"
+        );
+
+        assert!(pools
+            .recording_for_submission(second)
+            .unwrap()
+            .take_open_batch()
+            .is_some());
+        assert_eq!(crate::engine::batch_open_count_for_current_session(), 0);
     }
 }
 
