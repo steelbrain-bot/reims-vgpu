@@ -2226,6 +2226,18 @@ pub(crate) struct PreparedM2vProgress {
     pub(crate) failure: Option<ExecutorDiagnostic>,
 }
 
+/// Whole render-transaction recording work with no semantic-state authority.
+pub(crate) struct PreparedM2vExecution {
+    recording: PreparedDrawExecution,
+    metadata: Vec<PreparedM2vMetadata>,
+}
+
+/// Terminal worker result whose semantic plans still await ordered completion.
+pub(crate) struct RecordedM2vSubmission {
+    recording: RecordedDrawSubmission,
+    metadata: Vec<PreparedM2vMetadata>,
+}
+
 impl PreparedM2vSubmission {
     pub(crate) fn new(context: reims_vgpu_core::SubmissionContext) -> Self {
         Self {
@@ -2238,10 +2250,7 @@ impl PreparedM2vSubmission {
         self.draws.push(draw);
     }
 
-    pub(crate) fn execute(
-        self,
-        state: &mut Device,
-    ) -> Result<PreparedM2vProgress, ExecutorDiagnostic> {
+    pub(crate) fn into_execution(self) -> PreparedM2vExecution {
         let mut submission = PreparedDrawSubmission::new(self.context);
         let mut metadata = Vec::with_capacity(self.draws.len());
         for prepared in self.draws {
@@ -2249,8 +2258,44 @@ impl PreparedM2vSubmission {
             submission.push(draw);
             metadata.push(meta);
         }
-        let progress = submission.execute(state)?;
-        let completed = metadata
+        PreparedM2vExecution {
+            recording: submission.into_execution(),
+            metadata,
+        }
+    }
+
+    pub(crate) fn execute(
+        self,
+        state: &mut Device,
+    ) -> Result<PreparedM2vProgress, ExecutorDiagnostic> {
+        let executor = std::sync::Arc::clone(&state.executor);
+        let engine_started = std::time::Instant::now();
+        let recorded = self.into_execution().record(executor.as_ref());
+        crate::runtime::chain_phase::note_detached(
+            crate::runtime::chain_phase::Phase::Engine,
+            engine_started.elapsed(),
+        );
+        Ok(recorded?.complete(state))
+    }
+}
+
+impl PreparedM2vExecution {
+    pub(crate) fn record(
+        self,
+        executor: &dyn crate::runtime::executor::Executor,
+    ) -> Result<RecordedM2vSubmission, ExecutorDiagnostic> {
+        Ok(RecordedM2vSubmission {
+            recording: self.recording.record(executor)?,
+            metadata: self.metadata,
+        })
+    }
+}
+
+impl RecordedM2vSubmission {
+    pub(crate) fn complete(self, state: &mut Device) -> PreparedM2vProgress {
+        let progress = self.recording.complete(state);
+        let completed = self
+            .metadata
             .into_iter()
             .zip(progress.completed)
             .map(|(meta, completed)| {
@@ -2263,10 +2308,10 @@ impl PreparedM2vSubmission {
                 )
             })
             .collect();
-        Ok(PreparedM2vProgress {
+        PreparedM2vProgress {
             completed,
             failure: progress.failure,
-        })
+        }
     }
 }
 
