@@ -4547,9 +4547,35 @@ impl DeviceState {
         if fence_ref == 0 {
             return;
         }
+        self.task_objects.fences.set_update(
+            task_id,
+            fence_ref,
+            value,
+            reims_vgpu_core::FenceSignal::Compute,
+        );
+    }
+
+    pub fn set_fence_update(
+        &mut self,
+        task_id: u32,
+        fence_ref: u32,
+        value: u64,
+        signal: reims_vgpu_core::FenceSignal,
+    ) {
+        if fence_ref == 0 {
+            return;
+        }
         self.task_objects
             .fences
-            .set_generation(task_id, fence_ref, value);
+            .set_update(task_id, fence_ref, value, signal);
+    }
+
+    pub fn fence_signal(
+        &self,
+        task_id: u32,
+        fence_ref: u32,
+    ) -> Option<reims_vgpu_core::FenceSignal> {
+        self.task_objects.fences.signal(task_id, fence_ref)
     }
 
     pub fn event_generation(&self, task_id: u32, event_ref: u32) -> Option<u64> {

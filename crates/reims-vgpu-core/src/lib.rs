@@ -133,7 +133,7 @@ pub use stamp::{CompletionPublications, PendingStamp, StampLedger, StampWait, Un
 pub use submission::{SubmissionContext, SubmissionTracker};
 pub use synchronization::{
     plan_event, plan_fence, BarrierResource, Decision as SynchronizationDecision,
-    Domain as SynchronizationDomain, EventKind, FenceAction, MemoryBarrierScope,
+    Domain as SynchronizationDomain, EventKind, FenceAction, FenceSignal, MemoryBarrierScope,
     Plan as SynchronizationPlan, Reason as SynchronizationReason, TaskEventStates, TaskFenceStates,
     TaskGenerationStates, FENCE_INITIAL_GENERATION,
 };

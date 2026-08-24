@@ -42,6 +42,35 @@ fn a_malformed_compute_barrier_blocks_the_later_dispatch() {
 }
 
 #[test]
+fn compute_fences_reach_the_dependency_accumulator_from_the_stream_walker() {
+    let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+
+    let command = |opcode| {
+        let mut bytes = [0u8; wire_compute::FENCE_TOTAL_LEN as usize];
+        st32(&mut bytes[0..4], opcode);
+        st32(&mut bytes[4..8], wire_compute::FENCE_TOTAL_LEN);
+        st32(&mut bytes[8..12], 41);
+        bytes
+    };
+    for opcode in [
+        wire_compute::OPCODE_UPDATE_FENCE,
+        wire_compute::OPCODE_WAIT_FOR_FENCE,
+    ] {
+        let bytes = command(opcode);
+        handle_compute_record(&mut state, &mut host, 1, opcode, &bytes, &mut out, &mut seg);
+    }
+
+    assert_eq!(state.fence_generation(1, 41), Some(1));
+    assert_eq!(
+        seg.pending_barriers,
+        vec![reims_vgpu_core::ComputeBarrier::Fence]
+    );
+}
+
+#[test]
 fn render_pass_chain_edges_follow_the_decoded_encoder() {
     assert_eq!(render_pass_chain_position(0, 1), (false, false));
     assert_eq!(render_pass_chain_position(0, 3), (false, true));
@@ -5808,6 +5837,14 @@ fn a_render_encoder_fence_reaches_the_shared_fence_object() {
         state.fence_generation(1, FENCE_REF),
         Some(2),
         "both render updates landed on the fence object"
+    );
+    assert_eq!(
+        acc.render_work,
+        vec![RenderWork::Barrier(reims_vgpu_core::RenderBarrier::Fence {
+            after: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+            before: reims_vgpu_core::RenderBarrierStages::FRAGMENT,
+        })],
+        "the wait keeps both stage masks at its encoder position"
     );
 }
 

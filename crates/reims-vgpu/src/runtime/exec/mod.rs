@@ -42,7 +42,7 @@ use reims_vgpu_core::endian::{ld32, ld64};
 use reims_vgpu_core::pixel_format::{
     f64_to_unorm8, solid_rgba8, MTL_FORMAT_BGRA8_UNORM, RGBA8_BPP,
 };
-use reims_vgpu_core::{FenceAction, SynchronizationDomain as FenceDomain};
+use reims_vgpu_core::FenceAction;
 use reims_vgpu_protocol::pass_action::{
     store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR,
     MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
@@ -1885,20 +1885,6 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         }
     };
     match cmd.kind {
-        ComputeKind::UpdateFence | ComputeKind::WaitFence => {
-            let action = if cmd.kind == ComputeKind::UpdateFence {
-                FenceAction::Update
-            } else {
-                FenceAction::Wait
-            };
-            fence_exec::execute_fence(
-                state,
-                task_id,
-                FenceDomain::ComputeFence,
-                cmd.fence_ref,
-                action,
-            );
-        }
         ComputeKind::BufferBind | ComputeKind::BufferBindAttributeStride => {
             let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
         }
@@ -1918,6 +1904,8 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         | ComputeKind::ImageblockDimensions
         | ComputeKind::BarrierResources
         | ComputeKind::BarrierScope
+        | ComputeKind::UpdateFence
+        | ComputeKind::WaitFence
         | ComputeKind::UseHeaps
         | ComputeKind::UseResources
         | ComputeKind::CompressedTextureFlush => {
@@ -2897,13 +2885,52 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     return;
                 }
             };
-            fence_exec::execute_fence(
-                state,
-                task_id,
-                FenceDomain::RenderFence,
-                cmd.fence_ref,
-                action,
-            );
+            let stages = u16::try_from(cmd.fence_stages)
+                .ok()
+                .and_then(reims_vgpu_core::RenderBarrierStages::from_bits);
+            let Some(stages) = stages else {
+                let refusal = RenderBarrierRefusal::FenceStagesUnsupported {
+                    raw: cmd.fence_stages,
+                };
+                crate::observe::Emit::decline("render_fence", &refusal)
+                    .field("task", task_id)
+                    .field("fence", cmd.fence_ref)
+                    .fail_once(refusal.latch());
+                acc.unrepresentable
+                    .get_or_insert(StreamRefusal::Barrier(refusal));
+                return;
+            };
+            let status =
+                fence_exec::execute_render_fence(state, task_id, cmd.fence_ref, action, stages);
+            if action == FenceAction::Wait {
+                match status {
+                    fence_exec::FenceStatus::Ok => {
+                        let after = match state.fence_signal(task_id, cmd.fence_ref) {
+                            Some(reims_vgpu_core::FenceSignal::Render(stages)) => stages,
+                            Some(
+                                reims_vgpu_core::FenceSignal::Blit
+                                | reims_vgpu_core::FenceSignal::Compute,
+                            ) => reims_vgpu_core::RenderBarrierStages::ALL,
+                            None => unreachable!("a satisfied fence wait has an update"),
+                        };
+                        acc.push_barrier(reims_vgpu_core::RenderBarrier::Fence {
+                            after,
+                            before: stages,
+                        });
+                    }
+                    fence_exec::FenceStatus::Pending => {
+                        let refusal = RenderBarrierRefusal::FenceWaitPending {
+                            fence_ref: cmd.fence_ref,
+                        };
+                        crate::observe::Emit::decline("render_fence", &refusal)
+                            .field("task", task_id)
+                            .fail_once(refusal.latch());
+                        acc.unrepresentable
+                            .get_or_insert(StreamRefusal::Barrier(refusal));
+                    }
+                    fence_exec::FenceStatus::Missing | fence_exec::FenceStatus::Unsupported(_) => {}
+                }
+            }
         }
         RenderKind::OtherAccepted => {
             // An undecoded render opcode: the decoder accepts it (catch-all)
@@ -3716,6 +3743,8 @@ enum StreamRefusal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderBarrierRefusal {
     UnsupportedStages { side: &'static str, raw: u16 },
+    FenceStagesUnsupported { raw: u32 },
+    FenceWaitPending { fence_ref: u32 },
     UnsupportedScope { raw: u8 },
     UnidentifiedField { raw: u8 },
     ResourceUnavailable { index: u32, object_ref: u32 },
@@ -3727,6 +3756,8 @@ impl RenderBarrierRefusal {
             Self::UnsupportedStages { side, raw } => {
                 u64::from(raw) | (u64::from(side == "before") << 16)
             }
+            Self::FenceStagesUnsupported { raw } => (1 << 24) | u64::from(raw),
+            Self::FenceWaitPending { fence_ref } => (1 << 25) | u64::from(fence_ref),
             Self::UnsupportedScope { raw } => (1 << 20) | u64::from(raw),
             Self::UnidentifiedField { raw } => (1 << 21) | u64::from(raw),
             Self::ResourceUnavailable { index, object_ref } => {
@@ -3740,6 +3771,8 @@ impl crate::observe::Decline for RenderBarrierRefusal {
     fn slug(&self) -> &'static str {
         match self {
             Self::UnsupportedStages { .. } => "render_barrier_stages_unsupported",
+            Self::FenceStagesUnsupported { .. } => "render_fence_stages_unsupported",
+            Self::FenceWaitPending { .. } => "render_fence_wait_pending",
             Self::UnsupportedScope { .. } => "render_barrier_scope_unsupported",
             Self::UnidentifiedField { .. } => "render_barrier_unidentified_field",
             Self::ResourceUnavailable { .. } => "render_barrier_resource_unavailable",
@@ -3750,6 +3783,10 @@ impl crate::observe::Decline for RenderBarrierRefusal {
         match self {
             Self::UnsupportedStages { side, raw } => {
                 vec![("side", (*side).into()), ("raw", raw.to_string())]
+            }
+            Self::FenceStagesUnsupported { raw } => vec![("raw", raw.to_string())],
+            Self::FenceWaitPending { fence_ref } => {
+                vec![("fence", format!("{fence_ref:#x}"))]
             }
             Self::UnsupportedScope { raw } | Self::UnidentifiedField { raw } => {
                 vec![("raw", raw.to_string())]

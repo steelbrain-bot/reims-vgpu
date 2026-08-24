@@ -82,6 +82,37 @@ pub fn execute_fence(
     fence_ref: u32,
     action: FenceAction,
 ) -> FenceStatus {
+    execute_fence_scoped(state, task_id, domain, fence_ref, action, None)
+}
+
+/// Execute a render fence while retaining the exact producer stages carried by
+/// `updateFence:afterStages:`. Wait stages belong to the dependency emitted by
+/// the render stream and are therefore not stored here.
+pub fn execute_render_fence(
+    state: &mut Device,
+    task_id: u32,
+    fence_ref: u32,
+    action: FenceAction,
+    stages: reims_vgpu_core::RenderBarrierStages,
+) -> FenceStatus {
+    execute_fence_scoped(
+        state,
+        task_id,
+        Domain::RenderFence,
+        fence_ref,
+        action,
+        Some(stages),
+    )
+}
+
+fn execute_fence_scoped(
+    state: &mut Device,
+    task_id: u32,
+    domain: Domain,
+    fence_ref: u32,
+    action: FenceAction,
+    render_stages: Option<reims_vgpu_core::RenderBarrierStages>,
+) -> FenceStatus {
     if fence_ref == 0 {
         return FenceStatus::Missing;
     }
@@ -109,7 +140,15 @@ pub fn execute_fence(
     let current = state.fence_generation(task_id, fence_ref);
     let plan = plan_fence(action, domain, current);
     if plan.updates_state {
-        state.set_fence_generation(task_id, fence_ref, plan.update_value);
+        let signal = match domain {
+            Domain::BlitFence => reims_vgpu_core::FenceSignal::Blit,
+            Domain::ComputeFence => reims_vgpu_core::FenceSignal::Compute,
+            Domain::RenderFence => reims_vgpu_core::FenceSignal::Render(
+                render_stages.unwrap_or(reims_vgpu_core::RenderBarrierStages::ALL),
+            ),
+            Domain::Unknown | Domain::Event => unreachable!("fence domain checked above"),
+        };
+        state.set_fence_update(task_id, fence_ref, plan.update_value, signal);
     }
     let status = match plan.decision {
         Decision::SignalUpdate | Decision::SignalNoop | Decision::WaitSatisfied => FenceStatus::Ok,

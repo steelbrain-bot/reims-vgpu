@@ -59,6 +59,13 @@ pub enum RenderBarrier {
         after: RenderBarrierStages,
         before: RenderBarrierStages,
     },
+    /// A satisfied encoder-fence wait at this exact draw position. `after` is
+    /// the producer scope retained by the matching update; `before` is the
+    /// consumer scope carried by this wait.
+    Fence {
+        after: RenderBarrierStages,
+        before: RenderBarrierStages,
+    },
     Texture,
 }
 

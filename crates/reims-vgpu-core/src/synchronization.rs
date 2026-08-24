@@ -280,7 +280,53 @@ impl<M> TaskGenerationStates<M> {
     }
 }
 
-pub type TaskFenceStates = TaskGenerationStates<FenceObject>;
+/// Encoder domain and stage scope whose completed work one fence update
+/// publishes to a later wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FenceSignal {
+    Blit,
+    Compute,
+    Render(crate::RenderBarrierStages),
+}
+
+/// Generational fence values plus the exact producer scope of the latest
+/// update. Keeping both under one owner prevents a reused fence reference from
+/// inheriting the previous lifetime's render stages.
+#[derive(Debug, Default)]
+pub struct TaskFenceStates {
+    generations: TaskGenerationStates<FenceObject>,
+    signals: BTreeMap<(u32, u32), FenceSignal>,
+}
+
+impl TaskFenceStates {
+    pub fn generation(&self, task_id: u32, reference: u32) -> Option<u64> {
+        self.generations.generation(task_id, reference)
+    }
+
+    pub fn set_update(&mut self, task_id: u32, reference: u32, value: u64, signal: FenceSignal) {
+        self.generations.set_generation(task_id, reference, value);
+        self.signals.insert((task_id, reference), signal);
+    }
+
+    pub fn signal(&self, task_id: u32, reference: u32) -> Option<FenceSignal> {
+        self.signals.get(&(task_id, reference)).copied()
+    }
+
+    pub fn delete(&mut self, task_id: u32, reference: u32) -> bool {
+        self.signals.remove(&(task_id, reference));
+        self.generations.delete(task_id, reference)
+    }
+
+    pub fn delete_task(&mut self, task_id: u32) -> usize {
+        self.signals.retain(|&(task, _), _| task != task_id);
+        self.generations.delete_task(task_id)
+    }
+
+    pub fn identity(&self, task_id: u32, reference: u32) -> Option<ResourceId<FenceObject>> {
+        self.generations.identity(task_id, reference)
+    }
+}
+
 pub type TaskEventStates = TaskGenerationStates<EventObject>;
 
 #[cfg(test)]
@@ -357,15 +403,25 @@ mod tests {
     fn fence_and_event_namespaces_do_not_alias_and_reuse_advances_identity() {
         let mut fences = TaskFenceStates::default();
         let mut events = TaskEventStates::default();
-        fences.set_generation(3, 9, 1);
+        fences.set_update(
+            3,
+            9,
+            1,
+            FenceSignal::Render(crate::RenderBarrierStages::FRAGMENT),
+        );
         events.set_generation(3, 9, 40);
 
         let first_fence = fences.identity(3, 9).expect("fence identity");
         assert_eq!(fences.generation(3, 9), Some(1));
+        assert_eq!(
+            fences.signal(3, 9),
+            Some(FenceSignal::Render(crate::RenderBarrierStages::FRAGMENT))
+        );
         assert_eq!(events.generation(3, 9), Some(40));
         assert!(fences.delete(3, 9));
-        fences.set_generation(3, 9, 2);
+        fences.set_update(3, 9, 2, FenceSignal::Compute);
         assert_ne!(fences.identity(3, 9), Some(first_fence));
+        assert_eq!(fences.signal(3, 9), Some(FenceSignal::Compute));
         assert_eq!(events.generation(3, 9), Some(40));
     }
 }
