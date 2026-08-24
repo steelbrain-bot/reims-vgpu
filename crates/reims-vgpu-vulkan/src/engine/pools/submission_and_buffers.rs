@@ -152,6 +152,23 @@ impl EncoderPools {
         super::super::publish_guest_read_debt(true);
     }
 
+    /// Take a recycled gather slot of exactly `bucket` bytes out of this
+    /// encoder's free list and record it live, or `None` when none is free.
+    ///
+    /// Removing and admitting the slot are one encoder-local transition. A
+    /// slot cannot be returned to the free list until the submission that
+    /// names it retires, so two live recordings cannot acquire one buffer.
+    fn take_free_gather(&mut self, bucket: u64) -> Option<BufferSlot> {
+        let slot = self.gather_free.get_mut(&bucket)?.pop()?;
+        self.gather_live.push(slot);
+        Some(slot)
+    }
+
+    /// Admit a newly allocated gather slot to this encoder's live recording.
+    fn admit_guest_gather(&mut self, slot: BufferSlot) {
+        self.gather_live.push(slot);
+    }
+
     pub(in crate::engine) fn cb_bound_buffer(
         &self,
         key: (usize, u64, u64),
@@ -542,6 +559,69 @@ impl SharedPools {
             backing: BufferBacking::Slab(token),
             coherent: true,
             cached: ctx.mapped_memory_kind(mt).cached,
+        })
+    }
+
+    /// Allocate one device-local gather slot after an encoder-local free-list
+    /// miss.
+    ///
+    /// The returned slot is not live in any encoder until the caller admits
+    /// it. This method owns only the device-wide gather slab and can therefore
+    /// sit behind a short shared-state critical section.
+    unsafe fn allocate_guest_gather(
+        &mut self,
+        ctx: &DeviceContext,
+        bucket: u64,
+        usage: vk::BufferUsageFlags,
+        counters: &EngineCounters,
+    ) -> Result<BufferSlot, DrawError> {
+        let buffer = ctx
+            .device
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(bucket)
+                    .usage(
+                        usage
+                            | vk::BufferUsageFlags::TRANSFER_DST
+                            // TRANSFER_SRC unconditionally, because these slots
+                            // are recycled by size bucket and not by usage: the
+                            // sampled rail gathers into one and then copies it
+                            // into an image, so a slot first created for a
+                            // vertex window must remain a valid copy source.
+                            | vk::BufferUsageFlags::TRANSFER_SRC
+                            | vk::BufferUsageFlags::VERTEX_BUFFER
+                            | vk::BufferUsageFlags::INDEX_BUFFER
+                            | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    )
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateGuestGather, error)))?;
+        counters.note_create(CreateSite::GatherBuffer);
+        let req = ctx.device.get_buffer_memory_requirements(buffer);
+        let token = self
+            .slabs
+            .gather()
+            .acquire(ctx, &req, counters)
+            .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
+        ctx.device
+            .bind_buffer_memory(buffer, token.memory, token.offset())
+            .map_err(|error| {
+                self.slabs.release(&ctx.device, token);
+                ctx.device.destroy_buffer(buffer, None);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsBindGuestGather, error))
+            })?;
+        Ok(BufferSlot {
+            buffer,
+            memory: token.memory,
+            size: bucket,
+            // Device-local blocks are not mapped, and nothing on this rail
+            // reads these bytes with the CPU.
+            mapped: 0,
+            backing: BufferBacking::Slab(token),
+            // Neither field is consulted for a slot the CPU never touches.
+            coherent: false,
+            cached: false,
         })
     }
 }
@@ -3316,28 +3396,6 @@ impl ResourcePools {
         Ok(slot)
     }
 
-    /// Take a recycled gather slot of exactly `bucket` bytes out of the free
-    /// list and record it live, or `None` when the list has none.
-    ///
-    /// Split out of [`Self::acquire_guest_gather`] because it is the whole of
-    /// the pool's no-aliasing property and it is the half that needs no device,
-    /// so a test can exercise it: a slot **leaves** the free list when it is
-    /// handed out, and only `drain_cleanup` puts it back, which happens after
-    /// the fence of the submission that named it. Two acquires with no fence
-    /// between them therefore cannot resolve to one buffer.
-    ///
-    /// That property is why the guest-page writeback's detiling buffer comes
-    /// from here rather than from a slot of its own. It used to be a singleton
-    /// grown in place, whose safety rested on the writeback rail waiting its
-    /// fence before returning — and that wait was removed when the rail learned
-    /// to record the obligation instead. A grow then freed the buffer while a
-    /// submitted copy was still reading it.
-    fn take_free_gather(&mut self, bucket: u64) -> Option<BufferSlot> {
-        let slot = self.encoder.gather_free.get_mut(&bucket)?.pop()?;
-        self.encoder.gather_live.push(slot);
-        Some(slot)
-    }
-
     /// A DEVICE_LOCAL buffer of at least `size` bytes for the draw-time guest
     /// gather to assemble a scattered window into.
     ///
@@ -3363,62 +3421,13 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
         let bucket = Self::bucket(size.max(4));
-        if let Some(slot) = self.take_free_gather(bucket) {
+        if let Some(slot) = self.encoder.take_free_gather(bucket) {
             return Ok(slot);
         }
-        let buffer = ctx
-            .device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(bucket)
-                    .usage(
-                        usage
-                            | vk::BufferUsageFlags::TRANSFER_DST
-                            // TRANSFER_SRC unconditionally, because these slots
-                            // are recycled by size bucket and not by usage: the
-                            // sampled rail gathers into one and then copies it
-                            // into an image, so a slot first created for a
-                            // vertex window would be an invalid copy source the
-                            // second time it came out of `gather_free`.
-                            | vk::BufferUsageFlags::TRANSFER_SRC
-                            | vk::BufferUsageFlags::VERTEX_BUFFER
-                            | vk::BufferUsageFlags::INDEX_BUFFER
-                            | vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateGuestGather, e)))?;
-        counters.note_create(CreateSite::GatherBuffer);
-        let req = ctx.device.get_buffer_memory_requirements(buffer);
-        let token = self
+        let slot = self
             .shared
-            .slabs
-            .gather()
-            .acquire(ctx, &req, counters)
-            .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
-        ctx.device
-            .bind_buffer_memory(buffer, token.memory, token.offset())
-            .map_err(|e| {
-                self.shared.slabs.release(&ctx.device, token);
-                ctx.device.destroy_buffer(buffer, None);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsBindGuestGather, e))
-            })?;
-        let slot = BufferSlot {
-            buffer,
-            memory: token.memory,
-            size: bucket,
-            // Device-local blocks are not mapped, and nothing on this rail reads
-            // these bytes with the CPU. A non-zero value here would be a host
-            // address into memory that may not be host-visible at all.
-            mapped: 0,
-            backing: BufferBacking::Slab(token),
-            // Neither field is consulted for a slot the CPU never touches: both
-            // decide flush and invalidate behaviour on the mapped paths.
-            coherent: false,
-            cached: false,
-        };
-        self.encoder.gather_live.push(slot);
+            .allocate_guest_gather(ctx, bucket, usage, counters)?;
+        self.encoder.admit_guest_gather(slot);
         Ok(slot)
     }
 
@@ -6395,7 +6404,7 @@ mod exchange_rb_tests {
 /// The gather pool's no-aliasing property, which is what the guest-page
 /// writeback's detiling buffer now rests on.
 ///
-/// These exercise [`ResourcePools::take_free_gather`] rather than
+/// These exercise [`EncoderPools::take_free_gather`] rather than
 /// `acquire_guest_gather`, because the miss path allocates and needs a device
 /// while the property under test does not: a slot is *removed* from the free
 /// list when it is handed out and is recorded live, so nothing can hand the
@@ -6414,7 +6423,7 @@ mod exchange_rb_tests {
 /// larger window landing before an earlier one's fence retires. Nothing in this
 /// crate reaches that. The evidence for it is an `NVRM: Xid 31` MMU fault on
 /// the copy engine, and the argument is the pair of comments quoted on
-/// [`ResourcePools::take_free_gather`].
+/// [`EncoderPools::take_free_gather`].
 #[cfg(test)]
 mod gather_slots_do_not_alias {
     use super::*;
@@ -6448,8 +6457,11 @@ mod gather_slots_do_not_alias {
             .gather_free
             .insert(bucket, vec![slot(1, bucket), slot(2, bucket)]);
 
-        let first = pools.take_free_gather(bucket).expect("a free slot");
-        let second = pools.take_free_gather(bucket).expect("a second free slot");
+        let first = pools.encoder.take_free_gather(bucket).expect("a free slot");
+        let second = pools
+            .encoder
+            .take_free_gather(bucket)
+            .expect("a second free slot");
 
         assert_ne!(
             first.buffer, second.buffer,
@@ -6477,10 +6489,10 @@ mod gather_slots_do_not_alias {
             .gather_free
             .insert(bucket, vec![slot(7, bucket)]);
 
-        let taken = pools.take_free_gather(bucket).expect("a free slot");
+        let taken = pools.encoder.take_free_gather(bucket).expect("a free slot");
         assert_eq!(taken.buffer, vk::Buffer::from_raw(7));
         assert!(
-            pools.take_free_gather(bucket).is_none(),
+            pools.encoder.take_free_gather(bucket).is_none(),
             "the only slot was handed out; the list must be empty"
         );
         assert!(
