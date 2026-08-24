@@ -11,7 +11,6 @@ use super::caches::{
     canonicalize_layout_bindings, AttrKey, BindingSig, ColorLoadKey, LayoutKey, ObjectCaches,
     PassKey, PipelineKey, SecondaryAttachKey, SessionCacheIndexes, MAX_SECONDARY_ATTACH,
 };
-use super::context::ContextOwner;
 use super::counters::{CreateSite, EngineCounters};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
@@ -3746,8 +3745,13 @@ unsafe fn prepare_guest_sampled_transfer(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recording carries the leased context and the exact transaction owners"
+)]
 pub(crate) unsafe fn execute_draw_inner(
-    owner: &mut ContextOwner,
+    ctx: &super::context::DeviceContext,
+    force_loss: bool,
     caches: &mut ObjectCaches,
     indexes: &mut SessionCacheIndexes,
     pools: &mut RecordingPools<'_>,
@@ -3759,11 +3763,6 @@ pub(crate) unsafe fn execute_draw_inner(
     // `Drop`, so the `?` returns below keep their time.
     let mut phase = super::draw_phase::DrawTimer::start();
     validate_v1(req)?;
-    let force_loss = owner.force_device_lost;
-    if force_loss {
-        owner.force_device_lost = false;
-    }
-    let ctx = owner.ensure(counters)?;
     pools.ensure_init(ctx, counters)?;
 
     // Draw batching (deferred submit): a draw that hands the CPU nothing

@@ -1360,11 +1360,39 @@ pub fn take_engine_lock_census(win_ms: u64) -> Option<String> {
 /// inside the lock — and a sampler would miss precisely those.
 struct EngineGuard {
     guard: parking_lot::MutexGuard<'static, EngineState>,
-    caches: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ObjectCaches>,
-    resources: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionResources>,
+    caches: GuardSlot<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ObjectCaches>>,
+    resources:
+        GuardSlot<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionResources>>,
+    session: SessionHandle,
     session_id: SessionId,
     site: EngineLockSite,
     acquired: std::time::Instant,
+}
+
+struct GuardSlot<T>(Option<T>);
+
+impl<T> GuardSlot<T> {
+    fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    fn take(&mut self) -> T {
+        self.0.take().expect("engine guard field was already moved")
+    }
+}
+
+impl<T> std::ops::Deref for GuardSlot<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0.as_ref().expect("engine guard field was moved")
+    }
+}
+
+impl<T> std::ops::DerefMut for GuardSlot<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.0.as_mut().expect("engine guard field was moved")
+    }
 }
 
 impl std::ops::Deref for EngineGuard {
@@ -1396,7 +1424,7 @@ impl EngineGuard {
             #[cfg(feature = "host-window")]
             window_presenter,
             resident_epoch: _,
-        } = &mut **resources;
+        } = &mut ***resources;
         EngineParts {
             owner,
             caches,
@@ -1418,6 +1446,52 @@ impl EngineGuard {
         let session_id = self.session_id;
         self.guard
             .flush_device_derived(&mut self.caches, session_id, &mut self.resources);
+    }
+
+    fn into_submission_recording(mut self) -> Result<SubmissionRecording, DrawError> {
+        let (context, force_loss) = self
+            .guard
+            .owner
+            .lease_recording_context(&self.resources.counters)?;
+        let caches = self.caches.take();
+        let resources = self.resources.take();
+        let session = self.session.clone();
+        // `caches` and `resources` remain locked for this exact transaction;
+        // dropping the outer guard releases only the process-global owner lock.
+        drop(self);
+        Ok(SubmissionRecording {
+            context,
+            force_loss,
+            caches,
+            resources,
+            session,
+        })
+    }
+}
+
+struct SubmissionRecording {
+    context: Arc<context::SharedDeviceContext>,
+    force_loss: bool,
+    caches: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ObjectCaches>,
+    resources: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionResources>,
+    session: SessionHandle,
+}
+
+#[cfg(test)]
+mod submission_recording_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn an_exec_recording_lease_does_not_own_the_process_global_engine_lock() {
+        let recording = lock_engine()
+            .into_submission_recording()
+            .expect("a Vulkan context is available to the recording lease");
+        let owner = ENGINE
+            .try_lock()
+            .expect("whole-EXEC recording released the process-global owner lock");
+        drop(owner);
+        drop(recording);
+        test_reset_engine();
     }
 }
 
@@ -1453,8 +1527,9 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
     let resources = session.0.resources.lock_arc();
     EngineGuard {
         guard,
-        caches,
-        resources,
+        caches: GuardSlot::new(caches),
+        resources: GuardSlot::new(resources),
+        session: session.clone(),
         session_id: session.id(),
         site,
         acquired: std::time::Instant::now(),
@@ -1671,6 +1746,45 @@ fn execute_draw_request_locked(
     submission: &reims_vgpu_core::SubmissionContext,
     req: &DrawRequest,
 ) -> Result<DrawOutput, DrawError> {
+    let EngineParts {
+        ref mut owner,
+        ref mut caches,
+        ref mut indexes,
+        ref mut pools,
+        counters,
+        ..
+    } = guard.parts();
+    let (ctx, force_loss) = owner.lease_recording_context(counters)?;
+    let result = record_draw_request(
+        &ctx, force_loss, caches, indexes, pools, counters, submission, req,
+    );
+    match result {
+        Ok(out) => {
+            // Guest work reached the GPU, so any recreate that got us here did
+            // its job and the storm budget starts over. See
+            // `ContextOwner::note_work_completed`.
+            guard.owner.note_work_completed();
+            Ok(out)
+        }
+        Err(DrawError::DeviceLost(decline)) => {
+            guard.on_device_lost();
+            Err(DrawError::DeviceLost(decline))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_draw_request(
+    ctx: &context::DeviceContext,
+    force_loss: bool,
+    caches: &mut ObjectCaches,
+    indexes: &mut SessionCacheIndexes,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    submission: &reims_vgpu_core::SubmissionContext,
+    req: &DrawRequest,
+) -> Result<DrawOutput, DrawError> {
     exec::validate_v1(req)?;
     let vertex =
         crate::m2v_cache::resolve_prepared_shader(req.program.vertex.id).ok_or_else(|| {
@@ -1689,18 +1803,11 @@ fn execute_draw_request_locked(
             )
         })?;
     let program = exec::NativeRenderProgram { vertex, fragment };
-    let EngineParts {
-        ref mut owner,
-        ref mut caches,
-        ref mut indexes,
-        ref mut pools,
-        counters,
-        ..
-    } = guard.parts();
     let (result, dropped_unfilled_gathers) = unsafe {
         let mut recording = pools.recording_for_submission(submission.identity)?;
         let result = exec::execute_draw_inner(
-            owner,
+            ctx,
+            force_loss,
             caches,
             indexes,
             &mut recording,
@@ -1732,20 +1839,7 @@ fn execute_draw_request_locked(
             dropped_unfilled_gathers as u64,
         );
     }
-    match result {
-        Ok(out) => {
-            // Guest work reached the GPU, so any recreate that got us here did
-            // its job and the storm budget starts over. See
-            // `ContextOwner::note_work_completed`.
-            guard.owner.note_work_completed();
-            Ok(out)
-        }
-        Err(DrawError::DeviceLost(decline)) => {
-            guard.on_device_lost();
-            Err(DrawError::DeviceLost(decline))
-        }
-        Err(e) => Err(e),
-    }
+    result
 }
 
 /// Submit any open deferred draw batch (draw batching increment 1). Called at
@@ -2834,15 +2928,6 @@ fn execute_compute_request_locked(
     submission: &reims_vgpu_core::SubmissionContext,
     req: &ComputeRequest,
 ) -> Result<ComputeOutput, ComputeError> {
-    exec_compute::validate_compute(req)?;
-    let shader = crate::m2v_cache::resolve_prepared_shader(req.program.id).ok_or_else(|| {
-        DrawError::ComputeValidation(
-            compute_validation::ComputeValidationDecline::ProgramUnavailable {
-                id: req.program.id.get(),
-            },
-        )
-    })?;
-    let program = exec_compute::NativeComputeProgram { shader };
     let EngineParts {
         ref mut owner,
         ref mut caches,
@@ -2850,10 +2935,8 @@ fn execute_compute_request_locked(
         counters,
         ..
     } = guard.parts();
-    let result = unsafe {
-        let mut recording = pools.recording_for_submission(submission.identity)?;
-        exec_compute::execute_compute_inner(owner, caches, &mut recording, counters, req, &program)
-    };
+    let (ctx, force_loss) = owner.lease_recording_context(counters)?;
+    let result = record_compute_request(&ctx, force_loss, caches, pools, counters, submission, req);
     match result {
         Ok(out) => {
             // Same as the draw arm: a dispatch that ran proves the device.
@@ -2868,12 +2951,44 @@ fn execute_compute_request_locked(
     }
 }
 
+fn record_compute_request(
+    ctx: &context::DeviceContext,
+    force_loss: bool,
+    caches: &mut ObjectCaches,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    submission: &reims_vgpu_core::SubmissionContext,
+    req: &ComputeRequest,
+) -> Result<ComputeOutput, ComputeError> {
+    exec_compute::validate_compute(req)?;
+    let shader = crate::m2v_cache::resolve_prepared_shader(req.program.id).ok_or_else(|| {
+        DrawError::ComputeValidation(
+            compute_validation::ComputeValidationDecline::ProgramUnavailable {
+                id: req.program.id.get(),
+            },
+        )
+    })?;
+    let program = exec_compute::NativeComputeProgram { shader };
+    unsafe {
+        let mut recording = pools.recording_for_submission(submission.identity)?;
+        exec_compute::execute_compute_inner(
+            ctx,
+            force_loss,
+            caches,
+            &mut recording,
+            counters,
+            req,
+            &program,
+        )
+    }
+}
+
 /// Execute one immutable render/compute submission through one engine entry.
 ///
-/// This removes the per-command process-lock boundary. The lock still owns the
-/// shared engine for the duration of this transitional implementation; moving
-/// [`pools::EncoderPools`] to a recording worker removes that remaining coarse
-/// ownership without changing the packet transaction or its prefix semantics.
+/// The process-global owner lock is held only while leasing the exact device
+/// incarnation and the transaction's resource owners. Recording then owns
+/// those leases for the whole EXEC, so unrelated engine entry points no longer
+/// inherit the command buffer's CPU recording time as global lock hold time.
 pub fn execute_submission_progress(
     submission: reims_vgpu_core::ResolvedSubmission<Box<DrawRequest>, Box<ComputeRequest>>,
 ) -> reims_vgpu_core::SubmissionExecutionProgress<
@@ -2882,17 +2997,52 @@ pub fn execute_submission_progress(
 > {
     let identity = submission.context.identity;
     let mut outputs = Vec::with_capacity(submission.command_buffer.commands().len());
-    let mut guard = lock_engine();
+    let mut recording = match lock_engine().into_submission_recording() {
+        Ok(recording) => recording,
+        Err(error) => {
+            return reims_vgpu_core::SubmissionExecutionProgress {
+                submission: identity,
+                output: outputs.into_boxed_slice(),
+                gpu_materialized: std::sync::Arc::from([]),
+                failure: Some(error),
+            };
+        }
+    };
+    let mut failure = None;
     for command in submission.command_buffer.into_commands().into_vec() {
+        let force_loss = std::mem::take(&mut recording.force_loss);
+        let context = &*recording.context;
+        let caches = &mut *recording.caches;
+        let SessionResources {
+            pools,
+            indexes,
+            counters,
+            #[cfg(feature = "host-window")]
+                window_presenter: _,
+            resident_epoch: _,
+        } = &mut *recording.resources;
         let result = match command {
-            reims_vgpu_core::ResolvedCommand::Draw(request) => {
-                execute_draw_request_locked(&mut guard, &submission.context, &request)
-                    .map(reims_vgpu_core::ExecutionOutput::Draw)
-            }
-            reims_vgpu_core::ResolvedCommand::Compute(request) => {
-                execute_compute_request_locked(&mut guard, &submission.context, &request)
-                    .map(reims_vgpu_core::ExecutionOutput::Compute)
-            }
+            reims_vgpu_core::ResolvedCommand::Draw(request) => record_draw_request(
+                context,
+                force_loss,
+                caches,
+                indexes,
+                pools,
+                counters,
+                &submission.context,
+                &request,
+            )
+            .map(reims_vgpu_core::ExecutionOutput::Draw),
+            reims_vgpu_core::ResolvedCommand::Compute(request) => record_compute_request(
+                context,
+                force_loss,
+                caches,
+                pools,
+                counters,
+                &submission.context,
+                &request,
+            )
+            .map(reims_vgpu_core::ExecutionOutput::Compute),
             reims_vgpu_core::ResolvedCommand::Blit(_)
             | reims_vgpu_core::ResolvedCommand::ResourceState(_) => Err(DrawError::Facade(
                 EngineFacadeDecline::ExecutorServiceUnavailable {
@@ -2904,20 +3054,31 @@ pub fn execute_submission_progress(
             Ok(output) => outputs.push(output),
             Err(error) => {
                 apply_failure_scope(&mut outputs, &error);
-                return reims_vgpu_core::SubmissionExecutionProgress {
-                    submission: identity,
-                    output: outputs.into_boxed_slice(),
-                    gpu_materialized: std::sync::Arc::from([]),
-                    failure: Some(error),
-                };
+                failure = Some(error);
+                break;
             }
+        }
+    }
+    let session = recording.session.clone();
+    let completed_work = !outputs.is_empty();
+    let lost_device = failure
+        .as_ref()
+        .is_some_and(|error| matches!(error, DrawError::DeviceLost(_)));
+    drop(recording);
+    if completed_work || lost_device {
+        let _scope = enter_session(&session);
+        let mut guard = lock_engine();
+        if lost_device {
+            guard.on_device_lost();
+        } else {
+            guard.owner.note_work_completed();
         }
     }
     reims_vgpu_core::SubmissionExecutionProgress {
         submission: identity,
         output: outputs.into_boxed_slice(),
         gpu_materialized: std::sync::Arc::from([]),
-        failure: None,
+        failure,
     }
 }
 
@@ -6617,7 +6778,7 @@ pub fn test_reset_engine() {
     } else {
         g.owner = ContextOwner::new();
     }
-    *g.caches = ObjectCaches::new();
+    **g.caches = ObjectCaches::new();
     g.resources.indexes = SessionCacheIndexes::new();
     g.resources.pools = ResourcePools::new();
     g.resources.counters.reset_all();

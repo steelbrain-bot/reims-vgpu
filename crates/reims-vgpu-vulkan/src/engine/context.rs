@@ -1866,6 +1866,28 @@ impl ContextOwner {
         Ok(self.ctx.as_deref().map(std::ops::Deref::deref).unwrap())
     }
 
+    /// Lease the exact device incarnation used to record one transaction.
+    ///
+    /// Device replacement updates the owner's slot; it cannot invalidate a
+    /// recorder that already owns this `Arc`.  Taking the forced-loss test hook
+    /// at the same boundary also prevents a later transaction from consuming
+    /// an event assigned to this one.
+    pub(crate) fn lease_recording_context(
+        &mut self,
+        counters: &EngineCounters,
+    ) -> Result<(Arc<SharedDeviceContext>, bool), DrawError> {
+        let force_loss = std::mem::take(&mut self.force_device_lost);
+        self.ensure(counters)?;
+        Ok((
+            Arc::clone(
+                self.ctx
+                    .as_ref()
+                    .expect("ensure installed a recording context"),
+            ),
+            force_loss,
+        ))
+    }
+
     /// Decide whether a failed bring-up becomes the permanent answer.
     ///
     /// [`Self::ensure`] consults `init_error` before it consults anything else,

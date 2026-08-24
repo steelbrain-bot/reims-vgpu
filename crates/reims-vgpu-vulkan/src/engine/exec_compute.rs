@@ -12,7 +12,6 @@ use super::caches::{
 };
 use super::compute_execution::ComputeExecutionDecline;
 use super::compute_validation::ComputeValidationDecline;
-use super::context::ContextOwner;
 use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::pools::{BufferSlot, RecordingPools, SampledKey, StorageImageKey, StorageImageSlot};
@@ -562,7 +561,8 @@ pub(crate) struct NativeComputeProgram {
 }
 
 pub(crate) unsafe fn execute_compute_inner(
-    owner: &mut ContextOwner,
+    ctx: &super::context::DeviceContext,
+    force_loss: bool,
     caches: &mut ObjectCaches,
     pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
@@ -570,11 +570,6 @@ pub(crate) unsafe fn execute_compute_inner(
     program: &NativeComputeProgram,
 ) -> Result<ComputeOutput, DrawError> {
     validate_compute(req)?;
-    let force_loss = owner.force_device_lost;
-    if force_loss {
-        owner.force_device_lost = false;
-    }
-    let ctx = owner.ensure(counters)?;
     if !ctx.compute_capable {
         return Err(DrawError::Unsupported(
             super::reason::DrawReason::NoCombinedGraphicsComputeQueue,
