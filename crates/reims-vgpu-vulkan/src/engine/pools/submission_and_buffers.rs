@@ -710,36 +710,21 @@ impl ResourcePools {
         self.encoder.enter_submission(identity)
     }
 
-    /// Seal and submit every command still recorded for `identity`, then
-    /// release the encoder for the next guest submission.
+    /// Release the semantic submission after all of its commands have been
+    /// recorded.
     ///
-    /// Validation precedes the flush so a mismatched close cannot accidentally
-    /// submit another packet's work. Ownership is released only after queue
-    /// acceptance succeeds.
-    pub(crate) unsafe fn close_submission(
+    /// A decoded submission boundary orders commands and resource validity; it
+    /// does not require a Vulkan queue submission. Compatible ordered draws may
+    /// therefore remain in the same native command buffer until the batching
+    /// policy reaches one of its real flush conditions.
+    pub(crate) fn close_submission(
         &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
         identity: SubmissionIdentity,
     ) -> Result<(), DrawError> {
         if !self.encoder.submission_is_closing(identity)? {
             return Ok(());
         }
-        unsafe { self.batch_flush(ctx, counters) }?;
         self.encoder.release_submission(identity);
-        Ok(())
-    }
-
-    /// Release a submission when device initialization never produced a
-    /// context. No Vulkan recording can exist in this state, so there is
-    /// nothing to flush; the identity validation remains identical.
-    pub(crate) fn close_submission_without_context(
-        &mut self,
-        identity: SubmissionIdentity,
-    ) -> Result<(), DrawError> {
-        if self.encoder.submission_is_closing(identity)? {
-            self.encoder.release_submission(identity);
-        }
         Ok(())
     }
 

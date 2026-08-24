@@ -311,11 +311,11 @@ fn one_recording_retains_unchanged_blend_constants() {
     assert!(pixels.iter().any(|byte| *byte != 0));
 }
 
-/// A decoded EXEC packet is the contract-owned Vulkan recording lifetime.
-/// Closing it must submit its deferred tail before another packet can claim the
-/// encoder, while queue order preserves target contents across the boundary.
+/// Decoded submissions own their execution interval but do not dictate Vulkan
+/// queue-submit boundaries. Closing one releases its semantic ownership so the
+/// next can record, while compatible ordered draws remain in one native batch.
 #[test]
-fn submission_close_seals_before_the_next_packet_records() {
+fn submission_close_releases_ownership_without_splitting_the_native_batch() {
     let _guard = engine_test_lock().lock().unwrap();
     engine::flush_batched_draws();
     let (vert, frag) = triangle_spirv();
@@ -350,12 +350,8 @@ fn submission_close_seals_before_the_next_packet_records() {
     engine::close_submission(first_submission.identity).expect("close first submission");
     let first_close = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
-        first_close.batch_flushes, 1,
-        "the first packet close submitted its deferred tail"
-    );
-    assert_eq!(
-        first_close.batch_flush_draws, 1,
-        "the first packet close carried only its own draw"
+        first_close.batch_flushes, 0,
+        "the submission close must not add a queue submission"
     );
 
     let right = batch_req(&vert, &frag, &identity, true, half_scissor(false));
@@ -364,15 +360,20 @@ fn submission_close_seals_before_the_next_packet_records() {
     engine::close_submission(second_submission.identity).expect("close second submission");
 
     let delta = engine::counter_snapshot().delta_since(&before);
-    assert_eq!(delta.batch_flushes, 2, "each close submitted its own tail");
     assert_eq!(
-        delta.batch_flush_draws, 2,
-        "the two submissions retained one draw apiece"
+        delta.batch_flushes, 0,
+        "neither semantic close may split the native batch"
     );
 
     let pixels = engine::read_target(&identity)
         .expect("ordered submissions preserve the target")
         .into_rgba8();
+    let flushed = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(flushed.batch_flushes, 1, "the read submits the shared tail");
+    assert_eq!(
+        flushed.batch_flush_draws, 2,
+        "both ordered submissions shared the native command buffer"
+    );
     for y in [0u32, H / 2, H - 1] {
         for x in [0u32, W / 4, W / 2, 3 * W / 4, W - 1] {
             let offset = ((y * W + x) * 4) as usize;
