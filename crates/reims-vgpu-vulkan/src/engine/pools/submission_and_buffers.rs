@@ -32,6 +32,51 @@ fn classify_fence_wait(result: Result<(), vk::Result>) -> FenceWait {
     }
 }
 
+fn wait_error(counters: &EngineCounters, e: vk::Result, op: DeviceLostOp) -> DrawError {
+    if e == vk::Result::TIMEOUT {
+        counters.fence_timeouts.fetch_add(1, Ordering::Relaxed);
+        DrawError::FenceTimeout
+    } else if e == vk::Result::ERROR_DEVICE_LOST {
+        DrawError::DeviceLost(DeviceLostDecline::Driver { op, result: e })
+    } else {
+        DrawError::VkCall(VkCall::new(op.vk_op(), e))
+    }
+}
+
+/// Wait for one submitted fence to signal.
+///
+/// [`FENCE_TIMEOUT_NS`] is a diagnostic sampling interval, not a contract
+/// deadline. Vulkan's `TIMEOUT` reports only that the fence has not signaled
+/// yet; converting it into command loss makes guest behavior depend on host
+/// execution time. The first interval expiry emits the caller's detailed
+/// trail, and every expiry remains counted while the exact fence stays
+/// authoritative.
+unsafe fn wait_fence_until_signaled(
+    ctx: &DeviceContext,
+    counters: &EngineCounters,
+    fence: vk::Fence,
+    op: DeviceLostOp,
+    mut report_delayed: impl FnMut(),
+) -> Result<(), DrawError> {
+    let mut reported = false;
+    loop {
+        if let Some(error) = ctx.queue_failure() {
+            return Err(wait_error(counters, error, op));
+        }
+        match classify_fence_wait(ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS)) {
+            FenceWait::Signaled => return Ok(()),
+            FenceWait::Pending => {
+                counters.fence_timeouts.fetch_add(1, Ordering::Relaxed);
+                if !reported {
+                    report_delayed();
+                    reported = true;
+                }
+            }
+            FenceWait::Failed(error) => return Err(wait_error(counters, error, op)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod fence_wait_contract_tests {
     use super::*;
@@ -1520,52 +1565,6 @@ impl ResourcePools {
         }
     }
 
-    fn wait_error(counters: &EngineCounters, e: vk::Result, op: DeviceLostOp) -> DrawError {
-        if e == vk::Result::TIMEOUT {
-            counters.fence_timeouts.fetch_add(1, Ordering::Relaxed);
-            DrawError::FenceTimeout
-        } else if e == vk::Result::ERROR_DEVICE_LOST {
-            DrawError::DeviceLost(DeviceLostDecline::Driver { op, result: e })
-        } else {
-            DrawError::VkCall(VkCall::new(op.vk_op(), e))
-        }
-    }
-
-    /// Wait for one submitted fence to signal.
-    ///
-    /// [`FENCE_TIMEOUT_NS`] is a diagnostic sampling interval, not a contract
-    /// deadline. Vulkan's `TIMEOUT` reports only that the fence has not signaled
-    /// yet; converting it into command loss makes guest behavior depend on host
-    /// execution time. The first interval expiry emits the caller's detailed
-    /// trail, and every expiry remains counted while the exact fence stays
-    /// authoritative.
-    unsafe fn wait_fence_until_signaled(
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-        fence: vk::Fence,
-        op: DeviceLostOp,
-        mut report_delayed: impl FnMut(),
-    ) -> Result<(), DrawError> {
-        let mut reported = false;
-        loop {
-            if let Some(error) = ctx.queue_failure() {
-                return Err(Self::wait_error(counters, error, op));
-            }
-            match classify_fence_wait(ctx.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT_NS))
-            {
-                FenceWait::Signaled => return Ok(()),
-                FenceWait::Pending => {
-                    counters.fence_timeouts.fetch_add(1, Ordering::Relaxed);
-                    if !reported {
-                        report_delayed();
-                        reported = true;
-                    }
-                }
-                FenceWait::Failed(error) => return Err(Self::wait_error(counters, error, op)),
-            }
-        }
-    }
-
     /// Reset this slot's readback timestamp region and write its start stamp.
     ///
     /// The reset must be recorded into the same command buffer that writes the
@@ -1627,78 +1626,6 @@ impl ResourcePools {
         );
     }
 
-    /// Read a retiring slot's readback region and charge the two spans it holds.
-    ///
-    /// Called only with the slot's fence already signalled, which is what makes
-    /// the three queries available — so `vkGetQueryPoolResults` is asked without
-    /// `WAIT` and cannot block. This replaces a read that ran *before* the next
-    /// copy was recorded and argued that the previous copy's results were still
-    /// there because its reset had not executed yet. That argument assumed
-    /// submissions complete in submission order, which Vulkan does not grant.
-    unsafe fn readback_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
-        let Some(probe) = ctx.timestamps.as_ref() else {
-            return;
-        };
-        if !std::mem::replace(&mut self.encoder.slots[slot].readback_span_armed, false) {
-            return;
-        }
-        let mut ticks = [0u64; TimestampProbe::PER_SLOT as usize];
-        if ctx
-            .device
-            .get_query_pool_results(
-                probe.pool,
-                TimestampProbe::base(slot),
-                &mut ticks,
-                vk::QueryResultFlags::TYPE_64,
-            )
-            .is_ok()
-        {
-            let us =
-                |from: usize, to: usize| probe.scale.elapsed_ns(ticks[from], ticks[to]) / 1_000;
-            crate::telemetry::note_readback_gpu_us(us(0, 1), us(1, 2));
-        }
-    }
-
-    /// Read a retiring slot's timestamp pair and charge the delta.
-    ///
-    /// Only ever called with the slot's fence already signaled, which is what
-    /// makes both queries available — so `vkGetQueryPoolResults` is asked without
-    /// `WAIT` and a `NOT_READY` is a real defect in that ordering rather than
-    /// something to spin on. It is dropped rather than retried: a lost sample is
-    /// visible as `armed - read` and retrying inside the retire path would put an
-    /// unbounded wait on the drain worker to fix an instrument.
-    unsafe fn gpu_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
-        let Some(probe) = ctx.draw_spans.as_ref() else {
-            return;
-        };
-        let gpu_span::SlotSpan::Sealed { kind, draws } =
-            std::mem::replace(&mut self.encoder.slots[slot].span, gpu_span::SlotSpan::Idle)
-        else {
-            return;
-        };
-        // Only the prefix the command buffer actually wrote. A pair it never
-        // opened was reset and never signalled, and `vkGetQueryPoolResults`
-        // refuses the whole call for one unavailable query, which would drop
-        // this submission's own span along with the pass pairs.
-        let spans = std::mem::take(&mut self.encoder.slots[slot].pass_spans);
-        let mut ticks = vec![0u64; 2 + 2 * spans as usize];
-        if ctx
-            .device
-            .get_query_pool_results(
-                probe.pool,
-                DrawSpanProbe::base(slot),
-                &mut ticks,
-                vk::QueryResultFlags::TYPE_64,
-            )
-            .is_ok()
-        {
-            gpu_span::note_busy_ns(kind, probe.scale.elapsed_ns(ticks[0], ticks[1]), draws);
-            for pair in ticks[2..].chunks_exact(2) {
-                gpu_span::note_pass_ns(probe.scale.elapsed_ns(pair[0], pair[1]));
-            }
-        }
-    }
-
     /// Retire one slot: wait its fence, reset it, and drain the cleanup it
     /// owes. No-op for a slot with nothing pending.
     unsafe fn retire_slot(
@@ -1707,69 +1634,12 @@ impl ResourcePools {
         counters: &EngineCounters,
         index: usize,
     ) -> Result<(), DrawError> {
-        let Some(retired) = (unsafe { self.take_retired_slot(ctx, counters, index)? }) else {
+        let Some(retired) = (unsafe { self.encoder.take_retired_slot(ctx, counters, index)? })
+        else {
             return Ok(());
         };
         unsafe { self.apply_retired_entry(&ctx.device, retired) };
         Ok(())
-    }
-
-    /// Recover one completed slot from encoder ownership. Shared pools are not
-    /// mutated here; the returned transaction carries everything they are owed.
-    unsafe fn take_retired_slot(
-        &mut self,
-        ctx: &DeviceContext,
-        counters: &EngineCounters,
-        index: usize,
-    ) -> Result<Option<RetiredEntry>, DrawError> {
-        if self.encoder.slots[index].pending.is_none() {
-            return Ok(None);
-        }
-        self.await_submit_return(counters, index, DeviceLostOp::PoolsWaitFencesRetire)?;
-        if let Some(error) = ctx.queue_failure() {
-            return Err(Self::wait_error(
-                counters,
-                error,
-                DeviceLostOp::PoolsWaitFencesRetire,
-            ));
-        }
-        let fence = self.encoder.slots[index].fence;
-        Self::wait_fence_until_signaled(
-            ctx,
-            counters,
-            fence,
-            DeviceLostOp::PoolsWaitFencesRetire,
-            || {
-                // The first diagnostic deadline names the submission that is
-                // still executing. The wait continues because elapsed host
-                // time is not permission to discard the guest's command.
-                let held = match crate::gpu_hang_trail::submission(index) {
-                    Some(note) => format!("{note}"),
-                    None => "none (this slot's work was never recorded)".to_string(),
-                };
-                reims_vgpu_observe::fail(format!(
-                    "vk_engine_fence_delayed reason=vk_engine_fence_delayed \
-                     slot={index} deadline_ns={FENCE_TIMEOUT_NS} held={held}"
-                ));
-                if let Some(rest) = crate::gpu_hang_trail::outstanding() {
-                    reims_vgpu_observe::fail(format!(
-                        "vk_engine_fence_delayed_queue reason=vk_engine_fence_delayed {rest}"
-                    ));
-                }
-            },
-        )?;
-        ctx.device
-            .reset_fences(&[fence])
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsResetFencesRetire, e)))?;
-        // After the wait and before anything else: the fence signalling is
-        // precisely what makes this slot's two queries available, and the read is
-        // the only thing that returns the slot's span state to `Idle` so the next
-        // arming of it is not reported as a lost sample.
-        unsafe { self.gpu_span_read(ctx, index) };
-        // The same argument, for the other probe: this slot's three readback
-        // queries are readable exactly now and never before.
-        unsafe { self.readback_span_read(ctx, index) };
-        Ok(self.encoder.take_completed_entry(index))
     }
 
     /// Return a fence-complete encoder transaction to shared ownership.
@@ -1785,57 +1655,6 @@ impl ResourcePools {
         self.drain_shared_cleanup(cleanup);
         retirement.retire();
         self.release_ready_graveyard(device);
-    }
-
-    /// Recover host ownership of a slot's fence after an asynchronous queue
-    /// handoff. This waits only for the CPU-side `vkQueueSubmit` call to return;
-    /// the fence wait below remains the separate GPU-completion boundary.
-    fn await_submit_return(
-        &mut self,
-        counters: &EngineCounters,
-        index: usize,
-        op: DeviceLostOp,
-    ) -> Result<(), DrawError> {
-        let state = std::mem::replace(
-            &mut self.encoder.slots[index].submission,
-            SlotSubmission::HostOwned,
-        );
-        let result = match state {
-            SlotSubmission::HostOwned => Ok(()),
-            SlotSubmission::QueueOwned(receipt) => receipt.wait(),
-            SlotSubmission::Failed(error) => Err(error),
-        };
-        if let Err(error) = result {
-            self.encoder.slots[index].submission = SlotSubmission::Failed(error);
-        }
-        result.map_err(|error| Self::wait_error(counters, error, op))
-    }
-
-    /// Non-blocking ownership probe for opportunistic retirement. `false`
-    /// means the queue thread still owns the fence, so Vulkan must not be asked
-    /// for its status yet.
-    fn try_take_submit_return(
-        &mut self,
-        counters: &EngineCounters,
-        index: usize,
-    ) -> Result<bool, DrawError> {
-        let result = match &self.encoder.slots[index].submission {
-            SlotSubmission::HostOwned => return Ok(true),
-            SlotSubmission::QueueOwned(receipt) => {
-                let Some(result) = receipt.try_complete() else {
-                    return Ok(false);
-                };
-                result
-            }
-            SlotSubmission::Failed(error) => Err(*error),
-        };
-        self.encoder.slots[index].submission = match result {
-            Ok(()) => SlotSubmission::HostOwned,
-            Err(error) => SlotSubmission::Failed(error),
-        };
-        result.map(|()| true).map_err(|error| {
-            Self::wait_error(counters, error, DeviceLostOp::PoolsFenceStatusBeginEntry)
-        })
     }
 
     /// Start a new entry (draw / dispatch / sync helper): advance to the next
@@ -1885,15 +1704,13 @@ impl ResourcePools {
             if self.encoder.slots[index].pending.is_none() {
                 continue;
             }
-            if !self.try_take_submit_return(counters, index)? {
+            if !self.encoder.try_take_submit_return(counters, index)? {
                 break;
             }
             let signaled = ctx
                 .device
                 .get_fence_status(self.encoder.slots[index].fence)
-                .map_err(|e| {
-                    Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
-                })?;
+                .map_err(|e| wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry))?;
             if !signaled {
                 break;
             }
@@ -1901,16 +1718,18 @@ impl ResourcePools {
         }
         let next = (self.encoder.cur + 1) % self.encoder.slots.len();
         if self.encoder.slots[next].pending.is_some() {
-            self.await_submit_return(counters, next, DeviceLostOp::PoolsWaitFencesRetire)?;
+            self.encoder.await_submit_return(
+                counters,
+                next,
+                DeviceLostOp::PoolsWaitFencesRetire,
+            )?;
             // Count as a "block" only when the fence is genuinely unsignaled
             // (the GPU still owns the slot); reclaiming a finished slot on
             // advance is bookkeeping, not a stall.
             let still_running = !ctx
                 .device
                 .get_fence_status(self.encoder.slots[next].fence)
-                .map_err(|e| {
-                    Self::wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry)
-                })?;
+                .map_err(|e| wait_error(counters, e, DeviceLostOp::PoolsFenceStatusBeginEntry))?;
             self.retire_slot(ctx, counters, next)?;
             if still_running {
                 counters.ring_retire_blocks.fetch_add(1, Ordering::Relaxed);
@@ -2032,6 +1851,170 @@ impl ResourcePools {
 }
 
 impl EncoderPools {
+    /// Read a retiring slot's readback region and charge the two spans it holds.
+    ///
+    /// Called only with the slot's fence already signalled, which is what makes
+    /// the three queries available. The query read therefore needs no `WAIT`.
+    /// Keeping the armed bit beside the slot prevents a reset in another
+    /// encoder from being mistaken for this recording's result.
+    unsafe fn readback_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
+        let Some(probe) = ctx.timestamps.as_ref() else {
+            return;
+        };
+        if !std::mem::replace(&mut self.slots[slot].readback_span_armed, false) {
+            return;
+        }
+        let mut ticks = [0u64; TimestampProbe::PER_SLOT as usize];
+        if ctx
+            .device
+            .get_query_pool_results(
+                probe.pool,
+                TimestampProbe::base(slot),
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64,
+            )
+            .is_ok()
+        {
+            let us =
+                |from: usize, to: usize| probe.scale.elapsed_ns(ticks[from], ticks[to]) / 1_000;
+            crate::telemetry::note_readback_gpu_us(us(0, 1), us(1, 2));
+        }
+    }
+
+    /// Read a retiring slot's draw and pass timestamps.
+    ///
+    /// A missing result after this encoder's fence signals is an instrumentation
+    /// defect, not a reason to wait in the retirement path. Reading only the
+    /// written prefix avoids asking Vulkan for reset-but-unwritten query pairs.
+    unsafe fn gpu_span_read(&mut self, ctx: &DeviceContext, slot: usize) {
+        let Some(probe) = ctx.draw_spans.as_ref() else {
+            return;
+        };
+        let gpu_span::SlotSpan::Sealed { kind, draws } =
+            std::mem::replace(&mut self.slots[slot].span, gpu_span::SlotSpan::Idle)
+        else {
+            return;
+        };
+        let spans = std::mem::take(&mut self.slots[slot].pass_spans);
+        let mut ticks = vec![0u64; 2 + 2 * spans as usize];
+        if ctx
+            .device
+            .get_query_pool_results(
+                probe.pool,
+                DrawSpanProbe::base(slot),
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64,
+            )
+            .is_ok()
+        {
+            gpu_span::note_busy_ns(kind, probe.scale.elapsed_ns(ticks[0], ticks[1]), draws);
+            for pair in ticks[2..].chunks_exact(2) {
+                gpu_span::note_pass_ns(probe.scale.elapsed_ns(pair[0], pair[1]));
+            }
+        }
+    }
+
+    /// Recover host ownership after the queue thread returns from submit.
+    ///
+    /// This waits only for the CPU-side `vkQueueSubmit` call to return. The
+    /// slot's fence remains the separate GPU-completion boundary.
+    fn await_submit_return(
+        &mut self,
+        counters: &EngineCounters,
+        index: usize,
+        op: DeviceLostOp,
+    ) -> Result<(), DrawError> {
+        let state = std::mem::replace(&mut self.slots[index].submission, SlotSubmission::HostOwned);
+        let result = match state {
+            SlotSubmission::HostOwned => Ok(()),
+            SlotSubmission::QueueOwned(receipt) => receipt.wait(),
+            SlotSubmission::Failed(error) => Err(error),
+        };
+        if let Err(error) = result {
+            self.slots[index].submission = SlotSubmission::Failed(error);
+        }
+        result.map_err(|error| wait_error(counters, error, op))
+    }
+
+    /// Non-blockingly recover a fence whose queue submit has returned.
+    ///
+    /// `false` means the queue thread still owns the fence, so Vulkan must not
+    /// be asked for its status yet.
+    fn try_take_submit_return(
+        &mut self,
+        counters: &EngineCounters,
+        index: usize,
+    ) -> Result<bool, DrawError> {
+        let result = match &self.slots[index].submission {
+            SlotSubmission::HostOwned => return Ok(true),
+            SlotSubmission::QueueOwned(receipt) => {
+                let Some(result) = receipt.try_complete() else {
+                    return Ok(false);
+                };
+                result
+            }
+            SlotSubmission::Failed(error) => Err(*error),
+        };
+        self.slots[index].submission = match result {
+            Ok(()) => SlotSubmission::HostOwned,
+            Err(error) => SlotSubmission::Failed(error),
+        };
+        result
+            .map(|()| true)
+            .map_err(|error| wait_error(counters, error, DeviceLostOp::PoolsFenceStatusBeginEntry))
+    }
+
+    /// Recover one completed slot from encoder ownership. Shared pools are not
+    /// mutated here; the returned transaction carries everything they are owed.
+    unsafe fn take_retired_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        index: usize,
+    ) -> Result<Option<RetiredEntry>, DrawError> {
+        if self.slots[index].pending.is_none() {
+            return Ok(None);
+        }
+        self.await_submit_return(counters, index, DeviceLostOp::PoolsWaitFencesRetire)?;
+        if let Some(error) = ctx.queue_failure() {
+            return Err(wait_error(
+                counters,
+                error,
+                DeviceLostOp::PoolsWaitFencesRetire,
+            ));
+        }
+        let fence = self.slots[index].fence;
+        wait_fence_until_signaled(
+            ctx,
+            counters,
+            fence,
+            DeviceLostOp::PoolsWaitFencesRetire,
+            || {
+                let held = match crate::gpu_hang_trail::submission(index) {
+                    Some(note) => format!("{note}"),
+                    None => "none (this slot's work was never recorded)".to_string(),
+                };
+                reims_vgpu_observe::fail(format!(
+                    "vk_engine_fence_delayed reason=vk_engine_fence_delayed \
+                     slot={index} deadline_ns={FENCE_TIMEOUT_NS} held={held}"
+                ));
+                if let Some(rest) = crate::gpu_hang_trail::outstanding() {
+                    reims_vgpu_observe::fail(format!(
+                        "vk_engine_fence_delayed_queue reason=vk_engine_fence_delayed {rest}"
+                    ));
+                }
+            },
+        )?;
+        ctx.device
+            .reset_fences(&[fence])
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsResetFencesRetire, e)))?;
+        // Fence completion makes this encoder's query slots readable and is
+        // the only boundary that returns their state to idle for reuse.
+        unsafe { self.gpu_span_read(ctx, index) };
+        unsafe { self.readback_span_read(ctx, index) };
+        Ok(self.take_completed_entry(index))
+    }
+
     /// Install the shared order point for the command buffer about to record.
     fn begin_recording(&mut self, lease: RecordingLease) {
         assert!(
@@ -2689,16 +2672,20 @@ impl ResourcePools {
             .iter()
             .position(|slot| slot.fence == fence && slot.pending.is_some());
         if let Some(index) = index {
-            self.await_submit_return(counters, index, DeviceLostOp::PoolsWaitFencesEntry)?;
+            self.encoder.await_submit_return(
+                counters,
+                index,
+                DeviceLostOp::PoolsWaitFencesEntry,
+            )?;
         }
         if let Some(error) = ctx.queue_failure() {
-            return Err(Self::wait_error(
+            return Err(wait_error(
                 counters,
                 error,
                 DeviceLostOp::PoolsWaitFencesEntry,
             ));
         }
-        Self::wait_fence_until_signaled(
+        wait_fence_until_signaled(
             ctx,
             counters,
             fence,
@@ -5780,14 +5767,14 @@ mod recycle_tests {
         slot.submission = SlotSubmission::QueueOwned(receipt);
         pools.encoder.slots.push(slot);
 
-        assert!(!pools.try_take_submit_return(&counters, 0).unwrap());
+        assert!(!pools.encoder.try_take_submit_return(&counters, 0).unwrap());
         assert!(matches!(
             pools.encoder.slots[0].submission,
             SlotSubmission::QueueOwned(_)
         ));
 
         returned.send(Ok(())).unwrap();
-        assert!(pools.try_take_submit_return(&counters, 0).unwrap());
+        assert!(pools.encoder.try_take_submit_return(&counters, 0).unwrap());
         assert!(matches!(
             pools.encoder.slots[0].submission,
             SlotSubmission::HostOwned
@@ -5806,7 +5793,7 @@ mod recycle_tests {
         returned
             .send(Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
             .unwrap();
-        assert!(pools.try_take_submit_return(&counters, 0).is_err());
+        assert!(pools.encoder.try_take_submit_return(&counters, 0).is_err());
         assert!(matches!(
             pools.encoder.slots[0].submission,
             SlotSubmission::Failed(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)
