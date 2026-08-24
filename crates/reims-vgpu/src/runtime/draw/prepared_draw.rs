@@ -206,6 +206,45 @@ pub(super) struct PreparedDrawProgress {
     pub failure: Option<ExecutorDiagnostic>,
 }
 
+/// Immutable backend work after semantic resolution and before recording.
+///
+/// This value owns everything a recording worker needs and deliberately owns
+/// no [`Device`] or guest-memory reference. Its paired completion plans remain
+/// inert until the drain thread applies [`RecordedDrawSubmission::complete`].
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing the overwhelmingly common one-draw handoff adds an allocation to every draw"
+)]
+pub(super) enum PreparedDrawExecution {
+    Empty,
+    One {
+        context: reims_vgpu_core::SubmissionContext,
+        request: reims_vgpu_core::DrawRequest,
+        completion: DrawCompletionPlan,
+    },
+    Many {
+        context: reims_vgpu_core::SubmissionContext,
+        requests: Vec<reims_vgpu_core::DrawRequest>,
+        completions: Vec<DrawCompletionPlan>,
+    },
+}
+
+/// A worker's terminal backend result plus the semantic plans it cannot apply.
+pub(super) enum RecordedDrawSubmission {
+    Empty,
+    One {
+        receipt: executor::ExecutionReceipt<reims_vgpu_core::DrawOutput>,
+        completion: DrawCompletionPlan,
+    },
+    Many {
+        progress: reims_vgpu_core::SubmissionExecutionProgress<
+            reims_vgpu_core::DrawOutput,
+            executor::DrawError,
+        >,
+        completions: Vec<DrawCompletionPlan>,
+    },
+}
+
 impl PreparedDrawSubmission {
     pub fn new(context: reims_vgpu_core::SubmissionContext) -> Self {
         Self {
@@ -225,53 +264,120 @@ impl PreparedDrawSubmission {
         }
     }
 
-    pub fn execute(self, state: &mut Device) -> Result<PreparedDrawProgress, ExecutorDiagnostic> {
+    pub(super) fn into_execution(self) -> PreparedDrawExecution {
         let Some(first) = self.draws.first else {
-            return Ok(PreparedDrawProgress {
-                completed: Vec::new(),
-                failure: None,
-            });
+            return PreparedDrawExecution::Empty;
         };
         if self.draws.rest.is_empty() {
-            let completed = first.execute_direct(state, self.context)?;
-            return Ok(PreparedDrawProgress {
-                completed: vec![completed],
-                failure: None,
-            });
+            let (request, completion) = first.into_executor_parts();
+            return PreparedDrawExecution::One {
+                context: self.context,
+                request,
+                completion,
+            };
         }
         let draws = std::iter::once(first).chain(self.draws.rest);
-        let executor = std::sync::Arc::clone(&state.executor);
         let (minimum, _) = draws.size_hint();
         let mut requests = Vec::with_capacity(minimum);
-        let mut completion_plans = Vec::with_capacity(minimum);
+        let mut completions = Vec::with_capacity(minimum);
         for draw in draws {
             let (request, completion) = draw.into_executor_parts();
             requests.push(request);
-            completion_plans.push(completion);
+            completions.push(completion);
         }
+        PreparedDrawExecution::Many {
+            context: self.context,
+            requests,
+            completions,
+        }
+    }
+
+    pub fn execute(self, state: &mut Device) -> Result<PreparedDrawProgress, ExecutorDiagnostic> {
+        let executor = std::sync::Arc::clone(&state.executor);
         let engine_started = std::time::Instant::now();
-        let progress = executor::execute_draws_progress(executor.as_ref(), self.context, requests)
-            .map_err(|error| ExecutorDiagnostic::from_decline(&error));
+        let recorded = self.into_execution().record(executor.as_ref());
         crate::runtime::chain_phase::note_detached(
             crate::runtime::chain_phase::Phase::Engine,
             engine_started.elapsed(),
         );
-        let progress = progress?;
-        state
-            .task_objects
-            .resources
-            .record_gpu_materializations(progress.gpu_materialized.iter().copied());
-        let completed = completion_plans
-            .into_iter()
-            .zip(progress.output)
-            .map(|(plan, output)| plan.apply_output(progress.submission, output))
-            .collect();
-        Ok(PreparedDrawProgress {
-            completed,
-            failure: progress
-                .failure
-                .map(|error| ExecutorDiagnostic::from_decline(&error)),
-        })
+        Ok(recorded?.complete(state))
+    }
+}
+
+impl PreparedDrawExecution {
+    /// Perform backend recording without semantic or guest-memory authority.
+    pub(super) fn record(
+        self,
+        executor: &dyn crate::runtime::executor::Executor,
+    ) -> Result<RecordedDrawSubmission, ExecutorDiagnostic> {
+        match self {
+            Self::Empty => Ok(RecordedDrawSubmission::Empty),
+            Self::One {
+                context,
+                request,
+                completion,
+            } => executor::execute_draw(executor, context, request)
+                .map(|receipt| RecordedDrawSubmission::One {
+                    receipt,
+                    completion,
+                })
+                .map_err(|error| ExecutorDiagnostic::from_decline(&error)),
+            Self::Many {
+                context,
+                requests,
+                completions,
+            } => executor::execute_draws_progress(executor, context, requests)
+                .map(|progress| RecordedDrawSubmission::Many {
+                    progress,
+                    completions,
+                })
+                .map_err(|error| ExecutorDiagnostic::from_decline(&error)),
+        }
+    }
+}
+
+impl RecordedDrawSubmission {
+    /// Apply backend materialization and per-draw completion in packet order.
+    pub(super) fn complete(self, state: &mut Device) -> PreparedDrawProgress {
+        match self {
+            Self::Empty => PreparedDrawProgress {
+                completed: Vec::new(),
+                failure: None,
+            },
+            Self::One {
+                receipt,
+                completion,
+            } => {
+                state
+                    .task_objects
+                    .resources
+                    .record_gpu_materializations(receipt.gpu_materialized.iter().copied());
+                PreparedDrawProgress {
+                    completed: vec![completion.apply_output(receipt.submission, receipt.output)],
+                    failure: None,
+                }
+            }
+            Self::Many {
+                progress,
+                completions,
+            } => {
+                state
+                    .task_objects
+                    .resources
+                    .record_gpu_materializations(progress.gpu_materialized.iter().copied());
+                let completed = completions
+                    .into_iter()
+                    .zip(progress.output)
+                    .map(|(plan, output)| plan.apply_output(progress.submission, output))
+                    .collect();
+                PreparedDrawProgress {
+                    completed,
+                    failure: progress
+                        .failure
+                        .map(|error| ExecutorDiagnostic::from_decline(&error)),
+                }
+            }
+        }
     }
 }
 
@@ -322,18 +428,6 @@ impl PreparedDraw {
             .expect("one prepared draw returns one completion"))
     }
 
-    fn execute_direct(
-        self,
-        state: &mut Device,
-        submission: reims_vgpu_core::SubmissionContext,
-    ) -> Result<CompletedDraw, ExecutorDiagnostic> {
-        let (request, completion) = self.into_executor_parts();
-        let executor = std::sync::Arc::clone(&state.executor);
-        let receipt = executor::execute_draw(executor.as_ref(), submission, request)
-            .map_err(|error| ExecutorDiagnostic::from_decline(&error))?;
-        Ok(completion.apply(state, receipt))
-    }
-
     /// Split immutable executor input from the semantic transition its
     /// successful completion owes. Neither half mutates device state.
     pub(super) fn into_executor_parts(self) -> (reims_vgpu_core::DrawRequest, DrawCompletionPlan) {
@@ -353,20 +447,6 @@ impl PreparedDraw {
 }
 
 impl DrawCompletionPlan {
-    /// Apply only an executor-validated completion. A refusal never produces a
-    /// receipt and therefore cannot reach this transition.
-    pub(super) fn apply(
-        self,
-        state: &mut Device,
-        receipt: executor::ExecutionReceipt<reims_vgpu_core::DrawOutput>,
-    ) -> CompletedDraw {
-        state
-            .task_objects
-            .resources
-            .record_gpu_materializations(receipt.gpu_materialized.iter().copied());
-        self.apply_output(receipt.submission, receipt.output)
-    }
-
     fn apply_output(
         self,
         submission: reims_vgpu_protocol::SubmissionIdentity,
@@ -712,5 +792,44 @@ mod tests {
             DrawCompletionRoute::ResidentGvaStore(found) if found == identity
         ));
         assert!(completion.render_target_resource.is_none());
+    }
+
+    #[test]
+    fn whole_submission_handoff_owns_backend_work_and_inert_completion_plans() {
+        let context = reims_vgpu_core::SubmissionContext::standalone(7);
+        let identity = gva(0x3000);
+        let owner = std::sync::Arc::new(crate::model::TaskResource::new(
+            reims_vgpu_protocol::ObjectListEntry::new(
+                crate::runtime::decode::resource::ObjectKind::Texture,
+                0,
+                0,
+            ),
+            std::sync::Arc::from([]),
+        ));
+        let mut submission = PreparedDrawSubmission::new(context.clone());
+        submission.push(PreparedDraw::new(
+            reims_vgpu_core::DrawRequest {
+                target_identity: Some(identity.clone()),
+                ..Default::default()
+            },
+            DrawCompletionRoute::ResidentChain(identity),
+            Some(std::sync::Arc::clone(&owner)),
+        ));
+
+        let PreparedDrawExecution::One {
+            context: owned_context,
+            request,
+            completion,
+        } = submission.into_execution()
+        else {
+            panic!("one draw keeps the allocation-free owned handoff");
+        };
+        assert_eq!(owned_context, context);
+        assert!(request.target_identity.is_some());
+        assert!(completion.render_target_resource.is_some());
+        assert!(
+            !owner.was_render_target(),
+            "moving work across the recording boundary cannot publish completion"
+        );
     }
 }
