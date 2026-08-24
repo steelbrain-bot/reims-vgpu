@@ -152,7 +152,10 @@ impl EncoderPools {
     /// Re-entering the same submission is the ordinary multi-draw/dispatch
     /// case. A different live identity is a missing close boundary and refuses
     /// rather than letting two packets share mutable recording state.
-    fn enter_submission(&mut self, incoming: SubmissionIdentity) -> Result<(), DrawError> {
+    pub(crate) fn enter_submission(
+        &mut self,
+        incoming: SubmissionIdentity,
+    ) -> Result<(), DrawError> {
         if incoming.id.get() == 0 {
             return Ok(());
         }
@@ -190,6 +193,24 @@ impl EncoderPools {
     fn release_submission(&mut self, closing: SubmissionIdentity) {
         debug_assert_eq!(self.active_submission, Some(closing));
         self.active_submission = None;
+    }
+
+    /// Release the semantic submission after all of its commands have been
+    /// recorded.
+    ///
+    /// A decoded submission boundary orders commands and resource validity; it
+    /// does not require a Vulkan queue submission. Compatible ordered draws may
+    /// therefore remain in the same native command buffer until the batching
+    /// policy reaches one of its real flush conditions.
+    pub(crate) fn close_submission(
+        &mut self,
+        identity: SubmissionIdentity,
+    ) -> Result<(), DrawError> {
+        if !self.submission_is_closing(identity)? {
+            return Ok(());
+        }
+        self.release_submission(identity);
+        Ok(())
     }
 
     pub(crate) fn note_guest_read_recorded(&mut self) {
@@ -702,32 +723,6 @@ impl SharedPools {
 }
 
 impl ResourcePools {
-    /// Enter one exact guest submission on this pool's encoder.
-    pub(crate) fn enter_submission(
-        &mut self,
-        identity: SubmissionIdentity,
-    ) -> Result<(), DrawError> {
-        self.encoder.enter_submission(identity)
-    }
-
-    /// Release the semantic submission after all of its commands have been
-    /// recorded.
-    ///
-    /// A decoded submission boundary orders commands and resource validity; it
-    /// does not require a Vulkan queue submission. Compatible ordered draws may
-    /// therefore remain in the same native command buffer until the batching
-    /// policy reaches one of its real flush conditions.
-    pub(crate) fn close_submission(
-        &mut self,
-        identity: SubmissionIdentity,
-    ) -> Result<(), DrawError> {
-        if !self.encoder.submission_is_closing(identity)? {
-            return Ok(());
-        }
-        self.encoder.release_submission(identity);
-        Ok(())
-    }
-
     /// End one guest allocation's backend lifetime after open submissions.
     pub(crate) unsafe fn retire_guest_import(
         &mut self,

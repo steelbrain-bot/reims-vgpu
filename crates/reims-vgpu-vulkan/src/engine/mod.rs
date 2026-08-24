@@ -1587,7 +1587,7 @@ pub fn execute_draw_request_in_submission(
         ref counters,
         ..
     } = &mut *guard;
-    pools.enter_submission(submission.identity)?;
+    pools.encoder_mut().enter_submission(submission.identity)?;
     let result =
         unsafe { exec::execute_draw_inner(owner, caches, indexes, pools, counters, req, &program) };
     if result.is_err() {
@@ -2712,7 +2712,7 @@ pub fn execute_compute_request_in_submission(
         ref counters,
         ..
     } = &mut *guard;
-    pools.enter_submission(submission.identity)?;
+    pools.encoder_mut().enter_submission(submission.identity)?;
     let result = unsafe {
         exec_compute::execute_compute_inner(owner, caches, pools, counters, req, &program)
     };
@@ -2743,7 +2743,7 @@ pub fn close_submission(
     let mut guard = lock_engine();
     let result = {
         let EngineState { ref mut pools, .. } = &mut *guard;
-        pools.close_submission(identity)
+        pools.encoder_mut().close_submission(identity)
     };
     match result {
         Ok(()) => Ok(()),
