@@ -1507,22 +1507,7 @@ impl ResourcePools {
         // The same argument, for the other probe: this slot's three readback
         // queries are readable exactly now and never before.
         unsafe { self.readback_span_read(ctx, index) };
-        let pending = self.encoder.slots[index]
-            .pending
-            .take()
-            .expect("checked above");
-        self.encoder.in_flight = self.encoder.in_flight.saturating_sub(1);
-        // Its fence has signalled, so this submission is no longer a candidate
-        // for a wedge. Paired with the `note_submit` in `finish_entry_async`.
-        crate::gpu_hang_trail::note_retired(index);
-        let retirement = self.encoder.slots[index]
-            .retirement
-            .take()
-            .expect("submitted slot has no recording point");
-        Ok(Some(RetiredEntry {
-            cleanup: pending,
-            retirement,
-        }))
+        Ok(self.encoder.take_completed_entry(index))
     }
 
     /// Return a fence-complete encoder transaction to shared ownership.
@@ -1917,6 +1902,25 @@ impl EncoderPools {
             },
             admissions,
         }
+    }
+
+    /// Extract a fence-complete slot as one transaction for shared ownership.
+    /// Waiting and query collection happen before this call; no shared pool is
+    /// reachable from the transition itself.
+    fn take_completed_entry(&mut self, index: usize) -> Option<RetiredEntry> {
+        let cleanup = self.slots.get_mut(index)?.pending.take()?;
+        self.in_flight = self.in_flight.saturating_sub(1);
+        // Its fence has signalled, so this submission is no longer a candidate
+        // for a wedge. Paired with the submit-side record.
+        crate::gpu_hang_trail::note_retired(index);
+        let retirement = self.slots[index]
+            .retirement
+            .take()
+            .expect("submitted slot has no recording point");
+        Some(RetiredEntry {
+            cleanup,
+            retirement,
+        })
     }
 
     /// Whether the pass a draw is about to open is the one already standing in
@@ -5574,6 +5578,34 @@ mod recycle_tests {
             readback_span_armed: false,
             pass_spans: 0,
         }
+    }
+
+    #[test]
+    fn extracting_a_completed_encoder_entry_does_not_acknowledge_shared_retirement() {
+        let mut pools = ResourcePools::new();
+        let order = std::sync::Arc::clone(&pools.shared.retirement);
+        let submitted = order.reserve().unwrap().submitted();
+        let captured = order.latest().unwrap();
+        let mut slot = pending_slot();
+        slot.retirement = Some(submitted);
+        pools.encoder.slots.push(slot);
+        pools.encoder.in_flight = 1;
+
+        let retired = pools.encoder.take_completed_entry(0).expect("pending slot");
+        assert!(pools.encoder.slots[0].pending.is_none());
+        assert_eq!(pools.encoder.in_flight, 0);
+        assert!(
+            !order.retired(captured),
+            "encoder extraction is not shared-state acknowledgement"
+        );
+
+        let RetiredEntry {
+            cleanup,
+            retirement,
+        } = retired;
+        assert!(cleanup.dsets.is_empty());
+        retirement.retire();
+        assert!(order.retired(captured));
     }
 
     #[test]
