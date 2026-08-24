@@ -747,17 +747,54 @@ pub(crate) struct EncoderCheckout {
 /// Temporary full-pool view for device, maintenance, and teardown operations.
 /// Recording checkouts use [`RecordingPools`] and never borrow the depot.
 pub(crate) struct ResourcePoolsAccess<'a> {
-    pair: PoolPair<
-        &'a mut EncoderPools,
-        parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SharedPools>,
-    >,
+    pair: PoolPair<&'a mut EncoderPools, SharedPoolAccess>,
+}
+
+pub(crate) struct SharedPoolAccess {
+    owner: Arc<parking_lot::Mutex<SharedPools>>,
+    guard: Option<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SharedPools>>,
+}
+
+impl SharedPoolAccess {
+    fn lock(owner: Arc<parking_lot::Mutex<SharedPools>>) -> Self {
+        let guard = owner.clone().lock_arc();
+        Self {
+            owner,
+            guard: Some(guard),
+        }
+    }
+
+    fn release(&mut self) {
+        self.guard = None;
+    }
+
+    fn reacquire(&mut self) {
+        if self.guard.is_none() {
+            self.guard = Some(self.owner.clone().lock_arc());
+        }
+    }
+}
+
+impl std::ops::Deref for SharedPoolAccess {
+    type Target = SharedPools;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_deref()
+            .expect("shared pools must be acquired for a shared operation")
+    }
+}
+
+impl std::ops::DerefMut for SharedPoolAccess {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_deref_mut()
+            .expect("shared pools must be acquired for a shared operation")
+    }
 }
 
 impl<'a> std::ops::Deref for ResourcePoolsAccess<'a> {
-    type Target = PoolPair<
-        &'a mut EncoderPools,
-        parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SharedPools>,
-    >;
+    type Target = PoolPair<&'a mut EncoderPools, SharedPoolAccess>;
 
     fn deref(&self) -> &Self::Target {
         &self.pair
@@ -780,6 +817,14 @@ pub(crate) type RecordingPools<'a> = ResourcePoolsAccess<'a>;
 impl ResourcePoolsAccess<'_> {
     pub(crate) fn recording(&mut self) -> &mut Self {
         self
+    }
+
+    pub(crate) fn release_shared(&mut self) {
+        self.pair.shared.release();
+    }
+
+    pub(crate) fn reacquire_shared(&mut self) {
+        self.pair.shared.reacquire();
     }
 }
 

@@ -7,9 +7,7 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use super::caches::{
-    canonicalize_layout_bindings, BindingSig, ComputePipelineKey, LayoutKey, ObjectCaches,
-};
+use super::caches::{canonicalize_layout_bindings, BindingSig, ComputePipelineKey, LayoutKey};
 use super::compute_execution::ComputeExecutionDecline;
 use super::compute_validation::ComputeValidationDecline;
 use super::counters::EngineCounters;
@@ -563,7 +561,7 @@ pub(crate) struct NativeComputeProgram {
 pub(crate) unsafe fn execute_compute_inner(
     ctx: &super::context::DeviceContext,
     force_loss: bool,
-    caches: &mut ObjectCaches,
+    caches: &mut super::ObjectCacheAccess,
     pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     req: &ComputeRequest,

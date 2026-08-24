@@ -8,8 +8,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::caches::{
-    canonicalize_layout_bindings, AttrKey, BindingSig, ColorLoadKey, LayoutKey, ObjectCaches,
-    PassKey, PipelineKey, SecondaryAttachKey, SessionCacheIndexes, MAX_SECONDARY_ATTACH,
+    canonicalize_layout_bindings, AttrKey, BindingSig, ColorLoadKey, LayoutKey, PassKey,
+    PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
 };
 use super::counters::{CreateSite, EngineCounters};
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
@@ -3752,8 +3752,8 @@ unsafe fn prepare_guest_sampled_transfer(
 pub(crate) unsafe fn execute_draw_inner(
     ctx: &super::context::DeviceContext,
     force_loss: bool,
-    caches: &mut ObjectCaches,
-    indexes: &mut SessionCacheIndexes,
+    caches: &mut super::ObjectCacheAccess,
+    indexes: &mut super::IndexAccess,
     pools: &mut RecordingPools<'_>,
     counters: &EngineCounters,
     req: &DrawRequest,
@@ -6829,6 +6829,14 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     let clear = clear_values(req, implementation_depth_stencil);
+    // Every native handle and shared residency decision needed by the command
+    // buffer is now owned by local values or by this exact encoder. Release the
+    // session registry while vkCmd records the pass, state, draw, barriers and
+    // optional copy. Independent EXECs may perform their own shared planning in
+    // parallel; none can observe this encoder's command pool or retained state.
+    caches.release();
+    indexes.release();
+    pools.release_shared();
     phase.enter(super::draw_phase::Phase::RecordPass);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
@@ -7410,6 +7418,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     if force_loss {
+        pools.reacquire_shared();
         // Recycle transient resources before reporting loss.
         if let (Some(ds), Some(pool)) = (dset, dset_pool) {
             pools
@@ -7439,6 +7448,7 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
+    pools.reacquire_shared();
     // Submission ends here. Everything below is CPU-side publication and
     // retention work, and needs its own bar: charging it to `submit_us` makes
     // a slow registry or Store-footprint update look like driver queue cost.

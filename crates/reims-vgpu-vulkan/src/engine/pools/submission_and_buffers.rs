@@ -1205,7 +1205,7 @@ impl ResourcePools {
         RecordingPools {
             pair: PoolPair {
                 encoder: &mut self.encoder.0,
-                shared: Arc::clone(&self.shared).lock_arc(),
+                shared: SharedPoolAccess::lock(Arc::clone(&self.shared)),
             },
         }
     }
@@ -1214,7 +1214,7 @@ impl ResourcePools {
         super::ResourcePoolsAccess {
             pair: PoolPair {
                 encoder: &mut self.encoder.0,
-                shared: Arc::clone(&self.shared).lock_arc(),
+                shared: SharedPoolAccess::lock(Arc::clone(&self.shared)),
             },
         }
     }
@@ -1255,7 +1255,7 @@ impl ResourcePools {
         RecordingPools {
             pair: PoolPair {
                 encoder: &mut checkout.encoder.0,
-                shared: Arc::clone(&checkout.shared).lock_arc(),
+                shared: SharedPoolAccess::lock(Arc::clone(&checkout.shared)),
             },
         }
     }
@@ -1309,7 +1309,7 @@ impl ResourcePools {
         Ok(RecordingPools {
             pair: PoolPair {
                 encoder: &mut encoder.0,
-                shared: Arc::clone(&self.shared).lock_arc(),
+                shared: SharedPoolAccess::lock(Arc::clone(&self.shared)),
             },
         })
     }
@@ -1330,7 +1330,7 @@ impl ResourcePools {
         let result = unsafe {
             PoolPair {
                 encoder: &mut encoder.0,
-                shared: Arc::clone(&self.shared).lock_arc(),
+                shared: SharedPoolAccess::lock(Arc::clone(&self.shared)),
             }
             .close_submission(ctx, counters, identity)
         };
@@ -7192,6 +7192,40 @@ mod encoder_submission_ownership {
                 .and_then(|encoder| encoder.active_submission),
             Some(submission)
         );
+    }
+
+    #[test]
+    fn checked_out_encoders_can_record_while_the_other_releases_shared_pools() {
+        let mut pools = ResourcePools::new();
+        let first_identity = identity(23, 5);
+        let second_identity = identity(24, 5);
+        let mut first = pools.checkout_submission_encoder(first_identity).unwrap();
+        let mut second = pools.checkout_submission_encoder(second_identity).unwrap();
+
+        {
+            let mut first_recording = ResourcePools::recording_from_checkout(&mut first);
+            first_recording.release_shared();
+
+            let mut second_recording = ResourcePools::recording_from_checkout(&mut second);
+            assert_eq!(
+                first_recording.encoder.active_submission,
+                Some(first_identity)
+            );
+            assert_eq!(
+                second_recording.encoder.active_submission,
+                Some(second_identity)
+            );
+            second_recording.release_shared();
+
+            first_recording.reacquire_shared();
+            first_recording.release_shared();
+            second_recording.reacquire_shared();
+        }
+
+        pools.return_submission_encoder(first);
+        pools.return_submission_encoder(second);
+        assert!(pools.active_encoders.contains_key(&first_identity));
+        assert!(pools.active_encoders.contains_key(&second_identity));
     }
 
     #[test]

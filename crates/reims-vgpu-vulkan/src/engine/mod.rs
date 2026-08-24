@@ -1354,9 +1354,8 @@ pub fn take_engine_lock_census(win_ms: u64) -> Option<String> {
 /// inside the lock — and a sampler would miss precisely those.
 struct EngineGuard {
     guard: parking_lot::MutexGuard<'static, EngineState>,
-    caches: GuardSlot<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ObjectCaches>>,
-    indexes:
-        GuardSlot<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionCacheIndexes>>,
+    caches: Arc<Mutex<ObjectCaches>>,
+    indexes: Arc<Mutex<SessionCacheIndexes>>,
     resources:
         GuardSlot<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionResources>>,
     counters: Arc<EngineCounters>,
@@ -1365,6 +1364,43 @@ struct EngineGuard {
     site: EngineLockSite,
     acquired: std::time::Instant,
 }
+
+struct ReleasableAccess<T> {
+    guard: Option<parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, T>>,
+}
+
+impl<T> ReleasableAccess<T> {
+    fn lock(owner: Arc<Mutex<T>>) -> Self {
+        Self {
+            guard: Some(owner.lock_arc()),
+        }
+    }
+
+    fn release(&mut self) {
+        self.guard = None;
+    }
+}
+
+impl<T> std::ops::Deref for ReleasableAccess<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_deref()
+            .expect("recording cache must be held for a cache operation")
+    }
+}
+
+impl<T> std::ops::DerefMut for ReleasableAccess<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_deref_mut()
+            .expect("recording cache must be held for a cache operation")
+    }
+}
+
+type ObjectCacheAccess = ReleasableAccess<ObjectCaches>;
+type IndexAccess = ReleasableAccess<SessionCacheIndexes>;
 
 struct GuardSlot<T>(Option<T>);
 
@@ -1427,9 +1463,11 @@ impl EngineGuard {
 
     fn on_device_lost(&mut self) -> bool {
         let session_id = self.session_id;
+        let mut caches = self.caches.lock();
+        let mut indexes = self.indexes.lock();
         self.guard.on_device_lost(
-            &mut self.caches,
-            &mut self.indexes,
+            &mut caches,
+            &mut indexes,
             &self.counters,
             session_id,
             &mut self.resources,
@@ -1438,12 +1476,10 @@ impl EngineGuard {
 
     fn flush_device_derived(&mut self) {
         let session_id = self.session_id;
-        self.guard.flush_device_derived(
-            &mut self.caches,
-            &mut self.indexes,
-            session_id,
-            &mut self.resources,
-        );
+        let mut caches = self.caches.lock();
+        let mut indexes = self.indexes.lock();
+        self.guard
+            .flush_device_derived(&mut caches, &mut indexes, session_id, &mut self.resources);
     }
 
     fn into_submission_recording(
@@ -1549,6 +1585,22 @@ mod submission_recording_ownership_tests {
         drop(recording);
         test_reset_engine();
     }
+
+    #[test]
+    fn recording_access_releases_its_owner_for_an_independent_recorder() {
+        let owner = Arc::new(Mutex::new(7_u32));
+        let mut access = ReleasableAccess::lock(Arc::clone(&owner));
+        assert!(owner.try_lock().is_none());
+
+        access.release();
+        let mut independent = owner
+            .try_lock()
+            .expect("the native recording interval must not retain the shared owner");
+        *independent = 11;
+        drop(independent);
+
+        assert_eq!(*owner.lock(), 11);
+    }
 }
 
 impl Drop for EngineGuard {
@@ -1578,14 +1630,12 @@ fn lock_engine_at(site: EngineLockSite) -> EngineGuard {
             guard
         }
     };
-    let caches = guard.caches.lock_arc();
     let session = current_session_handle();
     let resources = session.0.resources.lock_arc();
-    let indexes = session.0.indexes.lock_arc();
     EngineGuard {
+        caches: Arc::clone(&guard.caches),
+        indexes: Arc::clone(&session.0.indexes),
         guard,
-        caches: GuardSlot::new(caches),
-        indexes: GuardSlot::new(indexes),
         resources: GuardSlot::new(resources),
         counters: Arc::clone(&session.0.counters),
         session: session.clone(),
@@ -1629,7 +1679,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         .resources
         .resident_epoch
         .fetch_add(1, Ordering::Release);
-    guard.indexes.clear();
+    guard.indexes.lock().clear();
     let (resident_targets, pooled_targets, sampled_images, storage_images) =
         guard.resources.pools.access().guest_reset_counts();
     let stats = GuestResetStats {
@@ -1801,6 +1851,8 @@ fn execute_draw_request_locked(
 ) -> Result<DrawOutput, DrawError> {
     let counters = Arc::clone(&guard.counters);
     let (ctx, force_loss) = guard.owner.lease_recording_context(&counters)?;
+    let mut caches = ObjectCacheAccess::lock(Arc::clone(&guard.caches));
+    let mut indexes = IndexAccess::lock(Arc::clone(&guard.indexes));
     let mut recording = guard
         .resources
         .pools
@@ -1808,8 +1860,8 @@ fn execute_draw_request_locked(
     let result = record_draw_request(
         &ctx,
         force_loss,
-        &mut guard.caches,
-        &mut guard.indexes,
+        &mut caches,
+        &mut indexes,
         &mut recording,
         &counters,
         req,
@@ -1834,8 +1886,8 @@ fn execute_draw_request_locked(
 fn record_draw_request(
     ctx: &context::DeviceContext,
     force_loss: bool,
-    caches: &mut ObjectCaches,
-    indexes: &mut SessionCacheIndexes,
+    caches: &mut ObjectCacheAccess,
+    indexes: &mut IndexAccess,
     recording: &mut pools::RecordingPools<'_>,
     counters: &EngineCounters,
     req: &DrawRequest,
@@ -2977,6 +3029,7 @@ fn execute_compute_request_locked(
 ) -> Result<ComputeOutput, ComputeError> {
     let counters = Arc::clone(&guard.counters);
     let (ctx, force_loss) = guard.owner.lease_recording_context(&counters)?;
+    let mut caches = ObjectCacheAccess::lock(Arc::clone(&guard.caches));
     let mut recording = guard
         .resources
         .pools
@@ -2984,7 +3037,7 @@ fn execute_compute_request_locked(
     let result = record_compute_request(
         &ctx,
         force_loss,
-        &mut guard.caches,
+        &mut caches,
         &mut recording,
         &counters,
         req,
@@ -3006,7 +3059,7 @@ fn execute_compute_request_locked(
 fn record_compute_request(
     ctx: &context::DeviceContext,
     force_loss: bool,
-    caches: &mut ObjectCaches,
+    caches: &mut ObjectCacheAccess,
     recording: &mut pools::RecordingPools<'_>,
     counters: &EngineCounters,
     req: &ComputeRequest,
@@ -3056,10 +3109,8 @@ pub fn execute_submission_progress(
     for command in submission.command_buffer.into_commands().into_vec() {
         let force_loss = std::mem::take(&mut recording.force_loss);
         let context = &*recording.context;
-        let mut caches_guard = recording.caches.lock();
-        let caches = &mut *caches_guard;
-        let mut indexes_guard = recording.indexes.lock();
-        let indexes = &mut *indexes_guard;
+        let mut caches = ObjectCacheAccess::lock(Arc::clone(&recording.caches));
+        let mut indexes = IndexAccess::lock(Arc::clone(&recording.indexes));
         let counters = &*recording.counters;
         let mut native = pools::ResourcePools::recording_from_checkout(
             recording
@@ -3071,17 +3122,22 @@ pub fn execute_submission_progress(
             reims_vgpu_core::ResolvedCommand::Draw(request) => record_draw_request(
                 context,
                 force_loss,
-                caches,
-                indexes,
+                &mut caches,
+                &mut indexes,
                 &mut native,
                 counters,
                 &request,
             )
             .map(reims_vgpu_core::ExecutionOutput::Draw),
-            reims_vgpu_core::ResolvedCommand::Compute(request) => {
-                record_compute_request(context, force_loss, caches, &mut native, counters, &request)
-                    .map(reims_vgpu_core::ExecutionOutput::Compute)
-            }
+            reims_vgpu_core::ResolvedCommand::Compute(request) => record_compute_request(
+                context,
+                force_loss,
+                &mut caches,
+                &mut native,
+                counters,
+                &request,
+            )
+            .map(reims_vgpu_core::ExecutionOutput::Compute),
             reims_vgpu_core::ResolvedCommand::Blit(_)
             | reims_vgpu_core::ResolvedCommand::ResourceState(_) => Err(DrawError::Facade(
                 EngineFacadeDecline::ExecutorServiceUnavailable {
@@ -6742,7 +6798,7 @@ pub fn maintain_resources(now_ms: u64) {
 ///
 /// See [`caches::ObjectCaches::levels`] for what reading it answers.
 pub fn object_cache_levels() -> [usize; 6] {
-    lock_engine().caches.levels()
+    lock_engine().caches.lock().levels()
 }
 
 /// Active topology policy for one deferred-submit command buffer, for the
@@ -6850,7 +6906,7 @@ pub fn test_reset_engine() {
             ctx.queue_barrier();
         }
         unsafe {
-            g.caches.destroy_all(&ctx.device);
+            g.caches.lock().destroy_all(&ctx.device);
             g.resources.pools.destroy_all(&ctx.device);
         }
         if poisoned {
@@ -6862,8 +6918,8 @@ pub fn test_reset_engine() {
     } else {
         g.owner = ContextOwner::new();
     }
-    **g.caches = ObjectCaches::new();
-    **g.indexes = SessionCacheIndexes::new();
+    *g.caches.lock() = ObjectCaches::new();
+    *g.indexes.lock() = SessionCacheIndexes::new();
     g.resources.pools = ResourcePools::new();
     g.counters.reset_all();
 }
