@@ -853,6 +853,19 @@ pub(crate) struct PendingExecState {
     fallback: SurfaceRecordingFallback,
 }
 
+/// Loaded command payload owned by one scheduler admission.
+///
+/// These stream bytes no longer depend on their mutable guest command-buffer
+/// pages. Resolution may still snapshot other guest resources through
+/// `HostMemory`; keeping the complete stream set here, rather than leaving `()`
+/// in the admission ledger, nevertheless means a conflict retains the exact
+/// EXEC commands instead of forcing the packet caller to reload them after the
+/// predecessor finishes.
+#[derive(Debug)]
+pub(crate) struct PreparedExecWork {
+    streams: Vec<Vec<u8>>,
+}
+
 pub(crate) enum RecordedExecCommit {
     Async(Box<AsyncExecCommit>),
     Synchronous(reims_vgpu_core::SubmissionContext),
@@ -1102,18 +1115,24 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         .submissions_scheduled
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .accept(submission_context.clone(), ())
+        .accept(submission_context.clone(), PreparedExecWork { streams })
         .expect("fresh packet identities reserve one scheduler position");
-    match dispatch {
-        reims_vgpu_core::SubmissionDispatch::Record(_) => {}
+    let prepared = match dispatch {
+        reims_vgpu_core::SubmissionDispatch::Record(work) => work.work,
         reims_vgpu_core::SubmissionDispatch::Queued { identity, .. } => {
-            let admitted = collect_exec_recordings(state, host, true);
+            let mut admitted = collect_exec_recordings(state, host, true);
+            let position = admitted
+                .iter()
+                .position(|work| work.context.identity == identity)
+                .expect("a declared conflict becomes recordable when active recorders quiesce");
+            let prepared = admitted.swap_remove(position).work;
             assert!(
-                admitted.contains(&identity),
-                "a declared conflict becomes recordable when active recorders quiesce"
+                admitted.is_empty(),
+                "the serial packet walker cannot leave another prepared EXEC without an owner"
             );
+            prepared
         }
-    }
+    };
     crate::runtime::drain::note_open_part(
         crate::runtime::drain::OpenPart::Use,
         use_started.elapsed().as_nanos() as u64,
@@ -1127,7 +1146,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         terminal_boundary: submission_context.segments.last().copied(),
         ..Default::default()
     };
-    for (stream_index, stream) in (0u32..).zip(streams) {
+    for (stream_index, stream) in (0u32..).zip(prepared.streams) {
         let walk_started = std::time::Instant::now();
         let finish_ns = walk_submitted_stream(
             state,
@@ -4990,7 +5009,7 @@ pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
     wait: bool,
-) -> Vec<SubmissionIdentity> {
+) -> Vec<reims_vgpu_core::SubmissionWork<PreparedExecWork>> {
     let worker_results = if wait {
         state.surface_recording_workers.quiesce()
     } else {
@@ -5017,7 +5036,7 @@ pub(crate) fn collect_exec_recordings<M: HostMemory + HostOps>(
                 RecordedExecCommit::Async(Box::new(AsyncExecCommit { pending, recording })),
             )
             .expect("the worker owns its live recording admission");
-        newly_recordable.extend(work.into_iter().map(|work| work.context.identity));
+        newly_recordable.extend(work);
     }
 
     loop {

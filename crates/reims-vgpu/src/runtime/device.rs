@@ -17,7 +17,10 @@ pub struct Device {
     pub(crate) executor: Arc<dyn Executor>,
     pub(crate) bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
     pub(crate) submissions_scheduled: std::sync::Mutex<
-        reims_vgpu_core::SubmissionScheduler<(), crate::runtime::exec::RecordedExecCommit>,
+        reims_vgpu_core::SubmissionScheduler<
+            crate::runtime::exec::PreparedExecWork,
+            crate::runtime::exec::RecordedExecCommit,
+        >,
     >,
     pub(crate) pending_execs: std::collections::HashMap<
         reims_vgpu_protocol::SubmissionIdentity,

@@ -21,6 +21,7 @@ fn terminal_surface_recording_and_completion_cross_a_worker_boundary_by_ownershi
 
     assert_send::<PreparedSurfaceTransaction>();
     assert_send::<RecordedSurfaceTransaction>();
+    assert_send::<PreparedExecWork>();
 }
 
 #[test]
@@ -39,7 +40,12 @@ fn an_async_exec_commits_only_after_its_worker_result_reaches_the_drain_owner() 
             .submissions_scheduled
             .lock()
             .unwrap()
-            .accept(context.clone(), ())
+            .accept(
+                context.clone(),
+                PreparedExecWork {
+                    streams: Vec::new(),
+                },
+            )
             .unwrap(),
         reims_vgpu_core::SubmissionDispatch::Record(_)
     ));
