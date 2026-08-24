@@ -4,6 +4,7 @@ use reims_vgpu_protocol::{
     ResourceId, ResourceObject, SegmentBoundary, SubmissionId, SubmissionIdentity,
     SubmissionResourceUse, TaskId,
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Protocol context shared by every operation in one submitted command stream.
@@ -76,6 +77,105 @@ pub enum SubmissionAdmissionRefusal {
 #[derive(Debug, Default)]
 pub struct SubmissionAdmissions {
     active: Vec<(SubmissionIdentity, SubmissionFootprint)>,
+}
+
+/// Guest-ordered ownership between concurrent recording and queue acceptance.
+///
+/// Recording workers may finish in any order.  A result becomes removable only
+/// when it is at the head of this unbounded arrival-order ledger, so a later
+/// EXEC can never reach a FIFO queue, presentation, or semantic completion
+/// before every earlier EXEC has produced its terminal recording result.
+#[derive(Debug)]
+pub struct SubmissionCommitOrder<T> {
+    pending: VecDeque<PendingCommit<T>>,
+}
+
+#[derive(Debug)]
+struct PendingCommit<T> {
+    identity: SubmissionIdentity,
+    recorded: Option<T>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmissionCommitOrderError {
+    AlreadyRegistered(SubmissionIdentity),
+    UnknownSubmission(SubmissionIdentity),
+    AlreadyRecorded(SubmissionIdentity),
+}
+
+impl<T> Default for SubmissionCommitOrder<T> {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+impl<T> SubmissionCommitOrder<T> {
+    /// Reserve this EXEC's place when its packet is accepted, before recording
+    /// is allowed to fan out.
+    pub fn register(
+        &mut self,
+        identity: SubmissionIdentity,
+    ) -> Result<(), SubmissionCommitOrderError> {
+        if self.pending.iter().any(|entry| entry.identity == identity) {
+            return Err(SubmissionCommitOrderError::AlreadyRegistered(identity));
+        }
+        self.pending.push_back(PendingCommit {
+            identity,
+            recorded: None,
+        });
+        Ok(())
+    }
+
+    /// Publish one worker's terminal recording result without changing its
+    /// guest-order position.
+    pub fn record(
+        &mut self,
+        identity: SubmissionIdentity,
+        result: T,
+    ) -> Result<(), SubmissionCommitOrderError> {
+        let Some(entry) = self
+            .pending
+            .iter_mut()
+            .find(|entry| entry.identity == identity)
+        else {
+            return Err(SubmissionCommitOrderError::UnknownSubmission(identity));
+        };
+        if entry.recorded.is_some() {
+            return Err(SubmissionCommitOrderError::AlreadyRecorded(identity));
+        }
+        entry.recorded = Some(result);
+        Ok(())
+    }
+
+    /// Remove the next queue-acceptable recording, if the oldest EXEC has
+    /// finished.  Later finished entries remain parked behind an unfinished
+    /// predecessor.
+    pub fn take_ready(&mut self) -> Option<(SubmissionIdentity, T)> {
+        let ready = self.pending.front()?.recorded.is_some();
+        ready.then(|| {
+            let entry = self.pending.pop_front().expect("the ready head exists");
+            (
+                entry.identity,
+                entry.recorded.expect("the removed head was recorded"),
+            )
+        })
+    }
+
+    /// Abort every registered EXEC in arrival order after device loss or
+    /// session reset.  The caller owns the typed refusal attached to each one.
+    pub fn abort_all(&mut self) -> impl Iterator<Item = SubmissionIdentity> + '_ {
+        self.pending.drain(..).map(|entry| entry.identity)
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
 }
 
 impl SubmissionAdmissions {
@@ -236,8 +336,9 @@ impl SubmissionTracker {
 #[cfg(test)]
 mod tests {
     use super::{
-        SubmissionAdmissionRefusal, SubmissionAdmissions, SubmissionConflict, SubmissionContext,
-        SubmissionFootprint, SubmissionTracker,
+        SubmissionAdmissionRefusal, SubmissionAdmissions, SubmissionCommitOrder,
+        SubmissionCommitOrderError, SubmissionConflict, SubmissionContext, SubmissionFootprint,
+        SubmissionTracker,
     };
     use reims_vgpu_protocol::{
         ObjectTableRef, ResourceId, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind,
@@ -267,6 +368,56 @@ mod tests {
             segments: std::sync::Arc::from([]),
             segment: None,
         }
+    }
+
+    #[test]
+    fn recording_finish_order_cannot_overtake_guest_commit_order() {
+        let first = context_with_resources(40, []).identity;
+        let second = context_with_resources(41, []).identity;
+        let mut order = SubmissionCommitOrder::default();
+        order.register(first).unwrap();
+        order.register(second).unwrap();
+
+        order.record(second, "second").unwrap();
+        assert_eq!(order.take_ready(), None);
+        order.record(first, "first").unwrap();
+        assert_eq!(order.take_ready(), Some((first, "first")));
+        assert_eq!(order.take_ready(), Some((second, "second")));
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn commit_positions_and_terminal_results_are_single_owner() {
+        let identity = context_with_resources(42, []).identity;
+        let unknown = context_with_resources(43, []).identity;
+        let mut order = SubmissionCommitOrder::default();
+        order.register(identity).unwrap();
+        assert_eq!(
+            order.register(identity),
+            Err(SubmissionCommitOrderError::AlreadyRegistered(identity))
+        );
+        assert_eq!(
+            order.record(unknown, 1),
+            Err(SubmissionCommitOrderError::UnknownSubmission(unknown))
+        );
+        order.record(identity, 2).unwrap();
+        assert_eq!(
+            order.record(identity, 3),
+            Err(SubmissionCommitOrderError::AlreadyRecorded(identity))
+        );
+    }
+
+    #[test]
+    fn device_loss_aborts_every_registered_position_in_guest_order() {
+        let identities = [44, 45, 46].map(|id| context_with_resources(id, []).identity);
+        let mut order = SubmissionCommitOrder::<()>::default();
+        for identity in identities {
+            order.register(identity).unwrap();
+        }
+        order.record(identities[1], ()).unwrap();
+
+        assert_eq!(order.abort_all().collect::<Vec<_>>(), identities);
+        assert!(order.is_empty());
     }
 
     #[test]
