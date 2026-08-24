@@ -4377,8 +4377,9 @@ impl Default for PresentationState {
 #[derive(Debug)]
 pub struct DeviceState {
     pub id: DeviceId,
-    /// Identity, participation, segment cursor, and completion for the active
-    /// decoded submission.
+    /// Monotonic identity source for decoded submissions. Immutable
+    /// participation and segment context travel with each scheduler/worker
+    /// envelope rather than occupying one device-global cursor.
     pub(crate) submissions: reims_vgpu_core::SubmissionTracker,
     /// Guest page shift for PFN↔GPA wire math (12 = x86, 14 = arm64e).
     pub page_shift: u32,

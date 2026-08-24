@@ -444,23 +444,19 @@ impl SubmissionFootprint {
     }
 }
 
-/// Device-local ownership of the currently decoded submission envelope.
+/// Device-local source of nonzero submission identities.
 ///
-/// Callers can obtain immutable [`SubmissionContext`] snapshots, but cannot
-/// mutate participation or segment position independently of submission
-/// identity. Reset drops this owner and therefore its active envelope.
+/// Immutable envelopes are owned by scheduler entries and resolver workers;
+/// keeping an active envelope here would make concurrent resolution
+/// unrepresentable by giving the whole device one mutable segment cursor.
 #[derive(Debug)]
 pub struct SubmissionTracker {
     next_id: u64,
-    active: Option<SubmissionContext>,
 }
 
 impl Default for SubmissionTracker {
     fn default() -> Self {
-        Self {
-            next_id: 1,
-            active: None,
-        }
+        Self { next_id: 1 }
     }
 }
 
@@ -474,60 +470,6 @@ impl SubmissionTracker {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         identity
     }
-
-    /// Install one complete participation envelope before its first segment.
-    pub fn begin(
-        &mut self,
-        identity: SubmissionIdentity,
-        resources: Arc<[SubmissionResourceUse]>,
-        segments: Arc<[SegmentBoundary]>,
-    ) {
-        assert!(
-            self.active.is_none(),
-            "a submission cannot begin while another remains active"
-        );
-        self.active = Some(SubmissionContext {
-            identity,
-            resources,
-            segments,
-            segment: None,
-        });
-    }
-
-    /// Reinstall an already-owned immutable envelope while its parked EXEC is
-    /// being resolved.
-    ///
-    /// Admission owns the context between these short active intervals. This
-    /// keeps the decoder cursor single-owner without requiring a conflicting
-    /// submission to occupy it while waiting for an older recorder.
-    pub fn resume(&mut self, context: SubmissionContext) {
-        assert!(
-            self.active.is_none(),
-            "a submission cannot resume while another remains active"
-        );
-        self.active = Some(context);
-    }
-
-    /// Select the active submission segment, when this operation belongs to an
-    /// EXEC envelope. Direct tools and focused walkers intentionally have no
-    /// active submission and continue to use standalone executor context.
-    pub fn enter_segment_if_active(&mut self, segment: Option<SegmentBoundary>) {
-        if let Some(active) = self.active.as_mut() {
-            active.segment = segment;
-        }
-    }
-
-    /// Immutable executor snapshot, or a standalone context for direct tools.
-    pub fn context_or_standalone(&self, task_id: u32) -> SubmissionContext {
-        self.active
-            .clone()
-            .unwrap_or_else(|| SubmissionContext::standalone(task_id))
-    }
-
-    /// Consume the active envelope at its single completion boundary.
-    pub fn finish(&mut self) -> Option<SubmissionContext> {
-        self.active.take()
-    }
 }
 
 #[cfg(test)]
@@ -539,8 +481,8 @@ mod tests {
         SubmissionTracker, SubmissionWork,
     };
     use reims_vgpu_protocol::{
-        ObjectTableRef, ResourceId, ResourceObject, ResourceValidity, SegmentBoundary, SegmentKind,
-        SubmissionId, SubmissionIdentity, SubmissionResourceUse, TaskId,
+        ObjectTableRef, ResourceId, ResourceObject, ResourceValidity, SubmissionId,
+        SubmissionIdentity, SubmissionResourceUse, TaskId,
     };
 
     fn context_with_resources(
@@ -885,41 +827,12 @@ mod tests {
     }
 
     #[test]
-    fn tracker_owns_identity_envelope_segment_and_completion_together() {
+    fn tracker_mints_nonzero_identities_per_device() {
         let mut tracker = SubmissionTracker::default();
         let first = tracker.next_identity(TaskId::new(7));
         let second = tracker.next_identity(TaskId::new(7));
         assert_ne!(first.id, second.id);
         assert_ne!(first.id.get(), 0);
-
-        let segment = SegmentBoundary {
-            stream_index: 2,
-            index: 3,
-            kind: SegmentKind::Render,
-            continues_previous: false,
-            continues_next: true,
-        };
-        tracker.begin(
-            first,
-            std::sync::Arc::from([]),
-            std::sync::Arc::from([segment]),
-        );
-        tracker.enter_segment_if_active(Some(segment));
-        let snapshot = tracker.context_or_standalone(99);
-        assert_eq!(snapshot.identity, first);
-        assert_eq!(snapshot.segment, Some(segment));
-        assert_eq!(snapshot.segments.as_ref(), &[segment]);
-
-        let finished = tracker
-            .finish()
-            .expect("the active envelope completes once");
-        assert_eq!(finished.identity, first);
-        assert!(tracker.finish().is_none());
-        assert_eq!(tracker.context_or_standalone(99).identity.id.get(), 0);
-
-        tracker.resume(finished.clone());
-        assert_eq!(tracker.context_or_standalone(99), finished);
-        assert_eq!(tracker.finish(), Some(finished));
-        assert!(tracker.finish().is_none());
+        assert_eq!(second.id.get(), first.id.get() + 1);
     }
 }

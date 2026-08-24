@@ -826,14 +826,14 @@ pub enum ExecPhase {
     Segments,
     /// Opening the submission: `consume_resource_table`, `begin_submission`,
     /// materializing one `SubmissionResourceUse` per resource descriptor, and
-    /// `submissions.begin`.
+    /// handing the immutable envelope to scheduler admission.
     ///
     /// Scales with the resource table's length rather than with the stream's,
     /// which is why it is separated from [`Self::Segments`] beside it — one is
     /// paid per byte of command stream and the other per resource the guest
     /// named, and a boot cannot tell them apart while they share a field.
     Open,
-    /// Closing it: `submissions.finish` and `complete_submission`.
+    /// Closing its backend and resource-lifetime submission owners.
     Close,
     /// Everything else the function does — header and payload validation, the
     /// resource-table decode, and any path that returns early. Derived rather
@@ -1019,7 +1019,7 @@ pub enum OpenPart {
     /// it names into this submission.
     Begin,
     /// Materializing one `SubmissionResourceUse` per descriptor and handing the
-    /// slice to `submissions.begin`.
+    /// slice to the immutable scheduler envelope.
     Use,
 }
 

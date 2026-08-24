@@ -12,6 +12,7 @@ pub use reims_vgpu_vulkan::engine::{
     CounterSnapshot, DrawError, DrawPhaseWindow, EngineFacadeDecline,
 };
 pub use reims_vgpu_vulkan::m2v_cache::M2vCacheDecline;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -98,9 +99,92 @@ impl ExecutionScope {
     }
 }
 
-/// Snapshot the active protocol context before entering a backend call.
-pub fn context_for(state: &crate::runtime::Device, task_id: u32) -> SubmissionContext {
-    state.submissions.context_or_standalone(task_id)
+thread_local! {
+    static CURRENT_SUBMISSION: RefCell<Option<SubmissionContext>> = const { RefCell::new(None) };
+}
+
+/// Restores the caller's prior immutable submission envelope when one EXEC
+/// resolution interval ends.
+pub(crate) struct SubmissionScope {
+    previous: Option<SubmissionContext>,
+}
+
+impl Drop for SubmissionScope {
+    fn drop(&mut self) {
+        CURRENT_SUBMISSION.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+/// Install one EXEC-owned envelope on the thread that resolves it.
+///
+/// The scope carries no semantic state. It is dynamic plumbing for helpers
+/// several layers below the stream walker, and each backend call clones the
+/// immutable value before crossing its port.
+pub(crate) fn enter_submission(context: SubmissionContext) -> SubmissionScope {
+    let previous = CURRENT_SUBMISSION.with(|slot| slot.replace(Some(context)));
+    SubmissionScope { previous }
+}
+
+/// Select the segment containing subsequent commands in this thread's EXEC.
+pub(crate) fn enter_submission_segment(segment: Option<reims_vgpu_protocol::SegmentBoundary>) {
+    CURRENT_SUBMISSION.with(|slot| {
+        if let Some(context) = slot.borrow_mut().as_mut() {
+            context.segment = segment;
+        }
+    });
+}
+
+/// Snapshot this worker's protocol context before entering a backend call.
+pub fn context_for(_state: &crate::runtime::Device, task_id: u32) -> SubmissionContext {
+    CURRENT_SUBMISSION
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(|| SubmissionContext::standalone(task_id))
+}
+
+#[cfg(test)]
+mod submission_scope_tests {
+    use super::*;
+    use reims_vgpu_protocol::{SubmissionId, SubmissionIdentity, TaskId};
+
+    fn context(id: u64) -> SubmissionContext {
+        SubmissionContext {
+            identity: SubmissionIdentity {
+                id: SubmissionId::new(id),
+                task: TaskId::new(7),
+            },
+            resources: Arc::from([]),
+            segments: Arc::from([]),
+            segment: None,
+        }
+    }
+
+    #[test]
+    fn submission_scopes_restore_and_threads_do_not_share_a_cursor() {
+        let state =
+            crate::runtime::Device::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        let outer = enter_submission(context(11));
+        assert_eq!(context_for(&state, 7).identity.id.get(), 11);
+        {
+            let _inner = enter_submission(context(12));
+            assert_eq!(context_for(&state, 7).identity.id.get(), 12);
+        }
+        assert_eq!(context_for(&state, 7).identity.id.get(), 11);
+
+        let other = std::thread::spawn(|| {
+            let state = crate::runtime::Device::new(
+                crate::model::DeviceId(2),
+                crate::model::PAGE_SHIFT_X86,
+            );
+            let _scope = enter_submission(context(13));
+            context_for(&state, 7).identity.id.get()
+        });
+        assert_eq!(other.join().unwrap(), 13);
+        assert_eq!(context_for(&state, 7).identity.id.get(), 11);
+        drop(outer);
+        assert_eq!(context_for(&state, 7).identity.id.get(), 0);
+    }
 }
 
 pub type ResolvedSubmission =

@@ -1173,7 +1173,7 @@ fn execute_prepared_exec<M: HostMemory + HostOps>(
                 mut measured_ns,
             },
     } = work;
-    state.submissions.resume(context.clone());
+    let _submission_scope = crate::runtime::executor::enter_submission(context.clone());
 
     let mut encoders = EncoderWalkState {
         terminal_boundary: context.segments.last().copied(),
@@ -1208,11 +1208,6 @@ fn execute_prepared_exec<M: HostMemory + HostOps>(
     }
     let close_started = std::time::Instant::now();
     if let Some(transaction) = encoders.pending_surface {
-        let finished_context = state
-            .submissions
-            .finish()
-            .expect("the terminal transaction closes its EXEC envelope");
-        debug_assert_eq!(finished_context.identity, context.identity);
         let identity = context.identity;
         let fallback = SurfaceRecordingFallback {
             task_id: transaction.completion.core.task_id,
@@ -1243,11 +1238,6 @@ fn execute_prepared_exec<M: HostMemory + HostOps>(
             .expect("one EXEC owns one terminal recording worker");
         return result;
     }
-    let finished_context = state
-        .submissions
-        .finish()
-        .expect("the synchronous path closes its EXEC envelope");
-    debug_assert_eq!(finished_context.identity, context.identity);
     let close_ns = close_started.elapsed().as_nanos() as u64;
     measured_ns += close_ns;
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Close, close_ns);
@@ -1801,7 +1791,7 @@ fn walk_submitted_stream<M: HostMemory + HostOps>(
         }
 
         let boundary = semantic_segment_boundary(stream_index, &seg);
-        state.submissions.enter_segment_if_active(boundary);
+        crate::runtime::executor::enter_submission_segment(boundary);
 
         let mut encoder = if seg.continues_previous {
             match encoders.open.take() {
