@@ -122,6 +122,94 @@ fn short_payload_noop() {
     assert_eq!(r.streams_loaded, 0);
 }
 
+/// The packet's semantic identity must reach the backend at the exact point
+/// its command streams end. Without this event a backend has no contract-owned
+/// lifetime for an independently recorded encoder and can only infer one from
+/// timing or from the next packet arriving.
+#[test]
+fn an_exec_packet_closes_its_exact_backend_submission() {
+    use crate::runtime::executor::*;
+    use reims_vgpu_core::{
+        CapabilityService, ComputeResidencyService, ExecutionPort, GuestWriteService,
+        PresentationService, ReadbackService, ResidentService,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct CloseProbe {
+        closed: Mutex<Vec<reims_vgpu_protocol::SubmissionIdentity>>,
+    }
+
+    impl ExecutionPort for CloseProbe {
+        type Submission = ResolvedSubmission;
+        type Completion = ExecutionCompletion;
+        type Error = DrawError;
+
+        fn execute(&self, _submission: Self::Submission) -> Result<Self::Completion, Self::Error> {
+            unreachable!("the test packet contains no executable stream")
+        }
+    }
+    impl ResidentService for CloseProbe {}
+    impl GuestWriteService for CloseProbe {}
+    impl ComputeResidencyService for CloseProbe {}
+    impl CapabilityService for CloseProbe {}
+    impl PresentationService for CloseProbe {}
+    impl ReadbackService for CloseProbe {
+        type Error = DrawError;
+
+        fn read_target(
+            &self,
+            _identity: &crate::model::TargetIdentity,
+        ) -> Result<reims_vgpu_core::TargetReadback, Self::Error> {
+            unreachable!("the test packet performs no readback")
+        }
+    }
+    impl GuestPageTransferService for CloseProbe {}
+    impl ResidentCopyService for CloseProbe {}
+    impl CompletionService for CloseProbe {}
+    impl SubmissionBatchService for CloseProbe {
+        fn close_submission(&self, identity: reims_vgpu_protocol::SubmissionIdentity) {
+            self.closed.lock().unwrap().push(identity);
+        }
+    }
+    impl GuestImportService for CloseProbe {}
+    impl GuestImagePlanningService for CloseProbe {}
+    impl MaintenanceService for CloseProbe {}
+    impl SessionService for CloseProbe {}
+    impl ObservationService for CloseProbe {}
+    impl ShaderTranslationService for CloseProbe {}
+    impl RenderBufferPlanningService for CloseProbe {}
+    impl WindowPresentationService for CloseProbe {}
+    impl Executor for CloseProbe {}
+
+    let probe = std::sync::Arc::new(CloseProbe::default());
+    let mut state = Device::new_with_executor(DeviceId(1), PAGE_SHIFT_X86, probe.clone());
+    let mut host = FakeHost::new();
+    state.define_task(3, 0x1_0000, 2);
+
+    // A declared zero-length command buffer is visited and refused, leaving an
+    // otherwise empty but well-formed submission. That isolates the boundary
+    // event from draw execution.
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+
+    let result = process_exec_indirect2(&mut state, &mut host, &payload);
+    assert_eq!(result.task_id, 3);
+    let closed = probe.closed.lock().unwrap();
+    assert_eq!(closed.len(), 1, "one packet has one close boundary");
+    assert_eq!(closed[0].task.get(), 3);
+    assert_ne!(
+        closed[0].id.get(),
+        0,
+        "a packet identity is never standalone"
+    );
+}
+
 /// An exec packet naming a slot that is not live must be refused under the
 /// word the guest sent, not silently re-aimed at slot `word >> 1`.
 ///

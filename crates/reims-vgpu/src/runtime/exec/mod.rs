@@ -1079,6 +1079,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     }
     let close_started = std::time::Instant::now();
     if let Some(context) = state.submissions.finish() {
+        state.executor.close_submission(context.identity);
         state.task_objects.resources.complete_submission(
             context.identity.id,
             context.resources.iter().filter_map(|use_| use_.resource),
