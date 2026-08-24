@@ -272,6 +272,13 @@ impl PreparedDrawSubmission {
 }
 
 impl PreparedDraw {
+    pub(super) fn resident_chain_identity(&self) -> Option<&TargetIdentity> {
+        match &self.route {
+            DrawCompletionRoute::ResidentChain(identity) => Some(identity),
+            _ => None,
+        }
+    }
+
     pub(super) fn new(
         request: reims_vgpu_core::DrawRequest,
         route: DrawCompletionRoute,

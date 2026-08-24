@@ -4503,6 +4503,150 @@ fn retire_render_barriers_after(
     }
 }
 
+struct PreparedResidentRecord {
+    req: draw::DrawEncodeRequest,
+    pipeline_ref: u32,
+    icb: bool,
+    draw_index: usize,
+}
+
+fn apply_prepared_resident_prefix(
+    out: &mut ExecResult,
+    records: &[PreparedResidentRecord],
+    progress: draw::PreparedM2vProgress,
+    visibility_counts: &mut std::collections::BTreeMap<u64, u64>,
+    total_draws: usize,
+) -> Result<Option<crate::model::TargetIdentity>, (Option<crate::model::TargetIdentity>, usize)> {
+    let completed_len = progress.completed.len();
+    let mut last_identity = None;
+    for (index, (record, completed)) in records.iter().zip(progress.completed).enumerate() {
+        if let (Some(arming), Some(samples)) = (record.req.visibility, completed.visibility_samples)
+        {
+            let slot = visibility_counts.entry(arming.offset).or_default();
+            *slot = slot.saturating_add(samples);
+        } else if let (Some(arming), None) = (record.req.visibility, completed.visibility_samples) {
+            crate::runtime::drain::note_store_route("visibility_query_unanswered");
+            if crate::observe::first_sight(
+                "visibility_query_unanswered",
+                u64::from(arming.mode.guest_ordinal()),
+            ) {
+                crate::observe::fail(format!(
+                    "visibility_query_unanswered reason=visibility_query_unanswered \
+                     task={} pipe={} mode={} off={:#x}",
+                    record.req.task_id,
+                    record.pipeline_ref,
+                    arming.mode.guest_ordinal(),
+                    arming.offset
+                ));
+            }
+        }
+        match (completed.status, completed.resident_identity) {
+            (EncodeStatus::Ok, Some(identity)) => {
+                out.draws_ok = out.draws_ok.saturating_add(1);
+                if record.icb {
+                    out.render_icb_ok = out.render_icb_ok.saturating_add(1);
+                    crate::runtime::drain::note_store_route("icb_exec_ok");
+                }
+                last_identity = Some(identity);
+            }
+            (status, _) => {
+                out.draws_fail = out.draws_fail.saturating_add(1);
+                if record.icb {
+                    out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+                }
+                note_draw_encode_fail(
+                    record.req.task_id,
+                    record.pipeline_ref,
+                    status,
+                    record.draw_index,
+                    total_draws,
+                );
+                return Err((last_identity, index));
+            }
+        }
+    }
+    if let Some(failure) = progress.failure {
+        let index = completed_len;
+        if let Some(record) = records.get(index) {
+            out.draws_fail = out.draws_fail.saturating_add(1);
+            if record.icb {
+                out.render_icb_fail = out.render_icb_fail.saturating_add(1);
+            }
+            let reason = crate::observe::Decline::slug(&failure);
+            note_draw_encode_fail(
+                record.req.task_id,
+                record.pipeline_ref,
+                EncodeStatus::BackendUnavailable(reason),
+                record.draw_index,
+                total_draws,
+            );
+        }
+        return Err((last_identity, index));
+    }
+    Ok(last_identity)
+}
+
+fn flush_prepared_resident(
+    state: &mut Device,
+    out: &mut ExecResult,
+    submission: &mut draw::PreparedM2vSubmission,
+    records: &mut Vec<PreparedResidentRecord>,
+    context: &reims_vgpu_core::SubmissionContext,
+    visibility_counts: &mut std::collections::BTreeMap<u64, u64>,
+    total_draws: usize,
+) -> Result<Option<crate::model::TargetIdentity>, (Option<crate::model::TargetIdentity>, usize)> {
+    if records.is_empty() {
+        return Ok(None);
+    }
+    let progress = std::mem::replace(
+        submission,
+        draw::PreparedM2vSubmission::new(context.clone()),
+    )
+    .execute(state)
+    .map_err(|error| {
+        crate::observe::fail(format!(
+            "draw_submission_fail reason={} detail={error}",
+            crate::observe::Decline::slug(&error)
+        ));
+        out.draws_fail = out.draws_fail.saturating_add(1);
+        (None, 0)
+    })?;
+    let identity =
+        apply_prepared_resident_prefix(out, records, progress, visibility_counts, total_draws)?;
+    records.clear();
+    Ok(identity)
+}
+
+fn land_prepared_resident_prefix<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    task_id: u32,
+    acc: &StreamAccum,
+    chain_rgba: &mut Option<Vec<u8>>,
+    records: &[PreparedResidentRecord],
+    resident_identity: Option<&crate::model::TargetIdentity>,
+    failed_index: usize,
+) {
+    let Some(record) = records.get(failed_index).or_else(|| records.last()) else {
+        return;
+    };
+    land_chain_before_abandon(
+        state,
+        host,
+        chain_rgba,
+        ChainAbandonContext {
+            task_id,
+            acc,
+            req: &record.req,
+            resident_identity,
+            end: ChainEnd {
+                cause: draw::ChainAbandonCause::TerminalRefusal,
+                resident: resident_identity.is_some(),
+            },
+        },
+    );
+}
+
 fn finish_stream<M: HostMemory + HostOps>(
     state: &mut Device,
     host: &mut M,
@@ -4552,6 +4696,9 @@ fn finish_stream<M: HostMemory + HostOps>(
         // independent, which is why this is a map and not a scalar.
         let mut visibility_counts: std::collections::BTreeMap<u64, u64> =
             std::collections::BTreeMap::new();
+        let submission_context = crate::runtime::executor::context_for(state, task_id);
+        let mut prepared_resident = draw::PreparedM2vSubmission::new(submission_context.clone());
+        let mut prepared_resident_records: Vec<PreparedResidentRecord> = Vec::new();
         // Resident render-pass chain: intermediate records keep their content
         // on the engine target (no CPU chain buffer); records 2+ LoadFromTarget.
         let mut resident_chain_identity: Option<crate::model::TargetIdentity> = None;
@@ -4758,6 +4905,173 @@ fn finish_stream<M: HostMemory + HostOps>(
                 let (do_writeback, force_full_store) = multi_draw_store_plan(draw_list.len(), di);
                 if do_writeback {
                     out.render_guest_stores = out.render_guest_stores.saturating_add(1);
+                }
+                if !do_writeback {
+                    match draw::prepare_intermediate_draw_chain(state, host, &req) {
+                        Ok(Some(prepared)) if prepared.resident_chain_identity().is_some() => {
+                            resident_chain_identity = prepared.resident_chain_identity().cloned();
+                            prepared_resident.push(prepared);
+                            prepared_resident_records.push(PreparedResidentRecord {
+                                req,
+                                pipeline_ref: pd.pipeline_ref,
+                                icb: pd.icb_ref.is_some(),
+                                draw_index: di,
+                            });
+                            pending_render_barriers.clear();
+                            continue;
+                        }
+                        Ok(Some(prepared)) => {
+                            match flush_prepared_resident(
+                                state,
+                                out,
+                                &mut prepared_resident,
+                                &mut prepared_resident_records,
+                                &submission_context,
+                                &mut visibility_counts,
+                                draw_list.len(),
+                            ) {
+                                Ok(identity) => resident_chain_identity = identity,
+                                Err((identity, failed_index)) => {
+                                    land_prepared_resident_prefix(
+                                        state,
+                                        host,
+                                        task_id,
+                                        acc,
+                                        &mut chain_rgba,
+                                        &prepared_resident_records,
+                                        identity.as_ref(),
+                                        failed_index,
+                                    );
+                                    break;
+                                }
+                            }
+                            let encode = prepared.execute_intermediate(state);
+                            // This uncommon CPU-chain route cannot be planned
+                            // past its pixels. It remains an explicit barrier;
+                            // resident draws collected before it are flushed by
+                            // the final-record boundary below.
+                            retire_render_barriers_after(
+                                encode.status,
+                                &mut pending_render_barriers,
+                            );
+                            fin.enter(crate::runtime::drain::FinishPhase::Result);
+                            match (encode.status, encode.chain_rgba, encode.resident_identity) {
+                                (EncodeStatus::Ok, Some(rgba), _) => {
+                                    out.draws_ok = out.draws_ok.saturating_add(1);
+                                    chain_rgba = Some(rgba);
+                                    continue;
+                                }
+                                (EncodeStatus::Ok, None, Some(identity)) => {
+                                    out.draws_ok = out.draws_ok.saturating_add(1);
+                                    resident_chain_identity = Some(identity);
+                                    continue;
+                                }
+                                (status, _, _) => {
+                                    out.draws_fail = out.draws_fail.saturating_add(1);
+                                    note_draw_encode_fail(
+                                        task_id,
+                                        pd.pipeline_ref,
+                                        status,
+                                        di,
+                                        draw_list.len(),
+                                    );
+                                    land_chain_before_abandon(
+                                        state,
+                                        host,
+                                        &mut chain_rgba,
+                                        ChainAbandonContext {
+                                            task_id,
+                                            acc,
+                                            req: &req,
+                                            resident_identity: resident_chain_identity.as_ref(),
+                                            end: ChainEnd {
+                                                cause: draw::ChainAbandonCause::TerminalRefusal,
+                                                resident: resident_chain_identity.is_some(),
+                                            },
+                                        },
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(encode) => {
+                            match flush_prepared_resident(
+                                state,
+                                out,
+                                &mut prepared_resident,
+                                &mut prepared_resident_records,
+                                &submission_context,
+                                &mut visibility_counts,
+                                draw_list.len(),
+                            ) {
+                                Ok(identity) => resident_chain_identity = identity,
+                                Err((identity, failed_index)) => {
+                                    land_prepared_resident_prefix(
+                                        state,
+                                        host,
+                                        task_id,
+                                        acc,
+                                        &mut chain_rgba,
+                                        &prepared_resident_records,
+                                        identity.as_ref(),
+                                        failed_index,
+                                    );
+                                    break;
+                                }
+                            }
+                            out.draws_fail = out.draws_fail.saturating_add(1);
+                            note_draw_encode_fail(
+                                task_id,
+                                pd.pipeline_ref,
+                                encode.status,
+                                di,
+                                draw_list.len(),
+                            );
+                            land_chain_before_abandon(
+                                state,
+                                host,
+                                &mut chain_rgba,
+                                ChainAbandonContext {
+                                    task_id,
+                                    acc,
+                                    req: &req,
+                                    resident_identity: resident_chain_identity.as_ref(),
+                                    end: ChainEnd {
+                                        cause: draw::ChainAbandonCause::TerminalRefusal,
+                                        resident: resident_chain_identity.is_some(),
+                                    },
+                                },
+                            );
+                            break;
+                        }
+                    }
+                }
+                if !prepared_resident_records.is_empty() {
+                    match flush_prepared_resident(
+                        state,
+                        out,
+                        &mut prepared_resident,
+                        &mut prepared_resident_records,
+                        &submission_context,
+                        &mut visibility_counts,
+                        draw_list.len(),
+                    ) {
+                        Ok(identity) => resident_chain_identity = identity,
+                        Err((identity, failed_index)) => {
+                            land_prepared_resident_prefix(
+                                state,
+                                host,
+                                task_id,
+                                acc,
+                                &mut chain_rgba,
+                                &prepared_resident_records,
+                                identity.as_ref(),
+                                failed_index,
+                            );
+                            break;
+                        }
+                    }
                 }
                 let draw_started = std::time::Instant::now();
                 fin.enter(crate::runtime::drain::FinishPhase::Encode);

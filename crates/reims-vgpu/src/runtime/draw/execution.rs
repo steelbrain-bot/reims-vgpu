@@ -2059,7 +2059,7 @@ pub(super) fn resolve_gva_load_source<M: HostMemory + HostOps>(
     }
 }
 
-struct PreparedM2vDraw {
+pub(crate) struct PreparedM2vDraw {
     draw: PreparedDraw,
     task_id: u32,
     pipeline_ref: u32,
@@ -2069,65 +2069,213 @@ struct PreparedM2vDraw {
 }
 
 impl PreparedM2vDraw {
+    fn into_submission_parts(self) -> (PreparedDraw, PreparedM2vMetadata) {
+        (
+            self.draw,
+            PreparedM2vMetadata {
+                task_id: self.task_id,
+                pipeline_ref: self.pipeline_ref,
+                width: self.width,
+                height: self.height,
+                census_verbose: self.census_verbose,
+            },
+        )
+    }
+
     fn execute(self, state: &mut Device) -> Result<M2vDrawSpan, ExecutorDiagnostic> {
-        let Self {
-            draw,
-            task_id,
-            pipeline_ref,
-            width,
-            height,
-            census_verbose,
-        } = self;
-        let completed = draw.execute(state, task_id)?;
-        crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
-        report_completed_pixels(
-            census_verbose,
-            pipeline_ref,
-            width,
-            height,
-            &completed.output,
-        );
-        let visibility_samples = completed.output.occlusion_samples;
-        let submission = completed.submission;
-        Ok(match completed.route {
-            DrawCompletionRoute::Pixels => M2vDrawSpan::Pixels {
-                submission,
-                bytes: completed.output.pixels,
-                bgra: completed.output.pixels_bgra,
-                visibility_samples,
-            },
-            DrawCompletionRoute::EffectsOnly => M2vDrawSpan::EffectsOnly {
-                submission,
-                visibility_samples,
-            },
-            DrawCompletionRoute::ResidentChain(identity) => M2vDrawSpan::ResidentChain {
-                submission,
-                identity,
-                visibility_samples,
-            },
-            DrawCompletionRoute::ResidentGvaReadback(identity) => {
-                M2vDrawSpan::ResidentGvaReadback {
-                    submission,
-                    identity,
-                    visibility_samples,
-                }
+        let (draw, meta) = self.into_submission_parts();
+        let completed = draw.execute(state, meta.task_id)?;
+        Ok(finish_m2v_draw(
+            meta.pipeline_ref,
+            meta.width,
+            meta.height,
+            meta.census_verbose,
+            completed,
+        ))
+    }
+
+    pub(crate) fn resident_chain_identity(&self) -> Option<&crate::model::TargetIdentity> {
+        self.draw.resident_chain_identity()
+    }
+
+    pub(crate) fn execute_intermediate(self, state: &mut Device) -> DrawChainResult {
+        let pipeline_ref = self.pipeline_ref;
+        match self.execute(state) {
+            Ok(span) => intermediate_chain_result(span),
+            Err(error) => {
+                crate::observe::fail(format!(
+                    "linux_m2v_draw reason={} pipe={} detail={error}",
+                    crate::observe::Decline::slug(&error),
+                    pipeline_ref
+                ));
+                DrawChainResult::new(
+                    EncodeStatus::BackendUnavailable(crate::observe::Decline::slug(&error)),
+                    None,
+                    None,
+                    None,
+                )
             }
-            DrawCompletionRoute::ResidentGvaStore(identity) => M2vDrawSpan::ResidentGvaStore {
-                submission,
-                identity,
-                guest_store_pages: completed.output.guest_store_pages,
-                visibility_samples,
-            },
-            DrawCompletionRoute::ResidentSurfaceStore(identity) => {
-                M2vDrawSpan::ResidentSurfaceStore {
-                    submission,
-                    identity,
-                    guest_store_pages: completed.output.guest_store_pages,
-                    guest_store_window: completed.output.guest_store_window,
-                    visibility_samples,
-                }
-            }
+        }
+    }
+}
+
+struct PreparedM2vMetadata {
+    task_id: u32,
+    pipeline_ref: u32,
+    width: u32,
+    height: u32,
+    census_verbose: bool,
+}
+
+fn finish_m2v_draw(
+    pipeline_ref: u32,
+    width: u32,
+    height: u32,
+    census_verbose: bool,
+    completed: CompletedDraw,
+) -> M2vDrawSpan {
+    crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Store);
+    report_completed_pixels(
+        census_verbose,
+        pipeline_ref,
+        width,
+        height,
+        &completed.output,
+    );
+    let visibility_samples = completed.output.occlusion_samples;
+    let submission = completed.submission;
+    match completed.route {
+        DrawCompletionRoute::Pixels => M2vDrawSpan::Pixels {
+            submission,
+            bytes: completed.output.pixels,
+            bgra: completed.output.pixels_bgra,
+            visibility_samples,
+        },
+        DrawCompletionRoute::EffectsOnly => M2vDrawSpan::EffectsOnly {
+            submission,
+            visibility_samples,
+        },
+        DrawCompletionRoute::ResidentChain(identity) => M2vDrawSpan::ResidentChain {
+            submission,
+            identity,
+            visibility_samples,
+        },
+        DrawCompletionRoute::ResidentGvaReadback(identity) => M2vDrawSpan::ResidentGvaReadback {
+            submission,
+            identity,
+            visibility_samples,
+        },
+        DrawCompletionRoute::ResidentGvaStore(identity) => M2vDrawSpan::ResidentGvaStore {
+            submission,
+            identity,
+            guest_store_pages: completed.output.guest_store_pages,
+            visibility_samples,
+        },
+        DrawCompletionRoute::ResidentSurfaceStore(identity) => M2vDrawSpan::ResidentSurfaceStore {
+            submission,
+            identity,
+            guest_store_pages: completed.output.guest_store_pages,
+            guest_store_window: completed.output.guest_store_window,
+            visibility_samples,
+        },
+    }
+}
+
+/// One EXEC-owned sequence of prepared Vulkan draws and the metadata needed to
+/// turn its exact successful prefix back into guest-ordered draw completions.
+pub(crate) struct PreparedM2vSubmission {
+    context: reims_vgpu_core::SubmissionContext,
+    draws: Vec<PreparedM2vDraw>,
+}
+
+pub(crate) struct PreparedM2vProgress {
+    pub(crate) completed: Vec<DrawChainResult>,
+    pub(crate) failure: Option<ExecutorDiagnostic>,
+}
+
+impl PreparedM2vSubmission {
+    pub(crate) fn new(context: reims_vgpu_core::SubmissionContext) -> Self {
+        Self {
+            context,
+            draws: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, draw: PreparedM2vDraw) {
+        self.draws.push(draw);
+    }
+
+    pub(crate) fn execute(
+        self,
+        state: &mut Device,
+    ) -> Result<PreparedM2vProgress, ExecutorDiagnostic> {
+        let mut submission = PreparedDrawSubmission::new(self.context);
+        let mut metadata = Vec::with_capacity(self.draws.len());
+        for prepared in self.draws {
+            let (draw, meta) = prepared.into_submission_parts();
+            submission.push(draw);
+            metadata.push(meta);
+        }
+        let progress = submission.execute(state)?;
+        let completed = metadata
+            .into_iter()
+            .zip(progress.completed)
+            .map(|(meta, completed)| {
+                intermediate_chain_result(finish_m2v_draw(
+                    meta.pipeline_ref,
+                    meta.width,
+                    meta.height,
+                    meta.census_verbose,
+                    completed,
+                ))
+            })
+            .collect();
+        Ok(PreparedM2vProgress {
+            completed,
+            failure: progress.failure,
         })
+    }
+}
+
+fn intermediate_chain_result(span: M2vDrawSpan) -> DrawChainResult {
+    match span {
+        M2vDrawSpan::Pixels {
+            mut bytes,
+            bgra,
+            visibility_samples,
+            ..
+        } => {
+            reorder_rb_in_place(&mut bytes, bgra, false);
+            DrawChainResult::new(EncodeStatus::Ok, Some(bytes), visibility_samples, None)
+        }
+        M2vDrawSpan::ResidentChain {
+            identity,
+            visibility_samples,
+            ..
+        } => DrawChainResult::new(EncodeStatus::Ok, None, visibility_samples, Some(identity)),
+        M2vDrawSpan::EffectsOnly {
+            visibility_samples, ..
+        } => DrawChainResult::new(EncodeStatus::Ok, None, visibility_samples, None),
+        M2vDrawSpan::ResidentGvaReadback {
+            visibility_samples, ..
+        }
+        | M2vDrawSpan::ResidentGvaStore {
+            visibility_samples, ..
+        }
+        | M2vDrawSpan::ResidentSurfaceStore {
+            visibility_samples, ..
+        } => DrawChainResult::new(
+            EncodeStatus::BadArgs("intermediate_draw_selected_final_store_route"),
+            None,
+            visibility_samples,
+            None,
+        ),
+        M2vDrawSpan::None => DrawChainResult::new(
+            EncodeStatus::BackendUnavailable("draw_vk_nothing_stored"),
+            None,
+            None,
+            None,
+        ),
     }
 }
 
@@ -2299,6 +2447,27 @@ fn prepare_metal2vulkan_draw<M: HostMemory + HostOps>(
             height: h,
             census_verbose,
         }))
+    }
+}
+
+pub(crate) fn prepare_intermediate_draw_chain<M: HostMemory + HostOps>(
+    state: &mut Device,
+    host: &mut M,
+    req: &DrawEncodeRequest,
+) -> Result<Option<PreparedM2vDraw>, DrawChainResult> {
+    match prepare_metal2vulkan_draw(state, host, req, false) {
+        Ok(prepared) => Ok(prepared),
+        Err(error) => {
+            let slug = crate::observe::Decline::slug(&error);
+            crate::runtime::drain::note_store_route(slug);
+            linux_m2v_draw_failure(&error, req).fail_once(req.pipeline_ref as u64);
+            Err(DrawChainResult::new(
+                EncodeStatus::BackendUnavailable("draw_vk_nothing_stored"),
+                None,
+                None,
+                None,
+            ))
+        }
     }
 }
 

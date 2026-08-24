@@ -15,6 +15,57 @@ use reims_vgpu_core::endian::{st16, st32, st64};
 use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
 #[test]
+fn a_batched_resident_failure_preserves_the_exact_successful_prefix() {
+    let first_identity = crate::model::TargetIdentity::Gva {
+        gva: 0x4000,
+        width: 8,
+        height: 8,
+        generation: 3,
+        format: reims_vgpu_core::pixel_format::TexelLayout::Rgba8,
+    };
+    let records = vec![
+        PreparedResidentRecord {
+            req: draw::DrawEncodeRequest::default(),
+            pipeline_ref: 7,
+            icb: false,
+            draw_index: 2,
+        },
+        PreparedResidentRecord {
+            req: draw::DrawEncodeRequest::default(),
+            pipeline_ref: 8,
+            icb: false,
+            draw_index: 3,
+        },
+    ];
+    let progress = draw::PreparedM2vProgress {
+        completed: vec![
+            draw::DrawChainResult {
+                status: EncodeStatus::Ok,
+                chain_rgba: None,
+                visibility_samples: None,
+                resident_identity: Some(first_identity.clone()),
+            },
+            draw::DrawChainResult {
+                status: EncodeStatus::BadArgs("second_draw_refused"),
+                chain_rgba: None,
+                visibility_samples: None,
+                resident_identity: None,
+            },
+        ],
+        failure: None,
+    };
+    let mut out = ExecResult::default();
+    let mut visibility = std::collections::BTreeMap::new();
+
+    let failure = apply_prepared_resident_prefix(&mut out, &records, progress, &mut visibility, 5)
+        .expect_err("the second completion is a refusal");
+
+    assert_eq!(failure, (Some(first_identity), 1));
+    assert_eq!(out.draws_ok, 1);
+    assert_eq!(out.draws_fail, 1);
+}
+
+#[test]
 fn a_malformed_compute_barrier_blocks_the_later_dispatch() {
     let mut state = Device::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
