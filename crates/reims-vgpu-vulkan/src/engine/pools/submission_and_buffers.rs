@@ -1577,14 +1577,13 @@ impl ResourcePools {
         else {
             return Ok(());
         };
-        unsafe { self.apply_retired_entry(&ctx.device, retired) };
+        unsafe { self.apply_shared_retirement(&ctx.device, retired) };
         Ok(())
     }
 
-    /// Return a fence-complete encoder transaction to shared ownership.
-    unsafe fn apply_retired_entry(&mut self, device: &ash::Device, retired: RetiredEntry) {
-        let (encoder, shared) = retired.split();
-        unsafe { self.encoder.reclaim_retired_entry(device, encoder) };
+    /// Apply the shared half of a retirement after its encoder has reclaimed
+    /// every private object.
+    unsafe fn apply_shared_retirement(&mut self, device: &ash::Device, shared: SharedRetirement) {
         let SharedRetirement {
             visibility,
             cleanup,
@@ -1956,14 +1955,17 @@ impl EncoderPools {
             .map_err(|error| wait_error(counters, error, DeviceLostOp::PoolsFenceStatusBeginEntry))
     }
 
-    /// Recover one completed slot from encoder ownership. Shared pools are not
-    /// mutated here; the returned transaction carries everything they are owed.
+    /// Recover one completed slot from encoder ownership.
+    ///
+    /// Private objects return to this encoder before the shared transaction is
+    /// exported. A caller applying that transaction therefore cannot reach
+    /// back into this ring or recycle one recorder's objects into another.
     unsafe fn take_retired_slot(
         &mut self,
         ctx: &DeviceContext,
         counters: &EngineCounters,
         index: usize,
-    ) -> Result<Option<RetiredEntry>, DrawError> {
+    ) -> Result<Option<SharedRetirement>, DrawError> {
         if self.slots[index].pending.is_none() {
             return Ok(None);
         }
@@ -2004,7 +2006,12 @@ impl EncoderPools {
         // the only boundary that returns their state to idle for reuse.
         unsafe { self.gpu_span_read(ctx, index) };
         unsafe { self.readback_span_read(ctx, index) };
-        Ok(self.take_completed_entry(index))
+        let Some(retired) = self.take_completed_entry(index) else {
+            return Ok(None);
+        };
+        let (encoder, shared) = retired.split();
+        unsafe { self.reclaim_retired_entry(&ctx.device, encoder) };
+        Ok(Some(shared))
     }
 
     /// Install the shared order point for the command buffer about to record.
