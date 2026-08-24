@@ -1046,18 +1046,16 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         segments: submission_segments,
         segment: None,
     };
-    state
-        .submission_admissions
+    let dispatch = state
+        .submissions_scheduled
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .admit(&submission_context)
-        .expect("the serial packet walker has no earlier active submission");
-    state
-        .submission_commits
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .register(submission_identity)
-        .expect("fresh packet identities reserve one commit position");
+        .accept(submission_context.clone(), ())
+        .expect("fresh packet identities reserve one scheduler position");
+    assert!(
+        matches!(dispatch, reims_vgpu_core::SubmissionDispatch::Record(_)),
+        "the serial packet walker cannot leave an earlier recorder active"
+    );
     crate::runtime::drain::note_open_part(
         crate::runtime::drain::OpenPart::Use,
         use_started.elapsed().as_nanos() as u64,
@@ -1097,15 +1095,19 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     }
     let close_started = std::time::Instant::now();
     if let Some(context) = state.submissions.finish() {
-        state
-            .submission_commits
+        let newly_recordable = state
+            .submissions_scheduled
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .record(context.identity, context)
             .expect("the active packet owns its reserved commit position");
+        assert!(
+            newly_recordable.is_empty(),
+            "the serial packet walker cannot have a queued conflicting EXEC"
+        );
         loop {
             let ready = state
-                .submission_commits
+                .submissions_scheduled
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take_ready();
@@ -1125,14 +1127,6 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
                         .fail();
                 }
             }
-            assert!(
-                state
-                    .submission_admissions
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .retire(identity),
-                "queue acceptance retires the exact recording admission"
-            );
         }
     }
     let close_ns = close_started.elapsed().as_nanos() as u64;

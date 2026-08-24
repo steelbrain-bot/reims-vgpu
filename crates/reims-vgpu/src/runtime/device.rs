@@ -16,9 +16,8 @@ pub struct Device {
     pub state: crate::model::DeviceState,
     pub(crate) executor: Arc<dyn Executor>,
     pub(crate) bound_buffers: crate::runtime::bound_buffers::BoundBuffers,
-    pub(crate) submission_admissions: std::sync::Mutex<reims_vgpu_core::SubmissionAdmissions>,
-    pub(crate) submission_commits: std::sync::Mutex<
-        reims_vgpu_core::SubmissionCommitOrder<reims_vgpu_core::SubmissionContext>,
+    pub(crate) submissions_scheduled: std::sync::Mutex<
+        reims_vgpu_core::SubmissionScheduler<(), reims_vgpu_core::SubmissionContext>,
     >,
     pending_imported_views: Vec<(reims_vgpu_memory::ImportId, usize, usize)>,
 }
@@ -61,8 +60,7 @@ impl std::fmt::Debug for Device {
             .field("state", &self.state)
             .field("executor", &self.executor)
             .field("bound_buffers", &self.bound_buffers)
-            .field("submission_admissions", &self.submission_admissions)
-            .field("submission_commits", &self.submission_commits)
+            .field("submissions_scheduled", &self.submissions_scheduled)
             .finish()
     }
 }
@@ -104,8 +102,7 @@ impl Device {
             ),
             executor,
             bound_buffers: Default::default(),
-            submission_admissions: Default::default(),
-            submission_commits: Default::default(),
+            submissions_scheduled: Default::default(),
             pending_imported_views: Vec::new(),
         }
     }
@@ -168,11 +165,7 @@ impl Device {
 
     fn reset_model(&mut self) {
         self.retire_all_bound_buffers();
-        *self
-            .submission_admissions
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Default::default();
-        self.submission_commits
+        self.submissions_scheduled
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .abort_all()
