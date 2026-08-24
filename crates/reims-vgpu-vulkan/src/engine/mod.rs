@@ -1374,10 +1374,6 @@ impl<T> GuardSlot<T> {
     fn new(value: T) -> Self {
         Self(Some(value))
     }
-
-    fn take(&mut self) -> T {
-        self.0.take().expect("engine guard field was already moved")
-    }
 }
 
 impl<T> std::ops::Deref for GuardSlot<T> {
@@ -1462,13 +1458,15 @@ impl EngineGuard {
     ) -> Result<SubmissionRecording, DrawError> {
         let (context, force_loss) = self.guard.owner.lease_recording_context(&self.counters)?;
         let checkout = self.resources.pools.checkout_submission_encoder(identity)?;
-        let caches = self.caches.take();
-        let indexes = self.indexes.take();
-        let resources = self.resources.take();
+        let caches = Arc::clone(&self.guard.caches);
+        let indexes = Arc::clone(&self.session.0.indexes);
+        let resources = Arc::clone(&self.session.0.resources);
         let counters = Arc::clone(&self.counters);
         let session = self.session.clone();
-        // `caches` and `resources` remain locked for this exact transaction;
-        // dropping the outer guard releases only the process-global owner lock.
+        // The checkout is the transaction's only exclusive owner. Shared
+        // registries are borrowed for one command at a time below; retaining
+        // any of their guards here would make an EXEC a session-wide critical
+        // section even though its encoder is already physically disjoint.
         drop(self);
         Ok(SubmissionRecording {
             context,
@@ -1486,9 +1484,9 @@ impl EngineGuard {
 struct SubmissionRecording {
     context: Arc<context::SharedDeviceContext>,
     force_loss: bool,
-    caches: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, ObjectCaches>,
-    indexes: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionCacheIndexes>,
-    resources: parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SessionResources>,
+    caches: Arc<Mutex<ObjectCaches>>,
+    indexes: Arc<Mutex<SessionCacheIndexes>>,
+    resources: Arc<Mutex<SessionResources>>,
     counters: Arc<EngineCounters>,
     session: SessionHandle,
     checkout: Option<pools::EncoderCheckout>,
@@ -1497,7 +1495,10 @@ struct SubmissionRecording {
 impl Drop for SubmissionRecording {
     fn drop(&mut self) {
         if let Some(checkout) = self.checkout.take() {
-            self.resources.pools.return_submission_encoder(checkout);
+            self.resources
+                .lock()
+                .pools
+                .return_submission_encoder(checkout);
         }
     }
 }
@@ -1515,6 +1516,30 @@ mod submission_recording_ownership_tests {
             .try_lock()
             .expect("whole-EXEC recording released the process-global owner lock");
         drop(owner);
+        drop(recording);
+        test_reset_engine();
+    }
+
+    #[test]
+    fn an_exec_recording_lease_owns_no_session_wide_mutex_guard() {
+        let recording = lock_engine()
+            .into_submission_recording(reims_vgpu_core::SubmissionContext::standalone(0).identity)
+            .expect("a Vulkan context is available to the recording lease");
+        let _caches = recording
+            .caches
+            .try_lock()
+            .expect("the EXEC does not retain the object-cache guard");
+        let _indexes = recording
+            .indexes
+            .try_lock()
+            .expect("the EXEC does not retain the session-index guard");
+        let _resources = recording
+            .resources
+            .try_lock()
+            .expect("the EXEC does not retain the session-resource guard");
+        drop(_resources);
+        drop(_indexes);
+        drop(_caches);
         drop(recording);
         test_reset_engine();
     }
@@ -3031,14 +3056,17 @@ pub fn execute_submission_progress(
     for command in submission.command_buffer.into_commands().into_vec() {
         let force_loss = std::mem::take(&mut recording.force_loss);
         let context = &*recording.context;
-        let caches = &mut *recording.caches;
+        let mut caches_guard = recording.caches.lock();
+        let caches = &mut *caches_guard;
+        let mut indexes_guard = recording.indexes.lock();
+        let indexes = &mut *indexes_guard;
+        let mut resources_guard = recording.resources.lock();
         let SessionResources {
             pools,
             #[cfg(feature = "host-window")]
                 window_presenter: _,
             resident_epoch: _,
-        } = &mut *recording.resources;
-        let indexes = &mut *recording.indexes;
+        } = &mut *resources_guard;
         let counters = &*recording.counters;
         let mut native = pools.recording_from_checkout(
             recording
