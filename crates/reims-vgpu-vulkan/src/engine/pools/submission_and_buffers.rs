@@ -3166,7 +3166,6 @@ where
     /// that completed is still correct and this rail carries ~4.8 binds a draw.
     /// Returns how many were forgotten so a boot can say whether the window this
     /// closes was ever open.
-    #[cfg(test)]
     pub(crate) fn discard_cb_binds_owed_a_gather(&mut self) -> usize {
         self.encoder.discard_cb_binds_owed_a_gather()
     }
@@ -7043,6 +7042,48 @@ mod encoder_submission_ownership {
         assert_eq!(
             pools.active_encoders.get(&next).unwrap().active_submission,
             Some(next)
+        );
+    }
+
+    #[test]
+    fn abandoning_a_named_exec_cleans_that_execs_bind_memo_only() {
+        use crate::engine::exec::BoundBuffer;
+        use crate::engine::types::BufferContent;
+
+        let mut pools = ResourcePools::new();
+        let named_identity = identity(30, 6);
+        let default_content = BufferContent::Bytes(std::sync::Arc::new(vec![1u8; 64]));
+        let named_content = BufferContent::Bytes(std::sync::Arc::new(vec![2u8; 64]));
+        let default_bind = super::CbBind::of(&default_content);
+        let named_bind = super::CbBind::of(&named_content);
+        let bound = |offset| BoundBuffer {
+            buffer: vk::Buffer::null(),
+            offset,
+            guest_import: false,
+        };
+
+        {
+            let mut default = pools.recording();
+            default.note_cb_bound_buffer(default_bind.clone(), bound(1));
+            default.note_cb_bind_owes_gather(default_bind.key());
+        }
+        {
+            let mut named = pools.recording_for_submission(named_identity).unwrap();
+            named.note_cb_bound_buffer(named_bind.clone(), bound(2));
+            named.note_cb_bind_owes_gather(named_bind.key());
+            assert_eq!(named.discard_cb_binds_owed_a_gather(), 1);
+            assert!(named.cb_bound_buffer(named_bind.key()).is_none());
+        }
+
+        let default = pools.recording();
+        assert!(
+            default.cb_bound_buffer(default_bind.key()).is_some(),
+            "a named EXEC failure must not clean identity zero instead"
+        );
+        assert_eq!(
+            default.encoder.cb_gather_owed.as_slice(),
+            &[default_bind.key()],
+            "the default encoder's unfinished gather remains its own debt"
         );
     }
 }

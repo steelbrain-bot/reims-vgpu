@@ -1641,9 +1641,9 @@ fn execute_draw_request_locked(
         counters,
         ..
     } = guard.parts();
-    let result = unsafe {
+    let (result, dropped_unfilled_gathers) = unsafe {
         let mut recording = pools.recording_for_submission(submission.identity)?;
-        exec::execute_draw_inner(
+        let result = exec::execute_draw_inner(
             owner,
             caches,
             indexes,
@@ -1651,9 +1651,14 @@ fn execute_draw_request_locked(
             counters,
             req,
             &program,
-        )
+        );
+        let dropped = result
+            .is_err()
+            .then(|| recording.discard_cb_binds_owed_a_gather())
+            .unwrap_or(0);
+        (result, dropped)
     };
-    if result.is_err() {
+    if dropped_unfilled_gathers > 0 {
         // A draw can abandon after staging a gathered window and before the copy
         // that fills it is recorded — `SampledResidentNotReady` and its two
         // siblings are recoverable control flow raised in between. The owed copy
@@ -1665,10 +1670,10 @@ fn execute_draw_request_locked(
         // Forget exactly those entries. Counted rather than silent, because a
         // zero here is what says the window was never open on a given workload,
         // and no other counter in this device could see it.
-        let n = pools.encoder_mut().discard_cb_binds_owed_a_gather();
-        if n > 0 {
-            crate::telemetry::note_route_n("cb_bind_dropped_unfilled_gather", n as u64);
-        }
+        crate::telemetry::note_route_n(
+            "cb_bind_dropped_unfilled_gather",
+            dropped_unfilled_gathers as u64,
+        );
     }
     match result {
         Ok(out) => {
