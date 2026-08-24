@@ -3777,7 +3777,8 @@ mod heap_image_definition_tests {
             }
         };
         let counters = EngineCounters::default();
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let heap = reims_vgpu_protocol::ResourceId::new(7, 3);
         let rgba_identity =
             ComputeStorageResidencyKey::heap_placement(heap, 0, 1 << 20, 64, 64, 0x46);
@@ -3900,7 +3901,8 @@ mod heap_image_definition_tests {
             NonPinnedTotals::default()
         );
 
-        unsafe { pools.destroy_all(&ctx.device) };
+        drop(pools);
+        unsafe { pool_owner.destroy_all(&ctx.device) };
         unsafe { ctx.destroy() };
     }
 }
@@ -3947,7 +3949,7 @@ pub(super) mod pin_count_tests {
         }
     }
 
-    fn retain(pools: &mut ResourcePools, identity: &TargetIdentity) -> bool {
+    fn retain(pools: &mut ResourcePoolsAccess<'_>, identity: &TargetIdentity) -> bool {
         pools.retain_resident_target(identity).is_some()
     }
 
@@ -4120,7 +4122,8 @@ pub(super) mod pin_count_tests {
 
     #[test]
     fn a_sampled_resident_pin_moves_into_the_submission_cleanup() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let identity = pinned_identity();
         pools
             .shared
@@ -4181,7 +4184,8 @@ pub(super) mod pin_count_tests {
     /// rather than a list of the writers somebody remembered.
     #[test]
     fn a_draw_into_a_resident_clears_its_content_stamp() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         pools.shared.registry.insert(id.clone(), dummy_slot(true));
 
@@ -4209,7 +4213,8 @@ pub(super) mod pin_count_tests {
 
     #[test]
     fn a_guest_write_updates_only_a_resident_over_the_guest_allocation() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let imported_id = pinned_identity();
         let device_id = TargetIdentity::Gva {
             gva: 0x8000,
@@ -4265,7 +4270,8 @@ pub(super) mod pin_count_tests {
     /// caller reads the `false` as "the elision is off for this surface".
     #[test]
     fn a_stamp_refuses_an_image_no_draw_has_written() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
 
         assert!(
@@ -4286,7 +4292,8 @@ pub(super) mod pin_count_tests {
     /// second is still armed. This is the eviction window a boolean pin had.
     #[test]
     fn shared_identity_pin_is_counted_not_boolean() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         pools.shared.registry.insert(id.clone(), dummy_slot(true));
 
@@ -4311,7 +4318,8 @@ pub(super) mod pin_count_tests {
     /// underflowing into a forever-pin.
     #[test]
     fn unpin_saturates_at_zero() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         pools.shared.registry.insert(id.clone(), dummy_slot(true));
         assert!(pools.pin_resident_target(&id, false));
@@ -4324,7 +4332,8 @@ pub(super) mod pin_count_tests {
     /// Store) and an absent identity.
     #[test]
     fn pin_refuses_not_ready_and_absent() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         assert!(!pools.pin_resident_target(&id, true), "absent identity");
         pools.shared.registry.insert(id.clone(), dummy_slot(false));
@@ -4334,7 +4343,8 @@ pub(super) mod pin_count_tests {
 
     #[test]
     fn complete_overwrite_pin_does_not_publish_unwritten_contents() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         pools.shared.registry.insert(id.clone(), dummy_slot(false));
 
@@ -4349,7 +4359,8 @@ pub(super) mod pin_count_tests {
 
     #[test]
     fn retaining_a_resource_pins_its_engine_owned_resident() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let recyclable_id = pinned_identity();
         pools
             .shared
@@ -4361,7 +4372,8 @@ pub(super) mod pin_count_tests {
 
     #[test]
     fn ending_the_last_resource_ownership_makes_the_slot_retirable() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         pools.shared.registry.insert(id.clone(), dummy_slot(true));
         pools.shared.registry_order.push_back(id.clone());
@@ -4373,7 +4385,8 @@ pub(super) mod pin_count_tests {
 
     #[test]
     fn an_old_lease_cannot_release_the_replacement_under_the_same_identity() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         pools.shared.registry.insert(id.clone(), dummy_slot(true));
         let old_incarnation = pools
@@ -4397,7 +4410,8 @@ pub(super) mod pin_count_tests {
 
     #[test]
     fn one_alias_release_does_not_end_another_resources_ownership() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         pools.shared.registry.insert(id.clone(), dummy_slot(true));
         pools.shared.registry_order.push_back(id.clone());
@@ -4418,7 +4432,8 @@ pub(super) mod pin_count_tests {
 
     #[test]
     fn released_resource_waits_for_existing_holders_but_not_for_time() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         pools.shared.registry.insert(id.clone(), dummy_slot(true));
         pools.shared.registry_order.push_back(id.clone());
@@ -4448,7 +4463,8 @@ pub(super) mod pin_count_tests {
     /// slot does not become uncollectable, only late.
     #[test]
     fn a_released_resource_holding_the_only_copy_of_a_frame_waits_for_the_copy_out() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = pinned_identity();
         pools.shared.registry.insert(id.clone(), dummy_slot(true));
         pools.shared.registry_order.push_back(id.clone());
@@ -4532,7 +4548,12 @@ pub(super) mod pin_count_tests {
     /// Registers through the product path rather than writing the map and the
     /// order itself, so this helper cannot be the copy that keeps them in step
     /// by accident while the product one stops.
-    fn admit(pools: &mut ResourcePools, id: TargetIdentity, last_touch_ms: u64, pin: u32) {
+    fn admit(
+        pools: &mut ResourcePoolsAccess<'_>,
+        id: TargetIdentity,
+        last_touch_ms: u64,
+        pin: u32,
+    ) {
         pools.register_resident(
             &id,
             new_resident(some_framebuffer(), vk::RenderPass::null()),
@@ -4555,7 +4576,7 @@ pub(super) mod pin_count_tests {
     /// nothing in the product mutates a live slot's — a geometry change goes
     /// through unregister + register — and the byte total relies on that.
     fn admit_sized(
-        pools: &mut ResourcePools,
+        pools: &mut ResourcePoolsAccess<'_>,
         id: TargetIdentity,
         last_touch_ms: u64,
         pin: u32,
@@ -4584,7 +4605,8 @@ pub(super) mod pin_count_tests {
     /// a test rather than an assertion at each site.
     #[test]
     fn a_resident_built_without_a_framebuffer_owes_the_graveyard_none() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.register_resident(
             &surf(1),
             new_resident(vk::Framebuffer::null(), vk::RenderPass::null()),
@@ -4625,7 +4647,8 @@ pub(super) mod pin_count_tests {
     /// would be answering a question the other rails believe they already asked.
     #[test]
     fn a_registered_resident_is_born_undrawn_unvouched_untransitioned_and_unpinned() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.register_resident(
             &surf(1),
             new_resident(some_framebuffer(), vk::RenderPass::null()),
@@ -4652,7 +4675,8 @@ pub(super) mod pin_count_tests {
     /// and one in the order alone is a victim that frees nothing.
     #[test]
     fn registration_writes_both_halves() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.register_resident(
             &surf(1),
             new_resident(some_framebuffer(), vk::RenderPass::null()),
@@ -4695,7 +4719,8 @@ pub(super) mod pin_count_tests {
     /// that never was.
     #[test]
     fn elapsed_time_never_reclaims_a_live_resident() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 10, 0);
         // The MRT-secondary path: rendered into, marked ready at the pass's
         // final layout, never pinned, never stamped, never flushed.
@@ -4739,7 +4764,8 @@ pub(super) mod pin_count_tests {
     /// they are marked ready.
     #[test]
     fn the_allocation_reclaim_offers_up_nothing_that_is_the_only_copy() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 0, 0);
         admit(&mut pools, surf(2), 0, 0);
         assert_eq!(
@@ -4785,7 +4811,8 @@ pub(super) mod pin_count_tests {
             ResidentReclaim::Recreated,
             ResidentReclaim::ResourceReleased,
         ] {
-            let mut pools = ResourcePools::new();
+            let mut pool_owner = ResourcePools::new();
+            let mut pools = pool_owner.access();
             admit(&mut pools, surf(1), 10, 0);
             // The sole-copy shape: rendered into and marked ready, never pinned,
             // never stamped, never written back.
@@ -4823,8 +4850,9 @@ pub(super) mod pin_count_tests {
     /// one that was.
     #[test]
     fn the_maintained_sole_copy_totals_track_the_walk() {
-        let mut pools = ResourcePools::new();
-        let check = |pools: &ResourcePools, what: &str| {
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
+        let check = |pools: &ResourcePoolsAccess<'_>, what: &str| {
             let walk = {
                 let sole = || {
                     pools
@@ -4907,7 +4935,8 @@ pub(super) mod pin_count_tests {
     /// Fails without the fold in `set_sole_copy`: the peak stays at zero.
     #[test]
     fn the_sole_copy_high_water_rises_when_the_population_does() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit_sized(&mut pools, surf(1), 0, 0, (64, 64));
         admit_sized(&mut pools, surf(2), 0, 0, (64, 64));
         assert_eq!(
@@ -4948,7 +4977,8 @@ pub(super) mod pin_count_tests {
     /// takes the oldest-created first.
     #[test]
     fn the_allocation_retry_may_reclaim_everything_that_is_not_a_sole_copy_or_pinned() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let now = 10_000;
         pools.shared.idle_clock_ms = now;
         admit(&mut pools, surf(1), now, 0); // fresh, recoverable -> yes
@@ -5000,7 +5030,8 @@ pub(super) mod pin_count_tests {
     /// keeps ticking the poll heartbeat still reclaims stale VRAM.
     #[test]
     fn maintenance_never_selects_live_residents_by_age() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 10, 0); // aged, non-pinned  -> victim
         admit(&mut pools, surf(2), 10, 1); // aged but PINNED   -> kept
                                            // now = 10 + AGE + 1 so slot 1's cutoff is crossed; a fresh slot is not.
@@ -5024,7 +5055,8 @@ pub(super) mod pin_count_tests {
     /// explicitly released or pressure-reclaimed identity was requested again.
     #[test]
     fn a_reclaim_records_when_so_the_censored_gap_can_be_recovered() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 0, 0);
         pools.shared.idle_clock_ms = 5_000;
         pools.unregister_resident(&surf(1), ResidentReclaim::AllocationReclaimed);
@@ -5090,7 +5122,8 @@ pub(super) mod pin_count_tests {
     /// logic it composes is here.
     #[test]
     fn a_recreated_resident_no_longer_reports_the_reclaim_that_took_it() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 0, 0);
 
         // Never held: no record, and nothing to mistake for one.
@@ -5134,7 +5167,8 @@ pub(super) mod pin_count_tests {
     /// Fails without the fix: nothing records the gap at all.
     #[test]
     fn the_resample_peak_holds_the_worst_gap_not_the_latest() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 0, 0);
         assert_eq!(pools.resident_resample_peak_ms(), 0);
 
@@ -5167,7 +5201,8 @@ pub(super) mod pin_count_tests {
     /// timestamp reflects that use.
     #[test]
     fn a_sampled_only_resident_is_not_aged_out() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         // Aged past the cutoff by every measure the drain has, and never drawn
         // into again — only read.
         admit(&mut pools, surf(1), 10, 0);
@@ -5190,7 +5225,8 @@ pub(super) mod pin_count_tests {
     /// GPU.
     #[test]
     fn the_allocation_reclaim_never_offers_a_pinned_resident() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 0, 1);
         admit(&mut pools, surf(2), 0, 2);
         assert!(
@@ -5216,7 +5252,8 @@ pub(super) mod pin_count_tests {
     /// makes the record unconditional.
     #[test]
     fn unregistering_a_resident_always_names_why_and_leaves_the_order_clean() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 0, 0);
         admit(&mut pools, surf(2), 0, 0);
 
@@ -5256,7 +5293,8 @@ pub(super) mod pin_count_tests {
     /// two have different repairs.
     #[test]
     fn the_reclaim_history_names_the_path_and_is_bounded() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.note_resident_reclaimed(&surf(1), ResidentReclaim::AllocationReclaimed);
         pools.note_resident_reclaimed(&surf(2), ResidentReclaim::AllocationReclaimed);
         assert_eq!(
@@ -5298,7 +5336,8 @@ pub(super) mod pin_count_tests {
     /// advances (admits stay fresh).
     #[test]
     fn maintenance_is_throttled_between_passes() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 0, 0);
         let t0 = IDLE_MAINTENANCE_START_MS + 1;
         assert!(pools.plan_idle_maintenance(t0));
@@ -5320,7 +5359,8 @@ pub(super) mod pin_count_tests {
     /// A maintenance pass cannot shrink a live registry, regardless of its size.
     #[test]
     fn maintenance_does_not_shrink_a_large_live_registry() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         const LIVE_RESIDENTS: usize = 9;
         for i in 0..LIVE_RESIDENTS as u32 {
             admit(&mut pools, surf(100 + i), 0, 0);
@@ -5339,7 +5379,8 @@ pub(super) mod pin_count_tests {
     /// staging bucket at 12.6 ms each.
     #[test]
     fn a_pass_with_no_victims_but_live_uploads_is_not_settled() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         // Quiet the gate first, so the assertion below is about uploads and not
         // about the counter still warming up.
         for _ in 0..SETTLED_PASSES_FOR_BUFFER_TRIM {
@@ -5380,7 +5421,8 @@ pub(super) mod pin_count_tests {
     /// activity, so a staging buffer cannot be freed and re-allocated mid-video.
     #[test]
     fn note_maintenance_settled_gates_buffer_trim_on_consecutive_idle() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         // Fewer than the threshold of quiet passes: no buffer trim yet.
         for _ in 0..(SETTLED_PASSES_FOR_BUFFER_TRIM - 1) {
             assert!(!pools.note_maintenance_settled(), "not settled enough yet");
@@ -5415,7 +5457,8 @@ pub(super) mod pin_count_tests {
     /// every call, so reuse-distance diagnostics include presentation reads.
     #[test]
     fn maintenance_keeps_the_display_target_alive_without_a_special_case() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 0, 0); // would be aged...
         let now = IDLE_MAINTENANCE_START_MS + 500;
         // ...but it is the presented target this frame.
@@ -5427,7 +5470,8 @@ pub(super) mod pin_count_tests {
     /// live targets survive a static desktop interval.
     #[test]
     fn maintenance_does_not_require_touching_a_live_target() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit(&mut pools, surf(1), 0, 0); // displayed target
         admit(&mut pools, surf(4), 0, 0); // registered but undrawn, otherwise aged
         let now = IDLE_MAINTENANCE_START_MS + 500;
@@ -5456,7 +5500,8 @@ pub(super) mod pin_count_tests {
         const TEXEL: u64 = 4; // SCANOUT_FORMAT, the shape `new_resident` builds
         const SMALL: (u32, u32) = (16, 16);
         const UHD: (u32, u32) = (3840, 2160);
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         for i in 1..=3u32 {
             admit_sized(&mut pools, surf(i), 10, 0, SMALL);
         }
@@ -5467,7 +5512,8 @@ pub(super) mod pin_count_tests {
 
         // The same slot count at 4K geometry. Pinned peers stay out of both
         // bands, so the two readings describe one population.
-        let mut big = ResourcePools::new();
+        let mut big_owner = ResourcePools::new();
+        let mut big = big_owner.access();
         for i in 1..=3u32 {
             admit_sized(&mut big, surf(i), 10, 0, UHD);
         }
@@ -5512,8 +5558,9 @@ pub(super) mod pin_count_tests {
     /// unpin that saturates at zero must not add a slot that is already there.
     #[test]
     fn the_maintained_non_pinned_totals_track_the_walk() {
-        let mut pools = ResourcePools::new();
-        let check = |pools: &ResourcePools, what: &str| {
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
+        let check = |pools: &ResourcePoolsAccess<'_>, what: &str| {
             assert_eq!(
                 pools.shared.registry_non_pinned,
                 pools.non_pinned_registry_totals_by_walk(),
@@ -5589,7 +5636,8 @@ pub(super) mod pin_count_tests {
     /// refuse to take — so a pinned peer must not inflate the reading.
     #[test]
     fn the_registry_reach_band_holds_the_peak_and_ignores_pinned_residents() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         assert_eq!(
             pools.registry_pressure_stats(),
             (0, 0),

@@ -394,9 +394,7 @@ struct SessionResources {
 /// pool/index swap.
 struct EngineParts<'a> {
     owner: &'a mut ContextOwner,
-    caches: &'a mut ObjectCaches,
-    pools: &'a mut ResourcePools,
-    indexes: &'a mut SessionCacheIndexes,
+    pools: pools::ResourcePoolsAccess<'a>,
     counters: &'a EngineCounters,
     #[cfg(feature = "host-window")]
     window_presenter: &'a mut Option<window_present::WindowPresenter>,
@@ -1407,8 +1405,6 @@ impl EngineGuard {
     fn parts(&mut self) -> EngineParts<'_> {
         let EngineGuard {
             guard,
-            caches,
-            indexes,
             resources,
             counters,
             ..
@@ -1422,9 +1418,7 @@ impl EngineGuard {
         } = &mut ***resources;
         EngineParts {
             owner,
-            caches,
-            pools,
-            indexes,
+            pools: pools.access(),
             counters,
             #[cfg(feature = "host-window")]
             window_presenter,
@@ -1522,7 +1516,7 @@ mod submission_recording_ownership_tests {
 
     #[test]
     fn an_exec_recording_lease_owns_no_session_wide_mutex_guard() {
-        let recording = lock_engine()
+        let mut recording = lock_engine()
             .into_submission_recording(reims_vgpu_core::SubmissionContext::standalone(0).identity)
             .expect("a Vulkan context is available to the recording lease");
         let _caches = recording
@@ -1540,6 +1534,18 @@ mod submission_recording_ownership_tests {
         drop(_resources);
         drop(_indexes);
         drop(_caches);
+        let _native = pools::ResourcePools::recording_from_checkout(
+            recording
+                .checkout
+                .as_mut()
+                .expect("the recording lease owns its exact encoder"),
+        );
+        let _resources = recording
+            .resources
+            .try_lock()
+            .expect("native recording borrows shared pools without borrowing the encoder depot");
+        drop(_resources);
+        drop(_native);
         drop(recording);
         test_reset_engine();
     }
@@ -1625,7 +1631,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         .fetch_add(1, Ordering::Release);
     guard.indexes.clear();
     let (resident_targets, pooled_targets, sampled_images, storage_images) =
-        guard.resources.pools.guest_reset_counts();
+        guard.resources.pools.access().guest_reset_counts();
     let stats = GuestResetStats {
         resident_targets,
         pooled_targets,
@@ -1633,27 +1639,21 @@ pub fn reset_guest_state() -> GuestResetStats {
         storage_images,
         had_context: guard.owner.ctx.is_some(),
     };
-    let EngineParts {
-        ref owner,
-        ref mut pools,
-        #[cfg(feature = "host-window")]
-        ref mut window_presenter,
-        ..
-    } = guard.parts();
-    if let Some(ctx) = owner.ctx.as_ref() {
+    let context = guard.owner.ctx.clone();
+    if let Some(ctx) = context.as_ref() {
         if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::GuestResetDeviceWaitIdle, error);
             reims_vgpu_observe::Emit::decline("vulkan_guest_reset", &decline).fail_once(0);
         }
         unsafe {
             #[cfg(feature = "host-window")]
-            if let Some(presenter) = window_presenter.as_mut() {
-                presenter.release_pins_after_idle(pools);
+            if let Some(presenter) = guard.resources.window_presenter.as_mut() {
+                presenter.release_pins_after_idle(&mut guard.resources.pools.access());
             }
-            pools.destroy_all(&ctx.device);
+            guard.resources.pools.destroy_all(&ctx.device);
         }
     }
-    **pools = ResourcePools::new();
+    guard.resources.pools = ResourcePools::new();
     clear_guest_write_pages();
     reims_vgpu_observe::off(format!(
         "vulkan_guest_reset resident={} pooled_targets={} sampled={} storage={} context={}",
@@ -1799,23 +1799,19 @@ fn execute_draw_request_locked(
     submission: &reims_vgpu_core::SubmissionContext,
     req: &DrawRequest,
 ) -> Result<DrawOutput, DrawError> {
-    let EngineParts {
-        ref mut owner,
-        ref mut caches,
-        ref mut indexes,
-        ref mut pools,
-        counters,
-        ..
-    } = guard.parts();
-    let (ctx, force_loss) = owner.lease_recording_context(counters)?;
-    let mut recording = pools.recording_for_submission(submission.identity)?;
+    let counters = Arc::clone(&guard.counters);
+    let (ctx, force_loss) = guard.owner.lease_recording_context(&counters)?;
+    let mut recording = guard
+        .resources
+        .pools
+        .recording_for_submission(submission.identity)?;
     let result = record_draw_request(
         &ctx,
         force_loss,
-        caches,
-        indexes,
+        &mut guard.caches,
+        &mut guard.indexes,
         &mut recording,
-        counters,
+        &counters,
         req,
     );
     match result {
@@ -2979,16 +2975,20 @@ fn execute_compute_request_locked(
     submission: &reims_vgpu_core::SubmissionContext,
     req: &ComputeRequest,
 ) -> Result<ComputeOutput, ComputeError> {
-    let EngineParts {
-        ref mut owner,
-        ref mut caches,
-        ref mut pools,
-        counters,
-        ..
-    } = guard.parts();
-    let (ctx, force_loss) = owner.lease_recording_context(counters)?;
-    let mut recording = pools.recording_for_submission(submission.identity)?;
-    let result = record_compute_request(&ctx, force_loss, caches, &mut recording, counters, req);
+    let counters = Arc::clone(&guard.counters);
+    let (ctx, force_loss) = guard.owner.lease_recording_context(&counters)?;
+    let mut recording = guard
+        .resources
+        .pools
+        .recording_for_submission(submission.identity)?;
+    let result = record_compute_request(
+        &ctx,
+        force_loss,
+        &mut guard.caches,
+        &mut recording,
+        &counters,
+        req,
+    );
     match result {
         Ok(out) => {
             // Same as the draw arm: a dispatch that ran proves the device.
@@ -3060,15 +3060,8 @@ pub fn execute_submission_progress(
         let caches = &mut *caches_guard;
         let mut indexes_guard = recording.indexes.lock();
         let indexes = &mut *indexes_guard;
-        let mut resources_guard = recording.resources.lock();
-        let SessionResources {
-            pools,
-            #[cfg(feature = "host-window")]
-                window_presenter: _,
-            resident_epoch: _,
-        } = &mut *resources_guard;
         let counters = &*recording.counters;
-        let mut native = pools.recording_from_checkout(
+        let mut native = pools::ResourcePools::recording_from_checkout(
             recording
                 .checkout
                 .as_mut()
@@ -3171,15 +3164,18 @@ pub fn close_submission(
 ) -> Result<(), DrawError> {
     let mut guard = lock_engine();
     let result = {
-        let EngineParts {
-            ref owner,
-            ref mut pools,
-            counters,
-            ..
-        } = guard.parts();
-        match owner.ctx.as_ref() {
-            Some(ctx) => unsafe { pools.close_submission(ctx, counters, identity) },
-            None => pools.close_submission_without_context(identity),
+        let context = guard.owner.ctx.clone();
+        match context.as_ref() {
+            Some(ctx) => unsafe {
+                guard
+                    .resources
+                    .pools
+                    .close_submission(ctx, &guard.counters, identity)
+            },
+            None => guard
+                .resources
+                .pools
+                .close_submission_without_context(identity),
         }
     };
     match result {
@@ -3208,7 +3204,7 @@ pub fn close_submission(
 /// anyway" (a census). That distinction has to be available on every Vulkan
 /// build, not only the ones that opened a window.
 pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) -> bool {
-    let guard = lock_engine();
+    let mut guard = lock_engine();
     if current_session_signals()
         .open_batches
         .load(std::sync::atomic::Ordering::Acquire)
@@ -3219,6 +3215,7 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
     guard
         .resources
         .pools
+        .access()
         .registry_get(identity)
         .is_some_and(|slot| pools::slot_presentable(slot, width, height))
 }
@@ -3374,10 +3371,15 @@ impl Drop for ResidentResourceLease {
 /// readiness is still validated by draw execution on every use.
 pub fn retain_resident_resource(identity: &TargetIdentity) -> Option<ResidentResourceLease> {
     let mut guard = lock_engine();
-    let incarnation = guard.resources.pools.retain_resident_target(identity)?;
+    let incarnation = guard
+        .resources
+        .pools
+        .access()
+        .retain_resident_target(identity)?;
     let backing = guard
         .resources
         .pools
+        .access()
         .registry_get(identity)
         .map(|slot| {
             classify_resident_content(slot.content_ready, slot.memory.guest_memory().is_some())
@@ -3408,10 +3410,11 @@ fn classify_resident_content(
 }
 
 pub fn resident_content_backing(identity: &TargetIdentity) -> ResidentContentBacking {
-    let guard = lock_engine();
+    let mut guard = lock_engine();
     guard
         .resources
         .pools
+        .access()
         .registry_get(identity)
         .map(|slot| {
             classify_resident_content(slot.content_ready, slot.memory.guest_memory().is_some())
@@ -3442,8 +3445,8 @@ fn classify_resident_read(
 /// Read readiness, content currency, and reclaim history under one registry
 /// lock. Lifetime retention remains a separate operation.
 pub fn resident_read_plan(identity: &TargetIdentity) -> reims_vgpu_core::ResidentReadPlan {
-    let guard = lock_engine();
-    if let Some(slot) = guard.resources.pools.registry_get(identity) {
+    let mut guard = lock_engine();
+    if let Some(slot) = guard.resources.pools.access().registry_get(identity) {
         return classify_resident_read(
             Some((
                 slot.content_ready,
@@ -3453,12 +3456,13 @@ pub fn resident_read_plan(identity: &TargetIdentity) -> reims_vgpu_core::Residen
             None,
         );
     }
-    let now = guard.resources.pools.idle_clock_ms();
+    let now = guard.resources.pools.access().idle_clock_ms();
     classify_resident_read(
         None,
         guard
             .resources
             .pools
+            .access()
             .prior_reclaim_at(identity)
             .map(|(why, at)| (why, now.saturating_sub(at))),
     )
@@ -3510,6 +3514,7 @@ pub fn note_resident_guest_write(identity: &TargetIdentity, epoch: u32) -> bool 
     guard
         .resources
         .pools
+        .access()
         .registry_note_guest_write(identity, epoch)
 }
 
@@ -3535,14 +3540,21 @@ pub fn note_resident_guest_write(identity: &TargetIdentity, epoch: u32) -> bool 
 pub fn resident_absent_after_reclaim(
     identity: &TargetIdentity,
 ) -> Option<(types::ResidentReclaim, u64)> {
-    let guard = lock_engine();
-    if guard.resources.pools.registry_get(identity).is_some() {
+    let mut guard = lock_engine();
+    if guard
+        .resources
+        .pools
+        .access()
+        .registry_get(identity)
+        .is_some()
+    {
         return None;
     }
-    let now = guard.resources.pools.idle_clock_ms();
+    let now = guard.resources.pools.access().idle_clock_ms();
     guard
         .resources
         .pools
+        .access()
         .prior_reclaim_at(identity)
         .map(|(why, at)| (why, now.saturating_sub(at)))
 }
@@ -3558,8 +3570,13 @@ pub fn resident_absent_after_reclaim(
 /// answer can be unknown — no slot, recycled image, a draw since the stamp —
 /// resolves to `None` and therefore to the seed.
 pub fn resident_content_epoch(identity: &TargetIdentity) -> Option<u32> {
-    let guard = lock_engine();
-    guard.resources.pools.registry_get(identity)?.content_epoch
+    let mut guard = lock_engine();
+    guard
+        .resources
+        .pools
+        .access()
+        .registry_get(identity)?
+        .content_epoch
 }
 
 /// What the registry says about an identity's content stamp, with the two ways
@@ -3586,8 +3603,8 @@ pub use reims_vgpu_core::ResidentContent;
 /// [`ResidentContent`] for one identity — the reading a deferred window takes
 /// before it believes a resident still holds its frame.
 pub fn resident_content_state(identity: &TargetIdentity) -> ResidentContent {
-    let guard = lock_engine();
-    match guard.resources.pools.registry_get(identity) {
+    let mut guard = lock_engine();
+    match guard.resources.pools.access().registry_get(identity) {
         None => ResidentContent::Absent,
         Some(slot) => match slot.content_epoch {
             None => ResidentContent::Unstamped,
@@ -3604,6 +3621,7 @@ pub fn stamp_resident_content_epoch(identity: &TargetIdentity, epoch: u32) -> bo
     guard
         .resources
         .pools
+        .access()
         .registry_stamp_content_epoch(identity, epoch)
 }
 
@@ -3618,6 +3636,7 @@ pub fn note_resident_content_copied_out(identity: &TargetIdentity) -> bool {
     guard
         .resources
         .pools
+        .access()
         .registry_note_content_copied_out(identity)
 }
 
@@ -3924,7 +3943,11 @@ pub fn compute_threadgroup_limits() -> (u32, u32) {
 /// ready; the caller must then perform the synchronous Store instead.
 pub fn pin_resident_target(identity: &TargetIdentity) -> bool {
     let mut guard = lock_engine();
-    guard.resources.pools.pin_resident_target(identity, true)
+    guard
+        .resources
+        .pools
+        .access()
+        .pin_resident_target(identity, true)
 }
 
 /// Drop the deferred render-Store pin (flushed, or the window was dropped at
@@ -3932,7 +3955,11 @@ pub fn pin_resident_target(identity: &TargetIdentity) -> bool {
 /// ends. No-op for an absent identity.
 pub fn unpin_resident_target(identity: &TargetIdentity) {
     let mut guard = lock_engine();
-    let _ = guard.resources.pools.pin_resident_target(identity, false);
+    let _ = guard
+        .resources
+        .pools
+        .access()
+        .pin_resident_target(identity, false);
 }
 
 /// Which engine entry point's initialization prologue refused, for the
@@ -3989,7 +4016,11 @@ pub fn compute_resident_storage_generation(
     identity: &reims_vgpu_core::ComputeStorageResidencyKey,
 ) -> Option<u32> {
     let mut guard = lock_engine();
-    guard.resources.pools.compute_resident_generation(identity)
+    guard
+        .resources
+        .pools
+        .access()
+        .compute_resident_generation(identity)
 }
 
 /// Generation + engine format of a resident compute storage image, if the
@@ -4008,6 +4039,7 @@ pub fn compute_resident_sample_source(
     guard
         .resources
         .pools
+        .access()
         .compute_resident_sample_source(identity)
 }
 
@@ -4016,7 +4048,11 @@ pub fn compute_resident_sample_source(
 /// registered — only LRU protection ends. No-op for an absent identity.
 pub fn unpin_resident_storage(identity: &reims_vgpu_core::ComputeStorageResidencyKey) {
     let mut guard = lock_engine();
-    guard.resources.pools.pin_resident_storage(identity, false);
+    guard
+        .resources
+        .pools
+        .access()
+        .pin_resident_storage(identity, false);
 }
 
 /// Release a compute-storage resident's claim on being unreclaimable because the
@@ -4033,6 +4069,7 @@ pub fn retire_resident_storage_content(identity: &reims_vgpu_core::ComputeStorag
     guard
         .resources
         .pools
+        .access()
         .note_compute_storage_content_retired(identity);
 }
 
@@ -4051,6 +4088,7 @@ pub fn retire_guest_import(import_id: reims_vgpu_memory::ImportId) -> bool {
         guard
             .resources
             .pools
+            .access()
             .retire_guest_import(&device, import_id)
     };
     false
@@ -4058,7 +4096,11 @@ pub fn retire_guest_import(import_id: reims_vgpu_memory::ImportId) -> bool {
 
 /// Allocation identities whose final backend access has retired.
 pub fn take_completed_guest_imports() -> Vec<reims_vgpu_memory::ImportId> {
-    lock_engine().resources.pools.take_completed_guest_imports()
+    lock_engine()
+        .resources
+        .pools
+        .access()
+        .take_completed_guest_imports()
 }
 
 /// A synchronous compute writeback landed this resident's output in the guest's
@@ -4090,6 +4132,7 @@ pub fn note_resident_storage_copied_out(identity: &reims_vgpu_core::ComputeStora
     guard
         .resources
         .pools
+        .access()
         .note_compute_storage_copied_out(identity);
 }
 
@@ -4208,8 +4251,9 @@ pub fn supports_sampled_layout_linear_filter(layout: reims_vgpu_protocol::TexelL
 /// no resident yet), not failures worth a fail-log line.
 pub fn read_resident_bgra(identity: &TargetIdentity, need: usize) -> Option<Vec<u8>> {
     {
-        let guard = lock_engine();
-        let slot = guard.resources.pools.registry_get(identity)?;
+        let mut guard = lock_engine();
+        let pools = guard.resources.pools.access();
+        let slot = pools.registry_get(identity)?;
         if !slot.content_ready {
             return None;
         }
@@ -4335,7 +4379,7 @@ impl Drop for ReadbackLeaseGuard {
 #[allow(clippy::too_many_arguments)]
 unsafe fn copy_image_level0_to_host(
     ctx: &context::DeviceContext,
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::ResourcePoolsAccess<'_>,
     counters: &EngineCounters,
     image: ash::vk::Image,
     old_layout: ash::vk::ImageLayout,
@@ -4379,7 +4423,7 @@ unsafe fn copy_image_level0_to_host(
 )]
 unsafe fn copy_image_level0_to_host_delivered(
     ctx: &context::DeviceContext,
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::ResourcePoolsAccess<'_>,
     counters: &EngineCounters,
     image: ash::vk::Image,
     old_layout: ash::vk::ImageLayout,
@@ -4940,8 +4984,8 @@ pub fn copy_target_to_guest_pages(
     }
     unsafe {
         let plan = {
-            let mut recording = pools.recording();
-            plan_guest_copy(ctx, &mut recording, counters, dst)?
+            let recording = pools.recording();
+            plan_guest_copy(ctx, recording, counters, dst)?
         };
         copy_image_level0_to_buffer(ctx, pools, counters, identity, &snap, &plan, pages)?;
         pools.registry_note_access(identity, pools::ResidentAccess::transfer_read());
@@ -5035,8 +5079,8 @@ pub fn copy_resident_level0(
     }
     unsafe { pools.batch_flush(ctx, counters)? };
     let plan = unsafe {
-        let mut recording = pools.recording();
-        plan_guest_copy(ctx, &mut recording, counters, target)?
+        let recording = pools.recording();
+        plan_guest_copy(ctx, recording, counters, target)?
     };
     let (destination_image, _) = unsafe {
         pools.registry_ensure_attachment(
@@ -5152,10 +5196,10 @@ pub fn copy_resident_level0(
             &destination_release,
         );
         {
-            let mut recording = pools.recording();
+            let recording = pools.recording();
             record_guest_copy_plan(
                 ctx,
-                &mut recording,
+                recording,
                 cb,
                 destination_image,
                 destination_next.layout(),
@@ -5164,8 +5208,8 @@ pub fn copy_resident_level0(
         }
         release_guest_copy_to_host(ctx, cb, &plan);
         if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
-            let mut recording = pools.recording();
-            record_guest_write_debt(&mut recording, GuestWriteSource::RingEntry, &pages);
+            let recording = pools.recording();
+            record_guest_write_debt(recording, GuestWriteSource::RingEntry, &pages);
         }
 
         pools.encoder_mut().gpu_span_seal_current(ctx, cb);
@@ -5865,7 +5909,7 @@ unsafe fn plan_guest_copies(
 /// name a live image belonging to `ctx`.
 unsafe fn copy_image_level0_to_buffer(
     ctx: &context::DeviceContext,
-    pools: &mut pools::ResourcePools,
+    pools: &mut pools::ResourcePoolsAccess<'_>,
     counters: &counters::EngineCounters,
     source: &TargetIdentity,
     snap: &ResidentReadSnapshot,
@@ -5941,15 +5985,8 @@ unsafe fn copy_image_level0_to_buffer(
             .readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1)
     };
     unsafe {
-        let mut recording = pools.recording();
-        record_guest_copy_plan(
-            ctx,
-            &mut recording,
-            cb,
-            snap.image,
-            read_access.layout(),
-            plan,
-        )
+        let recording = pools.recording();
+        record_guest_copy_plan(ctx, recording, cb, snap.image, read_access.layout(), plan)
     };
     unsafe {
         pools.encoder_mut().readback_span_mark(
@@ -5961,12 +5998,8 @@ unsafe fn copy_image_level0_to_buffer(
     };
     unsafe { release_guest_copy_to_host(ctx, cb, plan) };
     if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
-        let mut recording = pools.recording();
-        record_guest_write_debt(
-            &mut recording,
-            GuestWriteSource::ResidentTarget(source),
-            &pages,
-        );
+        let recording = pools.recording();
+        record_guest_write_debt(recording, GuestWriteSource::ResidentTarget(source), &pages);
     }
     // The wait this rail no longer takes here.
     //
@@ -6256,9 +6289,9 @@ pub fn warm_guest_ram_imports(
 /// rather than once at import time precisely because one line at import time
 /// cannot tell "imported once" from "imported once per window".
 pub fn guest_import_census() -> (u64, usize, usize, usize, usize, usize) {
-    let guard = lock_engine();
+    let mut guard = lock_engine();
     let (ramblocks, aliases, bytes, guest_images, live_guest_images, recycled_images) =
-        guard.resources.pools.host_ram_import_census();
+        guard.resources.pools.access().host_ram_import_census();
     (
         bytes,
         ramblocks,
@@ -6572,7 +6605,7 @@ mod resident_read_order_tests {
 /// does **not** bound the texel width: that is the readbacks' constraint, not
 /// the resident's, and `readback_snapshot` below is where it is applied.
 fn resident_read_snapshot(
-    pools: &pools::ResourcePools,
+    pools: &pools::ResourcePoolsAccess<'_>,
     identity: &TargetIdentity,
 ) -> Result<ResidentReadSnapshot, DrawError> {
     let Some(slot) = pools.registry_get(identity) else {
@@ -6626,7 +6659,7 @@ fn resident_read_snapshot(
 /// `copy_target_to_guest_pages` — needs neither: it copies the resident's own
 /// bytes into guest pages and never interprets them.
 fn readback_snapshot(
-    pools: &pools::ResourcePools,
+    pools: &pools::ResourcePoolsAccess<'_>,
     identity: &TargetIdentity,
 ) -> Result<(ResidentReadSnapshot, reims_vgpu_protocol::TexelLayout), DrawError> {
     let snap = resident_read_snapshot(pools, identity)?;
@@ -6719,11 +6752,11 @@ pub fn object_cache_levels() -> [usize; 6] {
 /// discrete devices intentionally carry different capacities, and the
 /// environment may narrow either one.
 pub fn batch_max_draws() -> u64 {
-    lock_engine().resources.pools.batch_capacity()
+    lock_engine().resources.pools.access().batch_capacity()
 }
 
 pub fn counter_snapshot() -> CounterSnapshot {
-    let eng = lock_engine();
+    let mut eng = lock_engine();
     let mut snap = eng.counters.snapshot();
     if let Some(owner) = eng
         .owner
@@ -6749,27 +6782,32 @@ pub fn counter_snapshot() -> CounterSnapshot {
     // Sampled-cache recycle diagnostics live on ResourcePools (single-threaded
     // under this lock), not the atomic counters; merge them in here.
     let (free_hits, free_allocs, recycle_admits, recycle_cap_drops) =
-        eng.resources.pools.recycle_stats();
+        eng.resources.pools.access().recycle_stats();
     snap.sampled_free_hits = free_hits;
     snap.sampled_free_allocs = free_allocs;
     snap.sampled_recycle_admits = recycle_admits;
     snap.sampled_recycle_cap_drops = recycle_cap_drops;
-    let (t_hits, t_allocs, t_admits, t_cap_drops) = eng.resources.pools.target_recycle_stats();
+    let (t_hits, t_allocs, t_admits, t_cap_drops) =
+        eng.resources.pools.access().target_recycle_stats();
     snap.target_free_hits = t_hits;
     snap.target_free_allocs = t_allocs;
     snap.target_recycle_admits = t_admits;
     snap.target_recycle_cap_drops = t_cap_drops;
-    let (reg_peak, reg_peak_bytes) = eng.resources.pools.registry_pressure_stats();
+    let (reg_peak, reg_peak_bytes) = eng.resources.pools.access().registry_pressure_stats();
     snap.registry_non_pinned_peak = reg_peak;
     snap.registry_non_pinned_peak_bytes = reg_peak_bytes;
-    let (sole_peak, sole_peak_bytes) = eng.resources.pools.registry_sole_copy_stats();
+    let (sole_peak, sole_peak_bytes) = eng.resources.pools.access().registry_sole_copy_stats();
     snap.registry_sole_copy_peak = sole_peak;
     snap.registry_sole_copy_peak_bytes = sole_peak_bytes;
-    let (cs_sole, cs_sole_bytes) = eng.resources.pools.compute_storage_sole_copy_stats();
+    let (cs_sole, cs_sole_bytes) = eng
+        .resources
+        .pools
+        .access()
+        .compute_storage_sole_copy_stats();
     snap.compute_storage_sole_copy_peak = cs_sole;
     snap.compute_storage_sole_copy_peak_bytes = cs_sole_bytes;
-    snap.resident_resample_peak_ms = eng.resources.pools.resident_resample_peak_ms();
-    let (slab_held, slab_carved) = eng.resources.pools.slab_held_bytes();
+    snap.resident_resample_peak_ms = eng.resources.pools.access().resident_resample_peak_ms();
+    let (slab_held, slab_carved) = eng.resources.pools.access().slab_held_bytes();
     snap.slab_held_bytes = slab_held;
     snap.slab_carved_bytes = slab_carved;
     snap

@@ -12,6 +12,7 @@ use super::*;
 
 impl ResourcePools {
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        let mut shared = self.shared.lock();
         let mut detached = self
             .active_encoders
             .drain()
@@ -20,40 +21,44 @@ impl ResourcePools {
             .collect::<Vec<_>>();
         for encoder in &mut detached {
             unsafe {
-                destroy_detached_encoder(device, &mut encoder.0, &mut self.pair.shared.0);
+                destroy_detached_encoder(device, &mut encoder.0, &mut shared);
             }
         }
+        let mut pools = PoolPair {
+            encoder: &mut self.encoder.0,
+            shared: &mut *shared,
+        };
         // An open (never-submitted) batch dies with the pool: its CB belongs
         // to cmd_pool (destroyed below) and its dsets to desc_pool; the
         // accumulated transients are already in the live lists.
-        self.discard_open_batch();
-        self.abort_recorded_guest_work();
+        pools.discard_open_batch();
+        pools.abort_recorded_guest_work();
         // No command from this CB will be submitted now. Destroying its command
         // pool discards the unfinished recording, including an open pass, so
         // there is neither a legal nor a useful cmd_end_render_pass to emit.
-        self.encoder.open_pass = None;
-        self.encoder.forget_pass_echo();
+        pools.encoder.open_pass = None;
+        pools.encoder.forget_pass_echo();
         // A queue handoff transaction is installed on its exact slot before
         // the driver can accept it. Current callers hold the pool exclusively
         // across that call; keeping teardown total over this state also makes
         // the ownership contract valid when recorders become independent.
-        for index in 0..self.encoder.slots.len() {
+        for index in 0..pools.encoder.slots.len() {
             let state = std::mem::replace(
-                &mut self.encoder.slots[index].submission,
+                &mut pools.encoder.slots[index].submission,
                 SlotSubmission::HostOwned,
             );
             match state {
                 SlotSubmission::SealedWaitingCommit(sealed) => {
-                    self.abort_sealed_entry(device, index, sealed);
+                    pools.abort_sealed_entry(device, index, sealed);
                 }
-                state => self.encoder.slots[index].submission = state,
+                state => pools.encoder.slots[index].submission = state,
             }
         }
         // A batched submit transfers host ownership of its fence to the queue
         // thread until the driver's submit call returns. Teardown can be
         // reached through session release without a queue-wide barrier, so
         // reclaim each exact fence before the waits below touch it.
-        for slot in &mut self.encoder.slots {
+        for slot in &mut pools.encoder.slots {
             let state = std::mem::replace(&mut slot.submission, SlotSubmission::HostOwned);
             let result = match state {
                 SlotSubmission::HostOwned => Ok(()),
@@ -72,7 +77,7 @@ impl ResourcePools {
         // Best-effort quiesce: wait every in-flight fence so no CB references
         // what we are about to destroy. On device loss the waits fail — the
         // teardown proceeds regardless, matching the recreate path.
-        for slot in &self.encoder.slots {
+        for slot in &pools.encoder.slots {
             if slot.pending.is_some() && !matches!(slot.submission, SlotSubmission::Failed(_)) {
                 if let Err(result) = device.wait_for_fences(&[slot.fence], true, FENCE_TIMEOUT_NS) {
                     let decline =
@@ -82,7 +87,7 @@ impl ResourcePools {
             }
         }
         {
-            let encoder = &mut self.pair.encoder.0;
+            let encoder = &mut pools.encoder;
             for slot in &mut encoder.slots {
                 if let Some(pending) = slot.pending.take() {
                     super::super::retire_guest_write_pages(&pending.visibility.guest_write_tokens);
@@ -106,10 +111,10 @@ impl ResourcePools {
         // Every fence above was waited (or failed on a lost device, where the
         // handles die with the device anyway), so no slot can still be reading:
         // release the whole graveyard regardless of what each handle waits on.
-        self.release_all_graveyard(device);
+        pools.release_all_graveyard(device);
         {
-            let encoder = &mut self.pair.encoder.0;
-            let shared = &mut self.pair.shared.0;
+            let encoder = &mut pools.encoder;
+            let shared = &mut pools.shared;
             for list in encoder.staging_free.values_mut() {
                 for s in list.drain(..) {
                     release_buffer_slot(device, &mut shared.slabs, s);
@@ -179,39 +184,39 @@ impl ResourcePools {
         // Ad-hoc framebuffers name views owned by the targets and residents
         // destroyed below, and a framebuffer may not outlive its attachments —
         // so they go first, before anything drains a view out from under one.
-        for (_, fb) in self.shared.ad_hoc_framebuffers.drain() {
+        for (_, fb) in pools.shared.ad_hoc_framebuffers.drain() {
             device.destroy_framebuffer(fb, None);
         }
         // Sampled / target / registry images are slab-backed: destroy the image
         // + view handles here, but their memory belongs to shared blocks freed
-        // once by `self.shared.slab.destroy_all(device)` at the end — never a per-image
+        // once by `pools.shared.slab.destroy_all(device)` at the end — never a per-image
         // `vkFreeMemory` (that would double-free a block many images share).
-        for s in self.shared.sampled_free.drain() {
+        for s in pools.shared.sampled_free.drain() {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for s in self.shared.attachment_snapshot_free.drain() {
+        for s in pools.shared.attachment_snapshot_free.drain() {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for img in self.shared.target_free.drain() {
+        for img in pools.shared.target_free.drain() {
             device.destroy_image_view(img.view, None);
             device.destroy_image(img.image, None);
         }
-        for s in self.encoder.sampled_live.drain(..) {
+        for s in pools.encoder.sampled_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for s in self.encoder.attachment_snapshot_live.drain(..) {
+        for s in pools.encoder.attachment_snapshot_live.drain(..) {
             device.destroy_image_view(s.view, None);
             device.destroy_image(s.image, None);
         }
-        for s in self.shared.sampled_cache.drain(..) {
+        for s in pools.shared.sampled_cache.drain(..) {
             device.destroy_image_view(s.slot.view, None);
             device.destroy_image(s.slot.image, None);
         }
-        self.shared.sampled_cache_bytes = 0;
-        for s in self.shared.storage_image_free.drain() {
+        pools.shared.sampled_cache_bytes = 0;
+        for s in pools.shared.storage_image_free.drain() {
             device.destroy_image_view(s.view, None);
             match s.backing {
                 StorageImageBacking::Dedicated(memory) => {
@@ -221,7 +226,7 @@ impl ResourcePools {
                 StorageImageBacking::HeapPlacement { .. } => {}
             }
         }
-        for s in self.encoder.storage_image_live.drain(..) {
+        for s in pools.encoder.storage_image_live.drain(..) {
             device.destroy_image_view(s.view, None);
             match s.backing {
                 StorageImageBacking::Dedicated(memory) => {
@@ -231,7 +236,7 @@ impl ResourcePools {
                 StorageImageBacking::HeapPlacement { .. } => {}
             }
         }
-        for (_, resident) in self.shared.compute_storage_registry.drain() {
+        for (_, resident) in pools.shared.compute_storage_registry.drain() {
             device.destroy_image_view(resident.slot.view, None);
             match resident.slot.backing {
                 StorageImageBacking::Dedicated(memory) => {
@@ -241,23 +246,23 @@ impl ResourcePools {
                 StorageImageBacking::HeapPlacement { .. } => {}
             }
         }
-        for (_, placement) in self.shared.heap_placement_memory.drain() {
+        for (_, placement) in pools.shared.heap_placement_memory.drain() {
             device.destroy_image(placement.image, None);
             device.free_memory(placement.memory, None);
         }
-        self.shared.compute_storage_order.clear();
-        for (_, t) in self.shared.targets.drain() {
+        pools.shared.compute_storage_order.clear();
+        for (_, t) in pools.shared.targets.drain() {
             device.destroy_framebuffer(t.framebuffer, None);
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }
-        self.shared.target_order.clear();
-        if let Some(t) = self.shared.multisample_target.take() {
+        pools.shared.target_order.clear();
+        if let Some(t) = pools.shared.multisample_target.take() {
             device.destroy_framebuffer(t.framebuffer, None);
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }
-        for (_, t) in self.shared.registry.drain() {
+        for (_, t) in pools.shared.registry.drain() {
             device.destroy_framebuffer(t.framebuffer, None);
             for (_, view) in t.alternate_views {
                 device.destroy_image_view(view, None);
@@ -265,48 +270,48 @@ impl ResourcePools {
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }
-        self.shared.guest_resident_authority.clear();
-        self.shared.registry_order.clear();
+        pools.shared.guest_resident_authority.clear();
+        pools.shared.registry_order.clear();
         // Every fence above was waited, so nothing can still be reading or
         // writing an imported RAMBlock. Freeing the memory is what ends the
         // GPU's access to guest RAM, so it runs on every teardown path
         // including the ones that are otherwise giving up.
-        self.shared.host_ram_imports.destroy_all(device);
+        pools.shared.host_ram_imports.destroy_all(device);
         // Free every slab block now that all slab-backed images are destroyed.
-        self.shared.slab.destroy_all(device);
+        pools.shared.slab.destroy_all(device);
         // Same for the HOST_VISIBLE upload blocks: every staging buffer bound
         // into one was destroyed above, so nothing can still reference the
         // block mappings this drops.
-        self.shared.slabs.destroy_all(device);
-        for slot in self.encoder.slots.drain(..) {
+        pools.shared.slabs.destroy_all(device);
+        for slot in pools.encoder.slots.drain(..) {
             device.destroy_fence(slot.fence, None);
         }
-        self.encoder.cur = 0;
+        pools.encoder.cur = 0;
         // After the fences above, so nothing submitted can still name it, and
         // before the arena because its sets were allocated against this layout.
         // Freed before the arena that owns their blocks. Anything still here was
         // never submitted, or its fence has already retired above.
-        let mut owed = std::mem::take(&mut self.encoder.scatter_dsets);
+        let mut owed = std::mem::take(&mut pools.encoder.scatter_dsets);
         // The recycle list holds only sets from entries whose fence retired,
         // which is the same "nothing can still name it" state this relies on.
-        owed.append(&mut self.encoder.scatter_dset_free);
-        self.encoder.desc_arena.free(device, &owed);
-        if let Some(scatter) = self.shared.scatter.take() {
+        owed.append(&mut pools.encoder.scatter_dset_free);
+        pools.encoder.desc_arena.free(device, &owed);
+        if let Some(scatter) = pools.shared.scatter.take() {
             scatter.destroy(device);
         }
-        self.shared.scatter_refused = false;
-        self.encoder.desc_arena.destroy(device);
-        if let Some(probe) = self.encoder.timestamps.take() {
+        pools.shared.scatter_refused = false;
+        pools.encoder.desc_arena.destroy(device);
+        if let Some(probe) = pools.encoder.timestamps.take() {
             device.destroy_query_pool(probe.pool, None);
         }
-        if let Some(probe) = self.encoder.draw_spans.take() {
+        if let Some(probe) = pools.encoder.draw_spans.take() {
             device.destroy_query_pool(probe.pool, None);
         }
-        if self.encoder.cmd_pool != vk::CommandPool::null() {
-            device.destroy_command_pool(self.encoder.cmd_pool, None);
-            self.encoder.cmd_pool = vk::CommandPool::null();
+        if pools.encoder.cmd_pool != vk::CommandPool::null() {
+            device.destroy_command_pool(pools.encoder.cmd_pool, None);
+            pools.encoder.cmd_pool = vk::CommandPool::null();
         }
-        self.encoder.initialized = false;
+        pools.encoder.initialized = false;
     }
 }
 

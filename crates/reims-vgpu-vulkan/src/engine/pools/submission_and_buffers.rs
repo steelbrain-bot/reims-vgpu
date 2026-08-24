@@ -138,7 +138,8 @@ mod fence_wait_contract_tests {
 
     #[test]
     fn a_rejected_commit_returns_the_exact_sealed_cleanup() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.encoder.slots.push(CmdSlot {
             cmd_buf: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -223,7 +224,8 @@ mod pass_echo_delta_order {
     /// cost in the device.
     #[test]
     fn passdiff_compat_means_one_image_described_two_ways() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.encoder_mut().note_pass_opened(echo(1, false));
         assert!(
             matches!(
@@ -1192,21 +1194,27 @@ where
 impl ResourcePools {
     pub(crate) fn new() -> Self {
         Self {
-            pair: PoolPair {
-                encoder: OwnedPool(EncoderPools::new()),
-                shared: OwnedPool(SharedPools::new()),
-            },
+            encoder: OwnedPool(EncoderPools::new()),
+            shared: Arc::new(parking_lot::Mutex::new(SharedPools::new())),
             active_encoders: HashMap::new(),
             idle_encoders: Vec::new(),
         }
     }
 
     pub(in crate::engine) fn recording(&mut self) -> RecordingPools<'_> {
-        let pair = &mut self.pair;
         RecordingPools {
             pair: PoolPair {
-                encoder: &mut pair.encoder.0,
-                shared: &mut pair.shared.0,
+                encoder: &mut self.encoder.0,
+                shared: Arc::clone(&self.shared).lock_arc(),
+            },
+        }
+    }
+
+    pub(crate) fn access(&mut self) -> super::ResourcePoolsAccess<'_> {
+        super::ResourcePoolsAccess {
+            pair: PoolPair {
+                encoder: &mut self.encoder.0,
+                shared: Arc::clone(&self.shared).lock_arc(),
             },
         }
     }
@@ -1218,7 +1226,7 @@ impl ResourcePools {
         identity: SubmissionIdentity,
     ) -> Result<EncoderCheckout, DrawError> {
         let mut encoder = if identity.id.get() == 0 {
-            std::mem::replace(&mut self.pair.encoder, OwnedPool(EncoderPools::new()))
+            std::mem::replace(&mut self.encoder, OwnedPool(EncoderPools::new()))
         } else if let Some(encoder) = self.active_encoders.remove(&identity) {
             encoder
         } else {
@@ -1228,25 +1236,26 @@ impl ResourcePools {
         };
         if let Err(error) = encoder.enter_submission(identity) {
             if identity.id.get() == 0 {
-                self.pair.encoder = encoder;
+                self.encoder = encoder;
             } else {
                 self.active_encoders.insert(identity, encoder);
             }
             return Err(error);
         }
-        Ok(EncoderCheckout { identity, encoder })
+        Ok(EncoderCheckout {
+            identity,
+            encoder,
+            shared: Arc::clone(&self.shared),
+        })
     }
 
-    /// Borrow the checkout together with the session-shared native pools for
-    /// one command recording call.
     pub(in crate::engine) fn recording_from_checkout<'a>(
-        &'a mut self,
         checkout: &'a mut EncoderCheckout,
     ) -> RecordingPools<'a> {
         RecordingPools {
             pair: PoolPair {
                 encoder: &mut checkout.encoder.0,
-                shared: &mut self.pair.shared.0,
+                shared: Arc::clone(&checkout.shared).lock_arc(),
             },
         }
     }
@@ -1255,9 +1264,13 @@ impl ResourcePools {
     /// came from.  Closing the submission, not returning this temporary owner,
     /// is what may move it to the idle depot.
     pub(in crate::engine) fn return_submission_encoder(&mut self, checkout: EncoderCheckout) {
-        let EncoderCheckout { identity, encoder } = checkout;
+        let EncoderCheckout {
+            identity,
+            encoder,
+            shared: _,
+        } = checkout;
         if identity.id.get() == 0 {
-            self.pair.encoder = encoder;
+            self.encoder = encoder;
             return;
         }
         let displaced = self.active_encoders.insert(identity, encoder);
@@ -1278,7 +1291,7 @@ impl ResourcePools {
         identity: SubmissionIdentity,
     ) -> Result<RecordingPools<'_>, DrawError> {
         if identity.id.get() == 0 {
-            self.pair.encoder.enter_submission(identity)?;
+            self.encoder.enter_submission(identity)?;
             return Ok(self.recording());
         }
         if !self.active_encoders.contains_key(&identity) {
@@ -1296,7 +1309,7 @@ impl ResourcePools {
         Ok(RecordingPools {
             pair: PoolPair {
                 encoder: &mut encoder.0,
-                shared: &mut self.pair.shared.0,
+                shared: Arc::clone(&self.shared).lock_arc(),
             },
         })
     }
@@ -1309,7 +1322,7 @@ impl ResourcePools {
         identity: SubmissionIdentity,
     ) -> Result<(), DrawError> {
         if identity.id.get() == 0 {
-            return unsafe { self.pair.close_submission(ctx, counters, identity) };
+            return unsafe { self.access().close_submission(ctx, counters, identity) };
         }
         let Some(mut encoder) = self.active_encoders.remove(&identity) else {
             return Ok(());
@@ -1317,7 +1330,7 @@ impl ResourcePools {
         let result = unsafe {
             PoolPair {
                 encoder: &mut encoder.0,
-                shared: &mut self.pair.shared.0,
+                shared: Arc::clone(&self.shared).lock_arc(),
             }
             .close_submission(ctx, counters, identity)
         };
@@ -1334,7 +1347,7 @@ impl ResourcePools {
         identity: SubmissionIdentity,
     ) -> Result<(), DrawError> {
         if identity.id.get() == 0 {
-            return self.pair.encoder.close_submission(identity);
+            return self.encoder.close_submission(identity);
         }
         let Some(mut encoder) = self.active_encoders.remove(&identity) else {
             return Ok(());
@@ -5181,7 +5194,8 @@ mod recycle_tests {
 
     #[test]
     fn sampled_guest_reuse_is_exact_and_ends_at_the_next_guest_operation() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let slot = null_slot(4, 4);
         let runs = Arc::new(vec![reims_vgpu_memory::GuestRun {
             host_ptr: 0x1000,
@@ -5220,7 +5234,8 @@ mod recycle_tests {
 
     #[test]
     fn sampled_guest_write_invalidation_is_page_exact() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let slot = null_slot(4, 4);
         let make = |host_ptr, page| {
             let mut source = guest_runs(Arc::new(vec![reims_vgpu_memory::GuestRun {
@@ -5247,7 +5262,8 @@ mod recycle_tests {
         use crate::engine::exec::BoundBuffer;
         use crate::engine::types::BufferContent;
 
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let content = |host_ptr| {
             BufferContent::GuestRuns(reims_vgpu_memory::GuestRunSource {
                 runs: Arc::new(vec![reims_vgpu_memory::GuestRun { host_ptr, len: 64 }]),
@@ -5291,7 +5307,8 @@ mod recycle_tests {
         use crate::engine::exec::BoundBuffer;
         use crate::engine::types::BufferContent;
 
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let guest = BufferContent::GuestRuns(reims_vgpu_memory::GuestRunSource {
             runs: Arc::new(vec![reims_vgpu_memory::GuestRun {
                 host_ptr: 0x1000,
@@ -5355,7 +5372,8 @@ mod recycle_tests {
     /// - **The bytes go back to zero.** The gauge follows the retained images.
     #[test]
     fn a_discarded_cache_leaves_no_entry_and_no_bytes() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let resource = reims_vgpu_core::ResourceLifetime::new();
         let owner = resource.reference();
 
@@ -5407,7 +5425,8 @@ mod recycle_tests {
         use crate::engine::exec::BoundBuffer;
         use crate::engine::types::BufferContent;
 
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let filled = BufferContent::Bytes(std::sync::Arc::new(vec![1u8; 64]));
         let owed = BufferContent::Bytes(std::sync::Arc::new(vec![2u8; 128]));
         let bound = |n: u64| BoundBuffer {
@@ -5469,7 +5488,8 @@ mod recycle_tests {
     /// and without it this bind returns the wrong image with nothing to log.
     #[test]
     fn a_collided_digest_over_different_bytes_is_not_a_sampled_hit() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let counters = EngineCounters::default();
 
         let retained: Vec<u8> = (0..64u8).collect();
@@ -5511,7 +5531,8 @@ mod recycle_tests {
     /// re-present of identical content still hits.
     #[test]
     fn the_same_bytes_under_their_own_digest_are_a_sampled_hit() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let counters = EngineCounters::default();
 
         let content: Vec<u8> = (0..64u8).map(|b| b.wrapping_mul(7)).collect();
@@ -5553,7 +5574,8 @@ mod recycle_tests {
 
     #[test]
     fn every_recycle_pool_retains_the_active_working_set() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         for i in 0..104 {
             pools.admit_sampled(null_slot(16, 16 + i));
             pools.admit_target(null_target(16, 16 + i, translate::pixel::SCANOUT_FORMAT));
@@ -5585,7 +5607,8 @@ mod recycle_tests {
     /// per-key capacity.
     #[test]
     fn evicted_sampled_slots_recycle_for_the_whole_active_working_set() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let hd = null_slot(1920, 1080).key();
         for i in 0..100 {
             pools.admit_sampled(null_slot(1920, 1080));
@@ -5601,10 +5624,11 @@ mod recycle_tests {
     /// serialized owner makes them reclaimable.
     #[test]
     fn sampled_cache_entries_follow_resource_lifetime_not_age() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let resource = reims_vgpu_core::ResourceLifetime::new();
         let owner = resource.reference();
-        let push = |pools: &mut ResourcePools, w: u32, h: u32, touch: u64, len: usize| {
+        let push = |pools: &mut ResourcePoolsAccess<'_>, w: u32, h: u32, touch: u64, len: usize| {
             pools.shared.sampled_cache_bytes = pools.shared.sampled_cache_bytes.saturating_add(len);
             pools.shared.sampled_cache.push(ResidentSampledSlot {
                 slot: null_slot(w, h),
@@ -5642,8 +5666,9 @@ mod recycle_tests {
     /// still cannot end their guest-visible lifetime.
     #[test]
     fn maintenance_does_not_reclaim_compute_storage_by_age() {
-        let mut pools = ResourcePools::new();
-        let admit = |pools: &mut ResourcePools, tex: u32, touch: u64, pinned: bool| {
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
+        let admit = |pools: &mut ResourcePoolsAccess<'_>, tex: u32, touch: u64, pinned: bool| {
             let id = ComputeStorageResidencyKey::linear(
                 reims_vgpu_protocol::ResourceId::new(tex, 1),
                 0,
@@ -5690,7 +5715,8 @@ mod recycle_tests {
     /// Fails without the gate: the resident is taken on the first call.
     #[test]
     fn a_compute_resident_that_is_the_only_copy_of_its_output_is_never_aged_out() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = admit_compute_resident(&mut pools, 1, 1_000, false);
         // The dispatch wrote it. Nothing else holds the result.
         pools.mark_resident_storage_image(&id, 7);
@@ -5718,7 +5744,8 @@ mod recycle_tests {
     /// Fails without the gate: both residents stay in the list once marked.
     #[test]
     fn the_compute_allocation_reclaim_offers_up_nothing_that_is_the_only_copy() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let a = admit_compute_resident(&mut pools, 1, 1_000, false);
         let b = admit_compute_resident(&mut pools, 2, 2_000, false);
         assert_eq!(
@@ -5746,8 +5773,9 @@ mod recycle_tests {
     /// that is the only way such a resident leaves.
     #[test]
     fn the_maintained_compute_sole_copy_totals_track_the_walk() {
-        let mut pools = ResourcePools::new();
-        let check = |pools: &ResourcePools, what: &str| {
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
+        let check = |pools: &ResourcePoolsAccess<'_>, what: &str| {
             let walk = {
                 let sole = || {
                     pools
@@ -5825,7 +5853,7 @@ mod recycle_tests {
     }
 
     fn admit_compute_resident(
-        pools: &mut ResourcePools,
+        pools: &mut ResourcePoolsAccess<'_>,
         tex: u32,
         touch: u64,
         pinned: bool,
@@ -5867,7 +5895,8 @@ mod recycle_tests {
     /// Fails without the fix: `tex 1` is reclaimed alongside its untouched peers.
     #[test]
     fn a_compute_resident_read_through_snapshot_is_not_aged_out() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let read = admit_compute_resident(&mut pools, 1, 1_000, false);
         let untouched = admit_compute_resident(&mut pools, 2, 1_000, false);
         pools.shared.idle_clock_ms = 10_000;
@@ -5902,7 +5931,8 @@ mod recycle_tests {
     /// Fails without the fix: `tex 1` is reclaimed alongside its untouched peer.
     #[test]
     fn a_read_only_compute_storage_resident_is_not_aged_out() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let read = admit_compute_resident(&mut pools, 1, 1_000, false);
         let untouched = admit_compute_resident(&mut pools, 2, 1_000, false);
         // The drain's clock has to be current before a read can be recorded
@@ -5942,7 +5972,8 @@ mod recycle_tests {
     #[test]
     fn rekeying_a_pinned_compute_resident_is_refused_rather_than_dropped() {
         use reims_vgpu_observe::decline::Decline;
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let pinned = admit_compute_resident(&mut pools, 1, 0, true);
         let unpinned = admit_compute_resident(&mut pools, 2, 0, false);
         let same = StorageImageKey {
@@ -5992,7 +6023,8 @@ mod recycle_tests {
     /// target registry's walk makes.
     #[test]
     fn an_all_pinned_compute_storage_registry_offers_no_victim() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         admit_compute_resident(&mut pools, 1, 0, true);
         admit_compute_resident(&mut pools, 2, 0, true);
         assert!(
@@ -6011,7 +6043,8 @@ mod recycle_tests {
     /// drops, while admissions still count the whole active working set.
     #[test]
     fn recycle_stats_count_every_admission_and_no_capacity_drops() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         assert_eq!(pools.recycle_stats(), (0, 0, 0, 0));
 
         for _ in 0..100 {
@@ -6042,7 +6075,8 @@ mod recycle_tests {
     /// geometry-keyed pool for the complete active working set.
     #[test]
     fn displaced_targets_recycle_for_the_whole_active_working_set() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let fmt = translate::pixel::SCANOUT_FORMAT;
         let key = null_target(1920, 1080, fmt).key();
 
@@ -6071,7 +6105,8 @@ mod recycle_tests {
     /// steady-geometry stream after the first fill is all hits, zero allocs.
     #[test]
     fn recycled_target_is_reused_across_generation_bumps() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let fmt = translate::pixel::SCANOUT_FORMAT;
 
         // Frame 0: cold — no free image, so it counts as an alloc (miss).
@@ -6142,7 +6177,8 @@ mod recycle_tests {
 
     #[test]
     fn extracting_a_completed_encoder_entry_does_not_acknowledge_shared_retirement() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let order = std::sync::Arc::clone(&pools.shared.retirement);
         let submitted = order.reserve().unwrap().submitted();
         let captured = order.latest().unwrap();
@@ -6172,7 +6208,8 @@ mod recycle_tests {
 
     #[test]
     fn recording_checkout_and_checkin_transfer_one_global_order_point() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.encoder.slots.push(idle_slot());
         let order = std::sync::Arc::clone(&pools.shared.retirement);
         let lease = pools.shared.checkout_recording().unwrap();
@@ -6200,7 +6237,8 @@ mod recycle_tests {
 
     #[test]
     fn sealed_recording_cancellation_cannot_cancel_a_later_recording() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let order = std::sync::Arc::clone(&pools.shared.retirement);
 
         let first_recording = pools.shared.checkout_recording().unwrap();
@@ -6229,7 +6267,8 @@ mod recycle_tests {
     fn opportunistic_retirement_never_polls_a_queue_owned_fence() {
         let counters = EngineCounters::default();
         let (receipt, returned) = crate::engine::queue_owner::PendingQueueSubmit::test_pair();
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let mut slot = pending_slot();
         slot.submission = SlotSubmission::QueueOwned(receipt);
         pools.encoder.slots.push(slot);
@@ -6252,7 +6291,8 @@ mod recycle_tests {
     fn rejected_async_submit_never_becomes_a_waitable_fence() {
         let counters = EngineCounters::default();
         let (receipt, returned) = crate::engine::queue_owner::PendingQueueSubmit::test_pair();
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let mut slot = pending_slot();
         slot.submission = SlotSubmission::QueueOwned(receipt);
         pools.encoder.slots.push(slot);
@@ -6278,7 +6318,8 @@ mod recycle_tests {
     /// the corruption the rail is allowed to exist only because this prevents.
     #[test]
     fn a_stamp_waits_for_guest_reads_only_when_one_was_recorded() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         assert!(!super::super::super::guest_access_outstanding());
         assert!(
             !pools.has_guest_read_debt(),
@@ -6326,7 +6367,7 @@ mod recycle_tests {
         };
         /// One thing that ends a remembered bind's life, named for the failure
         /// message.
-        type EndOfLife<'a> = (&'a str, &'a dyn Fn(&mut ResourcePools));
+        type EndOfLife<'a> = (&'a str, &'a dyn Fn(&mut ResourcePoolsAccess<'_>));
         let ends: [EndOfLife<'_>; 2] = [
             ("a seal", &|p| {
                 // This device-free test installs no native cleanup; explicitly
@@ -6337,7 +6378,8 @@ mod recycle_tests {
             ("a staging recycle", &|p| p.recycle_staging()),
         ];
         for (what, end) in ends {
-            let mut pools = ResourcePools::new();
+            let mut pool_owner = ResourcePools::new();
+            let mut pools = pool_owner.access();
             pools.note_cb_bound_buffer(bind.clone(), bound);
             assert!(
                 pools.cb_bound_buffer(bind.key()).is_some(),
@@ -6369,7 +6411,8 @@ mod recycle_tests {
     /// "The map still holds it" is the invariant itself, and it is exact.
     #[test]
     fn a_remembered_bind_holds_the_allocation_its_key_names() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let bound = crate::engine::exec::BoundBuffer {
             buffer: vk::Buffer::null(),
             offset: 0,
@@ -6406,7 +6449,8 @@ mod recycle_tests {
     /// change removed, wearing a different name.
     #[test]
     fn a_submission_seal_takes_exactly_the_guest_write_tokens_recorded_into_it() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let identity = TargetIdentity::Surface {
             id: 1,
             width: 16,
@@ -6440,7 +6484,8 @@ mod recycle_tests {
         crate::engine::clear_guest_write_pages();
         let pages =
             reims_vgpu_memory::GuestWritePages::new(&[0x1000, 0x2000]).expect("non-empty page set");
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
 
         pools.note_guest_write_pages_recorded(GuestWriteSource::ImportedBuffer, &pages);
         pools.note_guest_write_pages_recorded(GuestWriteSource::ImportedBuffer, &pages);
@@ -6474,7 +6519,8 @@ mod recycle_tests {
     /// transferring that pin to the submission that releases it.
     #[test]
     fn a_submitted_writeback_holds_its_residents_pin_until_its_slot_retires() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let identity = TargetIdentity::Surface {
             id: 7,
             width: 16,
@@ -6538,7 +6584,8 @@ mod recycle_tests {
     /// the dispatch finished would read its pages before the copy landed.
     #[test]
     fn a_ring_owned_writeback_records_the_debt_without_pinning_anything() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let identity = TargetIdentity::Surface {
             id: 9,
             width: 16,
@@ -6597,7 +6644,8 @@ mod recycle_tests {
     /// identity refuses every later re-shape for the life of the guest.
     #[test]
     fn a_compute_resident_writeback_pins_in_its_own_registry_until_the_slot_retires() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let id = admit_compute_resident(&mut pools, 1, 1_000, false);
 
         pools.note_guest_write_recorded(GuestWriteSource::ResidentStorage(&id), None);
@@ -6639,7 +6687,8 @@ mod recycle_tests {
     /// unpin would land on a future resident admitted under the same key.
     #[test]
     fn a_compute_writeback_against_an_unregistered_identity_records_no_pin() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let absent = ComputeStorageResidencyKey::linear(
             reims_vgpu_protocol::ResourceId::new(77, 1),
             0,
@@ -6669,7 +6718,8 @@ mod recycle_tests {
     /// now take. The host window's present pin is the live second holder.
     #[test]
     fn a_writeback_retirement_does_not_release_another_holders_pin() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let identity = TargetIdentity::Surface {
             id: 9,
             width: 16,
@@ -6709,7 +6759,8 @@ mod recycle_tests {
     /// how the settle came to release pins that were never taken.
     #[test]
     fn a_writeback_on_an_unpinnable_resident_queues_no_release() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let identity = TargetIdentity::Surface {
             id: 11,
             width: 16,
@@ -6734,7 +6785,8 @@ mod recycle_tests {
     /// extend the captured prefix.
     #[test]
     fn a_disposed_handle_waits_on_the_recordings_open_when_it_was_disposed_and_no_others() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let first = pools.shared.retirement.reserve().unwrap().submitted();
         let second = pools.shared.retirement.reserve().unwrap().submitted();
         let waiting = pools.shared.retirement.latest().unwrap();
@@ -6767,7 +6819,8 @@ mod recycle_tests {
     /// tail uses to decide whether it has submission work.
     #[test]
     fn batch_ownership_publishes_and_clears_the_tail_gate() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         assert!(!crate::engine::batch_open_for_current_session());
         pools.install_open_batch(OpenBatch {
             cb: vk::CommandBuffer::null(),
@@ -6792,7 +6845,8 @@ mod recycle_tests {
     /// drain boundary before it takes that lock.
     #[test]
     fn the_open_batch_slot_counts_as_open_even_though_it_owes_no_cleanup() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.encoder.slots = (0..4).map(|_| idle_slot()).collect();
         pools.encoder.cur = 3;
         assert!(!pools.current_entry_owns_cleanup(), "idle ring, no batch");
@@ -6832,7 +6886,8 @@ mod recycle_tests {
             height: 16,
             bgra: false,
         };
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.encoder.slots = (0..4).map(|_| idle_slot()).collect();
 
         assert!(
@@ -6889,7 +6944,8 @@ mod recycle_tests {
     /// even while later recordings remain live.
     #[test]
     fn a_ring_that_never_goes_idle_still_drains_the_graveyard() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let depth = 4;
         let mut submitted = VecDeque::new();
 
@@ -7124,7 +7180,7 @@ mod encoder_submission_ownership {
         assert_eq!(checkout.identity, submission);
         assert_eq!(checkout.encoder.active_submission, Some(submission));
         {
-            let recording = pools.recording_from_checkout(&mut checkout);
+            let recording = ResourcePools::recording_from_checkout(&mut checkout);
             assert_eq!(recording.encoder.active_submission, Some(submission));
         }
 
@@ -7278,7 +7334,8 @@ mod gather_slots_do_not_alias {
     /// detile wrote the buffer the first frame's scatter was still reading.
     #[test]
     fn a_second_acquire_cannot_name_the_first_ones_buffer() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let bucket = buffer_bucket(4096);
         pools
             .encoder
@@ -7310,7 +7367,8 @@ mod gather_slots_do_not_alias {
     /// submitted copy.
     #[test]
     fn an_acquired_slot_is_no_longer_free() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let bucket = buffer_bucket(4096);
         pools
             .encoder
@@ -7439,7 +7497,8 @@ mod scatter_descriptor_sets_do_not_alias {
     #[test]
     fn a_batch_fills_at_the_pools_cap_and_not_at_the_compiled_constant() {
         let target = batch_target();
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         pools.encoder.batch_max_draws = 4;
         pools.encoder.open_batch = Some(super::OpenBatch {
             cb: vk::CommandBuffer::null(),
@@ -7528,7 +7587,8 @@ mod imported_guest_visibility_tests {
 
     #[test]
     fn one_host_dependency_covers_one_guest_operation_until_a_gpu_write() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let cb = vk::CommandBuffer::from_raw(1);
 
         pools.begin_guest_operation(cb);
@@ -7578,7 +7638,8 @@ mod imported_guest_visibility_tests {
 
     #[test]
     fn an_operation_boundary_preserves_unconsumed_gpu_write_debt() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let cb = vk::CommandBuffer::from_raw(1);
 
         pools.begin_guest_operation(cb);
@@ -7594,7 +7655,8 @@ mod imported_guest_visibility_tests {
 
     #[test]
     fn a_new_command_buffer_owes_its_own_host_dependency() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let first = vk::CommandBuffer::from_raw(1);
         let second = vk::CommandBuffer::from_raw(2);
 
@@ -7616,7 +7678,8 @@ mod imported_guest_visibility_tests {
 
     #[test]
     fn render_encoder_continuations_share_visibility_only_in_one_command_buffer() {
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let first = vk::CommandBuffer::from_raw(1);
         let second = vk::CommandBuffer::from_raw(2);
 

@@ -726,7 +726,8 @@ pub(crate) struct PoolPair<Encoder, Shared> {
 }
 
 pub(crate) struct ResourcePools {
-    pair: PoolPair<OwnedPool<EncoderPools>, OwnedPool<SharedPools>>,
+    encoder: OwnedPool<EncoderPools>,
+    shared: Arc<parking_lot::Mutex<SharedPools>>,
     active_encoders: HashMap<SubmissionIdentity, OwnedPool<EncoderPools>>,
     idle_encoders: Vec<OwnedPool<EncoderPools>>,
 }
@@ -740,17 +741,30 @@ pub(crate) struct ResourcePools {
 pub(crate) struct EncoderCheckout {
     identity: SubmissionIdentity,
     encoder: OwnedPool<EncoderPools>,
+    shared: Arc<parking_lot::Mutex<SharedPools>>,
 }
 
-impl std::ops::Deref for ResourcePools {
-    type Target = PoolPair<OwnedPool<EncoderPools>, OwnedPool<SharedPools>>;
+/// Temporary full-pool view for device, maintenance, and teardown operations.
+/// Recording checkouts use [`RecordingPools`] and never borrow the depot.
+pub(crate) struct ResourcePoolsAccess<'a> {
+    pair: PoolPair<
+        &'a mut EncoderPools,
+        parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SharedPools>,
+    >,
+}
+
+impl<'a> std::ops::Deref for ResourcePoolsAccess<'a> {
+    type Target = PoolPair<
+        &'a mut EncoderPools,
+        parking_lot::lock_api::ArcMutexGuard<parking_lot::RawMutex, SharedPools>,
+    >;
 
     fn deref(&self) -> &Self::Target {
         &self.pair
     }
 }
 
-impl std::ops::DerefMut for ResourcePools {
+impl<'a> std::ops::DerefMut for ResourcePoolsAccess<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.pair
     }
@@ -761,21 +775,11 @@ impl std::ops::DerefMut for ResourcePools {
 /// Native execution takes this type instead of the session's owning pool so
 /// recording-local state can move to a worker without granting that worker
 /// ownership of session teardown or replacement.
-pub(crate) struct RecordingPools<'a> {
-    pair: PoolPair<&'a mut EncoderPools, &'a mut SharedPools>,
-}
+pub(crate) type RecordingPools<'a> = ResourcePoolsAccess<'a>;
 
-impl<'a> std::ops::Deref for RecordingPools<'a> {
-    type Target = PoolPair<&'a mut EncoderPools, &'a mut SharedPools>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.pair
-    }
-}
-
-impl std::ops::DerefMut for RecordingPools<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.pair
+impl ResourcePoolsAccess<'_> {
+    pub(crate) fn recording(&mut self) -> &mut Self {
+        self
     }
 }
 
@@ -4481,7 +4485,8 @@ mod staging_mapping_tests {
             }
         };
         let counters = EngineCounters::default();
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
 
         let first = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }
@@ -4504,7 +4509,8 @@ mod staging_mapping_tests {
         );
 
         pools.recycle_staging();
-        unsafe { pools.destroy_all(&ctx.device) };
+        drop(pools);
+        unsafe { pool_owner.destroy_all(&ctx.device) };
         unsafe { ctx.destroy() };
     }
 
@@ -4533,7 +4539,8 @@ mod staging_mapping_tests {
             }
         };
         let counters = EngineCounters::default();
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
 
         // Two passes over eleven distinct buckets from 64 B to 64 KiB. The
@@ -4566,7 +4573,8 @@ mod staging_mapping_tests {
         );
 
         pools.recycle_staging();
-        unsafe { pools.destroy_all(&ctx.device) };
+        drop(pools);
+        unsafe { pool_owner.destroy_all(&ctx.device) };
         unsafe { ctx.destroy() };
     }
 
@@ -4590,7 +4598,8 @@ mod staging_mapping_tests {
             }
         };
         let counters = EngineCounters::default();
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
         let usage = vk::BufferUsageFlags::VERTEX_BUFFER;
 
         let a = unsafe { pools.acquire_staging(&ctx, 4096, usage, &counters) }.expect("slot a");
@@ -4627,7 +4636,8 @@ mod staging_mapping_tests {
         }
 
         pools.recycle_staging();
-        unsafe { pools.destroy_all(&ctx.device) };
+        drop(pools);
+        unsafe { pool_owner.destroy_all(&ctx.device) };
         unsafe { ctx.destroy() };
     }
 
@@ -4655,7 +4665,8 @@ mod staging_mapping_tests {
             }
         };
         let counters = EngineCounters::default();
-        let mut pools = ResourcePools::new();
+        let mut pool_owner = ResourcePools::new();
+        let mut pools = pool_owner.access();
 
         let slot = unsafe { pools.encoder.acquire_readback(&ctx, 4096, &counters) }
             .expect("a 4 KiB readback slot must be available");
@@ -4671,7 +4682,8 @@ mod staging_mapping_tests {
                 pools.encoder.lease_readback().is_none(),
                 "an uncached slot must not be leased"
             );
-            unsafe { pools.destroy_all(&ctx.device) };
+            drop(pools);
+            unsafe { pool_owner.destroy_all(&ctx.device) };
             unsafe { ctx.destroy() };
             return;
         }
@@ -4734,7 +4746,8 @@ mod staging_mapping_tests {
         );
 
         pools.encoder.recycle_readback();
-        unsafe { pools.destroy_all(&ctx.device) };
+        drop(pools);
+        unsafe { pool_owner.destroy_all(&ctx.device) };
         unsafe { ctx.destroy() };
     }
 }
