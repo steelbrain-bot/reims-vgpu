@@ -235,6 +235,14 @@ impl SharedPools {
             host_ram_imports: host_ram::HostRamImports::default(),
         }
     }
+
+    /// Issue the global order point an encoder must own before it can read a
+    /// shared native registry.
+    fn checkout_recording(
+        &self,
+    ) -> Result<RecordingLease, super::super::retirement::RecordingSequenceExhausted> {
+        self.retirement.reserve()
+    }
 }
 
 impl ResourcePools {
@@ -1665,12 +1673,11 @@ impl ResourcePools {
             }
         }
         self.encoder.cur = next;
-        self.encoder.recording = Some(
-            self.shared
-                .retirement
-                .reserve()
-                .map_err(|_| DrawError::RecordingSequenceExhausted)?,
-        );
+        let lease = self
+            .shared
+            .checkout_recording()
+            .map_err(|_| DrawError::RecordingSequenceExhausted)?;
+        self.encoder.begin_recording(lease);
         Ok((
             self.encoder.slots[next].cmd_buf,
             self.encoder.slots[next].fence,
@@ -1709,35 +1716,13 @@ impl ResourcePools {
         timeline: Option<u64>,
         submit_return: Option<super::super::queue_owner::PendingQueueSubmit>,
     ) {
-        let SealedEntry {
-            cleanup,
-            admissions,
-        } = sealed;
-        debug_assert!(
-            self.encoder.slots[self.encoder.cur].pending.is_none(),
-            "current slot already owes cleanup"
-        );
-        debug_assert!(
-            self.encoder.slots[self.encoder.cur].retirement.is_none(),
-            "current slot already owns a recording point"
-        );
-        self.encoder.slots[self.encoder.cur].retirement = Some(
-            self.encoder
-                .recording
-                .take()
-                .expect("submission has no recording lease")
-                .submitted(),
-        );
-        self.encoder.slots[self.encoder.cur].pending = Some(cleanup);
-        self.encoder.slots[self.encoder.cur].submission = submit_return
-            .map(SlotSubmission::QueueOwned)
-            .unwrap_or(SlotSubmission::HostOwned);
-        self.encoder.in_flight += 1;
+        let admissions = self
+            .encoder
+            .park_submitted_entry(sealed, timeline, submit_return);
         // The submission is now outstanding, and this is the one point both
         // submit paths reach — a batch flush and a lone draw's own submit. The
         // trail's per-slot record is cleared again in `retire_slot`, so a slot
         // holding one is a submission whose fence has not signalled.
-        crate::gpu_hang_trail::note_submit(self.encoder.cur, timeline);
         self.admit_recorded_sampled(admissions);
     }
 
@@ -1803,6 +1788,15 @@ impl ResourcePools {
 }
 
 impl EncoderPools {
+    /// Install the shared order point for the command buffer about to record.
+    fn begin_recording(&mut self, lease: RecordingLease) {
+        assert!(
+            self.recording.is_none(),
+            "encoder began a second recording before ending the first"
+        );
+        self.recording = Some(lease);
+    }
+
     /// Whether a draw at `target` can append to the open batch, and when it
     /// cannot, which of the three reasons it is. Anything but
     /// [`BatchFit::Open`] means the caller must claim its own slot (and
@@ -1921,6 +1915,41 @@ impl EncoderPools {
             cleanup,
             retirement,
         })
+    }
+
+    /// Park a submitted command buffer and return the content admissions that
+    /// shared state may publish once the slot owns its cleanup.
+    fn park_submitted_entry(
+        &mut self,
+        sealed: SealedEntry,
+        timeline: Option<u64>,
+        submit_return: Option<super::super::queue_owner::PendingQueueSubmit>,
+    ) -> Vec<(SampledSlot, SampledRetain)> {
+        let SealedEntry {
+            cleanup,
+            admissions,
+        } = sealed;
+        debug_assert!(
+            self.slots[self.cur].pending.is_none(),
+            "current slot already owes cleanup"
+        );
+        debug_assert!(
+            self.slots[self.cur].retirement.is_none(),
+            "current slot already owns a recording point"
+        );
+        self.slots[self.cur].retirement = Some(
+            self.recording
+                .take()
+                .expect("submission has no recording lease")
+                .submitted(),
+        );
+        self.slots[self.cur].pending = Some(cleanup);
+        self.slots[self.cur].submission = submit_return
+            .map(SlotSubmission::QueueOwned)
+            .unwrap_or(SlotSubmission::HostOwned);
+        self.in_flight += 1;
+        crate::gpu_hang_trail::note_submit(self.cur, timeline);
+        admissions
     }
 
     /// Whether the pass a draw is about to open is the one already standing in
@@ -5604,6 +5633,30 @@ mod recycle_tests {
             retirement,
         } = retired;
         assert!(cleanup.dsets.is_empty());
+        retirement.retire();
+        assert!(order.retired(captured));
+    }
+
+    #[test]
+    fn recording_checkout_and_checkin_transfer_one_global_order_point() {
+        let mut pools = ResourcePools::new();
+        pools.encoder.slots.push(idle_slot());
+        let order = std::sync::Arc::clone(&pools.shared.retirement);
+        let lease = pools.shared.checkout_recording().unwrap();
+        let captured = order.latest().unwrap();
+
+        pools.encoder.begin_recording(lease);
+        let sealed = pools.encoder.seal_entry(Vec::new(), Vec::new());
+        let admissions = pools.encoder.park_submitted_entry(sealed, None, None);
+        assert!(admissions.is_empty());
+        assert!(pools.encoder.recording.is_none());
+        assert!(pools.encoder.slots[0].pending.is_some());
+        assert!(pools.encoder.slots[0].retirement.is_some());
+        assert_eq!(pools.encoder.in_flight, 1);
+        assert!(!order.retired(captured));
+
+        let retired = pools.encoder.take_completed_entry(0).unwrap();
+        let RetiredEntry { retirement, .. } = retired;
         retirement.retire();
         assert!(order.retired(captured));
     }
