@@ -4,7 +4,7 @@
 
 use ash::vk;
 use ash::vk::Handle;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -729,6 +729,7 @@ pub(crate) struct ResourcePools {
     encoder: OwnedPool<EncoderPools>,
     shared: Arc<parking_lot::Mutex<SharedPools>>,
     active_encoders: HashMap<SubmissionIdentity, OwnedPool<EncoderPools>>,
+    checked_out_encoders: HashSet<SubmissionIdentity>,
     idle_encoders: Vec<OwnedPool<EncoderPools>>,
 }
 

@@ -12,6 +12,10 @@ use super::*;
 
 impl ResourcePools {
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        assert!(
+            self.checked_out_encoders.is_empty(),
+            "recording quiescence must return every encoder before teardown"
+        );
         let mut shared = self.shared.lock();
         let mut detached = self
             .active_encoders

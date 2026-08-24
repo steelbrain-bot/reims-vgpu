@@ -86,7 +86,7 @@ use caches::{ObjectCaches, SessionCacheIndexes};
 use context::ContextOwner;
 use device_lost::{DeviceLostDecline, DeviceLostOp};
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use pools::ResourcePools;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -125,6 +125,7 @@ impl std::fmt::Debug for SessionHandle {
 
 struct SessionInner {
     id: SessionId,
+    released: std::sync::atomic::AtomicBool,
     resources: Arc<Mutex<SessionResources>>,
     indexes: Arc<Mutex<SessionCacheIndexes>>,
     counters: Arc<EngineCounters>,
@@ -139,6 +140,7 @@ impl SessionHandle {
     fn new(id: SessionId) -> Self {
         let handle = Self(Arc::new(SessionInner {
             id,
+            released: std::sync::atomic::AtomicBool::new(false),
             resources: Arc::new(Mutex::new(SessionResources::new())),
             indexes: Arc::new(Mutex::new(SessionCacheIndexes::new())),
             counters: Arc::new(EngineCounters::default()),
@@ -201,6 +203,9 @@ pub fn release_session(session: &SessionHandle) {
     if session.id() == SessionId(0) {
         return;
     }
+    if session.0.released.swap(true, Ordering::AcqRel) {
+        return;
+    }
     {
         let _scope = enter_session(session);
         reset_guest_state();
@@ -228,6 +233,7 @@ static LIVE_SESSIONS: Lazy<Mutex<HashMap<SessionId, Weak<SessionInner>>>> = Lazy
 static DEFAULT_SESSION: Lazy<SessionHandle> = Lazy::new(|| {
     SessionHandle(Arc::new(SessionInner {
         id: SessionId(0),
+        released: std::sync::atomic::AtomicBool::new(false),
         resources: Arc::new(Mutex::new(SessionResources::new())),
         indexes: Arc::new(Mutex::new(SessionCacheIndexes::new())),
         counters: Arc::new(EngineCounters::default()),
@@ -377,6 +383,100 @@ pub(crate) fn color_subresource_layers() -> ash::vk::ImageSubresourceLayers {
 struct EngineState {
     owner: ContextOwner,
     caches: Arc<Mutex<ObjectCaches>>,
+    recordings: Arc<RecordingGate>,
+}
+
+#[derive(Default)]
+struct RecordingGateState {
+    accepting: bool,
+    active: usize,
+}
+
+/// Device-incarnation barrier for whole-EXEC recording owners.
+///
+/// The count has no policy bound: it is exactly the set of live recording
+/// leases. Device teardown closes admission under the engine mutex, releases
+/// the session-resource mutex used by lease return, and waits for this set to
+/// become empty before destroying any handle an encoder may still reference.
+struct RecordingGate {
+    state: Mutex<RecordingGateState>,
+    empty: Condvar,
+}
+
+impl RecordingGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RecordingGateState {
+                accepting: true,
+                active: 0,
+            }),
+            empty: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> RecordingLease {
+        let mut state = self.state.lock();
+        assert!(
+            state.accepting,
+            "the engine mutex prevents recording admission during teardown"
+        );
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("live recording lease count overflowed");
+        RecordingLease {
+            gate: Arc::clone(self),
+        }
+    }
+
+    fn pause(&self) {
+        let mut state = self.state.lock();
+        assert!(state.accepting, "recording admission is already paused");
+        state.accepting = false;
+        self.empty.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait_paused(&self) {
+        let mut state = self.state.lock();
+        while state.accepting {
+            self.empty.wait(&mut state);
+        }
+    }
+
+    fn wait_empty(&self) {
+        let mut state = self.state.lock();
+        while state.active != 0 {
+            self.empty.wait(&mut state);
+        }
+    }
+
+    fn resume(&self) {
+        let mut state = self.state.lock();
+        assert!(!state.accepting, "recording admission was not paused");
+        assert_eq!(
+            state.active, 0,
+            "recording admission resumed while occupied"
+        );
+        state.accepting = true;
+    }
+}
+
+struct RecordingLease {
+    gate: Arc<RecordingGate>,
+}
+
+impl Drop for RecordingLease {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock();
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("recording lease released more than once");
+        if state.active == 0 {
+            self.gate.empty.notify_all();
+        }
+    }
 }
 
 struct SessionResources {
@@ -416,6 +516,7 @@ impl EngineState {
         Self {
             owner: ContextOwner::new(),
             caches: Arc::new(Mutex::new(ObjectCaches::new())),
+            recordings: Arc::new(RecordingGate::new()),
         }
     }
 
@@ -1445,7 +1546,11 @@ impl EngineGuard {
             counters,
             ..
         } = self;
-        let EngineState { owner, caches: _ } = &mut **guard;
+        let EngineState {
+            owner,
+            caches: _,
+            recordings: _,
+        } = &mut **guard;
         let SessionResources {
             pools,
             #[cfg(feature = "host-window")]
@@ -1461,33 +1566,64 @@ impl EngineGuard {
         }
     }
 
+    fn quiesce_recordings(&mut self) {
+        self.guard.recordings.pause();
+        // Recording drop returns its checked-out encoder through this mutex
+        // before releasing the final lease. Holding it while waiting would
+        // deadlock the first recorder that tries to make the count reach zero.
+        self.resources.0 = None;
+        self.guard.recordings.wait_empty();
+        self.resources = GuardSlot::new(self.session.0.resources.clone().lock_arc());
+    }
+
+    fn resume_recordings(&self) {
+        self.guard.recordings.resume();
+    }
+
     fn on_device_lost(&mut self) -> bool {
+        self.quiesce_recordings();
         let session_id = self.session_id;
         let mut caches = self.caches.lock();
         let mut indexes = self.indexes.lock();
-        self.guard.on_device_lost(
+        let recreated = self.guard.on_device_lost(
             &mut caches,
             &mut indexes,
             &self.counters,
             session_id,
             &mut self.resources,
-        )
+        );
+        drop(indexes);
+        drop(caches);
+        self.resume_recordings();
+        recreated
     }
 
     fn flush_device_derived(&mut self) {
+        self.quiesce_recordings();
         let session_id = self.session_id;
         let mut caches = self.caches.lock();
         let mut indexes = self.indexes.lock();
         self.guard
             .flush_device_derived(&mut caches, &mut indexes, session_id, &mut self.resources);
+        drop(indexes);
+        drop(caches);
+        self.resume_recordings();
     }
 
     fn into_submission_recording(
         mut self,
         identity: reims_vgpu_protocol::SubmissionIdentity,
     ) -> Result<SubmissionRecording, DrawError> {
+        if self.session.0.released.load(Ordering::Acquire) {
+            return Err(DrawError::Facade(
+                EngineFacadeDecline::ExecutorSessionReleased {
+                    session: self.session_id.0,
+                },
+            ));
+        }
         let (context, force_loss) = self.guard.owner.lease_recording_context(&self.counters)?;
         let checkout = self.resources.pools.checkout_submission_encoder(identity)?;
+        let recording_lease = self.guard.recordings.acquire();
         let caches = Arc::clone(&self.guard.caches);
         let indexes = Arc::clone(&self.session.0.indexes);
         let resources = Arc::clone(&self.session.0.resources);
@@ -1507,6 +1643,7 @@ impl EngineGuard {
             counters,
             session,
             checkout: Some(checkout),
+            recording_lease: Some(recording_lease),
         })
     }
 }
@@ -1520,6 +1657,7 @@ struct SubmissionRecording {
     counters: Arc<EngineCounters>,
     session: SessionHandle,
     checkout: Option<pools::EncoderCheckout>,
+    recording_lease: Option<RecordingLease>,
 }
 
 impl Drop for SubmissionRecording {
@@ -1530,6 +1668,7 @@ impl Drop for SubmissionRecording {
                 .pools
                 .return_submission_encoder(checkout);
         }
+        drop(self.recording_lease.take());
     }
 }
 
@@ -1601,6 +1740,63 @@ mod submission_recording_ownership_tests {
 
         assert_eq!(*owner.lock(), 11);
     }
+
+    #[test]
+    fn teardown_waits_for_the_exact_live_recording_set() {
+        let gate = Arc::new(RecordingGate::new());
+        let first = gate.acquire();
+        let second = gate.acquire();
+        gate.pause();
+
+        let waiter_gate = Arc::clone(&gate);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            waiter_gate.wait_empty();
+            done_tx.send(()).unwrap();
+        });
+
+        drop(first);
+        assert!(done_rx.try_recv().is_err());
+        drop(second);
+        done_rx
+            .recv()
+            .expect("teardown wakes when the final recording owner returns");
+        waiter.join().unwrap();
+        gate.resume();
+
+        let next_incarnation = gate.acquire();
+        drop(next_incarnation);
+    }
+
+    #[test]
+    fn guest_reset_cannot_pass_a_checked_out_encoder() {
+        let recording = lock_engine()
+            .into_submission_recording(reims_vgpu_core::SubmissionContext::standalone(0).identity)
+            .expect("a Vulkan context is available to the recording lease");
+        let gate = Arc::clone(&ENGINE.lock().recordings);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reset = std::thread::spawn(move || {
+            let stats = reset_guest_state();
+            done_tx.send(stats).unwrap();
+        });
+
+        gate.wait_paused();
+        assert!(
+            done_rx.try_recv().is_err(),
+            "reset must not destroy pools while an encoder is checked out"
+        );
+        drop(recording);
+        done_rx
+            .recv()
+            .expect("reset completes after the checked-out encoder returns");
+        reset.join().unwrap();
+
+        let next = lock_engine()
+            .into_submission_recording(reims_vgpu_core::SubmissionContext::standalone(0).identity)
+            .expect("the replacement pool accepts no stale checkout from before reset");
+        drop(next);
+        test_reset_engine();
+    }
 }
 
 impl Drop for EngineGuard {
@@ -1671,6 +1867,7 @@ pub struct GuestResetStats {
 /// immutable content-keyed shader/pipeline caches.
 pub fn reset_guest_state() -> GuestResetStats {
     let mut guard = lock_engine();
+    guard.quiesce_recordings();
     clear_open_batches();
     current_session_signals()
         .last_tail_batch_flush_us
@@ -1713,6 +1910,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         stats.storage_images,
         u8::from(stats.had_context)
     ));
+    guard.resume_recordings();
     stats
 }
 
@@ -6877,6 +7075,7 @@ pub fn reset_draw_counters() {
 /// Test-only: destroy device, clear recreate budget, rebuild on next draw.
 pub fn test_reset_engine() {
     let mut g = lock_engine();
+    g.quiesce_recordings();
     g.resources.resident_epoch.fetch_add(1, Ordering::Release);
     // A healthy `DeviceContext` is kept across the reset; only the pools, the
     // caches and the owner's flags are rebuilt.
@@ -6922,6 +7121,7 @@ pub fn test_reset_engine() {
     *g.indexes.lock() = SessionCacheIndexes::new();
     g.resources.pools = ResourcePools::new();
     g.counters.reset_all();
+    g.resume_recordings();
 }
 
 /// Test hook: next execute reports device lost (named path).

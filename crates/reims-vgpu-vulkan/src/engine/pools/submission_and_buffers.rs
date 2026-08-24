@@ -1197,6 +1197,7 @@ impl ResourcePools {
             encoder: OwnedPool(EncoderPools::new()),
             shared: Arc::new(parking_lot::Mutex::new(SharedPools::new())),
             active_encoders: HashMap::new(),
+            checked_out_encoders: HashSet::new(),
             idle_encoders: Vec::new(),
         }
     }
@@ -1242,6 +1243,8 @@ impl ResourcePools {
             }
             return Err(error);
         }
+        let inserted = self.checked_out_encoders.insert(identity);
+        assert!(inserted, "an encoder identity cannot be checked out twice");
         Ok(EncoderCheckout {
             identity,
             encoder,
@@ -1269,6 +1272,8 @@ impl ResourcePools {
             encoder,
             shared: _,
         } = checkout;
+        let removed = self.checked_out_encoders.remove(&identity);
+        assert!(removed, "a returned encoder must own a live checkout");
         if identity.id.get() == 0 {
             self.encoder = encoder;
             return;
@@ -1321,6 +1326,13 @@ impl ResourcePools {
         counters: &EngineCounters,
         identity: SubmissionIdentity,
     ) -> Result<(), DrawError> {
+        if self.checked_out_encoders.contains(&identity) {
+            return Err(DrawError::Facade(
+                super::super::EngineFacadeDecline::EncoderSubmissionStillRecording {
+                    closing: identity,
+                },
+            ));
+        }
         if identity.id.get() == 0 {
             return unsafe { self.access().close_submission(ctx, counters, identity) };
         }
@@ -1346,6 +1358,13 @@ impl ResourcePools {
         &mut self,
         identity: SubmissionIdentity,
     ) -> Result<(), DrawError> {
+        if self.checked_out_encoders.contains(&identity) {
+            return Err(DrawError::Facade(
+                super::super::EngineFacadeDecline::EncoderSubmissionStillRecording {
+                    closing: identity,
+                },
+            ));
+        }
         if identity.id.get() == 0 {
             return self.encoder.close_submission(identity);
         }
@@ -7226,6 +7245,25 @@ mod encoder_submission_ownership {
         pools.return_submission_encoder(second);
         assert!(pools.active_encoders.contains_key(&first_identity));
         assert!(pools.active_encoders.contains_key(&second_identity));
+    }
+
+    #[test]
+    fn close_refuses_an_encoder_that_is_still_owned_by_a_recorder() {
+        let mut pools = ResourcePools::new();
+        let submission = identity(25, 5);
+        let checkout = pools.checkout_submission_encoder(submission).unwrap();
+
+        assert_eq!(
+            pools.close_submission_without_context(submission),
+            Err(DrawError::Facade(
+                crate::engine::EngineFacadeDecline::EncoderSubmissionStillRecording {
+                    closing: submission,
+                }
+            ))
+        );
+
+        pools.return_submission_encoder(checkout);
+        pools.close_submission_without_context(submission).unwrap();
     }
 
     #[test]
