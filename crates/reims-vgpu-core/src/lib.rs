@@ -131,9 +131,9 @@ pub use service::{
 pub use shader_interface::*;
 pub use stamp::{CompletionPublications, PendingStamp, StampLedger, StampWait, UnmetSource};
 pub use submission::{
-    SubmissionAdmissionRefusal, SubmissionAdmissions, SubmissionCommitOrder,
-    SubmissionCommitOrderError, SubmissionConflict, SubmissionContext, SubmissionFootprint,
-    SubmissionTracker,
+    SubmissionAcceptError, SubmissionAdmissionRefusal, SubmissionAdmissions, SubmissionCommitOrder,
+    SubmissionCommitOrderError, SubmissionConflict, SubmissionContext, SubmissionDispatch,
+    SubmissionFootprint, SubmissionRecordError, SubmissionScheduler, SubmissionTracker,
 };
 pub use synchronization::{
     plan_event, plan_fence, BarrierResource, Decision as SynchronizationDecision,
