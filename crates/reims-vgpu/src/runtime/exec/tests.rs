@@ -6122,7 +6122,7 @@ fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
 /// The dirty-flag predicate is pointer identity, so an equal-but-separate table
 /// is a *changed* state and not an unchanged one.
 ///
-/// This is the property the whole reading rests on. `encoder_state_unchanged`
+/// This is the property the whole reading rests on. `render_encoder_delta`
 /// is allowed to be conservative — calling a genuinely unchanged pair "changed"
 /// only forgoes a saving — but it must never call a changed pair unchanged, and
 /// the way that would happen is by comparing contents instead of allocations.
@@ -6145,9 +6145,10 @@ fn encoder_state_is_unchanged_only_when_the_tables_are_the_same_allocation() {
         ..base.clone()
     };
     assert!(
-        encoder_state_unchanged(&base, &shared),
+        render_encoder_delta(&base, &shared).all_unchanged(),
         "cloned handles are the same allocation, so no Set record separated them"
     );
+    assert!(render_encoder_delta(&base, &shared).all_unchanged());
 
     // A different pipeline with every table shared is still a changed state:
     // the reflected interface the binds project onto has moved.
@@ -6156,8 +6157,15 @@ fn encoder_state_is_unchanged_only_when_the_tables_are_the_same_allocation() {
         ..shared.clone()
     };
     assert!(
-        !encoder_state_unchanged(&base, &repipelined),
+        !render_encoder_delta(&base, &repipelined).all_unchanged(),
         "a SetPipeline between the two draws changes which binding each bind lands on"
+    );
+    assert_eq!(
+        render_encoder_delta(&base, &repipelined),
+        reims_vgpu_core::RenderEncoderDelta {
+            pipeline: true,
+            ..reims_vgpu_core::RenderEncoderDelta::NONE_CHANGED
+        }
     );
 
     // Equal contents in a fresh allocation: the guest re-stated the class, so
@@ -6167,7 +6175,15 @@ fn encoder_state_is_unchanged_only_when_the_tables_are_the_same_allocation() {
         ..shared.clone()
     };
     assert!(
-        !encoder_state_unchanged(&base, &restated),
+        !render_encoder_delta(&base, &restated).all_unchanged(),
         "an equal-but-separate table is a Set record and must never read as unchanged"
     );
+    let restated_delta = render_encoder_delta(&base, &restated);
+    assert!(restated_delta.vertex_textures);
+    assert!(!restated_delta.pipeline);
+    assert!(!restated_delta.vertex_buffers);
+    assert!(!restated_delta.fragment_buffers);
+    assert!(!restated_delta.fragment_textures);
+    assert!(!restated_delta.vertex_samplers);
+    assert!(!restated_delta.fragment_samplers);
 }

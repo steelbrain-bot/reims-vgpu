@@ -102,7 +102,7 @@ pub use render::{
     BlendStateResource, BufferContent, ColorLoadAction, CullMode, DepthAspectAttachment,
     DepthAttachment, DepthClipMode, DepthState, DrawOutput, DrawRequest, FillMode, IndexType,
     IndexedDrawResource, LineWidth, PreparedRenderProgram, PreparedShaderStage, PrimitiveTopology,
-    RenderBarrier, RenderBarrierStages, RenderTargetExtent, SampledByteOrigin,
+    RenderBarrier, RenderBarrierStages, RenderEncoderDelta, RenderTargetExtent, SampledByteOrigin,
     SampledContentIdentity, SampledImageResource, SampledSource, ScissorResource,
     SecondaryColorTarget, SeedOrder, StencilAttachment, StencilFaceOps, StencilOp, StencilState,
     StorageBufferResource, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,

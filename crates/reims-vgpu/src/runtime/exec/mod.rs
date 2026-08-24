@@ -4643,12 +4643,15 @@ fn finish_stream<M: HostMemory + HostOps>(
         // allocation were separated by no `Set` record for that class at all.
         // `Arc::ptr_eq` is therefore an exact identity test, O(1), with no hash
         // and nothing remembered past the previous record — the dirty-flag
-        // question a Metal encoder answers natively, asked here for the first
-        // time so the size of the answer is known before anything is built on
-        // it. Instrument only: nothing below reads `unchanged`.
+        // question a Metal encoder answers natively. The same exact answer now
+        // travels in the semantic request; the routes remain its workload
+        // census rather than a second decision.
         let mut previous: Option<&PendingDraw> = None;
         for (di, pd) in draw_list.iter().enumerate() {
-            let unchanged = previous.is_some_and(|prev| encoder_state_unchanged(prev, pd));
+            let encoder_delta = previous
+                .map(|prev| render_encoder_delta(prev, pd))
+                .unwrap_or_default();
+            let unchanged = previous.is_some() && encoder_delta.all_unchanged();
             crate::runtime::drain::note_store_route(if unchanged {
                 "dirty_state_unchanged"
             } else {
@@ -4670,8 +4673,8 @@ fn finish_stream<M: HostMemory + HostOps>(
             // encoder re-emits only the class the guest touched — so the
             // all-or-nothing reading above is a floor on what a dirty-flag
             // model reaches, not its size.
-            if let Some(prev) = previous {
-                for (route, same) in encoder_class_state(prev, pd) {
+            if previous.is_some() {
+                for (route, same) in encoder_class_state(encoder_delta) {
                     if same {
                         crate::runtime::drain::note_store_route(route);
                     }
@@ -4700,6 +4703,7 @@ fn finish_stream<M: HostMemory + HostOps>(
             {
                 fin.enter(crate::runtime::drain::FinishPhase::Binds);
                 fill_draw_binds_from_pending(&mut req, pd);
+                req.encoder_delta = encoder_delta;
                 (req.continues_render_pass, req.render_pass_continues) =
                     render_pass_chain_position(di, draw_list.len());
                 // A resident IOSurface texture target carries attachment contents between
@@ -5323,7 +5327,7 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
 /// Per-class dirty flags between two consecutive draws, as
 /// `(census route, unchanged)`.
 ///
-/// [`encoder_state_unchanged`] answers the same question for all classes at
+/// [`reims_vgpu_core::RenderEncoderDelta::all_unchanged`] answers the same question for all classes at
 /// once, which is the fraction of draws that could be skipped **whole**. This
 /// is the fraction each class could be skipped *individually*, which is the
 /// number a per-class dirty-flag model — the one a `MTLRenderCommandEncoder`
@@ -5334,43 +5338,40 @@ fn multi_draw_chain_source(resident_chain: bool, cpu_chain_ready: bool) -> Multi
 ///
 /// Identity is decided exactly as it is there, by allocation and not by
 /// content, for exactly the reason given there.
-fn encoder_class_state(previous: &PendingDraw, next: &PendingDraw) -> [(&'static str, bool); 7] {
-    [
-        (
-            "dirty_class_pipeline",
-            previous.pipeline_ref == next.pipeline_ref,
+fn render_encoder_delta(
+    previous: &PendingDraw,
+    next: &PendingDraw,
+) -> reims_vgpu_core::RenderEncoderDelta {
+    reims_vgpu_core::RenderEncoderDelta {
+        pipeline: previous.pipeline_ref != next.pipeline_ref,
+        vertex_buffers: !std::sync::Arc::ptr_eq(&previous.vertex_buffers, &next.vertex_buffers),
+        fragment_buffers: !std::sync::Arc::ptr_eq(
+            &previous.fragment_buffers,
+            &next.fragment_buffers,
         ),
-        (
-            "dirty_class_vertex_buffers",
-            std::sync::Arc::ptr_eq(&previous.vertex_buffers, &next.vertex_buffers),
+        vertex_textures: !std::sync::Arc::ptr_eq(&previous.vertex_textures, &next.vertex_textures),
+        fragment_textures: !std::sync::Arc::ptr_eq(
+            &previous.fragment_textures,
+            &next.fragment_textures,
         ),
-        (
-            "dirty_class_fragment_buffers",
-            std::sync::Arc::ptr_eq(&previous.fragment_buffers, &next.fragment_buffers),
+        vertex_samplers: !std::sync::Arc::ptr_eq(&previous.vertex_samplers, &next.vertex_samplers),
+        fragment_samplers: !std::sync::Arc::ptr_eq(
+            &previous.fragment_samplers,
+            &next.fragment_samplers,
         ),
-        (
-            "dirty_class_vertex_textures",
-            std::sync::Arc::ptr_eq(&previous.vertex_textures, &next.vertex_textures),
-        ),
-        (
-            "dirty_class_fragment_textures",
-            std::sync::Arc::ptr_eq(&previous.fragment_textures, &next.fragment_textures),
-        ),
-        (
-            "dirty_class_vertex_samplers",
-            std::sync::Arc::ptr_eq(&previous.vertex_samplers, &next.vertex_samplers),
-        ),
-        (
-            "dirty_class_fragment_samplers",
-            std::sync::Arc::ptr_eq(&previous.fragment_samplers, &next.fragment_samplers),
-        ),
-    ]
+    }
 }
 
-fn encoder_state_unchanged(previous: &PendingDraw, next: &PendingDraw) -> bool {
-    encoder_class_state(previous, next)
-        .into_iter()
-        .all(|(_, same)| same)
+fn encoder_class_state(delta: reims_vgpu_core::RenderEncoderDelta) -> [(&'static str, bool); 7] {
+    [
+        ("dirty_class_pipeline", !delta.pipeline),
+        ("dirty_class_vertex_buffers", !delta.vertex_buffers),
+        ("dirty_class_fragment_buffers", !delta.fragment_buffers),
+        ("dirty_class_vertex_textures", !delta.vertex_textures),
+        ("dirty_class_fragment_textures", !delta.fragment_textures),
+        ("dirty_class_vertex_samplers", !delta.vertex_samplers),
+        ("dirty_class_fragment_samplers", !delta.fragment_samplers),
+    ]
 }
 
 fn fill_draw_binds_from_pending(req: &mut draw::DrawEncodeRequest, pd: &PendingDraw) {

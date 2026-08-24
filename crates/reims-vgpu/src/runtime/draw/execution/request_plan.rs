@@ -67,6 +67,7 @@ pub(super) fn plan_executor_request<M: HostMemory + HostOps>(
     let mut gva_load_identity = gva_load_identity;
 
     let mut resources = reims_vgpu_core::DrawRequest {
+        encoder_delta: req.encoder_delta,
         pipeline_lifetime: resolved.pipeline_lifetime.clone(),
         // Honor the guest's face-culling state, its winding, and its
         // primitive type. All three come from the protocol decoder, and all

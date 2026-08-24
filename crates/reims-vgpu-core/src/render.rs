@@ -210,6 +210,11 @@ impl RenderTargetExtent {
 /// transfer; guest-memory operands are bounded memory contracts.
 #[derive(Debug, Default)]
 pub struct DrawRequest {
+    /// Encoder setter classes changed since the preceding draw in this exact
+    /// render encoder. The request remains complete; this delta lets a backend
+    /// with retained native state avoid re-applying classes the guest did not
+    /// touch. A fresh native encoder treats every class as changed.
+    pub encoder_delta: RenderEncoderDelta,
     pub pipeline_lifetime: Option<ResourceLifetime>,
     pub program: PreparedRenderProgram,
     pub width: u32,
@@ -272,6 +277,61 @@ pub struct DrawRequest {
     pub render_barriers: Vec<RenderBarrier>,
     pub continues_render_pass: bool,
     pub render_pass_continues: bool,
+}
+
+/// Contract-owned changes between consecutive draws in one render encoder.
+///
+/// Separate booleans preserve exhaustiveness: adding a setter class requires
+/// every producer and consumer to name it, rather than silently truncating a
+/// mask. `Default` is the standalone/fresh-encoder answer and therefore marks
+/// every class changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenderEncoderDelta {
+    pub pipeline: bool,
+    pub vertex_buffers: bool,
+    pub fragment_buffers: bool,
+    pub vertex_textures: bool,
+    pub fragment_textures: bool,
+    pub vertex_samplers: bool,
+    pub fragment_samplers: bool,
+}
+
+impl RenderEncoderDelta {
+    pub const NONE_CHANGED: Self = Self {
+        pipeline: false,
+        vertex_buffers: false,
+        fragment_buffers: false,
+        vertex_textures: false,
+        fragment_textures: false,
+        vertex_samplers: false,
+        fragment_samplers: false,
+    };
+
+    pub const ALL_CHANGED: Self = Self {
+        pipeline: true,
+        vertex_buffers: true,
+        fragment_buffers: true,
+        vertex_textures: true,
+        fragment_textures: true,
+        vertex_samplers: true,
+        fragment_samplers: true,
+    };
+
+    pub const fn all_unchanged(self) -> bool {
+        !self.pipeline
+            && !self.vertex_buffers
+            && !self.fragment_buffers
+            && !self.vertex_textures
+            && !self.fragment_textures
+            && !self.vertex_samplers
+            && !self.fragment_samplers
+    }
+}
+
+impl Default for RenderEncoderDelta {
+    fn default() -> Self {
+        Self::ALL_CHANGED
+    }
 }
 
 impl DrawRequest {
@@ -614,6 +674,16 @@ pub struct SampledContentIdentity {
 mod tests {
     use super::*;
     use reims_vgpu_protocol::TexelLayout;
+
+    #[test]
+    fn a_fresh_encoder_must_apply_every_state_class() {
+        assert_eq!(
+            RenderEncoderDelta::default(),
+            RenderEncoderDelta::ALL_CHANGED
+        );
+        assert!(!RenderEncoderDelta::default().all_unchanged());
+        assert!(RenderEncoderDelta::NONE_CHANGED.all_unchanged());
+    }
 
     fn shaped(arrayed: bool, volume: bool, cube: bool) -> SampledImageResource {
         SampledImageResource {

@@ -832,6 +832,9 @@ pub type BindTable<T> = std::sync::Arc<Vec<T>>;
 pub struct DrawEncodeRequest {
     pub task_id: u32,
     pub pipeline_ref: u32,
+    /// Exact setter classes changed since the preceding draw in this render
+    /// encoder. Complete semantic state still travels beside it.
+    pub encoder_delta: reims_vgpu_core::RenderEncoderDelta,
     pub vertex_count: u32,
     pub instance_count: u32,
     pub primitive_topology: reims_vgpu_protocol::PrimitiveTopology,
