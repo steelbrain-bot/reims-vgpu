@@ -147,6 +147,12 @@ kernel void compute_barrier_read(device const uint *words [[buffer(0)]],
     verdict[gid] = words[gid] == compute_barrier_value(token, gid) ? 1u : 0u;
 }
 
+kernel void sync_resource_write(device uint *words [[buffer(0)]],
+                                constant uint &token [[buffer(1)]],
+                                uint gid [[thread_position_in_grid]]) {
+    words[gid] = token ^ gid;
+}
+
 struct VOut { float4 pos [[position]]; float2 uv; };
 
 // A full-target triangle strip driven from a vertex buffer the test owns, so a

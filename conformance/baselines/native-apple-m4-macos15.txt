@@ -93,6 +93,7 @@ CASE fb_rebound_between_draws PASS each draw read the offset bound before it
 CASE render_barrier_resource_fragment PASS 8 alternating producer/consumer rounds were visible
 CASE compute_barrier_resource PASS 8 alternating concurrent producer/consumer rounds were visible
 CASE compute_barrier_scope_buffers PASS 8 alternating concurrent producer/consumer rounds were visible
+CASE synchronize_resource_gpu_to_cpu PASS managed/shared GPU writes visible to CPU after synchronize
 CASE heap_texture_alias_lifecycle PASS one live range was released, reused at offset=0, and addressed as the replacement
 CASE heap_texture_placement_overlap PASS two live definitions at offset=0 executed sequentially and addressed the replacement
 CASE ebl_same_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
