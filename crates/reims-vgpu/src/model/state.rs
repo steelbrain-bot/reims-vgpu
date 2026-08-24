@@ -681,6 +681,7 @@ impl TaskResources {
     /// Residency tables legitimately contain objects which no command has
     /// constructed in this process yet. Those remain unresolved in the
     /// immutable envelope instead of being assigned a guessed identity.
+    #[cfg(test)]
     pub fn begin_submission(
         &self,
         task_id: u32,
@@ -700,6 +701,56 @@ impl TaskResources {
                     None => (object, None, None),
                 },
             )
+            .collect()
+    }
+
+    /// Retain exact resource generations for a submission which may wait for
+    /// scheduler admission, without snapshotting their mutable content yet.
+    pub fn reserve_submission(
+        &self,
+        task_id: u32,
+        submission: SubmissionId,
+        objects: impl IntoIterator<Item = ObjectTableRef<ResourceObject>>,
+    ) -> Vec<SubmissionResourceSnapshot> {
+        let mut registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let task = TaskId::new(task_id);
+        objects
+            .into_iter()
+            .map(|object| {
+                (
+                    object,
+                    registry.graph.reserve_submission(task, object, submission),
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// Snapshot current content for resource generations retained at packet
+    /// acceptance. This is called only once scheduler admission is owned.
+    pub fn begin_reserved_submission(
+        &self,
+        submission: SubmissionId,
+        resources: &[reims_vgpu_protocol::SubmissionResourceUse],
+    ) -> Vec<SubmissionResourceSnapshot> {
+        let registry = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        resources
+            .iter()
+            .map(|use_| {
+                let expected = use_.resource.map(|resource| {
+                    registry
+                        .graph
+                        .begin_reserved_submission(resource, submission)
+                        .expect("an admitted submission owns its retained resource")
+                });
+                (use_.object, use_.resource, expected)
+            })
             .collect()
     }
 

@@ -45,6 +45,7 @@ fn an_async_exec_commits_only_after_its_worker_result_reaches_the_drain_owner() 
                 PreparedExecWork {
                     task_id: 1,
                     streams: Vec::new(),
+                    resource_descs: Vec::new(),
                     result: ExecResult::default(),
                     started: std::time::Instant::now(),
                     measured_ns: 0,
@@ -101,7 +102,9 @@ fn an_async_exec_commits_only_after_its_worker_result_reaches_the_drain_owner() 
 #[test]
 fn a_conflicting_exec_parks_its_owned_streams_without_quiescing_the_recorder() {
     use crate::model::TaskResource;
-    use crate::runtime::decode::fifo::CHILD_EXEC_RESOURCE_OBJECT_ID;
+    use crate::runtime::decode::fifo::{
+        InvalidateValidityOps, CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
+    };
     use crate::runtime::decode::resource::ListObjectEntry;
     use reims_vgpu_protocol::{ObjectKind, ResourceValidity, SubmissionResourceUse};
 
@@ -147,6 +150,7 @@ fn a_conflicting_exec_parks_its_owned_streams_without_quiescing_the_recorder() {
                 PreparedExecWork {
                     task_id: 3,
                     streams: Vec::new(),
+                    resource_descs: Vec::new(),
                     result: ExecResult::default(),
                     started: std::time::Instant::now(),
                     measured_ns: 0,
@@ -209,11 +213,24 @@ fn a_conflicting_exec_parks_its_owned_streams_without_quiescing_the_recorder() {
             [CHILD_EXEC_INDIRECT_HEADER_LEN as usize + CHILD_EXEC_RESOURCE_OBJECT_ID as usize..],
         9,
     );
+    st32(
+        &mut payload
+            [CHILD_EXEC_INDIRECT_HEADER_LEN as usize + CHILD_EXEC_RESOURCE_VALIDITY_OPS as usize..],
+        InvalidateValidityOps::PAGE_ON.to_le_dword(),
+    );
 
     let accepted = process_exec_indirect2(&mut state, &mut host, &payload);
     assert!(accepted.pending_submission.is_some());
     assert_eq!(state.submissions_scheduled.lock().unwrap().waiting_len(), 1);
     assert_eq!(state.submissions_scheduled.lock().unwrap().active_len(), 1);
+    assert_eq!(
+        state
+            .task_objects
+            .resources
+            .content_version_for(resource_id),
+        first_content,
+        "a parked successor must not apply its guest-write validity before admission"
+    );
 
     rendezvous.wait();
     collect_exec_recordings(&mut state, &mut host, true);
@@ -226,6 +243,15 @@ fn a_conflicting_exec_parks_its_owned_streams_without_quiescing_the_recorder() {
     assert_eq!(state.submissions_scheduled.lock().unwrap().active_len(), 0);
     assert_eq!(state.completed_execs.len(), 2);
     assert!(state.ready_execs.is_empty());
+    assert!(
+        state
+            .task_objects
+            .resources
+            .content_version_for(resource_id)
+            .unwrap()
+            > first_content.unwrap(),
+        "the admitted successor must apply validity before resolving its commands"
+    );
 }
 
 #[test]

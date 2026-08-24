@@ -1063,6 +1063,25 @@ impl ResourceGraph {
         object: ObjectTableRef<ResourceObject>,
         submission: SubmissionId,
     ) -> Option<(AnyResourceId, ContentVersion)> {
+        let id = self.reserve_submission(task, object, submission)?;
+        let expected = self
+            .begin_reserved_submission(id, submission)
+            .expect("the just-reserved resource owns this submission");
+        Some((id, expected))
+    }
+
+    /// Retain the exact resource generation named by an accepted submission.
+    ///
+    /// Reservation protects object lifetime while scheduler admission is
+    /// parked, but deliberately does not snapshot content. A conflicting
+    /// predecessor may still advance that content before this submission is
+    /// admitted to resolution.
+    pub fn reserve_submission(
+        &mut self,
+        task: TaskId,
+        object: ObjectTableRef<ResourceObject>,
+        submission: SubmissionId,
+    ) -> Option<AnyResourceId> {
         let id = self
             .slots
             .get(&(task, object))
@@ -1071,12 +1090,24 @@ impl ResourceGraph {
             .resources
             .get_mut(&id)
             .expect("a resolved slot names a live resource");
-        let expected = node.content.current();
         node.in_flight.insert(submission);
         if node.lifecycle != LifecycleState::Released {
             node.lifecycle = LifecycleState::InFlight;
         }
-        Some((id, expected))
+        Some(id)
+    }
+
+    /// Snapshot content for an exact resource reservation at resolver admission.
+    pub fn begin_reserved_submission(
+        &self,
+        id: AnyResourceId,
+        submission: SubmissionId,
+    ) -> Result<ContentVersion, GraphError> {
+        let node = self.resources.get(&id).ok_or(GraphError::ResourceAbsent)?;
+        if !node.in_flight.contains(&submission) {
+            return Err(GraphError::SubmissionNotPrepared);
+        }
+        Ok(node.content.current())
     }
 
     pub fn complete(
@@ -1473,6 +1504,31 @@ mod tests {
             graph.resource(id).unwrap().lifecycle,
             LifecycleState::Released
         );
+        graph.complete(id, submission).unwrap();
+        assert!(graph.resource(id).is_none());
+    }
+
+    #[test]
+    fn reservation_retains_identity_but_snapshots_content_only_at_admission() {
+        let mut graph = ResourceGraph::default();
+        let id = graph
+            .create_resource(task(), object(1), ObjectKind::Buffer, None, [])
+            .unwrap();
+        let submission = SubmissionId::new(10);
+
+        assert_eq!(
+            graph.reserve_submission(task(), object(1), submission),
+            Some(id)
+        );
+        let version_after_reservation = graph.guest_wrote_aliases(id).unwrap();
+        assert_eq!(
+            graph.begin_reserved_submission(id, submission).unwrap(),
+            version_after_reservation,
+            "content is observed when the reserved submission is admitted"
+        );
+
+        graph.release_reference(task(), object(1)).unwrap();
+        assert!(graph.resource(id).is_some());
         graph.complete(id, submission).unwrap();
         assert!(graph.resource(id).is_none());
     }

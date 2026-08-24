@@ -872,6 +872,7 @@ pub(crate) struct SynchronousExecCommit {
 pub(crate) struct PreparedExecWork {
     task_id: u32,
     streams: Vec<Vec<u8>>,
+    resource_descs: Vec<ExecResourceDesc>,
     result: ExecResult,
     started: std::time::Instant,
     measured_ns: u64,
@@ -883,6 +884,7 @@ impl PreparedExecWork {
         Self {
             task_id,
             streams: Vec::new(),
+            resource_descs: Vec::new(),
             result: ExecResult {
                 task_id,
                 ..Default::default()
@@ -1083,22 +1085,9 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 
     let open_started = std::time::Instant::now();
     let descs = resource_descs.len() as u64;
-    // Validity commands are ordered at the head of this submission. They run
-    // under its identity before expected content is snapshotted, because a
-    // guest-write declaration creates the version the following commands must
-    // expect. That ordering is why this is a separate pass from the resolve
-    // below and not one fused loop over `resource_descs`.
-    let table_started = std::time::Instant::now();
-    consume_resource_table(state, task_id, &resource_descs);
-    crate::runtime::drain::note_open_part(
-        crate::runtime::drain::OpenPart::Table,
-        table_started.elapsed().as_nanos() as u64,
-        descs,
-    );
-
     let begin_started = std::time::Instant::now();
 
-    let resolved = state.task_objects.resources.begin_submission(
+    let resolved = state.task_objects.resources.reserve_submission(
         task_id,
         submission_identity.id,
         resource_descs
@@ -1156,6 +1145,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             PreparedExecWork {
                 task_id,
                 streams,
+                resource_descs,
                 result: out,
                 started: exec_started,
                 measured_ns,
@@ -1179,16 +1169,57 @@ fn execute_prepared_exec<M: HostMemory + HostOps>(
     work: reims_vgpu_core::SubmissionWork<PreparedExecWork>,
 ) -> ExecResult {
     let reims_vgpu_core::SubmissionWork {
-        context,
+        mut context,
         work:
             PreparedExecWork {
                 task_id,
                 streams,
+                resource_descs,
                 mut result,
                 started,
                 mut measured_ns,
             },
     } = work;
+    let activation_started = std::time::Instant::now();
+    // Validity commands are ordered at the head of an admitted submission.
+    // Reservation retained the exact generations while this EXEC waited, but
+    // applying the quad and snapshotting expected content before its conflict
+    // retired would let a parked successor mutate its active predecessor.
+    {
+        let _reservation_scope = crate::runtime::executor::enter_submission(context.clone());
+        let table_started = std::time::Instant::now();
+        consume_resource_table(state, task_id, &resource_descs);
+        crate::runtime::drain::note_open_part(
+            crate::runtime::drain::OpenPart::Table,
+            table_started.elapsed().as_nanos() as u64,
+            resource_descs.len() as u64,
+        );
+    }
+    let resolved = state
+        .task_objects
+        .resources
+        .begin_reserved_submission(context.identity.id, &context.resources);
+    context.resources = resource_descs
+        .iter()
+        .zip(resolved)
+        .map(
+            |(desc, (object, resource, expected_content))| SubmissionResourceUse {
+                object,
+                resource,
+                expected_content,
+                validity: ResourceValidity {
+                    clear_host: desc.ops.clear_host_valid != 0,
+                    set_host: desc.ops.set_host_valid != 0,
+                    clear_guest: desc.ops.clear_guest_valid != 0,
+                    set_guest: desc.ops.set_guest_valid != 0,
+                },
+            },
+        )
+        .collect::<Vec<_>>()
+        .into();
+    let activation_ns = activation_started.elapsed().as_nanos() as u64;
+    measured_ns = measured_ns.saturating_add(activation_ns);
+    crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Open, activation_ns);
     let _submission_scope = crate::runtime::executor::enter_submission(context.clone());
 
     let mut encoders = EncoderWalkState {
