@@ -4003,7 +4003,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // pool's results are undefined until reset, and resetting on the host needs
     // `hostQueryReset`, which is a Vulkan 1.2 feature this device does not ask
     // for.
-    unsafe { pools.readback_span_arm(ctx, cb) };
+    unsafe { pools.encoder_mut().readback_span_arm(ctx, cb) };
     // Nothing else supplies it. Queue submission order starts command buffers
     // in order; it does not finish them in order, and it is not a memory
     // dependency. A render pass's implicit final subpass dependency carries
@@ -4046,7 +4046,11 @@ unsafe fn copy_image_level0_to_host_delivered(
     // span from it to the end of the copy contains both. This slot is what
     // separates them: everything before it has reached TRANSFER, which after the
     // barrier means the draws are done.
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
+    unsafe {
+        pools
+            .encoder_mut()
+            .readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1)
+    };
     let region = [ash::vk::BufferImageCopy::default()
         .image_subresource(color_subresource_layers())
         .image_extent(ash::vk::Extent3D {
@@ -4078,7 +4082,14 @@ unsafe fn copy_image_level0_to_host_delivered(
     // `pools::BATCH_MAX_DRAWS`.
     ctx.device
         .cmd_copy_image_to_buffer(cb, image, read_layout, readback.buffer, &region);
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
+    unsafe {
+        pools.encoder_mut().readback_span_mark(
+            ctx,
+            cb,
+            ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            2,
+        )
+    };
     if appended.is_some() {
         // `batch_flush` ends the command buffer, submits it with the fence
         // `batch_open_recording` handed back, and seals the batch's cleanup —
@@ -5403,7 +5414,7 @@ unsafe fn copy_image_level0_to_buffer(
     // The reset must be recorded into the same command buffer: a query pool's
     // results are undefined until reset, and resetting on the host needs
     // `hostQueryReset`, a Vulkan 1.2 feature this device does not ask for.
-    unsafe { pools.readback_span_arm(ctx, cb) };
+    unsafe { pools.encoder_mut().readback_span_arm(ctx, cb) };
     // Unconditional, for the reason `copy_image_level0_to_host_delivered` states
     // at length: the barrier is a layout transition *and* a dependency, and this
     // rail needs the dependency whether or not the layout already matches. A
@@ -5427,9 +5438,20 @@ unsafe fn copy_image_level0_to_buffer(
         &[],
         &barrier,
     );
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1) };
+    unsafe {
+        pools
+            .encoder_mut()
+            .readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::TRANSFER, 1)
+    };
     unsafe { record_guest_copy_plan(ctx, pools, cb, snap.image, read_access.layout(), plan) };
-    unsafe { pools.readback_span_mark(ctx, cb, ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2) };
+    unsafe {
+        pools.encoder_mut().readback_span_mark(
+            ctx,
+            cb,
+            ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            2,
+        )
+    };
     unsafe { release_guest_copy_to_host(ctx, cb, plan) };
     if let Some(pages) = reims_vgpu_memory::GuestWritePages::new(pages) {
         record_guest_write_debt(pools, GuestWriteSource::ResidentTarget(source), &pages);

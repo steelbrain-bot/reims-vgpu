@@ -1565,67 +1565,6 @@ impl ResourcePools {
         }
     }
 
-    /// Reset this slot's readback timestamp region and write its start stamp.
-    ///
-    /// The reset must be recorded into the same command buffer that writes the
-    /// stamps: a query's results are undefined until it is reset, and resetting
-    /// on the host needs `hostQueryReset`, a Vulkan 1.2 feature this device does
-    /// not ask for.
-    ///
-    /// The region belongs to the current ring slot rather than being shared —
-    /// see [`TimestampProbe`], which used to be shared between the
-    /// readback (which waits its fence) and the guest-page writeback (which does
-    /// not), so two writebacks in flight reset each other's queries.
-    ///
-    /// # Safety
-    ///
-    /// `cb` must be the current slot's command buffer, recording, and outside
-    /// any render pass.
-    pub(crate) unsafe fn readback_span_arm(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer) {
-        let Some(probe) = ctx.timestamps.as_ref() else {
-            return;
-        };
-        let slot = self.encoder.cur;
-        let base = TimestampProbe::base(slot);
-        ctx.device
-            .cmd_reset_query_pool(cb, probe.pool, base, TimestampProbe::PER_SLOT);
-        ctx.device
-            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
-        self.encoder.slots[slot].readback_span_armed = true;
-    }
-
-    /// Write one of the two later stamps of the current slot's readback region.
-    ///
-    /// `mark` is 1 for the point after the barrier — where the draws ahead are
-    /// known done — and 2 for the end of the copy. Silently does nothing if the
-    /// slot was never armed, so a caller that stamps without a start cannot
-    /// publish a delta against a query holding another submission's ticks.
-    ///
-    /// # Safety
-    ///
-    /// As [`Self::readback_span_arm`].
-    pub(crate) unsafe fn readback_span_mark(
-        &mut self,
-        ctx: &DeviceContext,
-        cb: vk::CommandBuffer,
-        stage: vk::PipelineStageFlags,
-        mark: u32,
-    ) {
-        debug_assert!(mark < TimestampProbe::PER_SLOT);
-        let Some(probe) = ctx.timestamps.as_ref() else {
-            return;
-        };
-        if !self.encoder.slots[self.encoder.cur].readback_span_armed {
-            return;
-        }
-        ctx.device.cmd_write_timestamp(
-            cb,
-            stage,
-            probe.pool,
-            TimestampProbe::base(self.encoder.cur) + mark,
-        );
-    }
-
     /// Retire one slot: wait its fence, reset it, and drain the cleanup it
     /// owes. No-op for a slot with nothing pending.
     unsafe fn retire_slot(
@@ -1851,6 +1790,59 @@ impl ResourcePools {
 }
 
 impl EncoderPools {
+    /// Reset this slot's readback timestamp region and write its start stamp.
+    ///
+    /// Reset and writes are recorded into the same command buffer because the
+    /// device does not require host query reset. The region follows this
+    /// encoder's current ring slot, so another recorder cannot reset its query.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be this encoder's current command buffer, recording, and
+    /// outside any render pass.
+    pub(crate) unsafe fn readback_span_arm(&mut self, ctx: &DeviceContext, cb: vk::CommandBuffer) {
+        let Some(probe) = ctx.timestamps.as_ref() else {
+            return;
+        };
+        let slot = self.cur;
+        let base = TimestampProbe::base(slot);
+        ctx.device
+            .cmd_reset_query_pool(cb, probe.pool, base, TimestampProbe::PER_SLOT);
+        ctx.device
+            .cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, probe.pool, base);
+        self.slots[slot].readback_span_armed = true;
+    }
+
+    /// Write one of the two later stamps of the current readback region.
+    ///
+    /// `mark` is 1 after the dependency barrier and 2 after the copy. An
+    /// unarmed slot stays quiet so stale query contents cannot become a sample.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::readback_span_arm`].
+    pub(crate) unsafe fn readback_span_mark(
+        &mut self,
+        ctx: &DeviceContext,
+        cb: vk::CommandBuffer,
+        stage: vk::PipelineStageFlags,
+        mark: u32,
+    ) {
+        debug_assert!(mark < TimestampProbe::PER_SLOT);
+        let Some(probe) = ctx.timestamps.as_ref() else {
+            return;
+        };
+        if !self.slots[self.cur].readback_span_armed {
+            return;
+        }
+        ctx.device.cmd_write_timestamp(
+            cb,
+            stage,
+            probe.pool,
+            TimestampProbe::base(self.cur) + mark,
+        );
+    }
+
     /// Read a retiring slot's readback region and charge the two spans it holds.
     ///
     /// Called only with the slot's fence already signalled, which is what makes
