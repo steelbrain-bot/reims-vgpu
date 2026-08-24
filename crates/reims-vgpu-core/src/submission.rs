@@ -138,6 +138,7 @@ pub enum SubmissionRecordError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmissionCompleteError {
     NotRecording(SubmissionIdentity),
+    CommitNotTaken(SubmissionIdentity),
 }
 
 /// Queueing policy over disjoint recording and guest-ordered commit ownership.
@@ -302,6 +303,9 @@ impl<W, T> SubmissionScheduler<W, T> {
         &mut self,
         identity: SubmissionIdentity,
     ) -> Result<Vec<SubmissionWork<W>>, SubmissionCompleteError> {
+        if self.commits.contains(identity) {
+            return Err(SubmissionCompleteError::CommitNotTaken(identity));
+        }
         if !self.admissions.retire(identity) {
             return Err(SubmissionCompleteError::NotRecording(identity));
         }
@@ -476,9 +480,9 @@ impl SubmissionTracker {
 mod tests {
     use super::{
         SubmissionAcceptError, SubmissionAdmissionRefusal, SubmissionAdmissions,
-        SubmissionCommitOrder, SubmissionCommitOrderError, SubmissionConflict, SubmissionContext,
-        SubmissionDispatch, SubmissionFootprint, SubmissionRecordError, SubmissionScheduler,
-        SubmissionTracker, SubmissionWork,
+        SubmissionCommitOrder, SubmissionCommitOrderError, SubmissionCompleteError,
+        SubmissionConflict, SubmissionContext, SubmissionDispatch, SubmissionFootprint,
+        SubmissionRecordError, SubmissionScheduler, SubmissionTracker, SubmissionWork,
     };
     use reims_vgpu_protocol::{
         ObjectTableRef, ResourceId, ResourceObject, ResourceValidity, SubmissionId,
@@ -662,6 +666,22 @@ mod tests {
         assert_eq!(scheduler.take_ready(), Some((second.identity, "second")));
         assert!(scheduler.complete(second.identity).unwrap().is_empty());
         assert_eq!(scheduler.active_len(), 0);
+    }
+
+    #[test]
+    fn a_recorded_result_cannot_retire_before_the_commit_owner_takes_it() {
+        let context = context_with_resources(63, [Some(ResourceId::new(11, 1))]);
+        let mut scheduler = SubmissionScheduler::<(), ()>::default();
+        scheduler.accept(context.clone(), ()).unwrap();
+        scheduler.record(context.identity, ()).unwrap();
+
+        assert_eq!(
+            scheduler.complete(context.identity),
+            Err(SubmissionCompleteError::CommitNotTaken(context.identity))
+        );
+        assert_eq!(scheduler.active_len(), 1);
+        assert_eq!(scheduler.take_ready(), Some((context.identity, ())));
+        assert!(scheduler.complete(context.identity).unwrap().is_empty());
     }
 
     #[test]
