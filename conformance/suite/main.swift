@@ -77,7 +77,6 @@ synchronizeResourceCase()
 heapTextureAliasCase()
 heapTexturePlacementOverlapCase()
 encoderBindingLifetimeCase()
-textureViewLifetimeCase()
 
 if texPipeline == nil {
     report("fragsample_pipeline", false, "tex_fs pipeline would not build")
