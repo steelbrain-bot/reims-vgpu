@@ -1315,14 +1315,30 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
             "packet_stamp_wait_unmet",
             (u64::from(packet.opcode) << 32) | u64::from(index),
         ) {
+            let exec_publication = state.pending_exec_publications.values().any(|publication| {
+                stamp_slot_index(publication.stamp_index) == index
+                    && wait.satisfied_by(publication.stamp_value)
+            });
+            let scheduler = state
+                .submissions_scheduled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             crate::observe::off(format!(
                 "packet_stamp_wait_unmet opcode={:#x} {} index={index} awaited={:#x} \
-                 current={current:#x} behind={} (the packet is held until the slot \
-                 reaches it)",
+                 current={current:#x} behind={} exec_publication={} exec_pending={} \
+                 exec_completed={} exec_ready={} scheduler_active={} scheduler_waiting={} \
+                 scheduler_commit={} (the packet is held until the slot reaches it)",
                 packet.opcode,
                 packet_site(channel),
                 wait.value,
                 wait.value.wrapping_sub(current),
+                exec_publication,
+                state.pending_execs.len(),
+                state.completed_execs.len(),
+                state.ready_execs.len(),
+                scheduler.active_len(),
+                scheduler.waiting_len(),
+                scheduler.commit_len(),
             ));
         }
     }
