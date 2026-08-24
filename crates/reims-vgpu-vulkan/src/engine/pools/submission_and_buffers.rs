@@ -481,6 +481,69 @@ impl SharedPools {
     ) -> Result<RecordingLease, super::super::retirement::RecordingSequenceExhausted> {
         self.retirement.reserve()
     }
+
+    /// Allocate one upload slot after an encoder-local free-list miss.
+    ///
+    /// The returned slot is not live in any encoder until the caller admits it.
+    /// This method owns only the device-wide upload slab and can therefore sit
+    /// behind a short shared-state critical section.
+    unsafe fn allocate_staging(
+        &mut self,
+        ctx: &DeviceContext,
+        bucket: u64,
+        usage: vk::BufferUsageFlags,
+        counters: &EngineCounters,
+    ) -> Result<BufferSlot, DrawError> {
+        let buffer = ctx
+            .device
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(bucket)
+                    .usage(
+                        usage
+                            | vk::BufferUsageFlags::TRANSFER_SRC
+                            | vk::BufferUsageFlags::TRANSFER_DST
+                            | vk::BufferUsageFlags::VERTEX_BUFFER
+                            | vk::BufferUsageFlags::INDEX_BUFFER
+                            | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    )
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStaging, error)))?;
+        counters.note_create(CreateSite::StagingBuffer);
+        let req = ctx.device.get_buffer_memory_requirements(buffer);
+        let Some(mt) = ctx.memory_type_for(req.memory_type_bits, req.size, MemoryClass::Upload)
+        else {
+            ctx.device.destroy_buffer(buffer, None);
+            return Err(DrawError::Unsupported(
+                reason::DrawReason::NoHostVisibleMemoryForStaging {
+                    memory_type_bits: req.memory_type_bits,
+                },
+            ));
+        };
+        let token = self
+            .slabs
+            .upload()
+            .acquire(ctx, &req, counters)
+            .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
+        ctx.device
+            .bind_buffer_memory(buffer, token.memory, token.offset())
+            .map_err(|error| {
+                self.slabs.release(&ctx.device, token);
+                ctx.device.destroy_buffer(buffer, None);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsBindStaging, error))
+            })?;
+        Ok(BufferSlot {
+            buffer,
+            memory: token.memory,
+            size: bucket,
+            mapped: token.mapped,
+            backing: BufferBacking::Slab(token),
+            coherent: true,
+            cached: ctx.mapped_memory_kind(mt).cached,
+        })
+    }
 }
 
 impl ResourcePools {
@@ -3247,71 +3310,7 @@ impl ResourcePools {
         }
         let miss_started = Instant::now();
         let _slow = SlowStagingWrite::watch("acquire", need, 0);
-        let buffer = ctx
-            .device
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(bucket)
-                    .usage(
-                        usage
-                            | vk::BufferUsageFlags::TRANSFER_SRC
-                            | vk::BufferUsageFlags::TRANSFER_DST
-                            | vk::BufferUsageFlags::VERTEX_BUFFER
-                            | vk::BufferUsageFlags::INDEX_BUFFER
-                            | vk::BufferUsageFlags::STORAGE_BUFFER,
-                    )
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                None,
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStaging, e)))?;
-        counters.note_create(CreateSite::StagingBuffer);
-        let req = ctx.device.get_buffer_memory_requirements(buffer);
-        let mt = ctx
-            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Upload)
-            .ok_or({
-                DrawError::Unsupported(reason::DrawReason::NoHostVisibleMemoryForStaging {
-                    memory_type_bits: req.memory_type_bits,
-                })
-            })?;
-        // Carve out of a shared HOST_VISIBLE block rather than allocating one
-        // memory object per buffer. The block is allocated and mapped once; a
-        // miss here is a create + carve + bind, which is what turns the ~0.4 ms
-        // floor every miss used to pay into a handful of block allocations for
-        // the whole boot. The slab picks the same `MemoryClass::Upload` type
-        // `mt` resolves to and records it on the block, so a carve only ever
-        // lands in a block this bind can legally use; `mt` stays here because
-        // the slot still has to report that type's caching.
-        let token = self
-            .shared
-            .slabs
-            .upload()
-            .acquire(ctx, &req, counters)
-            .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
-        ctx.device
-            .bind_buffer_memory(buffer, token.memory, token.offset())
-            .map_err(|e| {
-                self.shared.slabs.release(&ctx.device, token);
-                ctx.device.destroy_buffer(buffer, None);
-                DrawError::VkCall(VkCall::new(VkOp::PoolsBindStaging, e))
-            })?;
-        let slot = BufferSlot {
-            buffer,
-            memory: token.memory,
-            size: bucket,
-            // The block's mapping covers every carve in it, so a slot's host
-            // address is a pointer into it. Nothing maps or unmaps per slot;
-            // the pool's whole point is that the allocation outlives the bind,
-            // and now so does the mapping of the block behind it.
-            mapped: token.mapped,
-            backing: BufferBacking::Slab(token),
-            // `MemoryClass::Upload` requires HOST_COHERENT, so a staging write
-            // needs no flush and the persistent mapping above is sound.
-            coherent: true,
-            // Read rather than asserted: `MemoryClass::Upload` says nothing
-            // about caching, and nothing on the staging path reads this field —
-            // it is the readback slots that decide anything on it.
-            cached: ctx.mapped_memory_kind(mt).cached,
-        };
+        let slot = unsafe { self.shared.allocate_staging(ctx, bucket, usage, counters) }?;
         self.encoder.staging_live.push(slot);
         self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
         Ok(slot)
