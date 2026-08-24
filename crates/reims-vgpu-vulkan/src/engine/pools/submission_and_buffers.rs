@@ -105,28 +105,28 @@ mod pass_echo_delta_order {
     #[test]
     fn passdiff_compat_means_one_image_described_two_ways() {
         let mut pools = ResourcePools::new();
-        pools.note_pass_opened(echo(1, false));
+        pools.encoder_mut().note_pass_opened(echo(1, false));
         assert!(
             matches!(
-                pools.pass_echo_delta(&echo(1, true)),
+                pools.encoder_mut().pass_echo_delta(&echo(1, true)),
                 Some(PassEchoField::Compatibility(_))
             ),
             "the same image with a different declared shape is the defect this \
              bucket exists to count, despite the framebuffer the shape brings"
         );
         assert_eq!(
-            pools.pass_echo_delta(&echo(2, true)),
+            pools.encoder_mut().pass_echo_delta(&echo(2, true)),
             Some(PassEchoField::Target),
             "a break where the image also moved is the guest changing target, \
              however the shape differs alongside it"
         );
         assert_eq!(
-            pools.pass_echo_delta(&echo(2, false)),
+            pools.encoder_mut().pass_echo_delta(&echo(2, false)),
             Some(PassEchoField::Target),
             "and at an identical shape too"
         );
         assert_eq!(
-            pools.pass_echo_delta(&echo(1, false)),
+            pools.encoder_mut().pass_echo_delta(&echo(1, false)),
             None,
             "an identical echo continues the standing pass"
         );
@@ -327,6 +327,17 @@ impl ResourcePools {
             },
         }
     }
+
+    /// The command-recording state owned by this encoder alone.
+    ///
+    /// Returning the narrow owner makes command-buffer state operations unable
+    /// to reach the resident registry or device-wide allocators by type. This
+    /// is the unit a future encoder worker can move independently; callers that
+    /// need shared resources continue to use [`ResourcePools`] explicitly.
+    pub(in crate::engine) fn encoder_mut(&mut self) -> &mut EncoderPools {
+        &mut self.encoder
+    }
+
     /// Advance the registry clock and report whether a bounded maintenance pass
     /// is due. The pass may release objects already outside every live resource
     /// (dead direct images and free-pool entries), but elapsed time is never an
@@ -1583,7 +1594,7 @@ impl ResourcePools {
         // different command buffer than the one that opened it. Unconditional
         // and above the early exits below, because every claim of a slot ends
         // the echoed pass's recording session whether a batch was open or not.
-        self.forget_pass_echo();
+        self.encoder.forget_pass_echo();
         // Reap the oldest contiguous run of already-signaled slots before
         // claiming one, rather than only the slot about to be reused. The
         // readback path deliberately waits a fence without retiring (see
@@ -1858,7 +1869,9 @@ impl ResourcePools {
             .as_ref()
             .map(|b| b.target == *target)
     }
+}
 
+impl EncoderPools {
     /// Whether the pass a draw is about to open is the one already standing in
     /// the same command buffer — see [`PassEcho`].
     ///
@@ -1866,7 +1879,7 @@ impl ResourcePools {
     /// answers "no" without a special case, which is correct: it has no
     /// predecessor to continue.
     pub(crate) fn pass_echoes(&self, echo: &PassEcho) -> bool {
-        self.encoder.last_pass.as_ref() == Some(echo)
+        self.last_pass.as_ref() == Some(echo)
     }
 
     /// Which field of the echo stopped this draw continuing, or `None` when it
@@ -1912,7 +1925,7 @@ impl ResourcePools {
     /// belong to is therefore the ranking question, and each one names a
     /// different repair.
     pub(crate) fn pass_echo_delta(&self, echo: &PassEcho) -> Option<PassEchoField> {
-        let Some(last) = self.encoder.last_pass.as_ref() else {
+        let Some(last) = self.last_pass.as_ref() else {
             return Some(PassEchoField::Nothing);
         };
         if last.cb != echo.cb {
@@ -1936,20 +1949,20 @@ impl ResourcePools {
     /// Record the pass a draw just opened. Called at the `vkCmdBeginRenderPass`
     /// and nowhere else, so the echo always names a pass that is standing.
     pub(crate) fn note_pass_opened(&mut self, echo: PassEcho) {
-        self.encoder.last_pass = Some(echo);
-        self.encoder.open_pass = Some(echo);
+        self.last_pass = Some(echo);
+        self.open_pass = Some(echo);
     }
 
     /// Whether `echo` is the render pass that is actually still open.
     pub(crate) fn open_pass_echoes(&self, echo: &PassEcho) -> bool {
-        self.encoder.open_pass.as_ref() == Some(echo)
+        self.open_pass.as_ref() == Some(echo)
     }
 
     /// End the pass in `cb` before recording a command that cannot live inside
     /// it or ending the command buffer. No-op when the preceding draw ended its
     /// pass normally.
     pub(crate) unsafe fn close_open_pass(&mut self, device: &ash::Device, cb: vk::CommandBuffer) {
-        let Some(open) = self.encoder.open_pass.take() else {
+        let Some(open) = self.open_pass.take() else {
             return;
         };
         debug_assert_eq!(
@@ -1958,10 +1971,8 @@ impl ResourcePools {
         );
         // Inside the instance, matching the begin stamp, so the delta is the
         // pass's own execution and not the boundary either side of it.
-        if let (Some(pool), Some(index)) =
-            (self.encoder.pass_probe, self.encoder.pass_open_index.take())
-        {
-            let slot = self.encoder.cur;
+        if let (Some(pool), Some(index)) = (self.pass_probe, self.pass_open_index.take()) {
+            let slot = self.cur;
             unsafe {
                 device.cmd_write_timestamp(
                     open.cb,
@@ -1970,7 +1981,7 @@ impl ResourcePools {
                     DrawSpanProbe::pass_base(slot, index) + 1,
                 )
             };
-            self.encoder.slots[slot].pass_spans = index + 1;
+            self.slots[slot].pass_spans = index + 1;
         }
         unsafe { device.cmd_end_render_pass(open.cb) };
     }
@@ -1993,29 +2004,28 @@ impl ResourcePools {
     /// The handle comparison inside that struct is the second lock on the same
     /// door, not the first.
     pub(crate) fn forget_pass_echo(&mut self) {
-        debug_assert!(
-            self.encoder.open_pass.is_none(),
-            "forgetting an open render pass"
-        );
+        debug_assert!(self.open_pass.is_none(), "forgetting an open render pass");
         // The pass span pair is opened and closed with `open_pass` itself, so
         // this must already hold. Asserted rather than cleared: clearing here
         // would hide a begin stamp that never got its end.
         debug_assert!(
-            self.encoder.pass_open_index.is_none(),
+            self.pass_open_index.is_none(),
             "forgetting a render pass whose span pair was never closed"
         );
-        self.encoder.last_pass = None;
-        self.encoder.cb_graphics.cb = None;
-        self.encoder.cb_graphics.pipeline = None;
-        self.encoder.cb_graphics.pipeline_layout = None;
-        self.encoder.cb_graphics.viewports.clear();
-        self.encoder.cb_graphics.scissors.clear();
-        self.encoder.cb_graphics.stencil = None;
-        self.encoder.cb_graphics.push_layout = None;
-        self.encoder.cb_graphics.push_bindings.clear();
-        self.encoder.cb_guest_visibility = super::CbGuestVisibility::default();
+        self.last_pass = None;
+        self.cb_graphics.cb = None;
+        self.cb_graphics.pipeline = None;
+        self.cb_graphics.pipeline_layout = None;
+        self.cb_graphics.viewports.clear();
+        self.cb_graphics.scissors.clear();
+        self.cb_graphics.stencil = None;
+        self.cb_graphics.push_layout = None;
+        self.cb_graphics.push_bindings.clear();
+        self.cb_guest_visibility = super::CbGuestVisibility::default();
     }
+}
 
+impl EncoderPools {
     /// Classify and return the imported-memory dependency `cb` still owes.
     ///
     /// Within one decoded guest operation, the first host dependency covers its
@@ -2028,31 +2038,33 @@ impl ResourcePools {
         cb: vk::CommandBuffer,
         classify: impl FnOnce() -> super::super::exec::ImportedGuestVisibility,
     ) -> Option<super::super::exec::ImportedGuestVisibility> {
-        if self.encoder.cb_guest_visibility.cb != Some(cb) {
-            self.encoder.cb_guest_visibility = super::CbGuestVisibility {
+        if self.cb_guest_visibility.cb != Some(cb) {
+            self.cb_guest_visibility = super::CbGuestVisibility {
                 cb: Some(cb),
                 host_visible: false,
                 gpu_write_since_barrier: false,
             };
         }
-        if self.encoder.cb_guest_visibility.host_visible
-            && !self.encoder.cb_guest_visibility.gpu_write_since_barrier
+        if self.cb_guest_visibility.host_visible
+            && !self.cb_guest_visibility.gpu_write_since_barrier
         {
             return None;
         }
         let visibility = classify();
         let includes_gpu_writes = visibility.includes_gpu_writes();
-        let needed = !self.encoder.cb_guest_visibility.host_visible
-            || (includes_gpu_writes && self.encoder.cb_guest_visibility.gpu_write_since_barrier);
+        let needed = !self.cb_guest_visibility.host_visible
+            || (includes_gpu_writes && self.cb_guest_visibility.gpu_write_since_barrier);
         if needed {
-            self.encoder.cb_guest_visibility.host_visible = true;
+            self.cb_guest_visibility.host_visible = true;
             if includes_gpu_writes {
-                self.encoder.cb_guest_visibility.gpu_write_since_barrier = false;
+                self.cb_guest_visibility.gpu_write_since_barrier = false;
             }
         }
         needed.then_some(visibility)
     }
+}
 
+impl ResourcePools {
     /// Begin one decoded guest operation recorded into `cb`.
     ///
     /// Guest CPU writes are external to this backend, so no command-buffer
@@ -2226,8 +2238,8 @@ impl ResourcePools {
         let close_started = std::time::Instant::now();
         // The CB is about to be ended and submitted, so no pass inside it is
         // still open to continue.
-        unsafe { self.close_open_pass(&ctx.device, batch.cb) };
-        self.forget_pass_echo();
+        unsafe { self.encoder.close_open_pass(&ctx.device, batch.cb) };
+        self.encoder.forget_pass_echo();
         counters.batch_flushes.fetch_add(1, Ordering::Relaxed);
         counters
             .batch_flush_draws
@@ -2567,7 +2579,9 @@ impl ResourcePools {
         crate::telemetry::note_route_n("sampled_bindmap_write_unknown", unknown);
         crate::telemetry::note_route_n("sampled_bindmap_write_disjoint", disjoint);
     }
+}
 
+impl EncoderPools {
     /// Bind the graphics pipeline unless this command buffer already carries it.
     ///
     /// A pipeline change clears the dynamic half of [`CbGraphicsState`], which is
@@ -2586,7 +2600,7 @@ impl ResourcePools {
         pipeline: vk::Pipeline,
         pipeline_layout: vk::PipelineLayout,
     ) {
-        let g = &mut self.encoder.cb_graphics;
+        let g = &mut self.cb_graphics;
         if g.cb != Some(cb) {
             // A recycled handle: everything the previous user of it bound was
             // made undefined by the `vkBeginCommandBuffer` in between.
@@ -2627,7 +2641,7 @@ impl ResourcePools {
     /// comparison in [`Self::set_dynamic_viewport_scissor`] needs them in a
     /// buffer it can swap rather than copy.
     pub(crate) fn dynamic_scratch(&mut self) -> (&mut Vec<vk::Viewport>, &mut Vec<vk::Rect2D>) {
-        let g = &mut self.encoder.cb_graphics;
+        let g = &mut self.cb_graphics;
         g.vp_scratch.clear();
         g.sc_scratch.clear();
         (&mut g.vp_scratch, &mut g.sc_scratch)
@@ -2647,7 +2661,7 @@ impl ResourcePools {
         cb: vk::CommandBuffer,
         counters: &EngineCounters,
     ) {
-        let g = &mut self.encoder.cb_graphics;
+        let g = &mut self.cb_graphics;
         if super::viewports_match(&g.vp_scratch, &g.viewports) {
             counters
                 .dynstate_viewport_held
@@ -2674,7 +2688,7 @@ impl ResourcePools {
     /// array already there is bit-for-bit what it would have sent. A consumer
     /// that kept its own copy would be a second spelling of the same rects.
     pub(crate) fn bound_scissors(&self) -> &[vk::Rect2D] {
-        &self.encoder.cb_graphics.scissors
+        &self.cb_graphics.scissors
     }
 
     /// Record the draw's vertex buffers as maximal consecutive binding runs,
@@ -2698,7 +2712,7 @@ impl ResourcePools {
         counters: &EngineCounters,
         requested: &[(u32, super::super::exec::BoundBuffer)],
     ) {
-        let g = &mut self.encoder.cb_graphics;
+        let g = &mut self.cb_graphics;
         counters
             .vertex_buffer_bind_slots
             .fetch_add(requested.len() as u64, Ordering::Relaxed);
@@ -2746,8 +2760,8 @@ impl ResourcePools {
 
     /// Scratch in which the next draw normalizes its push-descriptor state.
     pub(crate) fn push_descriptor_scratch(&mut self) -> &mut Vec<super::PushDescriptorBinding> {
-        self.encoder.cb_graphics.push_scratch.clear();
-        &mut self.encoder.cb_graphics.push_scratch
+        self.cb_graphics.push_scratch.clear();
+        &mut self.cb_graphics.push_scratch
     }
 
     /// Return whether this draw must record its push descriptors, retaining a
@@ -2757,7 +2771,7 @@ impl ResourcePools {
         layout: vk::PipelineLayout,
         counters: &EngineCounters,
     ) -> bool {
-        let g = &mut self.encoder.cb_graphics;
+        let g = &mut self.cb_graphics;
         if super::push_descriptors_match(g.push_layout, &g.push_bindings, layout, &g.push_scratch) {
             counters
                 .descriptor_push_held
@@ -2784,7 +2798,7 @@ impl ResourcePools {
         front: u32,
         back: u32,
     ) {
-        let g = &mut self.encoder.cb_graphics;
+        let g = &mut self.cb_graphics;
         if g.stencil == Some((front, back)) {
             counters
                 .dynstate_stencil_held
@@ -2797,7 +2811,9 @@ impl ResourcePools {
             device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::BACK, back);
         }
     }
+}
 
+impl ResourcePools {
     /// Whether a recorded command buffer still owes an ordering point for its
     /// guest-memory reads.
     pub(crate) fn has_guest_read_debt(&self) -> bool {
@@ -6540,33 +6556,44 @@ mod imported_guest_visibility_tests {
 
         pools.begin_guest_operation(cb);
         assert_eq!(
-            pools.imported_guest_barrier(cb, || ImportedGuestVisibility::HostOnly),
+            pools
+                .encoder_mut()
+                .imported_guest_barrier(cb, || ImportedGuestVisibility::HostOnly),
             Some(ImportedGuestVisibility::HostOnly)
         );
         assert_eq!(
-            pools.imported_guest_barrier(cb, || { panic!("visibility is already established") }),
+            pools
+                .encoder_mut()
+                .imported_guest_barrier(cb, || { panic!("visibility is already established") }),
             None
         );
 
         pools.note_cb_guest_write();
         assert_eq!(
-            pools.imported_guest_barrier(cb, || ImportedGuestVisibility::HostOnly),
+            pools
+                .encoder_mut()
+                .imported_guest_barrier(cb, || ImportedGuestVisibility::HostOnly),
             None,
             "a disjoint GPU write does not invalidate host visibility"
         );
         assert_eq!(
-            pools.imported_guest_barrier(cb, || ImportedGuestVisibility::GpuOverlap),
+            pools
+                .encoder_mut()
+                .imported_guest_barrier(cb, || ImportedGuestVisibility::GpuOverlap),
             Some(ImportedGuestVisibility::GpuOverlap)
         );
         assert_eq!(
             pools
+                .encoder_mut()
                 .imported_guest_barrier(cb, || { panic!("GPU visibility is already established") }),
             None
         );
 
         pools.begin_guest_operation(cb);
         assert_eq!(
-            pools.imported_guest_barrier(cb, || ImportedGuestVisibility::HostOnly),
+            pools
+                .encoder_mut()
+                .imported_guest_barrier(cb, || ImportedGuestVisibility::HostOnly),
             Some(ImportedGuestVisibility::HostOnly),
             "a later guest operation may follow an unobserved guest CPU write"
         );
@@ -6581,7 +6608,9 @@ mod imported_guest_visibility_tests {
         pools.note_cb_guest_write();
         pools.begin_guest_operation(cb);
         assert_eq!(
-            pools.imported_guest_barrier(cb, || ImportedGuestVisibility::GpuOverlap),
+            pools
+                .encoder_mut()
+                .imported_guest_barrier(cb, || ImportedGuestVisibility::GpuOverlap),
             Some(ImportedGuestVisibility::GpuOverlap)
         );
     }
@@ -6594,13 +6623,16 @@ mod imported_guest_visibility_tests {
 
         pools.begin_guest_operation(first);
         assert!(pools
+            .encoder_mut()
             .imported_guest_barrier(first, || ImportedGuestVisibility::HostOnly)
             .is_some());
         assert!(pools
+            .encoder_mut()
             .imported_guest_barrier(first, || { panic!("visibility is already established") })
             .is_none());
         pools.begin_guest_operation(second);
         assert!(pools
+            .encoder_mut()
             .imported_guest_barrier(second, || ImportedGuestVisibility::HostOnly)
             .is_some());
     }
@@ -6613,13 +6645,15 @@ mod imported_guest_visibility_tests {
 
         pools.enter_render_encoder_record(first, false);
         assert_eq!(
-            pools.imported_guest_barrier(first, || ImportedGuestVisibility::HostOnly),
+            pools
+                .encoder_mut()
+                .imported_guest_barrier(first, || ImportedGuestVisibility::HostOnly),
             Some(ImportedGuestVisibility::HostOnly)
         );
 
         pools.enter_render_encoder_record(first, true);
         assert_eq!(
-            pools.imported_guest_barrier(first, || {
+            pools.encoder_mut().imported_guest_barrier(first, || {
                 panic!("a draw call is not a host publication boundary")
             }),
             None
@@ -6627,7 +6661,9 @@ mod imported_guest_visibility_tests {
 
         pools.enter_render_encoder_record(second, true);
         assert_eq!(
-            pools.imported_guest_barrier(second, || ImportedGuestVisibility::HostOnly),
+            pools
+                .encoder_mut()
+                .imported_guest_barrier(second, || ImportedGuestVisibility::HostOnly),
             Some(ImportedGuestVisibility::HostOnly),
             "a continuation moved by an explicit boundary owes visibility in its new CB"
         );

@@ -1345,7 +1345,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 read_pages.push(source.physical_pages.clone());
             }
         }
-        if let Some(visibility) = pools.imported_guest_barrier(cb, || {
+        if let Some(visibility) = pools.encoder_mut().imported_guest_barrier(cb, || {
             let visibility = super::exec::imported_guest_visibility(&read_pages);
             super::exec::note_imported_guest_visibility(counters, visibility);
             visibility

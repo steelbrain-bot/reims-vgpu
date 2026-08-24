@@ -606,7 +606,7 @@ impl PassObstacles {
         device: &ash::Device,
         cb: vk::CommandBuffer,
     ) {
-        unsafe { pools.close_open_pass(device, cb) };
+        unsafe { pools.encoder_mut().close_open_pass(device, cb) };
         self.note(obstacle);
     }
 }
@@ -5770,7 +5770,8 @@ pub(crate) unsafe fn execute_draw_inner(
         // through a second imported-memory alias. Any descriptor or other
         // attachment that aliases these pages remains in `read_pages` and
         // therefore still forces the global dependency.
-        let continues_imported_target = req.continues_render_pass && pools.open_pass_echoes(&echo);
+        let continues_imported_target =
+            req.continues_render_pass && pools.encoder_mut().open_pass_echoes(&echo);
         if imported_target_needs_visibility(
             target_guest_memory.is_some(),
             continues_imported_target,
@@ -5791,7 +5792,7 @@ pub(crate) unsafe fn execute_draw_inner(
             // `GpuUnknown`, whose conservative barrier would close the pass.
             crate::telemetry::note_route("guest_visibility_same_attachment");
         } else {
-            if let Some(visibility) = pools.imported_guest_barrier(cb, || {
+            if let Some(visibility) = pools.encoder_mut().imported_guest_barrier(cb, || {
                 counters.guest_visibility_read_sets.fetch_add(
                     read_pages.len() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -6088,7 +6089,9 @@ pub(crate) unsafe fn execute_draw_inner(
             std::sync::atomic::Ordering::Relaxed,
         );
     } else if load_uses_gpu_content
-        && !(target_feedback && req.continues_render_pass && pools.open_pass_echoes(&echo))
+        && !(target_feedback
+            && req.continues_render_pass
+            && pools.encoder_mut().open_pass_echoes(&echo))
         && (loads_direct_guest
             || !pass_exit_needs_no_barrier(target_prior_access(target_snapshotted, target_access)))
     {
@@ -6778,7 +6781,7 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         let attachment_index = secondary_index + 1;
         let feedback = pass_key.color_feedback(attachment_index);
-        if feedback && req.continues_render_pass && pools.open_pass_echoes(&echo) {
+        if feedback && req.continues_render_pass && pools.encoder_mut().open_pass_echoes(&echo) {
             continue;
         }
         let dst_stage = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
@@ -6882,15 +6885,17 @@ pub(crate) unsafe fn execute_draw_inner(
     // closed at the exact recording site of every copy, barrier, dispatch, or
     // query reset Vulkan forbids inside it; this ladder therefore remains an
     // instrument for the continuation opportunities those commands consume.
-    let continues = joins && pools.pass_echoes(&echo);
-    let continues_open =
-        continues_open_render_pass(req.continues_render_pass, pools.open_pass_echoes(&echo));
+    let continues = joins && pools.encoder_mut().pass_echoes(&echo);
+    let continues_open = continues_open_render_pass(
+        req.continues_render_pass,
+        pools.encoder_mut().open_pass_echoes(&echo),
+    );
     // `passmerge_pass_differs` is one bucket over four independent causes with
     // four different repairs, and on a driven Maps leg it is the bucket that
     // holds 82 % of the draws. Split it where it is charged, so the two stay a
     // partition of each other rather than two counts of loosely the same thing.
     if joins && !continues {
-        if let Some(field) = pools.pass_echo_delta(&echo) {
+        if let Some(field) = pools.encoder_mut().pass_echo_delta(&echo) {
             crate::telemetry::note_route(field.route());
             // `passdiff_compat` is itself one bucket over nine attachment-shape
             // fields, and it became the dominant one when the framebuffer
@@ -6952,7 +6957,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // outside-pass command closes whatever the predecessor left open. A
         // continuation reopened here must LOAD regardless of the encoder's
         // original begin action; keep that contract repair measurable.
-        unsafe { pools.close_open_pass(&ctx.device, cb) };
+        unsafe { pools.encoder_mut().close_open_pass(&ctx.device, cb) };
         if req.continues_render_pass {
             crate::telemetry::note_route(match req.color_load_action {
                 super::types::ColorLoadAction::Load => "passreopen_from_load",
@@ -6969,7 +6974,7 @@ pub(crate) unsafe fn execute_draw_inner(
         crate::telemetry::note_route("passbegin_color0_resident");
         ctx.device
             .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
-        pools.note_pass_opened(echo);
+        pools.encoder_mut().note_pass_opened(echo);
         unsafe { pools.gpu_span_pass_begin(ctx, cb) };
     }
     if pass_key.feedback_colors != 0 {
@@ -7002,7 +7007,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // Only if this command buffer is not already carrying it — the three
     // `dynstate_*` skips below hang off this one call, because a pipeline change
     // is what invalidates them. See `super::pools::CbGraphicsState`.
-    unsafe { pools.bind_graphics_pipeline(&ctx.device, cb, counters, pipeline, pipeline_layout) };
+    unsafe {
+        pools.encoder_mut().bind_graphics_pipeline(
+            &ctx.device,
+            cb,
+            counters,
+            pipeline,
+            pipeline_layout,
+        )
+    };
     if let Some((pool, flags)) = occlusion {
         ctx.device.cmd_begin_query(cb, pool, 0, flags);
     }
@@ -7018,9 +7031,13 @@ pub(crate) unsafe fn execute_draw_inner(
     // Built into the pools' scratch rather than into two fresh `Vec`s: these are
     // rebuilt every draw, and the comparison that decides whether the driver
     // already has them needs a buffer it can swap rather than copy.
-    let (vp_scratch, sc_scratch) = pools.dynamic_scratch();
+    let (vp_scratch, sc_scratch) = pools.encoder_mut().dynamic_scratch();
     populate_dynamic_viewport_scissors(req, vp_scratch, sc_scratch);
-    unsafe { pools.set_dynamic_viewport_scissor(&ctx.device, cb, counters) };
+    unsafe {
+        pools
+            .encoder_mut()
+            .set_dynamic_viewport_scissor(&ctx.device, cb, counters)
+    };
     if let Some([constant_factor, slope_factor, clamp]) = depth_bias {
         unsafe {
             ctx.device
@@ -7038,7 +7055,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // guest state and a cache that held half of it would be two.
     if let Some(s) = req.effective_depth_state().and_then(|d| d.stencil) {
         unsafe {
-            pools.set_dynamic_stencil_reference(
+            pools.encoder_mut().set_dynamic_stencil_reference(
                 &ctx.device,
                 cb,
                 counters,
@@ -7049,7 +7066,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     if push_descriptors {
-        let push_state = pools.push_descriptor_scratch();
+        let push_state = pools.encoder_mut().push_descriptor_scratch();
         push_state.extend(storage_slots.iter().zip(&buffer_infos).map(
             |((binding, _, _), info)| super::pools::PushDescriptorBinding::Buffer {
                 binding: *binding,
@@ -7090,7 +7107,10 @@ pub(crate) unsafe fn execute_draw_inner(
                 layout: color_input_info.image_layout,
             });
         }
-        if pools.push_descriptors_changed(pipeline_layout, counters) {
+        if pools
+            .encoder_mut()
+            .push_descriptors_changed(pipeline_layout, counters)
+        {
             ctx.push_descriptor
                 .as_ref()
                 .expect("push layout requires enabled entry points")
@@ -7117,7 +7137,11 @@ pub(crate) unsafe fn execute_draw_inner(
             .fetch_add(1, Ordering::Relaxed);
     }
     phase.enter(super::draw_phase::Phase::RecordDraw);
-    unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
+    unsafe {
+        pools
+            .encoder_mut()
+            .bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs)
+    };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
             ctx.device.cmd_bind_index_buffer(
@@ -7164,7 +7188,7 @@ pub(crate) unsafe fn execute_draw_inner(
     if keep_pass_open {
         crate::telemetry::note_route("pass_left_open");
     } else {
-        unsafe { pools.close_open_pass(&ctx.device, cb) };
+        unsafe { pools.encoder_mut().close_open_pass(&ctx.device, cb) };
     }
     if pass_churn_probe_enabled() && load_uses_gpu_content && !target_feedback {
         // PROBE — `REIMS_VGPU_PASS_CHURN=on`. One extra render pass instance on
@@ -7424,7 +7448,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // on, and cheaper than computing a union of arbitrary rects.
         counters.note_draw_coverage(if rewrites_whole_attachment {
             super::counters::DrawCoverage::Full
-        } else if pools.bound_scissors().iter().any(|s| {
+        } else if pools.encoder_mut().bound_scissors().iter().any(|s| {
             s.offset.x <= 0
                 && s.offset.y <= 0
                 && s.extent.width >= req.width

@@ -21,7 +21,7 @@ impl ResourcePools {
         // pool discards the unfinished recording, including an open pass, so
         // there is neither a legal nor a useful cmd_end_render_pass to emit.
         self.encoder.open_pass = None;
-        self.forget_pass_echo();
+        self.encoder.forget_pass_echo();
         // A batched submit transfers host ownership of its fence to the queue
         // thread until the driver's submit call returns. Teardown can be
         // reached through session release without a queue-wide barrier, so

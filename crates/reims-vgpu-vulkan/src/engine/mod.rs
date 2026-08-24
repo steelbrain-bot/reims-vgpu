@@ -3949,7 +3949,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // A deferred draw may have left its render pass standing in this same
     // command buffer. The image barrier and copy below are outside-pass
     // commands; recording either inside that pass is invalid.
-    unsafe { pools.close_open_pass(&ctx.device, cb) };
+    unsafe { pools.encoder_mut().close_open_pass(&ctx.device, cb) };
     // Unconditional, and the layout match is exactly why. A barrier is two
     // things — a layout transition and a dependency — and this rail needs the
     // second one whether or not it needs the first. Every render pass resolves
@@ -4531,7 +4531,7 @@ pub fn copy_resident_level0(
             VkOp::ResidentCopyResetCb,
             VkOp::ResidentCopyBeginCb,
         )?;
-        pools.close_open_pass(&ctx.device, cb);
+        pools.encoder_mut().close_open_pass(&ctx.device, cb);
         let destination_next = pools::ResidentAccess::transfer_read();
         if !pools.pin_resident_for_entry(source) {
             pools.abort_recorded_guest_work();
@@ -5350,7 +5350,7 @@ unsafe fn copy_image_level0_to_buffer(
             )?
         };
     }
-    unsafe { pools.close_open_pass(&ctx.device, cb) };
+    unsafe { pools.encoder_mut().close_open_pass(&ctx.device, cb) };
     // The device's own clock, for the reason the readback rail takes it: `fence_us`
     // is CPU wall clock and cannot tell "the GPU is copying eight megabytes across
     // PCIe" from "the round trip costs more than the work". Those have opposite
