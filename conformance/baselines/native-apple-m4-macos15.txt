@@ -100,6 +100,7 @@ CASE heap_texture_placement_overlap PASS two live definitions at offset=0 execut
 CASE ebl_same_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_changed_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_same_bind_second_command_buffer PASS the binding re-issued on the second encoder is the one that drew
+CASE texture_view_retains_base_generation PASS the live view kept all 64 texels from its construction-time base
 CASE fragsample_a8Unorm_54x16_pitch_64_first_draw PASS 864 texels exact through the rasterizer
 CASE fragsample_a8Unorm_54x16_pitch_64_after_cpu_rewrite PASS 864 texels exact through the rasterizer
 CASE fragsample_a8Unorm_218x16_pitch_256_first_draw PASS 3488 texels exact through the rasterizer
@@ -250,5 +251,5 @@ ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_src_via_surface
 ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_resident_landed
 CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
-SUMMARY cases=245 failures=0 skipped=0
+SUMMARY cases=246 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true
