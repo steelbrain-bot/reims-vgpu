@@ -178,6 +178,17 @@ pub(super) struct PreparedDraw {
     render_target_resource: Option<std::sync::Arc<crate::model::TaskResource>>,
 }
 
+/// Semantic work owed only after the executor accepts one prepared draw.
+///
+/// Kept apart from [`PreparedDraw::request`] so immutable executor input can
+/// cross an ownership boundary without granting the executor access to
+/// `Device`. Applying this value is the sole transition that records backend
+/// materialization and render-target use.
+pub(super) struct DrawCompletionPlan {
+    route: DrawCompletionRoute,
+    render_target_resource: Option<std::sync::Arc<crate::model::TaskResource>>,
+}
+
 impl PreparedDraw {
     pub(super) fn new(
         request: reims_vgpu_core::DrawRequest,
@@ -201,27 +212,52 @@ impl PreparedDraw {
         state: &mut Device,
         task_id: u32,
     ) -> Result<CompletedDraw, ExecutorDiagnostic> {
+        let (request, completion) = self.into_executor_parts();
+        let executor = std::sync::Arc::clone(&state.executor);
+        let submission = executor::context_for(state, task_id);
+        let receipt = executor::execute_draw(executor.as_ref(), submission, request)
+            .map_err(|error| ExecutorDiagnostic::from_decline(&error))?;
+        Ok(completion.apply(state, receipt))
+    }
+
+    /// Split immutable executor input from the semantic transition its
+    /// successful completion owes. Neither half mutates device state.
+    pub(super) fn into_executor_parts(self) -> (reims_vgpu_core::DrawRequest, DrawCompletionPlan) {
         let Self {
             request,
             route,
             render_target_resource,
         } = self;
-        let executor = std::sync::Arc::clone(&state.executor);
-        let submission = executor::context_for(state, task_id);
-        let receipt = executor::execute_draw(executor.as_ref(), submission, request)
-            .map_err(|error| ExecutorDiagnostic::from_decline(&error))?;
+        (
+            request,
+            DrawCompletionPlan {
+                route,
+                render_target_resource,
+            },
+        )
+    }
+}
+
+impl DrawCompletionPlan {
+    /// Apply only an executor-validated completion. A refusal never produces a
+    /// receipt and therefore cannot reach this transition.
+    pub(super) fn apply(
+        self,
+        state: &mut Device,
+        receipt: executor::ExecutionReceipt<reims_vgpu_core::DrawOutput>,
+    ) -> CompletedDraw {
         state
             .task_objects
             .resources
             .record_gpu_materializations(receipt.gpu_materialized.iter().copied());
-        if let Some(resource) = render_target_resource {
+        if let Some(resource) = self.render_target_resource {
             resource.note_render_target_use();
         }
-        Ok(CompletedDraw {
+        CompletedDraw {
             submission: receipt.submission.id,
             output: receipt.output,
-            route,
-        })
+            route: self.route,
+        }
     }
 }
 
@@ -532,5 +568,27 @@ mod tests {
         assert!(matches!(route, DrawCompletionRoute::ResidentChain(_)));
         assert!(executor_request.skip_readback);
         assert_eq!(executor_request.target_identity, Some(gva(0x1000)));
+    }
+
+    #[test]
+    fn executor_input_and_completion_plan_split_without_applying_state() {
+        let identity = gva(0x2000);
+        let request = reims_vgpu_core::DrawRequest {
+            target_identity: Some(identity.clone()),
+            ..Default::default()
+        };
+        let prepared = PreparedDraw::new(
+            request,
+            DrawCompletionRoute::ResidentGvaStore(identity.clone()),
+            None,
+        );
+
+        let (request, completion) = prepared.into_executor_parts();
+        assert_eq!(request.target_identity, Some(identity.clone()));
+        assert!(matches!(
+            completion.route,
+            DrawCompletionRoute::ResidentGvaStore(found) if found == identity
+        ));
+        assert!(completion.render_target_resource.is_none());
     }
 }
