@@ -3582,7 +3582,9 @@ impl ResourcePools {
                 .push(slot);
         }
     }
+}
 
+impl EncoderPools {
     /// Create one host-visible buffer of exactly `bucket` bytes, usable as a
     /// transfer destination and as a storage buffer.
     ///
@@ -3630,13 +3632,15 @@ impl ResourcePools {
             .map_err(|e| DrawError::VkCall(VkCall::new(create_op, e)))?;
         counters.note_create(CreateSite::ReadbackBuffer);
         let req = ctx.device.get_buffer_memory_requirements(buffer);
-        let mt = ctx
-            .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Readback)
-            .ok_or({
-                DrawError::Unsupported(reason::DrawReason::NoHostVisibleMemoryForReadback {
+        let Some(mt) = ctx.memory_type_for(req.memory_type_bits, req.size, MemoryClass::Readback)
+        else {
+            ctx.device.destroy_buffer(buffer, None);
+            return Err(DrawError::Unsupported(
+                reason::DrawReason::NoHostVisibleMemoryForReadback {
                     memory_type_bits: req.memory_type_bits,
-                })
-            })?;
+                },
+            ));
+        };
         let memory = allocate_memory_timed(
             ctx,
             &vk::MemoryAllocateInfo::default()
@@ -3707,10 +3711,10 @@ impl ResourcePools {
         // readback rather than after an arbitrary delay. This is the only
         // engine-locked point the return path can rely on running.
         self.reclaim_returned_readback_leases();
-        let bucket = Self::bucket(size.max(4));
-        if let Some(list) = self.encoder.readback_free.get_mut(&bucket) {
+        let bucket = ResourcePools::bucket(size.max(4));
+        if let Some(list) = self.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
-                self.encoder.readback_live = Some(slot);
+                self.readback_live = Some(slot);
                 return Ok(slot);
             }
         }
@@ -3724,7 +3728,7 @@ impl ResourcePools {
             VkOp::PoolsBindReadback,
             VkOp::PoolsMapReadback,
         )?;
-        self.encoder.readback_live = Some(slot);
+        self.readback_live = Some(slot);
         Ok(slot)
     }
 
@@ -3738,10 +3742,10 @@ impl ResourcePools {
     /// pending cleanup, so nothing can hand it to a GPU copy underneath the
     /// borrow.
     ///
-    /// Must be called before [`Self::seal_entry`], which is what would
+    /// Must be called before [`ResourcePools::seal_entry`], which is what would
     /// otherwise move the slot into the submitted entry's cleanup.
     pub(crate) fn lease_readback(&mut self) -> Option<ReadbackLease> {
-        let slot = self.encoder.readback_live.take()?;
+        let slot = self.readback_live.take()?;
         // Two refusals, and both send the caller to the copying path rather
         // than to a failure.
         //
@@ -3757,26 +3761,23 @@ impl ResourcePools {
         // of a scattered walk, so where the cached type was unavailable the
         // copy is genuinely the faster shape and the lease declines.
         if slot.mapped == 0 || !slot.cached {
-            self.encoder.readback_live = Some(slot);
+            self.readback_live = Some(slot);
             return None;
         }
         let token = NEXT_READBACK_LEASE_TOKEN.fetch_add(1, Ordering::Relaxed);
         // Before the slot leaves the pool: the counter is what a teardown reads
         // to decide whether a borrow is live, and it must never see the slot
         // gone while the count still says nobody has it.
-        self.encoder
-            .readback_lease_returns
+        self.readback_lease_returns
             .outstanding
             .fetch_add(1, Ordering::AcqRel);
         let lease = ReadbackLease {
             token,
             ptr: slot.mapped,
             slot_size: slot.size,
-            returns: Arc::clone(&self.encoder.readback_lease_returns),
+            returns: Arc::clone(&self.readback_lease_returns),
         };
-        self.encoder
-            .readback_leased
-            .push(LeasedReadback { token, slot });
+        self.readback_leased.push(LeasedReadback { token, slot });
         Some(lease)
     }
 
@@ -3787,45 +3788,28 @@ impl ResourcePools {
     /// the calls that follow a lease, and a lease that is still out is simply
     /// not in the drained set.
     pub(crate) fn reclaim_returned_readback_leases(&mut self) {
-        let returned = std::mem::take(&mut *self.encoder.readback_lease_returns.returned.lock());
+        let returned = std::mem::take(&mut *self.readback_lease_returns.returned.lock());
         for token in returned {
-            let Some(index) = self
-                .encoder
-                .readback_leased
-                .iter()
-                .position(|l| l.token == token)
-            else {
+            let Some(index) = self.readback_leased.iter().position(|l| l.token == token) else {
                 // A teardown collected the leases while this token was in
                 // flight, so there is no slot left to give back. The handles
                 // died with the device; dropping the token is the whole of it.
                 continue;
             };
-            let slot = self.encoder.readback_leased.remove(index).slot;
-            let bucket = Self::bucket(slot.size);
-            self.encoder
-                .readback_free
-                .entry(bucket)
-                .or_default()
-                .push(slot);
+            let slot = self.readback_leased.remove(index).slot;
+            let bucket = ResourcePools::bucket(slot.size);
+            self.readback_free.entry(bucket).or_default().push(slot);
         }
     }
 
     pub(crate) fn recycle_readback(&mut self) {
-        if let Some(slot) = self.encoder.readback_live.take() {
-            let bucket = Self::bucket(slot.size);
-            self.encoder
-                .readback_free
-                .entry(bucket)
-                .or_default()
-                .push(slot);
+        if let Some(slot) = self.readback_live.take() {
+            let bucket = ResourcePools::bucket(slot.size);
+            self.readback_free.entry(bucket).or_default().push(slot);
         }
-        for slot in self.encoder.readback_multi_live.drain(..) {
-            let bucket = Self::bucket(slot.size);
-            self.encoder
-                .readback_free
-                .entry(bucket)
-                .or_default()
-                .push(slot);
+        for slot in self.readback_multi_live.drain(..) {
+            let bucket = ResourcePools::bucket(slot.size);
+            self.readback_free.entry(bucket).or_default().push(slot);
         }
     }
 
@@ -3836,10 +3820,10 @@ impl ResourcePools {
         size: u64,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
-        let bucket = Self::bucket(size.max(4));
-        if let Some(list) = self.encoder.readback_free.get_mut(&bucket) {
+        let bucket = ResourcePools::bucket(size.max(4));
+        if let Some(list) = self.readback_free.get_mut(&bucket) {
             if let Some(slot) = list.pop() {
-                self.encoder.readback_multi_live.push(slot);
+                self.readback_multi_live.push(slot);
                 return Ok(slot);
             }
         }
@@ -3853,10 +3837,12 @@ impl ResourcePools {
             VkOp::PoolsBindReadbackExtra,
             VkOp::PoolsMapReadbackExtra,
         )?;
-        self.encoder.readback_multi_live.push(slot);
+        self.readback_multi_live.push(slot);
         Ok(slot)
     }
+}
 
+impl ResourcePools {
     pub(crate) unsafe fn acquire_target(
         &mut self,
         ctx: &DeviceContext,

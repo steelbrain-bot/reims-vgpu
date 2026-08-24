@@ -1156,7 +1156,11 @@ pub(crate) unsafe fn execute_compute_inner(
                 let len = resource.width as u64
                     * resource.height as u64
                     * resource.format.bytes_per_texel() as u64;
-                ComputeImageDst::Readback(pools.acquire_readback_extra(ctx, len, counters)?)
+                ComputeImageDst::Readback(
+                    pools
+                        .encoder_mut()
+                        .acquire_readback_extra(ctx, len, counters)?,
+                )
             }
             super::types::ComputeImageDestination::GuestPages { target, .. } => {
                 ComputeImageDst::Direct(unsafe {
@@ -1762,7 +1766,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 .free_descriptor_sets(&ctx.device, &[(ds, pool)]);
         }
         pools.recycle_staging();
-        pools.recycle_readback();
+        pools.encoder_mut().recycle_readback();
         pools.recycle_storage_images();
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedCompute));
     }

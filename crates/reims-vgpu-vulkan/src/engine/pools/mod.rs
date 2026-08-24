@@ -345,7 +345,7 @@ pub(crate) struct EncoderPools {
     /// Extra live readbacks (compute multi-image / multi-buffer).
     readback_multi_live: Vec<BufferSlot>,
     /// Readback slots handed to a reader that is consuming their mapping with
-    /// the engine unlocked; see [`ResourcePools::lease_readback`].
+    /// the engine unlocked; see [`EncoderPools::lease_readback`].
     ///
     /// Deliberately in none of the three lists above. A leased slot must not
     /// reach a ring entry's `PendingGpuCleanup` (which would return it to
@@ -4493,7 +4493,7 @@ mod staging_mapping_tests {
         let counters = EngineCounters::default();
         let mut pools = ResourcePools::new();
 
-        let slot = unsafe { pools.acquire_readback(&ctx, 4096, &counters) }
+        let slot = unsafe { pools.encoder.acquire_readback(&ctx, 4096, &counters) }
             .expect("a 4 KiB readback slot must be available");
         assert_ne!(
             slot.mapped, 0,
@@ -4504,7 +4504,7 @@ mod staging_mapping_tests {
             // The gate is the point of the field: where the cached type was
             // unavailable the lease declines and the copy is the faster shape.
             assert!(
-                pools.lease_readback().is_none(),
+                pools.encoder.lease_readback().is_none(),
                 "an uncached slot must not be leased"
             );
             unsafe { pools.destroy_all(&ctx.device) };
@@ -4512,7 +4512,10 @@ mod staging_mapping_tests {
             return;
         }
 
-        let lease = pools.lease_readback().expect("a mapped cached slot leases");
+        let lease = pools
+            .encoder
+            .lease_readback()
+            .expect("a mapped cached slot leases");
         assert_eq!(
             lease.ptr, slot.mapped,
             "the lease must lend the slot's mapping"
@@ -4539,7 +4542,7 @@ mod staging_mapping_tests {
         );
         // The exclusivity claim, stated as the thing that would break it: a
         // second acquire must not be able to reach the leased slot.
-        let other = unsafe { pools.acquire_readback(&ctx, 4096, &counters) }
+        let other = unsafe { pools.encoder.acquire_readback(&ctx, 4096, &counters) }
             .expect("a second readback slot must be available");
         assert_ne!(
             other.buffer, slot.buffer,
@@ -4558,15 +4561,15 @@ mod staging_mapping_tests {
         );
         // Returned, then collected: the two are deliberately separate, because
         // the return may not take the engine lock and the collection needs it.
-        pools.reclaim_returned_readback_leases();
-        let back = unsafe { pools.acquire_readback(&ctx, 4096, &counters) }
+        pools.encoder.reclaim_returned_readback_leases();
+        let back = unsafe { pools.encoder.acquire_readback(&ctx, 4096, &counters) }
             .expect("the returned slot must be reusable");
         assert!(
             back.buffer == slot.buffer || back.buffer == other.buffer,
             "a returned lease must rejoin the free list rather than leak"
         );
 
-        pools.recycle_readback();
+        pools.encoder.recycle_readback();
         unsafe { pools.destroy_all(&ctx.device) };
         unsafe { ctx.destroy() };
     }

@@ -3918,7 +3918,9 @@ unsafe fn copy_image_level0_to_host_delivered(
         }
         None => pools.begin_entry(ctx, counters)?,
     };
-    let readback = pools.acquire_readback(ctx, rb_size, counters)?;
+    let readback = pools
+        .encoder_mut()
+        .acquire_readback(ctx, rb_size, counters)?;
     // Acquired here rather than beside the dispatch, for the ordering reason
     // above: every readback slot this submission owns must be claimed after
     // `begin_entry`, or it ends up owned by whatever ring entry the flush
@@ -3929,7 +3931,7 @@ unsafe fn copy_image_level0_to_host_delivered(
     // A leased slot belongs to no ring entry — the copy's fence is waited below
     // and the lease is returned explicitly.
     let mut lease = ReadbackLeaseGuard::new(if delivery == ReadbackDelivery::Lease {
-        pools.lease_readback()
+        pools.encoder_mut().lease_readback()
     } else {
         None
     });

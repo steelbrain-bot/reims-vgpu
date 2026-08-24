@@ -137,7 +137,7 @@ impl ResourcePools {
             }
             std::thread::yield_now();
         }
-        self.reclaim_returned_readback_leases();
+        self.encoder.reclaim_returned_readback_leases();
         for l in self.encoder.readback_leased.drain(..) {
             release_buffer_slot(device, &mut self.shared.slabs, l.slot);
         }

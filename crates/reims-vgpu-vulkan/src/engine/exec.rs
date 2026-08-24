@@ -5496,7 +5496,11 @@ pub(crate) unsafe fn execute_draw_inner(
     let do_readback = !req.skip_readback;
     phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
     let readback = if do_readback {
-        Some(pools.acquire_readback(ctx, rb_size, counters)?)
+        Some(
+            pools
+                .encoder_mut()
+                .acquire_readback(ctx, rb_size, counters)?,
+        )
     } else {
         None
     };
@@ -7403,7 +7407,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 .free_descriptor_sets(&ctx.device, &[(ds, pool)]);
         }
         pools.recycle_staging();
-        pools.recycle_readback();
+        pools.encoder_mut().recycle_readback();
         pools.recycle_sampled();
         return Err(DrawError::DeviceLost(DeviceLostDecline::ForcedDraw));
     }
