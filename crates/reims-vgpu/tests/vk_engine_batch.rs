@@ -258,6 +258,68 @@ fn a_refused_submission_tail_keeps_the_recorded_resident_prefix() {
 }
 
 #[test]
+fn two_live_execs_keep_distinct_encoder_state_until_ordered_close() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::flush_batched_draws();
+    let (vert, frag) = triangle_spirv();
+    let first_target = TargetIdentity::Surface {
+        id: 990_112,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let second_target = TargetIdentity::Surface {
+        id: 990_113,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let first = submission(112);
+    let second = submission(113);
+    let before = engine::counter_snapshot();
+
+    for (context, target) in [(&first, &first_target), (&second, &second_target)] {
+        let request = batch_req(&vert, &frag, target, false, half_scissor(true));
+        let progress = engine::execute_submission_progress(reims_vgpu_core::ResolvedSubmission {
+            context: context.clone(),
+            command_buffer: reims_vgpu_core::ResolvedCommandBuffer::single(
+                reims_vgpu_core::ResolvedCommand::Draw(Box::new(request)),
+            ),
+        });
+        if let Some(error) = progress.failure.as_ref() {
+            if progress.output.is_empty() && skip_if_no_gpu(&error.to_string()) {
+                eprintln!("skipping: {error}");
+                return;
+            }
+        }
+        assert_eq!(progress.output.len(), 1);
+        assert!(progress.failure.is_none());
+    }
+
+    let mid = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(mid.batch_opens, 2, "each live EXEC owns its own opener");
+    assert_eq!(
+        mid.batch_flushes, 0,
+        "starting the second EXEC must not flush the first encoder"
+    );
+
+    engine::close_submission(first.identity).expect("first EXEC closes in guest order");
+    engine::close_submission(second.identity).expect("second EXEC closes in guest order");
+    for target in [&first_target, &second_target] {
+        let pixels = engine::read_target(target)
+            .expect("each encoder published its own resident")
+            .into_rgba8();
+        let colored = pixels
+            .chunks_exact(4)
+            .filter(|pixel| is_frag_color(pixel))
+            .count();
+        assert!(colored > 0, "the ordered close submitted each live EXEC");
+    }
+}
+
+#[test]
 fn one_recording_retains_unchanged_vertex_buffer_state() {
     let _guard = engine_test_lock().lock().unwrap();
     engine::flush_batched_draws();

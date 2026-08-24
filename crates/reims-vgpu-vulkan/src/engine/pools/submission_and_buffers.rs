@@ -1196,6 +1196,8 @@ impl ResourcePools {
                 encoder: OwnedPool(EncoderPools::new()),
                 shared: OwnedPool(SharedPools::new()),
             },
+            active_encoders: HashMap::new(),
+            idle_encoders: Vec::new(),
         }
     }
 
@@ -1207,6 +1209,87 @@ impl ResourcePools {
                 shared: &mut pair.shared.0,
             },
         }
+    }
+
+    /// Borrow the encoder that owns one exact guest submission.
+    ///
+    /// An encoder returns to the reusable depot only at that submission's close
+    /// boundary. Until then repeated execution calls for the same EXEC recover
+    /// the same command ring and retained render-pass state, while a different
+    /// live identity cannot alias any encoder-local handle or memo.
+    pub(in crate::engine) fn recording_for_submission(
+        &mut self,
+        identity: SubmissionIdentity,
+    ) -> Result<RecordingPools<'_>, DrawError> {
+        if identity.id.get() == 0 {
+            self.pair.encoder.enter_submission(identity)?;
+            return Ok(self.recording());
+        }
+        if !self.active_encoders.contains_key(&identity) {
+            let mut encoder = self
+                .idle_encoders
+                .pop()
+                .unwrap_or_else(|| OwnedPool(EncoderPools::new()));
+            encoder.enter_submission(identity)?;
+            self.active_encoders.insert(identity, encoder);
+        }
+        let encoder = self
+            .active_encoders
+            .get_mut(&identity)
+            .expect("the submission encoder was installed above");
+        Ok(RecordingPools {
+            pair: PoolPair {
+                encoder: &mut encoder.0,
+                shared: &mut self.pair.shared.0,
+            },
+        })
+    }
+
+    /// Close and return one exact submission encoder to the reusable depot.
+    pub(crate) unsafe fn close_submission(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        identity: SubmissionIdentity,
+    ) -> Result<(), DrawError> {
+        if identity.id.get() == 0 {
+            return unsafe { self.pair.close_submission(ctx, counters, identity) };
+        }
+        let Some(mut encoder) = self.active_encoders.remove(&identity) else {
+            return Ok(());
+        };
+        let result = unsafe {
+            PoolPair {
+                encoder: &mut encoder.0,
+                shared: &mut self.pair.shared.0,
+            }
+            .close_submission(ctx, counters, identity)
+        };
+        if encoder.active_submission.is_none() {
+            self.idle_encoders.push(encoder);
+        } else {
+            self.active_encoders.insert(identity, encoder);
+        }
+        result
+    }
+
+    pub(crate) fn close_submission_without_context(
+        &mut self,
+        identity: SubmissionIdentity,
+    ) -> Result<(), DrawError> {
+        if identity.id.get() == 0 {
+            return self.pair.encoder.close_submission(identity);
+        }
+        let Some(mut encoder) = self.active_encoders.remove(&identity) else {
+            return Ok(());
+        };
+        let result = encoder.close_submission(identity);
+        if encoder.active_submission.is_none() {
+            self.idle_encoders.push(encoder);
+        } else {
+            self.active_encoders.insert(identity, encoder);
+        }
+        result
     }
 }
 
@@ -6915,6 +6998,52 @@ mod encoder_submission_ownership {
         encoder.enter_submission(standalone).unwrap();
         assert_eq!(encoder.active_submission, None);
         assert!(!encoder.submission_is_closing(standalone).unwrap());
+    }
+
+    #[test]
+    fn live_submissions_lease_distinct_encoders_until_exact_close() {
+        let mut pools = ResourcePools::new();
+        let first = identity(10, 4);
+        let second = identity(11, 4);
+
+        drop(pools.recording_for_submission(first).unwrap());
+        drop(pools.recording_for_submission(first).unwrap());
+        assert_eq!(pools.active_encoders.len(), 1);
+        assert!(pools.idle_encoders.is_empty());
+
+        drop(pools.recording_for_submission(second).unwrap());
+        assert_eq!(pools.active_encoders.len(), 2);
+        assert_ne!(
+            pools.active_encoders.get(&first).unwrap().active_submission,
+            pools
+                .active_encoders
+                .get(&second)
+                .unwrap()
+                .active_submission,
+        );
+
+        pools.close_submission_without_context(first).unwrap();
+        assert!(!pools.active_encoders.contains_key(&first));
+        assert!(pools.active_encoders.contains_key(&second));
+        assert_eq!(pools.idle_encoders.len(), 1);
+    }
+
+    #[test]
+    fn a_closed_encoder_is_reused_only_after_its_identity_is_released() {
+        let mut pools = ResourcePools::new();
+        let first = identity(20, 5);
+        let next = identity(21, 5);
+        drop(pools.recording_for_submission(first).unwrap());
+        pools.close_submission_without_context(first).unwrap();
+        assert_eq!(pools.idle_encoders.len(), 1);
+
+        drop(pools.recording_for_submission(next).unwrap());
+        assert!(pools.idle_encoders.is_empty());
+        assert_eq!(pools.active_encoders.len(), 1);
+        assert_eq!(
+            pools.active_encoders.get(&next).unwrap().active_submission,
+            Some(next)
+        );
     }
 }
 

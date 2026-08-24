@@ -67,7 +67,7 @@ pub struct SegmentBoundary {
 }
 
 /// Stable identity shared by all operations decoded from one guest submission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct SubmissionIdentity {
     pub id: SubmissionId,
     pub task: TaskId,

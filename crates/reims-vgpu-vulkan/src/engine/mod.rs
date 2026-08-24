@@ -1596,9 +1596,8 @@ fn execute_draw_request_locked(
         ref counters,
         ..
     } = &mut *guard;
-    pools.encoder_mut().enter_submission(submission.identity)?;
     let result = unsafe {
-        let mut recording = pools.recording();
+        let mut recording = pools.recording_for_submission(submission.identity)?;
         exec::execute_draw_inner(
             owner,
             caches,
@@ -2742,9 +2741,8 @@ fn execute_compute_request_locked(
         ref counters,
         ..
     } = &mut *guard;
-    pools.encoder_mut().enter_submission(submission.identity)?;
     let result = unsafe {
-        let mut recording = pools.recording();
+        let mut recording = pools.recording_for_submission(submission.identity)?;
         exec_compute::execute_compute_inner(owner, caches, &mut recording, counters, req, &program)
     };
     match result {
@@ -2828,7 +2826,7 @@ pub fn close_submission(
         } = &mut *guard;
         match owner.ctx.as_ref() {
             Some(ctx) => unsafe { pools.close_submission(ctx, counters, identity) },
-            None => pools.encoder_mut().close_submission(identity),
+            None => pools.close_submission_without_context(identity),
         }
     };
     match result {

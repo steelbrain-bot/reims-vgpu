@@ -727,6 +727,8 @@ pub(crate) struct PoolPair<Encoder, Shared> {
 
 pub(crate) struct ResourcePools {
     pair: PoolPair<OwnedPool<EncoderPools>, OwnedPool<SharedPools>>,
+    active_encoders: HashMap<SubmissionIdentity, OwnedPool<EncoderPools>>,
+    idle_encoders: Vec<OwnedPool<EncoderPools>>,
 }
 
 impl std::ops::Deref for ResourcePools {

@@ -12,6 +12,17 @@ use super::*;
 
 impl ResourcePools {
     pub(crate) unsafe fn destroy_all(&mut self, device: &ash::Device) {
+        let mut detached = self
+            .active_encoders
+            .drain()
+            .map(|(_, encoder)| encoder)
+            .chain(self.idle_encoders.drain(..))
+            .collect::<Vec<_>>();
+        for encoder in &mut detached {
+            unsafe {
+                destroy_detached_encoder(device, &mut encoder.0, &mut self.pair.shared.0);
+            }
+        }
         // An open (never-submitted) batch dies with the pool: its CB belongs
         // to cmd_pool (destroyed below) and its dsets to desc_pool; the
         // accumulated transients are already in the live lists.
@@ -297,6 +308,175 @@ impl ResourcePools {
         }
         self.encoder.initialized = false;
     }
+}
+
+/// Destroy one encoder after it has left the submission depot.
+///
+/// This is reached only from [`ResourcePools::destroy_all`]. Shared registries,
+/// allocators, and the graveyard remain alive until every detached encoder and
+/// the primary maintenance encoder have quiesced; otherwise one encoder could
+/// release a shared handle still named by another encoder's command buffer.
+unsafe fn destroy_detached_encoder(
+    device: &ash::Device,
+    encoder: &mut EncoderPools,
+    shared: &mut SharedPools,
+) {
+    let mut pools = PoolPair { encoder, shared };
+    pools.discard_open_batch();
+    pools.abort_recorded_guest_work();
+    pools.encoder.open_pass = None;
+    pools.encoder.forget_pass_echo();
+
+    for index in 0..pools.encoder.slots.len() {
+        let state = std::mem::replace(
+            &mut pools.encoder.slots[index].submission,
+            SlotSubmission::HostOwned,
+        );
+        match state {
+            SlotSubmission::SealedWaitingCommit(sealed) => {
+                unsafe { pools.abort_sealed_entry(device, index, sealed) };
+            }
+            state => pools.encoder.slots[index].submission = state,
+        }
+    }
+    for slot in &mut pools.encoder.slots {
+        let state = std::mem::replace(&mut slot.submission, SlotSubmission::HostOwned);
+        let result = match state {
+            SlotSubmission::HostOwned => Ok(()),
+            SlotSubmission::SealedWaitingCommit(_) => {
+                unreachable!("sealed entries were recovered before queue returns")
+            }
+            SlotSubmission::QueueOwned(receipt) => receipt.wait(),
+            SlotSubmission::Failed(result) => Err(result),
+        };
+        if let Err(result) = result {
+            slot.submission = SlotSubmission::Failed(result);
+            let decline = DrawError::VkCall(VkCall::new(VkOp::PoolsWaitFencesDestroy, result));
+            reims_vgpu_observe::Emit::decline("vk_pools_destroy", &decline).fail_once(0);
+        }
+    }
+    for slot in &pools.encoder.slots {
+        if slot.pending.is_some() && !matches!(slot.submission, SlotSubmission::Failed(_)) {
+            if let Err(result) = device.wait_for_fences(&[slot.fence], true, FENCE_TIMEOUT_NS) {
+                let decline = DrawError::VkCall(VkCall::new(VkOp::PoolsWaitFencesDestroy, result));
+                reims_vgpu_observe::Emit::decline("vk_pools_destroy", &decline).fail_once(0);
+            }
+        }
+    }
+    for slot in &mut pools.encoder.slots {
+        if let Some(pending) = slot.pending.take() {
+            super::super::retire_guest_write_pages(&pending.visibility.guest_write_tokens);
+            pools.encoder.staging_live.extend(pending.encoder.staging);
+            pools.encoder.gather_live.extend(pending.encoder.gather);
+            pools
+                .encoder
+                .readback_multi_live
+                .extend(pending.encoder.readback);
+            pools.encoder.sampled_live.extend(pending.shared.sampled);
+            pools
+                .encoder
+                .attachment_snapshot_live
+                .extend(pending.shared.attachment_snapshots);
+            pools
+                .encoder
+                .storage_image_live
+                .extend(pending.shared.storage_images);
+        }
+    }
+    pools.encoder.in_flight = 0;
+
+    for list in pools.encoder.staging_free.values_mut() {
+        for slot in list.drain(..) {
+            release_buffer_slot(device, &mut pools.shared.slabs, slot);
+        }
+    }
+    for slot in pools.encoder.staging_live.drain(..) {
+        release_buffer_slot(device, &mut pools.shared.slabs, slot);
+    }
+    for list in pools.encoder.gather_free.values_mut() {
+        for slot in list.drain(..) {
+            release_buffer_slot(device, &mut pools.shared.slabs, slot);
+        }
+    }
+    for slot in pools.encoder.gather_live.drain(..) {
+        release_buffer_slot(device, &mut pools.shared.slabs, slot);
+    }
+    for list in pools.encoder.readback_free.values_mut() {
+        for slot in list.drain(..) {
+            release_buffer_slot(device, &mut pools.shared.slabs, slot);
+        }
+    }
+    if let Some(slot) = pools.encoder.readback_live.take() {
+        release_buffer_slot(device, &mut pools.shared.slabs, slot);
+    }
+    for slot in pools.encoder.readback_multi_live.drain(..) {
+        release_buffer_slot(device, &mut pools.shared.slabs, slot);
+    }
+
+    let lease_deadline = std::time::Instant::now() + LEASE_QUIESCE;
+    while pools
+        .encoder
+        .readback_lease_returns
+        .outstanding
+        .load(std::sync::atomic::Ordering::Acquire)
+        != 0
+    {
+        if std::time::Instant::now() >= lease_deadline {
+            reims_vgpu_observe::Emit::decline(
+                "vk_pools_destroy",
+                &ReadbackLeaseQuiesceExpired {
+                    outstanding: pools
+                        .encoder
+                        .readback_lease_returns
+                        .outstanding
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    waited_ms: LEASE_QUIESCE.as_millis() as u64,
+                },
+            )
+            .fail_once(0);
+            break;
+        }
+        std::thread::yield_now();
+    }
+    pools.encoder.reclaim_returned_readback_leases();
+    for lease in pools.encoder.readback_leased.drain(..) {
+        release_buffer_slot(device, &mut pools.shared.slabs, lease.slot);
+    }
+
+    for slot in pools.encoder.sampled_live.drain(..) {
+        device.destroy_image_view(slot.view, None);
+        device.destroy_image(slot.image, None);
+    }
+    for slot in pools.encoder.attachment_snapshot_live.drain(..) {
+        device.destroy_image_view(slot.view, None);
+        device.destroy_image(slot.image, None);
+    }
+    for slot in pools.encoder.storage_image_live.drain(..) {
+        device.destroy_image_view(slot.view, None);
+        if let StorageImageBacking::Dedicated(memory) = slot.backing {
+            device.destroy_image(slot.image, None);
+            device.free_memory(memory, None);
+        }
+    }
+    for slot in pools.encoder.slots.drain(..) {
+        device.destroy_fence(slot.fence, None);
+    }
+    pools.encoder.cur = 0;
+    let mut owed = std::mem::take(&mut pools.encoder.scatter_dsets);
+    owed.append(&mut pools.encoder.scatter_dset_free);
+    pools.encoder.desc_arena.free(device, &owed);
+    pools.encoder.desc_arena.destroy(device);
+    if let Some(probe) = pools.encoder.timestamps.take() {
+        device.destroy_query_pool(probe.pool, None);
+    }
+    if let Some(probe) = pools.encoder.draw_spans.take() {
+        device.destroy_query_pool(probe.pool, None);
+    }
+    if pools.encoder.cmd_pool != vk::CommandPool::null() {
+        device.destroy_command_pool(pools.encoder.cmd_pool, None);
+        pools.encoder.cmd_pool = vk::CommandPool::null();
+    }
+    pools.encoder.initialized = false;
 }
 
 /// How long [`ResourcePools::destroy_all`] waits for readback-lease holders.
