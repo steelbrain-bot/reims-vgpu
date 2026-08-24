@@ -26,11 +26,12 @@ GPU probe carries its own count.
 
 Columns:
 
-    n         busy census windows scored (drain duty >= 0.4, draws > 10)
+    n         busy census windows scored (drain duty >= 0.5, draws > 0)
     cpu       drain_duty proc_us / guest draws
     gpu       gpu_span busy_us / retired_draws
     sum       the two per-draw prices added (interpret with overlap/occupancy)
-    fps       window_publish fresh / win_ms, over the same banded windows
+    fps       host-window presents / cadence window time over the probe slice
+    offered   host-window offers / cadence window time over the probe slice
     duty      mean drain_duty duty
     draws/s   guest draws / summed matched window time
     occ       measured CPU plus GPU busy time / summed matched window time
@@ -61,7 +62,7 @@ def _fields(line):
 
 
 def score(path):
-    gpu, pub, duty = {}, {}, []
+    gpu, pub, duty, cadence = {}, {}, [], []
     legacy_gpu = False
     with open(path, errors="ignore") as handle:
         for line in handle:
@@ -78,6 +79,16 @@ def score(path):
                 f = _fields(line)
                 if "t" in f and "fresh" in f and "win_ms" in f:
                     pub[int(float(f["t"]))] = (float(f["fresh"]), float(f["win_ms"]))
+            elif line.startswith("OFF host_window_cadence "):
+                f = _fields(line)
+                if "window_ms" in f and "presents" in f and "offered" in f:
+                    cadence.append(
+                        (
+                            float(f["presents"]),
+                            float(f["offered"]),
+                            float(f["window_ms"]),
+                        )
+                    )
             elif line.startswith("OFF drain_duty "):
                 duty.append(_fields(line))
 
@@ -93,7 +104,7 @@ def score(path):
         if "t" not in f or "proc_us" not in f or "win_ms" not in f:
             continue
         d, count = float(f["duty"]), float(f["draws"])
-        if d < 0.4 or count <= 10:
+        if d < 0.5 or count <= 0:
             continue
         gpu_window = near(gpu, int(float(f["t"])))
         if gpu_window is None or gpu_window[1] == 0:
@@ -119,11 +130,16 @@ def score(path):
     cpu_per_draw = cpu_us / draws
     gpu_per_draw = gpu_us / retired_draws
     total = cpu_per_draw + gpu_per_draw
-    fps = fresh / (publish_win_ms / 1000) if publish_win_ms else 0.0
+    cadence_presents = sum(sample[0] for sample in cadence)
+    cadence_offered = sum(sample[1] for sample in cadence)
+    cadence_ms = sum(sample[2] for sample in cadence)
+    fps = cadence_presents / (cadence_ms / 1000) if cadence_ms else 0.0
+    offered_fps = cadence_offered / (cadence_ms / 1000) if cadence_ms else 0.0
     occupancy = (cpu_us + gpu_us) / (busy_win_ms * 1000)
     return (
         f"{path:<40} n={n:<3} cpu={cpu_per_draw:5.2f} gpu={gpu_per_draw:5.2f} "
-        f"sum={total:5.2f} fps={fps:5.1f} duty={duty_sum / n:.2f} "
+        f"sum={total:5.2f} fps={fps:5.1f} offered={offered_fps:5.1f} "
+        f"duty={duty_sum / n:.2f} "
         f"draws/s={per_second:6.0f} occ={occupancy:.2f} "
         f"d/frame={frame_draws / fresh if fresh else 0:6.0f}"
     )
