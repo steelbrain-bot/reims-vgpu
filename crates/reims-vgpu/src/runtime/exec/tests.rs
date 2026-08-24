@@ -168,8 +168,12 @@ fn an_exec_packet_closes_its_exact_backend_submission() {
     impl ResidentCopyService for CloseProbe {}
     impl CompletionService for CloseProbe {}
     impl SubmissionBatchService for CloseProbe {
-        fn close_submission(&self, identity: reims_vgpu_protocol::SubmissionIdentity) {
+        fn close_submission(
+            &self,
+            identity: reims_vgpu_protocol::SubmissionIdentity,
+        ) -> Result<(), DrawError> {
             self.closed.lock().unwrap().push(identity);
+            Ok(())
         }
     }
     impl GuestImportService for CloseProbe {}

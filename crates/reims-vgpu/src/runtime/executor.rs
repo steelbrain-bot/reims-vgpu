@@ -375,7 +375,12 @@ pub trait SubmissionBatchService: std::fmt::Debug + Send + Sync {
     /// This is an ownership boundary, not a completion claim: a backend may
     /// retain submitted GPU work, but no later command belongs to this
     /// submission's recording context.
-    fn close_submission(&self, _identity: reims_vgpu_protocol::SubmissionIdentity) {}
+    fn close_submission(
+        &self,
+        _identity: reims_vgpu_protocol::SubmissionIdentity,
+    ) -> Result<(), DrawError> {
+        Ok(())
+    }
 }
 
 /// Backend materializations of guest allocation lifetimes.
@@ -877,6 +882,14 @@ impl SubmissionBatchService for VulkanExecutor {
 
     fn flush_submission_tail(&self) {
         reims_vgpu_vulkan::engine::flush_batched_draws();
+    }
+
+    fn close_submission(
+        &self,
+        identity: reims_vgpu_protocol::SubmissionIdentity,
+    ) -> Result<(), DrawError> {
+        let _scope = self.enter();
+        reims_vgpu_vulkan::engine::close_submission(identity)
     }
 }
 
@@ -1578,7 +1591,7 @@ impl ExecutionPort for VulkanExecutor {
                 }
                 Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
             },
-            |_, request| {
+            |context, request| {
                 let materialized = request
                     .sampled_images
                     .iter()
@@ -1591,7 +1604,9 @@ impl ExecutionPort for VulkanExecutor {
                     })
                     .filter_map(|image| image.content)
                     .collect::<Vec<_>>();
-                let output = reims_vgpu_vulkan::engine::execute_compute_request(&request)?;
+                let output = reims_vgpu_vulkan::engine::execute_compute_request_in_submission(
+                    context, &request,
+                )?;
                 Ok(reims_vgpu_core::CommandExecution::new(output, materialized))
             },
             |_, _| {

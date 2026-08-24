@@ -24,6 +24,7 @@ use super::{buffer_slab, color_subresource_range, gpu_span, host_ram, reason, sl
 use crate::memory::{MappedMemoryKind, MemoryClass};
 use crate::translate;
 use reims_vgpu_core::{ComputeStorageOrigin, ComputeStorageResidencyKey};
+use reims_vgpu_protocol::SubmissionIdentity;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct TargetKey {
@@ -413,6 +414,12 @@ pub(crate) struct EncoderPools {
     /// registry. Submission transfers it to the slot; abandoning the recording
     /// cancels it through `RecordingLease::drop`.
     recording: Option<RecordingLease>,
+    /// Exact guest submission whose commands this encoder is recording.
+    ///
+    /// Submission id zero is the core's standalone tool/test context and never
+    /// occupies this field. Product submissions enter on their first Vulkan
+    /// command and leave only through the runtime's decoded packet boundary.
+    active_submission: Option<SubmissionIdentity>,
     /// Open draw batch: a ring slot whose CB is still recording deferred
     /// same-target draws (submit pending). While `Some`, that CB references
     /// live GPU objects exactly like an in-flight CB, so dispose/graveyard

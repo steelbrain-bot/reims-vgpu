@@ -127,6 +127,18 @@ fn half_scissor(left: bool) -> ScissorResource {
     }
 }
 
+fn submission(id: u64) -> reims_vgpu_core::SubmissionContext {
+    reims_vgpu_core::SubmissionContext {
+        identity: reims_vgpu_protocol::SubmissionIdentity {
+            id: reims_vgpu_protocol::SubmissionId::new(id),
+            task: reims_vgpu_protocol::TaskId::new(77),
+        },
+        resources: std::sync::Arc::from([]),
+        segments: std::sync::Arc::from([]),
+        segment: None,
+    }
+}
+
 /// Opener (Clear, left half) + joiner (LoadFromTarget, right half) share one
 /// CB; the flush at read_target submits both and the readback shows BOTH
 /// halves colored — the joiner's LOAD preserved the opener's half across the
@@ -185,6 +197,80 @@ fn batched_draws_compose_and_flush_on_read() {
                 is_frag_color(&px[i..i + 4]),
                 "batched composite at ({x},{y}) = {:?}",
                 &px[i..i + 4]
+            );
+        }
+    }
+}
+
+/// A decoded EXEC packet is the contract-owned Vulkan recording lifetime.
+/// Closing it must submit its deferred tail before another packet can claim the
+/// encoder, while queue order preserves target contents across the boundary.
+#[test]
+fn submission_close_seals_before_the_next_packet_records() {
+    let _guard = engine_test_lock().lock().unwrap();
+    engine::flush_batched_draws();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_111,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+    let first_submission = submission(9_901);
+    let second_submission = submission(9_902);
+    let before = engine::counter_snapshot();
+
+    let left = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    if let Err(error) = engine::execute_draw_request_in_submission(&first_submission, &left) {
+        let _ = engine::close_submission(first_submission.identity);
+        let message = error.to_string();
+        if skip_if_no_gpu(&message) {
+            eprintln!("skipping: {message}");
+            return;
+        }
+        panic!("first submission draw: {message}");
+    }
+    assert_eq!(
+        engine::counter_snapshot()
+            .delta_since(&before)
+            .batch_flushes,
+        0,
+        "the packet remains open until its exact close event"
+    );
+    engine::close_submission(first_submission.identity).expect("close first submission");
+    let first_close = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        first_close.batch_flushes, 1,
+        "the first packet close submitted its deferred tail"
+    );
+    assert_eq!(
+        first_close.batch_flush_draws, 1,
+        "the first packet close carried only its own draw"
+    );
+
+    let right = batch_req(&vert, &frag, &identity, true, half_scissor(false));
+    engine::execute_draw_request_in_submission(&second_submission, &right)
+        .expect("the next submission claims the released encoder");
+    engine::close_submission(second_submission.identity).expect("close second submission");
+
+    let delta = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(delta.batch_flushes, 2, "each close submitted its own tail");
+    assert_eq!(
+        delta.batch_flush_draws, 2,
+        "the two submissions retained one draw apiece"
+    );
+
+    let pixels = engine::read_target(&identity)
+        .expect("ordered submissions preserve the target")
+        .into_rgba8();
+    for y in [0u32, H / 2, H - 1] {
+        for x in [0u32, W / 4, W / 2, 3 * W / 4, W - 1] {
+            let offset = ((y * W + x) * 4) as usize;
+            assert!(
+                is_frag_color(&pixels[offset..offset + 4]),
+                "cross-submission composite at ({x},{y}) = {:?}",
+                &pixels[offset..offset + 4]
             );
         }
     }

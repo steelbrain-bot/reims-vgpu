@@ -1079,7 +1079,13 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     }
     let close_started = std::time::Instant::now();
     if let Some(context) = state.submissions.finish() {
-        state.executor.close_submission(context.identity);
+        if let Err(error) = state.executor.close_submission(context.identity) {
+            out.draws_fail = out.draws_fail.saturating_add(1);
+            crate::observe::Emit::decline("submission_close", &error)
+                .field("submission", context.identity.id.get())
+                .field("task", context.identity.task.get())
+                .fail();
+        }
         state.task_objects.resources.complete_submission(
             context.identity.id,
             context.resources.iter().filter_map(|use_| use_.resource),

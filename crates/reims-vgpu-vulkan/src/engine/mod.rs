@@ -1557,7 +1557,7 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
 /// [`DrawRequest`] and becoming another identity callers can accidentally
 /// omit or disagree about.
 pub fn execute_draw_request_in_submission(
-    _submission: &reims_vgpu_core::SubmissionContext,
+    submission: &reims_vgpu_core::SubmissionContext,
     req: &DrawRequest,
 ) -> Result<DrawOutput, DrawError> {
     exec::validate_v1(req)?;
@@ -1587,6 +1587,7 @@ pub fn execute_draw_request_in_submission(
         ref counters,
         ..
     } = &mut *guard;
+    pools.enter_submission(submission.identity)?;
     let result =
         unsafe { exec::execute_draw_inner(owner, caches, indexes, pools, counters, req, &program) };
     if result.is_err() {
@@ -2684,8 +2685,16 @@ pub fn quiesce_guest_reads() {
     }
 }
 
-/// Execute one compute dispatch against the persistent engine.
+/// Execute one standalone compute dispatch against the persistent engine.
 pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, ComputeError> {
+    execute_compute_request_in_submission(&reims_vgpu_core::SubmissionContext::standalone(0), req)
+}
+
+/// Execute one compute dispatch in its decoded command-stream submission.
+pub fn execute_compute_request_in_submission(
+    submission: &reims_vgpu_core::SubmissionContext,
+    req: &ComputeRequest,
+) -> Result<ComputeOutput, ComputeError> {
     exec_compute::validate_compute(req)?;
     let shader = crate::m2v_cache::resolve_prepared_shader(req.program.id).ok_or_else(|| {
         DrawError::ComputeValidation(
@@ -2703,6 +2712,7 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
         ref counters,
         ..
     } = &mut *guard;
+    pools.enter_submission(submission.identity)?;
     let result = unsafe {
         exec_compute::execute_compute_inner(owner, caches, pools, counters, req, &program)
     };
@@ -2717,6 +2727,38 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Close the exact guest submission whose Vulkan commands have finished
+/// recording.
+///
+/// The close seals and submits any deferred tail batch before releasing the
+/// encoder identity, so the next packet cannot append to mutable state owned by
+/// this one.
+pub fn close_submission(
+    identity: reims_vgpu_protocol::SubmissionIdentity,
+) -> Result<(), DrawError> {
+    let mut guard = lock_engine();
+    let result = {
+        let EngineState {
+            ref mut owner,
+            ref mut pools,
+            ref counters,
+            ..
+        } = &mut *guard;
+        match owner.ctx.as_ref() {
+            Some(ctx) => unsafe { pools.close_submission(ctx, counters, identity) },
+            None => pools.close_submission_without_context(identity),
+        }
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(DrawError::DeviceLost(decline)) => {
+            guard.on_device_lost();
+            Err(DrawError::DeviceLost(decline))
+        }
+        Err(error) => Err(error),
     }
 }
 

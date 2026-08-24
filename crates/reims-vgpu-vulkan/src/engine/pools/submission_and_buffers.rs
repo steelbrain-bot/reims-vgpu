@@ -147,6 +147,51 @@ fn pass_spans_probe_enabled() -> bool {
 }
 
 impl EncoderPools {
+    /// Claim this encoder for one exact product submission.
+    ///
+    /// Re-entering the same submission is the ordinary multi-draw/dispatch
+    /// case. A different live identity is a missing close boundary and refuses
+    /// rather than letting two packets share mutable recording state.
+    fn enter_submission(&mut self, incoming: SubmissionIdentity) -> Result<(), DrawError> {
+        if incoming.id.get() == 0 {
+            return Ok(());
+        }
+        match self.active_submission {
+            None => {
+                self.active_submission = Some(incoming);
+                Ok(())
+            }
+            Some(active) if active == incoming => Ok(()),
+            Some(active) => Err(DrawError::Facade(
+                super::super::EngineFacadeDecline::EncoderSubmissionOverlap { active, incoming },
+            )),
+        }
+    }
+
+    /// Validate that `closing` owns this encoder and say whether it has state
+    /// to release. Packets with no Vulkan commands legitimately close an idle
+    /// encoder.
+    fn submission_is_closing(&self, closing: SubmissionIdentity) -> Result<bool, DrawError> {
+        if closing.id.get() == 0 {
+            return Ok(false);
+        }
+        match self.active_submission {
+            None => Ok(false),
+            Some(active) if active == closing => Ok(true),
+            Some(active) => Err(DrawError::Facade(
+                super::super::EngineFacadeDecline::EncoderSubmissionCloseMismatch {
+                    active,
+                    closing,
+                },
+            )),
+        }
+    }
+
+    fn release_submission(&mut self, closing: SubmissionIdentity) {
+        debug_assert_eq!(self.active_submission, Some(closing));
+        self.active_submission = None;
+    }
+
     pub(crate) fn note_guest_read_recorded(&mut self) {
         self.guest_reads_in_flight = true;
         super::super::publish_guest_read_debt(true);
@@ -464,6 +509,7 @@ impl EncoderPools {
             cur: 0,
             in_flight: 0,
             recording: None,
+            active_submission: None,
             open_batch: None,
             batch_max_draws: BATCH_MAX_DRAWS,
             last_pass: None,
@@ -656,6 +702,47 @@ impl SharedPools {
 }
 
 impl ResourcePools {
+    /// Enter one exact guest submission on this pool's encoder.
+    pub(crate) fn enter_submission(
+        &mut self,
+        identity: SubmissionIdentity,
+    ) -> Result<(), DrawError> {
+        self.encoder.enter_submission(identity)
+    }
+
+    /// Seal and submit every command still recorded for `identity`, then
+    /// release the encoder for the next guest submission.
+    ///
+    /// Validation precedes the flush so a mismatched close cannot accidentally
+    /// submit another packet's work. Ownership is released only after queue
+    /// acceptance succeeds.
+    pub(crate) unsafe fn close_submission(
+        &mut self,
+        ctx: &DeviceContext,
+        counters: &EngineCounters,
+        identity: SubmissionIdentity,
+    ) -> Result<(), DrawError> {
+        if !self.encoder.submission_is_closing(identity)? {
+            return Ok(());
+        }
+        unsafe { self.batch_flush(ctx, counters) }?;
+        self.encoder.release_submission(identity);
+        Ok(())
+    }
+
+    /// Release a submission when device initialization never produced a
+    /// context. No Vulkan recording can exist in this state, so there is
+    /// nothing to flush; the identity validation remains identical.
+    pub(crate) fn close_submission_without_context(
+        &mut self,
+        identity: SubmissionIdentity,
+    ) -> Result<(), DrawError> {
+        if self.encoder.submission_is_closing(identity)? {
+            self.encoder.release_submission(identity);
+        }
+        Ok(())
+    }
+
     /// End one guest allocation's backend lifetime after open submissions.
     pub(crate) unsafe fn retire_guest_import(
         &mut self,
@@ -6361,6 +6448,67 @@ mod exchange_rb_tests {
         let mut dst = [0u8; 4];
         exchange_rb_into(&src, &mut dst);
         assert_eq!(dst, [3, 2, 1, 4]);
+    }
+}
+
+#[cfg(test)]
+mod encoder_submission_ownership {
+    use super::*;
+    use reims_vgpu_protocol::{SubmissionId, TaskId};
+
+    fn identity(id: u64, task: u32) -> SubmissionIdentity {
+        SubmissionIdentity {
+            id: SubmissionId::new(id),
+            task: TaskId::new(task),
+        }
+    }
+
+    #[test]
+    fn one_submission_may_reenter_but_another_cannot_overlap_it() {
+        let mut encoder = EncoderPools::new();
+        let first = identity(1, 7);
+        let second = identity(2, 7);
+        encoder.enter_submission(first).unwrap();
+        encoder.enter_submission(first).unwrap();
+        assert_eq!(
+            encoder.enter_submission(second),
+            Err(DrawError::Facade(
+                crate::engine::EngineFacadeDecline::EncoderSubmissionOverlap {
+                    active: first,
+                    incoming: second,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn only_the_active_identity_can_close_and_release_the_encoder() {
+        let mut encoder = EncoderPools::new();
+        let first = identity(3, 8);
+        let other = identity(4, 9);
+        assert!(!encoder.submission_is_closing(first).unwrap());
+        encoder.enter_submission(first).unwrap();
+        assert_eq!(
+            encoder.submission_is_closing(other),
+            Err(DrawError::Facade(
+                crate::engine::EngineFacadeDecline::EncoderSubmissionCloseMismatch {
+                    active: first,
+                    closing: other,
+                }
+            ))
+        );
+        assert!(encoder.submission_is_closing(first).unwrap());
+        encoder.release_submission(first);
+        encoder.enter_submission(other).unwrap();
+    }
+
+    #[test]
+    fn standalone_calls_occupy_no_product_submission() {
+        let mut encoder = EncoderPools::new();
+        let standalone = identity(0, 0);
+        encoder.enter_submission(standalone).unwrap();
+        assert_eq!(encoder.active_submission, None);
+        assert!(!encoder.submission_is_closing(standalone).unwrap());
     }
 }
 

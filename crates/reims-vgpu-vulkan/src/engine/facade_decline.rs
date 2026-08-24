@@ -30,6 +30,14 @@ pub enum EngineFacadeDecline {
         expected: SubmissionIdentity,
         actual: SubmissionIdentity,
     },
+    EncoderSubmissionOverlap {
+        active: SubmissionIdentity,
+        incoming: SubmissionIdentity,
+    },
+    EncoderSubmissionCloseMismatch {
+        active: SubmissionIdentity,
+        closing: SubmissionIdentity,
+    },
     WindowPresenterNotAttached,
     StorageReadResidentAbsent {
         identity: ComputeStorageResidencyKey,
@@ -76,6 +84,10 @@ impl Decline for EngineFacadeDecline {
             Self::ExecutorCompletionIdentityMismatch { .. } => {
                 "vk_engine_executor_completion_identity_mismatch"
             }
+            Self::EncoderSubmissionOverlap { .. } => "vk_engine_encoder_submission_overlap",
+            Self::EncoderSubmissionCloseMismatch { .. } => {
+                "vk_engine_encoder_submission_close_mismatch"
+            }
             Self::WindowPresenterNotAttached => "vk_engine_window_presenter_not_attached",
             Self::StorageReadResidentAbsent { .. } => "vk_engine_storage_read_resident_absent",
             Self::StorageReadGenerationMismatch { .. } => {
@@ -114,6 +126,18 @@ impl Decline for EngineFacadeDecline {
                 ("expected_task", expected.task.get().to_string()),
                 ("actual_submission", actual.id.get().to_string()),
                 ("actual_task", actual.task.get().to_string()),
+            ],
+            Self::EncoderSubmissionOverlap { active, incoming } => vec![
+                ("active_submission", active.id.get().to_string()),
+                ("active_task", active.task.get().to_string()),
+                ("incoming_submission", incoming.id.get().to_string()),
+                ("incoming_task", incoming.task.get().to_string()),
+            ],
+            Self::EncoderSubmissionCloseMismatch { active, closing } => vec![
+                ("active_submission", active.id.get().to_string()),
+                ("active_task", active.task.get().to_string()),
+                ("closing_submission", closing.id.get().to_string()),
+                ("closing_task", closing.task.get().to_string()),
             ],
             Self::WindowPresenterNotAttached => Vec::new(),
             Self::StorageReadResidentAbsent { identity } => residency_fields(identity),
@@ -198,6 +222,26 @@ mod tests {
                     task: reims_vgpu_protocol::TaskId::new(4),
                 },
             },
+            EngineFacadeDecline::EncoderSubmissionOverlap {
+                active: SubmissionIdentity {
+                    id: reims_vgpu_protocol::SubmissionId::new(5),
+                    task: reims_vgpu_protocol::TaskId::new(6),
+                },
+                incoming: SubmissionIdentity {
+                    id: reims_vgpu_protocol::SubmissionId::new(7),
+                    task: reims_vgpu_protocol::TaskId::new(8),
+                },
+            },
+            EngineFacadeDecline::EncoderSubmissionCloseMismatch {
+                active: SubmissionIdentity {
+                    id: reims_vgpu_protocol::SubmissionId::new(9),
+                    task: reims_vgpu_protocol::TaskId::new(10),
+                },
+                closing: SubmissionIdentity {
+                    id: reims_vgpu_protocol::SubmissionId::new(11),
+                    task: reims_vgpu_protocol::TaskId::new(12),
+                },
+            },
             EngineFacadeDecline::WindowPresenterNotAttached,
             EngineFacadeDecline::StorageReadResidentAbsent {
                 identity: residency(),
@@ -246,7 +290,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 13, "the engine façade reason census moved");
+        assert_eq!(before, 15, "the engine façade reason census moved");
         assert_eq!(before, slugs.len(), "duplicate engine façade slug");
     }
 
