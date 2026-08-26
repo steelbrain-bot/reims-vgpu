@@ -2051,6 +2051,190 @@ pub struct GuestWindowRun {
     pub guest: GuestRef,
 }
 
+/// One exact logical guest allocation tiled by checked physical runs.
+///
+/// The offsets are validated once at construction, so consumers can copy an
+/// arbitrary allocation-relative range without reconstructing page or import
+/// seams. A contiguous allocation is the one-run form of the same type.
+#[derive(Clone, Debug)]
+pub struct GuestWindow {
+    runs: std::sync::Arc<[GuestWindowRun]>,
+    requested: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestWindowError {
+    Empty,
+    EmptyRun {
+        index: usize,
+    },
+    OffsetMismatch {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    LengthOverflow,
+}
+
+impl GuestWindow {
+    pub fn new(runs: Vec<GuestWindowRun>) -> Result<Self, GuestWindowError> {
+        if runs.is_empty() {
+            return Err(GuestWindowError::Empty);
+        }
+        let mut requested = 0_u64;
+        for (index, run) in runs.iter().enumerate() {
+            if run.guest.requested() == 0 {
+                return Err(GuestWindowError::EmptyRun { index });
+            }
+            if run.window_offset != requested {
+                return Err(GuestWindowError::OffsetMismatch {
+                    index,
+                    expected: requested,
+                    actual: run.window_offset,
+                });
+            }
+            requested = requested
+                .checked_add(run.guest.requested())
+                .ok_or(GuestWindowError::LengthOverflow)?;
+        }
+        Ok(Self {
+            runs: runs.into(),
+            requested,
+        })
+    }
+
+    pub fn contiguous(guest: GuestRef) -> Self {
+        let requested = guest.requested();
+        Self {
+            runs: vec![GuestWindowRun {
+                window_offset: 0,
+                guest,
+            }]
+            .into(),
+            requested,
+        }
+    }
+
+    pub const fn requested(&self) -> u64 {
+        self.requested
+    }
+
+    pub fn runs(&self) -> &[GuestWindowRun] {
+        &self.runs
+    }
+
+    pub fn validate_load_range(&self, offset: u64, len: usize) -> Result<(), GuestLoadError> {
+        let len_u64 =
+            u64::try_from(len).map_err(|_| GuestLoadError::RangeOverflow { offset, len })?;
+        let end = offset
+            .checked_add(len_u64)
+            .ok_or(GuestLoadError::RangeOverflow { offset, len })?;
+        if end > self.requested {
+            return Err(GuestLoadError::RangeEndPastRequest {
+                end,
+                requested: self.requested,
+            });
+        }
+        for run in self.runs.iter() {
+            let run_end = run.window_offset + run.guest.requested();
+            let start = offset.max(run.window_offset);
+            let finish = end.min(run_end);
+            if start < finish {
+                run.guest.validate_load_range(
+                    start - run.window_offset,
+                    usize::try_from(finish - start)
+                        .map_err(|_| GuestLoadError::RangeOverflow { offset, len })?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn load_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, GuestLoadError> {
+        self.validate_load_range(offset, len)?;
+        let end = offset + u64::try_from(len).expect("validated range length fits u64");
+        let mut bytes = Vec::with_capacity(len);
+        for run in self.runs.iter() {
+            let run_end = run.window_offset + run.guest.requested();
+            let start = offset.max(run.window_offset);
+            let finish = end.min(run_end);
+            if start < finish {
+                bytes.extend(
+                    run.guest.load_range(
+                        start - run.window_offset,
+                        usize::try_from(finish - start)
+                            .expect("validated guest-window run length fits usize"),
+                    )?,
+                );
+            }
+        }
+        Ok(bytes)
+    }
+
+    pub fn validate_store_range(&self, offset: u64, len: usize) -> Result<(), GuestStoreError> {
+        let len_u64 =
+            u64::try_from(len).map_err(|_| GuestStoreError::RangeOverflow { offset, len })?;
+        let end = offset
+            .checked_add(len_u64)
+            .ok_or(GuestStoreError::RangeOverflow { offset, len })?;
+        if end > self.requested {
+            return Err(GuestStoreError::RangeEndPastRequest {
+                end,
+                requested: self.requested,
+            });
+        }
+        for run in self.runs.iter() {
+            let run_end = run.window_offset + run.guest.requested();
+            let start = offset.max(run.window_offset);
+            let finish = end.min(run_end);
+            if start < finish {
+                run.guest.validate_store_range(
+                    start - run.window_offset,
+                    usize::try_from(finish - start)
+                        .map_err(|_| GuestStoreError::RangeOverflow { offset, len })?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn store_range(&self, offset: u64, bytes: &[u8]) -> Result<(), GuestStoreError> {
+        self.validate_store_range(offset, bytes.len())?;
+        let end = offset + u64::try_from(bytes.len()).expect("validated range length fits u64");
+        for run in self.runs.iter() {
+            let run_end = run.window_offset + run.guest.requested();
+            let start = offset.max(run.window_offset);
+            let finish = end.min(run_end);
+            if start < finish {
+                let source_start = usize::try_from(start - offset)
+                    .expect("validated guest-window source offset fits usize");
+                let source_end = usize::try_from(finish - offset)
+                    .expect("validated guest-window source end fits usize");
+                run.guest
+                    .store_range(start - run.window_offset, &bytes[source_start..source_end])?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestStoreError {
+    LengthMismatch { expected: u64, actual: usize },
+    RangeOverflow { offset: u64, len: usize },
+    RangeEndPastRequest { end: u64, requested: u64 },
+    AddressOverflow,
+    Bound(GuestRamError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestLoadError {
+    RangeOverflow { offset: u64, len: usize },
+    RangeEndPastRequest { end: u64, requested: u64 },
+    AddressOverflow,
+    Bound(GuestRamError),
+}
+
 impl GuestRef {
     /// Pair a slice with the import that made it.
     ///
@@ -2122,6 +2306,146 @@ impl GuestRef {
                 .store(value.to_le(), std::sync::atomic::Ordering::Release);
         }
         true
+    }
+
+    pub fn validate_store_bytes(&self, len: usize) -> Result<(), GuestStoreError> {
+        if u64::try_from(len).ok() != Some(self.requested()) {
+            return Err(GuestStoreError::LengthMismatch {
+                expected: self.requested(),
+                actual: len,
+            });
+        }
+        let bound = self.bound().map_err(GuestStoreError::Bound)?;
+        let byte_offset = bound
+            .offset
+            .checked_add(self.head())
+            .ok_or(GuestStoreError::AddressOverflow)?;
+        let byte_offset =
+            usize::try_from(byte_offset).map_err(|_| GuestStoreError::AddressOverflow)?;
+        self.import
+            .host_base()
+            .checked_add(byte_offset)
+            .ok_or(GuestStoreError::AddressOverflow)?;
+        Ok(())
+    }
+
+    /// Copy one exact post-timeline staging payload into the guest allocation.
+    /// The retained import keeps the mapping live and the checked slice owns
+    /// both the destination offset and length.
+    pub fn store_bytes(&self, bytes: &[u8]) -> Result<(), GuestStoreError> {
+        self.validate_store_bytes(bytes.len())?;
+        let bound = self.bound().map_err(GuestStoreError::Bound)?;
+        let byte_offset = usize::try_from(bound.offset + self.head())
+            .map_err(|_| GuestStoreError::AddressOverflow)?;
+        let address = self
+            .import
+            .host_base()
+            .checked_add(byte_offset)
+            .ok_or(GuestStoreError::AddressOverflow)?;
+        unsafe {
+            std::ptr::copy(bytes.as_ptr(), address as *mut u8, bytes.len());
+        }
+        Ok(())
+    }
+
+    pub fn validate_store_range(&self, offset: u64, len: usize) -> Result<(), GuestStoreError> {
+        let len_u64 =
+            u64::try_from(len).map_err(|_| GuestStoreError::RangeOverflow { offset, len })?;
+        let end = offset
+            .checked_add(len_u64)
+            .ok_or(GuestStoreError::RangeOverflow { offset, len })?;
+        if end > self.requested() {
+            return Err(GuestStoreError::RangeEndPastRequest {
+                end,
+                requested: self.requested(),
+            });
+        }
+        let bound = self.bound().map_err(GuestStoreError::Bound)?;
+        let byte_offset = bound
+            .offset
+            .checked_add(self.head())
+            .and_then(|start| start.checked_add(offset))
+            .ok_or(GuestStoreError::AddressOverflow)?;
+        let byte_offset =
+            usize::try_from(byte_offset).map_err(|_| GuestStoreError::AddressOverflow)?;
+        self.import
+            .host_base()
+            .checked_add(byte_offset)
+            .ok_or(GuestStoreError::AddressOverflow)?;
+        Ok(())
+    }
+
+    pub fn store_range(&self, offset: u64, bytes: &[u8]) -> Result<(), GuestStoreError> {
+        self.validate_store_range(offset, bytes.len())?;
+        let bound = self.bound().map_err(GuestStoreError::Bound)?;
+        let byte_offset = bound
+            .offset
+            .checked_add(self.head())
+            .and_then(|start| start.checked_add(offset))
+            .ok_or(GuestStoreError::AddressOverflow)?;
+        let byte_offset =
+            usize::try_from(byte_offset).map_err(|_| GuestStoreError::AddressOverflow)?;
+        let address = self
+            .import
+            .host_base()
+            .checked_add(byte_offset)
+            .ok_or(GuestStoreError::AddressOverflow)?;
+        unsafe {
+            std::ptr::copy(bytes.as_ptr(), address as *mut u8, bytes.len());
+        }
+        Ok(())
+    }
+
+    pub fn validate_load_range(&self, offset: u64, len: usize) -> Result<(), GuestLoadError> {
+        let len_u64 =
+            u64::try_from(len).map_err(|_| GuestLoadError::RangeOverflow { offset, len })?;
+        let end = offset
+            .checked_add(len_u64)
+            .ok_or(GuestLoadError::RangeOverflow { offset, len })?;
+        if end > self.requested() {
+            return Err(GuestLoadError::RangeEndPastRequest {
+                end,
+                requested: self.requested(),
+            });
+        }
+        let bound = self.bound().map_err(GuestLoadError::Bound)?;
+        let byte_offset = bound
+            .offset
+            .checked_add(self.head())
+            .and_then(|start| start.checked_add(offset))
+            .ok_or(GuestLoadError::AddressOverflow)?;
+        let byte_offset =
+            usize::try_from(byte_offset).map_err(|_| GuestLoadError::AddressOverflow)?;
+        self.import
+            .host_base()
+            .checked_add(byte_offset)
+            .ok_or(GuestLoadError::AddressOverflow)?;
+        Ok(())
+    }
+
+    /// Snapshot one exact range while the retained guest allocation is live.
+    /// Callers own the ordering contract that makes concurrent guest mutation
+    /// impossible for the duration of this read.
+    pub fn load_range(&self, offset: u64, len: usize) -> Result<Vec<u8>, GuestLoadError> {
+        self.validate_load_range(offset, len)?;
+        let bound = self.bound().map_err(GuestLoadError::Bound)?;
+        let byte_offset = bound
+            .offset
+            .checked_add(self.head())
+            .and_then(|start| start.checked_add(offset))
+            .ok_or(GuestLoadError::AddressOverflow)?;
+        let byte_offset =
+            usize::try_from(byte_offset).map_err(|_| GuestLoadError::AddressOverflow)?;
+        let address = self
+            .import
+            .host_base()
+            .checked_add(byte_offset)
+            .ok_or(GuestLoadError::AddressOverflow)?;
+        let mut bytes = vec![0; len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(address as *const u8, bytes.as_mut_ptr(), len);
+        }
+        Ok(bytes)
     }
 }
 
@@ -2647,6 +2971,30 @@ mod tests {
     }
 
     #[test]
+    fn guest_window_requires_an_exact_unbounded_run_tiling() {
+        let import = std::sync::Arc::new(import(0x8000, 0x1000));
+        let window = GuestWindow::new(vec![
+            window_run(&import, 0, 0, 0x1800),
+            window_run(&import, 0x1800, 0x3000, 0x900),
+            window_run(&import, 0x2100, 0x5000, 0x700),
+        ])
+        .expect("the three physical runs exactly tile one logical window");
+        assert_eq!(window.requested(), 0x2800);
+        assert_eq!(window.runs().len(), 3);
+        assert!(matches!(
+            GuestWindow::new(vec![
+                window_run(&import, 0, 0, 0x1000),
+                window_run(&import, 0x1001, 0x3000, 0x1000),
+            ]),
+            Err(GuestWindowError::OffsetMismatch {
+                index: 1,
+                expected: 0x1000,
+                actual: 0x1001,
+            })
+        ));
+    }
+
+    #[test]
     fn a_guest_run_source_exposes_one_bounded_direct_stretch() {
         let import = std::sync::Arc::new(import(0x4000, 0x1000));
         let source = GuestRunSource {
@@ -3020,6 +3368,47 @@ mod tests {
             import.slice_for_gpa(0x1800, 0x800),
             Err(GuestRamError::GpaOutsideImport { .. })
         ));
+    }
+
+    #[test]
+    fn an_exact_guest_reference_stores_only_its_requested_bytes() {
+        let mut allocation = vec![0u8; 32];
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(allocation.as_mut_ptr() as usize, 32, 1)
+                .expect("live allocation"),
+        );
+        let slice = import.slice(9, 4).expect("inside allocation");
+        let guest = GuestRef::new(import, slice).expect("matching import");
+
+        assert_eq!(
+            guest.store_bytes(&[1, 2, 3]),
+            Err(GuestStoreError::LengthMismatch {
+                expected: 4,
+                actual: 3,
+            })
+        );
+        guest.store_bytes(&[4, 5, 6, 7]).unwrap();
+        assert_eq!(&allocation[8..14], &[0, 4, 5, 6, 7, 0]);
+    }
+
+    #[test]
+    fn an_exact_guest_reference_loads_only_its_requested_range() {
+        let mut allocation = (0u8..32).collect::<Vec<_>>();
+        let import = std::sync::Arc::new(
+            GuestRamImport::new_host_allocation(allocation.as_mut_ptr() as usize, 32, 1)
+                .expect("live allocation"),
+        );
+        let slice = import.slice(9, 8).expect("inside allocation");
+        let guest = GuestRef::new(import, slice).expect("matching import");
+
+        assert_eq!(guest.load_range(2, 3).unwrap(), [11, 12, 13]);
+        assert_eq!(
+            guest.load_range(7, 2),
+            Err(GuestLoadError::RangeEndPastRequest {
+                end: 9,
+                requested: 8,
+            })
+        );
     }
 
     /// Resource admission is the exact three-term host-pointer contract: the

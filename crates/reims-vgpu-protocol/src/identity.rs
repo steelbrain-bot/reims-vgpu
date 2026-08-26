@@ -60,12 +60,31 @@ scalar_newtype!(
     u32
 );
 scalar_newtype!(SurfaceBackingId, u64);
-scalar_newtype!(StorageId, u64);
 scalar_newtype!(GuestVirtualAddress, u64);
 scalar_newtype!(GuestPhysicalAddress, u64);
 scalar_newtype!(ByteOffset, u64);
 scalar_newtype!(ByteLength, u64);
 scalar_newtype!(SubmissionId, u64);
+scalar_newtype!(SessionId, u64);
+scalar_newtype!(SessionGenerationId, u64);
+scalar_newtype!(VulkanDeviceEpochId, u64);
+scalar_newtype!(QueueOwnerId, u32);
+scalar_newtype!(QueueTimelineValue, u64);
+scalar_newtype!(TransactionId, u64);
+scalar_newtype!(ChannelId, u32);
+scalar_newtype!(ChannelSequence, u64);
+scalar_newtype!(IngressOrdinal, u64);
+scalar_newtype!(SubmissionDomainId, u64);
+scalar_newtype!(HazardDomainId, u64);
+scalar_newtype!(DomainSequence, u64);
+scalar_newtype!(PublicationDomainId, u64);
+scalar_newtype!(PublicationSequence, u64);
+scalar_newtype!(BackingId, u64);
+scalar_newtype!(RepresentationId, u64);
+scalar_newtype!(SwapchainGenerationId, u64);
+scalar_newtype!(PresentTicketId, u64);
+scalar_newtype!(EventId, u64);
+scalar_newtype!(FenceId, u64);
 scalar_newtype!(
     /// Executor-prepared shader identity.
     ///
@@ -78,6 +97,45 @@ scalar_newtype!(BackingGeneration, u64);
 scalar_newtype!(ContentVersion, u64);
 scalar_newtype!(PlaneIndex, u32);
 scalar_newtype!(TextureRotation, u8);
+
+impl SubmissionDomainId {
+    /// The source command queue's live ordering domain is its FIFO channel.
+    ///
+    /// Session generation remains outside this scalar identity, so channel-id
+    /// reuse after reset cannot join two queue lifetimes accidentally.
+    pub const fn for_fifo_channel(channel: ChannelId) -> Self {
+        Self(channel.get() as u64)
+    }
+}
+
+impl DomainSequence {
+    /// Queue-domain order is exactly the packet's order on its FIFO channel.
+    pub const fn for_channel_sequence(sequence: ChannelSequence) -> Self {
+        Self(sequence.get())
+    }
+}
+
+impl HazardDomainId {
+    /// Resource hazards are ordered within one source-queue submission domain.
+    /// Cross-queue visibility requires an explicit synchronization operation.
+    pub const fn for_submission_domain(domain: SubmissionDomainId) -> Self {
+        Self(domain.get())
+    }
+}
+
+impl PublicationDomainId {
+    /// Guest-visible packet effects publish in FIFO-channel order.
+    pub const fn for_fifo_channel(channel: ChannelId) -> Self {
+        Self(channel.get() as u64)
+    }
+}
+
+impl PublicationSequence {
+    /// Publication position is the packet's position on its FIFO channel.
+    pub const fn for_channel_sequence(sequence: ChannelSequence) -> Self {
+        Self(sequence.get())
+    }
+}
 
 impl fmt::LowerHex for GuestVirtualAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -1,15 +1,137 @@
 //! Canonical task-owned resource, storage, and mapping graph.
 
+use crate::content_authority::{
+    BackingRegion, ContentAuthority, ContentAuthorityError, GPU_REPRESENTATION,
+    GUEST_REPRESENTATION, HOST_REPRESENTATION,
+};
 use reims_vgpu_protocol::{
-    BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestVirtualAddress, HeapObject,
-    MapperSurfaceRef, MappingId, ObjectKind, ObjectTableRef, PlaneIndex, ResourceId,
-    ResourceObject, StorageId, SubmissionId, SurfaceBackingId, TaskId,
+    BackingGeneration, BackingId, ByteLength, ByteOffset, ContentVersion, GuestVirtualAddress,
+    HeapObject, MapperSurfaceRef, MappingId, ObjectKind, ObjectTableRef, PlaneIndex,
+    ResourceDescriptor, ResourceId, ResourceObject, SubmissionId, SurfaceBackingId, SwizzlePlan,
+    TaskId, TextureType, TextureViewForm,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::sync::{atomic::AtomicU64, Weak};
-use std::sync::{Arc, Mutex};
 
 type AnyResourceId = ResourceId<ResourceObject>;
+
+/// The contract-defined maximum number of texture-view hops followed while
+/// resolving one view. It bounds malformed guest cycles; it is not a cache or
+/// a capacity limit on live resources.
+pub const MAX_TEXTURE_VIEW_CHAIN: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedTextureViewRange {
+    pub level_base: u64,
+    pub level_count: u64,
+    pub slice_base: u64,
+    pub slice_count: u64,
+}
+
+impl ResolvedTextureViewRange {
+    fn compose_over(self, inner: Self) -> Result<Self, TextureViewResolveError> {
+        let level_end = self
+            .level_base
+            .checked_add(self.level_count)
+            .ok_or(TextureViewResolveError::LevelOverflow)?;
+        if level_end > inner.level_count {
+            return Err(TextureViewResolveError::LevelOutOfRange);
+        }
+        let slice_end = self
+            .slice_base
+            .checked_add(self.slice_count)
+            .ok_or(TextureViewResolveError::SliceOverflow)?;
+        if slice_end > inner.slice_count {
+            return Err(TextureViewResolveError::SliceOutOfRange);
+        }
+        Ok(Self {
+            level_base: inner
+                .level_base
+                .checked_add(self.level_base)
+                .ok_or(TextureViewResolveError::LevelOverflow)?,
+            level_count: self.level_count,
+            slice_base: inner
+                .slice_base
+                .checked_add(self.slice_base)
+                .ok_or(TextureViewResolveError::SliceOverflow)?,
+            slice_count: self.slice_count,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedTextureView {
+    pub view: AnyResourceId,
+    pub base: AnyResourceId,
+    pub range: Option<ResolvedTextureViewRange>,
+    pub texture_type: Option<TextureType>,
+    pub pixel_format: Option<u16>,
+    pub swizzle: Option<SwizzlePlan>,
+}
+
+/// Complete shader-visible view over one canonical texture resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedTextureBindingView {
+    pub resource: AnyResourceId,
+    pub base: AnyResourceId,
+    pub range: ResolvedTextureViewRange,
+    pub texture_type: TextureType,
+    pub pixel_format: u16,
+    pub swizzle: SwizzlePlan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureViewResolveError {
+    ResourceAbsent(AnyResourceId),
+    NotTextureView(AnyResourceId),
+    DescriptorAbsent(AnyResourceId),
+    DescriptorKindMismatch(AnyResourceId),
+    ParentCount(AnyResourceId),
+    EmptyRange(AnyResourceId),
+    UnknownTextureType(u16),
+    UnsupportedTextureType(TextureType),
+    InvalidSwizzle(AnyResourceId),
+    LevelOverflow,
+    LevelOutOfRange,
+    SliceOverflow,
+    SliceOutOfRange,
+    ChainOverflow(AnyResourceId),
+    BaseDescriptorAbsent(AnyResourceId),
+    UnsupportedBaseDescriptor(AnyResourceId),
+    BaseDeclarationAbsent(AnyResourceId),
+    EmptyBaseGeometry(AnyResourceId),
+    ViewRangeOutsideBase(AnyResourceId),
+}
+
+fn texture_declaration_view_facts(
+    declaration: reims_vgpu_protocol::TextureDeclaration,
+    base: AnyResourceId,
+) -> Result<(TextureType, u64, u64, u16), TextureViewResolveError> {
+    let texture_type = declaration.texture_type;
+    if let TextureType::Unknown(raw) = texture_type {
+        return Err(TextureViewResolveError::UnknownTextureType(u16::from(raw)));
+    }
+    if texture_type == TextureType::Buffer {
+        return Err(TextureViewResolveError::UnsupportedTextureType(
+            texture_type,
+        ));
+    }
+    let declared_layers = u64::from(declaration.array_length);
+    let layers = if matches!(texture_type, TextureType::Cube | TextureType::CubeArray) {
+        declared_layers
+            .checked_mul(u64::from(reims_vgpu_protocol::CUBE_FACES))
+            .ok_or(TextureViewResolveError::EmptyBaseGeometry(base))?
+    } else {
+        declared_layers
+    };
+    Ok((
+        texture_type,
+        u64::from(declaration.mipmap_level_count),
+        layers,
+        declaration.pixel_format,
+    ))
+}
 
 static NEXT_RESOURCE_LIFETIME: AtomicU64 = AtomicU64::new(1);
 
@@ -291,87 +413,104 @@ impl ContentState {
     }
 }
 
-/// Shared authority for every resource view over one storage object.
-///
-/// A resource constructed before its backing is known starts with a private
-/// authority. Attaching storage replaces that handle with the storage-owned
-/// one; every later alias therefore observes and mutates the same version
-/// state instead of maintaining counters which merely happen to agree.
-#[derive(Clone, Debug)]
-pub struct ContentAuthority(Arc<Mutex<ContentState>>);
-
-impl Default for ContentAuthority {
-    fn default() -> Self {
-        Self(Arc::new(Mutex::new(ContentState::default())))
-    }
-}
-
-impl PartialEq for ContentAuthority {
-    fn eq(&self, other: &Self) -> bool {
-        self.snapshot() == other.snapshot()
-    }
-}
-
-impl Eq for ContentAuthority {}
-
 impl ContentAuthority {
+    /// Compatibility projection for callers which still consume the entire
+    /// backing as one region. Canonical ownership remains the regional state.
     pub fn snapshot(&self) -> ContentState {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    pub fn same_authority(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        let current = self.whole_current();
+        ContentState {
+            current,
+            replicas: ReplicaVersions {
+                guest: self.whole_matches(GUEST_REPRESENTATION).then_some(current),
+                gpu: self.whole_matches(GPU_REPRESENTATION).then_some(current),
+                host: self.whole_matches(HOST_REPRESENTATION).then_some(current),
+            },
+            pending_gpu_writes: BTreeMap::new(),
+            next_version: current.get().saturating_add(1),
+        }
     }
 
     pub fn current(&self) -> ContentVersion {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .current
+        self.whole_current()
     }
 
     pub fn guest_wrote(&self) -> Result<ContentVersion, ContentError> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .guest_wrote()
+        self.guest_write_region(GUEST_REPRESENTATION, BackingRegion::Whole)
+            .map(|write| write.version)
+            .map_err(content_error)
     }
 
     pub fn gpu_store_planned(
         &self,
         submission: SubmissionId,
     ) -> Result<PendingContentWrite, ContentError> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .gpu_store_planned(submission)
+        self.ensure_representation(GPU_REPRESENTATION);
+        let writes = self
+            .plan_gpu_write_regions(submission, GPU_REPRESENTATION, [BackingRegion::Whole])
+            .map_err(content_error)?;
+        Ok(PendingContentWrite {
+            submission,
+            version: writes[0].version,
+        })
     }
 
     pub fn gpu_store_completed(
         &self,
         submission: SubmissionId,
     ) -> Result<ContentVersion, ContentError> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .gpu_store_completed(submission)
+        self.ensure_representation(GPU_REPRESENTATION);
+        let writes = self
+            .complete_gpu_write_regions(submission, GPU_REPRESENTATION)
+            .map_err(content_error)?;
+        Ok(writes[0].version)
     }
 
     pub fn copy_gpu_to_guest_completed(&self, version: ContentVersion) -> Result<(), ContentError> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .copy_gpu_to_guest_completed(version)
+        if !self.whole_matches(GPU_REPRESENTATION) {
+            return Err(ContentError::StaleSource);
+        }
+        self.materialize_whole(GUEST_REPRESENTATION, version)
+            .map_err(content_error)
     }
 
     pub fn gpu_materialized(&self, version: ContentVersion) -> Result<(), ContentError> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .gpu_materialized(version)
+        self.materialize_whole(GPU_REPRESENTATION, version)
+            .map_err(content_error)
+    }
+
+    pub fn replace_guest_backing(&self) -> Result<(), ContentError> {
+        if self.whole_matches(GUEST_REPRESENTATION)
+            && !self.whole_matches(GPU_REPRESENTATION)
+            && !self.whole_matches(HOST_REPRESENTATION)
+        {
+            return Err(ContentError::WouldLoseCurrentContent);
+        }
+        self.remove_whole_representation(GUEST_REPRESENTATION);
+        Ok(())
+    }
+}
+
+fn content_error(error: ContentAuthorityError) -> ContentError {
+    match error {
+        ContentAuthorityError::GpuWriteAlreadyPlanned => ContentError::SubmissionAlreadyWrites,
+        ContentAuthorityError::SubmissionDidNotPlanWrite => ContentError::SubmissionDidNotPlanWrite,
+        ContentAuthorityError::StaleSource
+        | ContentAuthorityError::GpuWriteReservationMismatch
+        | ContentAuthorityError::GpuWriteRepresentationMismatch
+        | ContentAuthorityError::UnknownRepresentation
+        | ContentAuthorityError::TransferNotPlanned
+        | ContentAuthorityError::InsufficientTransferDemand
+        | ContentAuthorityError::HostLandingSourceMismatch
+        | ContentAuthorityError::HostLandingNotPlanned
+        | ContentAuthorityError::HostLandingSourceNotCurrent
+        | ContentAuthorityError::HostIngressNotPlanned
+        | ContentAuthorityError::HostIngressSourceNotCurrent
+        | ContentAuthorityError::UnboundBacking
+        | ContentAuthorityError::EmptyBacking => ContentError::StaleSource,
+        ContentAuthorityError::VersionSpaceExhausted
+        | ContentAuthorityError::TransferDemandCountExhausted => {
+            ContentError::VersionSpaceExhausted
+        }
     }
 }
 
@@ -418,7 +557,7 @@ pub enum StorageBacking {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StorageNode {
-    pub id: StorageId,
+    pub id: BackingId,
     pub backing: StorageBacking,
     pub owners: BTreeSet<AnyResourceId>,
     pub content: ContentAuthority,
@@ -430,18 +569,22 @@ pub struct MappingNode {
     pub task: TaskId,
     pub address: GuestVirtualAddress,
     pub length: ByteLength,
-    pub storage: Option<StorageId>,
+    pub storage: Option<BackingId>,
     pub committed: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ResourceNode {
     pub id: AnyResourceId,
     pub task: TaskId,
     pub object: ObjectTableRef<ResourceObject>,
     pub kind: ObjectKind,
+    /// Complete semantic construction input decoded once at the namespace
+    /// boundary. Legacy graph-only callers may omit it; replacement lifecycle
+    /// admission always supplies it before native representation planning.
+    pub descriptor: Option<Arc<ResourceDescriptor>>,
     pub lifecycle: LifecycleState,
-    pub storage: Option<StorageId>,
+    pub storage: Option<BackingId>,
     pub backing_generation: BackingGeneration,
     pub content: ContentAuthority,
     pub parents: BTreeSet<AnyResourceId>,
@@ -457,12 +600,21 @@ pub enum GraphError {
     ParentAbsent,
     ParentCycle,
     StorageAbsent,
+    StorageInUse,
     StorageConflict,
     HeapPlacementOverlap,
     MappingAlreadyExists,
     MappingAbsent,
     SubmissionNotPrepared,
+    Content(ContentAuthorityError),
+    DescriptorConflict,
     IdentitySpaceExhausted,
+}
+
+impl From<ContentAuthorityError> for GraphError {
+    fn from(error: ContentAuthorityError) -> Self {
+        Self::Content(error)
+    }
 }
 
 #[derive(Debug)]
@@ -505,7 +657,8 @@ pub struct ResourceGraph {
     /// after `start - longest`. It only grows, so it can widen the scanned
     /// window but can never narrow it past a real overlap.
     longest_task_extent: BTreeMap<TaskId, u64>,
-    storage: BTreeMap<StorageId, StorageNode>,
+    storage: BTreeMap<BackingId, StorageNode>,
+    automatically_retired_storage: Vec<StorageNode>,
     mappings: BTreeMap<MappingId, MappingNode>,
     next_resource_index: u32,
     next_storage_id: u64,
@@ -519,6 +672,7 @@ impl Default for ResourceGraph {
             task_address_index: BTreeMap::new(),
             longest_task_extent: BTreeMap::new(),
             storage: BTreeMap::new(),
+            automatically_retired_storage: Vec::new(),
             mappings: BTreeMap::new(),
             next_resource_index: 1,
             next_storage_id: 1,
@@ -537,33 +691,93 @@ impl ResourceGraph {
     /// the alias set whose content authorities must advance.
     pub fn guest_wrote_aliases(&self, id: AnyResourceId) -> Option<ContentVersion> {
         let source = self.resources.get(&id)?.content.clone();
-        let mut scan_iters = 0u64;
-        let mut pending = vec![id];
-        let mut visited = BTreeSet::new();
-        let mut ranges = Vec::<(TaskId, u64, u64)>::new();
+        let (resources, _, scan_iters) = self.alias_closure(id);
         let mut authorities = Vec::<ContentAuthority>::new();
-
-        while let Some(resource_id) = pending.pop() {
-            if !visited.insert(resource_id) {
-                continue;
-            }
-            let Some(resource) = self.resources.get(&resource_id) else {
-                continue;
-            };
-            pending.extend(resource.parents.iter().copied());
-            pending.extend(resource.children.iter().copied());
+        for resource_id in &resources {
+            let resource = self
+                .resources
+                .get(resource_id)
+                .expect("alias closure contains only live resources");
             if !authorities
                 .iter()
                 .any(|known| known.same_authority(&resource.content))
             {
                 authorities.push(resource.content.clone());
             }
+        }
+
+        alias_walk_census::note(1, resources.len() as u64, scan_iters);
+        let version = source.guest_wrote().ok()?;
+        for authority in authorities {
+            if !authority.same_authority(&source) {
+                authority.guest_wrote().ok()?;
+            }
+        }
+        Some(version)
+    }
+
+    /// Every canonical backing connected to one resource by declared
+    /// parent/view, shared-storage, heap-alias, or overlapping task-address
+    /// relations. Dependency compilation uses these identities directly; it
+    /// never invents an alias key from an object name or host address.
+    pub fn alias_backings(&self, id: AnyResourceId) -> Option<Box<[BackingId]>> {
+        self.resources.get(&id)?;
+        let (_, backings, _) = self.alias_closure(id);
+        Some(backings.into_iter().collect::<Vec<_>>().into_boxed_slice())
+    }
+
+    /// Resolve the one storage backing inherited by an operation endpoint
+    /// through explicit parent/view relations. The wider alias closure is not
+    /// eligible: overlapping allocations may legitimately contribute several
+    /// hazard identities, while an endpoint must name one storage object.
+    pub fn resolved_backing(&self, id: AnyResourceId) -> Option<BackingId> {
+        self.resources.get(&id)?;
+        let mut pending = vec![id];
+        let mut visited = BTreeSet::new();
+        let mut resolved = None;
+        while let Some(resource_id) = pending.pop() {
+            let resource = self.resources.get(&resource_id)?;
+            if !visited.insert(resource_id) {
+                continue;
+            }
+            if let Some(storage) = resource.storage {
+                match resolved {
+                    None => resolved = Some(storage),
+                    Some(existing) if existing == storage => {}
+                    Some(_) => return None,
+                }
+            }
+            pending.extend(resource.parents.iter().copied());
+        }
+        resolved
+    }
+
+    fn alias_closure(
+        &self,
+        id: AnyResourceId,
+    ) -> (BTreeSet<AnyResourceId>, BTreeSet<BackingId>, u64) {
+        let mut scan_iters = 0u64;
+        let mut pending = vec![id];
+        let mut visited = BTreeSet::new();
+        let mut backings = BTreeSet::new();
+        let mut ranges = Vec::<(TaskId, u64, u64)>::new();
+
+        while let Some(resource_id) = pending.pop() {
+            let Some(resource) = self.resources.get(&resource_id) else {
+                continue;
+            };
+            if !visited.insert(resource_id) {
+                continue;
+            }
+            pending.extend(resource.parents.iter().copied());
+            pending.extend(resource.children.iter().copied());
             let Some(storage_id) = resource.storage else {
                 continue;
             };
             let Some(storage) = self.storage.get(&storage_id) else {
                 continue;
             };
+            backings.insert(storage_id);
             pending.extend(storage.owners.iter().copied());
             if let StorageBacking::TaskAddress {
                 task,
@@ -587,15 +801,7 @@ impl ResourceGraph {
                 }
             }
         }
-
-        alias_walk_census::note(1, visited.len() as u64, scan_iters);
-        let version = source.guest_wrote().ok()?;
-        for authority in authorities {
-            if !authority.same_authority(&source) {
-                authority.guest_wrote().ok()?;
-            }
-        }
-        Some(version)
+        (visited, backings, scan_iters)
     }
 
     fn parent_edge_would_cycle(&self, parent: AnyResourceId, child: AnyResourceId) -> bool {
@@ -623,7 +829,19 @@ impl ResourceGraph {
         task: TaskId,
         object: ObjectTableRef<ResourceObject>,
         kind: ObjectKind,
-        storage: Option<StorageId>,
+        storage: Option<BackingId>,
+        parents: impl IntoIterator<Item = AnyResourceId>,
+    ) -> Result<AnyResourceId, GraphError> {
+        self.create_resource_with_descriptor(task, object, kind, None, storage, parents)
+    }
+
+    pub fn create_resource_with_descriptor(
+        &mut self,
+        task: TaskId,
+        object: ObjectTableRef<ResourceObject>,
+        kind: ObjectKind,
+        descriptor: Option<Arc<ResourceDescriptor>>,
+        storage: Option<BackingId>,
         parents: impl IntoIterator<Item = AnyResourceId>,
     ) -> Result<AnyResourceId, GraphError> {
         if storage.is_some_and(|id| !self.storage.contains_key(&id)) {
@@ -678,6 +896,7 @@ impl ResourceGraph {
                 task,
                 object,
                 kind,
+                descriptor,
                 lifecycle: LifecycleState::Created,
                 storage,
                 backing_generation: BackingGeneration::new(1),
@@ -711,8 +930,420 @@ impl ResourceGraph {
         self.resources.get_mut(&id)
     }
 
-    pub fn create_storage(&mut self, backing: StorageBacking) -> Result<StorageId, GraphError> {
-        let id = StorageId::new(self.next_storage_id);
+    pub fn publish_resource_descriptor(
+        &mut self,
+        id: AnyResourceId,
+        descriptor: Arc<ResourceDescriptor>,
+    ) -> Result<(), GraphError> {
+        let node = self
+            .resources
+            .get_mut(&id)
+            .ok_or(GraphError::ResourceAbsent)?;
+        match node.descriptor.as_ref() {
+            Some(existing) if existing.as_ref() == descriptor.as_ref() => Ok(()),
+            Some(_) => Err(GraphError::DescriptorConflict),
+            None => {
+                node.descriptor = Some(descriptor);
+                Ok(())
+            }
+        }
+    }
+
+    /// Resolve a texture-view chain entirely from retained semantic
+    /// descriptors and generational parent edges. No task-local name is read
+    /// after construction, so slot reuse cannot redirect a live view.
+    pub fn resolve_texture_view(
+        &self,
+        view: AnyResourceId,
+    ) -> Result<ResolvedTextureView, TextureViewResolveError> {
+        let mut current = view;
+        let mut range: Option<ResolvedTextureViewRange> = None;
+        let mut texture_type = None;
+        let mut pixel_format = None;
+        let mut swizzle = None;
+
+        for _ in 0..MAX_TEXTURE_VIEW_CHAIN {
+            let node = self
+                .resources
+                .get(&current)
+                .ok_or(TextureViewResolveError::ResourceAbsent(current))?;
+            if node.kind == ObjectKind::IOSurfacePlaneView {
+                let descriptor = node
+                    .descriptor
+                    .as_deref()
+                    .ok_or(TextureViewResolveError::DescriptorAbsent(current))?;
+                let ResourceDescriptor::IOSurfacePlaneView(descriptor) = descriptor else {
+                    return Err(TextureViewResolveError::DescriptorKindMismatch(current));
+                };
+                let plane = descriptor
+                    .view
+                    .ok_or(TextureViewResolveError::DescriptorKindMismatch(current))?;
+                let plane_range = ResolvedTextureViewRange {
+                    level_base: 0,
+                    level_count: 1,
+                    slice_base: 0,
+                    slice_count: 1,
+                };
+                range = Some(match range {
+                    Some(outer) => outer.compose_over(plane_range)?,
+                    None => plane_range,
+                });
+                texture_type.get_or_insert(TextureType::D2);
+                pixel_format.get_or_insert(plane.pixel_format);
+                let mut parents = node.parents.iter().copied();
+                let Some(parent) = parents.next() else {
+                    return Err(TextureViewResolveError::ParentCount(current));
+                };
+                if parents.next().is_some() {
+                    return Err(TextureViewResolveError::ParentCount(current));
+                }
+                return Ok(ResolvedTextureView {
+                    view,
+                    base: parent,
+                    range,
+                    texture_type,
+                    pixel_format,
+                    swizzle,
+                });
+            }
+            if node.kind != ObjectKind::TextureView {
+                if current == view {
+                    return Err(TextureViewResolveError::NotTextureView(view));
+                }
+                return Ok(ResolvedTextureView {
+                    view,
+                    base: current,
+                    range,
+                    texture_type,
+                    pixel_format,
+                    swizzle,
+                });
+            }
+            let descriptor = node
+                .descriptor
+                .as_deref()
+                .ok_or(TextureViewResolveError::DescriptorAbsent(current))?;
+            let ResourceDescriptor::TextureView(descriptor) = descriptor else {
+                return Err(TextureViewResolveError::DescriptorKindMismatch(current));
+            };
+            let hop_range = match descriptor.form {
+                TextureViewForm::Simple => None,
+                TextureViewForm::Ranged | TextureViewForm::Swizzled => {
+                    if descriptor.level_count == 0 || descriptor.slice_count == 0 {
+                        return Err(TextureViewResolveError::EmptyRange(current));
+                    }
+                    Some(ResolvedTextureViewRange {
+                        level_base: descriptor.level_base,
+                        level_count: descriptor.level_count,
+                        slice_base: descriptor.slice_base,
+                        slice_count: descriptor.slice_count,
+                    })
+                }
+            };
+            range = match (range, hop_range) {
+                (Some(outer), Some(inner)) => Some(outer.compose_over(inner)?),
+                (outer @ Some(_), None) => outer,
+                (None, inner) => inner,
+            };
+            if texture_type.is_none() && descriptor.carries_range() {
+                let raw = descriptor.texture_type;
+                let narrowed = u8::try_from(raw)
+                    .map_err(|_| TextureViewResolveError::UnknownTextureType(raw))?;
+                let decoded = TextureType::from_raw(narrowed);
+                if let TextureType::Unknown(_) = decoded {
+                    return Err(TextureViewResolveError::UnknownTextureType(raw));
+                }
+                texture_type = Some(decoded);
+            }
+            if pixel_format.is_none() {
+                pixel_format = descriptor.declared_pixel_format();
+            }
+            let hop_swizzle = if descriptor.carries_swizzle() {
+                Some(
+                    reims_vgpu_protocol::swizzle_plan(&descriptor.swizzle)
+                        .ok_or(TextureViewResolveError::InvalidSwizzle(current))?,
+                )
+            } else {
+                None
+            };
+            swizzle = match (swizzle, hop_swizzle) {
+                (Some(outer), Some(inner)) => Some(outer.after(&inner)),
+                (outer @ Some(_), None) => outer,
+                (None, inner) => inner,
+            };
+            let mut parents = node.parents.iter().copied();
+            let Some(parent) = parents.next() else {
+                return Err(TextureViewResolveError::ParentCount(current));
+            };
+            if parents.next().is_some() {
+                return Err(TextureViewResolveError::ParentCount(current));
+            }
+            current = parent;
+        }
+        let node = self
+            .resources
+            .get(&current)
+            .ok_or(TextureViewResolveError::ResourceAbsent(current))?;
+        if node.kind == ObjectKind::TextureView {
+            Err(TextureViewResolveError::ChainOverflow(current))
+        } else {
+            Ok(ResolvedTextureView {
+                view,
+                base: current,
+                range,
+                texture_type,
+                pixel_format,
+                swizzle,
+            })
+        }
+    }
+
+    /// Resolve the complete shader-visible image view for either a base
+    /// texture or a generational texture-view resource.
+    pub fn resolve_texture_binding_view(
+        &self,
+        resource: AnyResourceId,
+    ) -> Result<ResolvedTextureBindingView, TextureViewResolveError> {
+        let resource_node = self
+            .resources
+            .get(&resource)
+            .ok_or(TextureViewResolveError::ResourceAbsent(resource))?;
+        let resolved = if matches!(
+            resource_node.kind,
+            ObjectKind::TextureView | ObjectKind::IOSurfacePlaneView
+        ) {
+            self.resolve_texture_view(resource)?
+        } else {
+            ResolvedTextureView {
+                view: resource,
+                base: resource,
+                range: None,
+                texture_type: None,
+                pixel_format: None,
+                swizzle: None,
+            }
+        };
+        let base = self
+            .resources
+            .get(&resolved.base)
+            .ok_or(TextureViewResolveError::ResourceAbsent(resolved.base))?;
+        let descriptor = base
+            .descriptor
+            .as_deref()
+            .ok_or(TextureViewResolveError::BaseDescriptorAbsent(resolved.base))?;
+        let (base_type, mip_levels, array_layers, base_pixel_format) =
+            match descriptor {
+                ResourceDescriptor::Texture(descriptor) => {
+                    let declaration = descriptor.declaration.ok_or(
+                        TextureViewResolveError::BaseDeclarationAbsent(resolved.base),
+                    )?;
+                    texture_declaration_view_facts(declaration, resolved.base)?
+                }
+                ResourceDescriptor::HeapTexture(descriptor) => {
+                    texture_declaration_view_facts(descriptor.declaration, resolved.base)?
+                }
+                ResourceDescriptor::BufferTexture(descriptor) => {
+                    texture_declaration_view_facts(descriptor.desc, resolved.base)?
+                }
+                ResourceDescriptor::MapperIOSurfaceTextureView(descriptor) => {
+                    texture_declaration_view_facts(descriptor.declaration, resolved.base)?
+                }
+                ResourceDescriptor::SurfaceBacking(_)
+                    if resolved.view != resolved.base
+                        && resolved.texture_type == Some(TextureType::D2)
+                        && resolved.range
+                            == Some(ResolvedTextureViewRange {
+                                level_base: 0,
+                                level_count: 1,
+                                slice_base: 0,
+                                slice_count: 1,
+                            }) =>
+                {
+                    (
+                        TextureType::D2,
+                        1,
+                        1,
+                        resolved.pixel_format.ok_or(
+                            TextureViewResolveError::BaseDeclarationAbsent(resolved.base),
+                        )?,
+                    )
+                }
+                _ => {
+                    return Err(TextureViewResolveError::UnsupportedBaseDescriptor(
+                        resolved.base,
+                    ));
+                }
+            };
+        if mip_levels == 0 || array_layers == 0 {
+            return Err(TextureViewResolveError::EmptyBaseGeometry(resolved.base));
+        }
+        let range = resolved.range.unwrap_or(ResolvedTextureViewRange {
+            level_base: 0,
+            level_count: mip_levels,
+            slice_base: 0,
+            slice_count: array_layers,
+        });
+        let level_end = range
+            .level_base
+            .checked_add(range.level_count)
+            .ok_or(TextureViewResolveError::LevelOverflow)?;
+        let slice_end = range
+            .slice_base
+            .checked_add(range.slice_count)
+            .ok_or(TextureViewResolveError::SliceOverflow)?;
+        if level_end > mip_levels || slice_end > array_layers {
+            return Err(TextureViewResolveError::ViewRangeOutsideBase(resource));
+        }
+        let texture_type = resolved.texture_type.unwrap_or(base_type);
+        if texture_type == TextureType::Buffer {
+            return Err(TextureViewResolveError::UnsupportedTextureType(
+                texture_type,
+            ));
+        }
+        Ok(ResolvedTextureBindingView {
+            resource,
+            base: resolved.base,
+            range,
+            texture_type,
+            pixel_format: resolved.pixel_format.unwrap_or(base_pixel_format),
+            swizzle: resolved
+                .swizzle
+                .unwrap_or_else(reims_vgpu_protocol::swizzle_identity),
+        })
+    }
+
+    /// Resolve every live shader-visible view whose generational parent chain
+    /// terminates at `base`. The returned identities are stable even when a
+    /// task-local object slot is subsequently reused.
+    pub fn texture_binding_views_for_base(
+        &self,
+        base: AnyResourceId,
+    ) -> Result<Box<[ResolvedTextureBindingView]>, TextureViewResolveError> {
+        self.resources
+            .get(&base)
+            .ok_or(TextureViewResolveError::ResourceAbsent(base))?;
+        let mut pending = self
+            .resources
+            .get(&base)
+            .expect("base presence was validated")
+            .children
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        let mut views = Vec::new();
+        while let Some(resource) = pending.pop() {
+            if !visited.insert(resource) {
+                continue;
+            }
+            let node = self
+                .resources
+                .get(&resource)
+                .ok_or(TextureViewResolveError::ResourceAbsent(resource))?;
+            pending.extend(node.children.iter().copied());
+            if !matches!(
+                node.kind,
+                ObjectKind::TextureView | ObjectKind::IOSurfacePlaneView
+            ) || node.lifecycle == LifecycleState::Released
+            {
+                continue;
+            }
+            let view = self.resolve_texture_binding_view(resource)?;
+            if view.base == base {
+                views.push(view);
+            }
+        }
+        views.sort_by_key(|view| view.resource);
+        Ok(views.into_boxed_slice())
+    }
+
+    pub fn resources_for_task(&self, task: TaskId) -> Box<[AnyResourceId]> {
+        self.resources
+            .values()
+            .filter_map(|resource| (resource.task == task).then_some(resource.id))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    pub fn live_resources_for_task(&self, task: TaskId) -> Box<[AnyResourceId]> {
+        let mut resources = self
+            .slots
+            .iter()
+            .filter_map(|(&(owner, _), slot)| (owner == task).then_some(slot.current).flatten())
+            .collect::<Vec<_>>();
+        resources.sort();
+        resources.into_boxed_slice()
+    }
+
+    /// The exact live child closure rooted at one resource, ordered with every
+    /// descendant before its parent so lifecycle release cannot leave a child
+    /// retaining a root that the command declared dead.
+    pub fn live_resource_tree_child_first(
+        &self,
+        root: AnyResourceId,
+    ) -> Option<Box<[AnyResourceId]>> {
+        self.resources.get(&root)?;
+        let mut pending = vec![(root, false)];
+        let mut visited = BTreeSet::new();
+        let mut ordered = Vec::new();
+        while let Some((resource, expanded)) = pending.pop() {
+            let node = self.resources.get(&resource)?;
+            if expanded {
+                ordered.push(resource);
+                continue;
+            }
+            if !visited.insert(resource) {
+                continue;
+            }
+            pending.push((resource, true));
+            pending.extend(node.children.iter().rev().map(|child| (*child, false)));
+        }
+        Some(ordered.into_boxed_slice())
+    }
+
+    /// Resolve every live generational resource backed by a task-address span
+    /// intersecting the decoded half-open range. Alias storage is expanded to
+    /// its exact owners and the result is stable and duplicate-free.
+    pub fn live_resources_overlapping_task_range(
+        &self,
+        task: TaskId,
+        address: GuestVirtualAddress,
+        length: ByteLength,
+    ) -> Option<Box<[AnyResourceId]>> {
+        let end = address.get().checked_add(length.get())?;
+        if address.get() == end {
+            return Some(Box::new([]));
+        }
+        let mut resources = self
+            .storage_overlapping(task, address.get(), end)
+            .filter_map(|backing| self.storage.get(&backing))
+            .flat_map(|storage| storage.owners.iter().copied())
+            .filter(|resource| {
+                self.resources
+                    .get(resource)
+                    .is_some_and(|node| node.lifecycle != LifecycleState::Released)
+            })
+            .collect::<Vec<_>>();
+        resources.sort_unstable();
+        resources.dedup();
+        Some(resources.into_boxed_slice())
+    }
+
+    pub fn create_storage(&mut self, backing: StorageBacking) -> Result<BackingId, GraphError> {
+        self.create_storage_with_regions(backing, [BackingRegion::Whole])
+    }
+
+    /// Create one canonical backing with its complete declared coordinate
+    /// coverage. Replacement lifecycle decoding supplies exact linear or image
+    /// regions when the contract establishes their translation; callers use
+    /// [`BackingRegion::Whole`] otherwise.
+    pub fn create_storage_with_regions(
+        &mut self,
+        backing: StorageBacking,
+        regions: impl Into<Box<[BackingRegion]>>,
+    ) -> Result<BackingId, GraphError> {
+        let id = BackingId::new(self.next_storage_id);
+        let content = ContentAuthority::for_backing_regions(id, regions)?;
         self.next_storage_id = self
             .next_storage_id
             .checked_add(1)
@@ -723,7 +1354,7 @@ impl ResourceGraph {
                 id,
                 backing,
                 owners: BTreeSet::new(),
-                content: ContentAuthority::default(),
+                content,
             },
         );
         if let StorageBacking::TaskAddress {
@@ -755,7 +1386,7 @@ impl ResourceGraph {
         task: TaskId,
         start: u64,
         end: u64,
-    ) -> impl Iterator<Item = StorageId> + '_ {
+    ) -> impl Iterator<Item = BackingId> + '_ {
         use std::ops::Bound;
         let longest = self.longest_task_extent.get(&task).copied().unwrap_or(0);
         let low = start.saturating_sub(longest);
@@ -765,18 +1396,63 @@ impl ResourceGraph {
                 Bound::Excluded((task, end, 0)),
             ))
             .filter(move |(_, &other_end)| start < other_end)
-            .map(|(&(_, _, id), _)| StorageId::new(id))
+            .map(|(&(_, _, id), _)| BackingId::new(id))
     }
 
-    pub fn storage(&self, id: StorageId) -> Option<&StorageNode> {
+    pub fn storage(&self, id: BackingId) -> Option<&StorageNode> {
         self.storage.get(&id)
+    }
+
+    /// Remove an explicitly destroyed backing after every resource and mapping
+    /// lifetime which names it has ended. Native ownership remains outside the
+    /// graph and uses the returned canonical identity to begin timeline-gated
+    /// retirement.
+    pub fn retire_storage(&mut self, id: BackingId) -> Result<StorageNode, GraphError> {
+        let storage = self.storage.get(&id).ok_or(GraphError::StorageAbsent)?;
+        if !storage.owners.is_empty()
+            || self
+                .mappings
+                .values()
+                .any(|mapping| mapping.storage == Some(id))
+        {
+            return Err(GraphError::StorageInUse);
+        }
+        Ok(self.remove_storage_node(id))
+    }
+
+    pub fn validate_storage_retirement_after_resources(
+        &self,
+        id: BackingId,
+        resources: &[AnyResourceId],
+    ) -> Result<(), GraphError> {
+        let storage = self.storage.get(&id).ok_or(GraphError::StorageAbsent)?;
+        let resources = resources.iter().copied().collect::<BTreeSet<_>>();
+        if storage
+            .owners
+            .iter()
+            .any(|owner| !resources.contains(owner))
+            || self
+                .mappings
+                .values()
+                .any(|mapping| mapping.storage == Some(id))
+        {
+            return Err(GraphError::StorageInUse);
+        }
+        Ok(())
+    }
+
+    /// Drain storage whose contract lifetime ended automatically with its last
+    /// heap allocation. The queue is unbounded and lossless; callers consume it
+    /// after any graph mutation that can collect a released resource.
+    pub fn take_automatically_retired_storage(&mut self) -> Vec<StorageNode> {
+        std::mem::take(&mut self.automatically_retired_storage)
     }
 
     pub fn mapper_storage(
         &mut self,
         mapper: MapperSurfaceRef,
         plane: PlaneIndex,
-    ) -> Result<StorageId, GraphError> {
+    ) -> Result<BackingId, GraphError> {
         if let Some(id) = self.storage.values().find_map(|storage| {
             (storage.backing == StorageBacking::MapperSurface { mapper, plane })
                 .then_some(storage.id)
@@ -786,10 +1462,36 @@ impl ResourceGraph {
         self.create_storage(StorageBacking::MapperSurface { mapper, plane })
     }
 
+    pub fn find_mapper_plane_storage(
+        &self,
+        mapper: MapperSurfaceRef,
+        plane: PlaneIndex,
+    ) -> Option<BackingId> {
+        self.storage.values().find_map(|storage| {
+            (storage.backing == StorageBacking::MapperSurface { mapper, plane })
+                .then_some(storage.id)
+        })
+    }
+
+    /// Resolve every already established plane backing for one mapper-service
+    /// surface identity without creating storage.
+    pub fn find_mapper_storage(&self, mapper: MapperSurfaceRef) -> Box<[BackingId]> {
+        self.storage
+            .values()
+            .filter_map(|storage| match storage.backing {
+                StorageBacking::MapperSurface { mapper: found, .. } if found == mapper => {
+                    Some(storage.id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
     pub fn registered_surface_storage(
         &mut self,
         surface: SurfaceBackingId,
-    ) -> Result<StorageId, GraphError> {
+    ) -> Result<BackingId, GraphError> {
         if let Some(id) = self.storage.values().find_map(|storage| {
             (storage.backing == StorageBacking::RegisteredSurface { surface }).then_some(storage.id)
         }) {
@@ -798,13 +1500,37 @@ impl ResourceGraph {
         self.create_storage(StorageBacking::RegisteredSurface { surface })
     }
 
+    /// Resolve an already established registered-surface backing without
+    /// creating storage from a surface name alone.
+    pub fn find_registered_surface_storage(&self, surface: SurfaceBackingId) -> Option<BackingId> {
+        self.storage.values().find_map(|storage| {
+            (storage.backing == StorageBacking::RegisteredSurface { surface }).then_some(storage.id)
+        })
+    }
+
     pub fn task_address_storage(
         &mut self,
         task: TaskId,
         address: GuestVirtualAddress,
         length: ByteLength,
-    ) -> Result<StorageId, GraphError> {
-        if let Some(id) = self.storage.values().find_map(|storage| {
+    ) -> Result<BackingId, GraphError> {
+        if let Some(id) = self.find_task_address_storage(task, address, length) {
+            return Ok(id);
+        }
+        self.create_storage(StorageBacking::TaskAddress {
+            task,
+            address,
+            length,
+        })
+    }
+
+    pub fn find_task_address_storage(
+        &self,
+        task: TaskId,
+        address: GuestVirtualAddress,
+        length: ByteLength,
+    ) -> Option<BackingId> {
+        self.storage.values().find_map(|storage| {
             (storage.backing
                 == StorageBacking::TaskAddress {
                     task,
@@ -812,13 +1538,23 @@ impl ResourceGraph {
                     length,
                 })
             .then_some(storage.id)
-        }) {
-            return Ok(id);
-        }
-        self.create_storage(StorageBacking::TaskAddress {
-            task,
-            address,
-            length,
+        })
+    }
+
+    pub fn find_buffer_range_storage(
+        &self,
+        buffer: AnyResourceId,
+        offset: ByteOffset,
+        bytes_per_row: ByteLength,
+    ) -> Option<BackingId> {
+        self.storage.values().find_map(|storage| {
+            (storage.backing
+                == StorageBacking::BufferRange {
+                    buffer,
+                    offset,
+                    bytes_per_row,
+                })
+            .then_some(storage.id)
         })
     }
 
@@ -982,7 +1718,7 @@ impl ResourceGraph {
     pub fn attach_initial_storage(
         &mut self,
         id: AnyResourceId,
-        storage: StorageId,
+        storage: BackingId,
     ) -> Result<(), GraphError> {
         if !self.storage.contains_key(&storage) {
             return Err(GraphError::StorageAbsent);
@@ -1008,7 +1744,7 @@ impl ResourceGraph {
     pub fn replace_backing(
         &mut self,
         id: AnyResourceId,
-        storage: StorageId,
+        storage: BackingId,
     ) -> Result<BackingGeneration, GraphError> {
         if !self.storage.contains_key(&storage) {
             return Err(GraphError::StorageAbsent);
@@ -1031,6 +1767,30 @@ impl ResourceGraph {
             .ok_or(GraphError::IdentitySpaceExhausted)?;
         node.backing_generation = BackingGeneration::new(next);
         Ok(node.backing_generation)
+    }
+
+    /// Advance the physical incarnation of one resource without changing its
+    /// logical backing or content authority.
+    ///
+    /// The replacement notification names only the task-local resource. Its
+    /// storage identity, guest address, geometry, and content remain the same;
+    /// page-derived native state must instead be keyed by this generation and
+    /// rebuilt after it advances.
+    pub fn replace_physical(
+        &mut self,
+        id: AnyResourceId,
+    ) -> Result<(Option<BackingId>, BackingGeneration), GraphError> {
+        let node = self
+            .resources
+            .get_mut(&id)
+            .ok_or(GraphError::ResourceAbsent)?;
+        let next = node
+            .backing_generation
+            .get()
+            .checked_add(1)
+            .ok_or(GraphError::IdentitySpaceExhausted)?;
+        node.backing_generation = BackingGeneration::new(next);
+        Ok((node.storage, node.backing_generation))
     }
 
     /// Resolve one object-table reference and enter the resource it names into
@@ -1140,9 +1900,26 @@ impl ResourceGraph {
     ) -> Result<AnyResourceId, GraphError> {
         let id = self
             .slots
-            .get_mut(&(task, object))
-            .and_then(|slot| slot.current.take())
+            .get(&(task, object))
+            .and_then(|slot| slot.current)
             .ok_or(GraphError::ReferenceUnbound)?;
+        self.release_resource(id)
+    }
+
+    /// Release the exact generational resource resolved at transaction
+    /// admission. A stale generation cannot delete the replacement occupying
+    /// the same task-local object slot.
+    pub fn release_resource(&mut self, id: AnyResourceId) -> Result<AnyResourceId, GraphError> {
+        let node = self.resources.get(&id).ok_or(GraphError::ResourceAbsent)?;
+        let key = (node.task, node.object);
+        let slot = self
+            .slots
+            .get_mut(&key)
+            .ok_or(GraphError::ReferenceUnbound)?;
+        if slot.current != Some(id) {
+            return Err(GraphError::ReferenceUnbound);
+        }
+        slot.current = None;
         self.resources
             .get_mut(&id)
             .ok_or(GraphError::ResourceAbsent)?
@@ -1210,7 +1987,8 @@ impl ResourceGraph {
                     )
             });
             if retire_heap_storage {
-                self.storage.remove(&storage_id);
+                let retired = self.remove_storage_node(storage_id);
+                self.automatically_retired_storage.push(retired);
             }
         }
         for parent in node.parents {
@@ -1219,6 +1997,30 @@ impl ResourceGraph {
             }
             self.collect_if_unowned(parent);
         }
+    }
+
+    fn remove_storage_node(&mut self, id: BackingId) -> StorageNode {
+        let storage = self
+            .storage
+            .remove(&id)
+            .expect("storage removal follows an exact presence check");
+        if let StorageBacking::TaskAddress {
+            task,
+            address,
+            length,
+        } = storage.backing
+        {
+            let start = address.get();
+            let end = start.saturating_add(length.get());
+            self.task_address_index.remove(&(task, start, id.get()));
+            debug_assert!(
+                start >= end
+                    || !self
+                        .task_address_index
+                        .contains_key(&(task, start, id.get()))
+            );
+        }
+        storage
     }
 }
 
@@ -1280,7 +2082,7 @@ mod tests {
                 .unwrap();
         }
 
-        let brute = |task: TaskId, start: u64, end: u64| -> BTreeSet<StorageId> {
+        let brute = |task: TaskId, start: u64, end: u64| -> BTreeSet<BackingId> {
             graph
                 .storage
                 .values()
@@ -1311,7 +2113,7 @@ mod tests {
                 continue;
             }
             queries += 1;
-            let indexed: BTreeSet<StorageId> =
+            let indexed: BTreeSet<BackingId> =
                 graph.storage_overlapping(task, start, end).collect();
             let expected = brute(task, start, end);
             assert_eq!(
@@ -1349,17 +2151,17 @@ mod tests {
             .unwrap();
         // Starts 9 990 bytes before the query and is the only reason the bound
         // has to reach back at all.
-        let found: BTreeSet<StorageId> = graph.storage_overlapping(task(), 9_995, 9_999).collect();
+        let found: BTreeSet<BackingId> = graph.storage_overlapping(task(), 9_995, 9_999).collect();
         assert_eq!(found, BTreeSet::from([long, short]));
 
         // Another task's identical range is not this task's alias.
-        let found: BTreeSet<StorageId> = graph
+        let found: BTreeSet<BackingId> = graph
             .storage_overlapping(TaskId::new(99), 9_995, 9_999)
             .collect();
         assert!(found.is_empty());
 
         // Touching end-to-start is not an overlap: [0, 10 000) and [10 000, ..).
-        let found: BTreeSet<StorageId> =
+        let found: BTreeSet<BackingId> =
             graph.storage_overlapping(task(), 10_000, 10_001).collect();
         assert!(found.is_empty(), "half-open ranges must not touch-overlap");
     }
@@ -1599,6 +2401,55 @@ mod tests {
     }
 
     #[test]
+    fn declared_backing_regions_are_owned_once_and_shared_by_every_view() {
+        let mut graph = ResourceGraph::default();
+        let left = BackingRegion::Linear(crate::LinearRange::new(0, 64).unwrap());
+        let right = BackingRegion::Linear(crate::LinearRange::new(64, 64).unwrap());
+        let storage = graph
+            .create_storage_with_regions(StorageBacking::Dedicated, [left, right])
+            .unwrap();
+        let first = graph
+            .create_resource(task(), object(70), ObjectKind::Buffer, Some(storage), [])
+            .unwrap();
+        let second = graph
+            .create_resource(
+                task(),
+                object(71),
+                ObjectKind::TextureView,
+                Some(storage),
+                [first],
+            )
+            .unwrap();
+
+        let first_authority = graph.resource(first).unwrap().content.clone();
+        let second_authority = graph.resource(second).unwrap().content.clone();
+        let write = first_authority
+            .guest_write_region(GUEST_REPRESENTATION, right)
+            .unwrap();
+        assert!(first_authority.same_authority(&second_authority));
+        assert_eq!(
+            second_authority.snapshot_regions(&[right]).as_ref(),
+            [write]
+        );
+    }
+
+    #[test]
+    fn invalid_region_declaration_does_not_consume_a_backing_identity() {
+        let mut graph = ResourceGraph::default();
+        assert_eq!(
+            graph.create_storage_with_regions(
+                StorageBacking::Dedicated,
+                Box::<[BackingRegion]>::default(),
+            ),
+            Err(GraphError::Content(ContentAuthorityError::EmptyBacking))
+        );
+        assert_eq!(
+            graph.create_storage(StorageBacking::Dedicated).unwrap(),
+            BackingId::new(1)
+        );
+    }
+
+    #[test]
     fn resources_over_the_same_task_allocation_share_storage_identity() {
         let mut graph = ResourceGraph::default();
         let first = graph
@@ -1717,8 +2568,21 @@ mod tests {
     #[test]
     fn a_buffer_texture_owns_a_typed_range_and_retains_its_buffer() {
         let mut graph = ResourceGraph::default();
+        let buffer_backing = graph
+            .task_address_storage(
+                task(),
+                GuestVirtualAddress::new(0x1000),
+                ByteLength::new(0x1000),
+            )
+            .unwrap();
         let buffer = graph
-            .create_resource(task(), object(1), ObjectKind::Buffer, None, [])
+            .create_resource(
+                task(),
+                object(1),
+                ObjectKind::Buffer,
+                Some(buffer_backing),
+                [],
+            )
             .unwrap();
         let texture = graph
             .create_resource(task(), object(2), ObjectKind::TextureView, None, [])
@@ -1740,6 +2604,10 @@ mod tests {
                 offset: ByteOffset::new(96),
                 bytes_per_row: ByteLength::new(512),
             }
+        );
+        assert_eq!(
+            graph.alias_backings(texture).unwrap().as_ref(),
+            [buffer_backing, texture_node.storage.unwrap()]
         );
         graph.release_reference(task(), object(1)).unwrap();
         assert!(graph.resource(buffer).is_some());
@@ -1805,6 +2673,10 @@ mod tests {
             graph.storage(storage).is_none(),
             "the last release frees the range"
         );
+        let retired = graph.take_automatically_retired_storage();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].id, storage);
+        assert!(graph.take_automatically_retired_storage().is_empty());
 
         let replacement = graph
             .create_resource(task(), object(3), ObjectKind::TextureView, None, [])
@@ -1816,6 +2688,42 @@ mod tests {
                 Some((ByteOffset::new(0x600), ByteLength::new(0x800))),
             )
             .expect("a placement may overlap a range whose lifetime ended");
+    }
+
+    #[test]
+    fn explicit_storage_retirement_refuses_live_resource_and_mapping_owners() {
+        let mut graph = ResourceGraph::default();
+        let storage = graph
+            .create_storage(StorageBacking::TaskAddress {
+                task: task(),
+                address: GuestVirtualAddress::new(0x4000),
+                length: ByteLength::new(0x1000),
+            })
+            .unwrap();
+        let resource = graph
+            .create_resource(task(), object(1), ObjectKind::Buffer, Some(storage), [])
+            .unwrap();
+        assert_eq!(graph.retire_storage(storage), Err(GraphError::StorageInUse));
+        graph.release_reference(task(), object(1)).unwrap();
+        assert!(graph.resource(resource).is_none());
+        graph
+            .create_mapping(MappingNode {
+                id: MappingId::new(9),
+                task: task(),
+                address: GuestVirtualAddress::new(0x4000),
+                length: ByteLength::new(0x1000),
+                storage: Some(storage),
+                committed: true,
+            })
+            .unwrap();
+        assert_eq!(graph.retire_storage(storage), Err(GraphError::StorageInUse));
+        graph.release_mapping(MappingId::new(9)).unwrap();
+        assert_eq!(graph.retire_storage(storage).unwrap().id, storage);
+        assert!(graph.storage(storage).is_none());
+        assert!(graph
+            .storage_overlapping(task(), 0x4000, 0x5000)
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -1905,6 +2813,33 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_backing_follows_only_an_unambiguous_parent_chain() {
+        let mut graph = ResourceGraph::default();
+        let first_parent = graph
+            .create_resource(task(), object(1), ObjectKind::Texture, None, [])
+            .unwrap();
+        let second_parent = graph
+            .create_resource(task(), object(2), ObjectKind::Texture, None, [])
+            .unwrap();
+        let view = graph
+            .create_resource(task(), object(3), ObjectKind::TextureView, None, [])
+            .unwrap();
+        graph.link_parent(view, first_parent).unwrap();
+        let first_storage = graph.create_storage(StorageBacking::Dedicated).unwrap();
+        graph
+            .attach_initial_storage(first_parent, first_storage)
+            .unwrap();
+        assert_eq!(graph.resolved_backing(view), Some(first_storage));
+
+        graph.link_parent(view, second_parent).unwrap();
+        let second_storage = graph.create_storage(StorageBacking::Dedicated).unwrap();
+        graph
+            .attach_initial_storage(second_parent, second_storage)
+            .unwrap();
+        assert_eq!(graph.resolved_backing(view), None);
+    }
+
+    #[test]
     fn cache_lifetime_refs_expire_only_with_the_owning_resource() {
         let lifetime = ResourceLifetime::new();
         let reference = lifetime.reference();
@@ -1919,5 +2854,184 @@ mod tests {
         );
         drop(lifetime);
         assert!(!reference.is_live());
+    }
+
+    #[test]
+    fn generational_texture_view_resolution_composes_ranges_swizzles_and_overrides() {
+        let mut graph = ResourceGraph::default();
+        let base = graph
+            .create_resource_with_descriptor(
+                task(),
+                object(1),
+                ObjectKind::Texture,
+                Some(Arc::new(ResourceDescriptor::Texture(
+                    reims_vgpu_protocol::LinearTextureDescriptor {
+                        declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+                            texture_type: TextureType::D2Array,
+                            framebuffer_only: false,
+                            is_drawable: false,
+                            write_swizzle_enabled: None,
+                            allow_gpu_optimized_contents: false,
+                            usage: reims_vgpu_protocol::TEXTURE_USAGE_SHADER_READ,
+                            pixel_format: 70,
+                            width: 64,
+                            height: 64,
+                            depth: 1,
+                            mipmap_level_count: 8,
+                            sample_count: 1,
+                            array_length: 10,
+                            resource_options: 0,
+                            protection_options: 0,
+                            swizzle: None,
+                        }),
+                        ..Default::default()
+                    },
+                ))),
+                None,
+                [],
+            )
+            .unwrap();
+        let inner_swizzle = [4, 3, 2, 5];
+        let inner = graph
+            .create_resource_with_descriptor(
+                task(),
+                object(2),
+                ObjectKind::TextureView,
+                Some(Arc::new(ResourceDescriptor::TextureView(
+                    reims_vgpu_protocol::TextureViewDescriptor {
+                        form: TextureViewForm::Swizzled,
+                        view_texture_ref: 2,
+                        base_texture_ref: 1,
+                        pixel_format: 70,
+                        texture_type: 3,
+                        level_base: 2,
+                        level_count: 4,
+                        slice_base: 3,
+                        slice_count: 5,
+                        swizzle: inner_swizzle,
+                    },
+                ))),
+                None,
+                [base],
+            )
+            .unwrap();
+        let outer_swizzle = [2, 4, 3, 5];
+        let outer = graph
+            .create_resource_with_descriptor(
+                task(),
+                object(3),
+                ObjectKind::TextureView,
+                Some(Arc::new(ResourceDescriptor::TextureView(
+                    reims_vgpu_protocol::TextureViewDescriptor {
+                        form: TextureViewForm::Swizzled,
+                        view_texture_ref: 3,
+                        base_texture_ref: 2,
+                        pixel_format: 80,
+                        texture_type: 3,
+                        level_base: 1,
+                        level_count: 2,
+                        slice_base: 2,
+                        slice_count: 2,
+                        swizzle: outer_swizzle,
+                    },
+                ))),
+                None,
+                [inner],
+            )
+            .unwrap();
+
+        let resolved = graph.resolve_texture_view(outer).unwrap();
+        assert_eq!(resolved.view, outer);
+        assert_eq!(resolved.base, base);
+        assert_eq!(
+            resolved.range,
+            Some(ResolvedTextureViewRange {
+                level_base: 3,
+                level_count: 2,
+                slice_base: 5,
+                slice_count: 2,
+            })
+        );
+        assert_eq!(resolved.texture_type, Some(TextureType::D2Array));
+        assert_eq!(resolved.pixel_format, Some(80));
+        assert_eq!(
+            resolved.swizzle,
+            Some(
+                reims_vgpu_protocol::swizzle_plan(&outer_swizzle)
+                    .unwrap()
+                    .after(&reims_vgpu_protocol::swizzle_plan(&inner_swizzle).unwrap())
+            )
+        );
+        assert_eq!(
+            graph.resolve_texture_binding_view(outer).unwrap(),
+            ResolvedTextureBindingView {
+                resource: outer,
+                base,
+                range: ResolvedTextureViewRange {
+                    level_base: 3,
+                    level_count: 2,
+                    slice_base: 5,
+                    slice_count: 2,
+                },
+                texture_type: TextureType::D2Array,
+                pixel_format: 80,
+                swizzle: reims_vgpu_protocol::swizzle_plan(&outer_swizzle)
+                    .unwrap()
+                    .after(&reims_vgpu_protocol::swizzle_plan(&inner_swizzle).unwrap()),
+            }
+        );
+        let unrelated_base = graph
+            .create_resource(task(), object(4), ObjectKind::Texture, None, [])
+            .unwrap();
+        graph
+            .create_resource(
+                task(),
+                object(5),
+                ObjectKind::TextureView,
+                None,
+                [unrelated_base],
+            )
+            .unwrap();
+        assert_eq!(
+            graph.texture_binding_views_for_base(base).unwrap(),
+            vec![
+                graph.resolve_texture_binding_view(inner).unwrap(),
+                graph.resolve_texture_binding_view(outer).unwrap(),
+            ]
+            .into_boxed_slice()
+        );
+    }
+
+    #[test]
+    fn descriptor_publication_is_idempotent_and_conflict_preserving() {
+        let mut graph = ResourceGraph::default();
+        let resource = graph
+            .create_resource(task(), object(1), ObjectKind::Buffer, None, [])
+            .unwrap();
+        let first = Arc::new(ResourceDescriptor::Buffer(
+            reims_vgpu_protocol::BufferDescriptor {
+                allocation_size: 64,
+                ..Default::default()
+            },
+        ));
+        graph
+            .publish_resource_descriptor(resource, Arc::clone(&first))
+            .unwrap();
+        graph
+            .publish_resource_descriptor(resource, Arc::new(first.as_ref().clone()))
+            .unwrap();
+        assert_eq!(
+            graph.publish_resource_descriptor(
+                resource,
+                Arc::new(ResourceDescriptor::Buffer(
+                    reims_vgpu_protocol::BufferDescriptor {
+                        allocation_size: 128,
+                        ..Default::default()
+                    },
+                )),
+            ),
+            Err(GraphError::DescriptorConflict)
+        );
+        assert_eq!(graph.resource(resource).unwrap().descriptor, Some(first));
     }
 }

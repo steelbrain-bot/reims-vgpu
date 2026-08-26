@@ -115,6 +115,8 @@ fn render_verdict(bytes: &[u8]) -> Reading {
         Err(S::ErrUnsupportedOpcode) => Verdict::NotImplemented("render_decode_unsupported_opcode"),
         Err(S::ErrShort) => Verdict::WrongShape("render_decode_short"),
         Err(S::ErrBadLength) => Verdict::WrongShape("render_decode_bad_length"),
+        Err(S::ErrResourceUsage) => Verdict::WrongShape("render_decode_resource_usage"),
+        Err(S::ErrRenderStages) => Verdict::WrongShape("render_decode_render_stages"),
         Err(S::ErrCountOutOfRange) => Verdict::WrongShape("render_decode_count_out_of_range"),
     };
     Reading {
@@ -132,12 +134,8 @@ fn compute_verdict(bytes: &[u8]) -> Reading {
         Err(S::ErrUnsupportedOpcode) => {
             Verdict::NotImplemented("compute_decode_unsupported_opcode")
         }
-        // `ErrShort` is now the compute arm's only shape failure, the way the
-        // blit arm's became after `ErrUnimplementedOpcode` went. Every compute
-        // refusal that is not an unknown or unsupported opcode is a layout this
-        // project has wrong, which makes the arm strictly stronger than when a
-        // second variant could absorb one.
         Err(S::ErrShort) => Verdict::WrongShape("compute_decode_short"),
+        Err(S::ErrResourceUsage) => Verdict::WrongShape("compute_decode_resource_usage"),
     };
     Reading {
         verdict,

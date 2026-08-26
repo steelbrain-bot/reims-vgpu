@@ -25,26 +25,21 @@
 //! Vulkan. Compute ICB execution remains a typed unsupported operation; the
 //! decoder does not imply that a backend executes every returned command kind.
 
-use crate::runtime::Device;
 use reims_vgpu_core::endian::{ld32, ld64}; // ld64: 0x1d1 gpu_address + dispatch args
 
 use crate::runtime::decode::resource::{
-    decode_serializer_resource, icb_layout_attribute_stride_slot_count,
-    icb_layout_kernel_tg_slot_count, icb_layout_table_len, Descriptor as ResourceDescriptor,
-    IcbCommandLayout, IndirectCommandBufferDescriptor, ObjectKind, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE,
-    ICB_BUFFER_BIND_STRIDE, ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS,
-    ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADS, ICB_CMD_TYPE_DRAW, ICB_CMD_TYPE_DRAW_INDEXED,
-    ICB_CMD_TYPE_DRAW_INDEXED_PATCHES, ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS,
-    ICB_CMD_TYPE_DRAW_MESH_THREADS, ICB_CMD_TYPE_DRAW_PATCHES, ICB_CONCURRENT_DISPATCH_ARGS_LEN,
-    ICB_DRAW_INDEXED_PATCHES_ARGS_LEN, ICB_DRAW_MESH_ARGS_LEN, ICB_DRAW_PATCHES_ARGS_LEN,
-    ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE,
+    icb_layout_attribute_stride_slot_count, icb_layout_kernel_tg_slot_count, icb_layout_table_len,
+    IcbCommandLayout, ICB_ATTRIBUTE_STRIDE_ENTRY_SIZE, ICB_BUFFER_BIND_STRIDE,
+    ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADGROUPS, ICB_CMD_TYPE_CONCURRENT_DISPATCH_THREADS,
+    ICB_CMD_TYPE_DRAW, ICB_CMD_TYPE_DRAW_INDEXED, ICB_CMD_TYPE_DRAW_INDEXED_PATCHES,
+    ICB_CMD_TYPE_DRAW_MESH_THREADGROUPS, ICB_CMD_TYPE_DRAW_MESH_THREADS, ICB_CMD_TYPE_DRAW_PATCHES,
+    ICB_CONCURRENT_DISPATCH_ARGS_LEN, ICB_DRAW_INDEXED_PATCHES_ARGS_LEN, ICB_DRAW_MESH_ARGS_LEN,
+    ICB_DRAW_PATCHES_ARGS_LEN, ICB_TESSELLATION_FACTOR_LEN, ICB_TG_MEMORY_STRIDE,
 }; // ICB_TG_MEMORY_STRIDE: object + kernel TG length tables
 #[cfg(test)]
 use crate::runtime::decode::resource::{
     MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES, MTL_INDIRECT_CMD_DRAW_PATCHES,
 }; // slot-encoder fixtures only
-use crate::runtime::host::{HostMemory, HostOps};
-use crate::runtime::objects;
 
 /// A refusal on the indirect-command-buffer rail.
 ///
@@ -101,30 +96,6 @@ impl crate::observe::Decline for IcbStatus {
             }
             .to_string(),
         )]
-    }
-}
-
-/// Carry an ICB refusal onto the compute rail without losing its name.
-///
-/// The compute rail is where an ICB refusal actually reaches the sink: the
-/// session hands a [`crate::runtime::compute_exec::ComputeStatus`] back to
-/// `exec`, which logs it as `compute_record reason=<slug>`. Before this
-/// conversion existed each boundary invented its own coarse literal —
-/// `icb_resolve_bad_descriptor_or_args` spoke for `BadDescriptor` *and* `Args`,
-/// i.e. for 93 of this file's checks at once — so the reason died one frame
-/// short of the log. Forwarding `self.slug()` means the check that refused is
-/// the reason that prints.
-impl From<IcbStatus> for crate::runtime::compute_exec::ComputeStatus {
-    fn from(e: IcbStatus) -> Self {
-        use crate::observe::Decline;
-        let slug = e.slug();
-        match e {
-            IcbStatus::Missing(_) => Self::MissingBuffer(slug),
-            IcbStatus::BadDescriptor(_) | IcbStatus::Args(_) | IcbStatus::Unsupported(_) => {
-                Self::Unsupported(slug)
-            }
-            IcbStatus::BackendFailed(_) => Self::BackendFailed(slug),
-        }
     }
 }
 
@@ -1153,113 +1124,6 @@ pub fn encode_compute_command_slot(
     Ok(slot)
 }
 
-/// Load and decode an ICB descriptor for `icb_ref` on the task object list.
-pub fn load_icb_descriptor<M: HostMemory + HostOps>(
-    state: &Device,
-    host: &M,
-    task_id: u32,
-    icb_ref: u32,
-) -> Result<IndirectCommandBufferDescriptor, IcbStatus> {
-    if icb_ref == 0 {
-        return Err(IcbStatus::Missing("icb_desc_ref_zero"));
-    }
-    // The two statuses this rail splits the ladder into, stated once: a tag that
-    // is not a serializer resource means the guest described something wrongly, while a
-    // missing entry or unreadable bytes mean it described nothing this device
-    // can see yet.
-    let (_entry, desc) = objects::resolve_descriptor(
-        state,
-        host,
-        task_id,
-        icb_ref,
-        &[ObjectKind::SerializerResource],
-    )
-    .map_err(|rung| {
-        let slug = crate::observe::ladder_slugs!("icb")(rung);
-        match rung {
-            objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                IcbStatus::Missing(slug)
-            }
-            objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
-        }
-    })?;
-    match decode_serializer_resource(&desc) {
-        Ok(ResourceDescriptor::IndirectCommandBuffer(icb)) => {
-            note_unapplied_icb_flags(task_id, icb_ref, &icb);
-            Ok(icb)
-        }
-        Ok(_) => Err(IcbStatus::BadDescriptor("icb_desc_not_icb_body")),
-        Err(_) => Err(IcbStatus::BadDescriptor(crate::observe::ladder_slug!(
-            "icb",
-            desc_decode
-        ))),
-    }
-}
-
-/// A flag the guest set on its indirect command buffer that this device decodes
-/// and does not apply.
-struct IcbFlagDropped(crate::runtime::decode::resource::IcbUnappliedFlag);
-
-impl crate::observe::Decline for IcbFlagDropped {
-    fn slug(&self) -> &'static str {
-        self.0.slug()
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        Vec::new()
-    }
-}
-
-/// Report every decoded ICB flag this device drops on the floor.
-///
-/// Eight of the ten attributed bits in the create body's flag word reach no
-/// executor: `supportRayTracing`, `supportDynamicAttributeStride` and the six
-/// inherit-state flags added in macOS 26. Each one therefore remains unapplied.
-///
-/// Counted rather than executed, deliberately. Six of the eight default *on* at
-/// both ends, so on a descriptor the guest left alone nothing is lost and every
-/// counter here is a healthy zero — which means a **non**-zero reading is the
-/// measured argument for implementing that flag, and says which one.
-///
-/// This sits in [`load_icb_descriptor`] so the count reflects what the guest
-/// asked for even before an executor exists.
-fn note_unapplied_icb_flags(task_id: u32, icb_ref: u32, desc: &IndirectCommandBufferDescriptor) {
-    use crate::observe::Decline as _;
-    for flag in desc.unapplied_flags() {
-        let decline = IcbFlagDropped(flag);
-        crate::runtime::drain::note_store_route(decline.slug());
-        crate::observe::Emit::decline("icb_desc_flag", &decline)
-            .field("task", task_id)
-            .field("icb", icb_ref)
-            .field("flags", format!("{:#06x}", desc.flags))
-            // The slug is already per flag, so the buffer is the only thing
-            // left to key on: one line per ICB per flag, however many times a
-            // cache miss reloads the descriptor.
-            .fail_once(icb_ref as u64);
-    }
-}
-
-/// Load the guest's ICB descriptor and record it, on every pathway.
-///
-/// Returns the descriptor the caller should build against. When the create body
-/// no longer matches what was recorded, the recorded command memory is dropped
-/// with it: a re-created ICB of a different shape is not the one whose slots the
-/// old span held, and decoding the old bytes at the new layout would read
-/// whatever happened to be at those offsets rather than refusing.
-pub fn resolve_icb_record<M: HostMemory + HostOps>(
-    state: &Device,
-    host: &M,
-    task_id: u32,
-    icb_ref: u32,
-) -> Result<IndirectCommandBufferDescriptor, IcbStatus> {
-    let desc = load_icb_descriptor(state, host, task_id, icb_ref)?;
-    state
-        .task_objects
-        .indirect_command_buffers
-        .record(task_id, icb_ref, desc)
-        .map_err(|_| IcbStatus::Args("icb_identity_space_exhausted"))
-}
-
 // ---------------------------------------------------------------------------
 // ICB auxiliary records and command-memory association
 // ---------------------------------------------------------------------------
@@ -1351,44 +1215,6 @@ pub fn decode_icb_host_resource_info(bytes: &[u8]) -> Result<IcbHostResourceInfo
 /// memory bound.
 pub const ICB_FILL_NO_COMMAND_MEMORY: &str = "icb_fill_no_command_memory";
 
-/// Register guest command-memory GVA for an ICB (backing buffer for CPU fills).
-///
-/// Fills are not stream opcodes; the guest writes this buffer via
-/// `PGSerializerIndirectComputeCommand`. Product re-decodes it at execute.
-pub fn bind_icb_command_memory(
-    state: &Device,
-    task_id: u32,
-    icb_ref: u32,
-    mem: IcbCommandMemory,
-) -> Result<(), IcbStatus> {
-    if icb_ref == 0 || mem.gva == 0 || mem.byte_len == 0 {
-        return Err(IcbStatus::Args("icb_bind_memory_bad_args"));
-    }
-    state
-        .task_objects
-        .indirect_command_buffers
-        .bind(task_id, icb_ref, mem)
-        .then_some(())
-        .ok_or(IcbStatus::Missing("icb_bind_memory_not_cached"))
-}
-
-/// Refuse info-segment `0x1d1` (`icbHostResourceInfo:info:`) by name.
-///
-/// This record is a query, not a backing association. It names an ICB, a reply
-/// buffer, and a byte offset at which the host must write two `u64` result
-/// words. Their semantics are not yet established, so manufacturing an answer
-/// or treating the reply destination as command memory would violate the wire
-/// contract. `runtime::heap_query` shows the shape a real reply takes once the
-/// two result words are known.
-pub fn apply_icb_host_resource_info<M: HostMemory + HostOps>(
-    _state: &Device,
-    _host: &M,
-    _task_id: u32,
-    _info: &IcbHostResourceInfo,
-) -> Result<IcbCommandMemory, IcbStatus> {
-    Err(IcbStatus::Unsupported("icb_info_query_unanswered"))
-}
-
 /// Read attribute-stride u64 at `attributeStrideOffset + index*8`.
 ///
 /// Returns `(stride, has)` — `has` is true when a stride table slot exists and
@@ -1436,81 +1262,25 @@ fn write_attribute_stride(
     Ok(())
 }
 
-fn type1_buffer_gva_size<M: HostMemory + HostOps>(
-    state: &Device,
-    host: &M,
-    task_id: u32,
-    buffer_ref: u32,
-) -> Result<(u64, u64), IcbStatus> {
-    objects::resolve_buffer_span(state, host, task_id, buffer_ref).map_err(
-        |refusal| match refusal {
-            objects::BufferSpanRefusal::Rung(rung) => {
-                let slug = crate::observe::ladder_slugs!("icb_type1")(rung);
-                match rung {
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        IcbStatus::Missing(slug)
-                    }
-                    objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
-                }
-            }
-            objects::BufferSpanRefusal::Decode => {
-                IcbStatus::BadDescriptor(crate::observe::ladder_slug!("icb_type1", desc_decode))
-            }
-            objects::BufferSpanRefusal::NoBacking => IcbStatus::Missing("icb_type1_no_backing"),
-        },
-    )
-}
-
-/// Convert absolute bind VA → offset into type-1 allocation (`handle << page_shift`).
-///
-/// PGSerializer stores `base+offset` in the bind VA field (not a separate offset).
-/// `wire_va == 0` means base (offset 0). Fail-closed if VA is below base or past size.
-fn offset_from_wire_va<M: HostMemory + HostOps>(
-    state: &Device,
-    host: &M,
-    task_id: u32,
-    buffer_ref: u32,
-    wire_va: u64,
-) -> Result<u64, IcbStatus> {
-    if wire_va == 0 {
-        return Ok(0);
-    }
-    let (base, size) = type1_buffer_gva_size(state, host, task_id, buffer_ref)?;
-    if wire_va < base {
-        return Err(IcbStatus::Args("icb_wire_va_below_base"));
-    }
-    let off = wire_va - base;
-    if off >= size {
-        return Err(IcbStatus::Args("icb_wire_va_past_end"));
-    }
-    Ok(off)
-}
-
-/// Resolve wire VAs on a compute fill into type-1 bind offsets (mutates in place).
-pub fn resolve_compute_fill_offsets<M: HostMemory + HostOps>(
-    state: &Device,
-    host: &M,
-    task_id: u32,
+fn resolve_compute_fill_offsets_with<E>(
     fill: &mut IcbComputeFill,
-) -> Result<(), IcbStatus> {
+    offset: &mut impl FnMut(u32, u64) -> Result<u64, E>,
+) -> Result<(), E> {
     for b in &mut fill.buffers {
         if b.wire_va != 0 {
-            b.offset = offset_from_wire_va(state, host, task_id, b.buffer_ref, b.wire_va)?;
+            b.offset = offset(b.buffer_ref, b.wire_va)?;
         }
     }
     Ok(())
 }
 
-/// Resolve wire VAs on a render fill into type-1 bind / index offsets (mutates in place).
-pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
-    state: &Device,
-    host: &M,
-    task_id: u32,
+fn resolve_render_fill_offsets_with<E>(
     fill: &mut IcbRenderFill,
-) -> Result<(), IcbStatus> {
+    offset: &mut impl FnMut(u32, u64) -> Result<u64, E>,
+) -> Result<(), E> {
     for b in &mut fill.buffers {
         if b.wire_va != 0 {
-            b.offset = offset_from_wire_va(state, host, task_id, b.buffer_ref, b.wire_va)?;
+            b.offset = offset(b.buffer_ref, b.wire_va)?;
         }
     }
     match &mut fill.draw {
@@ -1521,8 +1291,7 @@ pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
             ..
         } => {
             if *index_wire_va != 0 {
-                *index_buffer_offset =
-                    offset_from_wire_va(state, host, task_id, *index_buffer_ref, *index_wire_va)?;
+                *index_buffer_offset = offset(*index_buffer_ref, *index_wire_va)?;
             }
         }
         IcbRenderDraw::Patches {
@@ -1533,22 +1302,11 @@ pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
             ..
         } => {
             if *patch_index_wire_va != 0 && *patch_index_buffer_ref != 0 {
-                *patch_index_buffer_offset = offset_from_wire_va(
-                    state,
-                    host,
-                    task_id,
-                    *patch_index_buffer_ref,
-                    *patch_index_wire_va,
-                )?;
+                *patch_index_buffer_offset = offset(*patch_index_buffer_ref, *patch_index_wire_va)?;
             }
             if tessellation_factor.wire_va != 0 && tessellation_factor.buffer_ref != 0 {
-                tessellation_factor.offset = offset_from_wire_va(
-                    state,
-                    host,
-                    task_id,
-                    tessellation_factor.buffer_ref,
-                    tessellation_factor.wire_va,
-                )?;
+                tessellation_factor.offset =
+                    offset(tessellation_factor.buffer_ref, tessellation_factor.wire_va)?;
             }
         }
         IcbRenderDraw::IndexedPatches {
@@ -1562,31 +1320,17 @@ pub fn resolve_render_fill_offsets<M: HostMemory + HostOps>(
             ..
         } => {
             if *patch_index_wire_va != 0 && *patch_index_buffer_ref != 0 {
-                *patch_index_buffer_offset = offset_from_wire_va(
-                    state,
-                    host,
-                    task_id,
-                    *patch_index_buffer_ref,
-                    *patch_index_wire_va,
-                )?;
+                *patch_index_buffer_offset = offset(*patch_index_buffer_ref, *patch_index_wire_va)?;
             }
             if *control_point_index_wire_va != 0 {
-                *control_point_index_buffer_offset = offset_from_wire_va(
-                    state,
-                    host,
-                    task_id,
+                *control_point_index_buffer_offset = offset(
                     *control_point_index_buffer_ref,
                     *control_point_index_wire_va,
                 )?;
             }
             if tessellation_factor.wire_va != 0 && tessellation_factor.buffer_ref != 0 {
-                tessellation_factor.offset = offset_from_wire_va(
-                    state,
-                    host,
-                    task_id,
-                    tessellation_factor.buffer_ref,
-                    tessellation_factor.wire_va,
-                )?;
+                tessellation_factor.offset =
+                    offset(tessellation_factor.buffer_ref, tessellation_factor.wire_va)?;
             }
         }
         IcbRenderDraw::Primitives { .. }
@@ -1607,129 +1351,200 @@ pub enum IcbCommandFill {
     Render(IcbRenderFill),
 }
 
-/// Decode guest command memory into host ICB fills for the given index range.
-///
-/// Dispatches compute vs render fills from wire `commandTypes` / slot
-/// command-type tags, and resolves every wire VA into a type-1 bind offset, so
-/// the result names only refs and offsets. Nothing here touches a backend: the
-/// same decoder serves both product pathways and gives a future Vulkan executor
-/// typed commands to replay.
-pub fn decode_icb_command_range<M: HostMemory + HostOps>(
-    state: &Device,
-    host: &M,
-    task_id: u32,
-    icb_ref: u32,
+/// One position from a decoded ICB range. Empty slots are retained explicitly
+/// so publishing a freshly decoded range can remove an older command at the
+/// same position.
+#[derive(Clone, Debug)]
+pub struct DecodedIcbCommandSlot {
+    pub command_index: u64,
+    pub command: Option<IcbCommandFill>,
+}
+
+/// Resolve and publish one complete decoded ICB range into the replacement
+/// semantic owner. The caller supplies the immutable inherited encoder state;
+/// every populated slot is resolved against that same snapshot, while empty
+/// decoded slots explicitly clear their prior population.
+pub fn populate_replacement_icb<State, Render, Compute, E>(
+    owner: &mut reims_vgpu_core::IndirectCommandSlotOwner<
+        reims_vgpu_core::ResolvedIndirectCommandSlot<Render, Compute>,
+    >,
+    icb: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::IndirectCommandBufferObject>,
+    inherited: &State,
+    slots: Vec<DecodedIcbCommandSlot>,
+    mut resolve: impl FnMut(
+        &State,
+        &IcbCommandFill,
+    ) -> Result<
+        Option<reims_vgpu_core::ResolvedIndirectCommandSlot<Render, Compute>>,
+        E,
+    >,
+) -> Result<
+    reims_vgpu_core::PriorIndirectCommandPopulation<
+        reims_vgpu_core::ResolvedIndirectCommandSlot<Render, Compute>,
+    >,
+    reims_vgpu_core::IndirectCommandPopulationResolutionFailure<IcbCommandFill, E>,
+> {
+    let decoded = slots
+        .into_iter()
+        .map(|slot| (slot.command_index, slot.command))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    reims_vgpu_core::resolve_indirect_command_population(
+        owner,
+        icb,
+        inherited,
+        decoded,
+        |state, fill| resolve(state, fill),
+    )
+}
+
+/// Publish canonical render/compute replacement operations for one complete
+/// decoded range. Both direct and indirect work therefore enter the same
+/// backend-neutral command types; an empty decoded or contract-proven no-op
+/// slot removes any older population at that position.
+pub fn populate_resolved_replacement_icb<State, E>(
+    owner: &mut reims_vgpu_core::IndirectCommandSlotOwner<
+        reims_vgpu_core::ResolvedIndirectCommandSlot<
+            reims_vgpu_core::ResolvedRenderDispatch,
+            reims_vgpu_core::ResolvedComputeDispatch,
+        >,
+    >,
+    icb: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::IndirectCommandBufferObject>,
+    inherited: &State,
+    slots: Vec<DecodedIcbCommandSlot>,
+    mut render: impl FnMut(
+        &State,
+        &IcbRenderFill,
+    ) -> Result<Option<reims_vgpu_core::ResolvedRenderDispatch>, E>,
+    mut compute: impl FnMut(
+        &State,
+        &IcbComputeFill,
+    ) -> Result<Option<reims_vgpu_core::ResolvedComputeDispatch>, E>,
+) -> Result<
+    reims_vgpu_core::PriorIndirectCommandPopulation<
+        reims_vgpu_core::ResolvedIndirectCommandSlot<
+            reims_vgpu_core::ResolvedRenderDispatch,
+            reims_vgpu_core::ResolvedComputeDispatch,
+        >,
+    >,
+    reims_vgpu_core::IndirectCommandPopulationResolutionFailure<IcbCommandFill, E>,
+> {
+    populate_replacement_icb(owner, icb, inherited, slots, |state, fill| match fill {
+        IcbCommandFill::Render(fill) => render(state, fill)
+            .map(|operation| operation.map(reims_vgpu_core::ResolvedIndirectCommandSlot::Render)),
+        IcbCommandFill::Compute(fill) => compute(state, fill)
+            .map(|operation| operation.map(reims_vgpu_core::ResolvedIndirectCommandSlot::Compute)),
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IcbCommandBytesDecodeError<E> {
+    Decode(IcbStatus),
+    Buffer(E),
+}
+
+/// Decode one already-read, exact ICB command-memory window. Guest-memory
+/// transport is deliberately outside this function; absolute buffer VAs are
+/// converted through the supplied task/object resolver before a fill leaves.
+pub fn decode_icb_command_bytes<E>(
+    descriptor: &reims_vgpu_protocol::IndirectCommandBufferDescriptor,
     range_location: u64,
     range_length: u64,
-) -> Result<Vec<IcbCommandFill>, IcbStatus> {
+    bytes: &[u8],
+    mut resolve_buffer_offset: impl FnMut(u32, u64) -> Result<u64, E>,
+) -> Result<Vec<DecodedIcbCommandSlot>, IcbCommandBytesDecodeError<E>> {
     use crate::runtime::decode::resource::{
         MTL_INDIRECT_CMD_CONCURRENT_DISPATCH, MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS,
         MTL_INDIRECT_CMD_DRAW, MTL_INDIRECT_CMD_DRAW_INDEXED,
         MTL_INDIRECT_CMD_DRAW_INDEXED_PATCHES, MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS,
         MTL_INDIRECT_CMD_DRAW_MESH_THREADS, MTL_INDIRECT_CMD_DRAW_PATCHES,
     };
-    use crate::runtime::gva_mem;
 
-    let (layout, max_kernel, max_vertex, max_fragment, inheritance, command_types, max_cmds, mem) = {
-        let rec = state
-            .task_objects
-            .indirect_command_buffers
-            .snapshot(task_id, icb_ref)
-            .ok_or(IcbStatus::Missing("icb_fill_not_cached"))?;
-        (
-            rec.descriptor.layout,
-            rec.descriptor.max_kernel_buffer_bind_count,
-            rec.descriptor.max_vertex_buffer_bind_count,
-            rec.descriptor.max_fragment_buffer_bind_count,
-            IcbInheritance {
-                pipeline_state: rec.descriptor.inherit_pipeline_state(),
-                buffers: rec.descriptor.inherit_buffers(),
-            },
-            rec.descriptor.command_types,
-            rec.descriptor.max_command_count as u64,
-            rec.command_memory,
-        )
-    };
+    let layout = descriptor.layout;
     if layout.command_size == 0 {
-        return Err(IcbStatus::Args("icb_fill_zero_command_size"));
+        return Err(IcbCommandBytesDecodeError::Decode(IcbStatus::Args(
+            "icb_fill_zero_command_size",
+        )));
     }
-    let end = range_location
-        .checked_add(range_length)
-        .ok_or(IcbStatus::Args("icb_fill_range_overflow"))?;
-    if end > max_cmds {
-        return Err(IcbStatus::Args("icb_fill_range_past_capacity"));
+    let end =
+        range_location
+            .checked_add(range_length)
+            .ok_or(IcbCommandBytesDecodeError::Decode(IcbStatus::Args(
+                "icb_fill_range_overflow",
+            )))?;
+    if end > u64::from(descriptor.max_command_count) {
+        return Err(IcbCommandBytesDecodeError::Decode(IcbStatus::Args(
+            "icb_fill_range_past_capacity",
+        )));
     }
-    // An empty execute range is a true no-op. It neither resolves nor reads
-    // command backing, but its location still belongs to the declared ICB
-    // range and was validated above.
-    if range_length == 0 {
-        return Ok(Vec::new());
+    let byte_len = range_length
+        .checked_mul(u64::from(layout.command_size))
+        .ok_or(IcbCommandBytesDecodeError::Decode(IcbStatus::Args(
+            "icb_fill_range_byte_end_overflow",
+        )))?;
+    let host_len = usize::try_from(byte_len).map_err(|_| {
+        IcbCommandBytesDecodeError::Decode(IcbStatus::Args("icb_fill_range_host_size_overflow"))
+    })?;
+    if bytes.len() != host_len {
+        return Err(IcbCommandBytesDecodeError::Decode(IcbStatus::Args(
+            "icb_fill_command_bytes_length_mismatch",
+        )));
     }
-    let mem = mem.ok_or(IcbStatus::Missing(ICB_FILL_NO_COMMAND_MEMORY))?;
-    let command_size = u64::from(layout.command_size);
-    let byte_start = range_location
-        .checked_mul(command_size)
-        .ok_or(IcbStatus::Args("icb_fill_range_byte_start_overflow"))?;
-    let byte_end = end
-        .checked_mul(command_size)
-        .ok_or(IcbStatus::Args("icb_fill_range_byte_end_overflow"))?;
-    if byte_end > mem.byte_len {
-        return Err(IcbStatus::Args("icb_fill_range_past_memory"));
-    }
-    let byte_len = byte_end - byte_start;
-    let host_len = usize::try_from(byte_len)
-        .map_err(|_| IcbStatus::Args("icb_fill_range_host_size_overflow"))?;
-    let read_gva = mem
-        .gva
-        .checked_add(byte_start)
-        .ok_or(IcbStatus::Args("icb_fill_range_gva_overflow"))?;
-    let mut bytes = vec![0u8; host_len];
-    gva_mem::read_task_gva_by_id(
-        host,
-        &state.tasks,
-        task_id,
-        read_gva,
-        &mut bytes,
-        state.page_shift,
-    )
-    .map_err(|_| IcbStatus::BackendFailed("icb_fill_command_memory_read"))?;
-
-    let mut out = Vec::new();
-    // Concurrent-dispatch capability selects the compute command domain. A
-    // descriptor may retain render bits and still construct, but its render
-    // command setters are not valid; the extra bits do not make the backing
-    // heterogeneous.
-    let compute_command_domain = command_types
+    let inheritance = IcbInheritance {
+        pipeline_state: descriptor.inherit_pipeline_state(),
+        buffers: descriptor.inherit_buffers(),
+    };
+    let compute_command_domain = descriptor.command_types
         & (MTL_INDIRECT_CMD_CONCURRENT_DISPATCH | MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS)
         != 0;
+    let command_size =
+        usize::try_from(layout.command_size).expect("u32 command size always fits the host usize");
+    let mut out = Vec::new();
     for (local_index, i) in (range_location..end).enumerate() {
-        let off = local_index * (layout.command_size as usize);
-        let slot = &bytes[off..off + layout.command_size as usize];
+        let off = local_index * command_size;
+        let slot = &bytes[off..off + command_size];
         let type_offset = layout.command_type_offset as usize;
         if type_offset + 4 > slot.len() {
-            return Err(IcbStatus::Args("icb_fill_command_type_offset_oob"));
+            return Err(IcbCommandBytesDecodeError::Decode(IcbStatus::Args(
+                "icb_fill_command_type_offset_oob",
+            )));
         }
         let command_type = ld32(&slot[type_offset..]);
         if command_type == 0 {
+            out.push(DecodedIcbCommandSlot {
+                command_index: i,
+                command: None,
+            });
             continue;
         }
-        if command_types & command_type == 0 {
-            return Err(IcbStatus::Args("icb_fill_command_type_not_declared"));
+        if descriptor.command_types & command_type == 0 {
+            return Err(IcbCommandBytesDecodeError::Decode(IcbStatus::Args(
+                "icb_fill_command_type_not_declared",
+            )));
         }
         match command_type {
             MTL_INDIRECT_CMD_CONCURRENT_DISPATCH | MTL_INDIRECT_CMD_CONCURRENT_DISPATCH_THREADS => {
                 let Some(mut fill) = decode_compute_command_slot_with_inheritance(
                     &layout,
                     slot,
-                    max_kernel,
+                    descriptor.max_kernel_buffer_bind_count,
                     inheritance,
-                )?
+                )
+                .map_err(IcbCommandBytesDecodeError::Decode)?
                 else {
+                    out.push(DecodedIcbCommandSlot {
+                        command_index: i,
+                        command: None,
+                    });
                     continue;
                 };
                 fill.command_index = i as u32;
-                resolve_compute_fill_offsets(state, host, task_id, &mut fill)?;
-                out.push(IcbCommandFill::Compute(fill));
+                resolve_compute_fill_offsets_with(&mut fill, &mut resolve_buffer_offset)
+                    .map_err(IcbCommandBytesDecodeError::Buffer)?;
+                out.push(DecodedIcbCommandSlot {
+                    command_index: i,
+                    command: Some(IcbCommandFill::Compute(fill)),
+                });
             }
             MTL_INDIRECT_CMD_DRAW
             | MTL_INDIRECT_CMD_DRAW_INDEXED
@@ -1738,27 +1553,39 @@ pub fn decode_icb_command_range<M: HostMemory + HostOps>(
             | MTL_INDIRECT_CMD_DRAW_MESH_THREADGROUPS
             | MTL_INDIRECT_CMD_DRAW_MESH_THREADS => {
                 if compute_command_domain {
-                    return Err(IcbStatus::Args("icb_fill_render_command_in_compute_domain"));
+                    return Err(IcbCommandBytesDecodeError::Decode(IcbStatus::Args(
+                        "icb_fill_render_command_in_compute_domain",
+                    )));
                 }
                 let Some(mut fill) = decode_render_command_slot_with_inheritance(
                     &layout,
                     slot,
-                    max_vertex,
-                    max_fragment,
+                    descriptor.max_vertex_buffer_bind_count,
+                    descriptor.max_fragment_buffer_bind_count,
                     inheritance,
-                )?
+                )
+                .map_err(IcbCommandBytesDecodeError::Decode)?
                 else {
+                    out.push(DecodedIcbCommandSlot {
+                        command_index: i,
+                        command: None,
+                    });
                     continue;
                 };
                 fill.command_index = i as u32;
-                resolve_render_fill_offsets(state, host, task_id, &mut fill)?;
-                out.push(IcbCommandFill::Render(fill));
+                resolve_render_fill_offsets_with(&mut fill, &mut resolve_buffer_offset)
+                    .map_err(IcbCommandBytesDecodeError::Buffer)?;
+                out.push(DecodedIcbCommandSlot {
+                    command_index: i,
+                    command: Some(IcbCommandFill::Render(fill)),
+                });
             }
-            _ => return Err(IcbStatus::Args("icb_fill_unknown_command_type")),
+            _ => {
+                return Err(IcbCommandBytesDecodeError::Decode(IcbStatus::Args(
+                    "icb_fill_unknown_command_type",
+                )))
+            }
         }
     }
     Ok(out)
 }
-
-#[cfg(test)]
-mod tests;

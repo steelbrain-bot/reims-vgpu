@@ -96,26 +96,6 @@ use crate::runtime::host::HostAction;
 /// lost.
 const ENGINE_WINDOW_REDRAW_BACKSTOP: std::time::Duration =
     std::time::Duration::from_millis(GUEST_RESIZE_WARN_AFTER.as_millis() as u64 / 10);
-/// How many rebuilds of the presenter may go unproven before the window stops
-/// trying.
-///
-/// Derived from the engine's own device-recreate budget — and, the part that
-/// matters, **a storm budget in the same sense rather than a lifetime cap**.
-/// `ContextOwner::note_work_completed` zeroes `recreate_count` the moment guest
-/// work runs on a rebuilt device, on the reasoning that a device which recovered
-/// and is lost again later is a new incident and not the fourth step of the old
-/// one. Exactly the same holds for the presenter, so [`App::draw`] zeroes
-/// [`App::engine_reattempts`] on a present that reached the screen. What the
-/// bound then stops is a surface that genuinely cannot be created being retried
-/// once per redraw forever.
-///
-/// Reading it as a lifetime cap was measured wrong on real hardware, and the
-/// measurement is why this doc is here. A driven macos-11 boot lost the device
-/// more than eight times; the window rebuilt the presenter on the first three,
-/// logged `host_window_reattach status=ok attempt=3`, spent the budget, and sat
-/// out every later loss with the picture gone — which is most of the defect the
-/// re-attach exists to remove, reintroduced by its own bound.
-const MAX_ENGINE_REATTACHES: u32 = crate::runtime::executor::MAX_WINDOW_REATTACHES;
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
 /// apply within single-digit milliseconds; one second means the window system
@@ -326,17 +306,17 @@ impl WindowWaker {
 /// frame.
 fn window_presentation_frame(
     frame: &Frame,
-) -> crate::runtime::executor::WindowPresentationFrame<'_> {
+) -> crate::runtime::replacement_services::WindowPresentationFrame<'_> {
     let payload = match &frame.payload {
         FramePayload::CpuBgra { bgra, .. } => {
-            crate::runtime::executor::WindowPresentationPayload::CpuBgra(bgra)
+            crate::runtime::replacement_services::WindowPresentationPayload::CpuBgra(bgra)
         }
         FramePayload::Resident(resident) => {
-            crate::runtime::executor::WindowPresentationPayload::Resident(resident)
+            crate::runtime::replacement_services::WindowPresentationPayload::Resident(resident)
         }
     };
     let (width, height) = frame.payload.dimensions();
-    crate::runtime::executor::WindowPresentationFrame {
+    crate::runtime::replacement_services::WindowPresentationFrame {
         width,
         height,
         seq: frame.seq,
@@ -497,7 +477,7 @@ pub type ExitedFlag = Arc<AtomicBool>;
 /// process window, creating the native window, or attaching the engine
 /// presenter to it. Nothing here describes a swapchain or a blit — those belong
 /// to the engine presenter, which types its own declines
-/// ([`reims_vgpu_vulkan::engine`]'s `DrawError`), and there is no second
+/// (the Vulkan presentation adapter's `DrawError`), and there is no second
 /// presenter in this file to type declines for. The executor boundary preserves
 /// those decline fields in `WindowPresentationError` without exposing the
 /// backend error type to this loop.
@@ -613,7 +593,7 @@ impl std::error::Error for WindowError {}
 /// Spawn the window on a dedicated thread and return its join handle. The thread
 /// owns the winit event loop for its lifetime; it exits when the window closes.
 pub fn spawn(
-    executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
+    presenter: std::sync::Arc<dyn crate::runtime::replacement_services::WindowPresentationService>,
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
@@ -622,7 +602,7 @@ pub fn spawn(
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(executor, config, on_input, frames, stop, wake))
+        .spawn(move || run(presenter, config, on_input, frames, stop, wake))
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -630,17 +610,17 @@ pub fn spawn(
 /// closes). Prefer [`spawn`]; call this directly only if you already own a
 /// suitable thread.
 pub fn run(
-    executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
+    presenter: std::sync::Arc<dyn crate::runtime::replacement_services::WindowPresentationService>,
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
 ) -> Result<(), WindowError> {
-    let _scope = executor.enter();
+    let _scope = presenter.enter_window_presentation();
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
-    let mut app = App::new(executor, config, on_input, frames, stop);
+    let mut app = App::new(presenter, config, on_input, frames, stop);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -652,7 +632,7 @@ struct MainThreadWindow {
     event_loop: EventLoop<FramePublished>,
     app: App,
     exited: ExitedFlag,
-    _engine_scope: crate::runtime::executor::ExecutionScope,
+    _presentation_scope: crate::runtime::replacement_services::WindowPresentationScope,
 }
 
 #[cfg(target_os = "macos")]
@@ -663,7 +643,8 @@ thread_local! {
 #[cfg(target_os = "macos")]
 pub struct MainThreadWindowStart {
     pub id: u64,
-    pub executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
+    pub presenter:
+        std::sync::Arc<dyn crate::runtime::replacement_services::WindowPresentationService>,
     pub config: WindowConfig,
     pub on_input: InputSink,
     pub frames: FrameSlot,
@@ -683,7 +664,7 @@ pub struct MainThreadWindowStart {
 pub fn start_main_thread(start: MainThreadWindowStart) -> Result<(), WindowError> {
     let MainThreadWindowStart {
         id,
-        executor,
+        presenter,
         config,
         on_input,
         frames,
@@ -702,14 +683,14 @@ pub fn start_main_thread(start: MainThreadWindowStart) -> Result<(), WindowError
         }
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
-        let app = App::new(executor.clone(), config, on_input, frames, stop);
-        let engine_scope = executor.enter();
+        let app = App::new(presenter.clone(), config, on_input, frames, stop);
+        let presentation_scope = presenter.enter_window_presentation();
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
             app,
             exited,
-            _engine_scope: engine_scope,
+            _presentation_scope: presentation_scope,
         });
         Ok(())
     })
@@ -765,7 +746,7 @@ fn build_event_loop() -> Result<EventLoop<FramePublished>, WindowError> {
 }
 
 struct App {
-    executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
+    presenter: std::sync::Arc<dyn crate::runtime::replacement_services::WindowPresentationService>,
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
@@ -784,12 +765,6 @@ struct App {
     first_engine_present_logged: bool,
     first_engine_guest_logged: bool,
     engine_error_logged: bool,
-    /// How many times [`App::reattach_engine`] has rebuilt, or tried to rebuild,
-    /// the presenter after a device loss. Bounded by
-    /// [`MAX_ENGINE_REATTACHES`] so a surface that cannot be recreated is
-    /// retried a few times and then left alone, rather than once per redraw for
-    /// the life of the boot.
-    engine_reattempts: u32,
     /// A [`FramePublished`] arrived (or a present asked to be repeated) and no
     /// redraw has been requested for it yet. Consumed by `about_to_wait`, which
     /// is the one place that talks to the platform about redraws.
@@ -986,7 +961,7 @@ impl ApplicationHandler<FramePublished> for App {
             WindowEvent::Resized(size) => {
                 let applied = (size.width.max(1), size.height.max(1));
                 if self.engine_attached {
-                    self.executor.resize_window_presenter(applied.0, applied.1);
+                    self.presenter.resize_window_presenter(applied.0, applied.1);
                     self.note_guest_resize_applied(applied);
                 }
                 // Fresh swapchain images hold nothing; the seq gate would
@@ -1039,7 +1014,7 @@ impl ApplicationHandler<FramePublished> for App {
         // takes the presenter — the engine's own device-loss flush — did not
         // know to.
         if self.engine_attached {
-            self.executor.detach_window_presenter();
+            self.presenter.detach_window_presenter();
             self.engine_attached = false;
         }
         self.window = None;
@@ -1126,14 +1101,16 @@ impl App {
     /// four they are given is fixed. Written out at each site, a field added
     /// to the struct could be initialised in one and missed in the other.
     fn new(
-        executor: std::sync::Arc<dyn crate::runtime::executor::Executor>,
+        presenter: std::sync::Arc<
+            dyn crate::runtime::replacement_services::WindowPresentationService,
+        >,
         config: WindowConfig,
         on_input: InputSink,
         frames: FrameSlot,
         stop: StopFlag,
     ) -> Self {
         Self {
-            executor,
+            presenter,
             config,
             on_input,
             frames,
@@ -1145,7 +1122,6 @@ impl App {
             first_engine_present_logged: false,
             first_engine_guest_logged: false,
             engine_error_logged: false,
-            engine_reattempts: 0,
             // The first tick draws: `engine_redraw_required` is set and there is
             // no publish behind the first frame, which is a clear rather than a
             // guest frame.
@@ -1216,10 +1192,9 @@ impl App {
     /// host copies every presented layer otherwise pays: the drain's
     /// `read_target`, the publish copy, and a staging upload.
     ///
-    /// Taken out of `resumed` so [`Self::reattach_engine`] can run it again on a
-    /// window that already exists. `window_present_attach` is idempotent — it
-    /// returns `Ok` if a presenter is already there — so calling it twice is
-    /// safe, and it is the engine that publishes the attached flag.
+    /// The replacement epoch owns the presenter for the lifetime of this
+    /// native window. A second attach is therefore a typed refusal rather than
+    /// an implicit rebuild or retry policy in the window loop.
     fn attach_engine(&self, window: &Arc<Window>) -> Result<(), WindowError> {
         let display = window
             .display_handle()
@@ -1230,64 +1205,9 @@ impl App {
             .map_err(|error| WindowError::AttachWindowHandle(error.to_string()))?
             .as_raw();
         let size = window.inner_size();
-        self.executor
+        self.presenter
             .attach_window_presenter(display, handle, size.width.max(1), size.height.max(1))
             .map_err(|error| WindowError::AttachEngine(error.to_string()))
-    }
-
-    /// Rebuild the presenter after the engine device was lost and recreated.
-    ///
-    /// # Why the window has to do this and nothing else can
-    ///
-    /// A `VK_ERROR_DEVICE_LOST` poisons the engine device; the next guest draw
-    /// destroys everything derived from it — caches, pools, and the presenter's
-    /// swapchain, surface and semaphores — and brings a fresh `VkDevice` up.
-    /// Every *guest* resource then rebuilds itself on demand, because the
-    /// registry is keyed by a `TargetIdentity` the guest re-presents and
-    /// `registry_ensure` recreates whatever is missing. The presenter was the
-    /// one thing with no such path: its only constructor sits in `resumed`,
-    /// winit calls `resumed` once per window, so the swapchain died and stayed
-    /// dead. The device recovered, the guest recovered, and the picture did not
-    /// come back for the rest of the boot — measured as seven recreates in one
-    /// driven macos-11 boot, after which every leg reported no frames at all.
-    ///
-    /// Bounded, and the bound is the point: a surface that genuinely cannot be
-    /// recreated must not be retried once per redraw forever. Past the bound the
-    /// window keeps running on whatever the previous behaviour was — a named
-    /// refusal per present — rather than spinning.
-    fn reattach_engine(&mut self) {
-        let Some(window) = self.window.clone() else {
-            return;
-        };
-        if self.engine_reattempts >= MAX_ENGINE_REATTACHES {
-            return;
-        }
-        self.engine_reattempts += 1;
-        match self.attach_engine(&window) {
-            Ok(()) => {
-                // The presenter is new, so nothing on screen came from it and
-                // the sequence this loop last presented is not its history.
-                // Clearing it is what makes the next frame count as fresh
-                // instead of stale, which is the difference between recovering
-                // and looking recovered.
-                self.last_engine_seq = None;
-                self.engine_redraw_required = true;
-                self.engine_error_logged = false;
-                crate::observe::off(format!(
-                    "host_window_reattach status=ok attempt={}",
-                    self.engine_reattempts
-                ));
-                eprintln!(
-                    "reims-vgpu-window: engine presenter rebuilt after device loss \
-                     (attempt {})",
-                    self.engine_reattempts
-                );
-                self.force_redraw();
-            }
-            Err(error) => {
-                crate::observe::Emit::decline("host_window_reattach", &error).fail();
-            }
-        }
     }
 
     /// Present one frame through the engine presenter, or decide there is
@@ -1324,11 +1244,11 @@ impl App {
         }
         self.loop_census.draws_fresh += 1;
         let result = self
-            .executor
+            .presenter
             .present_window_frame(frame.as_deref().map(window_presentation_frame));
         match result {
-            Ok(crate::runtime::executor::WindowPresentOutcome::Busy) => {}
-            Ok(crate::runtime::executor::WindowPresentOutcome::Presented {
+            Ok(crate::runtime::replacement_services::WindowPresentOutcome::Busy) => {}
+            Ok(crate::runtime::replacement_services::WindowPresentOutcome::Presented {
                 route,
                 width,
                 height,
@@ -1336,13 +1256,6 @@ impl App {
                 suboptimal,
             }) => {
                 self.engine_error_logged = false;
-                // A frame reached the screen, so whatever rebuilt the presenter
-                // is proven and its budget starts over — the same rule, for the
-                // same reason, as `ContextOwner::note_work_completed` applies to
-                // the device's own recreate count. Without this the bound is a
-                // lifetime cap and a rail that recovers eight times is left dark
-                // after the third. See [`MAX_ENGINE_REATTACHES`].
-                self.engine_reattempts = 0;
                 self.last_engine_seq = incoming_seq;
                 // A suboptimal present armed a swapchain recreation; redraw
                 // promptly so the corrected drawable replaces this one even if
@@ -1384,13 +1297,6 @@ impl App {
                     crate::observe::Emit::decline("host_window_present", &error).fail();
                     eprintln!("reims-vgpu-window: engine resident present failed: {error}");
                     self.engine_error_logged = true;
-                }
-                // This one error is recoverable and every other one is the
-                // presenter's own: it says the presenter is *gone*, which on a
-                // running window means a device loss destroyed it. See
-                // [`Self::reattach_engine`].
-                if error.presenter_detached() {
-                    self.reattach_engine();
                 }
             }
         }
@@ -1438,7 +1344,7 @@ impl App {
         if let Some(applied) = immediate {
             // Applied synchronously — winit emits no later `Resized` for it.
             let applied = (applied.width.max(1), applied.height.max(1));
-            self.executor.resize_window_presenter(applied.0, applied.1);
+            self.presenter.resize_window_presenter(applied.0, applied.1);
             self.engine_redraw_required = true;
             self.note_guest_resize_applied(applied);
         }
@@ -1631,7 +1537,7 @@ mod tests {
         };
         assert!(matches!(
             window_presentation_frame(&cpu).payload,
-            crate::runtime::executor::WindowPresentationPayload::CpuBgra(bytes)
+            crate::runtime::replacement_services::WindowPresentationPayload::CpuBgra(bytes)
                 if bytes == [0x55; 16]
         ));
 
@@ -1648,7 +1554,7 @@ mod tests {
         };
         assert!(matches!(
             window_presentation_frame(&resident).payload,
-            crate::runtime::executor::WindowPresentationPayload::Resident(prepared)
+            crate::runtime::replacement_services::WindowPresentationPayload::Resident(prepared)
                 if prepared.source() == &source
         ));
     }

@@ -25,6 +25,47 @@ pub const DEVICE_DESC_BPE: usize = 0x20;
 pub const DEVICE_DESC_PLANE_COUNT: usize = 0x24;
 pub const DEVICE_DESC_PLANES: usize = 0x40;
 
+/// CoreVideo / IOSurface biplanar 420 full-range (`'420f'`).
+pub const IOSURFACE_FOURCC_420F: u32 = 0x3432_3066;
+/// CoreVideo / IOSurface biplanar 420 video-range (`'420v'`).
+pub const IOSURFACE_FOURCC_420V: u32 = 0x3432_3076;
+
+/// Whether an IOSurface OSType names the two-plane 8-bit 4:2:0 family.
+pub const fn iosurface_fourcc_is_biplanar(pixel_format: u32) -> bool {
+    matches!(pixel_format, IOSURFACE_FOURCC_420F | IOSURFACE_FOURCC_420V)
+}
+
+/// Convert an IOSurface OSType to one single-plane Metal pixel format.
+///
+/// Multi-plane and unknown OSTypes have no lossless single-format projection
+/// and return zero so callers can refuse them explicitly.
+pub const fn iosurface_pixel_format_to_mtl(pixel_format: u32) -> u16 {
+    use crate::metal_pixel::{
+        MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_R8_UNORM, MTL_FORMAT_RG8_UNORM, MTL_FORMAT_RGBA16_FLOAT,
+        MTL_FORMAT_RGBA8_UNORM,
+    };
+    match pixel_format {
+        0x4247_5241 | 0x4152_4742 => MTL_FORMAT_BGRA8_UNORM,
+        0x5247_4241 => MTL_FORMAT_RGBA8_UNORM,
+        0x5247_6841 | 0x4168_4752 => MTL_FORMAT_RGBA16_FLOAT,
+        0x5238_2020 => MTL_FORMAT_R8_UNORM,
+        0x5247_3038 => MTL_FORMAT_RG8_UNORM,
+        _ => 0,
+    }
+}
+
+/// Project the descriptor's dual-encoding pixel-format word to Metal.
+///
+/// Metal ordinals fit in the descriptor's 16-bit plane-format vocabulary;
+/// wider values are IOSurface OSTypes and go through the explicit table.
+pub const fn device_desc_format_to_mtl(raw: u32) -> u16 {
+    if raw <= u16::MAX as u32 {
+        raw as u16
+    } else {
+        iosurface_pixel_format_to_mtl(raw)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceSurfaceRecord {
     pub pixel_format: u32,
@@ -278,6 +319,22 @@ mod tests {
         );
         assert_eq!(format_bytes_per_pixel(MTL_FORMAT_R8_UNORM), Some(1));
         assert_eq!(decode_device_surface(&[0; DEVICE_DESC_LEN - 1]), None);
+    }
+
+    #[test]
+    fn device_format_projection_distinguishes_ordinals_fourccs_and_planes() {
+        use crate::metal_pixel::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA16_FLOAT};
+
+        assert_eq!(
+            device_desc_format_to_mtl(u32::from(MTL_FORMAT_RGBA16_FLOAT)),
+            MTL_FORMAT_RGBA16_FLOAT
+        );
+        assert_eq!(
+            device_desc_format_to_mtl(0x4247_5241),
+            MTL_FORMAT_BGRA8_UNORM
+        );
+        assert_eq!(device_desc_format_to_mtl(IOSURFACE_FOURCC_420F), 0);
+        assert_eq!(device_desc_format_to_mtl(0x5a5a_5a5a), 0);
     }
 
     #[test]

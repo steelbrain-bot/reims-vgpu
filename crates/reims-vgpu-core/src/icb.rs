@@ -8,7 +8,9 @@ use reims_vgpu_protocol::{
     SerializerRef, TaskId,
 };
 
-use crate::{NamespaceError, ReferenceNamespace};
+use crate::{
+    IndirectCommandBufferResolution, IndirectCommandResolver, NamespaceError, ReferenceNamespace,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcbRecord {
@@ -126,6 +128,22 @@ impl IcbRegistry {
     }
 }
 
+impl IndirectCommandResolver for IcbRegistry {
+    fn resolve_indirect_command_buffer(
+        &self,
+        task: TaskId,
+        reference: SerializerRef<IndirectCommandBufferObject>,
+    ) -> Option<IndirectCommandBufferResolution> {
+        let inner = self.lock();
+        let entry = inner.records.get(&(task, reference))?;
+        debug_assert_eq!(inner.namespace.resolve(task, reference), Some(entry.id));
+        Some(IndirectCommandBufferResolution {
+            identity: entry.id,
+            max_command_count: entry.record.descriptor.max_command_count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +177,25 @@ mod tests {
         assert_eq!(registry.delete_task(1), 1);
         assert!(registry.identity(1, 9).is_none());
         assert!(registry.identity(2, 9).is_some());
+    }
+
+    #[test]
+    fn mutation_resolution_is_one_atomic_generation_snapshot() {
+        let registry = IcbRegistry::default();
+        registry
+            .record(
+                1,
+                9,
+                IndirectCommandBufferDescriptor {
+                    max_command_count: 17,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let resolved = registry
+            .resolve_indirect_command_buffer(TaskId::new(1), SerializerRef::new(9))
+            .unwrap();
+        assert_eq!(resolved.identity, registry.identity(1, 9).unwrap());
+        assert_eq!(resolved.max_command_count, 17);
     }
 }

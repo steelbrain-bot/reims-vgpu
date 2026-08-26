@@ -26,6 +26,7 @@ reims-vgpu-observe = { path = "../reims-vgpu-observe" }
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
 reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
 reims-vgpu-wire = { path = "../reims-vgpu-wire" }
+spirv = "0.4"
 
 [dev-dependencies]
 reims-vgpu-testkit = { path = "../reims-vgpu-testkit" }

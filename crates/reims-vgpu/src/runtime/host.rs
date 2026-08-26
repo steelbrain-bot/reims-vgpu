@@ -652,6 +652,7 @@ pub struct FakeHost {
     pub actions: Vec<HostAction>,
     pub mono_ns: u64,
     pub bh_scheduled: bool,
+    worker_wakes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// When true (any host platform): `map_pages` models a host that can return
     /// only an already-packed sequential alias. The product x86 shim can also
     /// reconstruct scattered shared pages; this narrower fixture exercises the
@@ -799,6 +800,10 @@ impl Drop for FakeHost {
 impl FakeHost {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn worker_wake_count(&self) -> u64 {
+        self.worker_wakes.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Report `[base, base + len)` as device memory rather than guest RAM, so
@@ -1248,6 +1253,13 @@ impl HostControl for FakeHost {
 
     fn schedule_bh(&mut self) {
         self.bh_scheduled = true;
+    }
+
+    fn worker_wake(&self) -> WorkerWake {
+        let wakes = std::sync::Arc::clone(&self.worker_wakes);
+        WorkerWake::new(move || {
+            wakes.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        })
     }
 }
 

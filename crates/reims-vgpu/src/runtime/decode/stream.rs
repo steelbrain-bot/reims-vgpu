@@ -254,10 +254,7 @@ pub fn decode_next_segment(bytes: &[u8], cursor: &mut usize) -> Result<Segment, 
     let segment_index = segment_index_for_offset(bytes, *cursor as u32)?;
     let continues_previous = header[SEGMENT_CONTINUES_PREVIOUS_OFFSET] != 0;
     let continues_next = header[SEGMENT_CONTINUES_NEXT_OFFSET] != 0;
-    crate::runtime::drain::note_store_route(segment_chain_route(
-        continues_previous,
-        continues_next,
-    ));
+    crate::runtime::contract_census::note(segment_chain_route(continues_previous, continues_next));
     let out = Segment {
         offset: *cursor as u32,
         length: segment_len as u32,

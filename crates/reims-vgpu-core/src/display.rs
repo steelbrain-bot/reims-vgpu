@@ -102,6 +102,49 @@ pub struct DisplaySharedPage {
     pub display_index: u32,
 }
 
+pub const DISPLAY_SHARED_PENDING_OFFSET: u64 = 0x100;
+pub const DISPLAY_SHARED_ENABLE_MASK_OFFSET: u64 = 0x104;
+pub const DISPLAY_PRESENT_EVENT_MASK: u32 = 1 << 1;
+pub const DISPLAY_ONLINE_EVENT_MASK: u32 = 1 << 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisplayPresentNotification {
+    Disabled(DisplaySharedPage),
+    Deliver {
+        page: DisplaySharedPage,
+        pending: u32,
+        interrupt_bit: u32,
+        stale_online_removed: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisplayPresentNotificationError {
+    SharedPageUnavailable,
+    EnableMaskUnreadable(DisplaySharedPage),
+    PendingUnreadable(DisplaySharedPage),
+    DisplayIndexOutOfRange(DisplaySharedPage),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisplayOnlineNotification {
+    Idle,
+    WaitingForEnable(DisplaySharedPage),
+    Deliver {
+        page: DisplaySharedPage,
+        pending: u32,
+        interrupt_bit: u32,
+        first_pulse: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisplayOnlineNotificationError {
+    EnableMaskUnreadable(DisplaySharedPage),
+    PendingUnreadable(DisplaySharedPage),
+    DisplayIndexOutOfRange(DisplaySharedPage),
+}
+
 /// One online-handshake poll after lifecycle admission and cadence decisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayOnlinePoll {
@@ -146,6 +189,73 @@ impl DisplayHandshake {
     /// Complete the online handshake for the current shared-page generation.
     pub fn acknowledge_online(&mut self) {
         self.online_acked = true;
+    }
+
+    /// Plan the guest-visible completion event for one successfully presented
+    /// frame. Memory values are supplied by the host adapter; this owner alone
+    /// decides whether the class is enabled and whether an acknowledged stale
+    /// ONLINE bit may be removed.
+    pub fn plan_present_notification(
+        &self,
+        enable_mask: Option<u32>,
+        pending: Option<u32>,
+    ) -> Result<DisplayPresentNotification, DisplayPresentNotificationError> {
+        let page = self
+            .shared_page()
+            .ok_or(DisplayPresentNotificationError::SharedPageUnavailable)?;
+        let enable_mask =
+            enable_mask.ok_or(DisplayPresentNotificationError::EnableMaskUnreadable(page))?;
+        if enable_mask & DISPLAY_PRESENT_EVENT_MASK == 0 {
+            return Ok(DisplayPresentNotification::Disabled(page));
+        }
+        let pending = pending.ok_or(DisplayPresentNotificationError::PendingUnreadable(page))?;
+        let interrupt_bit = 1u32.checked_shl(page.display_index).ok_or(
+            DisplayPresentNotificationError::DisplayIndexOutOfRange(page),
+        )?;
+        let stale_online_removed = self.online_acked && pending & DISPLAY_ONLINE_EVENT_MASK != 0;
+        let pending = if stale_online_removed {
+            pending & !DISPLAY_ONLINE_EVENT_MASK
+        } else {
+            pending
+        } | DISPLAY_PRESENT_EVENT_MASK;
+        Ok(DisplayPresentNotification::Deliver {
+            page,
+            pending,
+            interrupt_bit,
+            stale_online_removed,
+        })
+    }
+
+    /// Plan one idempotent ONLINE offer. A generation remains eligible on
+    /// every host poll until the guest acknowledges it; the API declares no
+    /// retry limit or cadence that would authorize abandoning the handshake.
+    pub fn plan_online_notification(
+        &self,
+        enable_mask: Option<u32>,
+        pending: Option<u32>,
+    ) -> Result<DisplayOnlineNotification, DisplayOnlineNotificationError> {
+        let Some(page) = self.shared_page() else {
+            return Ok(DisplayOnlineNotification::Idle);
+        };
+        if self.online_acked {
+            return Ok(DisplayOnlineNotification::Idle);
+        }
+        let enable_mask =
+            enable_mask.ok_or(DisplayOnlineNotificationError::EnableMaskUnreadable(page))?;
+        if enable_mask & DISPLAY_ONLINE_EVENT_MASK == 0 {
+            return Ok(DisplayOnlineNotification::WaitingForEnable(page));
+        }
+        let pending = pending.ok_or(DisplayOnlineNotificationError::PendingUnreadable(page))?
+            | DISPLAY_ONLINE_EVENT_MASK;
+        let interrupt_bit = 1u32
+            .checked_shl(page.display_index)
+            .ok_or(DisplayOnlineNotificationError::DisplayIndexOutOfRange(page))?;
+        Ok(DisplayOnlineNotification::Deliver {
+            page,
+            pending,
+            interrupt_bit,
+            first_pulse: self.online_tries == 0,
+        })
     }
 
     /// Advance one online poll and decide whether the caller may inspect/pulse.
@@ -278,5 +388,102 @@ mod tests {
             display.begin_online_poll(3, 4),
             DisplayOnlinePoll::Exhausted(_)
         ));
+    }
+
+    #[test]
+    fn replacement_online_plan_never_abandons_an_unacknowledged_generation() {
+        let mut display = DisplayHandshake::default();
+        display.reinitialize(3, 0x4000);
+        for pulse in 0..1_000 {
+            let planned = display
+                .plan_online_notification(
+                    Some(DISPLAY_ONLINE_EVENT_MASK),
+                    Some(DISPLAY_PRESENT_EVENT_MASK),
+                )
+                .unwrap();
+            assert_eq!(
+                planned,
+                DisplayOnlineNotification::Deliver {
+                    page: DisplaySharedPage {
+                        gpa: 0x4000,
+                        display_index: 3,
+                    },
+                    pending: DISPLAY_ONLINE_EVENT_MASK | DISPLAY_PRESENT_EVENT_MASK,
+                    interrupt_bit: 1 << 3,
+                    first_pulse: pulse == 0,
+                }
+            );
+            display.record_online_pulse();
+        }
+        display.acknowledge_online();
+        assert_eq!(
+            display
+                .plan_online_notification(Some(DISPLAY_ONLINE_EVENT_MASK), Some(0))
+                .unwrap(),
+            DisplayOnlineNotification::Idle
+        );
+    }
+
+    #[test]
+    fn present_notification_preserves_only_a_live_online_event() {
+        let mut display = DisplayHandshake::default();
+        display.reinitialize(3, 0x4000);
+        assert_eq!(
+            display
+                .plan_present_notification(
+                    Some(DISPLAY_PRESENT_EVENT_MASK),
+                    Some(DISPLAY_ONLINE_EVENT_MASK),
+                )
+                .unwrap(),
+            DisplayPresentNotification::Deliver {
+                page: DisplaySharedPage {
+                    gpa: 0x4000,
+                    display_index: 3,
+                },
+                pending: DISPLAY_ONLINE_EVENT_MASK | DISPLAY_PRESENT_EVENT_MASK,
+                interrupt_bit: 1 << 3,
+                stale_online_removed: false,
+            }
+        );
+
+        display.acknowledge_online();
+        assert_eq!(
+            display
+                .plan_present_notification(
+                    Some(DISPLAY_PRESENT_EVENT_MASK),
+                    Some(DISPLAY_ONLINE_EVENT_MASK),
+                )
+                .unwrap(),
+            DisplayPresentNotification::Deliver {
+                page: DisplaySharedPage {
+                    gpa: 0x4000,
+                    display_index: 3,
+                },
+                pending: DISPLAY_PRESENT_EVENT_MASK,
+                interrupt_bit: 1 << 3,
+                stale_online_removed: true,
+            }
+        );
+    }
+
+    #[test]
+    fn present_notification_requires_the_guest_enable_and_exact_pending_word() {
+        let mut display = DisplayHandshake::default();
+        display.reinitialize(u32::BITS, 0x4000);
+        let page = display.shared_page().unwrap();
+        assert_eq!(
+            display.plan_present_notification(Some(0), None),
+            Ok(DisplayPresentNotification::Disabled(page))
+        );
+        assert_eq!(
+            display.plan_present_notification(Some(DISPLAY_PRESENT_EVENT_MASK), None),
+            Err(DisplayPresentNotificationError::PendingUnreadable(page))
+        );
+        assert_eq!(
+            display.plan_present_notification(Some(DISPLAY_PRESENT_EVENT_MASK), Some(0)),
+            Err(DisplayPresentNotificationError::DisplayIndexOutOfRange(
+                page
+            ))
+        );
     }
 }

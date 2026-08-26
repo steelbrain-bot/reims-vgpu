@@ -1,0 +1,35 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) buffer Destination {
+    uint words[];
+} destination;
+
+layout(push_constant) uniform Fill {
+    uint start;
+    uint byte_count;
+    uint pattern;
+    uint pattern_width;
+    uint word_count;
+} fill;
+
+void main() {
+    uint invocation_count = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint word = gl_GlobalInvocationID.x;
+         word < fill.word_count;
+         word += invocation_count) {
+        uint value = destination.words[word];
+        for (uint lane = 0; lane < 4; lane++) {
+            uint byte_offset = word * 4 + lane;
+            if (byte_offset >= fill.start &&
+                byte_offset - fill.start < fill.byte_count) {
+                uint phase = (byte_offset - fill.start) % fill.pattern_width;
+                uint shift = lane * 8;
+                uint pattern_byte = (fill.pattern >> (phase * 8)) & 0xff;
+                value = (value & ~(0xff << shift)) | (pattern_byte << shift);
+            }
+        }
+        destination.words[word] = value;
+    }
+}

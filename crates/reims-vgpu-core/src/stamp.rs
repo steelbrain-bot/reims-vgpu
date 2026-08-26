@@ -49,7 +49,6 @@ impl StampLedger {
     }
 
     pub fn wrote(&mut self, slot: u32, value: u32, page_bytes: u64) {
-        let slot = slot & reims_vgpu_protocol::STAMP_INDEX_MASK;
         if !slot_fits(slot, page_bytes) {
             return;
         }
@@ -83,7 +82,6 @@ impl StampLedger {
     }
 
     fn fold(map: &mut BTreeMap<u32, u32>, slot: u32, value: u32, page_bytes: u64) {
-        let slot = slot & reims_vgpu_protocol::STAMP_INDEX_MASK;
         if !slot_fits(slot, page_bytes) {
             return;
         }

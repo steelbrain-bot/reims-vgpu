@@ -1244,23 +1244,16 @@ pub const OPCODE_USE_RESOURCES_NO_STAGES: u32 = 0x87;
 /// encoder itself and write [`OPCODE_USE_HEAP`] / [`OPCODE_USE_RESOURCE`]. The
 /// unqualified `useHeaps:count:` and `useResources:count:usage:` are declared
 /// one class up, on the encoder base class every encoder derives from, and write
-/// these two. A render encoder answers all four, so a decoder that knows only
-/// the qualified pair sees a guest's `useResources:count:usage:` as an
-/// unimplemented opcode — the same shape as the `0x7d`/`0xa5` split that
-/// [`BufferStrideBind`] warns about, one level up.
-///
-/// They are invisible to [`crate::manifest`], which is built per class from each
-/// class's own method list; see the inheritance caveat there.
+/// these two. A render encoder answers all four, so the decoder must preserve
+/// all three distinct heads rather than reading an inherited record with a
+/// qualified form's offsets.
 ///
 /// # This head is a size, not a field map
 ///
-/// The record is a four-byte head followed by `count` four-byte refs, and
-/// `count` is the only field this device reads — residency is answered by doing
-/// nothing, so the head exists here to make the refs start in the right place
-/// and to let `count` bound the record. No fixture on a non-Apple checkout pins
-/// it; what stands behind the size is the emitted record length, and a wrong one
-/// fails the `count == refs.len()` check in `runtime::decode::render` rather
-/// than silently reading a ref short.
+/// The record is a four-byte head followed by `count` four-byte refs. The head
+/// makes the refs start in the right place and lets `count` bound the record.
+/// Singular and plural oracle fixtures pin both the head size and the repeated
+/// ref placement.
 #[repr(C)]
 #[derive(Debug)]
 pub struct UseHeapsNoStages {

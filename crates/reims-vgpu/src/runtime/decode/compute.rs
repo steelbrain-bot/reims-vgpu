@@ -1,56 +1,41 @@
 //! Compute command decoder (port of `host/utils/reims-vgpu-compute-decode`).
 
-use reims_vgpu_core::endian::ld32;
-use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject, SerializerRef};
+use reims_vgpu_protocol::{
+    HeapObject, ObjectTableRef, ResourceObject, ResourceUsage, SerializerRef,
+};
 use reims_vgpu_wire::ops::compute as wire;
+use reims_vgpu_wire::ops::render as shared_encoder_wire;
 
 /// Shared serializer op-header length from `reims-vgpu-wire`.
 use reims_vgpu_wire::OP_HEADER_LEN;
 
-/// Residency on the compute rail.
+/// Argument-buffer participation on the compute rail.
 ///
 /// # These are inherited, not unsupported
 ///
 /// This doc used to say the pair had **no selector behind it at all**: the
 /// compute encoder's own selector list carries no `useHeaps:`/`useResources:`,
 /// so — the argument went — nothing in the serializer can produce these two
-/// numbers, and `compute_noop_residency_hint` reading zero on a driven boot was
-/// that conclusion confirmed.
+/// numbers, and a zero runtime counter was once read as confirming that
+/// conclusion.
 ///
-/// The premise is true and the conclusion does not follow. Residency is declared
-/// on the encoder base class, which every encoder derives from, in an
+/// The premise is true and the conclusion does not follow. Participation is
+/// declared on the encoder base class, which every encoder derives from, in an
 /// unqualified `useHeaps:count:` / `useResources:count:usage:` pair; only the
 /// `stages:`-qualified overrides are declared on the render encoder, which is
-/// why those are the only ones that appear in
-/// [`reims_vgpu_wire::manifest`]. That manifest is built from each class's *own*
-/// method list and has no row for the base class, so a base-class selector is
-/// absent from it while being callable on every encoder — see the caveat in that
-/// module, which this is the worked example of.
+/// why those are the only ones the render class declares itself.
 ///
 /// So a compute encoder does answer `useHeaps:count:`, and these are the numbers
 /// it emits. The zero counter says this workload never issued one, which is the
 /// ordinary reading of a healthy zero, not evidence that the arm is unreachable.
 ///
-/// The layouts agree independently: the emitted record for `useHeaps:count:` is
+/// Native fixtures establish the layouts: `useHeaps:count:` is
 /// a four-byte head and `count` four-byte refs, and for
 /// `useResources:count:usage:` an eight-byte head and the same refs — which is
-/// exactly [`COUNT_BASE`] and [`BIND_BASE`] below.
-///
-/// # The render rail is the one with the gap
-///
-/// `runtime::decode::render` carried `0x86`/`0x87` as its residency pair until a
-/// capture replaced them with `0x1b`/`0x89`. That replacement was right for the
-/// records it measured — those are the `stages:`-qualified forms — but it left
-/// the render rail knowing only half the family, because a render encoder
-/// inherits the unqualified pair too. An unqualified `useResources:count:usage:`
-/// on a render encoder therefore reaches no render arm and is reported as
-/// `render_unimplemented reason=accepted_without_executor` rather than counted
-/// with its siblings under `render_noop_residency_hint`. No guest work is lost —
-/// this device answers residency hints by doing nothing, for the reason
-/// `runtime::exec` states — but the counter that exists to price that argument
-/// sees only the qualified half.
-pub const OP_USE_HEAPS: u32 = 0x86;
-pub const OP_USE_RESOURCES: u32 = 0x87;
+/// exactly [`COUNT_BASE`] and [`BIND_BASE`] below. These are access declarations
+/// for resources reached through argument buffers, not optional residency hints.
+pub const OP_USE_HEAPS: u32 = shared_encoder_wire::OPCODE_USE_HEAPS_NO_STAGES;
+pub const OP_USE_RESOURCES: u32 = shared_encoder_wire::OPCODE_USE_RESOURCES_NO_STAGES;
 
 pub const REJECTED_85: u32 = 0x85;
 pub const REJECTED_88: u32 = 0x88;
@@ -82,6 +67,7 @@ pub enum DecodeStatus {
     ErrShort,
     ErrUnknownOpcode,
     ErrUnsupportedOpcode,
+    ErrResourceUsage,
 }
 
 impl crate::observe::Refusal for DecodeStatus {
@@ -95,6 +81,7 @@ impl crate::observe::Refusal for DecodeStatus {
             Self::ErrShort => "compute_decode_short",
             Self::ErrUnknownOpcode => "compute_decode_unknown_opcode",
             Self::ErrUnsupportedOpcode => "compute_decode_unsupported_opcode",
+            Self::ErrResourceUsage => "compute_decode_resource_usage",
         })
     }
 }
@@ -208,7 +195,7 @@ pub struct Command {
     pub stage_in_indirect_buffer_offset: u64,
     pub threadgroup_memory_length: u64,
     pub threadgroup_memory_index: u32,
-    pub resource_usage: u32,
+    pub resource_usage: Option<ResourceUsage>,
     pub fence_ref: u32,
     pub barrier_scope: u16,
     pub condition_buffer_ref: u32,
@@ -324,8 +311,8 @@ fn var_len(cmd_len: usize, base: usize, count: u32, stride: usize) -> bool {
 ///
 /// Framing and covered layouts come from [`reims_vgpu_wire`]: [`reims_vgpu_wire::op`]
 /// for the shared header and the parsers in [`reims_vgpu_wire::ops::compute`] for
-/// each payload this encoder owns. Local residency opcodes (`OP_USE_HEAPS` /
-/// `OP_USE_RESOURCES`) have no wire export and stay hand-read.
+/// each payload this encoder owns, including the inherited participation
+/// records shared with render.
 pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
     let op = reims_vgpu_wire::op(command, 0).map_err(|_| DecodeStatus::ErrShort)?;
     let opcode = op.opcode();
@@ -337,7 +324,6 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
     if !opcode_supported(opcode) {
         return Err(DecodeStatus::ErrUnsupportedOpcode);
     }
-    let payload = op.payload;
     let mut out = Command {
         opcode,
         command_length: op.length(),
@@ -347,38 +333,29 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
 
     match opcode {
         OP_USE_HEAPS => {
-            // No wire export: Apple's compute serializer has no useHeaps: selector.
-            if command_length < COUNT_BASE {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let count = ld32(&payload[0..]);
-            if !var_len(command_length, COUNT_BASE, count, REF_SIZE) {
-                return Err(DecodeStatus::ErrShort);
-            }
+            let (head, refs) = shared_encoder_wire::use_heaps_no_stages(&op)
+                .map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseHeaps;
-            out.count = count;
-            for i in 0..count as usize {
-                out.heaps
-                    .push(SerializerRef::new(ld32(&payload[4 + i * REF_SIZE..])));
-            }
+            out.count = head.count.get();
+            out.heaps.extend(
+                refs.iter()
+                    .map(|reference| SerializerRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
         OP_USE_RESOURCES => {
-            // No wire export: same gap as OP_USE_HEAPS.
-            if command_length < BIND_BASE {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let count = ld32(&payload[0..]);
-            if !var_len(command_length, BIND_BASE, count, REF_SIZE) {
-                return Err(DecodeStatus::ErrShort);
-            }
+            let (head, refs) = shared_encoder_wire::use_resources_no_stages(&op)
+                .map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseResources;
-            out.count = count;
-            out.resource_usage = ld32(&payload[4..]);
-            for i in 0..count as usize {
-                out.resources
-                    .push(ObjectTableRef::new(ld32(&payload[8 + i * REF_SIZE..])));
-            }
+            out.count = head.count.get();
+            out.resource_usage = Some(
+                ResourceUsage::from_bits(head.usage.get())
+                    .map_err(|_| DecodeStatus::ErrResourceUsage)?,
+            );
+            out.resources.extend(
+                refs.iter()
+                    .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
+            );
             Ok(out)
         }
         wire::OPCODE_SET_PIPELINE_STATE => {
@@ -1022,34 +999,34 @@ mod tests {
         // Everything else the record could carry stays at its default, so no
         // field picked up the two unwritten bytes.
         assert_eq!(c.count, 0);
-        assert_eq!(c.resource_usage, 0);
+        assert_eq!(c.resource_usage, None);
         assert_eq!(c.fence_ref, 0);
     }
 
-    /// The compute encoder does not *declare* residency — it inherits it.
+    /// The compute encoder does not *declare* participation — it inherits it.
     ///
-    /// This asserts exactly one thing: no residency selector appears among the
+    /// This asserts exactly one thing: no participation selector appears among the
     /// compute encoder's own methods. That is all the manifest can say, because
     /// it is built from each class's own method list and has no row for the
-    /// encoder base class where residency is declared.
+    /// encoder base class where participation is declared.
     ///
     /// It used to be read as the stronger claim that these two opcodes have no
     /// producer at all, and [`OP_USE_HEAPS`] records why that does not follow.
     /// The assertion is unchanged and still worth keeping: if a future build
-    /// *overrides* residency on this class, the override may carry a different
+    /// *overrides* participation on this class, the override may carry a different
     /// record shape from the inherited one, and this fires before the arm below
     /// decodes the new shape with the old layout.
     #[test]
-    fn the_compute_encoder_declares_no_residency_selector() {
-        let residency: Vec<&str> = reims_vgpu_wire::manifest::MANIFEST
+    fn the_compute_encoder_declares_no_participation_selector() {
+        let participation: Vec<&str> = reims_vgpu_wire::manifest::MANIFEST
             .iter()
             .filter(|e| e.class == "PGSerializerComputeCommandEncoder")
             .map(|e| e.selector)
             .filter(|s| s.starts_with("useHeap") || s.starts_with("useResource"))
             .collect();
         assert!(
-            residency.is_empty(),
-            "the compute encoder now declares {residency:?} of its own; an \
+            participation.is_empty(),
+            "the compute encoder now declares {participation:?} of its own; an \
              override may not share the inherited record shape, so the \
              OP_USE_HEAPS/OP_USE_RESOURCES layouts need a fresh capture"
         );
@@ -1060,14 +1037,14 @@ mod tests {
     }
 
     #[test]
-    fn inherited_residency_records_preserve_their_typed_reference_arrays() {
+    fn inherited_participation_records_preserve_their_typed_reference_arrays() {
         let mut heaps = vec![0u8; COUNT_BASE + 2 * REF_SIZE];
         st32(&mut heaps, OP_USE_HEAPS);
         st32(&mut heaps[4..], (COUNT_BASE + 2 * REF_SIZE) as u32);
         st32(&mut heaps[OP_HEADER_LEN..], 2);
         st32(&mut heaps[COUNT_BASE..], 5151);
         st32(&mut heaps[COUNT_BASE + REF_SIZE..], 4343);
-        let heaps = decode(&heaps).expect("heap residency");
+        let heaps = decode(&heaps).expect("heap participation");
         assert_eq!(heaps.kind, Kind::UseHeaps);
         assert_eq!(
             heaps
@@ -1085,8 +1062,9 @@ mod tests {
         st32(&mut resources[COUNT_BASE..], 3);
         st32(&mut resources[BIND_BASE..], 7171);
         st32(&mut resources[BIND_BASE + REF_SIZE..], 8181);
-        let resources = decode(&resources).expect("resource residency");
+        let resources = decode(&resources).expect("resource participation");
         assert_eq!(resources.kind, Kind::UseResources);
+        assert_eq!(resources.resource_usage.unwrap().bits(), 3);
         assert_eq!(
             resources
                 .resources
@@ -1094,6 +1072,16 @@ mod tests {
                 .map(|reference| reference.get())
                 .collect::<Vec<_>>(),
             vec![7171, 8181]
+        );
+
+        let mut unknown_usage = vec![0u8; BIND_BASE];
+        st32(&mut unknown_usage, OP_USE_RESOURCES);
+        st32(&mut unknown_usage[4..], BIND_BASE as u32);
+        st32(&mut unknown_usage[COUNT_BASE..], 8);
+        assert_eq!(
+            decode(&unknown_usage),
+            Err(DecodeStatus::ErrResourceUsage),
+            "unknown resource usage was accepted"
         );
     }
 
@@ -1103,7 +1091,7 @@ mod tests {
     /// The render sibling of this test can assert plain set equality; this one
     /// cannot, and the difference is the point. `0x86`/`0x87` are declared on
     /// the encoder base class rather than on this one, which is what
-    /// `the_compute_encoder_declares_no_residency_selector` states and all it
+    /// `the_compute_encoder_declares_no_participation_selector` states and all it
     /// states — the manifest is built per class from each class's own methods
     /// and has no row for the base, so an inherited selector cannot appear in
     /// the set this test compares against. See [`OP_USE_HEAPS`].
@@ -1274,7 +1262,7 @@ mod tests {
                     );
                 }
                 // No selector at all is the weaker state, and the one the
-                // residency test above pins by name.
+                // participation test above pins by name.
                 None => assert!(
                     !rows().any(|e| e.opcodes.contains(op)),
                     "{name}: a selector now claims {op:#x}"

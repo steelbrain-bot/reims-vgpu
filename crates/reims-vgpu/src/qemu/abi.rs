@@ -44,16 +44,28 @@
     reason = "the shared QEMU C ABI safety contract is documented at module scope"
 )]
 
+use crate::device::{
+    replacement_device_console_feed as device_console_feed,
+    replacement_device_create as device_create,
+    replacement_device_cursor_glyph_copy as device_cursor_glyph_copy,
+    replacement_device_cursor_glyph_info as device_cursor_glyph_info,
+    replacement_device_destroy as device_destroy, replacement_device_drain as device_drain,
+    replacement_device_efi_console_copy as device_efi_console_copy,
+    replacement_device_gfx_read as device_gfx_read,
+    replacement_device_gfx_write as device_gfx_write,
+    replacement_device_iosfc_read as device_iosfc_read,
+    replacement_device_iosfc_write as device_iosfc_write, replacement_device_poll as device_poll,
+    replacement_device_pop_action as device_pop_action, replacement_device_reset as device_reset,
+    replacement_device_scanout_copy as device_scanout_copy,
+    replacement_device_scanout_may_paint as device_scanout_may_paint,
+    replacement_device_window_run_main as device_window_run_main,
+    replacement_device_window_set_early_fb as device_window_set_early_fb,
+    replacement_device_window_start as device_window_start,
+    replacement_device_window_stop as device_window_stop,
+};
 use crate::qemu::host_ops::ReimsVgpuHostOps;
 use crate::runtime::host::HostAction;
-use crate::{
-    backend_name, device_console_feed, device_create, device_cursor_glyph_copy,
-    device_cursor_glyph_info, device_destroy, device_drain, device_efi_console_copy,
-    device_gfx_read, device_gfx_write, device_iosfc_read, device_iosfc_write, device_poll,
-    device_pop_action, device_reset, device_scanout_copy, device_scanout_may_paint,
-    device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
-    unwind_safe, ConsoleFeed, CursorGlyphInfo,
-};
+use crate::{backend_name, unwind_safe, CursorGlyphInfo};
 use std::os::raw::{c_char, c_int};
 use std::slice;
 
@@ -481,12 +493,6 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_drain(handle: u64) -> c_int {
             if handle == 0 {
                 return REIMS_VGPU_QEMU_ERR_ARGS;
             }
-            // Before the drain, so the first tranche's engine-lock acquires are
-            // already attributed to the worker. Entering this function is the
-            // only property that distinguishes the drain thread from a vCPU
-            // inside an MMIO store, and telling those apart is what makes a
-            // stalled guest attributable — see `EngineLockSite`.
-            crate::runtime::executor::mark_drain_thread();
             if device_drain(handle) {
                 REIMS_VGPU_QEMU_OK
             } else {
@@ -580,32 +586,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_console_feed(
             unsafe {
                 *out_kind = feed.kind();
             }
-            if let ConsoleFeed::Early {
-                mapping_id,
-                width,
-                height,
-                generation,
-            } = feed
-            {
-                // Written one at a time rather than behind a single all-or-nothing
-                // null check: a caller that wants only the kind passes null for
-                // every one of these, and refusing that would put the shim back in
-                // the business of holding a scratch tuple it does not use.
-                unsafe {
-                    if !out_mapping_id.is_null() {
-                        *out_mapping_id = mapping_id;
-                    }
-                    if !out_width.is_null() {
-                        *out_width = width;
-                    }
-                    if !out_height.is_null() {
-                        *out_height = height;
-                    }
-                    if !out_generation.is_null() {
-                        *out_generation = generation;
-                    }
-                }
-            }
+            let _ = (out_mapping_id, out_width, out_height, out_generation);
             REIMS_VGPU_QEMU_OK
         },
         REIMS_VGPU_QEMU_ERR_PANIC,
@@ -700,7 +681,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_scanout_copy(
     height: u32,
     generation: u32,
 ) -> c_int {
-    use crate::runtime::scanout::ScanoutCopyResult;
+    use crate::runtime::replacement_scanout::ScanoutCopyResult;
     unwind_safe(
         "reims_vgpu_qemu_scanout_copy",
         || {

@@ -1,6 +1,5 @@
 //! Completion-stamp values after packet-record decoding.
 
-pub const STAMP_INDEX_MASK: u32 = 0xffff;
 pub const STAMP_SLOT_LEN: u64 = core::mem::size_of::<u32>() as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,7 +10,7 @@ pub struct StampWait {
 
 impl StampWait {
     pub const fn slot(self) -> u32 {
-        self.index & STAMP_INDEX_MASK
+        self.index
     }
 
     pub fn satisfied_by(self, current: u32) -> bool {
@@ -24,14 +23,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn raw_index_bits_are_consumed_at_the_semantic_boundary() {
+    fn the_wire_index_is_the_exact_fifo_slot() {
         assert_eq!(
             StampWait {
                 index: 0xabcd_1234,
                 value: 7
             }
             .slot(),
-            0x1234
+            0xabcd_1234
         );
     }
 

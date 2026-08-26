@@ -6,7 +6,9 @@
 //! remaining accepted opcodes are recognized and returned as typed kinds with
 //! raw length validation where the contract specifies fixed sizes.
 
-use reims_vgpu_protocol::{HeapObject, ObjectTableRef, ResourceObject, SerializerRef};
+use reims_vgpu_protocol::{
+    HeapObject, ObjectTableRef, RenderStages, ResourceObject, ResourceUsage, SerializerRef,
+};
 use reims_vgpu_wire::ops::render as wire;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
 use reims_vgpu_wire::ops::tile as wire_tile;
@@ -76,7 +78,7 @@ fn narrow_count(value: u64) -> Result<u32, DecodeStatus> {
 fn wire_instance_count(value: u64) -> Result<u32, DecodeStatus> {
     let count = narrow_count(value)?;
     if count == 0 {
-        crate::runtime::drain::note_store_route("draw_instance_count_zero");
+        crate::runtime::contract_census::note("draw_instance_count_zero");
         return Ok(1);
     }
     Ok(count)
@@ -129,9 +131,6 @@ pub const PASS_COLOR_ATTACH_STRIDE: usize = core::mem::size_of::<wire_pass::Colo
 #[cfg(test)]
 pub(crate) const PASS_ATTACH_TEXREF: usize =
     core::mem::offset_of!(wire_pass::AttachmentPrefix, texture_ref);
-#[cfg(test)]
-pub(crate) const PASS_ATTACH_RESOLVEREF: usize =
-    core::mem::offset_of!(wire_pass::AttachmentPrefix, resolve_texture_ref);
 pub const PASS_ATTACH_LEVEL: usize = core::mem::offset_of!(wire_pass::AttachmentPrefix, level);
 #[cfg(test)]
 pub(crate) const PASS_ATTACH_SLICE: usize =
@@ -145,9 +144,6 @@ pub(crate) const PASS_ATTACH_LOAD_ACTION: usize =
 #[cfg(test)]
 pub(crate) const PASS_ATTACH_STORE_ACTION: usize =
     core::mem::offset_of!(wire_pass::AttachmentPrefix, store_action);
-#[cfg(test)]
-pub(crate) const PASS_ATTACH_CLEAR_COLOR: usize =
-    core::mem::offset_of!(wire_pass::ColorAttachmentBody, clear_color_bits);
 #[cfg(test)]
 pub(crate) const PASS_DEPTH_ATTACH_CLEAR_DEPTH: usize =
     core::mem::offset_of!(wire_pass::DepthAttachmentBody, clear_depth_bits);
@@ -254,13 +250,6 @@ pub fn bind_record_len(count: u32, entry_size: usize) -> Option<usize> {
         .checked_mul(entry_size)
         .and_then(|n| n.checked_add(BIND_ENTRIES))
 }
-/// set*BufferOffset: index:u32 @0, offset:u64 @4 (payload 12; full cmd 0x14).
-#[cfg(test)]
-pub(crate) const BUFFER_OFFSET_INDEX: usize = core::mem::offset_of!(wire::BufferOffset, index);
-#[cfg(test)]
-pub(crate) const BUFFER_OFFSET_VALUE: usize = core::mem::offset_of!(wire::BufferOffset, offset);
-#[cfg(test)]
-pub(crate) const BUFFER_OFFSET_PAYLOAD_LEN: usize = core::mem::size_of::<wire::BufferOffset>();
 /// One scissor rectangle's extent. Its four fields are not named here: both
 /// scissor arms read them off `wire::ScissorRect` through the view.
 #[cfg(test)]
@@ -279,6 +268,8 @@ pub enum DecodeStatus {
     ErrUnknownOpcode,
     ErrUnsupportedOpcode,
     ErrBadLength,
+    ErrResourceUsage,
+    ErrRenderStages,
     /// A wide draw's 64-bit count does not fit the 32 bits `Command` carries.
     /// See [`narrow_count`] for why that is refused rather than truncated.
     ErrCountOutOfRange,
@@ -296,6 +287,8 @@ impl crate::observe::Refusal for DecodeStatus {
             Self::ErrUnknownOpcode => "render_decode_unknown_opcode",
             Self::ErrUnsupportedOpcode => "render_decode_unsupported_opcode",
             Self::ErrBadLength => "render_decode_bad_length",
+            Self::ErrResourceUsage => "render_decode_resource_usage",
+            Self::ErrRenderStages => "render_decode_render_stages",
             Self::ErrCountOutOfRange => "render_decode_count_out_of_range",
         })
     }
@@ -351,9 +344,8 @@ pub enum Kind {
     SetVisibilityResultMode,
     /// `setVertexAmplificationMode:value:` fills [`Command::mode`] and
     /// [`Command::amplification_value`]; `setVertexAmplificationCount:viewMappings:`
-    /// fills [`Command::count`]. Which of the two is [`Command::opcode`], as on
-    /// the wire. The view mappings are not lifted — see
-    /// [`wire::OPCODE_SET_VERTEX_AMPLIFICATION_MODE`].
+    /// fills [`Command::count`] and [`Command::amplification_mappings`]. Which
+    /// of the two is [`Command::opcode`], as on the wire.
     SetVertexAmplification,
     /// A bind against the **tile** argument tables: `0x9d`/`0x9e` (buffer and
     /// offset), `0x9f`/`0xa0` (sampler, plain and LOD-bearing), `0xa1`
@@ -388,10 +380,9 @@ pub enum Kind {
     /// form is [`Command::opcode`], as on the wire — except that `0x0c` is two
     /// records and [`Command::command_length`] is what separates them.
     ///
-    /// No field is lifted, because nothing here tessellates and a `patch_count`
-    /// with no consumer is worse than its absence. The record is still fully
-    /// bounds-checked, so a truncated one is refused rather than reported as a
-    /// smaller draw.
+    /// The complete typed geometry is in [`Command::patch_draw`]. Keeping the
+    /// operation distinct prevents an ordinary draw arm from consuming patch
+    /// counts or buffer operands before tessellation execution exists.
     DrawPatches,
     /// One pass property `writeDescriptor` emits as a record of its own rather
     /// than as a field of the pass descriptor: `0x1e` the default raster sample
@@ -430,8 +421,12 @@ pub struct ColorAttachment {
     pub slice: u32,
     /// Depth plane of a 3D attachment, sixteen bits above `slice`.
     pub depth_plane: u32,
+    pub resolve_level: u32,
+    pub resolve_slice: u32,
+    pub resolve_depth_plane: u32,
     pub load_action: u16,
     pub store_action: u16,
+    pub store_action_options: u16,
     /// MTLClearColor as RGBA doubles in `[0,1]`.
     pub clear_color: [f64; 4],
 }
@@ -451,9 +446,14 @@ pub struct DepthAttachment {
     /// nothing decodes is a field nothing can report.
     pub slice: u32,
     pub depth_plane: u32,
+    pub resolve_level: u32,
+    pub resolve_slice: u32,
+    pub resolve_depth_plane: u32,
     pub load_action: u16,
     pub store_action: u16,
+    pub store_action_options: u16,
     pub clear_depth: f64,
+    pub resolve_filter: u16,
 }
 
 /// A scissor rectangle in target texels, as `MTLScissorRect` declares one.
@@ -649,9 +649,14 @@ pub struct StencilAttachment {
     /// See [`DepthAttachment::slice`]; the prefix is the same 28 bytes.
     pub slice: u32,
     pub depth_plane: u32,
+    pub resolve_level: u32,
+    pub resolve_slice: u32,
+    pub resolve_depth_plane: u32,
     pub load_action: u16,
     pub store_action: u16,
+    pub store_action_options: u16,
     pub clear_stencil: u32,
+    pub resolve_filter: u16,
 }
 
 /// Which encoder table a render bind record names.
@@ -675,6 +680,71 @@ pub enum Stage {
     Fragment,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PatchBufferOperand {
+    pub reference: u32,
+    pub offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PatchDraw {
+    Direct {
+        control_points: u16,
+        patch_start: u64,
+        patch_count: u64,
+        patch_indices: PatchBufferOperand,
+        control_point_indices: Option<PatchBufferOperand>,
+        instance_count: u64,
+        base_instance: u64,
+    },
+    Indirect {
+        control_points: u16,
+        patch_indices: PatchBufferOperand,
+        control_point_indices: Option<PatchBufferOperand>,
+        arguments: PatchBufferOperand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TileRegion {
+    pub origin: [u64; 3],
+    pub size: [u64; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TileThreadgroupMemoryBinding {
+    pub length: u64,
+    pub offset: u64,
+    pub index: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TileSamplerBinding {
+    pub reference: u32,
+    pub lod_clamp: Option<(u32, u32)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TileBind {
+    Buffer {
+        first: u32,
+        bindings: Box<[DecodedBufferBind]>,
+    },
+    BufferOffset {
+        index: u32,
+        offset: u64,
+    },
+    Texture {
+        first: u32,
+        references: Box<[u32]>,
+    },
+    Sampler {
+        first: u32,
+        bindings: Box<[TileSamplerBinding]>,
+    },
+    ThreadgroupMemory(TileThreadgroupMemoryBinding),
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Command {
     pub opcode: u32,
@@ -685,10 +755,16 @@ pub struct Command {
     pub first: u32,
     pub count: u32,
     /// Resource declarations carried by [`Kind::UseResource`].
-    pub residency_resources: Vec<ObjectTableRef<ResourceObject>>,
+    pub participation_resources: Vec<ObjectTableRef<ResourceObject>>,
+    /// Raw `MTLResourceUsage` value carried by a resource-participation record.
+    /// `None` for heap participation and commands with no usage field.
+    pub participation_usage: Option<ResourceUsage>,
+    /// Raw render-stage mask carried by a qualified participation record.
+    /// `None` for the inherited forms whose selectors have no stage argument.
+    pub participation_stages: Option<RenderStages>,
     /// Heap declarations carried by [`Kind::UseHeap`]. Heap refs inhabit the
     /// serializer's heap namespace, not the task object-list namespace.
-    pub residency_heaps: Vec<SerializerRef<HeapObject>>,
+    pub participation_heaps: Vec<SerializerRef<HeapObject>>,
     /// Resource declarations carried by [`Kind::BarrierResources`].
     pub barrier_resources: Vec<ObjectTableRef<ResourceObject>>,
     /// Render stages whose accesses must complete before a barrier.
@@ -701,6 +777,10 @@ pub struct Command {
     pub barrier_unidentified_u8: u8,
     pub buffer_ref: u32,
     pub buffer_offset: u64,
+    /// Per-instance byte stride from `setTessellationFactorBuffer:offset:instanceStride:`.
+    /// This belongs to the one encoder-wide tessellation-factor binding and is
+    /// not an attribute-buffer stride.
+    pub tessellation_factor_instance_stride: u64,
     /// Multi-entry buffer binds for slots `first..first+count`.
     pub buffer_binds: Vec<DecodedBufferBind>,
     pub texture_ref: u32,
@@ -729,6 +809,10 @@ pub struct Command {
     /// declares it `q` where every count beside it is `Q`, and a negative
     /// offset read as unsigned becomes a large index rather than an error.
     pub base_vertex: i64,
+    /// Complete geometry of a tessellated patch draw. `None` on every other
+    /// render record; the enum distinguishes CPU-authored counts from a
+    /// GPU-resident indirect argument structure.
+    pub patch_draw: Option<PatchDraw>,
     /// Every viewport a [`Kind::SetViewport`] record carried, in the guest's
     /// order — the singular opcode's one, or all of `setViewports:count:`.
     ///
@@ -763,6 +847,9 @@ pub struct Command {
     /// bits: the selector declares it `Q` and the serializer narrows it, which
     /// only the capture shows.
     pub amplification_value: u32,
+    /// Exact `MTLVertexAmplificationViewMapping` entries, in view order.
+    /// Each pair is `(viewportArrayIndexOffset, renderTargetArrayIndexOffset)`.
+    pub amplification_mappings: Vec<[u32; 2]>,
     /// Threads per tile of a [`Kind::TileDispatch`], as width/height/depth.
     ///
     /// Unnarrowed `u64` — the serializer writes all three at full width, unlike
@@ -770,15 +857,28 @@ pub struct Command {
     /// to tell an empty dispatch from a real one and to say in the fail line
     /// how much work was dropped.
     pub tile_threads: [u64; 3],
+    /// Region limit carried by the two bounded tile-dispatch forms. Absence is
+    /// the unbounded form, not a zero-sized region.
+    pub tile_region: Option<TileRegion>,
+    /// Present only on the bounded tile-dispatch selector that declares a
+    /// render-target array index. The sibling record leaves those bytes
+    /// unwritten, so zero and absence are distinct.
+    pub tile_render_target_array_index: Option<u32>,
+    /// Exact imageblock-memory suballocation selected for the tile stage.
+    pub tile_threadgroup_memory: Option<TileThreadgroupMemoryBinding>,
+    /// Complete tile-stage setter. The older generic bind fields remain only
+    /// for the legacy executor until atomic cutover; replacement consumes this
+    /// typed form so tile resources cannot enter a vertex/fragment table.
+    pub tile_bind: Option<TileBind>,
     /// Value of a [`Kind::SetFloatState`] record.
     pub float_value: f32,
-    /// The sampler bind carried per-entry LOD clamps this decoder did not lift.
+    /// Transitional legacy flag saying that [`Self::sampler_lod_binds`] is
+    /// populated. Replacement consumes the typed per-entry values directly.
     /// Only ever true on [`Kind::SetSampler`]; see [`wire::OPCODE_SET_VERTEX_SAMPLER_LOD`].
     pub has_sampler_lod: bool,
-    /// The vertex buffer bind carried a per-entry attribute stride this decoder
-    /// did not lift. True on [`Kind::SetBuffer`] and [`Kind::SetBufferOffset`];
-    /// see [`wire::OPCODE_SET_VERTEX_BUFFER_STRIDE`]. The buffer still binds — what is
-    /// missing is the stride the guest wanted the vertex fetch to use.
+    /// Transitional legacy flag saying that the vertex-buffer record carried
+    /// an attribute stride. Replacement consumes [`DecodedBufferBind::attribute_stride`]
+    /// or [`Self::attribute_stride`] directly.
     pub has_attribute_stride: bool,
     /// The stride of a single-slot [`Kind::SetBufferOffset`] record that
     /// carried one (`setVertexBufferOffset:attributeStride:atIndex:`). The
@@ -788,6 +888,9 @@ pub struct Command {
     pub raw_payload_len: usize,
     /// Color attachment zero when kind is RenderPass (boot clear path).
     pub color0: ColorAttachment,
+    /// Every color attachment slot from a render-pass record, including empty
+    /// slots, in contract slot order.
+    pub color_attachments: Vec<ColorAttachment>,
     pub depth: DepthAttachment,
     pub stencil: StencilAttachment,
     /// The pass's own tail, on [`Kind::RenderPass`].
@@ -896,8 +999,12 @@ fn color_from_wire(c: &wire_pass::ColorAttachmentBody) -> ColorAttachment {
         level: u32::from(p.level.get()),
         slice: u32::from(p.slice.get()),
         depth_plane: u32::from(p.depth_plane.get()),
+        resolve_level: u32::from(p.resolve_level.get()),
+        resolve_slice: u32::from(p.resolve_slice.get()),
+        resolve_depth_plane: u32::from(p.resolve_depth_plane.get()),
         load_action: p.load_action.get(),
         store_action: p.store_action.get(),
+        store_action_options: p.store_action_options.get(),
         clear_color: c.clear_color(),
     }
 }
@@ -910,9 +1017,14 @@ fn depth_from_wire(d: &wire_pass::DepthAttachmentBody) -> DepthAttachment {
         level: u32::from(p.level.get()),
         slice: u32::from(p.slice.get()),
         depth_plane: u32::from(p.depth_plane.get()),
+        resolve_level: u32::from(p.resolve_level.get()),
+        resolve_slice: u32::from(p.resolve_slice.get()),
+        resolve_depth_plane: u32::from(p.resolve_depth_plane.get()),
         load_action: p.load_action.get(),
         store_action: p.store_action.get(),
+        store_action_options: p.store_action_options.get(),
         clear_depth: d.clear_depth(),
+        resolve_filter: d.resolve_filter.get(),
     }
 }
 
@@ -924,9 +1036,14 @@ fn stencil_from_wire(s: &wire_pass::StencilAttachmentBody) -> StencilAttachment 
         level: u32::from(p.level.get()),
         slice: u32::from(p.slice.get()),
         depth_plane: u32::from(p.depth_plane.get()),
+        resolve_level: u32::from(p.resolve_level.get()),
+        resolve_slice: u32::from(p.resolve_slice.get()),
+        resolve_depth_plane: u32::from(p.resolve_depth_plane.get()),
         load_action: p.load_action.get(),
         store_action: p.store_action.get(),
+        store_action_options: p.store_action_options.get(),
         clear_stencil: s.clear_stencil.get(),
+        resolve_filter: s.resolve_filter.get(),
     }
 }
 
@@ -1458,10 +1575,18 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             let (head, refs) = wire::use_resource(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseResource;
             out.count = head.count.get();
+            out.participation_usage = Some(
+                ResourceUsage::from_bits(head.usage.get() as u32)
+                    .map_err(|_| DecodeStatus::ErrResourceUsage)?,
+            );
+            out.participation_stages = Some(
+                RenderStages::from_bits(head.stages.get())
+                    .map_err(|_| DecodeStatus::ErrRenderStages)?,
+            );
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.residency_resources.extend(
+            out.participation_resources.extend(
                 refs.iter()
                     .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
             );
@@ -1472,21 +1597,24 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             let (head, refs) = wire::use_heap(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseHeap;
             out.count = head.count.get();
+            out.participation_stages = Some(
+                RenderStages::from_bits(head.stages.get())
+                    .map_err(|_| DecodeStatus::ErrRenderStages)?,
+            );
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.residency_heaps.extend(
+            out.participation_heaps.extend(
                 refs.iter()
                     .map(|reference| SerializerRef::new(reference.object_ref.get())),
             );
             Ok(out)
         }
-        // The two residency forms that take no `stages:`. A render encoder
+        // The two participation forms that take no `stages:`. A render encoder
         // inherits them from the encoder base class, so they arrive on this rail
         // as readily as the two above; without these arms they reached the
-        // `OtherAccepted` catch-all and were reported as unimplemented opcodes,
-        // which is a wrong answer twice over — they are implemented, by doing
-        // nothing, and `render_noop_residency_hint` was counting half its family.
+        // `OtherAccepted` catch-all rather than preserving their identities and
+        // usage declaration for semantic execution.
         //
         // Separate arms rather than a shared one because the heads differ: four
         // bytes here against the qualified pair's six and eight. Reading either
@@ -1497,10 +1625,14 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 wire::use_resources_no_stages(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::UseResource;
             out.count = head.count.get();
+            out.participation_usage = Some(
+                ResourceUsage::from_bits(head.usage.get())
+                    .map_err(|_| DecodeStatus::ErrResourceUsage)?,
+            );
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.residency_resources.extend(
+            out.participation_resources.extend(
                 refs.iter()
                     .map(|reference| ObjectTableRef::new(reference.object_ref.get())),
             );
@@ -1514,7 +1646,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count as usize != refs.len() {
                 return Err(DecodeStatus::ErrShort);
             }
-            out.residency_heaps.extend(
+            out.participation_heaps.extend(
                 refs.iter()
                     .map(|reference| SerializerRef::new(reference.object_ref.get())),
             );
@@ -1605,17 +1737,17 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::TileBind;
             out.first = m.index.get();
             out.count = 1;
-            // The length and the offset are read by the view and then not
-            // lifted, exactly as the other tile binds' entries are not: nothing
-            // downstream allocates imageblock memory, so a field carrying the
-            // size would have no consumer. `tile_threads` in particular is a
-            // dispatch's grid and must not be borrowed for it.
+            let binding = TileThreadgroupMemoryBinding {
+                length: m.length.get(),
+                offset: m.offset.get(),
+                index: m.index.get(),
+            };
+            out.tile_threadgroup_memory = Some(binding);
+            out.tile_bind = Some(TileBind::ThreadgroupMemory(binding));
             Ok(out)
         }
         wire_tile::OPCODE_SET_TILE_BUFFER => {
-            // Entries are not lifted (no tile table consumer); first/count and
-            // length come from the wire bind walk.
-            let (head, _entries) =
+            let (head, entries) =
                 wire_tile::tile_buffer_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileBind;
             out.first = head.first.get();
@@ -1623,13 +1755,28 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count == 0 {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            match bind_record_len(out.count, BUFFER_BIND_ENTRY_SIZE) {
-                Some(need) if payload.len() >= need => Ok(out),
-                _ => Err(DecodeStatus::ErrShort),
+            if !matches!(
+                bind_record_len(out.count, BUFFER_BIND_ENTRY_SIZE),
+                Some(need) if payload.len() >= need
+            ) {
+                return Err(DecodeStatus::ErrShort);
             }
+            out.buffer_binds = entries
+                .iter()
+                .map(|entry| DecodedBufferBind {
+                    buffer_ref: entry.buffer_ref.get(),
+                    offset: entry.offset.get(),
+                    attribute_stride: None,
+                })
+                .collect();
+            out.tile_bind = Some(TileBind::Buffer {
+                first: out.first,
+                bindings: out.buffer_binds.clone().into_boxed_slice(),
+            });
+            Ok(out)
         }
         wire_tile::OPCODE_SET_TILE_TEXTURE => {
-            let (head, _entries) =
+            let (head, entries) =
                 wire_tile::tile_texture_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileBind;
             out.first = head.first.get();
@@ -1637,13 +1784,21 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count == 0 {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            match bind_record_len(out.count, REF_BIND_ENTRY_SIZE) {
-                Some(need) if payload.len() >= need => Ok(out),
-                _ => Err(DecodeStatus::ErrShort),
+            if !matches!(
+                bind_record_len(out.count, REF_BIND_ENTRY_SIZE),
+                Some(need) if payload.len() >= need
+            ) {
+                return Err(DecodeStatus::ErrShort);
             }
+            out.ref_binds = entries.iter().map(|entry| entry.object_ref.get()).collect();
+            out.tile_bind = Some(TileBind::Texture {
+                first: out.first,
+                references: out.ref_binds.clone().into_boxed_slice(),
+            });
+            Ok(out)
         }
         wire_tile::OPCODE_SET_TILE_SAMPLER => {
-            let (head, _entries) =
+            let (head, entries) =
                 wire_tile::tile_sampler_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileBind;
             out.first = head.first.get();
@@ -1651,13 +1806,28 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count == 0 {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            match bind_record_len(out.count, REF_BIND_ENTRY_SIZE) {
-                Some(need) if payload.len() >= need => Ok(out),
-                _ => Err(DecodeStatus::ErrShort),
+            if !matches!(
+                bind_record_len(out.count, REF_BIND_ENTRY_SIZE),
+                Some(need) if payload.len() >= need
+            ) {
+                return Err(DecodeStatus::ErrShort);
             }
+            out.ref_binds = entries.iter().map(|entry| entry.object_ref.get()).collect();
+            out.tile_bind = Some(TileBind::Sampler {
+                first: out.first,
+                bindings: out
+                    .ref_binds
+                    .iter()
+                    .map(|reference| TileSamplerBinding {
+                        reference: *reference,
+                        lod_clamp: None,
+                    })
+                    .collect(),
+            });
+            Ok(out)
         }
         wire_tile::OPCODE_SET_TILE_SAMPLER_LOD => {
-            let (head, _entries) =
+            let (head, entries) =
                 wire_tile::tile_sampler_lod_binds(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileBind;
             out.first = head.first.get();
@@ -1665,10 +1835,39 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count == 0 {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            match bind_record_len(out.count, SAMPLER_LOD_BIND_ENTRY_SIZE) {
-                Some(need) if payload.len() >= need => Ok(out),
-                _ => Err(DecodeStatus::ErrShort),
+            if !matches!(
+                bind_record_len(out.count, SAMPLER_LOD_BIND_ENTRY_SIZE),
+                Some(need) if payload.len() >= need
+            ) {
+                return Err(DecodeStatus::ErrShort);
             }
+            out.ref_binds = entries
+                .iter()
+                .map(|entry| entry.sampler_ref.get())
+                .collect();
+            out.sampler_lod_binds = entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.lod_min_clamp.get().to_bits(),
+                        entry.lod_max_clamp.get().to_bits(),
+                    )
+                })
+                .collect();
+            out.tile_bind = Some(TileBind::Sampler {
+                first: out.first,
+                bindings: out
+                    .ref_binds
+                    .iter()
+                    .copied()
+                    .zip(out.sampler_lod_binds.iter().copied())
+                    .map(|(reference, lod_clamp)| TileSamplerBinding {
+                        reference,
+                        lod_clamp: Some(lod_clamp),
+                    })
+                    .collect(),
+            });
+            Ok(out)
         }
         wire_tile::OPCODE_SET_TILE_BUFFER_OFFSET => {
             if command_length != wire_tile::SET_TILE_BUFFER_OFFSET_TOTAL_LEN as usize {
@@ -1679,6 +1878,10 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.first = b.index.get();
             out.count = 1;
             out.buffer_offset = b.offset.get();
+            out.tile_bind = Some(TileBind::BufferOffset {
+                index: b.index.get(),
+                offset: b.offset.get(),
+            });
             Ok(out)
         }
         wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE => {
@@ -1700,7 +1903,16 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 .map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::TileDispatch;
             out.tile_threads = [d.width.get(), d.height.get(), d.depth.get()];
-            // Region / RT index not lifted — see wire tile module.
+            out.tile_region = Some(TileRegion {
+                origin: [d.origin_x.get(), d.origin_y.get(), d.origin_z.get()],
+                size: [
+                    d.region_width.get(),
+                    d.region_height.get(),
+                    d.region_depth.get(),
+                ],
+            });
+            out.tile_render_target_array_index =
+                wire_tile::dispatch_threads_per_tile_region_rt_index(&op);
             Ok(out)
         }
         wire_tile::OPCODE_GET_TILE_DIMENSIONS => {
@@ -1725,8 +1937,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
         }
         wire::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT => {
             // Four-byte count head (not BindHeader); mappings follow and are
-            // not lifted — nothing downstream amplifies. Wire parser bounds
-            // entries to the record length.
+            // Wire parser bounds entries to the record length.
             let (head, mappings) =
                 wire::vertex_amplification_count(&op).map_err(|_| DecodeStatus::ErrShort)?;
             out.kind = Kind::SetVertexAmplification;
@@ -1734,7 +1945,13 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if out.count as usize != mappings.len() {
                 return Err(DecodeStatus::ErrShort);
             }
-            let _ = mappings; // unlifted by design
+            out.amplification_mappings
+                .extend(mappings.iter().map(|mapping| {
+                    [
+                        mapping.viewport_array_index_offset.get(),
+                        mapping.render_target_array_index_offset.get(),
+                    ]
+                }));
             Ok(out)
         }
         wire::OPCODE_SET_VISIBILITY_RESULT_MODE => {
@@ -1807,10 +2024,9 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             // Every form is length-checked exactly, so a truncated patch draw
             // is an `ErrBadLength` rather than a draw with invented counts.
             //
-            // None of the fields is lifted. Nothing here tessellates, so a
-            // `patch_count` in `Command` would be a producer with no consumer;
-            // what `runtime::exec` needs is that a patch draw happened and
-            // which form, and the opcode carries both.
+            // The decoded enum keeps direct and GPU-indirect geometry distinct
+            // and represents the optional control-point index buffer directly;
+            // no zero reference is asked to stand in for a different form.
             let want = match opcode {
                 wire::OPCODE_DRAW_PATCHES => wire::DRAW_PATCHES_TOTAL_LEN as usize,
                 wire::OPCODE_DRAW_INDEXED_PATCHES => wire::DRAW_INDEXED_PATCHES_TOTAL_LEN as usize,
@@ -1830,29 +2046,114 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             if command_length != want {
                 return Err(DecodeStatus::ErrBadLength);
             }
-            // Viewed, so a record whose declared length outran its bytes is
-            // refused here rather than by whoever reads it next.
-            match opcode {
+            let operand = |reference, offset| PatchBufferOperand { reference, offset };
+            let patch_draw = match opcode {
                 wire::OPCODE_DRAW_PATCHES => {
-                    wire::draw_patches(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    let draw = wire::draw_patches(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    PatchDraw::Direct {
+                        control_points: draw.control_points.get(),
+                        patch_start: u64::from(draw.patch_start.get()),
+                        patch_count: u64::from(draw.patch_count.get()),
+                        patch_indices: operand(
+                            draw.patch_index_buffer_ref.get(),
+                            u64::from(draw.patch_index_buffer_offset.get()),
+                        ),
+                        control_point_indices: None,
+                        instance_count: u64::from(draw.instance_count.get()),
+                        base_instance: u64::from(draw.base_instance.get()),
+                    }
                 }
                 wire::OPCODE_DRAW_INDEXED_PATCHES => {
-                    wire::draw_indexed_patches(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    let draw =
+                        wire::draw_indexed_patches(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    PatchDraw::Direct {
+                        control_points: draw.control_points.get(),
+                        patch_start: u64::from(draw.patch_start.get()),
+                        patch_count: u64::from(draw.patch_count.get()),
+                        patch_indices: operand(
+                            draw.patch_index_buffer_ref.get(),
+                            u64::from(draw.patch_index_buffer_offset.get()),
+                        ),
+                        control_point_indices: Some(operand(
+                            draw.control_point_index_buffer_ref.get(),
+                            u64::from(draw.control_point_index_buffer_offset.get()),
+                        )),
+                        instance_count: u64::from(draw.instance_count.get()),
+                        base_instance: u64::from(draw.base_instance.get()),
+                    }
                 }
                 wire::OPCODE_DRAW_PATCHES_INDIRECT => {
-                    wire::draw_patches_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    let draw =
+                        wire::draw_patches_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    PatchDraw::Indirect {
+                        control_points: draw.control_points.get(),
+                        patch_indices: operand(
+                            draw.patch_index_buffer_ref.get(),
+                            draw.patch_index_buffer_offset.get(),
+                        ),
+                        control_point_indices: None,
+                        arguments: operand(
+                            draw.indirect_buffer_ref.get(),
+                            draw.indirect_buffer_offset.get(),
+                        ),
+                    }
                 }
                 wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT => {
-                    wire::draw_indexed_patches_indirect(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    let draw = wire::draw_indexed_patches_indirect(&op)
+                        .map_err(|_| DecodeStatus::ErrShort)?;
+                    PatchDraw::Indirect {
+                        control_points: draw.control_points.get(),
+                        patch_indices: operand(
+                            draw.patch_index_buffer_ref.get(),
+                            draw.patch_index_buffer_offset.get(),
+                        ),
+                        control_point_indices: Some(operand(
+                            draw.control_point_index_buffer_ref.get(),
+                            draw.control_point_index_buffer_offset.get(),
+                        )),
+                        arguments: operand(
+                            draw.indirect_buffer_ref.get(),
+                            draw.indirect_buffer_offset.get(),
+                        ),
+                    }
                 }
                 _ if command_length == wire::DRAW_PATCHES_WIDE_TOTAL_LEN as usize => {
-                    wire::draw_patches_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    let draw = wire::draw_patches_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    PatchDraw::Direct {
+                        control_points: draw.control_points.get(),
+                        patch_start: draw.patch_start.get(),
+                        patch_count: draw.patch_count.get(),
+                        patch_indices: operand(
+                            draw.patch_index_buffer_ref.get(),
+                            draw.patch_index_buffer_offset.get(),
+                        ),
+                        control_point_indices: None,
+                        instance_count: draw.instance_count.get(),
+                        base_instance: draw.base_instance.get(),
+                    }
                 }
                 _ => {
-                    wire::draw_indexed_patches_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    let draw =
+                        wire::draw_indexed_patches_wide(&op).map_err(|_| DecodeStatus::ErrShort)?;
+                    PatchDraw::Direct {
+                        control_points: draw.control_points.get(),
+                        patch_start: draw.patch_start.get(),
+                        patch_count: draw.patch_count.get(),
+                        patch_indices: operand(
+                            draw.patch_index_buffer_ref.get(),
+                            draw.patch_index_buffer_offset.get(),
+                        ),
+                        control_point_indices: Some(operand(
+                            draw.control_point_index_buffer_ref.get(),
+                            draw.control_point_index_buffer_offset.get(),
+                        )),
+                        instance_count: draw.instance_count.get(),
+                        base_instance: draw.base_instance.get(),
+                    }
                 }
-            }
+            };
             out.kind = Kind::DrawPatches;
+            out.patch_draw = Some(patch_draw);
             Ok(out)
         }
         wire::OPCODE_SET_TESSELLATION_FACTOR_BUFFER => {
@@ -1866,6 +2167,7 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             out.kind = Kind::SetTessellationFactorBuffer;
             out.buffer_ref = t.buffer_ref.get();
             out.buffer_offset = t.offset.get();
+            out.tessellation_factor_instance_stride = t.instance_stride.get();
             Ok(out)
         }
         wire::OPCODE_EXECUTE_COMMANDS_INDIRECT => {
@@ -1903,6 +2205,8 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 out.depth = depth_from_wire(&body.depth);
                 out.stencil = stencil_from_wire(&body.stencil);
                 out.color0 = color_from_wire(&body.color[0]);
+                out.color_attachments
+                    .extend(body.color.iter().map(color_from_wire));
                 out.pass_visibility_result_buffer_ref = body.visibility_result_buffer_ref.get();
                 out.pass_render_target_array_length = body.render_target_array_length.get();
                 out.pass_render_target_width = body.render_target_width.get();
@@ -1911,6 +2215,10 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
                 out.depth = decode_depth_attachment(payload);
                 out.stencil = decode_stencil_attachment(payload);
                 out.color0 = decode_color_attachment(payload, 0);
+                out.color_attachments.extend(
+                    (0..PASS_MAX_COLOR_ATTACHMENTS)
+                        .map(|index| decode_color_attachment(payload, index)),
+                );
             }
             if out.color0.texture_ref != 0 {
                 out.texture_ref = out.color0.texture_ref;

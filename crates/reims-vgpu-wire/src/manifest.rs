@@ -10,33 +10,19 @@
 //! OS updates: when Apple adds a selector, the inventory the oracle regenerates
 //! stops matching the manifest and the test says which one appeared.
 //!
-//! Every selector must end in one of three states. "Not looked at yet" is
+//! Every selector must end in one of four states. "Not looked at yet" is
 //! [`Coverage::Unimplemented`], which is honest; silence is not an option,
 //! because a selector missing from the manifest entirely is indistinguishable
-//! from one that does not exist.
+//! from one that does not exist. Internal helpers are [`Coverage::Delegated`]:
+//! their concrete caller owns the operation and opcode, so they are closed
+//! without inventing a second command.
 //!
-//! # Absent from here does not mean absent from the class
-//!
-//! `class_copyMethodList` returns the methods a class **declares itself**. It
-//! does not walk superclasses, and the encoder classes have one: they all derive
-//! from a shared `PGSerializerCommandEncoder` that [`INVENTORY`] has no row for.
-//! So a selector defined only on that base is invisible here while being
-//! callable on every encoder, and the rule above — missing means non-existent —
-//! does not hold for it.
-//!
-//! This is not hypothetical; it has already produced two wrong conclusions in
-//! this workspace. Residency is declared on the base class in two forms, an
-//! unqualified `useHeaps:count:` / `useResources:count:usage:` pair and their
-//! singular siblings, with only the `stages:`-qualified overrides declared on the
-//! render encoder. Reading "residency is not among the compute encoder's
-//! selectors" as "a compute encoder cannot receive a residency call" is exactly
-//! the inference this hole invites, and `runtime::decode::compute` drew it —
-//! concluding that its own opcodes had no producer when the base class inherits
-//! them one.
-//!
-//! Until the base class has an [`INVENTORY`] row and rows here, treat a selector
-//! that is absent as *untriaged with respect to inheritance*, and check the base
-//! class before concluding a call cannot reach an encoder.
+//! `class_copyMethodList` returns the methods a class **declares itself**; it
+//! does not walk superclasses. [`INVENTORY`] therefore includes the shared
+//! `PGSerializerCommandEncoder` base explicitly, alongside its derived encoder
+//! classes. This matters for residency: the unqualified resource and heap-use
+//! forms are declared on the base and inherited by every encoder, while only
+//! the `stages:`-qualified overrides are declared on the render encoder.
 
 /// What this crate has done about a selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +53,13 @@ pub enum Coverage {
         /// Module path of the view that reads the record's body.
         module: &'static str,
     },
+    /// Internal serializer helper whose bytes belong to its concrete caller.
+    ///
+    /// These selectors take the concrete command opcode and/or binding table
+    /// as arguments. They do not define an independent guest operation, so
+    /// attributing an opcode to the helper would duplicate the public
+    /// selector's manifest row. The reason states that delegation explicitly.
+    Delegated { reason: &'static str },
     /// Known to emit a wire operation; no view yet.
     Unimplemented,
     /// Emits no wire operation, so there is nothing to view.
@@ -105,11 +98,17 @@ pub struct ClassInventory {
     pub instance_methods: usize,
 }
 
-/// Measured on AppleParavirtGPUMetal 64.4.7 (macOS 26.5).
+/// The derived-class surface was measured on macOS 26.5. The shared encoder
+/// base was measured independently on macOS 15.6.1; keeping it as its own row
+/// prevents inherited selectors from disappearing from the denominator.
 pub const INVENTORY: &[ClassInventory] = &[
     ClassInventory {
         class: "PGSerializer",
         instance_methods: 95,
+    },
+    ClassInventory {
+        class: "PGSerializerCommandEncoder",
+        instance_methods: 19,
     },
     ClassInventory {
         class: "PGSerializerRenderCommandEncoder",
@@ -221,12 +220,180 @@ pub const EMITS_NO_OPERATION: &str = "the serializer returns without emitting an
 /// which is why it is a separate string.
 pub const NOT_A_COMMAND: &str = "an object-lifecycle hook rather than an encoder command";
 
+/// Exclusion reason for an encoder-side object accessor.
+pub const OBJECT_ACCESSOR: &str = "an object accessor rather than an encoder command";
+
+/// Reason shared by base-encoder helpers whose caller owns the operation.
+pub const DELEGATED_ENCODER_HELPER: &str =
+    "an internal record helper whose concrete caller owns the wire operation";
+
 /// Per-selector state.
 ///
 /// Seeded with the operations the oracle has actually driven. The rest of the
 /// surface in [`INVENTORY`] is not yet triaged into rows — [`untriaged`]
 /// reports that gap so it cannot be mistaken for coverage.
 pub const MANIFEST: &[Entry] = &[
+    // --- PGSerializerCommandEncoder ---------------------------------------
+    //
+    // These selectors are inherited by every concrete encoder. The three
+    // object-lifecycle operations are closed here; internal record helpers
+    // delegate operation ownership to their concrete callers.
+    // The base implementation is silent under every serializer capability.
+    // Concrete encoder classes override it and their rows cover the segment
+    // headers those overrides emit.
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "beginSegment:protectionOptions:",
+        opcodes: &[],
+        coverage: Coverage::Excluded {
+            reason: EMITS_NO_OPERATION,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "dealloc",
+        opcodes: &[],
+        coverage: Coverage::Excluded {
+            reason: NOT_A_COMMAND,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "endEncoding",
+        opcodes: &[],
+        coverage: Coverage::Excluded {
+            reason: NOT_A_COMMAND,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "getCommandBytes:forCommand:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "getCommandBytesRetry:forCommand:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "initWithCommandBuffer:serializer:",
+        opcodes: &[],
+        coverage: Coverage::Excluded {
+            reason: NOT_A_COMMAND,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "serializer",
+        opcodes: &[],
+        coverage: Coverage::Excluded {
+            reason: OBJECT_ACCESSOR,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "setBuffers:offsets:attributeStrides:withRange:withCommand:bindings:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "setBuffers:offsets:withRange:withCommand:bindings:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "setBytes:length:atIndex:withCommand:bindings:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "setBytes:length:attributeStride:atIndex:withCommand:bindings:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "setSamplerStates:lodMinClamps:lodMaxClamps:withRange:withCommand:bindings:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "setSamplerStates:withRange:withCommand:bindings:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "setTextures:withRange:withCommand:bindings:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "useHeap:",
+        opcodes: &[crate::ops::render::OPCODE_USE_HEAPS_NO_STAGES],
+        coverage: Coverage::Covered {
+            module: "ops::render",
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "useHeaps:count:",
+        opcodes: &[crate::ops::render::OPCODE_USE_HEAPS_NO_STAGES],
+        coverage: Coverage::Covered {
+            module: "ops::render",
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "useResource:usage:",
+        opcodes: &[crate::ops::render::OPCODE_USE_RESOURCES_NO_STAGES],
+        coverage: Coverage::Covered {
+            module: "ops::render",
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "useResources:count:usage:",
+        opcodes: &[crate::ops::render::OPCODE_USE_RESOURCES_NO_STAGES],
+        coverage: Coverage::Covered {
+            module: "ops::render",
+        },
+    },
+    Entry {
+        class: "PGSerializerCommandEncoder",
+        selector: "writeSegmentHeader:continuation:protectionOptions:",
+        opcodes: &[],
+        coverage: Coverage::Delegated {
+            reason: DELEGATED_ENCODER_HELPER,
+        },
+    },
+
     // Two opcodes, and which one the guest gets is a capability rather than an
     // argument: `-setSupportsSwizzledTextures:` switches this selector from the
     // 32-byte descriptor at `1` to the 40-byte one at `0x34`. Not
@@ -3447,6 +3614,7 @@ pub const MANIFEST: &[Entry] = &[
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
     pub covered: usize,
+    pub delegated: usize,
     pub unimplemented: usize,
     pub excluded: usize,
 }
@@ -3454,7 +3622,7 @@ pub struct Counts {
 impl Counts {
     #[inline]
     pub fn rows(&self) -> usize {
-        self.covered + self.unimplemented + self.excluded
+        self.covered + self.delegated + self.unimplemented + self.excluded
     }
 }
 
@@ -3464,6 +3632,7 @@ pub fn counts() -> Counts {
     for e in MANIFEST {
         match e.coverage {
             Coverage::Covered { .. } | Coverage::CoveredNoFixedOpcode { .. } => c.covered += 1,
+            Coverage::Delegated { .. } => c.delegated += 1,
             Coverage::Unimplemented => c.unimplemented += 1,
             Coverage::Excluded { .. } => c.excluded += 1,
         }
@@ -3552,6 +3721,20 @@ mod tests {
                         e.opcodes.is_empty(),
                         "-[{} {}] has no opcode of its own, yet records {:?} \
                          as if it did",
+                        e.class,
+                        e.selector,
+                        e.opcodes
+                    );
+                }
+                Coverage::Delegated { reason } => {
+                    assert!(
+                        !reason.is_empty(),
+                        "{} delegated without a reason",
+                        e.selector
+                    );
+                    assert!(
+                        e.opcodes.is_empty(),
+                        "-[{} {}] delegates opcode ownership yet records {:?}",
                         e.class,
                         e.selector,
                         e.opcodes

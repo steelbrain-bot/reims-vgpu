@@ -1,7 +1,9 @@
 //! Immutable, resource-resolved blit operations.
 
-use crate::{pixel_format::BlitAspect, ContentStamp};
-use reims_vgpu_protocol::{ByteLength, GuestVirtualAddress, MappingId, ResourceId, ResourceObject};
+use crate::{pixel_format::BlitAspect, LinearRange};
+use reims_vgpu_protocol::{
+    BackingId, ByteLength, GuestVirtualAddress, MappingId, ResourceId, ResourceObject,
+};
 
 /// One resolved mip level in a task-address texture allocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,7 +79,10 @@ pub enum ResolvedTextureBacking {
 /// One generational texture resource paired with its resolved guest storage.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedTextureEndpoint {
-    pub content: ContentStamp,
+    pub resource: ResourceId<ResourceObject>,
+    pub storage: BackingId,
+    pub level: u32,
+    pub slice: u32,
     pub backing: ResolvedTextureBacking,
 }
 
@@ -198,14 +203,16 @@ impl ResolvedTextureBacking {
 /// One checked byte range over a resolved buffer resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolvedBufferRange {
-    pub content: ContentStamp,
+    pub resource: ResourceId<ResourceObject>,
+    pub storage: BackingId,
+    pub region: LinearRange,
     pub address: GuestVirtualAddress,
     pub length: ByteLength,
 }
 
 impl ResolvedBufferRange {
     pub const fn resource(self) -> ResourceId<ResourceObject> {
-        self.content.resource
+        self.resource
     }
 }
 
@@ -242,14 +249,46 @@ pub enum ResolvedBlit {
     TextureCopyBatch(ResolvedTextureCopyBatch),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BlitKind {
+    Fill,
+    Copy,
+    BufferToTexture,
+    TextureToBuffer,
+    TextureToTexture,
+    TextureCopyBatch,
+}
+
+impl BlitKind {
+    pub const ALL: [Self; 6] = [
+        Self::Fill,
+        Self::Copy,
+        Self::BufferToTexture,
+        Self::TextureToBuffer,
+        Self::TextureToTexture,
+        Self::TextureCopyBatch,
+    ];
+}
+
 impl ResolvedBlit {
-    pub const fn destination_content(&self) -> ContentStamp {
+    pub const fn kind(&self) -> BlitKind {
         match self {
-            Self::Fill { destination, .. } | Self::Copy { destination, .. } => destination.content,
-            Self::BufferToTexture(operation) => operation.destination.content,
-            Self::TextureToBuffer(operation) => operation.destination.content,
-            Self::TextureToTexture(operation) => operation.destination.content,
-            Self::TextureCopyBatch(operation) => operation.first_level.first_slice.1.content,
+            Self::Fill { .. } => BlitKind::Fill,
+            Self::Copy { .. } => BlitKind::Copy,
+            Self::BufferToTexture(_) => BlitKind::BufferToTexture,
+            Self::TextureToBuffer(_) => BlitKind::TextureToBuffer,
+            Self::TextureToTexture(_) => BlitKind::TextureToTexture,
+            Self::TextureCopyBatch(_) => BlitKind::TextureCopyBatch,
+        }
+    }
+
+    pub const fn destination_resource(&self) -> ResourceId<ResourceObject> {
+        match self {
+            Self::Fill { destination, .. } | Self::Copy { destination, .. } => destination.resource,
+            Self::BufferToTexture(operation) => operation.destination.resource,
+            Self::TextureToBuffer(operation) => operation.destination.resource,
+            Self::TextureToTexture(operation) => operation.destination.resource,
+            Self::TextureCopyBatch(operation) => operation.first_level.first_slice.1.resource,
         }
     }
 }
@@ -257,14 +296,13 @@ impl ResolvedBlit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reims_vgpu_protocol::{ContentVersion, ResourceId};
+    use reims_vgpu_protocol::ResourceId;
 
     fn range(index: u32, generation: u32, address: u64) -> ResolvedBufferRange {
         ResolvedBufferRange {
-            content: ContentStamp {
-                resource: ResourceId::new(index, generation),
-                version: ContentVersion::new(4),
-            },
+            resource: ResourceId::new(index, generation),
+            storage: BackingId::new(u64::from(index)),
+            region: LinearRange::new(0, 16).unwrap(),
             address: GuestVirtualAddress::new(address),
             length: ByteLength::new(16),
         }
@@ -272,7 +310,10 @@ mod tests {
 
     fn linear_endpoint(index: u32) -> ResolvedTextureEndpoint {
         ResolvedTextureEndpoint {
-            content: range(index, 1, u64::from(index) << 12).content,
+            resource: range(index, 1, u64::from(index) << 12).resource,
+            storage: BackingId::new(u64::from(index)),
+            level: 0,
+            slice: 0,
             backing: ResolvedTextureBacking::Linear(ResolvedLinearTextureLevel {
                 base_gva: u64::from(index) << 12,
                 alloc_size: 0x1000,
@@ -296,10 +337,7 @@ mod tests {
             destination: range(7, 3, 0x2000),
         };
 
-        assert_eq!(
-            operation.destination_content().resource,
-            ResourceId::new(7, 3)
-        );
+        assert_eq!(operation.destination_resource(), ResourceId::new(7, 3));
     }
 
     #[test]
@@ -344,16 +382,16 @@ mod tests {
 
     #[test]
     fn resolved_buffer_to_texture_carries_only_generational_endpoints() {
-        let destination = ContentStamp {
-            resource: ResourceId::new(11, 4),
-            version: ContentVersion::new(6),
-        };
+        let destination = ResourceId::new(11, 4);
         let operation = ResolvedBlit::BufferToTexture(ResolvedBufferToTextureBlit {
             source: range(7, 3, 0x2000),
             source_bytes_per_row: 64,
             source_bytes_per_image: 256,
             destination: ResolvedTextureEndpoint {
-                content: destination,
+                resource: destination,
+                storage: BackingId::new(11),
+                level: 0,
+                slice: 0,
                 backing: ResolvedTextureBacking::Surface(ResolvedSurfaceTextureBacking {
                     mapping_id: MappingId::new(9),
                     plane: None,
@@ -375,19 +413,19 @@ mod tests {
             aspect: BlitAspect::Full,
         });
 
-        assert_eq!(operation.destination_content(), destination);
+        assert_eq!(operation.destination_resource(), destination);
     }
 
     #[test]
     fn resolved_texture_to_buffer_names_the_destination_lifetime() {
-        let source = ContentStamp {
-            resource: ResourceId::new(11, 4),
-            version: ContentVersion::new(6),
-        };
+        let source = ResourceId::new(11, 4);
         let destination = range(12, 8, 0x4000);
         let operation = ResolvedBlit::TextureToBuffer(ResolvedTextureToBufferBlit {
             source: ResolvedTextureEndpoint {
-                content: source,
+                resource: source,
+                storage: BackingId::new(11),
+                level: 0,
+                slice: 0,
                 backing: ResolvedTextureBacking::Linear(ResolvedLinearTextureLevel {
                     base_gva: 0x1000,
                     alloc_size: 0x1000,
@@ -414,7 +452,7 @@ mod tests {
             aspect: BlitAspect::Full,
         });
 
-        assert_eq!(operation.destination_content(), destination.content);
+        assert_eq!(operation.destination_resource(), destination.resource);
     }
 
     #[test]
@@ -430,6 +468,14 @@ mod tests {
             remaining_levels: Box::new([]),
         });
 
-        assert_eq!(operation.destination_content(), destination.content);
+        assert_eq!(operation.destination_resource(), destination.resource);
+    }
+
+    #[test]
+    fn blit_kind_surface_contains_every_variant_once() {
+        let unique = BlitKind::ALL
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), BlitKind::ALL.len());
     }
 }

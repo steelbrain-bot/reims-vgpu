@@ -12,6 +12,8 @@ pub mod blit;
 pub mod dispatch;
 pub mod geometry;
 pub mod identity;
+pub mod indirect_command;
+pub mod info;
 pub mod iosurface;
 pub mod mapper_request;
 pub mod metal_pixel;
@@ -35,10 +37,23 @@ pub use geometry::{
     tight_image_layout, tight_layered_image_bytes, Extent3,
 };
 pub use identity::{
-    BackingGeneration, ByteLength, ByteOffset, ContentVersion, GuestPhysicalAddress,
-    GuestVirtualAddress, MapperResolvedSurfaceId, MapperSurfaceRef, MappingId, ObjectTableRef,
-    PlaneIndex, PreparedShaderId, ResourceId, ResourceNamespaceId, SerializerRef, StorageId,
-    SubmissionId, SurfaceBackingId, SurfaceId, TaskId, TextureRotation,
+    BackingGeneration, BackingId, ByteLength, ByteOffset, ChannelId, ChannelSequence,
+    ContentVersion, DomainSequence, EventId, FenceId, GuestPhysicalAddress, GuestVirtualAddress,
+    HazardDomainId, IngressOrdinal, MapperResolvedSurfaceId, MapperSurfaceRef, MappingId,
+    ObjectTableRef, PlaneIndex, PreparedShaderId, PresentTicketId, PublicationDomainId,
+    PublicationSequence, QueueOwnerId, QueueTimelineValue, RepresentationId, ResourceId,
+    ResourceNamespaceId, SerializerRef, SessionGenerationId, SessionId, SubmissionDomainId,
+    SubmissionId, SurfaceBackingId, SurfaceId, SwapchainGenerationId, TaskId, TextureRotation,
+    TransactionId, VulkanDeviceEpochId,
+};
+pub use indirect_command::{
+    decode_indirect_command_operation, IndirectCommandDecodeError, IndirectCommandOperation,
+    IndirectCommandRange,
+};
+pub use info::{
+    decode_info_operation, CoordinateMapDirection, ImageblockDimensions, InfoDecodeError,
+    InfoOperation, InfoOperationKind, InfoReplyTarget, PipelineStateInfoKind,
+    RasterizationRateMapObject, RateMapCoordinate, ResourceInfoKind, UnsupportedInfoOperation,
 };
 pub use iosurface::*;
 pub use mapper_request::*;
@@ -59,30 +74,36 @@ pub use pixel::{
 };
 pub use resource::{
     decode_object_list_entry, decode_surface_backing_descriptor, BufferDescriptor,
-    BufferTextureDescriptor, ColorWriteMask, ComputePipelineObject, ComputeStageInputAttribute,
-    ComputeStageInputDescriptor, ComputeStageInputLayout, DepthStencilDescriptor, DepthStencilFace,
-    DepthStencilObject, EventObject, FenceObject, FunctionDescriptor, FunctionObject,
-    IOSurfacePlaneViewDecodeState, IOSurfacePlaneViewDescriptor, IOSurfacePlaneViewRecordKind,
+    BufferTextureDescriptor, ColorWriteMask, ComputePipelineDescriptor, ComputePipelineObject,
+    ComputeStageInputAttribute, ComputeStageInputDescriptor, ComputeStageInputLayout,
+    DepthStencilDescriptor, DepthStencilFace, DepthStencilObject, EventObject, FenceObject,
+    FunctionDescriptor, FunctionObject, IOSurfacePlaneViewDecodeState,
+    IOSurfacePlaneViewDescriptor, IOSurfacePlaneViewRecordKind,
     IOSurfacePlaneViewResourceDescriptor, IcbCommandLayout, IcbCommandMemory, IcbUnappliedFlag,
     IndirectCommandBufferDescriptor, LinearTextureDescriptor, ObjectKind, ObjectListDecodeError,
-    ObjectListEntry, RenderPipelineDescriptor, RenderPipelineObject, ResourceDecodeError,
-    ResourceDescriptor, SamplerDescriptor, SamplerObject, SurfaceBackingDescriptor,
-    SurfaceBackingPlane, TextureLevelLayout, TextureViewDescriptor, TextureViewForm,
-    VertexAttribute, CUBE_FACES, MAX_COLOR_ATTACHMENTS, MTL_COLOR_WRITE_MASK_ALL,
-    MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE, MTL_COLOR_WRITE_MASK_GREEN,
-    MTL_COLOR_WRITE_MASK_NONE, MTL_COLOR_WRITE_MASK_RED, OBJECT_LIST_ENTRY_LEN,
+    ObjectListDependency, ObjectListEntry, RasterizationRateMapDescriptor,
+    RasterizationRateMapLayerDescriptor, RenderPipelineDescriptor, RenderPipelineObject,
+    ResourceDecodeError, ResourceDescriptor, SamplerDescriptor, SamplerObject,
+    SurfaceBackingDescriptor, SurfaceBackingPlane, SurfacePlaneLayoutError, TextureLevelLayout,
+    TextureViewDescriptor, TextureViewForm, VertexAttribute, CUBE_FACES, MAX_COLOR_ATTACHMENTS,
+    MTL_COLOR_WRITE_MASK_ALL, MTL_COLOR_WRITE_MASK_ALPHA, MTL_COLOR_WRITE_MASK_BLUE,
+    MTL_COLOR_WRITE_MASK_GREEN, MTL_COLOR_WRITE_MASK_NONE, MTL_COLOR_WRITE_MASK_RED,
+    OBJECT_LIST_ENTRY_LEN,
 };
 pub use resource_state::ResourceValidityOps;
-pub use stamp::{StampWait, STAMP_INDEX_MASK, STAMP_SLOT_LEN};
+pub use stamp::{StampWait, STAMP_SLOT_LEN};
 pub use submission::{
-    HeapObject, IndirectCommandBufferObject, ResourceObject, ResourceValidity, SegmentBoundary,
-    SegmentKind, SubmissionIdentity, SubmissionResourceUse,
+    HeapObject, IndirectCommandBufferObject, ParticipationDecodeError, RenderStages,
+    ResourceObject, ResourceUsage, ResourceValidity, SegmentBoundary, SegmentKind,
+    SubmissionIdentity, SubmissionResourceUse,
 };
 pub use texture::{
     decode_heap_texture_descriptor, decode_mapper_iosurface_texture_view,
     texture_declaration_from_narrow, texture_declaration_from_wide, GuestWriteAnnouncement,
     HeapTextureDescriptor, MapperIOSurfaceTextureDecodeError, MapperIOSurfaceTextureView,
-    StorageMode, TextureDeclaration,
+    StorageMode, TextureDeclaration, TextureType, RESOURCE_OPTIONS_STORAGE_MODE_PRIVATE,
+    TEXTURE_USAGE_KNOWN, TEXTURE_USAGE_PIXEL_FORMAT_VIEW, TEXTURE_USAGE_RENDER_TARGET,
+    TEXTURE_USAGE_SHADER_ATOMIC, TEXTURE_USAGE_SHADER_READ, TEXTURE_USAGE_SHADER_WRITE,
 };
 pub use vertex::{decode_vertex_attribute_format, VertexAttributeFormat, VertexFormatDecodeError};
 pub use vertex_step::{

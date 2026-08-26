@@ -319,10 +319,9 @@ mod tests {
 
     fn range(index: u32) -> crate::ResolvedBufferRange {
         crate::ResolvedBufferRange {
-            content: ContentStamp {
-                resource: ResourceId::new(index, 1),
-                version: ContentVersion::new(2),
-            },
+            resource: ResourceId::new(index, 1),
+            storage: reims_vgpu_protocol::BackingId::new(u64::from(index)),
+            region: crate::LinearRange::new(0, 16).unwrap(),
             address: GuestVirtualAddress::new(u64::from(index) << 12),
             length: ByteLength::new(16),
         }
@@ -379,6 +378,7 @@ mod tests {
         let update = ResolvedResourceState {
             resource: None,
             mappings: vec![reims_vgpu_protocol::SurfaceId::new(5)].into_boxed_slice(),
+            targets: Box::new([]),
             ops: reims_vgpu_protocol::ResourceValidityOps::PAGE_ON,
         };
         let buffer: ResolvedCommandBuffer<(), ()> =
@@ -391,8 +391,14 @@ mod tests {
         use std::cell::RefCell;
 
         let context = SubmissionContext::standalone(7);
-        let first = range(1).content;
-        let second = range(2).content;
+        let first = ContentStamp {
+            resource: range(1).resource,
+            version: ContentVersion::new(2),
+        };
+        let second = ContentStamp {
+            resource: range(2).resource,
+            version: ContentVersion::new(2),
+        };
         let submission = ResolvedSubmission {
             context: context.clone(),
             command_buffer: ResolvedCommandBuffer::new(vec![
@@ -430,7 +436,10 @@ mod tests {
     #[test]
     fn a_failed_command_returns_the_exact_successful_prefix() {
         let context = SubmissionContext::standalone(7);
-        let first = range(1).content;
+        let first = ContentStamp {
+            resource: range(1).resource,
+            version: ContentVersion::new(2),
+        };
         let submission = ResolvedSubmission {
             context: context.clone(),
             command_buffer: ResolvedCommandBuffer::new(vec![

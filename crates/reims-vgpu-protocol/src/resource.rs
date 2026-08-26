@@ -1,5 +1,6 @@
 //! Semantic resource namespace entries.
 
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -109,9 +110,23 @@ pub struct RenderPipelineDescriptor {
     pub max_tessellation_factor: u32,
     pub tessellation_factor_step_function: u32,
     pub tessellation_output_winding_order: u32,
+    /// Whether this exact pipeline was constructed for indirect commands.
+    pub supports_indirect_command_buffers: bool,
     pub vertex_attributes: Vec<VertexAttribute>,
     pub color0: PipelineColorAttachment,
     pub color_attachments: Vec<PipelineColorAttachment>,
+}
+
+impl RenderPipelineDescriptor {
+    /// Effective multisample count. An omitted serialized value selects the
+    /// API's ordinary single-sample default.
+    pub const fn effective_raster_sample_count(&self) -> u32 {
+        if self.raster_sample_count == 0 {
+            1
+        } else {
+            self.raster_sample_count
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -152,6 +167,11 @@ pub struct ComputeStageInputDescriptor {
 pub struct ComputePipelineDescriptor {
     pub kernel_func_ref: u32,
     pub stage_input: Option<ComputeStageInputDescriptor>,
+    /// Descriptor-owned upper bound. `None` is Metal's omitted/default value,
+    /// so the compiled pipeline inherits the native device limit.
+    pub max_total_threads_per_threadgroup: Option<u32>,
+    /// Whether this exact pipeline was constructed for indirect commands.
+    pub supports_indirect_command_buffers: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -177,6 +197,8 @@ pub struct SamplerDescriptor {
     pub border_color: u32,
     pub normalized_coordinates: bool,
     pub support_argument_buffers: bool,
+    /// Written sampler flag bits `[3:1]` whose property is not identified.
+    pub unidentified_flags: u8,
     pub lod_average: bool,
 }
 
@@ -186,6 +208,8 @@ pub struct DepthStencilFace {
     pub stencil_failure_operation: u32,
     pub depth_failure_operation: u32,
     pub depth_stencil_pass_operation: u32,
+    /// Written packed-operation bits `[31:12]` whose property is unidentified.
+    pub unidentified_ops: u32,
     pub read_mask: u32,
     pub write_mask: u32,
 }
@@ -219,6 +243,25 @@ pub struct BufferDescriptor {
 }
 
 impl BufferDescriptor {
+    /// The descriptor bit that selects private storage instead of shared
+    /// page-backed storage.
+    pub const PRIVATE_FLAG: u64 = 1 << 32;
+
+    /// Written handle-word bits outside the page handle and private-storage
+    /// selector whose semantics are not represented by this descriptor.
+    pub const fn unidentified_handle_flags(&self) -> u64 {
+        self.handle64 & !((u32::MAX as u64) | Self::PRIVATE_FLAG)
+    }
+
+    /// Storage semantics stated by the buffer descriptor.
+    pub const fn storage_mode(&self) -> crate::StorageMode {
+        if self.is_private {
+            crate::StorageMode::Private
+        } else {
+            crate::StorageMode::Shared
+        }
+    }
+
     /// Guest VA and allocation size, or `None` when the declaration cannot
     /// identify a non-empty page-backed allocation.
     pub fn backing_gva_size(&self, page_shift: u32) -> Option<(u64, u64)> {
@@ -575,7 +618,10 @@ pub struct IndirectCommandBufferDescriptor {
     pub max_mesh_buffer_bind_count: u16,
     pub max_kernel_threadgroup_memory_bind_count: u16,
     pub max_object_threadgroup_memory_bind_count: u16,
+    pub unidentified_u8_a: u8,
+    pub unidentified_u8_b: u8,
     pub flags: u16,
+    pub unidentified_u32: u32,
     pub max_command_count: u32,
     pub options: u16,
     pub layout: IcbCommandLayout,
@@ -616,6 +662,20 @@ impl IcbUnappliedFlag {
 }
 
 impl IndirectCommandBufferDescriptor {
+    /// Bits the serializer writes for every descriptor default. The six
+    /// inherited render-state properties are enabled, the two support
+    /// properties are disabled, and the five unattributed serializer bits are
+    /// set. This is the semantic default, not the all-zero integer default.
+    pub const FLAGS_DEFAULT: u16 = 0x7ff0;
+    pub const UNIDENTIFIED_U8_A_DEFAULT: u8 = 1;
+    pub const UNIDENTIFIED_U8_B_DEFAULT: u8 = 1;
+    pub const UNIDENTIFIED_U32_DEFAULT: u32 = 0;
+    pub const FLAG_SUPPORT_RAY_TRACING: u16 = 1 << 2;
+    pub const UNIDENTIFIED_FLAGS_DEFAULT: u16 =
+        (1 << 6) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14);
+    pub const RESOURCE_OPTIONS_STORAGE_MODE_PRIVATE: u16 =
+        crate::RESOURCE_OPTIONS_STORAGE_MODE_PRIVATE;
+
     pub const fn inherit_pipeline_state(&self) -> bool {
         self.flags & (1 << 0) != 0
     }
@@ -625,13 +685,16 @@ impl IndirectCommandBufferDescriptor {
     }
 
     pub const fn unidentified_flags(&self) -> u16 {
-        self.flags & ((1 << 6) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14))
+        self.flags & Self::UNIDENTIFIED_FLAGS_DEFAULT
     }
 
     pub fn unapplied_flags(&self) -> Vec<IcbUnappliedFlag> {
         let mut out = Vec::new();
         for (bit, flag) in [
-            (1 << 2, IcbUnappliedFlag::SupportRayTracing),
+            (
+                Self::FLAG_SUPPORT_RAY_TRACING,
+                IcbUnappliedFlag::SupportRayTracing,
+            ),
             (1 << 3, IcbUnappliedFlag::SupportDynamicAttributeStride),
         ] {
             if self.flags & bit != 0 {
@@ -654,6 +717,26 @@ impl IndirectCommandBufferDescriptor {
     }
 }
 
+/// One variable-rate layer with its exact horizontal and vertical qualities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RasterizationRateMapLayerDescriptor {
+    pub sample_width: u16,
+    pub sample_height: u16,
+    /// Exact IEEE-754 encodings in sample order. Keeping the bits avoids
+    /// making NaN equality a lifecycle identity decision.
+    pub horizontal_quality_bits: Box<[u32]>,
+    pub vertical_quality_bits: Box<[u32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RasterizationRateMapDescriptor {
+    pub screen_width: u16,
+    pub screen_height: u16,
+    pub unidentified_u32_a: u32,
+    pub unidentified_u32_b: u32,
+    pub layers: Box<[RasterizationRateMapLayerDescriptor]>,
+}
+
 /// Semantic result of decoding one object-list construction descriptor.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResourceDescriptor {
@@ -671,6 +754,62 @@ pub enum ResourceDescriptor {
     IOSurfacePlaneView(IOSurfacePlaneViewResourceDescriptor),
     MapperIOSurfaceTextureView(crate::MapperIOSurfaceTextureView),
     IndirectCommandBuffer(IndirectCommandBufferDescriptor),
+    RasterizationRateMap(RasterizationRateMapDescriptor),
+}
+
+impl ResourceDescriptor {
+    /// Object-list identities whose construction must precede this descriptor.
+    ///
+    /// This is only the object-list relation. Heap and mapper-service
+    /// identities belong to distinct namespaces and are resolved by their own
+    /// owners rather than converted into object-table references here.
+    pub fn object_list_dependencies(&self, task: TaskId) -> Box<[ObjectListDependency]> {
+        let mut dependencies: Vec<ObjectListDependency> = Vec::new();
+        let mut push = |owner_task: TaskId, reference: u32| {
+            if reference != 0
+                && !dependencies.iter().any(|dependency| {
+                    dependency.task == owner_task && dependency.object.get() == reference
+                })
+            {
+                dependencies.push(ObjectListDependency {
+                    task: owner_task,
+                    object: ObjectTableRef::new(reference),
+                });
+            }
+        };
+        match self {
+            Self::RenderPipeline(descriptor) => {
+                push(task, descriptor.vertex_func_ref);
+                push(task, descriptor.fragment_func_ref);
+                push(task, descriptor.object_func_ref);
+                push(task, descriptor.mesh_func_ref);
+            }
+            Self::ComputePipeline(descriptor) => push(task, descriptor.kernel_func_ref),
+            Self::TextureView(descriptor) => push(task, descriptor.base_texture_ref),
+            Self::BufferTexture(descriptor) => push(task, descriptor.buffer_ref),
+            Self::IOSurfacePlaneView(descriptor) => {
+                push(descriptor.owner_task, descriptor.surface.get())
+            }
+            Self::Buffer(_)
+            | Self::Texture(_)
+            | Self::SurfaceBacking(_)
+            | Self::Sampler(_)
+            | Self::Function(_)
+            | Self::DepthStencil(_)
+            | Self::HeapTexture(_)
+            | Self::MapperIOSurfaceTextureView(_)
+            | Self::IndirectCommandBuffer(_)
+            | Self::RasterizationRateMap(_) => {}
+        }
+        dependencies.into_boxed_slice()
+    }
+}
+
+/// One task-qualified object-list dependency.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ObjectListDependency {
+    pub task: TaskId,
+    pub object: ObjectTableRef<ResourceObject>,
 }
 
 /// One plane declared by a registered IOSurface backing object.
@@ -697,6 +836,106 @@ pub struct SurfaceBackingDescriptor {
     pub width: u32,
     pub height: u32,
     pub bytes_per_row: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfacePlaneLayoutError {
+    PlaneOutOfBounds,
+    GeometryMismatch,
+    EmptyLayout,
+    SpanOverflow,
+    SpanTooLarge,
+    SpanPastAllocation,
+}
+
+impl SurfaceBackingDescriptor {
+    /// Project one declared IOSurface plane into the ordinary linear-texture
+    /// vocabulary used by transfer and native-image construction.
+    pub fn plane_linear_texture(
+        &self,
+        view: IOSurfacePlaneViewDescriptor,
+    ) -> Result<LinearTextureDescriptor, SurfacePlaneLayoutError> {
+        let plane_index = usize::try_from(view.plane_index)
+            .ok()
+            .filter(|index| *index < usize::from(self.plane_count))
+            .ok_or(SurfacePlaneLayoutError::PlaneOutOfBounds)?;
+        let plane = self.planes[plane_index];
+        if view.width != plane.width || view.height != plane.height || view.depth != 1 {
+            return Err(SurfacePlaneLayoutError::GeometryMismatch);
+        }
+        if view.pixel_format == 0
+            || plane.width == 0
+            || plane.height == 0
+            || plane.bytes_per_row == 0
+            || plane.bytes_per_element == 0
+        {
+            return Err(SurfacePlaneLayoutError::EmptyLayout);
+        }
+        let tight_row = plane
+            .width
+            .checked_mul(u32::from(plane.bytes_per_element))
+            .ok_or(SurfacePlaneLayoutError::SpanOverflow)?;
+        if tight_row > plane.bytes_per_row {
+            return Err(SurfacePlaneLayoutError::SpanPastAllocation);
+        }
+        let occupied = u64::from(plane.height - 1)
+            .checked_mul(u64::from(plane.bytes_per_row))
+            .and_then(|prefix| prefix.checked_add(u64::from(tight_row)))
+            .ok_or(SurfacePlaneLayoutError::SpanOverflow)?;
+        let end = u64::from(plane.offset)
+            .checked_add(occupied)
+            .ok_or(SurfacePlaneLayoutError::SpanOverflow)?;
+        if end > self.length {
+            return Err(SurfacePlaneLayoutError::SpanPastAllocation);
+        }
+        let declaration = crate::TextureDeclaration {
+            texture_type: crate::TextureType::D2,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
+            allow_gpu_optimized_contents: false,
+            // This construction form carries no usage mask. Zero retains that
+            // absence; native planning then enables only format-supported uses.
+            usage: 0,
+            pixel_format: view.pixel_format,
+            width: view.width,
+            height: view.height,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            resource_options: 0,
+            protection_options: 0,
+            swizzle: None,
+        };
+        let used_size =
+            u32::try_from(occupied).map_err(|_| SurfacePlaneLayoutError::SpanTooLarge)?;
+        Ok(LinearTextureDescriptor {
+            allocation_size: self.length,
+            handle: self.backing_pfn,
+            mipmap_level_count: 1,
+            base_offset: u64::from(plane.offset),
+            bytes_per_slice: 0,
+            slice_count: 1,
+            cube_faces: false,
+            compressed_layout: false,
+            bytes_per_element: plane.bytes_per_element,
+            used_size,
+            row_stride: plane.bytes_per_row,
+            width: plane.width,
+            height: plane.height,
+            depth: 1,
+            declaration: Some(declaration),
+            levels: vec![TextureLevelLayout {
+                offset: 0,
+                size: occupied,
+                row_stride: u64::from(plane.bytes_per_row),
+                width: plane.width,
+                height: plane.height,
+                depth: 1,
+            }],
+        })
+    }
 }
 
 /// Decode one complete registered-surface construction descriptor.
@@ -1028,7 +1267,7 @@ mod tests {
         // A declared `Managed` texture is the one mode that does announce, so
         // the fail-closed answer above is the absence and not a constant.
         let mut declaration = crate::TextureDeclaration {
-            texture_type: 0,
+            texture_type: crate::TextureType::D1,
             framebuffer_only: false,
             is_drawable: false,
             write_swizzle_enabled: None,
@@ -1109,6 +1348,13 @@ mod tests {
         assert_eq!(descriptor.backing_gva_size(12), Some((0x42_000, 0x3000)));
         assert_eq!(descriptor.backing_gva_size(14), Some((0x108_000, 0x3000)));
         assert_eq!(descriptor.backing_gva_size(0), None);
+        assert_eq!(descriptor.unidentified_handle_flags(), 0);
+
+        let unidentified = BufferDescriptor {
+            handle64: descriptor.handle64 | (1 << 47),
+            ..descriptor
+        };
+        assert_eq!(unidentified.unidentified_handle_flags(), 1 << 47);
     }
 
     #[test]
@@ -1161,6 +1407,62 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_dependencies_preserve_only_explicit_object_list_relations() {
+        let render = ResourceDescriptor::RenderPipeline(RenderPipelineDescriptor {
+            vertex_func_ref: 7,
+            fragment_func_ref: 0,
+            object_func_ref: 7,
+            mesh_func_ref: 9,
+            ..Default::default()
+        });
+        assert_eq!(
+            render
+                .object_list_dependencies(TaskId::new(2))
+                .iter()
+                .map(|dependency| (dependency.task.get(), dependency.object.get()))
+                .collect::<Vec<_>>(),
+            vec![(2, 7), (2, 9)]
+        );
+
+        let view = ResourceDescriptor::TextureView(TextureViewDescriptor {
+            base_texture_ref: 4,
+            ..Default::default()
+        });
+        assert_eq!(
+            view.object_list_dependencies(TaskId::new(2)).as_ref(),
+            [ObjectListDependency {
+                task: TaskId::new(2),
+                object: ObjectTableRef::new(4),
+            }]
+        );
+
+        let plane = IOSurfacePlaneViewResourceDescriptor {
+            surface: ObjectTableRef::new(12),
+            owner_task: TaskId::new(3),
+            operation_kind: None,
+            operation_length: None,
+            own_ref: None,
+            record_kind: None,
+            unidentified_record_flags: 0,
+            view: None,
+            decode_state: IOSurfacePlaneViewDecodeState::MissingOperation,
+        };
+        assert_eq!(
+            ResourceDescriptor::IOSurfacePlaneView(plane)
+                .object_list_dependencies(TaskId::new(2))
+                .as_ref(),
+            [ObjectListDependency {
+                task: TaskId::new(3),
+                object: ObjectTableRef::new(12),
+            }]
+        );
+
+        assert!(ResourceDescriptor::Buffer(BufferDescriptor::default())
+            .object_list_dependencies(TaskId::new(2))
+            .is_empty());
+    }
+
+    #[test]
     fn texture_view_semantics_do_not_expose_serializer_opcodes() {
         let simple = TextureViewDescriptor::default();
         assert!(!simple.carries_range());
@@ -1174,6 +1476,22 @@ mod tests {
         assert!(swizzled.carries_range());
         assert!(swizzled.carries_swizzle());
         assert_eq!(swizzled.declared_pixel_format(), Some(80));
+    }
+
+    #[test]
+    fn buffer_storage_mode_is_derived_from_the_descriptor_flag() {
+        assert_eq!(
+            BufferDescriptor::default().storage_mode(),
+            crate::StorageMode::Shared
+        );
+        assert_eq!(
+            BufferDescriptor {
+                is_private: true,
+                ..Default::default()
+            }
+            .storage_mode(),
+            crate::StorageMode::Private
+        );
     }
 
     #[test]
@@ -1330,5 +1648,53 @@ mod tests {
         let unapplied = descriptor.unapplied_flags();
         assert!(unapplied.contains(&IcbUnappliedFlag::SupportRayTracing));
         assert!(unapplied.contains(&IcbUnappliedFlag::InheritDepthStencilState));
+    }
+
+    #[test]
+    fn registered_surface_plane_projects_one_exact_linear_texture_layout() {
+        let mut planes = [SurfaceBackingPlane::default();
+            reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP];
+        planes[0] = SurfaceBackingPlane {
+            offset: 0x400,
+            width: 64,
+            height: 32,
+            bytes_per_row: 0x140,
+            bytes_per_element: 4,
+        };
+        let surface = SurfaceBackingDescriptor {
+            length: 0x5000,
+            backing_pfn: 0x123,
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            plane_count: 1,
+            planes,
+            width: 64,
+            height: 32,
+            bytes_per_row: 0x140,
+        };
+        let layout = surface
+            .plane_linear_texture(IOSurfacePlaneViewDescriptor {
+                pixel_format: 80,
+                width: 64,
+                height: 32,
+                depth: 1,
+                plane_index: 0,
+            })
+            .expect("the view exactly matches its declared plane");
+        assert_eq!(layout.allocation_size, surface.length);
+        assert_eq!(layout.base_offset, 0x400);
+        assert_eq!(layout.levels[0].row_stride, 0x140);
+        assert_eq!(layout.levels[0].size, 31 * 0x140 + 64 * 4);
+        assert_eq!(layout.declaration.unwrap().usage, 0);
+
+        assert_eq!(
+            surface.plane_linear_texture(IOSurfacePlaneViewDescriptor {
+                pixel_format: 80,
+                width: 63,
+                height: 32,
+                depth: 1,
+                plane_index: 0,
+            }),
+            Err(SurfacePlaneLayoutError::GeometryMismatch)
+        );
     }
 }

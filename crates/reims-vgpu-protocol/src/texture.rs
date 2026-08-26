@@ -4,11 +4,94 @@ use crate::{
     HeapObject, MapperSurfaceRef, PlaneIndex, ResourceDecodeError, ResourceObject, SerializerRef,
     TextureRotation,
 };
+use core::fmt;
 use reims_vgpu_wire::device_desc::{
     MapperIOSurfaceTextureError as WireMapperError, MapperIOSurfaceTextureOperation,
 };
 use reims_vgpu_wire::ops::texture::{TextureDescriptorBody, WideTextureDescriptorBody};
+
+/// `MTLTextureUsage` bits carried by [`TextureDeclaration::usage`].
+pub const TEXTURE_USAGE_SHADER_READ: u32 = 1 << 0;
+pub const TEXTURE_USAGE_SHADER_WRITE: u32 = 1 << 1;
+pub const TEXTURE_USAGE_RENDER_TARGET: u32 = 1 << 2;
+pub const TEXTURE_USAGE_PIXEL_FORMAT_VIEW: u32 = 1 << 4;
+pub const TEXTURE_USAGE_SHADER_ATOMIC: u32 = 1 << 5;
+pub const TEXTURE_USAGE_KNOWN: u32 = TEXTURE_USAGE_SHADER_READ
+    | TEXTURE_USAGE_SHADER_WRITE
+    | TEXTURE_USAGE_RENDER_TARGET
+    | TEXTURE_USAGE_PIXEL_FORMAT_VIEW
+    | TEXTURE_USAGE_SHADER_ATOMIC;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureType {
+    D1,
+    D1Array,
+    D2,
+    D2Array,
+    D2Multisample,
+    Cube,
+    CubeArray,
+    D3,
+    D2MultisampleArray,
+    Buffer,
+    Unknown(u8),
+}
+
+impl TextureType {
+    pub const fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::D1,
+            1 => Self::D1Array,
+            2 => Self::D2,
+            3 => Self::D2Array,
+            4 => Self::D2Multisample,
+            5 => Self::Cube,
+            6 => Self::CubeArray,
+            7 => Self::D3,
+            8 => Self::D2MultisampleArray,
+            9 => Self::Buffer,
+            raw => Self::Unknown(raw),
+        }
+    }
+
+    pub const fn raw(self) -> u8 {
+        match self {
+            Self::D1 => 0,
+            Self::D1Array => 1,
+            Self::D2 => 2,
+            Self::D2Array => 3,
+            Self::D2Multisample => 4,
+            Self::Cube => 5,
+            Self::CubeArray => 6,
+            Self::D3 => 7,
+            Self::D2MultisampleArray => 8,
+            Self::Buffer => 9,
+            Self::Unknown(raw) => raw,
+        }
+    }
+}
+
+impl From<TextureType> for u8 {
+    fn from(value: TextureType) -> Self {
+        value.raw()
+    }
+}
+
+impl From<TextureType> for u16 {
+    fn from(value: TextureType) -> Self {
+        u16::from(value.raw())
+    }
+}
+
+impl fmt::Display for TextureType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.raw().fmt(formatter)
+    }
+}
 use reims_vgpu_wire::WireError;
+
+/// `MTLResourceOptions` bits selecting private storage.
+pub const RESOURCE_OPTIONS_STORAGE_MODE_PRIVATE: u16 = 2 << 4;
 
 /// `MTLStorageMode`, decoded once from `resource_options[7:4]`.
 ///
@@ -93,7 +176,7 @@ impl StorageMode {
 /// absent field into a false declaration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextureDeclaration {
-    pub texture_type: u8,
+    pub texture_type: TextureType,
     pub framebuffer_only: bool,
     pub is_drawable: bool,
     /// Present only in the wide declaration. The narrow form leaves the same
@@ -232,7 +315,7 @@ pub enum MapperIOSurfaceTextureDecodeError {
 /// Project a checked narrow serializer view into one semantic declaration.
 pub fn texture_declaration_from_narrow(d: &TextureDescriptorBody) -> TextureDeclaration {
     TextureDeclaration {
-        texture_type: d.texture_type(),
+        texture_type: TextureType::from_raw(d.texture_type()),
         framebuffer_only: d.framebuffer_only(),
         is_drawable: d.is_drawable(),
         write_swizzle_enabled: None,
@@ -254,7 +337,7 @@ pub fn texture_declaration_from_narrow(d: &TextureDescriptorBody) -> TextureDecl
 /// Project a checked wide serializer view into one semantic declaration.
 pub fn texture_declaration_from_wide(d: &WideTextureDescriptorBody) -> TextureDeclaration {
     TextureDeclaration {
-        texture_type: d.texture_type(),
+        texture_type: TextureType::from_raw(d.texture_type()),
         framebuffer_only: d.framebuffer_only(),
         is_drawable: d.is_drawable(),
         write_swizzle_enabled: Some(d.write_swizzle_enabled()),
@@ -388,6 +471,26 @@ mod storage_mode_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_type_decoder_covers_every_declared_ordinal() {
+        let expected = [
+            TextureType::D1,
+            TextureType::D1Array,
+            TextureType::D2,
+            TextureType::D2Array,
+            TextureType::D2Multisample,
+            TextureType::Cube,
+            TextureType::CubeArray,
+            TextureType::D3,
+            TextureType::D2MultisampleArray,
+            TextureType::Buffer,
+        ];
+        for (raw, expected) in expected.into_iter().enumerate() {
+            assert_eq!(TextureType::from_raw(raw as u8), expected);
+        }
+        assert_eq!(TextureType::from_raw(10), TextureType::Unknown(10));
+    }
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());

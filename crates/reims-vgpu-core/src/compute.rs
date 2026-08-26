@@ -1,7 +1,7 @@
 //! Backend-independent resolved compute commands and their typed results.
 
 use reims_vgpu_memory::{GuestImageSource, GuestPageTarget, GuestRunSource};
-use reims_vgpu_protocol::{SampledImageFormat, StorageImageFormat};
+use reims_vgpu_protocol::{ResourceId, SampledImageFormat, SamplerObject, StorageImageFormat};
 pub use reims_vgpu_protocol::{
     SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction, SamplerFilter, SamplerMipFilter,
 };
@@ -21,10 +21,13 @@ pub enum ComputeBarrier {
     Fence,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct SamplerResource {
     pub binding: u32,
     pub source: SamplerSource,
+    /// Exact guest sampler generation for dynamic state. Static executable
+    /// samplers and explicit null descriptors have no independent object.
+    pub identity: Option<ResourceId<SamplerObject>>,
     pub min_filter: SamplerFilter,
     pub mag_filter: SamplerFilter,
     pub mip_filter: SamplerMipFilter,
@@ -43,6 +46,7 @@ pub struct SamplerResource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum SamplerSource {
     State,
+    Static,
     Null,
 }
 
@@ -51,6 +55,7 @@ impl SamplerResource {
         Self {
             binding,
             source: SamplerSource::State,
+            identity: None,
             min_filter: SamplerFilter::Linear,
             mag_filter: SamplerFilter::Linear,
             mip_filter: SamplerMipFilter::NotMipmapped,

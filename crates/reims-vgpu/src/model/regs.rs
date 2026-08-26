@@ -3,6 +3,11 @@
 //! Sources: `apple-pv-gpu.h`, `reims_vgpu_fifo_format.h`.
 //! Values are protocol constants — not content heuristics.
 
+// This module is the complete decoded register/FIFO vocabulary. Some declared
+// values are exercised only by a guest generation or pathway unavailable to a
+// given host build; lack of a local call site does not retire that contract.
+#![allow(dead_code)]
+
 /// Control block base inside the gfx window.
 pub const REG_BASE: u64 = 0x1000;
 
@@ -231,7 +236,7 @@ pub const fn scanout_extent_ok(width: u32, height: u32) -> bool {
 // the device's address arithmetic and its fixtures want. Both derive from the
 // one re-exported shift, so they cannot disagree in value — but the names do
 // collide, so import from one module or the other on purpose.
-pub(crate) use reims_vgpu_paging::geometry::{pfn_to_gpa, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
+pub(crate) use reims_vgpu_paging::geometry::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 // Gated with the fixtures that want them. That is the same statement the
 // comment above makes, now enforced rather than asserted: no product path
 // names either one, because product code goes through `state.page_size()`.
@@ -246,7 +251,7 @@ pub const PACKET_TOTAL_SIZE: usize = 0x04;
 pub const PACKET_COMPLETION_STAMP: usize = 0x08;
 pub const PACKET_HEADER_LEN: u32 = 12;
 pub const PACKET_STAMP_LEN: u32 = 8;
-pub const STAMP_INDEX_MASK: u32 = reims_vgpu_protocol::STAMP_INDEX_MASK;
+#[cfg(test)]
 pub const STAMP_SLOT_LEN: u32 = reims_vgpu_protocol::STAMP_SLOT_LEN as u32;
 
 /// `CmdDisplaySetSharedStatePage`, the same command as
@@ -636,6 +641,9 @@ pub const DEFINE_TASK_DIRECTORY_PFN: usize = 0x0c;
 pub const DEFINE_TASK_LEN: usize = 16;
 pub const DEFINE_TASK_ID_SHIFT: u32 = 1;
 
+pub const DELETE_TASK_ID: usize = 0x00;
+pub const DELETE_TASK_LEN: usize = size_of::<u32>();
+
 pub const SET_OBJECT_LIST_TASK_ID: usize = 0x00;
 pub const SET_OBJECT_LIST_PFN: usize = 0x04;
 pub const SET_OBJECT_LIST_COUNT: usize = 0x08;
@@ -655,8 +663,8 @@ pub const CHILD_SHARED_STATE_INDEX: usize = 0x00;
 pub const CHILD_SHARED_STATE_PFN: usize = 0x04;
 pub const CHILD_SHARED_STATE_LEN: usize = 8;
 
-pub const DISPLAY_SHARED_PENDING: u64 = 0x100;
-pub const DISPLAY_SHARED_ENABLE_MASK: u64 = 0x104;
+pub const DISPLAY_SHARED_PENDING: u64 = reims_vgpu_core::DISPLAY_SHARED_PENDING_OFFSET;
+pub const DISPLAY_SHARED_ENABLE_MASK: u64 = reims_vgpu_core::DISPLAY_SHARED_ENABLE_MASK_OFFSET;
 
 // The display shared page carries a two-word event mailbox: a *pending* word the
 // device ORs bits into, and an *enable* word the guest owns. The guest's display
@@ -709,9 +717,9 @@ pub const DISPLAY_VBL_EVENT_MASK: u32 = 1 << 0;
 /// the guest's own log, so both are recorded here.
 ///
 /// Whether a guest arms this class is a per-generation decision, not a constant.
-pub const DISPLAY_PRESENT_EVENT_MASK: u32 = 1 << 1;
+pub const DISPLAY_PRESENT_EVENT_MASK: u32 = reims_vgpu_core::DISPLAY_PRESENT_EVENT_MASK;
 /// Display became available — dispatched to the guest's online event source.
-pub const DISPLAY_ONLINE_EVENT_MASK: u32 = 1 << 2;
+pub const DISPLAY_ONLINE_EVENT_MASK: u32 = reims_vgpu_core::DISPLAY_ONLINE_EVENT_MASK;
 /// Display went away — dispatched to the guest's *offline* event source.
 ///
 /// **Nothing in this device may signal this bit, and nothing does.** It is named
@@ -1679,12 +1687,12 @@ pub fn published_byte_count(head: u32, tail: u32, ring_size: u32) -> Option<u32>
 
 #[inline]
 pub fn stamp_slot_count(page_bytes: u64) -> u32 {
-    (page_bytes / STAMP_SLOT_LEN as u64).min(u32::MAX as u64) as u32
+    reims_vgpu_core::completion_stamp_slot_count(page_bytes)
 }
 
 #[inline]
 pub fn stamp_slot_index(raw: u32) -> u32 {
-    raw & STAMP_INDEX_MASK
+    raw
 }
 
 /// Byte offset of stamp slot `index` within the stamp page.
@@ -1695,12 +1703,7 @@ pub fn stamp_slot_index(raw: u32) -> u32 {
 /// and wrote past the 4 KiB stamp page into adjacent guest RAM (wild write).
 #[inline]
 pub fn stamp_slot_offset(index: u32, page_bytes: u64) -> Option<u64> {
-    let slots = stamp_slot_count(page_bytes);
-    if index >= slots {
-        None
-    } else {
-        Some((index as u64) * STAMP_SLOT_LEN as u64)
-    }
+    reims_vgpu_core::completion_stamp_slot_offset(index, page_bytes)
 }
 
 #[cfg(test)]
@@ -1930,7 +1933,7 @@ mod tests {
             Some(PAGE_SIZE_X86 - STAMP_SLOT_LEN as u64)
         );
         assert_eq!(stamp_slot_offset(x86_slots, PAGE_SIZE_X86), None);
-        assert_eq!(stamp_slot_index(0xabcd_1234), 0x1234);
+        assert_eq!(stamp_slot_index(0xabcd_1234), 0xabcd_1234);
     }
 
     /// The C shims bound guest geometry against the same ceiling this module

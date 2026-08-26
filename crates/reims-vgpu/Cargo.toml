@@ -69,9 +69,3 @@ reims-vgpu-core = { path = "../reims-vgpu-core", features = ["test-fixtures"] }
 
 [build-dependencies]
 cc = "1"
-
-# Standalone visual smoke test for the host-owned window (needs a display + the
-# windowing stack); built only when the host-window feature is on.
-[[example]]
-name = "host_window_smoke"
-required-features = ["host-window"]

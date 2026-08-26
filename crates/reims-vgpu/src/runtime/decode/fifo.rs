@@ -16,7 +16,7 @@
 //! back head — lives in `runtime/drain/mod.rs`, which does it against live guest
 //! memory and reports each failure as a `PacketFault`.
 
-use reims_vgpu_core::endian::{ld32, st16, st32};
+use reims_vgpu_core::endian::{ld32, ld64, st16, st32};
 
 // --- child record layout, as the PVG command table numbers them ---
 
@@ -302,6 +302,28 @@ pub struct ExecResourceDesc {
     pub tail: [u8; CHILD_EXEC_RESOURCE_TAIL_LEN as usize],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecCommandBufferDesc {
+    pub gva: u64,
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecIndirect2Command {
+    pub task_id: u32,
+    pub resources: Vec<ExecResourceDesc>,
+    pub command_buffers: Vec<ExecCommandBufferDesc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecIndirect2DecodeError {
+    ShortHeader { plen: usize },
+    TableLengthOverflow,
+    TruncatedTables { plen: usize, need: u64 },
+    ZeroCommandBuffers,
+    ZeroCommandBufferLength { index: usize, gva: u64 },
+}
+
 impl ExecResourceDesc {
     /// How many of the 16 trailing bytes this record actually sets.
     pub fn tail_nonzero_bytes(&self) -> u32 {
@@ -344,6 +366,63 @@ pub fn decode_exec_resource_table(payload: &[u8]) -> Option<Vec<ExecResourceDesc
         off += CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
     }
     Some(descs)
+}
+
+/// Decode one complete `EXEC_INDIRECT2` envelope before any task-memory read.
+/// A declared command-buffer table is atomic: one malformed descriptor refuses
+/// the packet rather than silently shortening its immutable EXEC.
+pub fn decode_exec_indirect2(
+    payload: &[u8],
+) -> Result<ExecIndirect2Command, ExecIndirect2DecodeError> {
+    let plen = payload.len();
+    if plen < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
+        return Err(ExecIndirect2DecodeError::ShortHeader { plen });
+    }
+    let task_id = ld32(&payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..]);
+    let resource_count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
+    let command_buffer_count = ld32(&payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..]);
+    if command_buffer_count == 0 {
+        return Err(ExecIndirect2DecodeError::ZeroCommandBuffers);
+    }
+    let resource_bytes = u64::from(resource_count)
+        .checked_mul(u64::from(CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN))
+        .ok_or(ExecIndirect2DecodeError::TableLengthOverflow)?;
+    let command_buffer_bytes = u64::from(command_buffer_count)
+        .checked_mul(u64::from(CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN))
+        .ok_or(ExecIndirect2DecodeError::TableLengthOverflow)?;
+    let command_buffer_offset = u64::from(CHILD_EXEC_INDIRECT_HEADER_LEN)
+        .checked_add(resource_bytes)
+        .ok_or(ExecIndirect2DecodeError::TableLengthOverflow)?;
+    let need = command_buffer_offset
+        .checked_add(command_buffer_bytes)
+        .ok_or(ExecIndirect2DecodeError::TableLengthOverflow)?;
+    if need > plen as u64 {
+        return Err(ExecIndirect2DecodeError::TruncatedTables { plen, need });
+    }
+    let resources =
+        decode_exec_resource_table(payload).ok_or(ExecIndirect2DecodeError::TableLengthOverflow)?;
+    let mut command_buffers = Vec::with_capacity(command_buffer_count as usize);
+    for index in 0..command_buffer_count as usize {
+        let offset = usize::try_from(command_buffer_offset)
+            .ok()
+            .and_then(|base| {
+                index
+                    .checked_mul(CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize)
+                    .and_then(|delta| base.checked_add(delta))
+            })
+            .ok_or(ExecIndirect2DecodeError::TableLengthOverflow)?;
+        let gva = ld64(&payload[offset + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..]);
+        let length = ld64(&payload[offset + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..]);
+        if length == 0 {
+            return Err(ExecIndirect2DecodeError::ZeroCommandBufferLength { index, gva });
+        }
+        command_buffers.push(ExecCommandBufferDesc { gva, length });
+    }
+    Ok(ExecIndirect2Command {
+        task_id,
+        resources,
+        command_buffers,
+    })
 }
 
 /// Decode CmdReplacePhysical (`0x3c`): `{task_id, object_id}`, 8 bytes.
@@ -399,7 +478,7 @@ pub fn decode_synchronize_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reims_vgpu_core::endian::st32;
+    use reims_vgpu_core::endian::{st32, st64};
 
     /// RE pageBacking: plen=16 = header + one 8-byte record; LE `01 00 00 01`
     /// = clear_host_valid + set_guest_valid (PVG validity-op bytes).
@@ -474,6 +553,66 @@ mod tests {
         assert_eq!(
             CHILD_EXEC_RESOURCE_TAIL + CHILD_EXEC_RESOURCE_TAIL_LEN,
             CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN
+        );
+    }
+
+    #[test]
+    fn complete_exec_envelope_keeps_every_declared_command_buffer() {
+        let resource_count = 1usize;
+        let command_buffer_count = 2usize;
+        let command_buffer_offset = CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + resource_count * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as usize;
+        let mut payload = vec![
+            0u8;
+            command_buffer_offset
+                + command_buffer_count
+                    * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+        ];
+        st32(&mut payload[0..], 7);
+        st32(&mut payload[4..], resource_count as u32);
+        st32(&mut payload[8..], command_buffer_count as u32);
+        st32(&mut payload[CHILD_EXEC_INDIRECT_HEADER_LEN as usize..], 41);
+        for (index, (gva, length)) in [(0x1000, 32), (0x9000, 48)].into_iter().enumerate() {
+            let offset =
+                command_buffer_offset + index * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize;
+            st64(&mut payload[offset..], gva);
+            st64(&mut payload[offset + 8..], length);
+        }
+        let decoded = decode_exec_indirect2(&payload).unwrap();
+        assert_eq!(decoded.task_id, 7);
+        assert_eq!(decoded.resources.len(), 1);
+        assert_eq!(decoded.resources[0].object_id, 41);
+        assert_eq!(
+            decoded.command_buffers,
+            [
+                ExecCommandBufferDesc {
+                    gva: 0x1000,
+                    length: 32,
+                },
+                ExecCommandBufferDesc {
+                    gva: 0x9000,
+                    length: 48,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn one_zero_length_refuses_the_complete_exec_envelope() {
+        let command_buffer_offset = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+        let mut payload =
+            vec![0u8; command_buffer_offset + 2 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize];
+        st32(&mut payload[8..], 2);
+        st64(&mut payload[command_buffer_offset..], 0x1000);
+        st64(&mut payload[command_buffer_offset + 8..], 32);
+        let second = command_buffer_offset + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize;
+        st64(&mut payload[second..], 0x2000);
+        assert_eq!(
+            decode_exec_indirect2(&payload),
+            Err(ExecIndirect2DecodeError::ZeroCommandBufferLength {
+                index: 1,
+                gva: 0x2000,
+            })
         );
     }
 

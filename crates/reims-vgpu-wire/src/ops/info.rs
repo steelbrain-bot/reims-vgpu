@@ -38,6 +38,59 @@ use crate::le::{F32le, U32le, U64le};
 use crate::op::Op;
 use crate::view::{view, Wire, WireError};
 
+/// Scratch allocation the serializer requests for an info reply.
+///
+/// The record carries only the buffer and offset returned by that allocation.
+/// Length and alignment are nevertheless part of the contract: a resolver
+/// needs both to prove that the complete reply fits in the named buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplyLayout {
+    pub length: u32,
+    pub alignment: u32,
+}
+
+const fn reply(length: u32) -> ReplyLayout {
+    ReplyLayout {
+        length,
+        alignment: 4,
+    }
+}
+
+/// Fixed reply layout for a query opcode.
+///
+/// [`OPCODE_RATE_MAP_INFO`] is deliberately absent because its exact reply
+/// length is carried by [`RateMapInfoQuery::reply_len`]. The four selectors
+/// whose serializer path refuses before allocating reply storage are absent as
+/// well; a caller must preserve that distinction as a typed unsupported case.
+#[inline]
+pub const fn fixed_reply_layout(opcode: u32) -> Option<ReplyLayout> {
+    match opcode {
+        OPCODE_COMPUTE_PIPELINE_STATE_INFO => Some(reply(28)),
+        OPCODE_RENDER_PIPELINE_STATE_INFO => Some(reply(12)),
+        OPCODE_BUFFER_HOST_RESOURCE_INFO => Some(reply(8)),
+        OPCODE_TEXTURE_HOST_RESOURCE_INFO => Some(reply(16)),
+        OPCODE_HEAP_HOST_RESOURCE_INFO => Some(reply(8)),
+        OPCODE_SAMPLER_HOST_RESOURCE_INFO => Some(reply(16)),
+        OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN
+        | OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN_WIDE => Some(reply(16)),
+        OPCODE_RENDER_PIPELINE_IMAGEBLOCK | OPCODE_COMPUTE_PIPELINE_IMAGEBLOCK => Some(reply(4)),
+        OPCODE_MAP_SCREEN_TO_PHYSICAL | OPCODE_MAP_PHYSICAL_TO_SCREEN => Some(reply(8)),
+        OPCODE_ICB_HOST_RESOURCE_INFO
+        | OPCODE_RENDER_PIPELINE_HOST_RESOURCE_INFO
+        | OPCODE_COMPUTE_PIPELINE_HOST_RESOURCE_INFO
+        | OPCODE_DEPTH_STENCIL_HOST_RESOURCE_INFO
+        | OPCODE_RATE_MAP_INFO
+        | OPCODE_COPY_RATE_PARAMETER_BUFFER => None,
+        _ => None,
+    }
+}
+
+/// Validate and return the variable rate-map reply layout.
+#[inline]
+pub fn rate_map_reply_layout(reply_len: u32) -> Option<ReplyLayout> {
+    rate_map_layer_count(reply_len).map(|_| reply(reply_len))
+}
+
 // --- The query family ------------------------------------------------------
 
 pub const OPCODE_COMPUTE_PIPELINE_STATE_INFO: u32 = 0x1c2;
@@ -457,6 +510,42 @@ mod tests {
         assert_eq!(rate_map_layer_count(19), None);
         assert_eq!(rate_map_layer_count(21), None);
         assert_eq!(rate_map_layer_count(u32::MAX), None);
+    }
+
+    #[test]
+    fn every_supported_fixed_query_has_its_exact_reply_layout() {
+        for (opcode, length) in [
+            (OPCODE_COMPUTE_PIPELINE_STATE_INFO, 28),
+            (OPCODE_RENDER_PIPELINE_STATE_INFO, 12),
+            (OPCODE_BUFFER_HOST_RESOURCE_INFO, 8),
+            (OPCODE_TEXTURE_HOST_RESOURCE_INFO, 16),
+            (OPCODE_HEAP_HOST_RESOURCE_INFO, 8),
+            (OPCODE_SAMPLER_HOST_RESOURCE_INFO, 16),
+            (OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN, 16),
+            (OPCODE_HEAP_TEXTURE_DESCRIPTOR_SIZE_AND_ALIGN_WIDE, 16),
+            (OPCODE_RENDER_PIPELINE_IMAGEBLOCK, 4),
+            (OPCODE_COMPUTE_PIPELINE_IMAGEBLOCK, 4),
+            (OPCODE_MAP_SCREEN_TO_PHYSICAL, 8),
+            (OPCODE_MAP_PHYSICAL_TO_SCREEN, 8),
+        ] {
+            assert_eq!(
+                fixed_reply_layout(opcode),
+                Some(ReplyLayout {
+                    length,
+                    alignment: 4,
+                })
+            );
+        }
+        for opcode in [
+            OPCODE_ICB_HOST_RESOURCE_INFO,
+            OPCODE_RENDER_PIPELINE_HOST_RESOURCE_INFO,
+            OPCODE_COMPUTE_PIPELINE_HOST_RESOURCE_INFO,
+            OPCODE_DEPTH_STENCIL_HOST_RESOURCE_INFO,
+            OPCODE_RATE_MAP_INFO,
+            OPCODE_COPY_RATE_PARAMETER_BUFFER,
+        ] {
+            assert_eq!(fixed_reply_layout(opcode), None);
+        }
     }
 
     /// The two records that share a byte layout must not share a predicate: one

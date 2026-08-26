@@ -67,6 +67,12 @@
 /// assigned in `main` once the class exists.
 static id gStagingBuffer;
 
+// Exact scratch allocation requested by the operation currently being
+// captured. Query reply capacity is part of the serializer contract even
+// though the wire carries only the returned buffer/offset pair.
+static size_t gLastBufferBytesLength;
+static size_t gLastBufferBytesAlignment;
+
 @interface CaptureCommandStream : NSObject {
   unsigned char *_continuationTarget;
 }
@@ -88,6 +94,8 @@ static id gStagingBuffer;
                 alignment:(size_t)a
                    buffer:(id *)buf
                    offset:(size_t *)off {
+  gLastBufferBytesLength = n;
+  gLastBufferBytesAlignment = a;
   void *p = arenaTakeUncounted(n, a);
   if (buf) *buf = gStagingBuffer;
   if (off) *off = STUB_STAGING_OFFSET;

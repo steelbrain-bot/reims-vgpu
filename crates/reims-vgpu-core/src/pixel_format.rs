@@ -390,12 +390,28 @@ pub fn depth_stencil_packing(format: u16) -> Option<DepthStencilPacking> {
 /// what makes that disagreement unwritable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlitAspect {
-    /// Full texel (options None / zero).
+    /// No explicit plane option. Image/image copies name the full texel; for a
+    /// buffer copy involving combined depth/stencil storage Metal selects the
+    /// depth plane, as returned by [`buffer_image_blit_aspect`].
     Full,
     /// Depth plane of a depth or depth-stencil texture.
     Depth,
     /// Stencil plane of a stencil or depth-stencil texture.
     Stencil,
+}
+
+/// Resolve an options-bearing buffer/image copy to the plane Metal transfers.
+/// Combined depth/stencil storage defaults to depth when neither explicit
+/// plane option is present; every other format/aspect retains its spelling.
+pub fn buffer_image_blit_aspect(format: u16, aspect: BlitAspect) -> BlitAspect {
+    if aspect == BlitAspect::Full
+        && format_has_depth_aspect(format)
+        && format_has_stencil_aspect(format)
+    {
+        BlitAspect::Depth
+    } else {
+        aspect
+    }
 }
 
 /// Bytes per texel for a blit aspect selection.
@@ -1875,6 +1891,18 @@ mod tests {
             MTL_FORMAT_DEPTH32_FLOAT,
             BlitAspect::Depth
         ));
+        assert_eq!(
+            buffer_image_blit_aspect(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, BlitAspect::Full),
+            BlitAspect::Depth
+        );
+        assert_eq!(
+            buffer_image_blit_aspect(MTL_FORMAT_RGBA8_UNORM, BlitAspect::Full),
+            BlitAspect::Full
+        );
+        assert_eq!(
+            buffer_image_blit_aspect(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, BlitAspect::Stencil),
+            BlitAspect::Stencil
+        );
         // Color cannot take DS options.
         assert_eq!(
             blit_aspect_bytes_per_pixel(MTL_FORMAT_BGRA8_UNORM, BlitAspect::Depth),

@@ -39,6 +39,10 @@ impl RenderBarrierStages {
     pub fn is_subset_of(self, other: Self) -> bool {
         self.0 & !other.0 == 0
     }
+
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
 }
 
 /// One memory dependency declared between draws in a render encoder.
@@ -137,14 +141,14 @@ pub struct StencilState {
 
 /// One executor-prepared shader stage and the semantic descriptor interface
 /// the resolved module statically uses.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PreparedShaderStage {
     pub id: reims_vgpu_protocol::PreparedShaderId,
     pub used_descriptor_bindings: Arc<[u32]>,
 }
 
 /// The two prepared stages required by one resolved render pipeline.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PreparedRenderProgram {
     pub vertex: PreparedShaderStage,
     pub fragment: PreparedShaderStage,

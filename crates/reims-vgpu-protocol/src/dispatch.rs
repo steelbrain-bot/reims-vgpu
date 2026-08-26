@@ -40,6 +40,9 @@ pub struct WorkgroupPlan {
     /// that second case wrong culls threads the guest asked for, which is the
     /// same class of loss as running ones it did not.
     pub threads_per_grid: [u32; 3],
+    /// Exact Metal threadgroup dimensions used as the translated kernel's
+    /// local size. Rounded counts and the thread grid cannot recover it.
+    pub threads_per_threadgroup: [u32; 3],
 }
 
 impl Default for WorkgroupPlan {
@@ -54,6 +57,7 @@ impl Default for WorkgroupPlan {
         Self {
             counts: [0; 3],
             threads_per_grid: [0; 3],
+            threads_per_threadgroup: [0; 3],
         }
     }
 }
@@ -77,6 +81,7 @@ pub fn workgroup_counts(
                 grid[1].saturating_mul(group[1]),
                 grid[2].saturating_mul(group[2]),
             ],
+            threads_per_threadgroup: group,
         });
     }
     let counts = [
@@ -87,6 +92,7 @@ pub fn workgroup_counts(
     Some(WorkgroupPlan {
         counts,
         threads_per_grid: grid,
+        threads_per_threadgroup: group,
     })
 }
 
@@ -130,6 +136,7 @@ mod tests {
             Some(WorkgroupPlan {
                 counts: [3, 1, 1],
                 threads_per_grid: [17, 1, 1],
+                threads_per_threadgroup: [8, 1, 1],
             })
         );
         // A threadgroup-count dispatch names workgroups already, so there is
@@ -139,6 +146,7 @@ mod tests {
             Some(WorkgroupPlan {
                 counts: [7, 3, 1],
                 threads_per_grid: [56, 24, 1],
+                threads_per_threadgroup: [8, 8, 1],
             })
         );
     }

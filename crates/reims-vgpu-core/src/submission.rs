@@ -16,7 +16,7 @@ use std::sync::Arc;
 pub struct SubmissionContext {
     pub identity: SubmissionIdentity,
     pub resources: Arc<[SubmissionResourceUse]>,
-    /// Every admitted segment in command-buffer order.
+    /// Every admitted segment in serialized-stream order.
     pub segments: Arc<[SegmentBoundary]>,
     /// Segment containing the operation currently submitted to the executor.
     pub segment: Option<SegmentBoundary>,

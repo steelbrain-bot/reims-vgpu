@@ -190,6 +190,7 @@ mod tests {
             declared_bindings: Arc::from([]),
             descriptor_uses: Arc::from([]),
             texture_uses: Arc::from([]),
+            storage_image_accesses: Arc::from([]),
             buffer_binding_base: 0,
             texture_binding_base: 32,
             sampler_binding_base: 64,

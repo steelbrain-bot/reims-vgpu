@@ -20,7 +20,7 @@ fn every_render_decode_failure_names_its_own_check() {
     assert_eq!(slugs.len(), n, "two render decode checks share a slug");
 }
 use super::*;
-use reims_vgpu_core::endian::{st16, st32};
+use reims_vgpu_core::endian::{st16, st32, st64};
 
 fn hdr(op: u32, len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
@@ -506,6 +506,79 @@ fn depth_and_stencil_pass_slots() {
     let s = decode_stencil_attachment(&payload);
     assert_eq!(s.texture_ref, 88);
     assert_eq!(s.clear_stencil, 9);
+}
+
+#[test]
+fn resolve_coordinates_options_and_filters_survive_pass_decode() {
+    use reims_vgpu_core::endian::st16;
+    use reims_vgpu_wire::ops::render_pass as pass;
+
+    let mut payload = vec![0u8; PASS_MIN_PAYLOAD];
+    let write_prefix = |payload: &mut [u8], base: usize, seed: u16| {
+        st16(
+            &mut payload[base + core::mem::offset_of!(pass::AttachmentPrefix, resolve_level)..],
+            seed,
+        );
+        st16(
+            &mut payload[base + core::mem::offset_of!(pass::AttachmentPrefix, resolve_slice)..],
+            seed + 1,
+        );
+        st16(
+            &mut payload
+                [base + core::mem::offset_of!(pass::AttachmentPrefix, resolve_depth_plane)..],
+            seed + 2,
+        );
+        st16(
+            &mut payload
+                [base + core::mem::offset_of!(pass::AttachmentPrefix, store_action_options)..],
+            seed + 3,
+        );
+    };
+    write_prefix(&mut payload, PASS_DEPTH_ATTACH_OFF, 10);
+    write_prefix(&mut payload, PASS_STENCIL_ATTACH_OFF, 20);
+    write_prefix(&mut payload, PASS_COLOR_ATTACH_OFF, 30);
+    st16(
+        &mut payload[core::mem::offset_of!(pass::DepthAttachmentBody, resolve_filter)..],
+        17,
+    );
+    st16(
+        &mut payload[PASS_STENCIL_ATTACH_OFF
+            + core::mem::offset_of!(pass::StencilAttachmentBody, resolve_filter)..],
+        27,
+    );
+
+    let depth = decode_depth_attachment(&payload);
+    assert_eq!(
+        (
+            depth.resolve_level,
+            depth.resolve_slice,
+            depth.resolve_depth_plane,
+            depth.store_action_options,
+            depth.resolve_filter,
+        ),
+        (10, 11, 12, 13, 17)
+    );
+    let stencil = decode_stencil_attachment(&payload);
+    assert_eq!(
+        (
+            stencil.resolve_level,
+            stencil.resolve_slice,
+            stencil.resolve_depth_plane,
+            stencil.store_action_options,
+            stencil.resolve_filter,
+        ),
+        (20, 21, 22, 23, 27)
+    );
+    let color = decode_color_attachment(&payload, 0);
+    assert_eq!(
+        (
+            color.resolve_level,
+            color.resolve_slice,
+            color.resolve_depth_plane,
+            color.store_action_options,
+        ),
+        (30, 31, 32, 33)
+    );
 }
 
 /// Each of the first two records ends where the next one begins: depth
@@ -1148,6 +1221,11 @@ fn vertex_amplification_decodes_at_the_widths_the_serializer_wrote() {
     let c = decode(&v).expect("amplification count");
     assert_eq!(c.kind, Kind::SetVertexAmplification);
     assert_eq!(c.count, 2, "the head was read as eight bytes");
+    assert_eq!(
+        c.amplification_mappings,
+        [[0x1111, 0x2222], [0x3333, 0x4444]],
+        "each mapping survives in guest order"
+    );
 
     // A count with no mappings behind it. The record is the guest's own
     // length claim, so this is the bound, and it must not wrap.
@@ -1212,6 +1290,18 @@ fn the_wide_patch_draw_opcode_is_resolved_by_length_and_refused_without_one() {
             .unwrap_or_else(|e| panic!("0x0c at {total} bytes: {e:?}"));
         assert_eq!(c.kind, Kind::DrawPatches);
         assert_eq!(c.command_length as usize, total);
+        let Some(PatchDraw::Direct {
+            control_point_indices,
+            ..
+        }) = c.patch_draw
+        else {
+            panic!("wide patch draw did not retain direct geometry")
+        };
+        assert_eq!(
+            control_point_indices.is_some(),
+            total == wire::DRAW_INDEXED_PATCHES_WIDE_TOTAL_LEN as usize,
+            "the shared wide opcode lost its length-selected indexed form"
+        );
     }
 
     // Between the two, above both, and below both: none has a reading.
@@ -1256,6 +1346,70 @@ fn the_wide_patch_draw_opcode_is_resolved_by_length_and_refused_without_one() {
             "op {op:#x} accepted a record four bytes short"
         );
     }
+
+    let mut indexed = hdr(
+        wire::OPCODE_DRAW_INDEXED_PATCHES,
+        wire::DRAW_INDEXED_PATCHES_TOTAL_LEN as usize,
+    );
+    let body = &mut indexed[OP_HEADER_LEN..];
+    st16(body, 0x11);
+    st16(&mut body[2..], 0x22);
+    st32(&mut body[4..], 5151);
+    st16(&mut body[8..], 0x33);
+    st32(&mut body[10..], 5252);
+    st16(&mut body[14..], 0x44);
+    st16(&mut body[16..], 0x55);
+    st16(&mut body[18..], 0x66);
+    st16(&mut body[20..], 3);
+    assert_eq!(
+        decode(&indexed).unwrap().patch_draw,
+        Some(PatchDraw::Direct {
+            control_points: 3,
+            patch_start: 0x11,
+            patch_count: 0x22,
+            patch_indices: PatchBufferOperand {
+                reference: 5151,
+                offset: 0x33,
+            },
+            control_point_indices: Some(PatchBufferOperand {
+                reference: 5252,
+                offset: 0x44,
+            }),
+            instance_count: 0x55,
+            base_instance: 0x66,
+        })
+    );
+
+    let mut indirect = hdr(
+        wire::OPCODE_DRAW_INDEXED_PATCHES_INDIRECT,
+        wire::DRAW_INDEXED_PATCHES_INDIRECT_TOTAL_LEN as usize,
+    );
+    let body = &mut indirect[OP_HEADER_LEN..];
+    st32(body, 5151);
+    st32(&mut body[4..], 5252);
+    st32(&mut body[8..], 5353);
+    st64(&mut body[12..], 0x1111);
+    st64(&mut body[20..], 0x2222);
+    st64(&mut body[28..], 0x3333);
+    st16(&mut body[36..], 7);
+    assert_eq!(
+        decode(&indirect).unwrap().patch_draw,
+        Some(PatchDraw::Indirect {
+            control_points: 7,
+            patch_indices: PatchBufferOperand {
+                reference: 5151,
+                offset: 0x1111,
+            },
+            control_point_indices: Some(PatchBufferOperand {
+                reference: 5252,
+                offset: 0x2222,
+            }),
+            arguments: PatchBufferOperand {
+                reference: 5353,
+                offset: 0x3333,
+            },
+        })
+    );
 
     // A record whose header promises more bytes than are present is
     // refused by the framing, before any of the above runs.
@@ -1314,6 +1468,12 @@ fn a_colour_attachments_level_does_not_swallow_its_slice() {
         assert_eq!(att.level, u32::from(level), "level took the slice's bits");
         assert_eq!(att.slice, u32::from(slice), "slice went unread");
         assert_eq!(att.depth_plane, u32::from(plane), "depth plane went unread");
+        let decoded = decode(&cmd).expect("the pass retains every attachment slot");
+        assert_eq!(decoded.color_attachments.len(), PASS_MAX_COLOR_ATTACHMENTS);
+        assert_eq!(decoded.color_attachments[0], att);
+        assert!(decoded.color_attachments[1..]
+            .iter()
+            .all(|attachment| attachment.texture_ref == 0));
     }
 }
 
@@ -1489,9 +1649,13 @@ fn the_store_action_options_are_not_wider_store_actions() {
     let c = decode(&v).expect("tessellation factor buffer");
     assert_eq!(c.kind, Kind::SetTessellationFactorBuffer);
     assert_eq!(
-        (c.buffer_ref, c.buffer_offset),
-        (5151, 0x3456),
-        "read as a bind header rather than as a ref and an offset"
+        (
+            c.buffer_ref,
+            c.buffer_offset,
+            c.tessellation_factor_instance_stride,
+        ),
+        (5151, 0x3456, 0x4567),
+        "read as a bind header or crossed offset and instance stride"
     );
 
     for (op, total) in [
@@ -1596,6 +1760,22 @@ fn a_tile_record_is_decoded_rather_than_accepted_without_a_claim() {
     let c = decode(&v).expect("tile threadgroup memory");
     assert_eq!(c.kind, Kind::TileBind);
     assert_eq!((c.first, c.count), (5, 1));
+    assert_eq!(
+        c.tile_threadgroup_memory,
+        Some(TileThreadgroupMemoryBinding {
+            length: 0x1234,
+            offset: 0x2345,
+            index: 5,
+        })
+    );
+    assert_eq!(
+        c.tile_bind,
+        Some(TileBind::ThreadgroupMemory(TileThreadgroupMemoryBinding {
+            length: 0x1234,
+            offset: 0x2345,
+            index: 5,
+        }))
+    );
 
     // `0x9b`: three unnarrowed `u64`, none of them equal.
     let total = wire_tile::DISPATCH_THREADS_PER_TILE_TOTAL_LEN as usize;
@@ -1608,9 +1788,9 @@ fn a_tile_record_is_decoded_rather_than_accepted_without_a_claim() {
     assert_eq!(c.tile_threads, [0x11, 0x22, 0x33]);
 
     // `0xa2`/`0xa3`: the same nine `u64`, the grid first and the region
-    // origin-before-size. Only `0xa3` writes the trailing `u32`, so the
-    // decoder must read neither -- set those four bytes and require the
-    // answer not to move on either opcode.
+    // origin-before-size. Only `0xa3` writes the trailing `u32`, so set
+    // those four bytes and require `0xa3` to retain them while `0xa2`
+    // ignores the unwritten tail.
     let total = wire_tile::DISPATCH_THREADS_PER_TILE_IN_REGION_TOTAL_LEN as usize;
     for op in [
         wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION,
@@ -1630,15 +1810,35 @@ fn a_tile_record_is_decoded_rather_than_accepted_without_a_claim() {
             [0x11, 0x22, 0x33],
             "op {op:#x} took the region's origin for the grid"
         );
+        assert_eq!(
+            c.tile_region,
+            Some(TileRegion {
+                origin: [0x44, 0x55, 0x66],
+                size: [0x77, 0x88, 0x99],
+            })
+        );
+        assert_eq!(
+            c.tile_render_target_array_index,
+            (op == wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX).then_some(0)
+        );
 
         let mut noisy = v.clone();
         noisy[OP_HEADER_LEN + wire_tile::REGION_RT_INDEX_OFFSET..][..4].fill(0xff);
-        assert_eq!(
-            decode(&noisy).expect("tile region dispatch"),
-            c,
-            "op {op:#x} let the trailing render-target index reach a field; on \
-             0xa2 those four bytes are the guest's ring"
-        );
+        let mut noisy_decoded = decode(&noisy).expect("tile region dispatch");
+        if op == wire_tile::OPCODE_DISPATCH_THREADS_PER_TILE_IN_REGION_RT_INDEX {
+            assert_eq!(
+                noisy_decoded.tile_render_target_array_index,
+                Some(u32::MAX),
+                "the selector's declared render-target index was dropped"
+            );
+            noisy_decoded.tile_render_target_array_index = Some(0);
+            assert_eq!(noisy_decoded, c);
+        } else {
+            assert_eq!(
+                noisy_decoded, c,
+                "the index-absent selector read unwritten trailing ring bytes"
+            );
+        }
     }
 
     // `0xa4`: a ref then a 64-bit offset, and it is a readback rather than
@@ -1660,6 +1860,13 @@ fn a_tile_record_is_decoded_rather_than_accepted_without_a_claim() {
     let c = decode(&v).expect("tile buffer offset");
     assert_eq!(c.kind, Kind::TileBind);
     assert_eq!((c.first, c.count, c.buffer_offset), (4, 1, 0x2345));
+    assert_eq!(
+        c.tile_bind,
+        Some(TileBind::BufferOffset {
+            index: 4,
+            offset: 0x2345,
+        })
+    );
 
     // The four bind opcodes, each at its own entry stride. A two-slot
     // record is built at the right size and accepted, and the same record
@@ -1678,9 +1885,109 @@ fn a_tile_record_is_decoded_rather_than_accepted_without_a_claim() {
         let mut v = hdr(op, total);
         st32(&mut v[OP_HEADER_LEN + BIND_FIRST..], 7);
         st32(&mut v[OP_HEADER_LEN + BIND_COUNT..], 2);
+        let entries = &mut v[OP_HEADER_LEN + BIND_ENTRIES..];
+        match op {
+            wire_tile::OPCODE_SET_TILE_BUFFER => {
+                st32(entries, 5151);
+                st64(&mut entries[4..], 0x3456);
+                st32(&mut entries[entry_size..], 5252);
+                st64(&mut entries[entry_size + 4..], 0x4567);
+            }
+            wire_tile::OPCODE_SET_TILE_SAMPLER_LOD => {
+                st32(entries, 5151);
+                st32(&mut entries[4..], 0.25f32.to_bits());
+                st32(&mut entries[8..], 0.75f32.to_bits());
+                st32(&mut entries[entry_size..], 5252);
+                st32(&mut entries[entry_size + 4..], 0.5f32.to_bits());
+                st32(&mut entries[entry_size + 8..], 0.875f32.to_bits());
+            }
+            _ => {
+                st32(entries, 5151);
+                st32(&mut entries[entry_size..], 5252);
+            }
+        }
         let c = decode(&v).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
         assert_eq!(c.kind, Kind::TileBind, "op {op:#x}");
         assert_eq!((c.first, c.count), (7, 2), "op {op:#x}");
+        match op {
+            wire_tile::OPCODE_SET_TILE_BUFFER => {
+                let expected = [
+                    DecodedBufferBind {
+                        buffer_ref: 5151,
+                        offset: 0x3456,
+                        attribute_stride: None,
+                    },
+                    DecodedBufferBind {
+                        buffer_ref: 5252,
+                        offset: 0x4567,
+                        attribute_stride: None,
+                    },
+                ];
+                assert_eq!(c.buffer_binds, expected);
+                assert_eq!(
+                    c.tile_bind,
+                    Some(TileBind::Buffer {
+                        first: 7,
+                        bindings: Box::new(expected),
+                    })
+                );
+            }
+            wire_tile::OPCODE_SET_TILE_SAMPLER_LOD => {
+                assert_eq!(c.ref_binds, [5151, 5252]);
+                assert_eq!(
+                    c.sampler_lod_binds,
+                    [
+                        (0.25f32.to_bits(), 0.75f32.to_bits()),
+                        (0.5f32.to_bits(), 0.875f32.to_bits()),
+                    ]
+                );
+                assert_eq!(
+                    c.tile_bind,
+                    Some(TileBind::Sampler {
+                        first: 7,
+                        bindings: Box::new([
+                            TileSamplerBinding {
+                                reference: 5151,
+                                lod_clamp: Some((0.25f32.to_bits(), 0.75f32.to_bits())),
+                            },
+                            TileSamplerBinding {
+                                reference: 5252,
+                                lod_clamp: Some((0.5f32.to_bits(), 0.875f32.to_bits())),
+                            },
+                        ]),
+                    })
+                );
+            }
+            wire_tile::OPCODE_SET_TILE_TEXTURE => {
+                assert_eq!(c.ref_binds, [5151, 5252]);
+                assert_eq!(
+                    c.tile_bind,
+                    Some(TileBind::Texture {
+                        first: 7,
+                        references: Box::new([5151, 5252]),
+                    })
+                );
+            }
+            _ => {
+                assert_eq!(c.ref_binds, [5151, 5252]);
+                assert_eq!(
+                    c.tile_bind,
+                    Some(TileBind::Sampler {
+                        first: 7,
+                        bindings: Box::new([
+                            TileSamplerBinding {
+                                reference: 5151,
+                                lod_clamp: None,
+                            },
+                            TileSamplerBinding {
+                                reference: 5252,
+                                lod_clamp: None,
+                            },
+                        ]),
+                    })
+                );
+            }
+        }
 
         let mut short = hdr(op, total - entry_size);
         st32(&mut short[OP_HEADER_LEN + BIND_FIRST..], 7);
@@ -2061,7 +2368,7 @@ fn the_accepted_window_ends_where_apples_render_manifest_does() {
 /// The roster below is references rather than numbers, so no entry can
 /// carry a wrong *value*; what this test adds is that no entry can go
 /// *missing*. The reverse direction matters as much and is the shape of the
-/// `0x86`/`0x87` residency bug: an opcode named here and absent from the
+/// `0x86`/`0x87` participation bug: an opcode named here and absent from the
 /// manifest is a number no capture supports.
 ///
 /// **`0x1a` used to be excluded from it, on a claim that was wrong.** This
@@ -2090,7 +2397,7 @@ fn the_accepted_window_ends_where_apples_render_manifest_does() {
 /// in [`reims_vgpu_wire::manifest`]. Adding them to the roster would fail this
 /// test for a reason that is about the instrument rather than about the device,
 /// so they stay out of it and are covered by
-/// `the_inherited_residency_opcodes_reach_the_residency_arm` instead.
+/// `the_inherited_participation_opcodes_reach_the_participation_arm` instead.
 #[test]
 fn the_render_opcode_table_is_exactly_apples_render_manifest() {
     let device: &[(u32, &str)] = &[
@@ -2403,10 +2710,10 @@ fn the_render_opcode_table_is_exactly_apples_render_manifest() {
 /// itself; `0x86`/`0x87` are the unqualified ones it inherits. The four numbers
 /// must stay distinct, because their heads are three different sizes and reading
 /// one record with another's layout starts the refs in the wrong place —
-/// `a_residency_record_is_bounded_by_its_own_count` is what catches that, and it
+/// `a_participation_record_is_bounded_by_its_own_count` is what catches that, and it
 /// can only catch it while the opcodes disagree.
 #[test]
-fn the_residency_opcodes_are_the_ones_apples_serializer_writes() {
+fn the_participation_opcodes_are_the_ones_the_serializer_writes() {
     use reims_vgpu_wire::ops::render as wire;
     assert_eq!(wire::OPCODE_USE_HEAP, 0x1b);
     assert_eq!(wire::OPCODE_USE_RESOURCE, 0x89);
@@ -2420,19 +2727,19 @@ fn the_residency_opcodes_are_the_ones_apples_serializer_writes() {
     ];
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
-            assert_ne!(a, b, "two residency forms share one opcode");
+            assert_ne!(a, b, "two participation forms share one opcode");
         }
     }
 }
 
-/// The refs of a residency record start at a different offset on each form,
+/// The refs of a participation record start at a different offset on each form,
 /// and the count-led extent is checked rather than assumed.
 ///
 /// `useHeap:` puts its array at `+6`, which is not a multiple of four: a
 /// record read with `useResource:`'s `+8` accepts two bytes fewer than it
 /// needs, so the length check is what separates the two layouts.
 #[test]
-fn a_residency_record_is_bounded_by_its_own_count() {
+fn a_participation_record_is_bounded_by_its_own_count() {
     for (op, refs_at, kind) in [
         (
             wire::OPCODE_USE_RESOURCE,
@@ -2454,6 +2761,16 @@ fn a_residency_record_is_bounded_by_its_own_count() {
         let body = |count: u32, entries: usize| {
             let mut v = hdr(op, OP_HEADER_LEN + refs_at + entries * REF_BIND_ENTRY_SIZE);
             st32(&mut v[OP_HEADER_LEN + RESIDENCY_COUNT..], count);
+            match op {
+                wire::OPCODE_USE_RESOURCE => {
+                    st16(&mut v[OP_HEADER_LEN + 4..], 3);
+                    st16(&mut v[OP_HEADER_LEN + 6..], 5);
+                }
+                wire::OPCODE_USE_HEAP => st16(&mut v[OP_HEADER_LEN + 4..], 5),
+                wire::OPCODE_USE_RESOURCES_NO_STAGES => st32(&mut v[OP_HEADER_LEN + 4..], 3),
+                wire::OPCODE_USE_HEAPS_NO_STAGES => {}
+                _ => unreachable!(),
+            }
             for i in 0..entries {
                 st32(
                     &mut v[OP_HEADER_LEN + refs_at + i * REF_BIND_ENTRY_SIZE..],
@@ -2466,9 +2783,23 @@ fn a_residency_record_is_bounded_by_its_own_count() {
         let c = decode(&body(2, 2)).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
         assert_eq!(c.kind, kind, "op {op:#x}");
         assert_eq!(c.count, 2, "op {op:#x}");
+        let expected_usage = match op {
+            wire::OPCODE_USE_RESOURCE | wire::OPCODE_USE_RESOURCES_NO_STAGES => {
+                Some(reims_vgpu_protocol::ResourceUsage::from_bits(3).unwrap())
+            }
+            _ => None,
+        };
+        let expected_stages = match op {
+            wire::OPCODE_USE_RESOURCE | wire::OPCODE_USE_HEAP => {
+                Some(reims_vgpu_protocol::RenderStages::from_bits(5).unwrap())
+            }
+            _ => None,
+        };
+        assert_eq!(c.participation_usage, expected_usage, "op {op:#x} usage");
+        assert_eq!(c.participation_stages, expected_stages, "op {op:#x} stages");
         match kind {
             Kind::UseResource => assert_eq!(
-                c.residency_resources
+                c.participation_resources
                     .iter()
                     .map(|reference| reference.get())
                     .collect::<Vec<_>>(),
@@ -2476,7 +2807,7 @@ fn a_residency_record_is_bounded_by_its_own_count() {
                 "op {op:#x} dropped its resource declarations"
             ),
             Kind::UseHeap => assert_eq!(
-                c.residency_heaps
+                c.participation_heaps
                     .iter()
                     .map(|reference| reference.get())
                     .collect::<Vec<_>>(),
@@ -2494,7 +2825,7 @@ fn a_residency_record_is_bounded_by_its_own_count() {
         );
         // Past the bind cap and still well-formed. This record names no
         // table slot, so a bind-table cap is not its bound; refusing here
-        // would drop a residency declaration a guest may legitimately make.
+        // would drop a participation declaration a guest may legitimately make.
         let big = 40u32;
         let c = decode(&body(big, big as usize))
             .unwrap_or_else(|e| panic!("op {op:#x} refused {big} resources: {e:?}"));
@@ -2518,29 +2849,37 @@ fn a_residency_record_is_bounded_by_its_own_count() {
     }
 }
 
-/// `0x86` and `0x87` reach the residency arm, not the catch-all.
-///
-/// This test used to assert the opposite, and the reason it gave was sound at
-/// the time: the residency kinds had no executor arm, so reading these two as
-/// residency removed them from `Kind::OtherAccepted` — the one net that would
-/// have named them on the failure channel. Both halves of that have since
-/// changed. `runtime::exec` answers `UseResource`/`UseHeap` with
-/// `render_noop_residency_hint`, so the kind is a counter rather than a hole;
-/// and the numbers are not a guess but the two forms of residency a render
-/// encoder inherits from the encoder base class, which
-/// [`reims_vgpu_wire::ops::render::UseHeapsNoStages`] records.
-///
-/// So the net they belong in is the counter, and leaving them in the catch-all
-/// reported an implemented command as unimplemented while
-/// `render_noop_residency_hint` counted half its family.
 #[test]
-fn the_inherited_residency_opcodes_reach_the_residency_arm() {
+fn participation_refuses_usage_and_stage_bits_outside_the_api_vocabulary() {
+    let mut resource = hdr(wire::OPCODE_USE_RESOURCE, OP_HEADER_LEN + USE_RESOURCE_REFS);
+    st32(&mut resource[OP_HEADER_LEN + RESIDENCY_COUNT..], 0);
+    st16(&mut resource[OP_HEADER_LEN + 4..], 8);
+    st16(&mut resource[OP_HEADER_LEN + 6..], 1);
+    assert_eq!(
+        decode(&resource),
+        Err(DecodeStatus::ErrResourceUsage),
+        "unknown usage was accepted"
+    );
+
+    st16(&mut resource[OP_HEADER_LEN + 4..], 1);
+    st16(&mut resource[OP_HEADER_LEN + 6..], 0x20);
+    assert_eq!(
+        decode(&resource),
+        Err(DecodeStatus::ErrRenderStages),
+        "unknown render stage was accepted"
+    );
+}
+
+/// `0x86` and `0x87` reach typed participation decoding, not the catch-all.
+/// Their shared-base selectors and layouts are pinned by native fixtures.
+#[test]
+fn the_inherited_participation_opcodes_reach_the_participation_arm() {
     for (op, kind) in [
         (wire::OPCODE_USE_HEAPS_NO_STAGES, Kind::UseHeap),
         (wire::OPCODE_USE_RESOURCES_NO_STAGES, Kind::UseResource),
     ] {
         let c = decode(&hdr(op, OP_HEADER_LEN + 16)).unwrap_or_else(|e| panic!("{op:#x}: {e:?}"));
-        assert_eq!(c.kind, kind, "{op:#x} did not reach the residency arm");
+        assert_eq!(c.kind, kind, "{op:#x} did not reach the participation arm");
     }
 }
 

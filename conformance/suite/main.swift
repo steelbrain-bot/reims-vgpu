@@ -63,6 +63,8 @@ depthStencilIndependenceCases()
 
 stencilIndependenceCases()
 
+combinedDepthStencilDefaultBufferCopyCase()
+
 mipCase()
 
 mipBlitCase()
@@ -73,10 +75,19 @@ fragmentBufferCase()
 renderBarrierCase()
 computeBarrierCase(resourceBarrier: true)
 computeBarrierCase(resourceBarrier: false)
+indirectComputeDispatchCase()
 synchronizeResourceCase()
 heapTextureAliasCase()
 heapTexturePlacementOverlapCase()
 encoderBindingLifetimeCase()
+sameQueueCommandBufferOrderCase()
+sameQueueCompletionPublicationCase()
+emptyCommandBufferCompletionCase()
+independentQueueCompletionPublicationCase()
+scheduledBeforeCompletedPublicationCase()
+defaultCommandBufferRetainsResourceCase()
+indirectCommandMutationCase()
+pipelineInformationCase()
 
 if texPipeline == nil {
     report("fragsample_pipeline", false, "tex_fs pipeline would not build")
@@ -190,6 +201,10 @@ blitIOSurfaceSourceCase(1024, 768, frames: 8)
 blitIOSurfaceSourceCase(1920, 1080, frames: 4)
 
 blitBufferBackedCase(512, 512)
+
+// A device-wide waiter-first scheduling defect can stop all later work, so
+// this bounded probe deliberately closes the battery.
+crossQueueSharedEventVisibilityCase()
 
 print("SUMMARY cases=\(ran) failures=\(failures) skipped=\(skipped)")
 

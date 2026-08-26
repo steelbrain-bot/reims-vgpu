@@ -21,6 +21,27 @@ pub struct ResourceValidity {
     pub host_published_seq: u64,
 }
 
+impl ResourceValidity {
+    pub fn apply(&mut self, ops: ResourceValidityOps) {
+        if ops.clear_host_valid != 0 {
+            self.host_valid = false;
+            self.host_stated = true;
+        }
+        if ops.set_host_valid != 0 {
+            self.host_valid = true;
+            self.host_stated = true;
+        }
+        if ops.clear_guest_valid != 0 {
+            self.guest_valid = false;
+            self.guest_stated = true;
+        }
+        if ops.set_guest_valid != 0 {
+            self.guest_valid = true;
+            self.guest_stated = true;
+        }
+    }
+}
+
 /// Content currency and ownership statements for one mapping.
 ///
 /// Mapping identity, page-table incarnation, and host materialization are not
@@ -63,22 +84,7 @@ impl MappingContentState {
 
     /// Apply ordered validity bytes without changing content currency.
     pub fn apply_validity(&mut self, ops: ResourceValidityOps) {
-        if ops.clear_host_valid != 0 {
-            self.validity.host_valid = false;
-            self.validity.host_stated = true;
-        }
-        if ops.set_host_valid != 0 {
-            self.validity.host_valid = true;
-            self.validity.host_stated = true;
-        }
-        if ops.clear_guest_valid != 0 {
-            self.validity.guest_valid = false;
-            self.validity.guest_stated = true;
-        }
-        if ops.set_guest_valid != 0 {
-            self.validity.guest_valid = true;
-            self.validity.guest_stated = true;
-        }
+        self.validity.apply(ops);
     }
 }
 

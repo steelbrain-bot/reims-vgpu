@@ -19,9 +19,10 @@ BUNDLE=/System/Library/Extensions/AppleParavirtGPUMetal.bundle
 
 usage() {
   cat <<'EOF'
-usage: wire-oracle.sh [--fixtures] [--inventory] [--all]
+usage: wire-oracle.sh [--fixtures] [--encoder-fixtures] [--inventory] [--all]
 
   --fixtures   capture wire operations + expectations   (default)
+  --encoder-fixtures  capture encoder operations only
   --inventory  dump every selector on the serializer classes
   --all        both
 
@@ -30,9 +31,11 @@ EOF
 }
 
 do_fixtures=0
+fixture_mode=fixtures
 do_inventory=0
 case "${1:---fixtures}" in
   --fixtures) do_fixtures=1 ;;
+  --encoder-fixtures) do_fixtures=1; fixture_mode=encoder-fixtures ;;
   --inventory) do_inventory=1 ;;
   --all) do_fixtures=1; do_inventory=1 ;;
   -h|--help) usage; exit 0 ;;
@@ -85,7 +88,7 @@ clang -arch x86_64 -fobjc-arc -O1 -Wall \
 
 if [[ $do_fixtures == 1 ]]; then
   echo "wire-oracle: capturing fixtures"
-  arch -x86_64 "$BUILD_DIR/oracle" fixtures "$OUT_DIR/fixtures.json"
+  arch -x86_64 "$BUILD_DIR/oracle" "$fixture_mode" "$OUT_DIR/fixtures.json"
 fi
 
 if [[ $do_inventory == 1 ]]; then

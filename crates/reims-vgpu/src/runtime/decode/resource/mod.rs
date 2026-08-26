@@ -8,7 +8,7 @@ use reims_vgpu_core::endian::{st16, st32}; // ICB layout fixture encoder only
 use core::mem::{offset_of, size_of};
 use reims_vgpu_wire::ops::{
     backed_texture as w_backed, depth_stencil as w_ds, heap_texture as w_heap, icb as w_icb,
-    sampler as w_smp, texture_view as w_view,
+    rate_map as w_rate, sampler as w_smp, texture_view as w_view,
 };
 use reims_vgpu_wire::OP_HEADER_LEN as OP_HDR;
 
@@ -38,8 +38,8 @@ impl crate::observe::Decline for DecodeDecline {
 ///
 /// Wire tag 3 carries the same geometry prefix as wire tag 2 (WindowServer
 /// composite and glyph sources); wire tag 7 is the serializer-resource
-/// container for sampler, depth-stencil, render/compute pipeline, and indirect
-/// command-buffer descriptors.
+/// container for sampler, depth-stencil, render/compute pipeline, indirect
+/// command-buffer, and rasterization-rate-map descriptors.
 pub const OBJECT_TYPE_BUFFER: u8 = 1;
 pub const OBJECT_TYPE_TEXTURE: u8 = 2;
 pub const OBJECT_TYPE_TEXTURE_VARIANT: u8 = 3;
@@ -56,6 +56,8 @@ pub const SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE: u32 = 0x0e;
 /// Indirect command buffer create body from
 /// `PGSerializer newIndirectCommandBufferWithDescriptor:layout:maxCommandCount:options:allocator:`.
 pub const SERIALIZER_RESOURCE_OBJECT_ICB: u32 = w_icb::OPCODE_NEW_INDIRECT_COMMAND_BUFFER;
+pub const SERIALIZER_RESOURCE_OBJECT_RASTERIZATION_RATE_MAP: u32 =
+    w_rate::OPCODE_NEW_RASTERIZATION_RATE_MAP;
 /// End of the 16-byte serializer resource header, which is also where its first TLV
 /// starts — one boundary, so one name.
 pub const SERIALIZER_RESOURCE_FIRST_TLVS: usize = 16;
@@ -92,7 +94,16 @@ pub(crate) const ICB_DESC_MAX_KERNEL_TG_BINDS: usize =
 pub(crate) const ICB_DESC_MAX_OBJECT_TG_BINDS: usize =
     OP_HDR + offset_of!(w_icb::NewIcbBody, max_object_threadgroup_memory_bind_count);
 #[cfg(test)]
+pub(crate) const ICB_DESC_UNIDENTIFIED_U8_A: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, unidentified_u8_a);
+#[cfg(test)]
+pub(crate) const ICB_DESC_UNIDENTIFIED_U8_B: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, unidentified_u8_b);
+#[cfg(test)]
 pub(crate) const ICB_DESC_FLAGS: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, flags);
+#[cfg(test)]
+pub(crate) const ICB_DESC_UNIDENTIFIED_U32: usize =
+    OP_HDR + offset_of!(w_icb::NewIcbBody, unidentified_u32);
 /// Bytes per ICB kernel-threadgroup-memory length slot (`u64` length at index).
 pub const ICB_TG_MEMORY_STRIDE: usize = 8;
 /// Bytes per ICB attribute-stride table entry (`u64` stride at buffer index).
@@ -118,7 +129,8 @@ pub const ICB_FLAG_INHERIT_PIPELINE_STATE: u16 = 1 << 0;
 pub const ICB_FLAG_INHERIT_BUFFERS: u16 = 1 << 1;
 /// `supportRayTracing`, default **off** on both Metal's descriptor and the
 /// guest's, so a set bit is the guest asking for something.
-pub const ICB_FLAG_SUPPORT_RAY_TRACING: u16 = 1 << 2;
+pub const ICB_FLAG_SUPPORT_RAY_TRACING: u16 =
+    IndirectCommandBufferDescriptor::FLAG_SUPPORT_RAY_TRACING;
 /// `supportDynamicAttributeStride`, default off.
 pub const ICB_FLAG_SUPPORT_DYNAMIC_ATTRIBUTE_STRIDE: u16 = 1 << 3;
 /// `inheritDepthStencilState`, default **on** — so a *clear* bit is the guest
@@ -138,7 +150,7 @@ pub const ICB_FLAG_INHERIT_TRIANGLE_FILL_MODE: u16 = 1 << 10;
 /// none of the eleven BOOLs the descriptor declares. Bit 15 is excluded because
 /// the serializer never writes it, which the poison test measures rather than
 /// assumes.
-pub const ICB_FLAG_UNIDENTIFIED: u16 = (1 << 6) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14);
+pub const ICB_FLAG_UNIDENTIFIED: u16 = IndirectCommandBufferDescriptor::UNIDENTIFIED_FLAGS_DEFAULT;
 /// Bit 15, which the serializer never writes: on a guest's ring it is whatever
 /// the last record left there.
 ///
@@ -161,7 +173,7 @@ pub const ICB_FLAG_NEVER_WRITTEN: u16 = 1 << 15;
 /// [`IndirectCommandBufferDescriptor::unapplied_flags`] on every test that used
 /// it.
 #[cfg(test)]
-pub(crate) const ICB_FLAGS_DEFAULT: u16 = 0x7ff0;
+pub(crate) const ICB_FLAGS_DEFAULT: u16 = IndirectCommandBufferDescriptor::FLAGS_DEFAULT;
 /// Embedded ICB command layout (52 B) at +0x1c in the create body.
 #[cfg(test)]
 pub(crate) const ICB_DESC_LAYOUT: usize = OP_HDR + offset_of!(w_icb::NewIcbBody, layout);
@@ -249,7 +261,6 @@ pub use reims_vgpu_protocol::BufferDescriptor;
 pub const LINEAR_DESC_MIN_LEN: usize = 16;
 pub const LINEAR_DESC_SIZE: usize = 0;
 pub const LINEAR_DESC_HANDLE: usize = 8;
-const BUFFER_DESC_PRIVATE_BIT: u64 = 1 << 32;
 /// Arm fixture alias of [`reims_vgpu_paging::geometry::PAGE_SHIFT_ARM64E`].
 /// Prefer `PAGE_SHIFT_ARM64E` / `PAGE_SHIFT_X86` at new call sites. Product
 /// paths must pass `Device::page_shift`, not a fixed arch constant.
@@ -713,6 +724,10 @@ pub const PIPELINE_TAG_MAX_TESSELLATION_FACTOR: u8 = 0x0d;
 pub const PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION: u8 = 0x11;
 /// `MTLRenderPipelineDescriptor.tessellationOutputWindingOrder`.
 pub const PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER: u8 = 0x12;
+/// `MTLRenderPipelineDescriptor.supportIndirectCommandBuffers`, a `BOOL`
+/// widened to four bytes. It is the last classic descriptor property before
+/// the mesh serializer's section-offset extension at `0x14`.
+pub const PIPELINE_TAG_SUPPORT_INDIRECT_COMMAND_BUFFERS: u8 = 0x13;
 /// The `rasterSampleCount` a descriptor that omits the property is asking for,
 /// and the only count this device rasterizes at.
 ///
@@ -895,6 +910,8 @@ const DEPTH_STENCIL_DESC_ID: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody,
 #[cfg(test)]
 const DEPTH_STENCIL_DESC_FRONT_FACE: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody, front);
 #[cfg(test)]
+const DEPTH_STENCIL_DESC_BACK_FACE: usize = OP_HDR + offset_of!(w_ds::DepthStencilBody, back);
+#[cfg(test)]
 pub(crate) const DEPTH_STENCIL_DEPTH_WRITE: u32 = 1 << 3;
 
 pub use reims_vgpu_protocol::{
@@ -934,7 +951,7 @@ pub fn decode_buffer_descriptor(bytes: &[u8]) -> Result<BufferDescriptor, Decode
         allocation_size: ld64(&bytes[LINEAR_DESC_SIZE..]),
         handle64,
         handle: handle64 as u32,
-        is_private: handle64 & BUFFER_DESC_PRIVATE_BIT != 0,
+        is_private: handle64 & BufferDescriptor::PRIVATE_FLAG != 0,
     })
 }
 
@@ -1346,6 +1363,7 @@ fn face_from_wire(face: &w_ds::StencilFace) -> DepthStencilFace {
         stencil_failure_operation: face.stencil_failure_operation() as u32,
         depth_failure_operation: face.depth_failure_operation() as u32,
         depth_stencil_pass_operation: face.depth_stencil_pass_operation() as u32,
+        unidentified_ops: face.unidentified_ops_bits(),
         read_mask: face.read_mask.get(),
         write_mask: face.write_mask.get(),
     }
@@ -1397,7 +1415,7 @@ fn wire_max_anisotropy(value: u8) -> u32 {
     if value != 0 {
         return u32::from(value);
     }
-    crate::runtime::drain::note_store_route("sampler_max_anisotropy_zero");
+    crate::runtime::contract_census::note("sampler_max_anisotropy_zero");
     1
 }
 
@@ -1422,6 +1440,7 @@ pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, Deco
         border_color: body.border_color() as u32,
         normalized_coordinates: body.normalized_coordinates(),
         support_argument_buffers: body.support_argument_buffers(),
+        unidentified_flags: body.unidentified_flag_bits(),
         lod_average: body.lod_average(),
     })
 }
@@ -1437,7 +1456,7 @@ pub fn decode_sampler_descriptor(bytes: &[u8]) -> Result<SamplerDescriptor, Deco
 /// boot's classic pipelines that carry `0x03` — an instrument built to find
 /// unread fields hiding one behind a tag its *other* branch reads. Which tags
 /// count as consumed is a property of the branch taken, so it is chosen there.
-const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 8] = [
+const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 9] = [
     PIPELINE_TAG_VERTEX_FUNC,
     PIPELINE_TAG_FRAGMENT_FUNC,
     PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET,
@@ -1446,6 +1465,7 @@ const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 8] = [
     PIPELINE_TAG_MAX_TESSELLATION_FACTOR,
     PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION,
     PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER,
+    PIPELINE_TAG_SUPPORT_INDIRECT_COMMAND_BUFFERS,
 ];
 
 /// Tags [`decode_render_pipeline_descriptor`] reads on the **mesh** shape.
@@ -1453,12 +1473,13 @@ const CLASSIC_PIPELINE_TAGS_CONSUMED: [u8; 8] = [
 /// Four: the section offset that selected this branch and the three function
 /// refs whose roles it re-maps. See [`CLASSIC_PIPELINE_TAGS_CONSUMED`] for why
 /// the two sets are listed apart.
-const MESH_PIPELINE_TAGS_CONSUMED: [u8; 5] = [
+const MESH_PIPELINE_TAGS_CONSUMED: [u8; 6] = [
     PIPELINE_TAG_MESH_SECTION_OFFSET,
     PIPELINE_TAG_VERTEX_FUNC,
     PIPELINE_TAG_FRAGMENT_FUNC,
     PIPELINE_TAG_MESH_FRAGMENT_FUNC,
     PIPELINE_TAG_RASTER_SAMPLE_COUNT,
+    PIPELINE_TAG_SUPPORT_INDIRECT_COMMAND_BUFFERS,
 ];
 
 /// Tags [`decode_compute_pipeline_descriptor`] reads out of a compute
@@ -1468,9 +1489,11 @@ const MESH_PIPELINE_TAGS_CONSUMED: [u8; 5] = [
 /// because a union would report a render tag as *consumed* on a compute
 /// pipeline that has no reader for it — an instrument built to find unread
 /// fields must not hide one behind a tag its other caller reads.
-const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 2] = [
+const COMPUTE_PIPELINE_TAGS_CONSUMED: [u8; 4] = [
     PIPELINE_TAG_KERNEL_FUNC,
     PIPELINE_TAG_COMPUTE_STAGE_INPUT_OFFSET,
+    COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS,
+    COMPUTE_PIPELINE_TAG_SUPPORT_INDIRECT_COMMAND_BUFFERS,
 ];
 
 /// `MTLRenderPipelineDescriptor.label`, a four-byte reference into the record's
@@ -1489,6 +1512,13 @@ const COMPUTE_PIPELINE_TAG_THREADGROUP_MULTIPLE: u8 = 0x01;
 /// [`RENDER_PIPELINE_TAG_LABEL`] at a different index, for the reason that
 /// constant's doc gives.
 const COMPUTE_PIPELINE_TAG_LABEL: u8 = 0x02;
+/// `MTLComputePipelineDescriptor.supportIndirectCommandBuffers`, a `BOOL`
+/// widened to four bytes. Omission is the descriptor default, `false`.
+const COMPUTE_PIPELINE_TAG_SUPPORT_INDIRECT_COMMAND_BUFFERS: u8 = 0x07;
+/// `MTLComputePipelineDescriptor.maxTotalThreadsPerThreadgroup`, serialized as
+/// the compact unsigned 16-bit value used by this descriptor grammar.
+/// Omission means the descriptor did not impose a limit of its own.
+const COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS: u8 = 0x08;
 /// `MTLComputePipelineDescriptor.stageInputDescriptor` — a byte offset from the
 /// end of the 16-byte serializer resource header to a nested property list, in the same units
 /// as [`PIPELINE_TAG_VERTEX_DESCRIPTOR_OFFSET`] and
@@ -1950,6 +1980,25 @@ pub fn decode_render_pipeline_descriptor(
         compact_tlv_u32(&fields, PIPELINE_TAG_TESSELLATION_FACTOR_STEP_FUNCTION).unwrap_or(0);
     out.tessellation_output_winding_order =
         compact_tlv_u32(&fields, PIPELINE_TAG_TESSELLATION_OUTPUT_WINDING_ORDER).unwrap_or(0);
+    out.supports_indirect_command_buffers = fields
+        .iter()
+        .find(|field| field.tag == PIPELINE_TAG_SUPPORT_INDIRECT_COMMAND_BUFFERS)
+        .map(|field| {
+            if field.length != 4 {
+                return Err(DecodeStatus::ErrUnsupported(
+                    "res_render_pipeline_indirect_width",
+                ));
+            }
+            match field.value_u32 {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(DecodeStatus::ErrUnsupported(
+                    "res_render_pipeline_indirect_value",
+                )),
+            }
+        })
+        .transpose()?
+        .unwrap_or(false);
     // Mesh SPI shape: tag 0x14 section offset (host serializeMeshRenderPipelineDescriptor).
     // Classic serializer resource uses tag 0x08. Roles for 0x01/0x02/0x03 differ by shape.
     if let Some(off) = compact_tlv_u32(&fields, PIPELINE_TAG_MESH_SECTION_OFFSET) {
@@ -2449,7 +2498,7 @@ fn parse_one_color_entry(
                 // attachments are not a dense in-order prefix, so every consumer
                 // that matches `a.slot == c.slot` was reading another slot's
                 // blend state, write mask and pixel format.
-                crate::runtime::drain::note_store_route(
+                crate::runtime::contract_census::note(
                     "serializer_resource_color_slot_off_position",
                 );
             }
@@ -3348,9 +3397,42 @@ pub fn decode_compute_pipeline_descriptor(
         Some(off) => parse_compute_stage_input_section(bytes, off)?,
         None => parse_compute_stage_input_block(bytes, SERIALIZER_RESOURCE_FIRST_TLVS + consumed)?,
     };
+    let max_total_threads_per_threadgroup = fields
+        .iter()
+        .find(|field| field.tag == COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS)
+        .map(|field| {
+            if field.length != 2 {
+                return Err(DecodeStatus::ErrUnsupported(
+                    "res_compute_pipeline_max_threads_width",
+                ));
+            }
+            Ok(u32::from(ld16(&bytes[field.value_offset..])))
+        })
+        .transpose()?;
+    let supports_indirect_command_buffers = fields
+        .iter()
+        .find(|field| field.tag == COMPUTE_PIPELINE_TAG_SUPPORT_INDIRECT_COMMAND_BUFFERS)
+        .map(|field| {
+            if field.length != 4 {
+                return Err(DecodeStatus::ErrUnsupported(
+                    "res_compute_pipeline_indirect_width",
+                ));
+            }
+            match field.value_u32 {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(DecodeStatus::ErrUnsupported(
+                    "res_compute_pipeline_indirect_value",
+                )),
+            }
+        })
+        .transpose()?
+        .unwrap_or(false);
     Ok(ComputePipelineDescriptor {
         kernel_func_ref: compact_tlv_u32(&fields, PIPELINE_TAG_KERNEL_FUNC).unwrap_or(0),
         stage_input,
+        max_total_threads_per_threadgroup,
+        supports_indirect_command_buffers,
     })
 }
 
@@ -3704,14 +3786,65 @@ pub fn decode_icb_descriptor(
             as u16,
         max_object_threadgroup_memory_bind_count: body.max_object_threadgroup_memory_bind_count
             as u16,
+        unidentified_u8_a: body.unidentified_u8_a,
+        unidentified_u8_b: body.unidentified_u8_b,
         flags,
+        unidentified_u32: body.unidentified_u32.get(),
         max_command_count: body.max_command_count.get(),
         options: body.options.get(),
         layout,
     })
 }
 
-/// Decode a serializer resource (sampler, depth-stencil, pipeline, or ICB).
+pub fn decode_rasterization_rate_map_descriptor(
+    bytes: &[u8],
+) -> Result<reims_vgpu_protocol::RasterizationRateMapDescriptor, DecodeStatus> {
+    let op =
+        reims_vgpu_wire::op(bytes, 0).map_err(|_| DecodeStatus::ErrShort("res_rate_map_short"))?;
+    if op.opcode() != SERIALIZER_RESOURCE_OBJECT_RASTERIZATION_RATE_MAP
+        || op.length() as usize != bytes.len()
+    {
+        return Err(DecodeStatus::ErrUnsupported("res_rate_map_tag"));
+    }
+    let (head, layer_counts) =
+        w_rate::rate_map(&op).map_err(|_| DecodeStatus::ErrShort("res_rate_map_short"))?;
+    let written =
+        w_rate::quality_span(&op).map_err(|_| DecodeStatus::ErrShort("res_rate_map_short"))?;
+    if written
+        .checked_add(w_rate::UNWRITTEN_TAIL_LEN)
+        .is_none_or(|declared_payload| declared_payload != op.payload.len())
+    {
+        return Err(DecodeStatus::ErrUnsupported("res_rate_map_length"));
+    }
+    let mut layers = Vec::with_capacity(layer_counts.len());
+    for (index, counts) in layer_counts.iter().enumerate() {
+        let (horizontal, vertical) = w_rate::layer_qualities(&op, index)
+            .map_err(|_| DecodeStatus::ErrShort("res_rate_map_short"))?;
+        layers.push(reims_vgpu_protocol::RasterizationRateMapLayerDescriptor {
+            sample_width: counts.sample_width.get(),
+            sample_height: counts.sample_height.get(),
+            horizontal_quality_bits: horizontal
+                .iter()
+                .map(|quality| quality.get().to_bits())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            vertical_quality_bits: vertical
+                .iter()
+                .map(|quality| quality.get().to_bits())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        });
+    }
+    Ok(reims_vgpu_protocol::RasterizationRateMapDescriptor {
+        screen_width: head.screen_width.get(),
+        screen_height: head.screen_height.get(),
+        unidentified_u32_a: head.unidentified_u32_a.get(),
+        unidentified_u32_b: head.unidentified_u32_b.get(),
+        layers: layers.into_boxed_slice(),
+    })
+}
+
+/// Decode a serializer resource.
 ///
 /// The object-list wire tag is consumed by [`ObjectKind::SerializerResource`].
 /// Callers beyond this module deal only in the semantic family and decoded
@@ -3736,6 +3869,9 @@ pub fn decode_serializer_resource(bytes: &[u8]) -> Result<Descriptor, DecodeStat
         )),
         SERIALIZER_RESOURCE_OBJECT_ICB => Ok(Descriptor::IndirectCommandBuffer(
             decode_icb_descriptor(bytes)?,
+        )),
+        SERIALIZER_RESOURCE_OBJECT_RASTERIZATION_RATE_MAP => Ok(Descriptor::RasterizationRateMap(
+            decode_rasterization_rate_map_descriptor(bytes)?,
         )),
         _ => Err(DecodeStatus::ErrUnsupported(
             "res_serializer_resource_subtype_unknown",

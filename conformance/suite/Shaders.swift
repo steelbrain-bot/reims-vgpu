@@ -177,6 +177,33 @@ kernel void sync_resource_write(device uint *words [[buffer(0)]],
     words[gid] = token ^ gid;
 }
 
+// The indirect arguments carry threadgroup counts, while the shader-visible
+// grid is their product with the encoded threads-per-threadgroup. Recording
+// both the grid and one marker per thread distinguishes those two quantities.
+kernel void indirect_threadgroups_write(device uint *out [[buffer(0)]],
+                                         device uint *observed_grid [[buffer(1)]],
+                                         constant uint &capacity [[buffer(2)]],
+                                         device uint *ran [[buffer(4)]],
+                                         uint3 gid [[thread_position_in_grid]],
+                                         uint3 grid [[threads_per_grid]]) {
+    ran[0] = 1u;
+    observed_grid[0] = grid.x;
+    observed_grid[1] = grid.y;
+    observed_grid[2] = grid.z;
+    uint linear = gid.x + grid.x * (gid.y + grid.y * gid.z);
+    if (linear < capacity) {
+        out[linear] = 0xa5000000u | linear;
+    }
+}
+
+// One thread per indirect command. Distinct output and value-buffer offsets
+// make reset and copy observable per command slot rather than only as a total
+// dispatch count.
+kernel void indirect_command_write(device uint *out [[buffer(0)]],
+                                   device const uint *value [[buffer(1)]]) {
+    out[0] = value[0];
+}
+
 struct VOut { float4 pos [[position]]; float2 uv; };
 
 // A full-target triangle strip driven from a vertex buffer the test owns, so a

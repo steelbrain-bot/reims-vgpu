@@ -408,13 +408,13 @@ impl crate::runtime::host::HostControl for QemuHost<'_> {
                     // reaches it, so this hop is the one candidate for
                     // `gap_idle_us` that is ours.
                     if q.is_empty() {
-                        crate::runtime::drain::note_irq_armed();
+                        crate::runtime::host_action_census::note_armed();
                     }
                     q.push_back(action);
                 }
                 drop(q);
                 if coalesced {
-                    crate::runtime::drain::note_irq_coalesced(action.kind);
+                    crate::runtime::host_action_census::note_coalesced(action.kind);
                 }
                 self.notify_actions();
                 return;
@@ -423,7 +423,7 @@ impl crate::runtime::host::HostControl for QemuHost<'_> {
                 let mut q = prompt.lock();
                 q.retain(|a| a.kind != HostActionKind::CursorUpdate);
                 if q.is_empty() {
-                    crate::runtime::drain::note_irq_armed();
+                    crate::runtime::host_action_census::note_armed();
                 }
                 q.push_back(action);
                 drop(q);

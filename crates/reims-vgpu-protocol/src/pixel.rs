@@ -222,6 +222,33 @@ pub enum StorageImageFormat {
 }
 
 impl StorageImageFormat {
+    pub const ALL: [Self; 24] = [
+        Self::Rgba32Float,
+        Self::Rgba16Float,
+        Self::R16Float,
+        Self::R16Uint,
+        Self::Rgba16Uint,
+        Self::Rgba8Uint,
+        Self::Rgba8Sint,
+        Self::Rgba8Unorm,
+        Self::Bgra8Unorm,
+        Self::Rg16Float,
+        Self::R8Unorm,
+        Self::Rg8Unorm,
+        Self::Rgba32Uint,
+        Self::Rgba32Sint,
+        Self::R32Uint,
+        Self::R32Sint,
+        Self::R32Float,
+        Self::Rgb9e5Ufloat,
+        Self::R16Unorm,
+        Self::Rg16Unorm,
+        Self::Rgba16Unorm,
+        Self::Rgb10a2Unorm,
+        Self::Bgr10a2Unorm,
+        Self::Rg11b10Float,
+    ];
+
     /// Bytes occupied by one stored texel.
     pub const fn bytes_per_texel(self) -> usize {
         match self {

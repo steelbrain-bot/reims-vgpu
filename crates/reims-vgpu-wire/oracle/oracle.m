@@ -500,6 +500,13 @@ static NSArray *textureCases(id ser, id cap) {
 
 // --- Encoder records -------------------------------------------------------
 
+/// Build the shared encoder base through its own designated initializer.
+static id makeBaseEncoder(id ser, id stream) {
+  return ((id (*)(id, SEL, id, id))objc_msgSend)(
+      [objc_getClass("PGSerializerCommandEncoder") alloc],
+      sel_getUid("initWithCommandBuffer:serializer:"), stream, ser);
+}
+
 /// Build a render encoder over a pass with one colour attachment.
 ///
 /// Creating it emits records of its own (the render-pass record, and an 8-byte
@@ -607,6 +614,8 @@ static BOOL captureCase(NSMutableArray *cases, NSString *cls, NSString *name,
                         NSString *sel, NSDictionary *expect, int wanted,
                         NSArray<NSDictionary *> *expects, void (^invoke)(void)) {
   arenaReset();
+  gLastBufferBytesLength = 0;
+  gLastBufferBytesAlignment = 0;
   if (!runSurvivingAbort(invoke)) {
     int sig = (int)gLastSignal;
     if (sig == SIGABRT) {
@@ -640,6 +649,13 @@ static BOOL captureCase(NSMutableArray *cases, NSString *cls, NSString *name,
   for (int i = 0; i < wanted; i++) {
     NSString *slot = wanted == 1 ? name : [NSString stringWithFormat:@"%@_%d", name, i];
     NSDictionary *expect_i = wanted == 1 ? expect : expects[i];
+    if ([cls isEqualToString:@"PGSerializerInfoCommandEncoder"] &&
+        gLastBufferBytesLength != 0) {
+      NSMutableDictionary *measured = [expect_i mutableCopy];
+      measured[@"reply_length"] = @(gLastBufferBytesLength);
+      measured[@"reply_alignment"] = @(gLastBufferBytesAlignment);
+      expect_i = measured;
+    }
     NSDictionary *c = caseFromCaptureAt(slot, cls, sel, expect_i, i, wanted, &produced);
     if (c) [cases addObject:c];
   }
@@ -741,6 +757,18 @@ static void addEncoderCase(NSMutableArray *cases, id ser, id stream, NSString *n
   addCaseOnEncoder(cases, @"PGSerializerRenderCommandEncoder",
                    ^id {
                      return makeRenderEncoder(ser, stream);
+                   },
+                   name, sel, expect, invoke);
+}
+
+/// Drive a selector on an instance of the shared encoder base. Concrete
+/// encoders may override the same selector, so their fixtures remain separate.
+static void addBaseEncoderCase(NSMutableArray *cases, id ser, id stream,
+                               NSString *name, NSString *sel,
+                               NSDictionary *expect, void (^invoke)(id enc)) {
+  addCaseOnEncoder(cases, @"PGSerializerCommandEncoder",
+                   ^id {
+                     return makeBaseEncoder(ser, stream);
                    },
                    name, sel, expect, invoke);
 }
@@ -949,6 +977,14 @@ static void addBlitCase(NSMutableArray *cases, id ser, id stream, NSString *name
 static NSArray *encoderCases(id ser) {
   NSMutableArray *cases = [NSMutableArray array];
   id stream = [[CaptureCommandStream alloc] init];
+
+  addBaseEncoderCase(cases, ser, stream, @"base_begin_segment",
+                     @"beginSegment:protectionOptions:",
+                     @{@"flag" : @1, @"protection_options" : @0x33}, ^(id enc) {
+                       ((void (*)(id, SEL, char, unsigned long))objc_msgSend)(
+                           enc, sel_getUid("beginSegment:protectionOptions:"), 1,
+                           0x33);
+                     });
 
   addEncoderCase(cases, ser, stream, @"render_draw_primitives",
                  @"drawPrimitives:vertexStart:vertexCount:",
@@ -1295,6 +1331,53 @@ static NSArray *encoderCases(id ser) {
   id dst_icb = [[StubICB alloc] initWithRef:STUB_ICB_DST_REF];
   id tex = [[StubTexture alloc] init];
   id vbuf = [[StubBuffer alloc] init];
+
+  addBaseEncoderCase(cases, ser, stream, @"base_use_heap", @"useHeap:",
+                     @{@"heap_ref" : @(STUB_HEAP_REF), @"count" : @1}, ^(id enc) {
+                       ((void (*)(id, SEL, id))objc_msgSend)(
+                           enc, sel_getUid("useHeap:"), [[StubHeap alloc] init]);
+                     });
+
+  {
+    id heaps[2] = {[[StubHeap alloc] init], [[StubHeap2 alloc] init]};
+    const id *heap_list = heaps;
+    addBaseEncoderCase(cases, ser, stream, @"base_use_heaps_count",
+                       @"useHeaps:count:",
+                       @{@"heap_ref" : @(STUB_HEAP_REF),
+                         @"heap_ref_2" : @(STUB_HEAP2_REF),
+                         @"count" : @2},
+                       ^(id enc) {
+                         ((void (*)(id, SEL, const id *, unsigned long))objc_msgSend)(
+                             enc, sel_getUid("useHeaps:count:"), heap_list, 2);
+                       });
+  }
+
+  addBaseEncoderCase(cases, ser, stream, @"base_use_resource",
+                     @"useResource:usage:",
+                     @{@"resource_ref" : @(STUB_BUFFER_REF),
+                       @"count" : @1,
+                       @"usage" : @1},
+                     ^(id enc) {
+                       ((void (*)(id, SEL, id, unsigned long))objc_msgSend)(
+                           enc, sel_getUid("useResource:usage:"), vbuf, 1);
+                     });
+
+  {
+    id resources[2] = {vbuf, tex};
+    const id *resource_list = resources;
+    addBaseEncoderCase(cases, ser, stream, @"base_use_resources_count",
+                       @"useResources:count:usage:",
+                       @{@"resource_ref" : @(STUB_BUFFER_REF),
+                         @"resource_ref_2" : @(STUB_TEXTURE_REF),
+                         @"count" : @2,
+                         @"usage" : @2},
+                       ^(id enc) {
+                         ((void (*)(id, SEL, const id *, unsigned long,
+                                    unsigned long))objc_msgSend)(
+                             enc, sel_getUid("useResources:count:usage:"),
+                             resource_list, 2, 2);
+                       });
+  }
 
   addEncoderCase(cases, ser, stream, @"render_set_render_pipeline_state",
                  @"setRenderPipelineState:", @{@"pipeline_ref" : @(STUB_PIPELINE_REF)},
@@ -6512,6 +6595,7 @@ static NSArray *capabilityCases(id ser) {
     NSString *slug = [flag lowercaseString];
     SEL getSel = sel_getUid(getter.UTF8String);
     SEL setSel = sel_getUid(setter.UTF8String);
+    if (![ser respondsToSelector:getSel] || ![ser respondsToSelector:setSel]) continue;
 
     addSerializerCase(cases, [NSString stringWithFormat:@"capability_get_%@", slug],
                       getter, @{}, ^{
@@ -6529,11 +6613,13 @@ static NSArray *capabilityCases(id ser) {
 
   for (NSString *flag in readOnly) {
     NSString *getter = [NSString stringWithFormat:@"supports%@", flag];
+    SEL getSel = sel_getUid(getter.UTF8String);
+    if (![ser respondsToSelector:getSel]) continue;
     addSerializerCase(cases, [NSString stringWithFormat:@"capability_get_%@",
                                                        [flag lowercaseString]],
                       getter, @{}, ^{
                         (void)((char (*)(id, SEL))objc_msgSend)(
-                            ser, sel_getUid(getter.UTF8String));
+                            ser, getSel);
                       });
   }
 
@@ -6552,7 +6638,8 @@ static NSArray *capabilityCases(id ser) {
 // at a hex dump settles.
 static NSDictionary *inventory(void) {
   NSArray *classes = @[
-    @"PGSerializer", @"PGSerializerRenderCommandEncoder",
+    @"PGSerializer", @"PGSerializerCommandEncoder",
+    @"PGSerializerRenderCommandEncoder",
     @"PGSerializerComputeCommandEncoder", @"PGSerializerBlitCommandEncoder",
     @"PGSerializerInfoCommandEncoder"
   ];
@@ -6660,14 +6747,18 @@ static NSArray *onePass(id<MTLDevice> dev, id cap, unsigned char poison, BOOL re
   if (gForceAllCapabilities) {
     for (NSString *flag in capabilityFlagNames()) {
       NSString *setter = [NSString stringWithFormat:@"setSupports%@:", flag];
-      ((void (*)(id, SEL, char))objc_msgSend)(ser, sel_getUid(setter.UTF8String), (char)1);
+      SEL setSel = sel_getUid(setter.UTF8String);
+      if (![ser respondsToSelector:setSel]) continue;
+      ((void (*)(id, SEL, char))objc_msgSend)(ser, setSel, (char)1);
     }
   } else if (gForceOneCapability) {
     // An attribution pass. Exactly one flag on, so the selectors that stop
     // being silent are the ones this flag alone unlocks -- which is the
     // argument `withCapability` needs, measured rather than tried.
     NSString *setter = [NSString stringWithFormat:@"setSupports%@:", gForceOneCapability];
-    ((void (*)(id, SEL, char))objc_msgSend)(ser, sel_getUid(setter.UTF8String), (char)1);
+    SEL setSel = sel_getUid(setter.UTF8String);
+    if ([ser respondsToSelector:setSel])
+      ((void (*)(id, SEL, char))objc_msgSend)(ser, setSel, (char)1);
   }
 
   NSMutableArray *cases = [NSMutableArray array];
@@ -6729,6 +6820,26 @@ static NSArray *blitPass(id<MTLDevice> dev, id cap, unsigned char poison, BOOL r
   if (!ser) return nil;
   recordCapabilityDefaults(ser);
   return blitCases(ser);
+}
+
+/// Encoder-only pass for serializer versions whose object-creation or
+/// capability surfaces cannot run the full modern inventory.
+static NSArray *encoderPass(id<MTLDevice> dev, id cap, unsigned char poison, BOOL record) {
+  gPoison = poison;
+  gRecordOutcomes = record;
+  gNextRef = 1;
+  id ser = ((id (*)(id, SEL, id, id))objc_msgSend)(
+      [objc_getClass("PGSerializer") alloc],
+      sel_getUid("initWithDevice:objectRefAllocator:"), dev,
+      [[RefAllocator alloc] init]);
+  if (!ser) return nil;
+  recordCapabilityDefaults(ser);
+  NSMutableArray *cases = [NSMutableArray array];
+  [cases addObjectsFromArray:encoderCases(ser)];
+  [cases addObjectsFromArray:blitCases(ser)];
+  [cases addObjectsFromArray:computeCases(ser)];
+  [cases addObjectsFromArray:infoCases(ser)];
+  return cases;
 }
 
 /// Attach each case's per-bit written mask, derived from its two passes.
@@ -6914,7 +7025,7 @@ static void diffAgainstDefault(NSDictionary *base, NSArray *forced, NSString *fl
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc < 3) {
-      fprintf(stderr, "usage: %s (fixtures|texture-fixtures|creation-fixtures|blit-fixtures|inventory) <out.json>\n",
+      fprintf(stderr, "usage: %s (fixtures|texture-fixtures|creation-fixtures|blit-fixtures|encoder-fixtures|inventory) <out.json>\n",
               argv[0]);
       return 2;
     }
@@ -7002,6 +7113,26 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "blit-fixtures") == 0) {
       NSArray *first = blitPass(dev, cap, ARENA_POISON, YES);
       NSArray *second = blitPass(dev, cap, ARENA_POISON_ALT, NO);
+      if (!first || !second) return 1;
+      NSMutableArray *unmasked = [NSMutableArray array];
+      NSArray *cases = mergeWrittenMasks(first, second, unmasked);
+      return writeJSON(@{
+        @"schema" : @3,
+        @"provenance" : provenance(),
+        @"host_gpu" : dev.name ?: @"(unknown)",
+        @"cases" : cases,
+        @"poison" : @[ @(ARENA_POISON), @(ARENA_POISON_ALT) ],
+        @"unmasked" : unmasked,
+        @"unsupported" : gUnsupported,
+        @"silent" : gSilent,
+        @"crashed" : gCrashed,
+        @"multi" : gMulti,
+      }, argv[2]);
+    }
+
+    if (strcmp(argv[1], "encoder-fixtures") == 0) {
+      NSArray *first = encoderPass(dev, cap, ARENA_POISON, YES);
+      NSArray *second = encoderPass(dev, cap, ARENA_POISON_ALT, NO);
       if (!first || !second) return 1;
       NSMutableArray *unmasked = [NSMutableArray array];
       NSArray *cases = mergeWrittenMasks(first, second, unmasked);

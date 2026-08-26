@@ -16,6 +16,16 @@ struct Slot<M> {
     current: Option<ResourceId<M>>,
 }
 
+impl<M> Clone for Slot<M> {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index,
+            next_generation: self.next_generation,
+            current: self.current,
+        }
+    }
+}
+
 /// One API-specific reference namespace, partitioned by task.
 ///
 /// Samplers, pipelines, heaps, and fences allocate references independently.
@@ -26,6 +36,15 @@ struct Slot<M> {
 pub struct ReferenceNamespace<M> {
     slots: BTreeMap<(TaskId, SerializerRef<M>), Slot<M>>,
     next_index: u32,
+}
+
+impl<M> Clone for ReferenceNamespace<M> {
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            next_index: self.next_index,
+        }
+    }
 }
 
 impl<M> Default for ReferenceNamespace<M> {
@@ -94,6 +113,20 @@ impl<M> ReferenceNamespace<M> {
             }
         }
         released
+    }
+
+    pub fn live_for_task(&self, task: TaskId) -> Box<[(SerializerRef<M>, ResourceId<M>)]> {
+        self.slots
+            .iter()
+            .filter_map(|((slot_task, reference), slot)| {
+                if *slot_task == task {
+                    slot.current.map(|identity| (*reference, identity))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 }
 

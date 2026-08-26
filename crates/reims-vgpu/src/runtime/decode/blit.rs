@@ -373,30 +373,42 @@ pub fn decode(command: &[u8]) -> Result<Command, DecodeStatus> {
             Ok(out)
         }
         wire::OPCODE_OPTIMIZE_ICB | wire::OPCODE_RESET_ICB => {
-            if command_length != wire::ICB_RANGE_TOTAL_LEN as usize {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let r = wire::icb_range(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            let operation = reims_vgpu_protocol::decode_indirect_command_operation(&op)
+                .map_err(|_| DecodeStatus::ErrShort)?;
+            let (icb, range) = match operation {
+                reims_vgpu_protocol::IndirectCommandOperation::Optimize { icb, range }
+                | reims_vgpu_protocol::IndirectCommandOperation::Reset { icb, range } => {
+                    (icb, range)
+                }
+                reims_vgpu_protocol::IndirectCommandOperation::Copy { .. } => unreachable!(),
+            };
             out.kind = Kind::IcbRange;
             out.resource_kind = RefKind::IndirectCommandBuffer;
-            out.resource = r.icb_ref.get();
-            out.range_location = r.range_location.get();
-            out.range_length = r.range_length.get();
+            out.resource = icb.get();
+            out.range_location = range.location;
+            out.range_length = range.length;
             Ok(out)
         }
         wire::OPCODE_COPY_ICB => {
-            if command_length != wire::COPY_ICB_TOTAL_LEN as usize {
-                return Err(DecodeStatus::ErrShort);
-            }
-            let c = wire::copy_icb(&op).map_err(|_| DecodeStatus::ErrShort)?;
+            let operation = reims_vgpu_protocol::decode_indirect_command_operation(&op)
+                .map_err(|_| DecodeStatus::ErrShort)?;
+            let reims_vgpu_protocol::IndirectCommandOperation::Copy {
+                source,
+                source_range,
+                destination,
+                destination_index,
+            } = operation
+            else {
+                unreachable!()
+            };
             out.kind = Kind::IcbCopy;
             out.source_kind = RefKind::IndirectCommandBuffer;
             out.destination_kind = RefKind::IndirectCommandBuffer;
-            out.source = c.source_ref.get();
-            out.destination = c.dest_ref.get();
-            out.range_location = c.range_location.get();
-            out.range_length = c.range_length.get();
-            out.destination_index = c.dest_index.get();
+            out.source = source.get();
+            out.destination = destination.get();
+            out.range_location = source_range.location;
+            out.range_length = source_range.length;
+            out.destination_index = destination_index;
             Ok(out)
         }
         wire::OPCODE_FILL_BUFFER_PATTERN4 => {

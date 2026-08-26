@@ -227,6 +227,8 @@ fn is_variable_length(opcode: u32) -> bool {
         || opcode == r::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT
         || opcode == r::OPCODE_USE_RESOURCE
         || opcode == r::OPCODE_USE_HEAP
+        || opcode == r::OPCODE_USE_HEAPS_NO_STAGES
+        || opcode == r::OPCODE_USE_RESOURCES_NO_STAGES
         || opcode == r::OPCODE_MEMORY_BARRIER_RESOURCES
         || opcode == r::OPCODE_SET_SCISSOR_RECTS
         || opcode == r::OPCODE_SET_VIEWPORTS
@@ -2139,8 +2141,8 @@ fn coverage_is_reported_every_run_so_the_gap_stays_visible() {
     let untriaged = manifest::untriaged();
     let surface: usize = manifest::INVENTORY.iter().map(|c| c.instance_methods).sum();
     eprintln!(
-        "wire coverage: {} covered, {} unimplemented, {} excluded, {} untriaged of {} selectors",
-        c.covered, c.unimplemented, c.excluded, untriaged, surface
+        "wire coverage: {} covered, {} delegated, {} unimplemented, {} excluded, {} untriaged of {} selectors",
+        c.covered, c.delegated, c.unimplemented, c.excluded, untriaged, surface
     );
     assert_eq!(c.rows() + untriaged, surface);
 }
@@ -2161,7 +2163,9 @@ fn every_render_fixture_reads_back_what_metal_was_asked_for() {
     let mut draw_opcodes_seen = std::collections::BTreeSet::new();
 
     for case in root["cases"].as_array().expect("cases array") {
-        if case["class"] != "PGSerializerRenderCommandEncoder" {
+        if case["class"] != "PGSerializerRenderCommandEncoder"
+            && case["class"] != "PGSerializerCommandEncoder"
+        {
             continue;
         }
         let name = case["name"].as_str().expect("case name");
@@ -2558,6 +2562,45 @@ fn every_render_fixture_reads_back_what_metal_was_asked_for() {
                 assert_eq!(refs[0].object_ref.get() as u64, expect_u64(case, "heap_ref"), "{name}: heap_ref");
                 if let Some(r2) = case["expect"]["heap_ref_2"].as_u64() {
                     assert_eq!(refs[1].object_ref.get() as u64, r2, "{name}: heap_ref_2");
+                }
+            }
+            render::OPCODE_USE_HEAPS_NO_STAGES => {
+                let (head, refs) = render::use_heaps_no_stages(&o)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let count = expect_u64(case, "count");
+                assert_eq!(head.count.get() as u64, count, "{name}: count");
+                assert_eq!(refs.len() as u64, count, "{name}: ref count");
+                assert_eq!(
+                    refs[0].object_ref.get() as u64,
+                    expect_u64(case, "heap_ref"),
+                    "{name}: heap_ref"
+                );
+                if let Some(r2) = case["expect"]["heap_ref_2"].as_u64() {
+                    assert_eq!(refs[1].object_ref.get() as u64, r2, "{name}: heap_ref_2");
+                }
+            }
+            render::OPCODE_USE_RESOURCES_NO_STAGES => {
+                let (head, refs) = render::use_resources_no_stages(&o)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+                let count = expect_u64(case, "count");
+                assert_eq!(head.count.get() as u64, count, "{name}: count");
+                assert_eq!(
+                    head.usage.get() as u64,
+                    expect_u64(case, "usage"),
+                    "{name}: usage"
+                );
+                assert_eq!(refs.len() as u64, count, "{name}: ref count");
+                assert_eq!(
+                    refs[0].object_ref.get() as u64,
+                    expect_u64(case, "resource_ref"),
+                    "{name}: resource_ref"
+                );
+                if let Some(r2) = case["expect"]["resource_ref_2"].as_u64() {
+                    assert_eq!(
+                        refs[1].object_ref.get() as u64,
+                        r2,
+                        "{name}: resource_ref_2"
+                    );
                 }
             }
             render::OPCODE_SET_COLOR_STORE_ACTION => {
@@ -3852,10 +3895,13 @@ fn every_segment_header_fixture_reads_back_what_the_encoder_wrote() {
         Some(&segment::SEGMENT_TYPE_INFO),
         "the info encoder no longer writes SEGMENT_TYPE_INFO"
     );
-    let distinct: std::collections::BTreeSet<u8> = by_class.values().copied().collect();
+    let distinct: std::collections::BTreeSet<u8> = by_class
+        .iter()
+        .filter_map(|(class, ty)| (*class != "PGSerializerCommandEncoder").then_some(*ty))
+        .collect();
     assert_eq!(
         distinct.len(),
-        by_class.len(),
+        by_class.len() - usize::from(by_class.contains_key("PGSerializerCommandEncoder")),
         "two encoder classes wrote the same value at +4, so nothing here shows \
          it is a type rather than a constant: {by_class:?}"
     );
@@ -4347,6 +4393,28 @@ fn every_info_fixture_reads_back_what_metal_was_asked_for() {
                     "{name}: reply_offset"
                 );
                 reply_refs.insert(buf);
+                let expected_layout = if selector.starts_with("mapCoordinateInternal:") {
+                    Some(info::ReplyLayout {
+                        length: 8,
+                        alignment: 4,
+                    })
+                } else if o.opcode() == info::OPCODE_RATE_MAP_INFO {
+                    let q = info::rate_map_info(&o).expect("rate-map reply layout");
+                    info::rate_map_reply_layout(q.reply_len.get())
+                } else {
+                    info::fixed_reply_layout(o.opcode())
+                }
+                .expect("emitted info query has a supported reply layout");
+                assert_eq!(
+                    expected_layout.length as u64,
+                    expect_u64(case, "reply_length"),
+                    "{name}: reply_length"
+                );
+                assert_eq!(
+                    expected_layout.alignment as u64,
+                    expect_u64(case, "reply_alignment"),
+                    "{name}: reply_alignment"
+                );
             }};
         }
 

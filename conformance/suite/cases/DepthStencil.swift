@@ -35,6 +35,119 @@ private func depthTestState(_ compare: MTLCompareFunction) -> MTLDepthStencilSta
     return dev.makeDepthStencilState(descriptor: descriptor)
 }
 
+/// With combined storage, an option-free buffer copy selects the depth plane.
+/// Seed stencil first and prove both directions leave that independent plane
+/// intact, so a packed-cell interpretation cannot accidentally pass.
+func combinedDepthStencilDefaultBufferCopyCase() {
+    let label = "combined_depth_stencil_default_buffer_copy_selects_depth"
+    let width = 4, height = 2, rowBytes = 256
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .depth32Float_stencil8,
+        width: width,
+        height: height,
+        mipmapped: false)
+    descriptor.usage = .renderTarget
+    descriptor.storageMode = .private
+    guard let texture = dev.makeTexture(descriptor: descriptor),
+          let source = dev.makeBuffer(length: rowBytes * height, options: .storageModeShared),
+          let stencilSource = dev.makeBuffer(length: rowBytes * height, options: .storageModeShared),
+          let implicitDepth = dev.makeBuffer(length: rowBytes * height, options: .storageModeShared),
+          let stencil = dev.makeBuffer(length: rowBytes * height, options: .storageModeShared) else {
+        report(label, false, "combined texture or transfer buffer allocation failed")
+        return
+    }
+
+    let sourceBytes = source.contents().bindMemory(to: UInt8.self, capacity: rowBytes * height)
+    let stencilSourceBytes = stencilSource.contents().bindMemory(
+        to: UInt8.self, capacity: rowBytes * height)
+    sourceBytes.initialize(repeating: 0, count: rowBytes * height)
+    stencilSourceBytes.initialize(repeating: 0, count: rowBytes * height)
+    let depthBits = Float(0.25).bitPattern.littleEndian
+    for y in 0..<height {
+        for x in 0..<width {
+            let offset = y * rowBytes + x * 4
+            sourceBytes[offset + 0] = UInt8(truncatingIfNeeded: depthBits)
+            sourceBytes[offset + 1] = UInt8(truncatingIfNeeded: depthBits >> 8)
+            sourceBytes[offset + 2] = UInt8(truncatingIfNeeded: depthBits >> 16)
+            sourceBytes[offset + 3] = UInt8(truncatingIfNeeded: depthBits >> 24)
+            stencilSourceBytes[y * rowBytes + x] = 0x5a
+        }
+    }
+
+    let commandBuffer = queue.makeCommandBuffer()!
+    let blit = commandBuffer.makeBlitCommandEncoder()!
+    let size = MTLSize(width: width, height: height, depth: 1)
+    blit.copy(from: stencilSource,
+              sourceOffset: 0,
+              sourceBytesPerRow: rowBytes,
+              sourceBytesPerImage: rowBytes * height,
+              sourceSize: size,
+              to: texture,
+              destinationSlice: 0,
+              destinationLevel: 0,
+              destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+              options: .stencilFromDepthStencil)
+    blit.copy(from: source,
+              sourceOffset: 0,
+              sourceBytesPerRow: rowBytes,
+              sourceBytesPerImage: rowBytes * height,
+              sourceSize: size,
+              to: texture,
+              destinationSlice: 0,
+              destinationLevel: 0,
+              destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+              options: [])
+    blit.copy(from: texture,
+              sourceSlice: 0,
+              sourceLevel: 0,
+              sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+              sourceSize: size,
+              to: implicitDepth,
+              destinationOffset: 0,
+              destinationBytesPerRow: rowBytes,
+              destinationBytesPerImage: rowBytes * height,
+              options: [])
+    blit.copy(from: texture,
+              sourceSlice: 0,
+              sourceLevel: 0,
+              sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+              sourceSize: size,
+              to: stencil,
+              destinationOffset: 0,
+              destinationBytesPerRow: rowBytes,
+              destinationBytesPerImage: rowBytes * height,
+              options: .stencilFromDepthStencil)
+    blit.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+    guard commandBuffer.status == .completed else {
+        report(label, false, "default combined buffer copy status=\(commandBuffer.status.rawValue)")
+        return
+    }
+
+    let depthBytes = implicitDepth.contents().bindMemory(
+        to: UInt8.self, capacity: rowBytes * height)
+    let stencilBytes = stencil.contents().bindMemory(to: UInt8.self, capacity: rowBytes * height)
+    var mismatch = ""
+    for y in 0..<height {
+        for x in 0..<width {
+            let depthOffset = y * rowBytes + x * 4
+            let gotDepth = UInt32(depthBytes[depthOffset + 0])
+                | (UInt32(depthBytes[depthOffset + 1]) << 8)
+                | (UInt32(depthBytes[depthOffset + 2]) << 16)
+                | (UInt32(depthBytes[depthOffset + 3]) << 24)
+            let gotStencil = stencilBytes[y * rowBytes + x]
+            if gotDepth != depthBits || gotStencil != 0x5a {
+                mismatch = "at=(\(x),\(y)) depth=\(hex(gotDepth)) stencil=\(hex(UInt32(gotStencil)))"
+                break
+            }
+        }
+        if !mismatch.isEmpty { break }
+    }
+    report(label, mismatch.isEmpty,
+           mismatch.isEmpty ? "default copies selected depth and preserved stencil" : mismatch)
+}
+
 private struct DepthTaskFixture {
     let pipeline: MTLRenderPipelineState
     let vertices: MTLBuffer

@@ -1176,6 +1176,7 @@ dependencies = [
  "reims-vgpu-protocol",
  "reims-vgpu-testkit",
  "reims-vgpu-wire",
+ "spirv",
 ]
 
 [[package]]

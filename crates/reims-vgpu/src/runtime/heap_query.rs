@@ -28,9 +28,8 @@ pub const TEXTURE_BODY_LEN: usize = wire::TEXTURE_DESCRIPTOR_LEN;
 /// [`crate::runtime::decode::resource::decode_heap_texture`].
 pub const WIDE_TEXTURE_BODY_LEN: usize = wire::WIDE_TEXTURE_DESCRIPTOR_LEN;
 
-const TEXTURE_USAGE_SHADER_READ: u32 = 1 << 0;
-const TEXTURE_USAGE_SHADER_WRITE: u32 = 1 << 1;
-const SUPPORTED_TEXTURE_USAGE: u32 = TEXTURE_USAGE_SHADER_READ | TEXTURE_USAGE_SHADER_WRITE;
+const SUPPORTED_TEXTURE_USAGE: u32 = reims_vgpu_protocol::TEXTURE_USAGE_SHADER_READ
+    | reims_vgpu_protocol::TEXTURE_USAGE_SHADER_WRITE;
 // `MTLResourceStorageModePrivate`: the storage-mode ordinal occupies
 // `resource_options[7:4]`; the wire crate owns and tests that field projection.
 const PRIVATE_DEFAULT_CACHE_RESOURCE_OPTIONS: u16 = 2 << 4;
@@ -199,7 +198,7 @@ pub fn decode_wide_serialized_texture_descriptor(
 pub fn image_plan(
     desc: &TextureDescriptor,
 ) -> Result<reims_vgpu_core::HeapTextureImagePlan, QueryError> {
-    if desc.texture_type != 2
+    if desc.texture_type != reims_vgpu_protocol::TextureType::D2
         || desc.width == 0
         || desc.height == 0
         || desc.depth != 1
@@ -287,7 +286,7 @@ mod tests {
         assert_eq!(
             request.descriptor,
             TextureDescriptor {
-                texture_type: 2,
+                texture_type: reims_vgpu_protocol::TextureType::D2,
                 framebuffer_only: false,
                 is_drawable: false,
                 write_swizzle_enabled: None,

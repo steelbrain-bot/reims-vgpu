@@ -222,8 +222,9 @@ pub(super) fn plan_bound_buffers<M: HostMemory + HostOps>(
         let step_rate = a.step_rate();
         attrs.push(reims_vgpu_core::VertexAttributeResource {
             location: a.location,
-            // One Vulkan binding per location (archive render_draw_core).
-            binding: a.location,
+            // Vulkan attributes sharing one Metal layout consume the same
+            // buffer binding; the attribute location is a separate namespace.
+            binding: a.buffer_index,
             format,
             offset: a.offset,
             stride,

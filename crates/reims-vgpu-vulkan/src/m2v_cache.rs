@@ -13,7 +13,7 @@
 //! the argument for why the digest is not allowed to.
 //! Measure-only hit/miss counters for fail-log census.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -302,7 +302,23 @@ pub struct CachedShader {
     render_source: Option<RenderTranslationSource>,
     render_specializations: RenderSpecializationCache,
     kernel_source: Option<KernelTranslationSource>,
-    kernel_specializations: Mutex<HashMap<Vec<RuntimeStorageImageRequest>, Arc<CachedShader>>>,
+    kernel_specializations: Mutex<HashMap<KernelSpecializationKey, Arc<CachedShader>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StaticWorkgroupType {
+    Scalar { bytes: u64 },
+    Vector { component: u32, count: u32 },
+    Matrix { column: u32, count: u32 },
+    Array { element: u32, length: u32 },
+    Structure,
+    Pointer { pointee: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StaticWorkgroupLayout {
+    size: u64,
+    align: u64,
 }
 
 #[derive(Clone)]
@@ -327,6 +343,27 @@ pub struct RuntimeStorageImageRequest {
     pub storage_image_atomic: bool,
     pub read_without_format: bool,
     pub write_without_format: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelDispatchContract {
+    DynamicThreads,
+    Workgroups,
+}
+
+impl KernelDispatchContract {
+    const fn translation(self) -> Option<metal2vulkan::reflect::KernelDispatch> {
+        match self {
+            Self::DynamicThreads => None,
+            Self::Workgroups => Some(metal2vulkan::reflect::KernelDispatch::Workgroups),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct KernelSpecializationKey {
+    storage_images: Vec<RuntimeStorageImageRequest>,
+    dispatch: KernelDispatchContract,
 }
 
 /// One binding numbering of a translated module, beside the reflected
@@ -564,12 +601,25 @@ fn project_prepared_variant(
     texture_uses.sort_unstable_by_key(|(metal_index, _)| *metal_index);
     texture_uses.dedup_by_key(|(metal_index, _)| *metal_index);
     let texture_uses = texture_uses.into();
+    let mut storage_image_accesses = interface
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == reims_vgpu_core::ShaderResourceKind::StorageImage)
+        .filter_map(|binding| binding.descriptor.map(|descriptor| descriptor.binding))
+        .filter_map(|binding| {
+            crate::spirv_bind::storage_image_access(&variant.words, binding)
+                .map(|access| (binding, access))
+        })
+        .collect::<Vec<_>>();
+    storage_image_accesses.sort_unstable_by_key(|(binding, _)| *binding);
+    storage_image_accesses.dedup_by_key(|(binding, _)| *binding);
     reims_vgpu_core::PreparedShaderVariant {
         program: prepared_stage(&variant),
         samplers: variant.samplers.clone(),
         declared_bindings,
         descriptor_uses,
         texture_uses,
+        storage_image_accesses: storage_image_accesses.into(),
         buffer_binding_base: layout.buffers.start,
         texture_binding_base: layout.sampled_textures.start,
         sampler_binding_base: layout.samplers.start,
@@ -605,7 +655,7 @@ fn runtime_sampler_state(
         SamplerMipFilter,
     };
 
-    let sampler = crate::engine::types::effective_sampler_state(sampler)
+    let sampler = crate::native_types::effective_sampler_state(sampler)
         .map_err(|reason| reason.to_string())?;
     let filter = |value| match value {
         SamplerFilter::Nearest => native::SamplerFilter::Nearest,
@@ -864,7 +914,10 @@ pub fn prepare_shader_words(words: Vec<u32>) -> Arc<ShaderVariant> {
     )
 }
 
-pub(crate) fn resolve_prepared_shader(
+/// Acquire the native module owner named by a prepared semantic program.
+/// The registry is weak: a guest pipeline or prepared dispatch must retain
+/// the returned owner for every lifetime in which the identity can execute.
+pub fn resolve_prepared_shader(
     id: reims_vgpu_protocol::PreparedShaderId,
 ) -> Option<Arc<ShaderVariant>> {
     prepared_shader_registry()
@@ -894,39 +947,43 @@ pub fn prepare_test_shader(words: Vec<u32>) -> reims_vgpu_core::PreparedShaderSt
 #[cfg(feature = "test-fixtures")]
 pub fn empty_test_shader(stage: RenderTranslationStage) -> Arc<CachedShader> {
     use metal2vulkan::reflect::{ShaderReflection, ShaderStage, REFLECTION_VERSION};
-    let stage = match stage {
-        RenderTranslationStage::Vertex => ShaderStage::Vertex,
-        RenderTranslationStage::Fragment => ShaderStage::Fragment,
+    static OWNERS: OnceLock<(Arc<CachedShader>, Arc<CachedShader>)> = OnceLock::new();
+    let build = |stage| {
+        Arc::new(CachedShader::new(
+            Vec::new(),
+            Arc::new(ShaderReflection {
+                reflection_version: REFLECTION_VERSION,
+                descriptor_layout: Default::default(),
+                stage,
+                // A render fixture, so there is no dispatch grid to cull against.
+                kernel_dispatch: None,
+                entry_point: None,
+                bindings: vec![],
+                argument_buffer_fields: vec![],
+                vertex_attributes: vec![],
+                varyings: vec![],
+                render_targets: vec![],
+                depth_members: vec![],
+                depth_qualifier: None,
+                stencil_members: vec![],
+                local_size: None,
+                vertex_builtins: None,
+                tessellation: None,
+                imageblock_layouts: vec![],
+                implicit_imageblock_attachments: vec![],
+                fragment_imageblock: None,
+                datalayout: None,
+                runtime_sampler_specializations: vec![],
+                runtime_storage_image_specializations: vec![],
+                function_constants: vec![],
+            }),
+        ))
     };
-    Arc::new(CachedShader::new(
-        Vec::new(),
-        Arc::new(ShaderReflection {
-            reflection_version: REFLECTION_VERSION,
-            descriptor_layout: Default::default(),
-            stage,
-            // A render fixture, so there is no dispatch grid to cull against.
-            kernel_dispatch: None,
-            entry_point: None,
-            bindings: vec![],
-            argument_buffer_fields: vec![],
-            vertex_attributes: vec![],
-            varyings: vec![],
-            render_targets: vec![],
-            depth_members: vec![],
-            depth_qualifier: None,
-            stencil_members: vec![],
-            local_size: None,
-            vertex_builtins: None,
-            tessellation: None,
-            imageblock_layouts: vec![],
-            implicit_imageblock_attachments: vec![],
-            fragment_imageblock: None,
-            datalayout: None,
-            runtime_sampler_specializations: vec![],
-            runtime_storage_image_specializations: vec![],
-            function_constants: vec![],
-        }),
-    ))
+    let owners = OWNERS.get_or_init(|| (build(ShaderStage::Vertex), build(ShaderStage::Fragment)));
+    Arc::clone(match stage {
+        RenderTranslationStage::Vertex => &owners.0,
+        RenderTranslationStage::Fragment => &owners.1,
+    })
 }
 
 impl Drop for ShaderVariant {
@@ -1225,6 +1282,7 @@ fn reflected_storage_format(
 fn translate_kernel_with_storage(
     source: &KernelTranslationSource,
     requests: &[RuntimeStorageImageRequest],
+    dispatch: KernelDispatchContract,
 ) -> M2vResult<CachedShader> {
     let _guard = translation_lock()
         .lock()
@@ -1260,6 +1318,7 @@ fn translate_kernel_with_storage(
     }
     let mut options = metal2vulkan::passes::TransformOptions {
         kernel_local_size: source.local_size,
+        kernel_dispatch: dispatch.translation(),
         ..Default::default()
     };
     for request in &unique {
@@ -1360,16 +1419,29 @@ impl CachedShader {
         self: &Arc<Self>,
         requests: &[RuntimeStorageImageRequest],
     ) -> M2vResult<PreparedKernelVariant> {
-        let cached = (!requests.is_empty())
+        self.prepare_kernel_for_dispatch(requests, KernelDispatchContract::DynamicThreads)
+    }
+
+    pub fn prepare_kernel_for_dispatch(
+        self: &Arc<Self>,
+        requests: &[RuntimeStorageImageRequest],
+        dispatch: KernelDispatchContract,
+    ) -> M2vResult<PreparedKernelVariant> {
+        let key = KernelSpecializationKey {
+            storage_images: requests.to_vec(),
+            dispatch,
+        };
+        let is_base = requests.is_empty() && dispatch == KernelDispatchContract::DynamicThreads;
+        let cached = (!is_base)
             .then(|| {
                 self.kernel_specializations
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .get(requests)
+                    .get(&key)
                     .cloned()
             })
             .flatten();
-        let owner = if requests.is_empty() {
+        let owner = if is_base {
             Arc::clone(self)
         } else if let Some(cached) = cached {
             cached
@@ -1379,11 +1451,11 @@ impl CachedShader {
                     detail: "kernel translation source lifetime ended".to_string(),
                 }
             })?;
-            let specialized = Arc::new(translate_kernel_with_storage(source, requests)?);
+            let specialized = Arc::new(translate_kernel_with_storage(source, requests, dispatch)?);
             self.kernel_specializations
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .insert(requests.to_vec(), Arc::clone(&specialized));
+                .insert(key, Arc::clone(&specialized));
             specialized
         };
         let storage_formats = requests
@@ -1412,6 +1484,13 @@ impl CachedShader {
     /// Whether translation retained the source module's data-layout contract.
     pub fn source_datalayout_present(&self) -> bool {
         self.reflection.datalayout.is_some()
+    }
+
+    /// Fixed threadgroup bytes owned by this translated pipeline. `None`
+    /// means the shader has a dispatch-sized threadgroup pointer argument, so
+    /// the fixed and dynamic portions cannot be conflated.
+    pub fn static_threadgroup_memory_length(&self) -> Option<u64> {
+        static_workgroup_memory_length(&self.words, &self.reflection)
     }
 
     /// Materialize the translator-validated module and its reflection without
@@ -1901,6 +1980,258 @@ fn translate_kernel_air(air: &[u8], local_size: [u32; 3]) -> M2vResult<CachedSha
     )
 }
 
+fn align_static_workgroup(value: u64, alignment: u64) -> Option<u64> {
+    let mask = alignment.checked_sub(1)?;
+    value.checked_add(mask).map(|sum| sum & !mask)
+}
+
+fn static_workgroup_type_layout(
+    id: u32,
+    types: &HashMap<u32, StaticWorkgroupType>,
+    arrays: &HashMap<u32, u64>,
+    structures: &HashMap<u32, Box<[u32]>>,
+    member_offsets: &HashMap<(u32, u32), u64>,
+    visiting: &mut HashSet<u32>,
+) -> Option<StaticWorkgroupLayout> {
+    if !visiting.insert(id) {
+        return None;
+    }
+    let result = match *types.get(&id)? {
+        StaticWorkgroupType::Scalar { bytes } => StaticWorkgroupLayout {
+            size: bytes,
+            align: bytes,
+        },
+        StaticWorkgroupType::Vector { component, count } => {
+            let component = static_workgroup_type_layout(
+                component,
+                types,
+                arrays,
+                structures,
+                member_offsets,
+                visiting,
+            )?;
+            let size = component.size.checked_mul(u64::from(count))?;
+            let lanes = if count == 3 { 4 } else { count };
+            StaticWorkgroupLayout {
+                size,
+                align: component.align.checked_mul(u64::from(lanes))?,
+            }
+        }
+        StaticWorkgroupType::Matrix { column, count } => {
+            let column = static_workgroup_type_layout(
+                column,
+                types,
+                arrays,
+                structures,
+                member_offsets,
+                visiting,
+            )?;
+            let stride = align_static_workgroup(column.size, column.align)?;
+            StaticWorkgroupLayout {
+                size: stride.checked_mul(u64::from(count))?,
+                align: column.align,
+            }
+        }
+        StaticWorkgroupType::Array { element, length } => {
+            let element = static_workgroup_type_layout(
+                element,
+                types,
+                arrays,
+                structures,
+                member_offsets,
+                visiting,
+            )?;
+            let stride = arrays
+                .get(&id)
+                .copied()
+                .unwrap_or(align_static_workgroup(element.size, element.align)?);
+            StaticWorkgroupLayout {
+                size: stride.checked_mul(u64::from(length))?,
+                align: element.align,
+            }
+        }
+        StaticWorkgroupType::Structure => {
+            let members = structures.get(&id)?;
+            let mut cursor = 0u64;
+            let mut structure_align = 1u64;
+            for (member_index, member) in members.iter().copied().enumerate() {
+                let member = static_workgroup_type_layout(
+                    member,
+                    types,
+                    arrays,
+                    structures,
+                    member_offsets,
+                    visiting,
+                )?;
+                structure_align = structure_align.max(member.align);
+                let offset = member_offsets
+                    .get(&(id, member_index as u32))
+                    .copied()
+                    .unwrap_or(align_static_workgroup(cursor, member.align)?);
+                cursor = offset.checked_add(member.size)?;
+            }
+            StaticWorkgroupLayout {
+                size: align_static_workgroup(cursor, structure_align)?,
+                align: structure_align,
+            }
+        }
+        StaticWorkgroupType::Pointer { pointee } => static_workgroup_type_layout(
+            pointee,
+            types,
+            arrays,
+            structures,
+            member_offsets,
+            visiting,
+        )?,
+    };
+    visiting.remove(&id);
+    Some(result)
+}
+
+/// Return the fixed threadgroup allocation described by the executable module.
+///
+/// A threadgroup pointer argument has dispatch-owned length and is deliberately
+/// outside this calculation. Reflection identifies that case from the shader
+/// interface; without one, every `Workgroup` variable in the validated module
+/// is a fixed pipeline allocation. Metal reports the aggregate in 16-byte
+/// allocation quanta (a 68-byte declaration therefore reports 80), so the
+/// final aggregate is rounded by that contract rather than by a host-device
+/// limit.
+fn static_workgroup_memory_length(words: &[u32], reflection: &ShaderReflection) -> Option<u64> {
+    if reflection
+        .bindings
+        .iter()
+        .any(|binding| binding.kind == metal2vulkan::reflect::ResourceKind::ThreadgroupBuffer)
+    {
+        return None;
+    }
+    if words.len() < 5 || words[0] != spirv::MAGIC_NUMBER {
+        return None;
+    }
+
+    let mut types = HashMap::new();
+    let mut constants = HashMap::new();
+    let mut array_length_ids = HashMap::new();
+    let mut arrays = HashMap::new();
+    let mut structures = HashMap::new();
+    let mut member_offsets = HashMap::new();
+    let mut workgroup_roots = Vec::new();
+    let mut cursor = 5usize;
+    while cursor < words.len() {
+        let header = words[cursor];
+        let word_count = (header >> 16) as usize;
+        if word_count == 0 || cursor.checked_add(word_count)? > words.len() {
+            return None;
+        }
+        let operands = &words[cursor + 1..cursor + word_count];
+        match spirv::Op::from_u32(header & 0xffff) {
+            Some(spirv::Op::TypeBool) if !operands.is_empty() => {
+                types.insert(operands[0], StaticWorkgroupType::Scalar { bytes: 1 });
+            }
+            Some(spirv::Op::TypeInt | spirv::Op::TypeFloat) if operands.len() >= 2 => {
+                let bytes = u64::from(operands[1]).checked_div(8)?;
+                if bytes == 0 || !bytes.is_power_of_two() {
+                    return None;
+                }
+                types.insert(operands[0], StaticWorkgroupType::Scalar { bytes });
+            }
+            Some(spirv::Op::TypeVector) if operands.len() >= 3 => {
+                types.insert(
+                    operands[0],
+                    StaticWorkgroupType::Vector {
+                        component: operands[1],
+                        count: operands[2],
+                    },
+                );
+            }
+            Some(spirv::Op::TypeMatrix) if operands.len() >= 3 => {
+                types.insert(
+                    operands[0],
+                    StaticWorkgroupType::Matrix {
+                        column: operands[1],
+                        count: operands[2],
+                    },
+                );
+            }
+            Some(spirv::Op::TypeArray) if operands.len() >= 3 => {
+                types.insert(
+                    operands[0],
+                    StaticWorkgroupType::Array {
+                        element: operands[1],
+                        length: 0,
+                    },
+                );
+                array_length_ids.insert(operands[0], operands[2]);
+            }
+            Some(spirv::Op::TypeStruct) if !operands.is_empty() => {
+                types.insert(operands[0], StaticWorkgroupType::Structure);
+                structures.insert(operands[0], Box::from(&operands[1..]));
+            }
+            Some(spirv::Op::TypePointer) if operands.len() >= 3 => {
+                types.insert(
+                    operands[0],
+                    StaticWorkgroupType::Pointer {
+                        pointee: operands[2],
+                    },
+                );
+            }
+            Some(spirv::Op::Constant) if operands.len() >= 3 => {
+                let value = u64::from(operands[2])
+                    | operands.get(3).map_or(0, |high| u64::from(*high) << 32);
+                constants.insert(operands[1], value);
+            }
+            Some(spirv::Op::Decorate) if operands.len() >= 3 => {
+                if operands[1] == spirv::Decoration::ArrayStride as u32 {
+                    arrays.insert(operands[0], u64::from(operands[2]));
+                }
+            }
+            Some(spirv::Op::MemberDecorate) if operands.len() >= 4 => {
+                if operands[2] == spirv::Decoration::Offset as u32 {
+                    member_offsets.insert((operands[0], operands[1]), u64::from(operands[3]));
+                }
+            }
+            Some(spirv::Op::Variable)
+                if operands.len() >= 3 && operands[2] == spirv::StorageClass::Workgroup as u32 =>
+            {
+                workgroup_roots.push(operands[0]);
+            }
+            _ => {}
+        }
+        cursor += word_count;
+    }
+
+    for (array, length_id) in array_length_ids {
+        let length = u32::try_from(*constants.get(&length_id)?).ok()?;
+        let StaticWorkgroupType::Array {
+            element,
+            length: slot,
+        } = types.get_mut(&array)?
+        else {
+            return None;
+        };
+        let _ = element;
+        *slot = length;
+    }
+
+    let mut total = 0u64;
+    for root in workgroup_roots {
+        let layout = static_workgroup_type_layout(
+            root,
+            &types,
+            &arrays,
+            &structures,
+            &member_offsets,
+            &mut HashSet::new(),
+        )?;
+        total = align_static_workgroup(total, layout.align)?.checked_add(layout.size)?;
+    }
+    if total == 0 {
+        Some(0)
+    } else {
+        align_static_workgroup(total, 16)
+    }
+}
+
 /// Package the translator-validated module with reflection produced by the
 /// same translation and options.
 fn finish_translated(
@@ -2290,6 +2621,24 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[test]
+    fn workgroup_dispatch_specialization_is_a_distinct_translation_contract() {
+        assert_eq!(KernelDispatchContract::DynamicThreads.translation(), None);
+        assert_eq!(
+            KernelDispatchContract::Workgroups.translation(),
+            Some(metal2vulkan::reflect::KernelDispatch::Workgroups)
+        );
+        let dynamic = KernelSpecializationKey {
+            storage_images: Vec::new(),
+            dispatch: KernelDispatchContract::DynamicThreads,
+        };
+        let workgroups = KernelSpecializationKey {
+            storage_images: Vec::new(),
+            dispatch: KernelDispatchContract::Workgroups,
+        };
+        assert_ne!(dynamic, workgroups);
+    }
+
     fn empty_reflection(
         stage: metal2vulkan::reflect::ShaderStage,
         datalayout: Option<&str>,
@@ -2320,6 +2669,39 @@ mod tests {
             runtime_storage_image_specializations: vec![],
             function_constants: vec![],
         }
+    }
+
+    fn push_spirv_instruction(words: &mut Vec<u32>, op: spirv::Op, operands: &[u32]) {
+        words.push((((operands.len() + 1) as u32) << 16) | op as u32);
+        words.extend_from_slice(operands);
+    }
+
+    #[test]
+    fn fixed_workgroup_storage_is_reported_in_metal_allocation_quanta() {
+        let mut words = vec![spirv::MAGIC_NUMBER, 0x0001_0600, 0, 6, 0];
+        push_spirv_instruction(&mut words, spirv::Op::TypeInt, &[1, 32, 0]);
+        push_spirv_instruction(&mut words, spirv::Op::Constant, &[1, 2, 17]);
+        push_spirv_instruction(&mut words, spirv::Op::TypeArray, &[3, 1, 2]);
+        push_spirv_instruction(
+            &mut words,
+            spirv::Op::TypePointer,
+            &[4, spirv::StorageClass::Workgroup as u32, 3],
+        );
+        push_spirv_instruction(
+            &mut words,
+            spirv::Op::Variable,
+            &[4, 5, spirv::StorageClass::Workgroup as u32],
+        );
+        let reflection = empty_reflection(metal2vulkan::reflect::ShaderStage::Kernel, None);
+
+        assert_eq!(
+            static_workgroup_memory_length(&words, &reflection),
+            Some(80)
+        );
+        assert_eq!(
+            static_workgroup_memory_length(&words[..5], &reflection),
+            Some(0)
+        );
     }
 
     #[test]

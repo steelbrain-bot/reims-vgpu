@@ -2,8 +2,8 @@
 //!
 //! | Module | Role |
 //! | --- | --- |
-//! | [`model`] | Live guest-visible state (regs, rings, objects, present) |
-//! | [`runtime`] | Composition, drain, resolution, and executor adaptation |
+//! | [`model`] | Register-window and FIFO contract vocabulary |
+//! | [`runtime`] | Replacement transaction composition and host adaptation |
 //! | [`qemu`] | QEMU C ABI surface only |
 //!
 //! The product executor is the sibling `reims-vgpu-vulkan` crate.
@@ -36,8 +36,6 @@ compile_error!(
 /// Every environment variable this device reads, and the rule that an override
 /// may only narrow what it does — see the module doc.
 pub mod env;
-#[cfg(test)]
-mod iosurface_contract_tests;
 pub mod model;
 /// Crate-wide observability: the always-on fail sink and the decline
 /// vocabulary. Above `runtime/` because every subsystem owes the reader a
@@ -54,15 +52,6 @@ pub mod qemu;
 #[cfg(feature = "host-window")]
 pub mod host_window;
 
-/// The device registry and the entry surface `qemu::abi` wraps. Private, with
-/// the names that surface reaches re-exported below — the shape
-/// `display_surface` and `window_publish` already use.
+/// The replacement device registry and the entry surface `qemu::abi` wraps.
 mod device;
-pub(crate) use device::{
-    backend_name, device_console_feed, device_create, device_cursor_glyph_copy,
-    device_cursor_glyph_info, device_destroy, device_drain, device_efi_console_copy,
-    device_gfx_read, device_gfx_write, device_iosfc_read, device_iosfc_write, device_poll,
-    device_pop_action, device_reset, device_scanout_copy, device_scanout_may_paint,
-    device_window_run_main, device_window_set_early_fb, device_window_start, device_window_stop,
-    unwind_safe, ConsoleFeed, CursorGlyphInfo,
-};
+pub(crate) use device::{backend_name, unwind_safe, CursorGlyphInfo};

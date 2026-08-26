@@ -16,6 +16,13 @@ pub struct DeviceInfoLimits {
     pub native_fp16: bool,
 }
 
+/// Host limits used by the child compute-pipeline information query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComputeInfoLimits {
+    pub max_total_threads_per_threadgroup: u32,
+    pub thread_execution_width: u32,
+}
+
 /// Host-GPU facts available to semantic planning.
 ///
 /// These describe how the executor can implement an already-decoded command.

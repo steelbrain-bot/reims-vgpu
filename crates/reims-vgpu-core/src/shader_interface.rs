@@ -371,6 +371,9 @@ pub struct PreparedShaderVariant {
     /// The backend projects this after applying its executable binding
     /// numbering, so command preparation never needs that private numbering.
     pub texture_uses: Arc<[(u32, DescriptorUse)]>,
+    /// Exact storage-image read/write behavior of this executable module,
+    /// keyed by its final descriptor binding.
+    pub storage_image_accesses: Arc<[(u32, StorageImageAccess)]>,
     /// Effective descriptor-band bases reported by the translator for this
     /// exact module. Runtime supplies Metal indices and never reconstructs the
     /// selected descriptor layout.
@@ -425,6 +428,13 @@ impl PreparedShaderVariant {
             .ok()
             .map(|index| self.texture_uses[index].1)
             .unwrap_or(DescriptorUse::NotDeclared)
+    }
+
+    pub fn storage_image_access(&self, binding: u32) -> Option<StorageImageAccess> {
+        self.storage_image_accesses
+            .binary_search_by_key(&binding, |(binding, _)| *binding)
+            .ok()
+            .map(|index| self.storage_image_accesses[index].1)
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::model::PAGE_SHIFT_ARM64E;
 
 use super::*;
-use reims_vgpu_core::endian::{st32, st64};
+use reims_vgpu_core::endian::{st16, st32, st64};
 
 /// A `newSampler` record carrying `state`, at the layout the wire crate's
 /// own fixtures use.
@@ -13,6 +13,51 @@ fn sampler_record(state: u32) -> Vec<u8> {
     st32(&mut b[8..], 7);
     st32(&mut b[12..], state);
     b
+}
+
+#[test]
+fn rasterization_rate_map_decode_owns_only_the_written_variable_payload() {
+    const TOTAL: usize = 64;
+    let mut bytes = vec![0xa5; TOTAL];
+    st32(
+        &mut bytes[0..],
+        SERIALIZER_RESOURCE_OBJECT_RASTERIZATION_RATE_MAP,
+    );
+    st32(&mut bytes[4..], TOTAL as u32);
+    st32(&mut bytes[8..], 19);
+    st16(&mut bytes[12..], 320);
+    st16(&mut bytes[14..], 200);
+    st32(&mut bytes[16..], 1);
+    st32(&mut bytes[20..], 2);
+    st32(&mut bytes[24..], 0);
+    st16(&mut bytes[28..], 2);
+    st16(&mut bytes[30..], 2);
+    for (offset, value) in [(32, 0.25f32), (36, 0.5), (40, 0.75), (44, 1.0)] {
+        st32(&mut bytes[offset..], value.to_bits());
+    }
+
+    let descriptor = decode_rasterization_rate_map_descriptor(&bytes).unwrap();
+    assert_eq!(
+        descriptor,
+        reims_vgpu_protocol::RasterizationRateMapDescriptor {
+            screen_width: 320,
+            screen_height: 200,
+            unidentified_u32_a: 2,
+            unidentified_u32_b: 0,
+            layers: vec![reims_vgpu_protocol::RasterizationRateMapLayerDescriptor {
+                sample_width: 2,
+                sample_height: 2,
+                horizontal_quality_bits: vec![0.25f32.to_bits(), 0.5f32.to_bits()]
+                    .into_boxed_slice(),
+                vertical_quality_bits: vec![0.75f32.to_bits(), 1.0f32.to_bits()].into_boxed_slice(),
+            }]
+            .into_boxed_slice(),
+        }
+    );
+    assert!(matches!(
+        decode_rasterization_rate_map_descriptor(&bytes[..TOTAL - 1]),
+        Err(DecodeStatus::ErrShort("res_rate_map_short"))
+    ));
 }
 
 /// The five anisotropy bits are read verbatim, and only a record outside
@@ -46,6 +91,12 @@ fn a_sampler_carries_its_own_anisotropy_and_only_zero_is_repaired() {
     let zeroed = 0x8400_0000 & !(0x1f << 26);
     let sd = decode_sampler_descriptor(&sampler_record(zeroed)).expect("zeroed anisotropy");
     assert_eq!(sd.max_anisotropy, 1);
+
+    let mut unidentified = sampler_record(0x8400_0000);
+    unidentified[16] = 0b1010;
+    let sd = decode_sampler_descriptor(&unidentified).expect("written sampler flags");
+    assert!(!sd.support_argument_buffers);
+    assert_eq!(sd.unidentified_flags, 0b101);
 }
 
 /// A one-attribute vertex-input block whose single buffer layout carries
@@ -431,7 +482,7 @@ fn a_wide_heap_texture_record_decodes_at_its_own_offsets() {
         assert_eq!(desc.height, 0x2222);
         assert_eq!(desc.array_length, 7);
         assert_eq!(desc.pixel_format, 80);
-        assert_eq!(desc.texture_type, 2);
+        assert_eq!(desc.texture_type, reims_vgpu_protocol::TextureType::D2);
         assert!(desc.allow_gpu_optimized_contents);
         // Thirty-two bits, not eight. The narrow body's `usage` is a byte
         // of the packed word; this one is a field of its own, and holding
@@ -624,7 +675,10 @@ fn the_embedded_descriptor_decodes_through_the_shared_reader() {
     let descriptor =
         crate::runtime::heap_query::decode_serialized_texture_descriptor(record.descriptor)
             .expect("the shared decoder accepts the embedded body");
-    assert_eq!(descriptor.texture_type, 2);
+    assert_eq!(
+        descriptor.texture_type,
+        reims_vgpu_protocol::TextureType::D2
+    );
     assert_eq!(descriptor.usage, 5);
     assert_eq!(descriptor.pixel_format, 80);
     assert_eq!(descriptor.width, 0x1111);
@@ -685,7 +739,10 @@ fn icb_descriptor_from_serializer_fixture() {
     b[ICB_DESC_MAX_VERTEX_BINDS] = 0;
     b[ICB_DESC_MAX_FRAGMENT_BINDS] = 0;
     b[ICB_DESC_MAX_KERNEL_BINDS] = 4;
+    b[ICB_DESC_UNIDENTIFIED_U8_A] = 2;
+    b[ICB_DESC_UNIDENTIFIED_U8_B] = 3;
     st16(&mut b[ICB_DESC_FLAGS..], 0); // no inherit
+    st32(&mut b[ICB_DESC_UNIDENTIFIED_U32..], 0x4455_6677);
     let layout = compute_only_icb_layout(4);
     b[ICB_DESC_LAYOUT..ICB_DESC_LAYOUT + ICB_LAYOUT_LEN]
         .copy_from_slice(&encode_icb_command_layout(&layout));
@@ -695,6 +752,9 @@ fn icb_descriptor_from_serializer_fixture() {
     assert_eq!(icb.command_types, MTL_INDIRECT_CMD_CONCURRENT_DISPATCH);
     assert_eq!(icb.max_kernel_buffer_bind_count, 4);
     assert_eq!(icb.max_command_count, 8);
+    assert_eq!(icb.unidentified_u8_a, 2);
+    assert_eq!(icb.unidentified_u8_b, 3);
+    assert_eq!(icb.unidentified_u32, 0x4455_6677);
     assert!(!icb.inherit_buffers());
     assert!(!icb.inherit_pipeline_state());
 }
@@ -1172,6 +1232,77 @@ fn compute_pipeline_stage_input_fixture() {
     assert_eq!(si.dropped_layouts, 0);
 }
 
+fn compute_pipeline_information_descriptor(max_threads: u16, indirect: u32) -> Vec<u8> {
+    const FIELD_BYTES: usize = (2 + 4) + (2 + 2) + (2 + 4);
+    let total = SERIALIZER_RESOURCE_FIRST_TLVS + 1 + FIELD_BYTES;
+    let mut bytes = vec![0; total];
+    st32(&mut bytes[0..], SERIALIZER_RESOURCE_OBJECT_COMPUTE_PIPELINE);
+    st32(&mut bytes[4..], total as u32);
+    st32(
+        &mut bytes[12..],
+        (total - SERIALIZER_RESOURCE_FIRST_TLVS) as u32,
+    );
+    bytes[SERIALIZER_RESOURCE_FIRST_TLVS] = 3;
+    let mut cursor = SERIALIZER_RESOURCE_FIRST_TLVS + 1;
+    bytes[cursor] = PIPELINE_TAG_KERNEL_FUNC;
+    bytes[cursor + 1] = 4;
+    st32(&mut bytes[cursor + 2..], 9);
+    cursor += 6;
+    bytes[cursor] = COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS;
+    bytes[cursor + 1] = 2;
+    st16(&mut bytes[cursor + 2..], max_threads);
+    cursor += 4;
+    bytes[cursor] = COMPUTE_PIPELINE_TAG_SUPPORT_INDIRECT_COMMAND_BUFFERS;
+    bytes[cursor + 1] = 4;
+    st32(&mut bytes[cursor + 2..], indirect);
+    bytes
+}
+
+#[test]
+fn compute_pipeline_information_properties_are_construction_facts() {
+    let direct =
+        decode_compute_pipeline_descriptor(&compute_pipeline_information_descriptor(384, 0))
+            .expect("the two identified information properties decode");
+    let indirect =
+        decode_compute_pipeline_descriptor(&compute_pipeline_information_descriptor(192, 1))
+            .expect("the indirect descriptor decodes independently");
+
+    assert_eq!(direct.max_total_threads_per_threadgroup, Some(384));
+    assert!(!direct.supports_indirect_command_buffers);
+    assert_eq!(indirect.max_total_threads_per_threadgroup, Some(192));
+    assert!(indirect.supports_indirect_command_buffers);
+}
+
+#[test]
+fn malformed_compute_pipeline_information_properties_refuse() {
+    let mut bad_bool = compute_pipeline_information_descriptor(384, 2);
+    assert_eq!(
+        decode_compute_pipeline_descriptor(&bad_bool),
+        Err(DecodeStatus::ErrUnsupported(
+            "res_compute_pipeline_indirect_value"
+        ))
+    );
+
+    let max_tag = bad_bool
+        .iter()
+        .position(|byte| *byte == COMPUTE_PIPELINE_TAG_MAX_TOTAL_THREADS)
+        .expect("max-thread tag");
+    bad_bool.remove(max_tag + 3);
+    bad_bool[max_tag + 1] = 1;
+    let shortened = bad_bool.len() as u32;
+    st32(&mut bad_bool[4..], shortened);
+    st32(
+        &mut bad_bool[12..],
+        shortened - SERIALIZER_RESOURCE_FIRST_TLVS as u32,
+    );
+    assert_eq!(
+        decode_compute_pipeline_descriptor(&bad_bool),
+        Err(DecodeStatus::ErrUnsupported(
+            "res_compute_pipeline_max_threads_width"
+        ))
+    );
+}
+
 /// Build a compute pipeline descriptor in the shape macOS 12 sends: a first TLV
 /// block naming the kernel function and the offset of a stage-input section,
 /// and a section in the vertex-descriptor grammar declaring `attrs` attributes
@@ -1508,7 +1639,10 @@ fn linear_texture_geometry() {
     assert_eq!(d.row_stride, 256);
     assert_eq!(d.declared_pixel_format(), Some(MTL_FORMAT_BGRA8_UNORM));
     assert_eq!(d.declared_usage(), Some(5));
-    assert_eq!(d.declaration.unwrap().texture_type, 2);
+    assert_eq!(
+        d.declaration.unwrap().texture_type,
+        reims_vgpu_protocol::TextureType::D2
+    );
     assert_eq!(
         d.backing_gva_size(PAGE_SHIFT_ARM64E),
         Some(((0x10u64) << RESOURCE_PAGE_SHIFT, 0x10000))
@@ -1792,6 +1926,40 @@ fn compact_render_pipeline_funcs() {
     assert_eq!(p.object_func_ref, 0);
     assert_eq!(p.mesh_func_ref, 0);
     assert_eq!(p.object_id, 9);
+}
+
+#[test]
+fn render_pipeline_indirect_support_is_a_construction_fact() {
+    use reims_vgpu_core::endian::st32;
+
+    let mut bytes = vec![0u8; 16 + 1 + 3 * 6];
+    let len = bytes.len() as u32;
+    st32(&mut bytes[0..], SERIALIZER_RESOURCE_OBJECT_RENDER_PIPELINE);
+    st32(&mut bytes[4..], len);
+    bytes[16] = 3;
+    let mut cursor = 17;
+    for (tag, value) in [
+        (PIPELINE_TAG_VERTEX_FUNC, 2),
+        (PIPELINE_TAG_FRAGMENT_FUNC, 1),
+        (PIPELINE_TAG_SUPPORT_INDIRECT_COMMAND_BUFFERS, 1),
+    ] {
+        bytes[cursor] = tag;
+        bytes[cursor + 1] = 4;
+        st32(&mut bytes[cursor + 2..], value);
+        cursor += 6;
+    }
+
+    let descriptor = decode_render_pipeline_descriptor(&bytes)
+        .expect("the indirect-command property is part of the descriptor contract");
+    assert!(descriptor.supports_indirect_command_buffers);
+
+    st32(&mut bytes[cursor - 4..], 2);
+    assert_eq!(
+        decode_render_pipeline_descriptor(&bytes),
+        Err(DecodeStatus::ErrUnsupported(
+            "res_render_pipeline_indirect_value"
+        ))
+    );
 }
 
 /// A pipeline that renders through a depth-stencil buffer declares the two
@@ -2257,6 +2425,8 @@ fn depth_stencil_object_decode() {
     // compare Less=1, write enabled, both stencil faces present
     let bits = 1u32 | DEPTH_STENCIL_DEPTH_WRITE | (1 << 4) | (1 << 5);
     st32(&mut b[DEPTH_STENCIL_DESC_STATE_BITS..], bits);
+    st32(&mut b[DEPTH_STENCIL_DESC_FRONT_FACE..], (0xabcde << 12) | 7);
+    st32(&mut b[DEPTH_STENCIL_DESC_BACK_FACE..], (0x54321 << 12) | 7);
     st32(&mut b[DEPTH_STENCIL_DESC_FRONT_FACE + 4..], 0xff);
     st32(&mut b[DEPTH_STENCIL_DESC_FRONT_FACE + 8..], 0xff);
     let d = decode_depth_stencil_descriptor(&b).unwrap();
@@ -2266,6 +2436,8 @@ fn depth_stencil_object_decode() {
     assert!(d.front_stencil_present);
     assert!(d.back_stencil_present);
     assert_eq!(d.front_face.read_mask, 0xff);
+    assert_eq!(d.front_face.unidentified_ops, 0xabcde);
+    assert_eq!(d.back_face.unidentified_ops, 0x54321);
 }
 
 #[test]
@@ -3079,7 +3251,7 @@ fn decodes_opcode9_buffer_texture_live_blobs() {
     assert_eq!(d1.offset, 0);
     assert_eq!(d1.bytes_per_row, 1280);
     assert_eq!(d1.desc.pixel_format, 0x50); // BGRA8_UNORM
-    assert_eq!(d1.desc.texture_type as u16, TEXTURE_VIEW_MTL_TYPE_2D);
+    assert_eq!(u16::from(d1.desc.texture_type), TEXTURE_VIEW_MTL_TYPE_2D);
     assert_eq!((d1.desc.width, d1.desc.height), (284, 284));
     assert_eq!(d1.desc.depth, 1);
     assert_eq!(d1.desc.mipmap_level_count, 1);
