@@ -15219,6 +15219,37 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .is_ok()
     }
 
+    /// Whether this resource is a view onto another resource rather than a
+    /// texture of its own.
+    ///
+    /// A texture is its own base, so the two are told apart by whether the
+    /// resolution moves.
+    pub(crate) fn is_texture_binding_view(
+        &self,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    ) -> bool {
+        self.texture_binding_view_base(resource)
+            .is_some_and(|base| base != resource)
+    }
+
+    /// The resource that owns the image a binding view is installed onto.
+    ///
+    /// The install targets the owner's image, so the guard in front of it has
+    /// to ask about the owner and not about the chain's base -- for a plane
+    /// view those are two different resources and only one of them ever has an
+    /// image.
+    pub(crate) fn texture_binding_view_image_owner(
+        &self,
+        view: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    ) -> Option<ResourceId<reims_vgpu_protocol::ResourceObject>> {
+        self.execution
+            .resources()
+            .graph()
+            .resolve_texture_binding_view(view)
+            .ok()
+            .map(|resolved| resolved.image_owner)
+    }
+
     /// The texture a binding view ultimately views.
     ///
     /// A view's image is its base's, because a view has none of its own.

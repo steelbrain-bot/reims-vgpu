@@ -791,35 +791,37 @@ impl ResourceGraph {
     /// hazard identities, while an endpoint must name one storage object.
     /// The resource that owns the image one binding reads through.
     ///
-    /// A resource owning storage *is* its backing, so it owns the native image
-    /// over that storage. A texture view aliases its base's storage and owns
-    /// none, so it reads the base's image; an IOSurface plane view owns the
-    /// plane it names, so it owns its own image while its parent surface owns
-    /// the whole allocation. The view chain's base answers only the first of
-    /// those, which is why this walks storage ownership and not the chain.
+    /// A texture view is declared carrying its base's storage, so "owns
+    /// storage" does not tell the two apart -- both do. What does is whether a
+    /// parent owns the *same* storage: a texture view's base does, so the view
+    /// reads the base's image and owns none, while an IOSurface plane view
+    /// owns the plane it names and its parent surface owns the whole
+    /// allocation and no backing at all. So the owner is the outermost
+    /// ancestor sharing this resource's storage, which is the resource itself
+    /// whenever no parent shares it.
     ///
-    /// `None` where nothing in the chain owns storage, which is a resource
-    /// with no backing rather than a resource whose owner is ambiguous.
+    /// The view chain's `base` answers the first shape and inverts the second,
+    /// which is why this is not that. `None` where the resource owns no
+    /// storage -- a registered surface, which is an allocation and not an
+    /// image -- or where two parents share the storage and neither is the
+    /// outermost, which is a graph this device does not build.
     pub fn image_owner(&self, id: AnyResourceId) -> Option<AnyResourceId> {
-        let mut pending = vec![id];
+        let storage = self.resources.get(&id)?.storage?;
+        let mut owner = id;
         let mut visited = BTreeSet::new();
-        let mut resolved = None;
-        while let Some(resource_id) = pending.pop() {
-            let resource = self.resources.get(&resource_id)?;
-            if !visited.insert(resource_id) {
-                continue;
-            }
-            if resource.storage.is_some() {
-                match resolved {
-                    None => resolved = Some(resource_id),
-                    Some(existing) if existing == resource_id => {}
-                    Some(_) => return None,
-                }
-                continue;
-            }
-            pending.extend(resource.parents.iter().copied());
+        while visited.insert(owner) {
+            let node = self.resources.get(&owner)?;
+            let mut sharing = node.parents.iter().copied().filter(|parent| {
+                self.resources
+                    .get(parent)
+                    .is_some_and(|node| node.storage == Some(storage))
+            });
+            let (Some(next), None) = (sharing.next(), sharing.next()) else {
+                return Some(owner);
+            };
+            owner = next;
         }
-        resolved
+        Some(owner)
     }
 
     pub fn resolved_backing(&self, id: AnyResourceId) -> Option<BackingId> {
