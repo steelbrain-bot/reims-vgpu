@@ -426,7 +426,7 @@ fn prepare_task_address_backing_representation<Semantic>(
 where
     Semantic: Clone,
 {
-    let (resource, task, address, length) = runtime
+    let facts = runtime
         .task_address_backing_materialization_facts(backing)
         .map_err(
             |reason| ReplacementObjectRepresentationPreparationError::BackingUnavailable {
@@ -434,11 +434,25 @@ where
                 reason,
             },
         )?;
-    let guest =
-        resolve_task_guest_window(runtime, host, page_shift, task, address.get(), length.get())?;
-    runtime
-        .materialize_resource_with_guest_window(resource, guest)
-        .map_err(ReplacementObjectRepresentationPreparationError::Construction)?;
+    // One window over the guest bytes, and an image per texture declared over
+    // them. Two aliased textures share the allocation and need one native
+    // object each, so this is a loop rather than a single materialization.
+    for resource in facts.resources {
+        if runtime.texture_has_execution_representation(resource) {
+            continue;
+        }
+        let guest = resolve_task_guest_window(
+            runtime,
+            host,
+            page_shift,
+            facts.task,
+            facts.address.get(),
+            facts.length.get(),
+        )?;
+        runtime
+            .materialize_resource_with_guest_window(resource, guest)
+            .map_err(ReplacementObjectRepresentationPreparationError::Construction)?;
+    }
     Ok(())
 }
 
@@ -582,18 +596,11 @@ where
                     resource,
                 ),
             )?;
-        let backing = runtime
-            .execution()
-            .resources()
-            .graph()
-            .resource(resource)
-            .and_then(|node| node.storage)
-            .ok_or(
-                ReplacementObjectRepresentationPreparationError::SurfaceDescriptorUnavailable(
-                    resource,
-                ),
-            )?;
-        if runtime.backing_has_execution_representation(backing) {
+        // This texture's own image, not the backing's. A second texture
+        // declared over the same guest range carries its own image, and asking
+        // the backing skips it -- every draw naming it then refuses with
+        // `MissingExecutionRepresentation` and parks the channel behind it.
+        if runtime.texture_has_execution_representation(resource) {
             continue;
         }
         let guest = resolve_task_guest_window(
@@ -611,14 +618,17 @@ where
     // A view declared after its base image was built is not in the set that
     // materialization handed to the image, so it has to be installed on the
     // image that already exists. A view declared before it needs nothing here:
-    // the materialization ahead reads every view over the backing and carries
-    // it. Which of the two happened is the backing's own state, so this asks
-    // the backing rather than tracking the order.
+    // the materialization ahead reads that texture's views and carries them.
+    // Which of the two happened is the base's own state, so this asks whether
+    // the base has an image rather than tracking the order -- and it must be
+    // the base's image and not merely some image on the base's backing, since
+    // an aliased texture over the same range has one of its own that this view
+    // does not belong on.
     for view in views {
-        let Some(backing) = runtime.resolved_backing(view) else {
+        let Some(base) = runtime.texture_binding_view_base(view) else {
             continue;
         };
-        if !runtime.backing_has_execution_representation(backing) {
+        if !runtime.texture_has_execution_representation(base) {
             continue;
         }
         if let Err(reason) = runtime.materialize_texture_view(view) {
@@ -630,7 +640,7 @@ where
                 slug: "replacement_texture_view_install_refused",
                 fields: vec![
                     ("resource", format!("{view:?}")),
-                    ("backing", format!("{backing:?}")),
+                    ("base", format!("{base:?}")),
                     ("reason", reason.clone()),
                 ],
                 discriminant: fnv_discriminant(&reason),
@@ -8683,6 +8693,105 @@ mod tests {
 
         prepare_backing_representation(&mut runtime, &mut host, shift, view.backing).unwrap();
         assert!(runtime.backing_has_execution_representation(view.backing));
+    }
+
+    /// Two textures declared over one guest range are two textures, so both
+    /// need an image. Materialization asked the *backing* whether one existed
+    /// and skipped the second, whose every draw then refused with
+    /// `MissingExecutionRepresentation` and parked its channel behind it --
+    /// which on a driven macos-13 boot stopped the device entirely.
+    #[test]
+    fn both_textures_over_one_guest_range_are_materialized() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(7);
+        runtime.define_task(task, 0x10_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        let data = 9u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        host.map_range(data, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        host.write_gpa(root + 0x10 * 4, &9u32.to_le_bytes())
+            .unwrap();
+
+        // Same handle, same size: the backing is canonical per
+        // (task, address, length), so both land on one.
+        let declare = |runtime: &mut ReplacementRuntimeSession<()>, object: u32, format: u16| {
+            crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+                runtime,
+                shift,
+                task,
+                object,
+                reims_vgpu_protocol::ResourceDescriptor::Texture(
+                    reims_vgpu_protocol::LinearTextureDescriptor {
+                        allocation_size: 64,
+                        handle: 0x10,
+                        mipmap_level_count: 1,
+                        bytes_per_element: 4,
+                        used_size: 64,
+                        row_stride: 16,
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                        declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+                            texture_type: reims_vgpu_protocol::TextureType::D2,
+                            framebuffer_only: false,
+                            is_drawable: false,
+                            write_swizzle_enabled: None,
+                            allow_gpu_optimized_contents: false,
+                            usage: 1,
+                            pixel_format: format,
+                            width: 4,
+                            height: 4,
+                            depth: 1,
+                            mipmap_level_count: 1,
+                            sample_count: 1,
+                            array_length: 1,
+                            resource_options: 0,
+                            protection_options: 0,
+                            swizzle: None,
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap()
+        };
+
+        let first = declare(&mut runtime, 17, 70);
+        let second = declare(&mut runtime, 18, 80);
+        assert_eq!(
+            first.backing, second.backing,
+            "one guest range is one backing however many textures name it"
+        );
+
+        prepare_backing_representation(&mut runtime, &mut host, shift, first.backing).unwrap();
+
+        // Both, and each its own. Asking the backing answered yes after the
+        // first and the second was never built.
+        assert!(runtime.texture_has_execution_representation(first.resource));
+        assert!(runtime.texture_has_execution_representation(second.resource));
+        let designated = runtime
+            .execution()
+            .resources()
+            .designated_views(first.backing)
+            .unwrap();
+        assert_eq!(
+            designated.len(),
+            2,
+            "each texture owns one image over the shared range: {designated:?}"
+        );
     }
 
     #[test]

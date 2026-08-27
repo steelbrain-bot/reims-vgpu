@@ -15094,6 +15094,20 @@ fn synchronize_object_discriminant(
 /// materializer, and a task-address backing with no described owner has no
 /// descriptor to build a native object from at all. Only the first is ever
 /// resolved by a later packet.
+/// What materializing one task-address backing needs to know.
+///
+/// The resources are every texture declared over the range, in declaration
+/// order, because each of them owns an image of its own and rebuilding one is
+/// not rebuilding the backing. A range with no texture yields the single
+/// buffer owner instead: a backing owes at most one buffer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReplacementTaskAddressMaterializationFacts {
+    pub resources: Box<[ResourceId<reims_vgpu_protocol::ResourceObject>]>,
+    pub task: reims_vgpu_protocol::TaskId,
+    pub address: reims_vgpu_protocol::GuestVirtualAddress,
+    pub length: reims_vgpu_protocol::ByteLength,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementTaskAddressMaterializationRefusal {
     StorageAbsent,
@@ -15106,12 +15120,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         &self,
         backing: reims_vgpu_protocol::BackingId,
     ) -> Result<
-        (
-            ResourceId<reims_vgpu_protocol::ResourceObject>,
-            reims_vgpu_protocol::TaskId,
-            reims_vgpu_protocol::GuestVirtualAddress,
-            reims_vgpu_protocol::ByteLength,
-        ),
+        ReplacementTaskAddressMaterializationFacts,
         ReplacementTaskAddressMaterializationRefusal,
     > {
         let graph = self.execution.resources().graph();
@@ -15136,21 +15145,47 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         // the image transfers through, so a later buffer view of the same
         // bytes resolves through that endpoint. Materializing the buffer owner
         // builds only a buffer, and the texture view then has nothing.
-        let owner = |wanted_texture: bool| {
-            storage.owners.iter().copied().find(|resource| {
-                graph
-                    .resource(*resource)
-                    .is_some_and(|node| match node.descriptor.as_deref() {
-                        Some(reims_vgpu_protocol::ResourceDescriptor::Texture(_)) => wanted_texture,
-                        Some(reims_vgpu_protocol::ResourceDescriptor::Buffer(_)) => !wanted_texture,
-                        _ => false,
-                    })
-            })
+        //
+        // Every texture owner, not the first: a guest may declare two textures
+        // over one range and each carries its own image, so rebuilding one and
+        // stopping leaves the others with nothing and every draw naming them
+        // parks its channel.
+        let owners = |wanted_texture: bool| {
+            storage
+                .owners
+                .iter()
+                .copied()
+                .filter(|resource| {
+                    graph
+                        .resource(*resource)
+                        .is_some_and(|node| match node.descriptor.as_deref() {
+                            Some(reims_vgpu_protocol::ResourceDescriptor::Texture(_)) => {
+                                wanted_texture
+                            }
+                            Some(reims_vgpu_protocol::ResourceDescriptor::Buffer(_)) => {
+                                !wanted_texture
+                            }
+                            _ => false,
+                        })
+                })
+                .collect::<Vec<_>>()
         };
-        let resource = owner(true)
-            .or_else(|| owner(false))
-            .ok_or(ReplacementTaskAddressMaterializationRefusal::NoDescribedOwner)?;
-        Ok((resource, task, address, length))
+        let mut resources = owners(true);
+        if resources.is_empty() {
+            // No texture declared over these bytes: the buffer owner builds
+            // the only native object they need, and one is enough because a
+            // backing owes at most one buffer.
+            resources = owners(false).into_iter().take(1).collect();
+        }
+        if resources.is_empty() {
+            return Err(ReplacementTaskAddressMaterializationRefusal::NoDescribedOwner);
+        }
+        Ok(ReplacementTaskAddressMaterializationFacts {
+            resources: resources.into_boxed_slice(),
+            task,
+            address,
+            length,
+        })
     }
 }
 
@@ -15172,6 +15207,42 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         self.execution
             .resources()
             .any_designated_representation(backing)
+            .is_ok()
+    }
+
+    /// The texture a binding view ultimately views.
+    ///
+    /// A view's image is its base's, because a view has none of its own.
+    pub(crate) fn texture_binding_view_base(
+        &self,
+        view: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    ) -> Option<ResourceId<reims_vgpu_protocol::ResourceObject>> {
+        self.execution
+            .resources()
+            .graph()
+            .resolve_texture_binding_view(view)
+            .ok()
+            .map(|resolved| resolved.base)
+    }
+
+    /// Whether this texture's own image over its backing exists.
+    ///
+    /// The question materialization has to ask, and it is not
+    /// [`Self::backing_has_execution_representation`]: a backing carries one
+    /// image per texture declared over its range, so another texture having
+    /// materialized says nothing about this one. Asking the backing skips the
+    /// second alias, and every draw that names it then refuses with
+    /// `MissingExecutionRepresentation` and parks its channel.
+    pub(crate) fn texture_has_execution_representation(
+        &self,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    ) -> bool {
+        let Some(backing) = self.resolved_backing(resource) else {
+            return false;
+        };
+        self.execution
+            .resources()
+            .view_representation(backing, reims_vgpu_core::BackingView::Image(resource))
             .is_ok()
     }
 
@@ -29525,12 +29596,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             runtime.task_address_backing_materialization_facts(declaration.backing),
-            Ok((
-                declaration.resource,
+            Ok(ReplacementTaskAddressMaterializationFacts {
+                resources: Box::new([declaration.resource]),
                 task,
-                reims_vgpu_protocol::GuestVirtualAddress::new(0x900 << 12),
-                reims_vgpu_protocol::ByteLength::new(64),
-            ))
+                address: reims_vgpu_protocol::GuestVirtualAddress::new(0x900 << 12),
+                length: reims_vgpu_protocol::ByteLength::new(64),
+            })
         );
         let replacement =
             crate::runtime::replacement_child_packet::admit_replacement_physical_replacement(
