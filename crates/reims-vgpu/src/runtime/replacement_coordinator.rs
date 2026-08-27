@@ -277,6 +277,33 @@ fn replacement_host_exec_failure_diagnostic(
     }
 }
 
+/// The submission positions in `order` that `owned` does not account for.
+///
+/// A settled transaction is not one of these: `submitted` and `abandoned` are
+/// the two transitions that release a domain claim, so an entry carrying either
+/// owes nothing to anybody. Everything else is holding its domain's head, and
+/// something has to be holding *it*.
+fn unowned_submission_positions(
+    order: &[reims_vgpu_core::SubmissionOrderEntry],
+    owned: &std::collections::BTreeSet<reims_vgpu_protocol::TransactionId>,
+) -> Vec<(reims_vgpu_protocol::TransactionId, String)> {
+    order
+        .iter()
+        .filter(|entry| !entry.submitted && !entry.abandoned && !owned.contains(&entry.transaction))
+        .map(|entry| {
+            (
+                entry.transaction,
+                format!(
+                    "{}@{}.{}",
+                    entry.transaction.get(),
+                    entry.domain.get(),
+                    entry.sequence.get()
+                ),
+            )
+        })
+        .collect()
+}
+
 fn missing_execution_representation<Semantic>(
     failure: &crate::runtime::replacement_session::ReplacementExecIngressDispatchFailure<Semantic>,
 ) -> Option<reims_vgpu_protocol::BackingId> {
@@ -5683,6 +5710,9 @@ pub(crate) struct ReplacementDeviceCoordinator<Semantic> {
     ready_guest_uploads: std::collections::VecDeque<
         Box<crate::runtime::replacement_session::ReplacementQueueReadyGuestUpload<Semantic>>,
     >,
+    /// Transactions no live owner held at the previous pipeline census. See
+    /// the `replacement_unowned_transaction` emitter.
+    previously_unowned: std::collections::BTreeSet<reims_vgpu_protocol::TransactionId>,
     ready_indirect_ranges: std::collections::VecDeque<
         Box<crate::runtime::replacement_session::ReplacementQueueReadyIndirectRange<Semantic>>,
     >,
@@ -6069,6 +6099,7 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
             timelines: ReplacementTimelineCoordinator::default(),
             publications: ReplacementPublicationCoordinator::default(),
             ready_guest_uploads: std::collections::VecDeque::new(),
+            previously_unowned: std::collections::BTreeSet::new(),
             ready_indirect_ranges: std::collections::VecDeque::new(),
             recordings_to_cleanup: std::collections::VecDeque::new(),
             pending_recording_cleanups: std::collections::VecDeque::new(),
@@ -6811,6 +6842,68 @@ impl ReplacementDeviceCoordinator<()> {
             })
             .collect::<Vec<_>>()
             .join(" ");
+        // A transaction the submission order has not settled and no live owner
+        // holds is lost guest work that nothing else reports. Its domain claim
+        // is never released, so every later transaction on that domain refuses
+        // behind it with `NotSubmissionHead` for the life of the device -- and
+        // the counters all read as if the device were merely busy: live owner
+        // gauges at zero, no retained failure, no refusal, and a blocked head
+        // that names the *successor* rather than the transaction that was
+        // dropped. Two boots were spent reading that as an ordering bug.
+        //
+        // This is a lead and not a verdict, which is why it is on the `OFF`
+        // channel and why it reports only what was unowned at two consecutive
+        // censuses. The owner sets below are the ones the pipeline holds
+        // transactions in; a retained failure elsewhere is held for the moment
+        // it takes to retry, which one census can catch and two cannot. A name
+        // that appears here for the life of a boot is the real thing.
+        let mut owned = std::collections::BTreeSet::new();
+        owned.extend(self.cpu.transaction_ids());
+        owned.extend(self.present.transaction_ids());
+        owned.extend(self.exec_recordings.transaction_ids());
+        owned.extend(self.exec_submissions.transaction_ids());
+        owned.extend(self.guest_uploads.transaction_ids());
+        owned.extend(self.guest_upload_suffixes.transaction_ids());
+        owned.extend(self.indirects.transaction_ids());
+        owned.extend(self.runtime.parked_recording_transactions());
+        owned.extend(
+            self.ready_guest_uploads
+                .iter()
+                .map(|ready| ready.transaction()),
+        );
+        owned.extend(
+            self.ready_indirect_ranges
+                .iter()
+                .map(|ready| ready.transaction()),
+        );
+        owned.extend(
+            self.continuing_guest_uploads
+                .iter()
+                .map(|continuing| continuing.transaction()),
+        );
+        owned.extend(
+            self.continuing_indirect_ranges
+                .iter()
+                .map(|continuing| continuing.transaction()),
+        );
+        let orphaned =
+            unowned_submission_positions(&self.runtime.submission_order_census(), &owned);
+        let unowned = orphaned
+            .iter()
+            .map(|(transaction, _)| *transaction)
+            .collect::<std::collections::BTreeSet<_>>();
+        let sustained = orphaned
+            .iter()
+            .filter(|(transaction, _)| self.previously_unowned.contains(transaction))
+            .map(|(_, position)| position.clone())
+            .collect::<Vec<_>>();
+        self.previously_unowned = unowned;
+        if !sustained.is_empty() {
+            crate::observe::off(format!(
+                "replacement_unowned_transaction reason=submission_claim_held_by_no_live_owner transactions=[{}]",
+                sustained.join(" ")
+            ));
+        }
         if !order.is_empty() {
             crate::observe::off(format!(
                 "replacement_submission_order transaction@domain.sequence:rias {order}"
@@ -10553,5 +10646,42 @@ mod tests {
                 mapping_id
             ))
             .is_some());
+    }
+
+    /// A settled position owes nothing; an unsettled one somebody has to hold.
+    ///
+    /// Reading this the other way is what makes a leak invisible: a transaction
+    /// whose owner was dropped looks exactly like one in flight, because both
+    /// are "not submitted yet" and no counter distinguishes them.
+    #[test]
+    fn only_an_unsettled_position_with_no_owner_is_reported_as_unowned() {
+        let entry = |transaction: u64, sequence: u64, submitted, abandoned| {
+            reims_vgpu_core::SubmissionOrderEntry {
+                transaction: reims_vgpu_protocol::TransactionId::new(transaction),
+                domain: reims_vgpu_protocol::SubmissionDomainId::new(1),
+                sequence: reims_vgpu_protocol::DomainSequence::new(sequence),
+                recorded: true,
+                issued: true,
+                submitted,
+                abandoned,
+            }
+        };
+        let order = [
+            entry(10, 1, true, false),
+            entry(11, 2, false, true),
+            entry(12, 3, false, false),
+            entry(13, 4, false, false),
+        ];
+        let owned = std::collections::BTreeSet::from([reims_vgpu_protocol::TransactionId::new(12)]);
+
+        let unowned = unowned_submission_positions(&order, &owned);
+        assert_eq!(
+            unowned
+                .iter()
+                .map(|(_, position)| position.as_str())
+                .collect::<Vec<_>>(),
+            ["13@1.4"],
+            "submitted and abandoned both release the domain claim, and 12 is held"
+        );
     }
 }

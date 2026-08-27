@@ -7089,6 +7089,22 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         }
     }
 
+    /// Every transaction a parked recording map still holds.
+    ///
+    /// Read beside the coordinator's own owner sets: a transaction the
+    /// submission order has not settled and *nothing* holds is lost guest work
+    /// with no other symptom, and this is one of the places it can be held.
+    pub fn parked_recording_transactions(&self) -> Vec<reims_vgpu_protocol::TransactionId> {
+        self.execution
+            .epoch
+            .recorded_execs
+            .keys()
+            .chain(self.execution.epoch.recorded_guest_uploads.keys())
+            .chain(self.execution.epoch.recorded_indirect_ranges.keys())
+            .copied()
+            .collect()
+    }
+
     pub const fn execution(&self) -> &ReplacementExecutionOwners<Semantic> {
         &self.execution
     }
