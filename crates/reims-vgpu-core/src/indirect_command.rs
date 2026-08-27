@@ -2009,7 +2009,7 @@ mod tests {
         assert_eq!(
             readback.arguments_representation(),
             resources
-                .execution_representation_id(BackingId::new(9))
+                .any_designated_representation(BackingId::new(9))
                 .unwrap()
         );
         assert_eq!(readback.arguments_range(), LinearRange::new(16, 8).unwrap());

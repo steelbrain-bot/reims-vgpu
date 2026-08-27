@@ -747,13 +747,19 @@ mod image_bindings_sealed {
     impl Sealed for reims_vgpu_core::ResolvedRenderDispatch {}
 }
 
-type RenderImageBinding = (
-    BackingId,
-    vk::ImageUsageFlags,
-    vk::ImageLayout,
-    Option<RenderAttachmentRole>,
-    bool,
-);
+/// One image a render pass binds, named by the texture as well as the backing.
+///
+/// A backing carries an image for each texture declared over its range, so the
+/// backing alone does not say which image an attachment or a binding means.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderImageBinding {
+    pub backing: BackingId,
+    pub resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+    pub usage: vk::ImageUsageFlags,
+    pub layout: vk::ImageLayout,
+    pub role: Option<RenderAttachmentRole>,
+    pub is_resolve: bool,
+}
 
 pub trait ReplacementRenderImageBindings: image_bindings_sealed::Sealed {
     fn render_image_bindings(&self) -> Box<[RenderImageBinding]>;
@@ -773,18 +779,20 @@ impl ReplacementRenderImageBindings for ResolvedRenderDispatch {
         // read anywhere in the encoder decides the layout for every draw in it.
         fn attachment_binding(
             backing: BackingId,
+            resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
             role: RenderAttachmentRole,
             feedback_loop: bool,
             input_attachment: bool,
             is_resolve: bool,
         ) -> RenderImageBinding {
-            (
+            RenderImageBinding {
                 backing,
-                render_attachment_usage(role, feedback_loop, input_attachment),
-                render_attachment_layout(role, feedback_loop, input_attachment),
-                Some(role),
+                resource,
+                usage: render_attachment_usage(role, feedback_loop, input_attachment),
+                layout: render_attachment_layout(role, feedback_loop, input_attachment),
+                role: Some(role),
                 is_resolve,
-            )
+            }
         }
 
         self.attachments
@@ -792,6 +800,7 @@ impl ReplacementRenderImageBindings for ResolvedRenderDispatch {
             .flat_map(|attachment| {
                 std::iter::once(attachment_binding(
                     attachment.backing,
+                    attachment.resource,
                     attachment.role,
                     attachment.feedback_loop,
                     attachment.input_attachment,
@@ -801,27 +810,36 @@ impl ReplacementRenderImageBindings for ResolvedRenderDispatch {
                     // A resolve target is written by the pass and never read
                     // by it, so it is in no feedback loop and is no input
                     // attachment however the attachment it resolves is read.
-                    attachment_binding(resolve.backing, attachment.role, false, false, true)
+                    attachment_binding(
+                        resolve.backing,
+                        resolve.resource,
+                        attachment.role,
+                        false,
+                        false,
+                        true,
+                    )
                 }))
             })
             .chain(
                 self.resources
                     .iter()
                     .filter_map(|resource| match resource.class {
-                        RenderBindingClass::SampledImage => Some((
-                            resource.backing,
-                            vk::ImageUsageFlags::SAMPLED,
-                            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            None,
-                            false,
-                        )),
-                        RenderBindingClass::StorageImage => Some((
-                            resource.backing,
-                            vk::ImageUsageFlags::STORAGE,
-                            vk::ImageLayout::GENERAL,
-                            None,
-                            false,
-                        )),
+                        RenderBindingClass::SampledImage => Some(RenderImageBinding {
+                            backing: resource.backing,
+                            resource: resource.resource,
+                            usage: vk::ImageUsageFlags::SAMPLED,
+                            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            role: None,
+                            is_resolve: false,
+                        }),
+                        RenderBindingClass::StorageImage => Some(RenderImageBinding {
+                            backing: resource.backing,
+                            resource: resource.resource,
+                            usage: vk::ImageUsageFlags::STORAGE,
+                            layout: vk::ImageLayout::GENERAL,
+                            role: None,
+                            is_resolve: false,
+                        }),
                         RenderBindingClass::VertexBuffer
                         | RenderBindingClass::IndexBuffer
                         | RenderBindingClass::IndirectBuffer
@@ -847,15 +865,24 @@ pub fn derive_render_image_uses<NativePipeline, Operation: ReplacementRenderImag
         ),
     >::new();
     let bindings = prepared.operation().render_image_bindings();
-    for (backing, usage, layout, role, is_resolve) in bindings.into_vec() {
-        // Every render image binding names the backing's image view; a buffer
-        // view of the same bytes has no image state.
+    for binding in bindings.into_vec() {
+        let RenderImageBinding {
+            backing,
+            resource,
+            usage,
+            layout,
+            role,
+            is_resolve,
+        } = binding;
+        // Every render image binding names one texture's image over the
+        // backing; a buffer view of the same bytes has no image state, and
+        // another texture declared over the same range has its own.
         let image = ReplacementImageKey {
             backing,
             representation: ViewRepresentation::lookup(
                 representations,
                 backing,
-                BackingView::Image,
+                BackingView::Image(resource),
             )
             .ok_or(RenderImageStateError::RepresentationUseMismatch(backing))?,
         };
@@ -1362,8 +1389,11 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
         // image view; a bound buffer names its byte view. `image_view` and
         // `byte_view` say which, so a backing carrying both objects resolves
         // correctly at every site below.
-        let image_view = |backing: BackingId| {
-            ViewRepresentation::lookup(representations, backing, BackingView::Image)
+        let image_view = |backing: BackingId,
+                          resource: reims_vgpu_protocol::ResourceId<
+            reims_vgpu_protocol::ResourceObject,
+        >| {
+            ViewRepresentation::lookup(representations, backing, BackingView::Image(resource))
                 .ok_or(RenderRecordError::RepresentationUseMismatch(backing))
         };
         let byte_view = |backing: BackingId| {
@@ -1390,7 +1420,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
             let target = attachment_target(attachment, representations, resolver)?;
             let key = ReplacementImageKey {
                 backing: attachment.backing,
-                representation: image_view(attachment.backing)?,
+                representation: image_view(attachment.backing, attachment.resource)?,
             };
             validate_attachment_target(key, attachment, target, pipeline.sample_count)?;
             attachment_views.push(target.view);
@@ -1428,7 +1458,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                 let target = resolve_target(resolve, representations, resolver)?;
                 let key = ReplacementImageKey {
                     backing: resolve.backing,
-                    representation: image_view(resolve.backing)?,
+                    representation: image_view(resolve.backing, resolve.resource)?,
                 };
                 validate_resolve_target(key, attachment.role, resolve, target)?;
                 attachment_views.push(target.view);
@@ -1481,14 +1511,14 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                 let first_target = attachment_target(first, representations, resolver)?;
                 let first_key = ReplacementImageKey {
                     backing: first.backing,
-                    representation: image_view(first.backing)?,
+                    representation: image_view(first.backing, first.resource)?,
                 };
                 validate_attachment_target(first_key, first, first_target, pipeline.sample_count)?;
                 if let Some(second) = stencil.filter(|_| depth.is_some()) {
                     let second_target = attachment_target(second, representations, resolver)?;
                     let second_key = ReplacementImageKey {
                         backing: second.backing,
-                        representation: image_view(second.backing)?,
+                        representation: image_view(second.backing, second.resource)?,
                     };
                     validate_attachment_target(
                         second_key,
@@ -1526,7 +1556,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                     let first_target = resolve_target(first_resolve, representations, resolver)?;
                     let first_key = ReplacementImageKey {
                         backing: first_resolve.backing,
-                        representation: image_view(first_resolve.backing)?,
+                        representation: image_view(first_resolve.backing, first_resolve.resource)?,
                     };
                     validate_resolve_target(
                         first_key,
@@ -1542,7 +1572,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                         let second_target = resolve_target(second, representations, resolver)?;
                         let second_key = ReplacementImageKey {
                             backing: second.backing,
-                            representation: image_view(second.backing)?,
+                            representation: image_view(second.backing, second.resource)?,
                         };
                         validate_resolve_target(
                             second_key,
@@ -1572,7 +1602,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
             // names the texels.
             let view = match resource.view {
                 RenderBindingView::Buffer(_) => BackingView::Bytes,
-                RenderBindingView::Image(_) => BackingView::Image,
+                RenderBindingView::Image(_) => BackingView::Image(resource.resource),
             };
             let representation =
                 ViewRepresentation::lookup(representations, resource.backing, view).ok_or(
@@ -1879,7 +1909,7 @@ fn attachment_target(
         representation: ViewRepresentation::lookup(
             representations,
             attachment.backing,
-            BackingView::Image,
+            BackingView::Image(attachment.resource),
         )
         .ok_or(RenderRecordError::RepresentationUseMismatch(
             attachment.backing,
@@ -1903,7 +1933,7 @@ fn resolve_target(
         representation: ViewRepresentation::lookup(
             representations,
             resolve.backing,
-            BackingView::Image,
+            BackingView::Image(resolve.resource),
         )
         .ok_or(RenderRecordError::RepresentationUseMismatch(
             resolve.backing,
@@ -2961,12 +2991,19 @@ mod tests {
         ready
     }
 
-    /// A backing whose execution representation is an image, which is what
-    /// every attachment and sampled binding in these fixtures needs. A
-    /// fixture binding a backing as a buffer — a visibility result, an
-    /// indirect argument — asks for [`BackingView::Bytes`] instead.
-    fn backing(owner: &mut ResourceLifecycleOwner<()>, current: bool) -> BackingId {
-        view_backing(owner, current, BackingView::Image)
+    /// A backing carrying one texture's image, which is what every attachment
+    /// and sampled binding in these fixtures needs. The texture must be the
+    /// one the fixture goes on to name: a backing's image is keyed by the
+    /// texture that declared it, so materializing it for another resource
+    /// leaves the binding resolving nothing. A fixture binding a backing as a
+    /// buffer — a visibility result, an indirect argument — asks for
+    /// [`BackingView::Bytes`] instead.
+    fn backing(
+        owner: &mut ResourceLifecycleOwner<()>,
+        current: bool,
+        resource: ResourceId<ResourceObject>,
+    ) -> BackingId {
+        view_backing(owner, current, BackingView::Image(resource))
     }
 
     fn view_backing(
@@ -3146,7 +3183,7 @@ mod tests {
     #[test]
     fn attachment_sampling_uses_the_feedback_layout_on_one_representation() {
         let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
-        let backing = backing(&mut lifecycle, true);
+        let backing = backing(&mut lifecycle, true, ResourceId::new(80, 1));
         let resource = ResourceId::new(80, 1);
         let mut attachment = plan_attachment(RenderAttachmentRole::Color(0), 80);
         attachment.resource = resource;
@@ -3216,7 +3253,7 @@ mod tests {
     #[test]
     fn a_draw_that_samples_nothing_still_takes_its_encoder_feedback_layout() {
         let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
-        let backing = backing(&mut lifecycle, true);
+        let backing = backing(&mut lifecycle, true, ResourceId::new(80, 1));
         let resource = ResourceId::new(80, 1);
         let mut attachment = plan_attachment(RenderAttachmentRole::Color(0), 80);
         attachment.resource = resource;
@@ -3257,8 +3294,8 @@ mod tests {
     #[test]
     fn a_resolve_target_of_a_feedback_attachment_is_no_feedback_attachment() {
         let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
-        let target = backing(&mut lifecycle, true);
-        let resolved = backing(&mut lifecycle, true);
+        let target = backing(&mut lifecycle, true, ResourceId::new(80, 1));
+        let resolved = backing(&mut lifecycle, true, ResourceId::new(81, 1));
         let mut attachment = plan_attachment(RenderAttachmentRole::Color(0), 80);
         attachment.backing = target;
         attachment.sample_count = 4;
@@ -3305,7 +3342,7 @@ mod tests {
     #[test]
     fn a_color_input_attachment_binds_in_the_layout_its_pass_declares() {
         let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
-        let target = backing(&mut lifecycle, true);
+        let target = backing(&mut lifecycle, true, ResourceId::new(80, 1));
         let mut attachment = plan_attachment(RenderAttachmentRole::Color(0), 80);
         attachment.backing = target;
         attachment.sample_count = 1;
@@ -3341,7 +3378,7 @@ mod tests {
     #[test]
     fn one_feedback_aspect_puts_the_whole_depth_stencil_attachment_in_the_loop() {
         let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
-        let combined = backing(&mut lifecycle, true);
+        let combined = backing(&mut lifecycle, true, ResourceId::new(252, 1));
         let resource = ResourceId::new(252, 1);
         let mut depth = plan_attachment(RenderAttachmentRole::Depth, 252);
         depth.resource = resource;
@@ -3569,8 +3606,8 @@ mod tests {
     #[test]
     fn color_draw_projects_exact_attachment_sampled_descriptor_and_draw() {
         let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
-        let sampled = backing(&mut lifecycle, true);
-        let attachment = backing(&mut lifecycle, false);
+        let sampled = backing(&mut lifecycle, true, ResourceId::new(3, 1));
+        let attachment = backing(&mut lifecycle, false, ResourceId::new(4, 1));
         let visibility = view_backing(&mut lifecycle, false, BackingView::Bytes);
         let arguments = view_backing(&mut lifecycle, true, BackingView::Bytes);
         let operation = ResolvedRenderDispatch {
@@ -3671,13 +3708,14 @@ mod tests {
         .unwrap();
         let attachment_key = ReplacementImageKey {
             backing: attachment,
-            representation: lifecycle.execution_representation_id(attachment).unwrap(),
+            representation: lifecycle.any_designated_representation(attachment).unwrap(),
         };
         let sampled_key = ReplacementImageKey {
             backing: sampled,
-            representation: lifecycle.execution_representation_id(sampled).unwrap(),
+            representation: lifecycle.any_designated_representation(sampled).unwrap(),
         };
-        let visibility_representation = lifecycle.execution_representation_id(visibility).unwrap();
+        let visibility_representation =
+            lifecycle.any_designated_representation(visibility).unwrap();
         let mut images = ReplacementImageStateOwner::new(EPOCH);
         for (key, layout) in [
             (attachment_key, vk::ImageLayout::UNDEFINED),
@@ -3798,7 +3836,7 @@ mod tests {
             2
         );
 
-        let argument_representation = lifecycle.execution_representation_id(arguments).unwrap();
+        let argument_representation = lifecycle.any_designated_representation(arguments).unwrap();
         let mut indirect = operation;
         indirect.draw = ResolvedRenderDraw::IndexedIndirect {
             topology: PrimitiveTopology::Triangle,
@@ -3916,7 +3954,7 @@ mod tests {
     #[test]
     fn combined_depth_stencil_projects_one_view_and_independent_clear_values() {
         let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
-        let depth_stencil = backing(&mut lifecycle, false);
+        let depth_stencil = backing(&mut lifecycle, false, ResourceId::new(5, 1));
         let operation = ResolvedRenderDispatch {
             pipeline: ResourceId::new(2, 1),
             program: Default::default(),
@@ -3982,7 +4020,7 @@ mod tests {
         let key = ReplacementImageKey {
             backing: depth_stencil,
             representation: lifecycle
-                .execution_representation_id(depth_stencil)
+                .any_designated_representation(depth_stencil)
                 .unwrap(),
         };
         let mut images = ReplacementImageStateOwner::new(EPOCH);
@@ -4035,8 +4073,8 @@ mod tests {
     #[test]
     fn multisample_color_resolve_retains_both_views_in_render_pass_order() {
         let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
-        let attachment = backing(&mut lifecycle, false);
-        let resolve = backing(&mut lifecycle, false);
+        let attachment = backing(&mut lifecycle, false, ResourceId::new(5, 1));
+        let resolve = backing(&mut lifecycle, false, ResourceId::new(6, 1));
         let operation = ResolvedRenderDispatch {
             pipeline: ResourceId::new(2, 1),
             program: Default::default(),
@@ -4091,11 +4129,11 @@ mod tests {
         .unwrap();
         let attachment_key = ReplacementImageKey {
             backing: attachment,
-            representation: lifecycle.execution_representation_id(attachment).unwrap(),
+            representation: lifecycle.any_designated_representation(attachment).unwrap(),
         };
         let resolve_key = ReplacementImageKey {
             backing: resolve,
-            representation: lifecycle.execution_representation_id(resolve).unwrap(),
+            representation: lifecycle.any_designated_representation(resolve).unwrap(),
         };
         let mut images = ReplacementImageStateOwner::new(EPOCH);
         for key in [attachment_key, resolve_key] {

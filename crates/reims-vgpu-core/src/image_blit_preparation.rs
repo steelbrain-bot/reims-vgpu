@@ -270,7 +270,10 @@ fn collect_regions(
                 .or_default()
                 .push(BackingRegion::Linear(blit.source.region));
             writes
-                .entry((blit.destination.storage, BackingView::Image))
+                .entry((
+                    blit.destination.storage,
+                    BackingView::Image(blit.destination.resource),
+                ))
                 .or_default()
                 .extend(image_regions(
                     &blit.destination,
@@ -282,7 +285,10 @@ fn collect_regions(
         ResolvedBlit::TextureToBuffer(blit) => {
             let aspect = buffer_image_blit_aspect(blit.source.backing.pixel_format(), blit.aspect);
             reads
-                .entry((blit.source.storage, BackingView::Image))
+                .entry((
+                    blit.source.storage,
+                    BackingView::Image(blit.source.resource),
+                ))
                 .or_default()
                 .extend(image_regions(
                     &blit.source,
@@ -297,7 +303,10 @@ fn collect_regions(
         }
         ResolvedBlit::TextureToTexture(blit) => {
             reads
-                .entry((blit.source.storage, BackingView::Image))
+                .entry((
+                    blit.source.storage,
+                    BackingView::Image(blit.source.resource),
+                ))
                 .or_default()
                 .extend(image_regions(
                     &blit.source,
@@ -306,7 +315,10 @@ fn collect_regions(
                     blit.aspect,
                 )?);
             writes
-                .entry((blit.destination.storage, BackingView::Image))
+                .entry((
+                    blit.destination.storage,
+                    BackingView::Image(blit.destination.resource),
+                ))
                 .or_default()
                 .extend(image_regions(
                     &blit.destination,
@@ -327,11 +339,14 @@ fn collect_regions(
                     };
                     let origin = crate::TextureOrigin { x: 0, y: 0, z: 0 };
                     reads
-                        .entry((source.storage, BackingView::Image))
+                        .entry((source.storage, BackingView::Image(source.resource)))
                         .or_default()
                         .extend(image_regions(source, origin, extent, BlitAspect::Full)?);
                     writes
-                        .entry((destination.storage, BackingView::Image))
+                        .entry((
+                            destination.storage,
+                            BackingView::Image(destination.resource),
+                        ))
                         .or_default()
                         .extend(image_regions(
                             destination,
@@ -690,8 +705,8 @@ mod tests {
         GUEST_REPRESENTATION,
     };
     use reims_vgpu_protocol::{
-        ByteLength, ChannelId, GuestVirtualAddress, QueueOwnerId, ResourceId, SessionGenerationId,
-        VulkanDeviceEpochId,
+        ByteLength, ChannelId, GuestVirtualAddress, QueueOwnerId, ResourceId, ResourceObject,
+        SessionGenerationId, VulkanDeviceEpochId,
     };
 
     fn backing(resources: &mut ResourceLifecycleOwner<&'static str>) -> BackingId {
@@ -753,9 +768,13 @@ mod tests {
         }
     }
 
+    /// The texture every endpoint in these fixtures names, and therefore the
+    /// image view its backing carries.
+    const TEXTURE: ResourceId<ResourceObject> = ResourceId::new(2, 1);
+
     fn texture(backing: BackingId, format: u16) -> ResolvedTextureEndpoint {
         ResolvedTextureEndpoint {
-            resource: ResourceId::new(2, 1),
+            resource: TEXTURE,
             storage: backing,
             level: 2,
             slice: 3,
@@ -827,14 +846,14 @@ mod tests {
                 RepresentationRoute::HostStagingTransfer {
                     working: crate::WorkingMemoryClass::DeviceLocal,
                 },
-                BackingView::Image,
+                BackingView::Image(TEXTURE),
                 "image",
             )
             .unwrap();
         let destination_representation = execution(
             &mut resources,
             destination,
-            BackingView::Image,
+            BackingView::Image(TEXTURE),
             "destination",
         );
         materialize(
@@ -871,7 +890,11 @@ mod tests {
         );
         assert_ne!(endpoint, image);
         assert_eq!(
-            ViewRepresentation::lookup(prepared.representations(), destination, BackingView::Image),
+            ViewRepresentation::lookup(
+                prepared.representations(),
+                destination,
+                BackingView::Image(TEXTURE)
+            ),
             Some(destination_representation)
         );
         // The use keeps the endpoint alive for the transaction; the image is
@@ -896,7 +919,7 @@ mod tests {
         let destination_representation = execution(
             &mut resources,
             destination,
-            BackingView::Image,
+            BackingView::Image(TEXTURE),
             "destination",
         );
         materialize(
@@ -935,7 +958,7 @@ mod tests {
                 },
                 ViewRepresentation {
                     backing: destination,
-                    view: BackingView::Image,
+                    view: BackingView::Image(TEXTURE),
                     representation: destination_representation,
                 },
             ]
@@ -1006,7 +1029,7 @@ mod tests {
         let mut writes = BTreeMap::new();
         collect_regions(&operation, &mut reads, &mut writes).unwrap();
         assert_eq!(
-            writes[&(destination, BackingView::Image)].as_slice(),
+            writes[&(destination, BackingView::Image(TEXTURE))].as_slice(),
             [768, 832, 896, 960]
                 .map(|offset| BackingRegion::Linear(LinearRange::new(offset, 16).unwrap()))
         );
@@ -1067,7 +1090,7 @@ mod tests {
         let destination_representation = execution(
             &mut resources,
             destination,
-            BackingView::Image,
+            BackingView::Image(TEXTURE),
             "destination",
         );
         materialize(

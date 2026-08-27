@@ -13,8 +13,8 @@ use crate::{
     ResourceValidity, TransferKey, GUEST_REPRESENTATION, HOST_REPRESENTATION,
 };
 use reims_vgpu_protocol::{
-    BackingId, QueueOwnerId, QueueTimelineValue, RepresentationId, ResourceValidityOps,
-    TransactionId, VulkanDeviceEpochId,
+    BackingId, QueueOwnerId, QueueTimelineValue, RepresentationId, ResourceId, ResourceObject,
+    ResourceValidityOps, TransactionId, VulkanDeviceEpochId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,11 +39,15 @@ struct ManagedBacking<T> {
     lifecycle: BackingLifecycle,
     validity: ResourceValidity,
     representations: BTreeMap<RepresentationId, NativeRepresentation<T>>,
-    execution_representation: Option<RepresentationId>,
-    /// Which view of the bytes the execution representation is. Meaningless
-    /// until one exists; [`BackingView::Bytes`] until then because a backing
-    /// with no execution representation owes neither view.
-    execution_view: BackingView,
+    /// The representation serving each view of these bytes.
+    ///
+    /// A backing owes at most one buffer, and one image for every texture
+    /// declared over its range. Metal aliases textures over one allocation
+    /// deliberately and each keeps its own format and geometry, so this is a
+    /// map rather than the single designation it used to be: with one slot the
+    /// first alias to materialize served every other one, and no image view
+    /// bridges two formats of different bit widths.
+    execution_representations: BTreeMap<BackingView, RepresentationId>,
     retiring_representations: BTreeSet<RepresentationId>,
     accepted_uses: BTreeMap<TransactionId, BTreeMap<RepresentationId, usize>>,
 }
@@ -105,19 +109,31 @@ pub struct GpuWriteReservation {
 /// Which view of a backing's bytes a native object is.
 ///
 /// A backing is one run of guest bytes and its representations are views of
-/// them, but only one may be the *execution* representation. A guest
-/// allocation may be declared as both a buffer and a linear texture, and those
-/// two views need different native objects — so the execution representation
-/// serves one of them and the other is served by the transfer endpoint the
-/// same materialization built. Which one it serves is stated here by the
-/// materializer, which knows, rather than inferred later by a consumer that
-/// does not.
+/// them. A guest allocation may be declared as both a buffer and a linear
+/// texture, and those two views need different native objects, so the view is
+/// stated by the materializer, which knows, rather than inferred later by a
+/// consumer that does not.
+///
+/// The image view is named by the texture that declared it, because a backing
+/// may carry more than one. Two textures declared over one guest range are two
+/// textures under the contract — Metal aliases them deliberately and each
+/// keeps its own format, geometry and subresource ranges — so each needs its
+/// own native image over the same bytes. Keying the view by the backing alone
+/// gave a backing a single image, which meant the first alias to materialize
+/// served every other one; at 32 bits per texel against 64 no image view
+/// reinterprets between them, and both the binding and the attachment paths
+/// refused on that pair.
+///
+/// The texture, not its declaration, is the key. Two textures whose
+/// declarations happen to match are still two textures, and a resource
+/// re-created in a later generation is a different one for free.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum BackingView {
     /// The backing's bytes, addressed linearly.
     Bytes,
-    /// The backing's texels, addressed by subresource and coordinate.
-    Image,
+    /// One texture's texels over the backing, addressed by subresource and
+    /// coordinate.
+    Image(ResourceId<ResourceObject>),
 }
 
 /// One endpoint's native object, named by the backing it addresses and by
@@ -258,8 +274,7 @@ impl<T> ManagedBackingOwner<T> {
                 lifecycle: BackingLifecycle::Live,
                 validity: ResourceValidity::default(),
                 representations: BTreeMap::new(),
-                execution_representation: None,
-                execution_view: BackingView::Bytes,
+                execution_representations: BTreeMap::new(),
                 retiring_representations: BTreeSet::new(),
                 accepted_uses: BTreeMap::new(),
             },
@@ -458,7 +473,7 @@ impl<T> ManagedBackingOwner<T> {
                 native,
             });
         }
-        if record.execution_representation.is_some() {
+        if record.execution_representations.contains_key(&view) {
             return Err(ManagedRepresentationFailure {
                 reason: ManagedBackingError::DuplicateExecutionRepresentation,
                 native,
@@ -469,23 +484,27 @@ impl<T> ManagedBackingOwner<T> {
             .backings
             .get_mut(&backing)
             .expect("representation creation retained its live backing");
-        record.execution_representation = Some(representation);
-        record.execution_view = view;
+        record
+            .execution_representations
+            .insert(view, representation);
         Ok(representation)
     }
 
     /// The representation serving one view of a backing's bytes.
     ///
-    /// The execution representation serves the view its materialization built,
-    /// and the *other* view of the same bytes is the transfer endpoint that
-    /// materialization built beside it. So this is a total function over the
-    /// two views rather than a lookup that can miss, and a consumer never has
-    /// to guess which of a backing's representations its endpoint meant.
+    /// A view a materialization built is answered directly. An image view that
+    /// has not been built is named rather than substituted: it is a texture
+    /// declared over these bytes whose native image does not exist yet, and
+    /// serving it with another texture's image is exactly the substitution
+    /// that made two formats collide.
     ///
-    /// A backing whose execution representation is a buffer owes no image, and
-    /// that is the one case with no answer: it is named rather than
-    /// substituted, because an image endpoint on such a backing is a
-    /// materialization that has not happened yet.
+    /// The byte view is the one that can still be answered without having been
+    /// designated, because a backing that owes an image also owes the endpoint
+    /// that image transfers through, and that endpoint is a property of the
+    /// backing's own storage rather than of any one texture over it. Every
+    /// image on a backing shares its guest bytes and therefore its route
+    /// family, so which image the route is read from does not change the
+    /// answer.
     pub fn view_representation(
         &self,
         backing: BackingId,
@@ -495,23 +514,28 @@ impl<T> ManagedBackingOwner<T> {
             .backings
             .get(&backing)
             .ok_or(ManagedBackingError::UnknownBacking)?;
-        let execution = record
-            .execution_representation
-            .ok_or(ManagedBackingError::MissingExecutionRepresentation)?;
-        if record.execution_view == view {
-            return Ok(execution);
+        if let Some(representation) = record.execution_representations.get(&view) {
+            return Ok(*representation);
         }
-        if view == BackingView::Image {
+        if record.execution_representations.is_empty() {
             return Err(ManagedBackingError::MissingExecutionRepresentation);
         }
-        // The byte endpoint the execution representation transfers through.
-        // The route names it: an imported or directly aliased backing keeps
-        // the guest's own pages, and a staged one keeps the host copy.
-        let endpoint = match record
-            .representations
-            .get(&execution)
-            .map(|held| held.route)
-        {
+        if matches!(view, BackingView::Image(_)) {
+            return Err(ManagedBackingError::MissingExecutionRepresentation);
+        }
+        // The byte endpoint the images transfer through. The route names it:
+        // an imported or directly aliased backing keeps the guest's own pages,
+        // and a staged one keeps the host copy.
+        let route = record
+            .execution_representations
+            .values()
+            .find_map(|representation| {
+                record
+                    .representations
+                    .get(representation)
+                    .map(|held| held.route)
+            });
+        let endpoint = match route {
             Some(
                 RepresentationRoute::ImportedGuestTransfer { .. }
                 | RepresentationRoute::DirectGuestAlias,
@@ -526,10 +550,14 @@ impl<T> ManagedBackingOwner<T> {
         }
     }
 
-    /// Exact execution identity and native object selected at construction.
-    pub fn execution_representation(&self, backing: BackingId) -> Option<(RepresentationId, &T)> {
+    /// Exact execution identity and native object one view was built with.
+    pub fn execution_representation(
+        &self,
+        backing: BackingId,
+        view: BackingView,
+    ) -> Option<(RepresentationId, &T)> {
         let record = self.backings.get(&backing)?;
-        let representation = record.execution_representation?;
+        let representation = *record.execution_representations.get(&view)?;
         Some((
             representation,
             record
@@ -639,21 +667,120 @@ impl<T> ManagedBackingOwner<T> {
     pub fn execution_representation_coverage(
         &self,
         backing: BackingId,
+        view: BackingView,
     ) -> Option<(RepresentationId, Vec<RegionVersion>)> {
         let record = self.backings.get(&backing)?;
-        let representation = record.execution_representation?;
+        let representation = *record.execution_representations.get(&view)?;
         Some((
             representation,
             record.authority.representation_coverage(representation),
         ))
     }
 
-    pub fn execution_representation_id(
+    /// Any one of a backing's designated representations.
+    ///
+    /// For questions about the backing's *storage* rather than about a
+    /// texture: which transfer route it takes, which endpoint it stages
+    /// through. Every representation over one backing addresses the same guest
+    /// bytes and is therefore built on the same route family, so which one
+    /// answers does not change the answer. A question that a different view
+    /// would answer differently is a question that must name its view.
+    pub fn any_designated_representation(
         &self,
         backing: BackingId,
     ) -> Result<RepresentationId, ManagedBackingError> {
         self.live_backing(backing)?
-            .execution_representation
+            .execution_representations
+            .values()
+            .next()
+            .copied()
+            .ok_or(ManagedBackingError::MissingExecutionRepresentation)
+    }
+
+    /// Any designated representation holding the exact regional content an
+    /// immutable operation requires, with its native object.
+    ///
+    /// The view-free counterpart of
+    /// [`Self::execution_representation_for_snapshot`], for a caller reading a
+    /// backing's content rather than one texture's. Content is per
+    /// representation, so this can find one current object while another over
+    /// the same bytes is stale; the refusal is
+    /// [`ManagedBackingError::StaleExecutionRepresentation`] only when none
+    /// of them holds it.
+    pub fn designated_representation_for_snapshot(
+        &self,
+        backing: BackingId,
+        snapshot: &[RegionVersion],
+    ) -> Result<(RepresentationId, &T), ManagedBackingError> {
+        let record = self.live_backing(backing)?;
+        if record.execution_representations.is_empty() {
+            return Err(ManagedBackingError::MissingExecutionRepresentation);
+        }
+        record
+            .execution_representations
+            .values()
+            .find(|representation| {
+                record
+                    .authority
+                    .representation_matches(**representation, snapshot)
+            })
+            .and_then(|representation| {
+                Some((
+                    *representation,
+                    record
+                        .representations
+                        .get(representation)?
+                        .native
+                        .as_ref()?,
+                ))
+            })
+            .ok_or(ManagedBackingError::StaleExecutionRepresentation)
+    }
+
+    /// Whether one representation is still a view this backing designates.
+    ///
+    /// A recorded plan names exact representation identities, and the question
+    /// it asks later is whether they are still current — not which view they
+    /// serve. Replacement retires every designation at once, so membership is
+    /// the whole answer.
+    pub fn is_designated(&self, backing: BackingId, representation: RepresentationId) -> bool {
+        self.backings.get(&backing).is_some_and(|record| {
+            record
+                .execution_representations
+                .values()
+                .any(|designated| *designated == representation)
+        })
+    }
+
+    /// Every view of a backing a materialization has designated, in view
+    /// order.
+    ///
+    /// A backing may carry an image for each texture declared over its range,
+    /// so a caller that owes work to *the* execution representation — content
+    /// synchronization is the one that does — owes it to all of them. Asking
+    /// for one and serving the rest with it is what a single designation used
+    /// to do silently.
+    pub fn designated_views(
+        &self,
+        backing: BackingId,
+    ) -> Result<Vec<(BackingView, RepresentationId)>, ManagedBackingError> {
+        Ok(self
+            .live_backing(backing)?
+            .execution_representations
+            .iter()
+            .map(|(view, representation)| (*view, *representation))
+            .collect())
+    }
+
+    pub fn execution_representation_id(
+        &self,
+        backing: BackingId,
+        view: BackingView,
+    ) -> Result<RepresentationId, ManagedBackingError> {
+        self.live_backing(backing)?
+            .execution_representations
+            .get(&view)
+            .copied()
             .ok_or(ManagedBackingError::MissingExecutionRepresentation)
     }
 
@@ -667,11 +794,14 @@ impl<T> ManagedBackingOwner<T> {
     ) -> Result<ManagedBackingProgress<T>, ManagedBackingError> {
         self.validate_replace_execution_representation(backing)?;
         let record = self.live_backing_mut(backing)?;
-        let Some(representation) = record.execution_representation.take() else {
+        let designated = std::mem::take(&mut record.execution_representations);
+        if designated.is_empty() {
             return Ok(ManagedBackingProgress::Live);
-        };
-        if !record.retiring_representations.insert(representation) {
-            return Err(ManagedBackingError::ExecutionRepresentationAlreadyRetiring);
+        }
+        for representation in designated.into_values() {
+            if !record.retiring_representations.insert(representation) {
+                return Err(ManagedBackingError::ExecutionRepresentationAlreadyRetiring);
+            }
         }
         self.finish_retirement_if_ready(backing)
     }
@@ -682,8 +812,9 @@ impl<T> ManagedBackingOwner<T> {
     ) -> Result<(), ManagedBackingError> {
         let record = self.live_backing(backing)?;
         if record
-            .execution_representation
-            .is_some_and(|representation| record.retiring_representations.contains(&representation))
+            .execution_representations
+            .values()
+            .any(|representation| record.retiring_representations.contains(representation))
         {
             return Err(ManagedBackingError::ExecutionRepresentationAlreadyRetiring);
         }
@@ -722,11 +853,14 @@ impl<T> ManagedBackingOwner<T> {
     pub fn execution_representation_for_snapshot(
         &self,
         backing: BackingId,
+        view: BackingView,
         snapshot: &[RegionVersion],
     ) -> Result<(RepresentationId, &T), ManagedBackingError> {
         let record = self.live_backing(backing)?;
         let representation = record
-            .execution_representation
+            .execution_representations
+            .get(&view)
+            .copied()
             .ok_or(ManagedBackingError::MissingExecutionRepresentation)?;
         if !record
             .authority
@@ -2110,7 +2244,7 @@ mod tests {
             .unwrap();
         assert_ne!(transfer, execution);
         assert_eq!(
-            owner.execution_representation(backing),
+            owner.execution_representation(backing, BackingView::Bytes),
             Some((execution, &"execution"))
         );
         let failure = owner
@@ -2128,7 +2262,7 @@ mod tests {
         assert_eq!(failure.native, "duplicate");
         assert_eq!(owner.census().live_representations, 2);
         assert_eq!(
-            owner.execution_representation(backing),
+            owner.execution_representation(backing, BackingView::Bytes),
             Some((execution, &"execution"))
         );
     }
@@ -2164,7 +2298,7 @@ mod tests {
             ManagedBackingProgress::Live
         );
         assert_eq!(
-            owner.execution_representation_id(backing),
+            owner.execution_representation_id(backing, BackingView::Bytes),
             Err(ManagedBackingError::MissingExecutionRepresentation)
         );
         let new = owner
@@ -2217,7 +2351,7 @@ mod tests {
             .snapshot_content(backing, &[BackingRegion::Whole])
             .unwrap();
         assert_eq!(
-            owner.execution_representation_for_snapshot(backing, &snapshot),
+            owner.execution_representation_for_snapshot(backing, BackingView::Bytes, &snapshot),
             Err(ManagedBackingError::StaleExecutionRepresentation)
         );
 
@@ -2234,7 +2368,7 @@ mod tests {
             .snapshot_content(backing, &[BackingRegion::Whole])
             .unwrap();
         assert_eq!(
-            owner.execution_representation_for_snapshot(backing, &snapshot),
+            owner.execution_representation_for_snapshot(backing, BackingView::Bytes, &snapshot),
             Ok((execution, &"execution"))
         );
 
@@ -2287,7 +2421,7 @@ mod tests {
             .snapshot_content(backing, &[BackingRegion::Whole])
             .unwrap();
         assert_eq!(
-            owner.execution_representation_for_snapshot(backing, &newer),
+            owner.execution_representation_for_snapshot(backing, BackingView::Bytes, &newer),
             Err(ManagedBackingError::StaleExecutionRepresentation)
         );
     }
@@ -2660,11 +2794,85 @@ mod tests {
     /// only reading available is "some content is not current" -- which is what
     /// the refusal already said. A boot spent twenty-eight thousand retries on
     /// one of these.
+    /// Two textures declared over one guest range are two textures, and a
+    /// backing that gave them one image served whichever materialized first to
+    /// both. At 32 bits per texel against 64 no image view reinterprets
+    /// between them, so the second alias lost every binding and every
+    /// attachment it named.
+    #[test]
+    fn two_textures_over_one_backing_each_get_their_own_image() {
+        let (mut owner, backing) = owner();
+        let wide = BackingView::Image(ResourceId::new(7, 1));
+        let narrow = BackingView::Image(ResourceId::new(8, 1));
+
+        let wide_representation = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                wide,
+                "wide",
+            )
+            .unwrap();
+        // The same backing, a second texture: not a duplicate designation.
+        let narrow_representation = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                narrow,
+                "narrow",
+            )
+            .unwrap();
+        assert_ne!(wide_representation, narrow_representation);
+
+        // Each view resolves to its own image, and neither is substituted for
+        // the other -- which is the whole defect this key exists to prevent.
+        assert_eq!(
+            owner.view_representation(backing, wide),
+            Ok(wide_representation)
+        );
+        assert_eq!(
+            owner.view_representation(backing, narrow),
+            Ok(narrow_representation)
+        );
+        assert_eq!(
+            owner.execution_representation(backing, wide).map(|_| ()),
+            Some(())
+        );
+
+        // A third texture over the same bytes has no image yet, and that is
+        // named rather than answered with one of the two that do.
+        assert_eq!(
+            owner.view_representation(backing, BackingView::Image(ResourceId::new(9, 1))),
+            Err(ManagedBackingError::MissingExecutionRepresentation)
+        );
+
+        // Re-declaring the same texture is still a duplicate.
+        let duplicate = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                wide,
+                "again",
+            )
+            .expect_err("one texture owns one image over one backing");
+        assert_eq!(
+            duplicate.reason,
+            ManagedBackingError::DuplicateExecutionRepresentation
+        );
+        assert_eq!(duplicate.native, "again");
+
+        assert_eq!(
+            owner.designated_views(backing).unwrap(),
+            vec![(wide, wide_representation), (narrow, narrow_representation)]
+        );
+        assert!(owner.is_designated(backing, narrow_representation));
+    }
+
     #[test]
     fn a_backing_can_say_what_its_execution_representation_holds() {
         let (mut owner, backing) = owner();
         assert_eq!(
-            owner.execution_representation_coverage(backing),
+            owner.execution_representation_coverage(backing, BackingView::Bytes),
             None,
             "a backing with no execution representation holds nothing to report"
         );
@@ -2677,7 +2885,9 @@ mod tests {
                 "execution",
             )
             .unwrap();
-        let (reported, coverage) = owner.execution_representation_coverage(backing).unwrap();
+        let (reported, coverage) = owner
+            .execution_representation_coverage(backing, BackingView::Bytes)
+            .unwrap();
         assert_eq!(reported, execution);
         assert_eq!(
             coverage,
@@ -2690,7 +2900,7 @@ mod tests {
         );
 
         assert_eq!(
-            owner.execution_representation_coverage(BackingId::new(99)),
+            owner.execution_representation_coverage(BackingId::new(99), BackingView::Bytes),
             None,
             "a backing this owner does not hold has no coverage to report"
         );

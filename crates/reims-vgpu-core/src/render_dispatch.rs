@@ -585,7 +585,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
         // addresses; `validate_shape` has already proved class and view agree.
         let view = match resource.view {
             RenderBindingView::Buffer(_) => BackingView::Bytes,
-            RenderBindingView::Image(_) => BackingView::Image,
+            RenderBindingView::Image(_) => BackingView::Image(resource.resource),
         };
         let group = grouped.entry((resource.backing, view)).or_default();
         group.0.extend(resource.regions.iter().copied());
@@ -601,7 +601,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
     }
     for attachment in &operation.attachments {
         let group = grouped
-            .entry((attachment.backing, BackingView::Image))
+            .entry((attachment.backing, BackingView::Image(attachment.resource)))
             .or_default();
         group.0.extend(attachment.regions.iter().copied());
         group.1 |= operation.begins_encoder && attachment.load == LoadAction::Load;
@@ -613,7 +613,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
         group.3.insert(attachment.resource);
         if let Some(resolve) = &attachment.resolve {
             let group = grouped
-                .entry((resolve.backing, BackingView::Image))
+                .entry((resolve.backing, BackingView::Image(resolve.resource)))
                 .or_default();
             group.0.extend(resolve.regions.iter().copied());
             group.2 |= operation.ends_encoder;
@@ -1121,9 +1121,22 @@ mod tests {
         ready
     }
 
-    /// A backing whose execution representation is an image, which is what
-    /// every sampled binding and every attachment in these fixtures needs.
-    fn backing(owner: &mut ResourceLifecycleOwner<()>, current: bool) -> BackingId {
+    /// The textures these fixtures declare, and therefore the image view each
+    /// backing carries. A backing's image is named by the texture that
+    /// declared it, so a fixture must materialize the one its binding or its
+    /// attachment goes on to name.
+    const SAMPLED: ResourceId<ResourceObject> = ResourceId::new(3, 1);
+    const TARGET: ResourceId<ResourceObject> = ResourceId::new(4, 1);
+    const RESOLVE: ResourceId<ResourceObject> = ResourceId::new(6, 1);
+
+    /// A backing whose execution representation is one texture's image, which
+    /// is what every sampled binding and every attachment in these fixtures
+    /// needs.
+    fn backing(
+        owner: &mut ResourceLifecycleOwner<()>,
+        current: bool,
+        resource: ResourceId<ResourceObject>,
+    ) -> BackingId {
         let ResourceLifecycleEffect::BackingCreated(backing) = owner
             .apply(ResolvedResourceLifecycle::CreateBacking {
                 backing: StorageBacking::Dedicated,
@@ -1137,7 +1150,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
-                BackingView::Image,
+                BackingView::Image(resource),
                 (),
             )
             .unwrap();
@@ -1212,8 +1225,8 @@ mod tests {
     #[test]
     fn prepared_render_owns_pipeline_exact_reads_target_write_and_cancellation() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
-        let sampled = backing(&mut owner, true);
-        let target = backing(&mut owner, false);
+        let sampled = backing(&mut owner, true, SAMPLED);
+        let target = backing(&mut owner, false, TARGET);
         let operation = direct(sampled, target, LoadAction::Clear);
         let accesses = operation.accesses(HazardDomainId::new(9));
         assert_eq!(accesses.len(), 2);
@@ -1271,8 +1284,8 @@ mod tests {
     #[test]
     fn stale_load_refuses_before_another_backing_reserves_a_write() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
-        let writable = backing(&mut owner, true);
-        let stale_target = backing(&mut owner, false);
+        let writable = backing(&mut owner, true, SAMPLED);
+        let stale_target = backing(&mut owner, false, TARGET);
         let mut operation = direct(writable, stale_target, LoadAction::Load);
         operation.resources[0].mode = AccessMode::Write;
         assert!(matches!(
@@ -1317,8 +1330,8 @@ mod tests {
     #[test]
     fn whole_exec_envelope_retains_render_pipeline_resources_and_cancellation() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
-        let sampled = backing(&mut owner, true);
-        let target = backing(&mut owner, false);
+        let sampled = backing(&mut owner, true, SAMPLED);
+        let target = backing(&mut owner, false, TARGET);
         let transaction = TransactionId::new(10);
         let submission = SubmissionId::new(14);
         let operation = direct(sampled, target, LoadAction::Clear);
@@ -1382,8 +1395,8 @@ mod tests {
     #[test]
     fn descriptor_arrays_accept_distinct_elements_and_reject_sampler_collisions() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
-        let sampled = backing(&mut owner, true);
-        let target = backing(&mut owner, false);
+        let sampled = backing(&mut owner, true, SAMPLED);
+        let target = backing(&mut owner, false, TARGET);
         let mut operation = direct(sampled, target, LoadAction::Clear);
         operation.resources[0].descriptor_count = 2;
         let mut second = operation.resources[0].clone();
@@ -1423,8 +1436,8 @@ mod tests {
     #[test]
     fn vertex_layout_and_buffer_binding_are_one_validated_shape() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
-        let sampled = backing(&mut owner, true);
-        let target = backing(&mut owner, false);
+        let sampled = backing(&mut owner, true, SAMPLED);
+        let target = backing(&mut owner, false, TARGET);
         let mut operation = direct(sampled, target, LoadAction::Clear);
         operation.vertex_buffers = Box::new([ResolvedVertexBufferLayout {
             binding: 7,
@@ -1469,8 +1482,8 @@ mod tests {
     #[test]
     fn indirect_draw_requires_one_read_only_argument_binding() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
-        let sampled = backing(&mut owner, true);
-        let target = backing(&mut owner, false);
+        let sampled = backing(&mut owner, true, SAMPLED);
+        let target = backing(&mut owner, false, TARGET);
         let mut operation = direct(sampled, target, LoadAction::Clear);
         operation.draw = ResolvedRenderDraw::Indirect {
             topology: PrimitiveTopology::Triangle,
@@ -1516,8 +1529,8 @@ mod tests {
     #[test]
     fn explicit_null_image_has_descriptor_shape_without_a_resource_access() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
-        let sampled = backing(&mut owner, true);
-        let target = backing(&mut owner, false);
+        let sampled = backing(&mut owner, true, SAMPLED);
+        let target = backing(&mut owner, false, TARGET);
         let mut operation = direct(sampled, target, LoadAction::Clear);
         let access_count = operation.accesses(HazardDomainId::new(1)).len();
         operation.null_bindings = Box::new([ResolvedRenderNullBinding {
@@ -1546,8 +1559,8 @@ mod tests {
     #[test]
     fn dont_care_store_discards_only_at_timeline_completion_and_resolve_refuses() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
-        let sampled = backing(&mut owner, true);
-        let target = backing(&mut owner, true);
+        let sampled = backing(&mut owner, true, SAMPLED);
+        let target = backing(&mut owner, true, TARGET);
         let mut operation = direct(sampled, target, LoadAction::Clear);
         operation.attachments[0].store = StoreAction::DontCare;
         let prepared = prepare_render_dispatch(
@@ -1599,7 +1612,7 @@ mod tests {
             ))
         ));
 
-        let resolve = backing(&mut owner, false);
+        let resolve = backing(&mut owner, false, RESOLVE);
         operation.attachments[0].sample_count = 4;
         operation.attachments[0].resolve = Some(ResolvedRenderResolveAttachment {
             resource: ResourceId::new(6, 1),
@@ -1632,8 +1645,8 @@ mod tests {
     #[test]
     fn continued_encoder_defers_attachment_load_and_store_to_its_boundaries() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
-        let sampled = backing(&mut owner, true);
-        let target = backing(&mut owner, true);
+        let sampled = backing(&mut owner, true, SAMPLED);
+        let target = backing(&mut owner, true, TARGET);
         let mut operation = direct(sampled, target, LoadAction::Load);
         operation.attachments[0].store = StoreAction::DontCare;
         operation.begins_encoder = false;

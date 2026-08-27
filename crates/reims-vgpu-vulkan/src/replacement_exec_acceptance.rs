@@ -953,11 +953,14 @@ mod tests {
                 (),
             )
             .unwrap();
+        // The image is keyed by the texture declared over the backing; this
+        // fixture names only one.
+        let destination_texture = ResourceId::<reims_vgpu_protocol::ResourceObject>::new(2, 1);
         let destination_representation = lifecycle
             .create_execution_representation(
                 destination,
                 RepresentationRoute::HostVisibleWorking,
-                BackingView::Image,
+                BackingView::Image(destination_texture),
                 (),
             )
             .unwrap();

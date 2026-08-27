@@ -308,28 +308,45 @@ mod compute_image_bindings_sealed {
     impl Sealed for reims_vgpu_core::ResolvedComputeDispatch {}
 }
 
+/// One image a compute dispatch binds, named by the texture as well as the
+/// backing.
+///
+/// A backing carries an image for each texture declared over its range, so the
+/// backing alone does not say which image a binding means.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplacementComputeImageBinding {
+    pub backing: BackingId,
+    pub resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+    pub usage: vk::ImageUsageFlags,
+    pub storage: bool,
+}
+
 pub trait ReplacementComputeImageBindings: compute_image_bindings_sealed::Sealed {
-    fn image_bindings(&self) -> Box<[(BackingId, vk::ImageUsageFlags, bool)]>;
+    fn image_bindings(&self) -> Box<[ReplacementComputeImageBinding]>;
 }
 
 impl ReplacementComputeImageBindings for () {
-    fn image_bindings(&self) -> Box<[(BackingId, vk::ImageUsageFlags, bool)]> {
+    fn image_bindings(&self) -> Box<[ReplacementComputeImageBinding]> {
         Box::new([])
     }
 }
 
 impl ReplacementComputeImageBindings for ResolvedComputeDispatch {
-    fn image_bindings(&self) -> Box<[(BackingId, vk::ImageUsageFlags, bool)]> {
+    fn image_bindings(&self) -> Box<[ReplacementComputeImageBinding]> {
         self.resources
             .iter()
-            .filter_map(|resource| match resource.class {
-                ComputeBindingClass::Buffer => None,
-                ComputeBindingClass::SampledImage => {
-                    Some((resource.backing, vk::ImageUsageFlags::SAMPLED, false))
-                }
-                ComputeBindingClass::StorageImage => {
-                    Some((resource.backing, vk::ImageUsageFlags::STORAGE, true))
-                }
+            .filter_map(|resource| {
+                let (usage, storage) = match resource.class {
+                    ComputeBindingClass::Buffer => return None,
+                    ComputeBindingClass::SampledImage => (vk::ImageUsageFlags::SAMPLED, false),
+                    ComputeBindingClass::StorageImage => (vk::ImageUsageFlags::STORAGE, true),
+                };
+                Some(ReplacementComputeImageBinding {
+                    backing: resource.backing,
+                    resource: resource.resource,
+                    usage,
+                    storage,
+                })
             })
             .collect::<Vec<_>>()
             .into_boxed_slice()
@@ -387,12 +404,19 @@ pub fn derive_compute_image_uses<NativePipeline, Operation: ReplacementComputeIm
 ) -> Result<Box<[ReplacementImageUse]>, ComputeImageStateError> {
     let representations = prepared.representations();
     let mut images = BTreeMap::<ReplacementImageKey, (vk::ImageUsageFlags, bool)>::new();
-    for (backing, usage, storage) in prepared.operation().image_bindings() {
-        // An image binding names the backing's image view. A backing bound
-        // once as a buffer and once as a texture holds both objects, and only
-        // the image one has image state.
+    for binding in prepared.operation().image_bindings() {
+        let ReplacementComputeImageBinding {
+            backing,
+            resource,
+            usage,
+            storage,
+        } = binding;
+        // An image binding names one texture's image over the backing. A
+        // backing bound once as a buffer and once as a texture holds both
+        // objects, and two textures declared over one range hold one image
+        // each -- only the one this binding names has its image state.
         let representation =
-            ViewRepresentation::lookup(representations, backing, BackingView::Image)
+            ViewRepresentation::lookup(representations, backing, BackingView::Image(resource))
                 .ok_or(ComputeImageStateError::RepresentationUseMismatch(backing))?;
         let image = ReplacementImageKey {
             backing,
@@ -692,7 +716,7 @@ impl ReplacementComputeProgram<ResolvedComputeDispatch> {
             // designated.
             let view = match resource.view {
                 ComputeBindingView::Buffer(_) => BackingView::Bytes,
-                ComputeBindingView::Image(_) => BackingView::Image,
+                ComputeBindingView::Image(_) => BackingView::Image(resource.resource),
             };
             let representation =
                 ViewRepresentation::lookup(representations, resource.backing, view).ok_or(
@@ -1714,11 +1738,12 @@ mod tests {
         else {
             unreachable!()
         };
+        let resource = ResourceId::<ResourceObject>::new(9, 1);
         let representation = owner
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
-                BackingView::Image,
+                BackingView::Image(resource),
                 (),
             )
             .unwrap();
@@ -1731,7 +1756,6 @@ mod tests {
         {
             owner.complete_transfer(transfer).unwrap();
         }
-        let resource = ResourceId::<ResourceObject>::new(9, 1);
         let binding = |class, binding, mode| ResolvedComputeResourceBinding {
             class,
             binding,

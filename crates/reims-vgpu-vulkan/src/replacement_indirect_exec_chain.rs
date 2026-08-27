@@ -1692,8 +1692,8 @@ mod tests {
         fn resolve(
             &self,
             _: BackingId,
-        ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
-            None
+        ) -> Box<[crate::replacement_barrier_record::NativeBarrierResolution]> {
+            Box::new([])
         }
     }
 

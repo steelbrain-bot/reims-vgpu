@@ -70,7 +70,14 @@ pub struct NativeBarrierResolution {
 }
 
 pub trait ReplacementBarrierResolver {
-    fn resolve(&self, backing: BackingId) -> Option<NativeBarrierResolution>;
+    /// Every native object over one backing's bytes.
+    ///
+    /// A backing carries a buffer and an image for each texture declared over
+    /// its range, and a barrier moves no content, so it applies to all of
+    /// them. Resolving one and barriering it left every other alias of the
+    /// same bytes unsynchronized. An empty slice is a backing this resolver
+    /// does not know.
+    fn resolve(&self, backing: BackingId) -> Box<[NativeBarrierResolution]>;
 }
 
 pub trait ReplacementBarrierResourceResolver {
@@ -212,17 +219,20 @@ pub fn resolve_hazard_barriers(
                     .dst_access_mask(barrier.destination.access),
             ),
             BarrierTarget::Backing { backing, scope } => {
-                let resolution = resolver
-                    .resolve(backing)
-                    .ok_or(BarrierRecordError::UnknownBacking(backing))?;
-                resolve_backing(
-                    barrier.source,
-                    barrier.destination,
-                    backing,
-                    scope,
-                    resolution,
-                    &mut batch,
-                )?;
+                let resolutions = resolver.resolve(backing);
+                if resolutions.is_empty() {
+                    return Err(BarrierRecordError::UnknownBacking(backing));
+                }
+                for resolution in resolutions {
+                    resolve_backing(
+                        barrier.source,
+                        barrier.destination,
+                        backing,
+                        scope,
+                        resolution,
+                        &mut batch,
+                    )?;
+                }
             }
         }
     }
@@ -278,21 +288,23 @@ pub fn resolve_explicit_barrier(
                 backings.extend(aliases);
             }
             for backing in backings {
-                let resolution =
-                    native
-                        .resolve(backing)
-                        .ok_or(ExplicitBarrierResolveError::Native(
-                            BarrierRecordError::UnknownBacking(backing),
-                        ))?;
-                resolve_backing(
-                    source,
-                    destination,
-                    backing,
-                    BackingBarrierScope::WholeBacking,
-                    resolution,
-                    &mut batch,
-                )
-                .map_err(ExplicitBarrierResolveError::Native)?;
+                let resolutions = native.resolve(backing);
+                if resolutions.is_empty() {
+                    return Err(ExplicitBarrierResolveError::Native(
+                        BarrierRecordError::UnknownBacking(backing),
+                    ));
+                }
+                for resolution in resolutions {
+                    resolve_backing(
+                        source,
+                        destination,
+                        backing,
+                        BackingBarrierScope::WholeBacking,
+                        resolution,
+                        &mut batch,
+                    )
+                    .map_err(ExplicitBarrierResolveError::Native)?;
+                }
             }
         }
     }
@@ -601,7 +613,7 @@ mod tests {
     struct Resolver(BTreeMap<BackingId, NativeBarrierTarget>);
 
     impl ReplacementBarrierResolver for Resolver {
-        fn resolve(&self, backing: BackingId) -> Option<NativeBarrierResolution> {
+        fn resolve(&self, backing: BackingId) -> Box<[NativeBarrierResolution]> {
             self.0
                 .get(&backing)
                 .copied()
@@ -612,6 +624,8 @@ mod tests {
                         reims_vgpu_protocol::RepresentationId::new(1),
                     ),
                 })
+                .into_iter()
+                .collect()
         }
     }
 

@@ -2904,7 +2904,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .create_execution_representation(
                 backing,
                 route,
-                reims_vgpu_core::BackingView::Image,
+                reims_vgpu_core::BackingView::Image(resource),
                 native,
             )
             .map_err(|failure| {
@@ -3209,10 +3209,14 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .ok_or(ReplacementRepresentationConstructionError::StorageAbsent(
                 resource,
             ))?;
+        // The base's image, because a binding view has none of its own: it is
+        // installed onto the image the texture it views was materialized with.
+        // For a plane view the base is that plane, which is the resource its
+        // own materialization keyed the image by.
         let representation = self
             .epoch
             .resources
-            .execution_representation_id(backing)
+            .execution_representation_id(backing, reims_vgpu_core::BackingView::Image(view.base))
             .map_err(ReplacementRepresentationConstructionError::Lifecycle)?;
         let native = self
             .epoch
@@ -3526,11 +3530,13 @@ impl ReplacementExecResourceManifest {
         &self,
         resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
     ) -> bool {
+        // Membership, not identity of a single designation: a backing carries
+        // one image per texture declared over it, and replacement retires them
+        // together, so a recorded identity is current exactly while it is
+        // still one of them.
         self.upload_representations
             .iter()
-            .all(|(&backing, &representation)| {
-                resources.execution_representation_id(backing) == Ok(representation)
-            })
+            .all(|(&backing, &representation)| resources.is_designated(backing, representation))
     }
 
     fn upload_content_matches(
@@ -3538,15 +3544,22 @@ impl ReplacementExecResourceManifest {
         resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
     ) -> bool {
         self.content_requirements.iter().all(|request| {
-            let Ok(representation) = resources.execution_representation_id(request.backing) else {
+            let Ok(designated) = resources.designated_views(request.backing) else {
                 return false;
             };
+            if designated.is_empty() {
+                return false;
+            }
             let Ok(snapshot) = resources.snapshot_content(request.backing, &request.regions) else {
                 return false;
             };
-            resources
-                .representation_matches(request.backing, representation, &snapshot)
-                .unwrap_or(false)
+            // Every image over these bytes holds its own copy, so the upload's
+            // content requirement is met only when all of them hold it.
+            designated.into_iter().all(|(_, representation)| {
+                resources
+                    .representation_matches(request.backing, representation, &snapshot)
+                    .unwrap_or(false)
+            })
         })
     }
 }
@@ -7134,19 +7147,28 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     pub fn execution_representation_coverage(
         &self,
         backing: reims_vgpu_protocol::BackingId,
-    ) -> Option<(reims_vgpu_protocol::RepresentationId, String)> {
-        let (representation, coverage) = self
-            .execution
-            .resources()
-            .execution_representation_coverage(backing)?;
-        Some((
-            representation,
-            coverage
-                .iter()
-                .map(|held| format!("{:?}@{}", held.region, held.version.get()))
-                .collect::<Vec<_>>()
-                .join(","),
-        ))
+    ) -> Vec<(reims_vgpu_protocol::RepresentationId, String)> {
+        let resources = self.execution.resources();
+        let Ok(designated) = resources.designated_views(backing) else {
+            return Vec::new();
+        };
+        // Every view, because a stale refusal names only the backing and the
+        // stale one may be any image over it.
+        designated
+            .into_iter()
+            .filter_map(|(view, _)| {
+                let (representation, coverage) =
+                    resources.execution_representation_coverage(backing, view)?;
+                Some((
+                    representation,
+                    coverage
+                        .iter()
+                        .map(|held| format!("{:?}@{}", held.region, held.version.get()))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ))
+            })
+            .collect()
     }
 
     /// Every transaction a parked recording map still holds.
@@ -11069,7 +11091,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .map(|(position, ops, target)| {
                 let execution_representation = || {
                     resources
-                        .execution_representation_id(target.backing)
+                        .any_designated_representation(target.backing)
                         .map_err(|reason| {
                             ReplacementExecResourceReadinessError::ValidityRepresentation {
                                 backing: target.backing,
@@ -11085,7 +11107,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 let (host_ingress_destination, guest_upload_destination) = if ops.clear_host_valid
                     != 0
                 {
-                    let representation = match resources.execution_representation_id(target.backing)
+                    // A storage question -- which route these bytes stage
+                    // through -- so any image over them answers it.
+                    let representation = match resources
+                        .any_designated_representation(target.backing)
                     {
                         Ok(representation) => Some(representation),
                         Err(
@@ -11147,7 +11172,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                         (None, reims_vgpu_core::GUEST_REPRESENTATION)
                     } else {
                         let representation = resources
-                            .execution_representation_for_snapshot(target.backing, &snapshot)
+                            .designated_representation_for_snapshot(target.backing, &snapshot)
                             .map_err(|reason| {
                                 ReplacementExecResourceReadinessError::ValidityRepresentation {
                                     backing: target.backing,
@@ -11214,8 +11239,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     .entry(request.backing)
                     .or_default()
                     .extend(request.regions.iter().copied());
+                // One representative identity for readiness bookkeeping: the
+                // predicate below compares it against the validity record,
+                // which names the same representative. The per-image fan-out
+                // is content synchronization's, which plans a transfer for
+                // every view over these bytes.
                 let destination = resources
-                    .execution_representation_id(request.backing)
+                    .any_designated_representation(request.backing)
                     .map_err(|reason| {
                         ReplacementExecResourceReadinessError::ValidityRepresentation {
                             backing: request.backing,
@@ -11276,7 +11306,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     regions,
                     permitted_pending_writes,
                 } = request;
-                let destination = match resources.execution_representation_id(backing) {
+                let destination = match resources.any_designated_representation(backing) {
                     Ok(destination) => destination,
                     Err(reason) => {
                         return Some(Err(
@@ -11412,7 +11442,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .into_iter()
             .map(|backing| {
                 resources
-                    .execution_representation_id(backing)
+                    .any_designated_representation(backing)
                     .map(|representation| (backing, representation))
                     .map_err(|reason| {
                         ReplacementExecResourceReadinessError::ValidityRepresentation {
@@ -12847,7 +12877,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             let (representation, native) = match self
                 .execution
                 .resources()
-                .execution_representation_for_snapshot(backing, &snapshot)
+                .designated_representation_for_snapshot(backing, &snapshot)
             {
                 Ok(resolved) => resolved,
                 Err(reason) => {
@@ -15136,7 +15166,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     ) -> bool {
         self.execution
             .resources()
-            .execution_representation_id(backing)
+            .any_designated_representation(backing)
             .is_ok()
     }
 

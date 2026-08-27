@@ -1510,20 +1510,30 @@ impl ReplacementBarrierResolver for ReplacementRepresentationResolver<'_> {
     fn resolve(
         &self,
         backing: BackingId,
-    ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
-        let (representation, native) = self.resources.execution_representation(backing)?;
-        let layout = native.image().and_then(|_| {
-            self.images
-                .state(ReplacementImageKey {
-                    backing,
-                    representation,
+    ) -> Box<[crate::replacement_barrier_record::NativeBarrierResolution]> {
+        let Ok(designated) = self.resources.designated_views(backing) else {
+            return Box::new([]);
+        };
+        designated
+            .into_iter()
+            .filter_map(|(view, _)| {
+                let (representation, native) =
+                    self.resources.execution_representation(backing, view)?;
+                let layout = native.image().and_then(|_| {
+                    self.images
+                        .state(ReplacementImageKey {
+                            backing,
+                            representation,
+                        })
+                        .map(|state| state.layout)
+                });
+                Some(crate::replacement_barrier_record::NativeBarrierResolution {
+                    target: native.barrier(layout),
+                    lease: native.lease(backing, representation),
                 })
-                .map(|state| state.layout)
-        });
-        Some(crate::replacement_barrier_record::NativeBarrierResolution {
-            target: native.barrier(layout),
-            lease: native.lease(backing, representation),
-        })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 }
 
@@ -1586,7 +1596,7 @@ impl ReplacementBarrierResolver for ReplacementExecutionResolver<'_> {
     fn resolve(
         &self,
         backing: BackingId,
-    ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
+    ) -> Box<[crate::replacement_barrier_record::NativeBarrierResolution]> {
         self.representations.resolve(backing)
     }
 }
@@ -2620,14 +2630,17 @@ mod tests {
                 resolver.resolve_buffer(backing, representation),
                 Some(buffer_target())
             );
+            let [resolution] = &resolver.resolve(backing)[..] else {
+                unreachable!("this backing carries one designated view")
+            };
             assert!(matches!(
-                resolver.resolve(backing).map(|resolution| resolution.target),
-                Some(NativeBarrierTarget::Buffer {
+                resolution.target,
+                NativeBarrierTarget::Buffer {
                     buffer,
                     base_offset: 16,
                     size: 96,
                     queue_families: None,
-                }) if buffer == vk::Buffer::from_raw(3)
+                } if buffer == vk::Buffer::from_raw(3)
             ));
         }
         drop(resources);
@@ -2663,7 +2676,10 @@ mod tests {
         let images = ReplacementImageStateOwner::new(VulkanDeviceEpochId::new(1));
         let resolution = {
             let resolver = ReplacementRepresentationResolver::new(&resources, &images, None);
-            resolver.resolve(backing).expect("the backing is installed")
+            let [resolution] = &resolver.resolve(backing)[..] else {
+                unreachable!("the backing is installed and carries one view")
+            };
+            resolution.clone()
         };
         drop(resources);
         // The raw handle in `resolution.target` is still named by the caller,

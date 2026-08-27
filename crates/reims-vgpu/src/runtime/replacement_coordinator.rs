@@ -6929,16 +6929,13 @@ impl ReplacementDeviceCoordinator<()> {
                 _ => None,
             })
         {
-            let Some((representation, holds)) =
-                self.runtime.execution_representation_coverage(backing)
-            else {
-                continue;
-            };
-            crate::observe::off(format!(
-                "replacement_stale_representation backing={} representation={} holds=[{holds}]",
-                backing.get(),
-                representation.get()
-            ));
+            for (representation, holds) in self.runtime.execution_representation_coverage(backing) {
+                crate::observe::off(format!(
+                    "replacement_stale_representation backing={} representation={} holds=[{holds}]",
+                    backing.get(),
+                    representation.get()
+                ));
+            }
         }
         let unowned = orphaned
             .iter()
@@ -8736,7 +8733,7 @@ mod tests {
         let first = runtime
             .execution()
             .resources()
-            .execution_representation_id(declaration.backing)
+            .any_designated_representation(declaration.backing)
             .unwrap();
 
         let replacement =
@@ -8764,7 +8761,7 @@ mod tests {
         let second = runtime
             .execution()
             .resources()
-            .execution_representation_id(declaration.backing)
+            .any_designated_representation(declaration.backing)
             .expect("a physical replacement reinstalls the execution representation");
         assert_ne!(first, second);
         complete_host_applied_cpu_packet(&mut runtime, applied, ()).unwrap();

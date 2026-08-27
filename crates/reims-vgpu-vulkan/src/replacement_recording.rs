@@ -5052,8 +5052,8 @@ mod tests {
         fn resolve(
             &self,
             _backing: reims_vgpu_protocol::BackingId,
-        ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
-            None
+        ) -> Box<[crate::replacement_barrier_record::NativeBarrierResolution]> {
+            Box::new([])
         }
     }
 

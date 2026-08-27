@@ -1271,29 +1271,68 @@ impl<T> ResourceLifecycleOwner<T> {
     pub fn execution_representation_for_snapshot(
         &self,
         backing: BackingId,
+        view: BackingView,
         snapshot: &[RegionVersion],
     ) -> Result<(RepresentationId, &T), ManagedBackingError> {
         self.native
-            .execution_representation_for_snapshot(backing, snapshot)
+            .execution_representation_for_snapshot(backing, view, snapshot)
+    }
+
+    /// See [`crate::ManagedBackingOwner::any_designated_representation`].
+    pub fn any_designated_representation(
+        &self,
+        backing: BackingId,
+    ) -> Result<RepresentationId, ManagedBackingError> {
+        self.native.any_designated_representation(backing)
+    }
+
+    /// See
+    /// [`crate::ManagedBackingOwner::designated_representation_for_snapshot`].
+    pub fn designated_representation_for_snapshot(
+        &self,
+        backing: BackingId,
+        snapshot: &[RegionVersion],
+    ) -> Result<(RepresentationId, &T), ManagedBackingError> {
+        self.native
+            .designated_representation_for_snapshot(backing, snapshot)
+    }
+
+    /// See [`crate::ManagedBackingOwner::is_designated`].
+    pub fn is_designated(&self, backing: BackingId, representation: RepresentationId) -> bool {
+        self.native.is_designated(backing, representation)
+    }
+
+    /// See [`crate::ManagedBackingOwner::designated_views`].
+    pub fn designated_views(
+        &self,
+        backing: BackingId,
+    ) -> Result<Vec<(BackingView, RepresentationId)>, ManagedBackingError> {
+        self.native.designated_views(backing)
     }
 
     pub fn execution_representation_id(
         &self,
         backing: BackingId,
+        view: BackingView,
     ) -> Result<RepresentationId, ManagedBackingError> {
-        self.native.execution_representation_id(backing)
+        self.native.execution_representation_id(backing, view)
     }
 
     /// See [`crate::ManagedBackingOwner::execution_representation_coverage`].
     pub fn execution_representation_coverage(
         &self,
         backing: BackingId,
+        view: BackingView,
     ) -> Option<(RepresentationId, Vec<crate::RegionVersion>)> {
-        self.native.execution_representation_coverage(backing)
+        self.native.execution_representation_coverage(backing, view)
     }
 
-    pub fn execution_representation(&self, backing: BackingId) -> Option<(RepresentationId, &T)> {
-        self.native.execution_representation(backing)
+    pub fn execution_representation(
+        &self,
+        backing: BackingId,
+        view: BackingView,
+    ) -> Option<(RepresentationId, &T)> {
+        self.native.execution_representation(backing, view)
     }
 
     pub fn representation(
@@ -2372,7 +2411,7 @@ mod tests {
                 if *found == backing && ready == &["old"]
         ));
         assert_eq!(
-            owner.execution_representation_id(backing),
+            owner.any_designated_representation(backing),
             Err(ManagedBackingError::MissingExecutionRepresentation)
         );
     }

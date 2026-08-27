@@ -181,24 +181,39 @@ pub(crate) fn derive_image_uses(
     representations: &[ViewRepresentation],
     final_layouts: &impl ReplacementImageFinalLayout,
 ) -> Result<Box<[ReplacementImageUse]>, ImageBlitStateError> {
-    let mut roles = BTreeMap::<BackingId, ImageRoles>::new();
+    // Keyed by the texture as well as its backing: two textures declared over
+    // one guest range are two images, and a blit between them would otherwise
+    // collapse into one entry naming a single object for both endpoints.
+    let mut roles = BTreeMap::<
+        (
+            BackingId,
+            reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+        ),
+        ImageRoles,
+    >::new();
     match operation {
         ResolvedBlit::Fill { .. } | ResolvedBlit::Copy { .. } => {
             unreachable!("PreparedImageBlit cannot contain a buffer-only variant")
         }
         ResolvedBlit::BufferToTexture(blit) => {
             roles
-                .entry(blit.destination.storage)
+                .entry((blit.destination.storage, blit.destination.resource))
                 .or_default()
                 .destination = true;
         }
         ResolvedBlit::TextureToBuffer(blit) => {
-            roles.entry(blit.source.storage).or_default().source = true;
+            roles
+                .entry((blit.source.storage, blit.source.resource))
+                .or_default()
+                .source = true;
         }
         ResolvedBlit::TextureToTexture(blit) => {
-            roles.entry(blit.source.storage).or_default().source = true;
             roles
-                .entry(blit.destination.storage)
+                .entry((blit.source.storage, blit.source.resource))
+                .or_default()
+                .source = true;
+            roles
+                .entry((blit.destination.storage, blit.destination.resource))
                 .or_default()
                 .destination = true;
         }
@@ -207,20 +222,27 @@ pub(crate) fn derive_image_uses(
                 for (source, destination) in
                     std::iter::once(&level.first_slice).chain(level.remaining_slices.iter())
                 {
-                    roles.entry(source.storage).or_default().source = true;
-                    roles.entry(destination.storage).or_default().destination = true;
+                    roles
+                        .entry((source.storage, source.resource))
+                        .or_default()
+                        .source = true;
+                    roles
+                        .entry((destination.storage, destination.resource))
+                        .or_default()
+                        .destination = true;
                 }
             }
         }
     }
     roles
         .into_iter()
-        .map(|(backing, roles)| {
-            // Image state is about the image, so it is the backing's image
-            // view that this use names — never a buffer view of the same
-            // bytes that some other endpoint of the blit reads.
+        .map(|((backing, resource), roles)| {
+            // Image state is about the image, so it is this texture's image
+            // over the backing that the use names — never a buffer view of the
+            // same bytes that some other endpoint of the blit reads, and never
+            // another texture's image over the same range.
             let representation =
-                ViewRepresentation::lookup(representations, backing, BackingView::Image)
+                ViewRepresentation::lookup(representations, backing, BackingView::Image(resource))
                     .ok_or(ImageBlitStateError::MissingRepresentation(backing))?;
             let image = ReplacementImageKey {
                 backing,
@@ -785,10 +807,14 @@ fn resolve_endpoint(
     state: &PreparedImageState,
     resolver: &impl ReplacementImageResolver,
 ) -> Result<(ReplacementImageKey, NativeImageTarget, vk::ImageLayout), ImageBlitRecordError> {
-    let representation =
-        ViewRepresentation::lookup(representations, endpoint.storage, BackingView::Image).ok_or(
-            ImageBlitRecordError::MissingRepresentation(endpoint.storage),
-        )?;
+    let representation = ViewRepresentation::lookup(
+        representations,
+        endpoint.storage,
+        BackingView::Image(endpoint.resource),
+    )
+    .ok_or(ImageBlitRecordError::MissingRepresentation(
+        endpoint.storage,
+    ))?;
     let key = ReplacementImageKey {
         backing: endpoint.storage,
         representation,
@@ -1248,12 +1274,12 @@ mod tests {
             &[
                 ViewRepresentation {
                     backing: BackingId::new(1),
-                    view: BackingView::Image,
+                    view: BackingView::Image(ResourceId::new(1, 1)),
                     representation: RepresentationId::new(11),
                 },
                 ViewRepresentation {
                     backing: BackingId::new(2),
-                    view: BackingView::Image,
+                    view: BackingView::Image(ResourceId::new(2, 1)),
                     representation: RepresentationId::new(12),
                 },
             ],
@@ -1271,7 +1297,9 @@ mod tests {
         let operation = ResolvedBlit::TextureToTexture(ResolvedTextureToTextureBlit {
             source: endpoint(1, 1),
             source_origin: TextureOrigin { x: 0, y: 0, z: 0 },
-            destination: endpoint(1, 2),
+            // One texture, so one image: two resources over one backing are
+            // two textures and would be two images.
+            destination: endpoint(1, 1),
             destination_origin: TextureOrigin { x: 4, y: 4, z: 0 },
             extent: TextureExtent {
                 width: 4,
@@ -1284,7 +1312,7 @@ mod tests {
             &operation,
             &[ViewRepresentation {
                 backing: BackingId::new(1),
-                view: BackingView::Image,
+                view: BackingView::Image(ResourceId::new(1, 1)),
                 representation: RepresentationId::new(11),
             }],
             &General,
@@ -1331,12 +1359,12 @@ mod tests {
             &[
                 ViewRepresentation {
                     backing: source.storage,
-                    view: BackingView::Image,
+                    view: BackingView::Image(source.resource),
                     representation: source_key.representation,
                 },
                 ViewRepresentation {
                     backing: destination.storage,
-                    view: BackingView::Image,
+                    view: BackingView::Image(destination.resource),
                     representation: destination_key.representation,
                 },
             ],
@@ -1393,12 +1421,12 @@ mod tests {
                 &[
                     ViewRepresentation {
                         backing: source.storage,
-                        view: BackingView::Image,
+                        view: BackingView::Image(source.resource),
                         representation: source_key.representation,
                     },
                     ViewRepresentation {
                         backing: destination.storage,
-                        view: BackingView::Image,
+                        view: BackingView::Image(destination.resource),
                         representation: destination_key.representation,
                     },
                 ],
@@ -1498,7 +1526,7 @@ mod tests {
             },
             ViewRepresentation {
                 backing: image.storage,
-                view: BackingView::Image,
+                view: BackingView::Image(image.resource),
                 representation: image_key.representation,
             },
         ];
@@ -1629,7 +1657,7 @@ mod tests {
                 },
                 ViewRepresentation {
                     backing: image.storage,
-                    view: BackingView::Image,
+                    view: BackingView::Image(image.resource),
                     representation: image_key.representation,
                 },
             ],
