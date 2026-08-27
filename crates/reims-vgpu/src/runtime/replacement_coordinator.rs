@@ -4381,6 +4381,43 @@ pub(crate) enum ReplacementCoordinatedGuestUploadSuffix<Semantic> {
     Accepted(Box<crate::runtime::replacement_session::AcceptedReplacementIndirectFinal>),
 }
 
+impl<Semantic> ReplacementCoordinatedGuestUploadSuffix<Semantic> {
+    /// The state this suffix is retained in, for the census.
+    ///
+    /// A suffix holds a position in its source domain, so one stuck here parks
+    /// every later transaction in that domain. The census used to report only
+    /// how many suffixes were live, which reads the same for a suffix that is
+    /// working and one that stopped a thousand ticks ago --- and while a
+    /// suffix sat in `preparation_failed` holding a whole domain, the only
+    /// stage list on the census belonged to a different coordinator and
+    /// printed empty. That is a zero produced by where it was sampled, and it
+    /// reads as "nothing is stuck".
+    const fn stage(&self) -> &'static str {
+        match self {
+            Self::Continuing(_) => "continuing",
+            Self::PreparationFailed(_) => "preparation_failed",
+            Self::ResolutionFailed(_) => "resolution_failed",
+            Self::DispatchFailed(_) => "dispatch_failed",
+            Self::PendingRecording(_) => "pending_recording",
+            Self::PendingRefreshRecording(_) => "pending_refresh_recording",
+            Self::RefreshResolutionFailed(_) => "refresh_resolution_failed",
+            Self::RefreshDispatchFailed(_) => "refresh_dispatch_failed",
+            Self::RefreshPreparationFailed(_) => "refresh_preparation_failed",
+            Self::RefreshEnqueueFailed(_) => "refresh_enqueue_failed",
+            Self::PendingRefresh(_) => "pending_refresh",
+            Self::RefreshAcceptanceRefused(_) => "refresh_acceptance_refused",
+            Self::RefreshAccepted(_) => "refresh_accepted",
+            Self::FinalPreparationFailed(_) => "final_preparation_failed",
+            Self::FinalEnqueueFailed(_) => "final_enqueue_failed",
+            Self::PendingFinal(_) => "pending_final",
+            Self::AcceptanceRefused(_) => "acceptance_refused",
+            Self::Accepted(_) => "accepted",
+            Self::DriverRefused { .. } => "driver_refused",
+            Self::RefreshDriverRefused { .. } => "refresh_driver_refused",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementGuestUploadSuffixProgress {
     WaitingForProducer,
@@ -4447,6 +4484,14 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
             ReplacementCoordinatedGuestUploadSuffix::Continuing(Box::new(continuing)),
         );
         Ok(transaction)
+    }
+
+    /// Which state each live suffix is retained in.
+    pub fn stages(&self) -> Vec<(reims_vgpu_protocol::TransactionId, &'static str)> {
+        self.suffixes
+            .iter()
+            .map(|(transaction, state)| (*transaction, state.stage()))
+            .collect()
     }
 
     /// Every retained suffix that stopped because a backing it reads has no
@@ -6854,8 +6899,15 @@ impl ReplacementDeviceCoordinator<()> {
             .map(|(transaction, stage)| format!("{}:{stage}", transaction.get()))
             .collect::<Vec<_>>()
             .join(",");
+        let suffix_stages = self
+            .guest_upload_suffixes
+            .stages()
+            .into_iter()
+            .map(|(transaction, stage)| format!("{}:{stage}", transaction.get()))
+            .collect::<Vec<_>>()
+            .join(",");
         crate::observe::off(format!(
-            "replacement_pipeline_census recordings={} submissions={} uploads={} upload_stages=[{upload_stages}] retired_batches={} upload_suffixes={} indirects={} ready_uploads={} ready_indirects={} parked_execs={} parked_uploads={} parked_indirects={} blocked_drains={} drain_failures={}",
+            "replacement_pipeline_census recordings={} submissions={} uploads={} upload_stages=[{upload_stages}] retired_batches={} upload_suffixes={} suffix_stages=[{suffix_stages}] indirects={} ready_uploads={} ready_indirects={} parked_execs={} parked_uploads={} parked_indirects={} blocked_drains={} drain_failures={}",
             self.exec_recordings.live_recordings(),
             self.exec_submissions.live_submissions(),
             self.guest_uploads.live_uploads(),
