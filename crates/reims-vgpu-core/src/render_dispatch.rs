@@ -175,11 +175,12 @@ pub enum RenderAttachmentClear {
 pub struct ResolvedRenderAttachment {
     pub role: RenderAttachmentRole,
     pub resource: ResourceId<ResourceObject>,
-    /// The texture that owns the native image these texels live in.
+    /// The resource that owns the native image these texels live in.
     ///
-    /// Equal to `resource` whenever the guest named a texture; a bound texture
-    /// view names its base here, because the view has no image of its own.
-    pub base: ResourceId<ResourceObject>,
+    /// Equal to `resource` whenever the guest named something that owns its
+    /// own storage; a texture view aliasing a base names that base here,
+    /// because such a view has no image of its own.
+    pub image_owner: ResourceId<ResourceObject>,
     pub backing: BackingId,
     pub regions: Box<[BackingRegion]>,
     pub pixel_format: u16,
@@ -212,11 +213,12 @@ pub struct ResolvedRenderAttachment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedRenderResolveAttachment {
     pub resource: ResourceId<ResourceObject>,
-    /// The texture that owns the native image these texels live in.
+    /// The resource that owns the native image these texels live in.
     ///
-    /// Equal to `resource` whenever the guest named a texture; a bound texture
-    /// view names its base here, because the view has no image of its own.
-    pub base: ResourceId<ResourceObject>,
+    /// Equal to `resource` whenever the guest named something that owns its
+    /// own storage; a texture view aliasing a base names that base here,
+    /// because such a view has no image of its own.
+    pub image_owner: ResourceId<ResourceObject>,
     pub backing: BackingId,
     pub regions: Box<[BackingRegion]>,
     pub pixel_format: u16,
@@ -613,7 +615,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
         let group = grouped
             .entry((
                 attachment.backing,
-                BackingView::Image(ImageOwner::base(attachment.base)),
+                BackingView::Image(ImageOwner::owning(attachment.image_owner)),
             ))
             .or_default();
         group.0.extend(attachment.regions.iter().copied());
@@ -628,7 +630,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
             let group = grouped
                 .entry((
                     resolve.backing,
-                    BackingView::Image(ImageOwner::base(resolve.base)),
+                    BackingView::Image(ImageOwner::owning(resolve.image_owner)),
                 ))
                 .or_default();
             group.0.extend(resolve.regions.iter().copied());
@@ -1101,6 +1103,7 @@ mod tests {
         ResolvedTextureBindingView {
             resource,
             base: resource,
+            image_owner: resource,
             range: ResolvedTextureViewRange {
                 level_base: 0,
                 level_count: 1,
@@ -1166,7 +1169,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
-                BackingView::Image(ImageOwner::base(resource)),
+                BackingView::Image(ImageOwner::owning(resource)),
                 (),
             )
             .unwrap();
@@ -1209,7 +1212,7 @@ mod tests {
             attachments: Box::new([ResolvedRenderAttachment {
                 role: RenderAttachmentRole::Color(0),
                 resource: ResourceId::new(4, 1),
-                base: ResourceId::new(4, 1),
+                image_owner: ResourceId::new(4, 1),
                 backing: target,
                 regions: Box::new([BackingRegion::Whole]),
                 pixel_format: 80,
@@ -1255,6 +1258,7 @@ mod tests {
         operation.resources[0].view = RenderBindingView::Image(ResolvedTextureBindingView {
             resource: view,
             base: SAMPLED,
+            image_owner: SAMPLED,
             ..image_view(SAMPLED)
         });
         let prepared = prepare_render_dispatch(
@@ -1267,12 +1271,13 @@ mod tests {
         )
         .unwrap();
         assert!(prepared.representations().iter().any(|entry| {
-            entry.backing == sampled && entry.view == BackingView::Image(ImageOwner::base(SAMPLED))
+            entry.backing == sampled
+                && entry.view == BackingView::Image(ImageOwner::owning(SAMPLED))
         }));
         assert!(!prepared
             .representations()
             .iter()
-            .any(|entry| { entry.view == BackingView::Image(ImageOwner::base(view)) }));
+            .any(|entry| { entry.view == BackingView::Image(ImageOwner::owning(view)) }));
         cancel_prepared_render_dispatch(&mut owner, prepared).unwrap();
     }
 
@@ -1670,7 +1675,7 @@ mod tests {
         operation.attachments[0].sample_count = 4;
         operation.attachments[0].resolve = Some(ResolvedRenderResolveAttachment {
             resource: ResourceId::new(6, 1),
-            base: ResourceId::new(6, 1),
+            image_owner: ResourceId::new(6, 1),
             backing: resolve,
             regions: Box::new([BackingRegion::Whole]),
             pixel_format: operation.attachments[0].pixel_format,

@@ -655,6 +655,7 @@ mod tests {
         ResolvedTextureBindingView {
             resource,
             base: resource,
+            image_owner: resource,
             range: ResolvedTextureViewRange {
                 level_base: 0,
                 level_count: 1,
@@ -928,7 +929,7 @@ mod tests {
         let stale = view_backing(
             &mut owner,
             false,
-            BackingView::Image(ImageOwner::base(ResourceId::new(6, 1))),
+            BackingView::Image(ImageOwner::owning(ResourceId::new(6, 1))),
         );
         let mut operation = dispatch(writable, AccessMode::Write);
         let mut resources = operation.resources.into_vec();

@@ -75,6 +75,12 @@ pub struct ResolvedTextureView {
 pub struct ResolvedTextureBindingView {
     pub resource: AnyResourceId,
     pub base: AnyResourceId,
+    /// The resource that owns the native image this binding reads through.
+    ///
+    /// Not always `base`: a view aliasing its base's storage reads the base's
+    /// image, but an IOSurface plane view owns the plane it names and so owns
+    /// its own. See [`ResourceGraph::image_owner`].
+    pub image_owner: AnyResourceId,
     pub range: ResolvedTextureViewRange,
     pub texture_type: TextureType,
     pub pixel_format: u16,
@@ -783,6 +789,39 @@ impl ResourceGraph {
     /// through explicit parent/view relations. The wider alias closure is not
     /// eligible: overlapping allocations may legitimately contribute several
     /// hazard identities, while an endpoint must name one storage object.
+    /// The resource that owns the image one binding reads through.
+    ///
+    /// A resource owning storage *is* its backing, so it owns the native image
+    /// over that storage. A texture view aliases its base's storage and owns
+    /// none, so it reads the base's image; an IOSurface plane view owns the
+    /// plane it names, so it owns its own image while its parent surface owns
+    /// the whole allocation. The view chain's base answers only the first of
+    /// those, which is why this walks storage ownership and not the chain.
+    ///
+    /// `None` where nothing in the chain owns storage, which is a resource
+    /// with no backing rather than a resource whose owner is ambiguous.
+    pub fn image_owner(&self, id: AnyResourceId) -> Option<AnyResourceId> {
+        let mut pending = vec![id];
+        let mut visited = BTreeSet::new();
+        let mut resolved = None;
+        while let Some(resource_id) = pending.pop() {
+            let resource = self.resources.get(&resource_id)?;
+            if !visited.insert(resource_id) {
+                continue;
+            }
+            if resource.storage.is_some() {
+                match resolved {
+                    None => resolved = Some(resource_id),
+                    Some(existing) if existing == resource_id => {}
+                    Some(_) => return None,
+                }
+                continue;
+            }
+            pending.extend(resource.parents.iter().copied());
+        }
+        resolved
+    }
+
     pub fn resolved_backing(&self, id: AnyResourceId) -> Option<BackingId> {
         self.resources.get(&id)?;
         let mut pending = vec![id];
@@ -1285,6 +1324,9 @@ impl ResourceGraph {
         Ok(ResolvedTextureBindingView {
             resource,
             base: resolved.base,
+            // Storage ownership, not the view chain: a plane view owns its
+            // plane's image while its parent surface owns the allocation.
+            image_owner: self.image_owner(resource).unwrap_or(resolved.base),
             range,
             texture_type,
             pixel_format: resolved.pixel_format.unwrap_or(base_pixel_format),
@@ -2570,6 +2612,15 @@ mod tests {
             [first, second]
         );
 
+        // Each plane view owns the image over its own plane. The view chain's
+        // base is the surface, which owns no storage and therefore no image,
+        // so an owner read off the chain would send both planes' bindings to
+        // one image that was never built.
+        for view in views {
+            assert_eq!(graph.image_owner(view), Some(view));
+        }
+        assert_eq!(graph.image_owner(surface), None);
+
         // A guest write to the allocation reaches both planes, because the
         // alias closure follows the surface's children whether or not they
         // share its authority.
@@ -3147,6 +3198,7 @@ mod tests {
             ResolvedTextureBindingView {
                 resource: outer,
                 base,
+                image_owner: base,
                 range: ResolvedTextureViewRange {
                     level_base: 3,
                     level_count: 2,

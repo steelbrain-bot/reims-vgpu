@@ -4950,7 +4950,7 @@ mod tests {
     fn image_endpoint(backing: u64, resource: u32) -> ResolvedTextureEndpoint {
         ResolvedTextureEndpoint {
             resource: ResourceId::new(resource, 1),
-            base: ResourceId::new(resource, 1),
+            image_owner: ResourceId::new(resource, 1),
             storage: reims_vgpu_protocol::BackingId::new(backing),
             level: 0,
             slice: 0,

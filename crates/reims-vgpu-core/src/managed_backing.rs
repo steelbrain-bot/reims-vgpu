@@ -125,19 +125,19 @@ pub struct GpuWriteReservation {
 pub struct ImageOwner(ResourceId<ResourceObject>);
 
 impl ImageOwner {
-    /// A base texture, which owns its own image.
+    /// A resource that owns the storage its image covers, and so owns the
+    /// image.
     ///
-    /// For the resolvers this is the `base` an endpoint already carries, and
-    /// for a materialized declaration it is the declared resource: a view
-    /// declares no storage and so reaches no materializer.
-    pub const fn base(texture: ResourceId<ResourceObject>) -> Self {
+    /// For the resolvers this is the owner an endpoint already carries, and
+    /// for a materialized declaration it is the declared resource: what
+    /// reaches a materializer owns storage by construction.
+    pub const fn owning(texture: ResourceId<ResourceObject>) -> Self {
         Self(texture)
     }
 
-    /// The base a resolved binding reads through, which owns the image
-    /// whatever the guest named.
+    /// The owner a resolved binding reads through, whatever the guest named.
     pub const fn of_view(view: crate::ResolvedTextureBindingView) -> Self {
-        Self(view.base)
+        Self(view.image_owner)
     }
 
     /// The owning texture, for diagnostics and for the graph lookups keyed by
@@ -2843,8 +2843,8 @@ mod tests {
     #[test]
     fn two_textures_over_one_backing_each_get_their_own_image() {
         let (mut owner, backing) = owner();
-        let wide = BackingView::Image(ImageOwner::base(ResourceId::new(7, 1)));
-        let narrow = BackingView::Image(ImageOwner::base(ResourceId::new(8, 1)));
+        let wide = BackingView::Image(ImageOwner::owning(ResourceId::new(7, 1)));
+        let narrow = BackingView::Image(ImageOwner::owning(ResourceId::new(8, 1)));
 
         let wide_representation = owner
             .create_execution_representation(
@@ -2885,7 +2885,7 @@ mod tests {
         assert_eq!(
             owner.view_representation(
                 backing,
-                BackingView::Image(ImageOwner::base(ResourceId::new(9, 1)))
+                BackingView::Image(ImageOwner::owning(ResourceId::new(9, 1)))
             ),
             Err(ManagedBackingError::MissingExecutionRepresentation)
         );

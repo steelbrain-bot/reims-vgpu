@@ -1211,6 +1211,7 @@ mod tests {
         reims_vgpu_core::ResolvedTextureBindingView {
             resource,
             base: resource,
+            image_owner: resource,
             range: reims_vgpu_core::ResolvedTextureViewRange {
                 level_base: 0,
                 level_count: 1,
@@ -1750,7 +1751,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
-                BackingView::Image(reims_vgpu_core::ImageOwner::base(resource)),
+                BackingView::Image(reims_vgpu_core::ImageOwner::owning(resource)),
                 (),
             )
             .unwrap();

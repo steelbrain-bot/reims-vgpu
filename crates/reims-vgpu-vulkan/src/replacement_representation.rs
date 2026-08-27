@@ -2356,6 +2356,7 @@ mod tests {
         let semantic = reims_vgpu_core::ResolvedTextureBindingView {
             resource: ResourceId::new(9, 3),
             base: ResourceId::new(2, 1),
+            image_owner: ResourceId::new(2, 1),
             range: reims_vgpu_core::ResolvedTextureViewRange {
                 level_base: 1,
                 level_count: 2,
@@ -2732,6 +2733,7 @@ mod tests {
         let whole = reims_vgpu_core::ResolvedTextureBindingView {
             resource,
             base: resource,
+            image_owner: resource,
             range: reims_vgpu_core::ResolvedTextureViewRange {
                 level_base: 0,
                 level_count: 2,

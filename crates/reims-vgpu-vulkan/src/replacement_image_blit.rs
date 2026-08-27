@@ -193,7 +193,7 @@ pub(crate) fn derive_image_uses(
             roles
                 .entry((
                     blit.destination.storage,
-                    reims_vgpu_core::ImageOwner::base(blit.destination.base),
+                    reims_vgpu_core::ImageOwner::owning(blit.destination.image_owner),
                 ))
                 .or_default()
                 .destination = true;
@@ -202,7 +202,7 @@ pub(crate) fn derive_image_uses(
             roles
                 .entry((
                     blit.source.storage,
-                    reims_vgpu_core::ImageOwner::base(blit.source.base),
+                    reims_vgpu_core::ImageOwner::owning(blit.source.image_owner),
                 ))
                 .or_default()
                 .source = true;
@@ -211,14 +211,14 @@ pub(crate) fn derive_image_uses(
             roles
                 .entry((
                     blit.source.storage,
-                    reims_vgpu_core::ImageOwner::base(blit.source.base),
+                    reims_vgpu_core::ImageOwner::owning(blit.source.image_owner),
                 ))
                 .or_default()
                 .source = true;
             roles
                 .entry((
                     blit.destination.storage,
-                    reims_vgpu_core::ImageOwner::base(blit.destination.base),
+                    reims_vgpu_core::ImageOwner::owning(blit.destination.image_owner),
                 ))
                 .or_default()
                 .destination = true;
@@ -231,14 +231,14 @@ pub(crate) fn derive_image_uses(
                     roles
                         .entry((
                             source.storage,
-                            reims_vgpu_core::ImageOwner::base(source.base),
+                            reims_vgpu_core::ImageOwner::owning(source.image_owner),
                         ))
                         .or_default()
                         .source = true;
                     roles
                         .entry((
                             destination.storage,
-                            reims_vgpu_core::ImageOwner::base(destination.base),
+                            reims_vgpu_core::ImageOwner::owning(destination.image_owner),
                         ))
                         .or_default()
                         .destination = true;
@@ -822,7 +822,7 @@ fn resolve_endpoint(
     let representation = ViewRepresentation::lookup(
         representations,
         endpoint.storage,
-        BackingView::Image(reims_vgpu_core::ImageOwner::base(endpoint.base)),
+        BackingView::Image(reims_vgpu_core::ImageOwner::owning(endpoint.image_owner)),
     )
     .ok_or(ImageBlitRecordError::MissingRepresentation(
         endpoint.storage,
@@ -1139,7 +1139,7 @@ mod tests {
     fn endpoint(backing: u64, resource: u32) -> ResolvedTextureEndpoint {
         ResolvedTextureEndpoint {
             resource: ResourceId::new(resource, 1),
-            base: ResourceId::new(resource, 1),
+            image_owner: ResourceId::new(resource, 1),
             storage: reims_vgpu_protocol::BackingId::new(backing),
             level: 0,
             slice: 0,
@@ -1287,14 +1287,14 @@ mod tests {
             &[
                 ViewRepresentation {
                     backing: BackingId::new(1),
-                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(ResourceId::new(
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::owning(ResourceId::new(
                         1, 1,
                     ))),
                     representation: RepresentationId::new(11),
                 },
                 ViewRepresentation {
                     backing: BackingId::new(2),
-                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(ResourceId::new(
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::owning(ResourceId::new(
                         2, 1,
                     ))),
                     representation: RepresentationId::new(12),
@@ -1329,7 +1329,9 @@ mod tests {
             &operation,
             &[ViewRepresentation {
                 backing: BackingId::new(1),
-                view: BackingView::Image(reims_vgpu_core::ImageOwner::base(ResourceId::new(1, 1))),
+                view: BackingView::Image(reims_vgpu_core::ImageOwner::owning(ResourceId::new(
+                    1, 1,
+                ))),
                 representation: RepresentationId::new(11),
             }],
             &General,
@@ -1376,12 +1378,12 @@ mod tests {
             &[
                 ViewRepresentation {
                     backing: source.storage,
-                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(source.resource)),
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::owning(source.resource)),
                     representation: source_key.representation,
                 },
                 ViewRepresentation {
                     backing: destination.storage,
-                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::owning(
                         destination.resource,
                     )),
                     representation: destination_key.representation,
@@ -1440,14 +1442,14 @@ mod tests {
                 &[
                     ViewRepresentation {
                         backing: source.storage,
-                        view: BackingView::Image(reims_vgpu_core::ImageOwner::base(
+                        view: BackingView::Image(reims_vgpu_core::ImageOwner::owning(
                             source.resource
                         )),
                         representation: source_key.representation,
                     },
                     ViewRepresentation {
                         backing: destination.storage,
-                        view: BackingView::Image(reims_vgpu_core::ImageOwner::base(
+                        view: BackingView::Image(reims_vgpu_core::ImageOwner::owning(
                             destination.resource
                         )),
                         representation: destination_key.representation,
@@ -1549,7 +1551,7 @@ mod tests {
             },
             ViewRepresentation {
                 backing: image.storage,
-                view: BackingView::Image(reims_vgpu_core::ImageOwner::base(image.resource)),
+                view: BackingView::Image(reims_vgpu_core::ImageOwner::owning(image.resource)),
                 representation: image_key.representation,
             },
         ];
@@ -1680,7 +1682,7 @@ mod tests {
                 },
                 ViewRepresentation {
                     backing: image.storage,
-                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(image.resource)),
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::owning(image.resource)),
                     representation: image_key.representation,
                 },
             ],

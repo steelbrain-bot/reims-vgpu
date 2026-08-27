@@ -814,7 +814,7 @@ impl ReplacementRenderImageBindings for ResolvedRenderDispatch {
             .flat_map(|attachment| {
                 std::iter::once(attachment_binding(
                     attachment.backing,
-                    reims_vgpu_core::ImageOwner::base(attachment.base),
+                    reims_vgpu_core::ImageOwner::owning(attachment.image_owner),
                     attachment.role,
                     attachment.feedback_loop,
                     attachment.input_attachment,
@@ -826,7 +826,7 @@ impl ReplacementRenderImageBindings for ResolvedRenderDispatch {
                     // attachment however the attachment it resolves is read.
                     attachment_binding(
                         resolve.backing,
-                        reims_vgpu_core::ImageOwner::base(resolve.base),
+                        reims_vgpu_core::ImageOwner::owning(resolve.image_owner),
                         attachment.role,
                         false,
                         false,
@@ -1433,7 +1433,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                 backing: attachment.backing,
                 representation: image_view(
                     attachment.backing,
-                    reims_vgpu_core::ImageOwner::base(attachment.base),
+                    reims_vgpu_core::ImageOwner::owning(attachment.image_owner),
                 )?,
             };
             validate_attachment_target(key, attachment, target, pipeline.sample_count)?;
@@ -1474,7 +1474,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                     backing: resolve.backing,
                     representation: image_view(
                         resolve.backing,
-                        reims_vgpu_core::ImageOwner::base(resolve.base),
+                        reims_vgpu_core::ImageOwner::owning(resolve.image_owner),
                     )?,
                 };
                 validate_resolve_target(key, attachment.role, resolve, target)?;
@@ -1530,7 +1530,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                     backing: first.backing,
                     representation: image_view(
                         first.backing,
-                        reims_vgpu_core::ImageOwner::base(first.base),
+                        reims_vgpu_core::ImageOwner::owning(first.image_owner),
                     )?,
                 };
                 validate_attachment_target(first_key, first, first_target, pipeline.sample_count)?;
@@ -1540,7 +1540,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                         backing: second.backing,
                         representation: image_view(
                             second.backing,
-                            reims_vgpu_core::ImageOwner::base(second.base),
+                            reims_vgpu_core::ImageOwner::owning(second.image_owner),
                         )?,
                     };
                     validate_attachment_target(
@@ -1581,7 +1581,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                         backing: first_resolve.backing,
                         representation: image_view(
                             first_resolve.backing,
-                            reims_vgpu_core::ImageOwner::base(first_resolve.base),
+                            reims_vgpu_core::ImageOwner::owning(first_resolve.image_owner),
                         )?,
                     };
                     validate_resolve_target(
@@ -1600,7 +1600,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                             backing: second.backing,
                             representation: image_view(
                                 second.backing,
-                                reims_vgpu_core::ImageOwner::base(second.base),
+                                reims_vgpu_core::ImageOwner::owning(second.image_owner),
                             )?,
                         };
                         validate_resolve_target(
@@ -1940,7 +1940,7 @@ fn attachment_target(
         representation: ViewRepresentation::lookup(
             representations,
             attachment.backing,
-            BackingView::Image(reims_vgpu_core::ImageOwner::base(attachment.base)),
+            BackingView::Image(reims_vgpu_core::ImageOwner::owning(attachment.image_owner)),
         )
         .ok_or(RenderRecordError::RepresentationUseMismatch(
             attachment.backing,
@@ -1964,7 +1964,7 @@ fn resolve_target(
         representation: ViewRepresentation::lookup(
             representations,
             resolve.backing,
-            BackingView::Image(reims_vgpu_core::ImageOwner::base(resolve.base)),
+            BackingView::Image(reims_vgpu_core::ImageOwner::owning(resolve.image_owner)),
         )
         .ok_or(RenderRecordError::RepresentationUseMismatch(
             resolve.backing,
@@ -2587,7 +2587,7 @@ mod tests {
         let attachment = |pixel_format, extent: [u32; 3], sample_count| ResolvedRenderAttachment {
             role: RenderAttachmentRole::Color(0),
             resource: ResourceId::new(1, 1),
-            base: ResourceId::new(1, 1),
+            image_owner: ResourceId::new(1, 1),
             backing: BackingId::new(1),
             regions: Box::new([BackingRegion::Whole]),
             pixel_format,
@@ -2713,6 +2713,7 @@ mod tests {
         reims_vgpu_core::ResolvedTextureBindingView {
             resource,
             base: resource,
+            image_owner: resource,
             range: reims_vgpu_core::ResolvedTextureViewRange {
                 level_base: 0,
                 level_count: 1,
@@ -3038,7 +3039,7 @@ mod tests {
         view_backing(
             owner,
             current,
-            BackingView::Image(reims_vgpu_core::ImageOwner::base(resource)),
+            BackingView::Image(reims_vgpu_core::ImageOwner::owning(resource)),
         )
     }
 
@@ -3082,7 +3083,7 @@ mod tests {
         ResolvedRenderAttachment {
             role,
             resource: ResourceId::new(u32::from(format), 1),
-            base: ResourceId::new(u32::from(format), 1),
+            image_owner: ResourceId::new(u32::from(format), 1),
             backing: BackingId::new(u64::from(format)),
             regions: Box::new([BackingRegion::Whole]),
             pixel_format: format,
@@ -3343,7 +3344,7 @@ mod tests {
         attachment.store = StoreAction::StoreAndMultisampleResolve;
         attachment.resolve = Some(reims_vgpu_core::ResolvedRenderResolveAttachment {
             resource: ResourceId::new(81, 1),
-            base: ResourceId::new(81, 1),
+            image_owner: ResourceId::new(81, 1),
             backing: resolved,
             regions: Box::new([BackingRegion::Whole]),
             pixel_format: 80,
@@ -3691,7 +3692,7 @@ mod tests {
             attachments: Box::new([ResolvedRenderAttachment {
                 role: RenderAttachmentRole::Color(0),
                 resource: ResourceId::<ResourceObject>::new(4, 1),
-                base: ResourceId::<ResourceObject>::new(4, 1),
+                image_owner: ResourceId::<ResourceObject>::new(4, 1),
                 backing: attachment,
                 regions: Box::new([BackingRegion::Whole]),
                 pixel_format: 80,
@@ -4015,7 +4016,7 @@ mod tests {
                 ResolvedRenderAttachment {
                     role: RenderAttachmentRole::Depth,
                     resource: ResourceId::new(5, 1),
-                    base: ResourceId::new(5, 1),
+                    image_owner: ResourceId::new(5, 1),
                     backing: depth_stencil,
                     regions: Box::new([BackingRegion::Whole]),
                     pixel_format: 252,
@@ -4031,7 +4032,7 @@ mod tests {
                 ResolvedRenderAttachment {
                     role: RenderAttachmentRole::Stencil,
                     resource: ResourceId::new(5, 1),
-                    base: ResourceId::new(5, 1),
+                    image_owner: ResourceId::new(5, 1),
                     backing: depth_stencil,
                     regions: Box::new([BackingRegion::Whole]),
                     pixel_format: 252,
@@ -4136,7 +4137,7 @@ mod tests {
             attachments: Box::new([ResolvedRenderAttachment {
                 role: RenderAttachmentRole::Color(0),
                 resource: ResourceId::new(5, 1),
-                base: ResourceId::new(5, 1),
+                image_owner: ResourceId::new(5, 1),
                 backing: attachment,
                 regions: Box::new([BackingRegion::Whole]),
                 pixel_format: 80,
@@ -4147,7 +4148,7 @@ mod tests {
                 clear: RenderAttachmentClear::Color([0; 4]),
                 resolve: Some(reims_vgpu_core::ResolvedRenderResolveAttachment {
                     resource: ResourceId::new(6, 1),
-                    base: ResourceId::new(6, 1),
+                    image_owner: ResourceId::new(6, 1),
                     backing: resolve,
                     regions: Box::new([BackingRegion::Whole]),
                     pixel_format: 80,

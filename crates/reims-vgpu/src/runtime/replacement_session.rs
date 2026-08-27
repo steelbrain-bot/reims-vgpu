@@ -2909,7 +2909,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .create_execution_representation(
                 backing,
                 route,
-                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::base(resource)),
+                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::owning(resource)),
                 native,
             )
             .map_err(|failure| {
@@ -3223,7 +3223,9 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .resources
             .execution_representation_id(
                 backing,
-                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::base(view.base)),
+                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::owning(
+                    view.image_owner,
+                )),
             )
             .map_err(ReplacementRepresentationConstructionError::Lifecycle)?;
         let native = self
@@ -6896,9 +6898,10 @@ pub(crate) enum ReplacementRenderAttachmentResolutionError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReplacementRenderAttachmentResource {
     pub resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
-    /// The texture that owns the image this attachment renders into. Equal to
-    /// `resource` unless the guest named a texture view.
-    pub base: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    /// The resource that owns the image this attachment renders into. Equal
+    /// to `resource` unless the guest named a view that aliases another
+    /// resource's storage.
+    pub image_owner: ResourceId<reims_vgpu_protocol::ResourceObject>,
     pub backing: reims_vgpu_protocol::BackingId,
     pub pixel_format: u16,
     pub extent: [u32; 3],
@@ -15248,7 +15251,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 Some(reims_vgpu_core::BackingView::Bytes)
             }
             reims_vgpu_protocol::ResourceDescriptor::Texture(_) => Some(
-                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::base(resource)),
+                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::owning(resource)),
             ),
             _ => None,
         }
@@ -15492,7 +15495,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         };
         Ok(reims_vgpu_core::ResolvedTextureEndpoint {
             resource,
-            base: view.base,
+            image_owner: view.image_owner,
             storage: backing,
             level,
             slice,
@@ -15593,7 +15596,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 reims_vgpu_core::TexelBox::new([0, 0, 0], extent).ok_or(Error::EmptyExtent)?;
             return Ok(ReplacementRenderAttachmentResource {
                 resource,
-                base: view.base,
+                image_owner: view.image_owner,
                 backing,
                 pixel_format: view.pixel_format,
                 extent,
@@ -15635,7 +15638,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .map_or(1, |declaration| u32::from(declaration.sample_count).max(1));
         Ok(ReplacementRenderAttachmentResource {
             resource,
-            base: view.base,
+            image_owner: view.image_owner,
             backing,
             pixel_format: view.pixel_format,
             extent,
@@ -21412,6 +21415,7 @@ mod tests {
                 reims_vgpu_core::ResolvedTextureBindingView {
                     resource,
                     base: resource,
+                    image_owner: resource,
                     range: reims_vgpu_core::ResolvedTextureViewRange {
                         level_base: 0,
                         level_count: 1,
@@ -26056,6 +26060,10 @@ mod tests {
             reims_vgpu_core::ResolvedTextureBindingView {
                 resource: view.resource,
                 base: declared.resource,
+                // The plane view owns the plane's storage, so it owns the
+                // image over it. The surface owns the allocation and no
+                // backing, so it owns no image and cannot be the owner here.
+                image_owner: view.resource,
                 range: reims_vgpu_core::ResolvedTextureViewRange {
                     level_base: 0,
                     level_count: 1,
@@ -33425,7 +33433,7 @@ mod tests {
         );
         let texture_endpoint = reims_vgpu_core::ResolvedTextureEndpoint {
             resource,
-            base: resource,
+            image_owner: resource,
             storage: backing,
             level: 0,
             slice: 0,

@@ -3019,7 +3019,7 @@ pub(crate) fn resolve_render_pass_attachments<Semantic: Clone>(
                 }
                 Ok(reims_vgpu_core::ResolvedRenderResolveAttachment {
                     resource: resolve.resource,
-                    base: resolve.base,
+                    image_owner: resolve.image_owner,
                     backing: resolve.backing,
                     regions: Box::new([resolve.region]),
                     pixel_format: resolve.pixel_format,
@@ -3031,7 +3031,7 @@ pub(crate) fn resolve_render_pass_attachments<Semantic: Clone>(
         resolved.push(ResolvedRenderAttachment {
             role,
             resource: target.resource,
-            base: target.base,
+            image_owner: target.image_owner,
             backing: target.backing,
             regions: Box::new([target.region]),
             pixel_format: target.pixel_format,
@@ -3156,7 +3156,7 @@ pub(crate) fn resolve_render_pass_attachments<Semantic: Clone>(
                 }
                 Ok(reims_vgpu_core::ResolvedRenderResolveAttachment {
                     resource: resolve.resource,
-                    base: resolve.base,
+                    image_owner: resolve.image_owner,
                     backing: resolve.backing,
                     regions: Box::new([resolve.region]),
                     pixel_format: resolve.pixel_format,
@@ -3168,7 +3168,7 @@ pub(crate) fn resolve_render_pass_attachments<Semantic: Clone>(
         resolved.push(ResolvedRenderAttachment {
             role,
             resource: target.resource,
-            base: target.base,
+            image_owner: target.image_owner,
             backing: target.backing,
             regions: Box::new([target.region]),
             pixel_format: target.pixel_format,
@@ -4842,7 +4842,7 @@ mod tests {
                 attachments: Box::new([ResolvedRenderAttachment {
                     role: RenderAttachmentRole::Color(0),
                     resource: attachment_resource,
-                    base: attachment_resource,
+                    image_owner: attachment_resource,
                     backing: attachment_backing,
                     regions: Box::new([BackingRegion::Whole]),
                     pixel_format: 80,
@@ -4867,6 +4867,7 @@ mod tests {
                         view: RenderBindingView::Image(ResolvedTextureBindingView {
                             resource: attachment_resource,
                             base: attachment_resource,
+                            image_owner: attachment_resource,
                             range: ResolvedTextureViewRange {
                                 level_base: 0,
                                 level_count: 1,
