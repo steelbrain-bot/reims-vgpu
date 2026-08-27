@@ -100,15 +100,19 @@ pub enum ReplacementExecProgramError {
 impl ReplacementExecProgramError {
     /// Whether re-offering this EXEC could ever produce a different answer.
     ///
-    /// Only the unimplemented image-view arms are terminal today. Everything
-    /// else here is either a device fault or a state a later packet supplies,
-    /// and a wrong `true` throws away guest work that would have recorded.
+    /// Only the unimplemented arms are terminal today. Everything else here is
+    /// either a device fault or a state a later packet supplies, and a wrong
+    /// `true` throws away guest work that would have recorded.
     /// See
-    /// [`crate::replacement_image_transition::TextureBindingViewDecline::is_unimplemented`].
+    /// [`crate::replacement_image_transition::TextureBindingViewDecline::is_unimplemented`]
+    /// and
+    /// [`crate::replacement_resource_state::ResourceStateTransferRecordError::is_terminal_refusal`].
     pub const fn is_terminal_refusal(&self) -> bool {
         match self {
             Self::Render(reason) => reason.is_terminal_refusal(),
             Self::Compute(reason) => reason.is_terminal_refusal(),
+            Self::ContentSynchronization(reason) => reason.is_terminal_refusal(),
+            Self::ResourceState(reason) => reason.reason.is_terminal_refusal(),
             _ => false,
         }
     }
@@ -1007,6 +1011,29 @@ mod tests {
             streams: Box::new([]),
             accesses: Box::new([]),
         }
+    }
+
+    #[test]
+    fn only_the_unrecordable_transfer_shapes_end_a_content_synchronization() {
+        use crate::replacement_resource_state::ResourceStateTransferRecordError;
+        let key = reims_vgpu_core::TransferKey {
+            backing: reims_vgpu_protocol::BackingId::new(1),
+            region: reims_vgpu_core::BackingRegion::Whole,
+            version: reims_vgpu_protocol::ContentVersion::new(1),
+            source: reims_vgpu_protocol::RepresentationId::new(2),
+            destination: reims_vgpu_protocol::RepresentationId::new(3),
+        };
+        // A shape this device does not implement cannot become recordable, so
+        // retrying it holds its submission head for the life of the boot.
+        assert!(ReplacementExecProgramError::ContentSynchronization(
+            ResourceStateTransferRecordError::ImageToImageUnsupported(key)
+        )
+        .is_terminal_refusal());
+        // A preparation a later pass supplies is a wait, not a decline.
+        assert!(!ReplacementExecProgramError::ContentSynchronization(
+            ResourceStateTransferRecordError::ImageTransferRequiresState(key)
+        )
+        .is_terminal_refusal());
     }
 
     #[test]

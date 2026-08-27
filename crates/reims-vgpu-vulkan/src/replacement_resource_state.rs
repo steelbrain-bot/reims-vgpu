@@ -54,6 +54,24 @@ pub enum ResourceStateTransferRecordError {
     HostLandingRangeOutOfBounds(HostLandingKey),
 }
 
+impl ResourceStateTransferRecordError {
+    /// Whether re-offering this transfer could ever produce a different answer.
+    ///
+    /// Only the shapes this device does not implement are terminal. Both name
+    /// a property of the transfer itself -- two image endpoints, or a linear
+    /// layout the buffer/image copy cannot express -- so no later packet
+    /// supplies anything that changes them, and retrying holds a submission
+    /// head forever. Everything else here is either a device fault or a state
+    /// a later packet supplies, and a wrong `true` throws away guest work that
+    /// would have recorded.
+    pub const fn is_terminal_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::ImageToImageUnsupported(_) | Self::ImageLayoutUnsupported(_)
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeResourceStateTransfer {
     Buffer(NativeBufferBlit),
@@ -742,8 +760,15 @@ fn resolve_transfer(
         return resolve_buffer_transfer(backings, transfer, resolver)
             .map(NativeResourceStateTransfer::Buffer);
     }
-    let state = image_state
-        .ok_or(ResourceStateTransferRecordError::ImageTransferRequiresState(transfer))?;
+    // The prepared image state is a prerequisite of exactly one endpoint
+    // shape -- the buffer/image pair below is the only arm that reads it.
+    // Demanding it before the shape is known reports every *other* shape as a
+    // missing preparation, which reads as "not ready yet" and is retried
+    // forever, when the truth is a transfer this device cannot record at all
+    // and must decline once by its own name.
+    let state = || {
+        image_state.ok_or(ResourceStateTransferRecordError::ImageTransferRequiresState(transfer))
+    };
     match (
         source_buffer,
         source_image,
@@ -756,11 +781,17 @@ fn resolve_transfer(
             image,
             destination_key,
             true,
-            state,
+            state()?,
             resolver,
         ),
         (None, Some(image), Some(buffer), None) => resolve_buffer_image_transfer(
-            transfer, buffer, image, source_key, false, state, resolver,
+            transfer,
+            buffer,
+            image,
+            source_key,
+            false,
+            state()?,
+            resolver,
         ),
         (None, Some(_), None, Some(_)) => Err(
             ResourceStateTransferRecordError::ImageToImageUnsupported(transfer),
@@ -1416,6 +1447,60 @@ mod tests {
         assert!(matches!(
             ReplacementResourceStateProgram::resolve(&prepared, &resolver),
             Err(ResourceStateTransferRecordError::ImageTransferRequiresState(found))
+                if found == key
+        ));
+    }
+
+    #[test]
+    fn an_unrecordable_image_pair_names_its_shape_and_not_a_missing_state() {
+        use crate::replacement_image_transition::{NativeImageTarget, ReplacementImageResolver};
+        // A transfer whose endpoints are both images can never be recorded,
+        // whatever preparation runs. Naming it as a missing image state makes
+        // a permanent refusal look like a wait, and the channel retries it
+        // forever behind its own submission head.
+        struct BothImages {
+            backing: BackingId,
+        }
+        impl ReplacementBufferResolver for BothImages {
+            fn resolve_buffer(
+                &self,
+                _backing: BackingId,
+                _representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                None
+            }
+        }
+        impl ReplacementImageResolver for BothImages {
+            fn resolve_image(&self, image: ReplacementImageKey) -> Option<NativeImageTarget> {
+                (image.backing == self.backing).then_some(NativeImageTarget {
+                    image: vk::Image::from_raw(33),
+                    view: vk::ImageView::from_raw(34),
+                    image_type: vk::ImageType::TYPE_2D,
+                    full_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    usage: vk::ImageUsageFlags::TRANSFER_SRC,
+                    pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_R8_UNORM,
+                    extent: vk::Extent3D {
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                    },
+                    samples: vk::SampleCountFlags::TYPE_1,
+                })
+            }
+        }
+        let (prepared, key, _) = prepared(BackingRegion::Whole);
+        let resolver = BothImages {
+            backing: key.backing,
+        };
+        assert!(matches!(
+            ReplacementResourceStateProgram::resolve_with_image_state(&prepared, None, &resolver),
+            Err(ResourceStateTransferRecordError::ImageToImageUnsupported(found))
                 if found == key
         ));
     }
