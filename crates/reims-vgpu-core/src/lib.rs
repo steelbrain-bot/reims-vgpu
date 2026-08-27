@@ -369,9 +369,10 @@ pub use residency::{
 };
 pub use resource::{
     ContentError, ContentStamp, ContentState, GraphError, LifecycleState, MappingNode,
-    PendingContentWrite, ReplicaVersions, ResolvedTextureBindingView, ResolvedTextureView,
-    ResolvedTextureViewRange, ResourceGraph, ResourceLifetime, ResourceLifetimeRef, ResourceNode,
-    StorageBacking, StorageClass, StorageNode, TextureViewResolveError, MAX_TEXTURE_VIEW_CHAIN,
+    ObjectSlotState, PendingContentWrite, ReplicaVersions, ResolvedTextureBindingView,
+    ResolvedTextureView, ResolvedTextureViewRange, ResourceGraph, ResourceLifetime,
+    ResourceLifetimeRef, ResourceNode, StorageBacking, StorageClass, StorageNode,
+    TextureViewResolveError, MAX_TEXTURE_VIEW_CHAIN,
 };
 pub use resource_lifecycle::{
     HostIngressBatchError, HostLandingBatchError, ResolvedResourceCompletion,

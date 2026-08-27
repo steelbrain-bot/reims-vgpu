@@ -5520,9 +5520,17 @@ pub(crate) enum ReplacementExecResourceTableError {
         object: u32,
         nonzero_bytes: u32,
     },
+    /// A resource-table entry names an object-table slot that resolves to no
+    /// live resource.
+    ///
+    /// `slot` is what separates the two cases, and they are not the same
+    /// failure: an undeclared name can still be bound by a later packet, while
+    /// a released one is a name the guest has finished with, whose resource is
+    /// gone and whose next declaration creates a different object.
     ResourceAbsent {
         task: reims_vgpu_protocol::TaskId,
         object: reims_vgpu_protocol::ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
+        slot: reims_vgpu_core::ObjectSlotState,
     },
     AliasClosureAbsent(ResourceId<reims_vgpu_protocol::ResourceObject>),
     BackingAbsent(reims_vgpu_protocol::BackingId),
@@ -9135,9 +9143,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     });
                 }
                 let object = reims_vgpu_protocol::ObjectTableRef::new(descriptor.object_id);
-                let resource = graph
-                    .resolve(task, object)
-                    .ok_or(ReplacementExecResourceTableError::ResourceAbsent { task, object })?;
+                let resource = graph.resolve(task, object).ok_or_else(|| {
+                    ReplacementExecResourceTableError::ResourceAbsent {
+                        task,
+                        object,
+                        slot: graph.slot_state(task, object),
+                    }
+                })?;
                 let backings = graph.alias_backings(resource).ok_or(
                     ReplacementExecResourceTableError::AliasClosureAbsent(resource),
                 )?;

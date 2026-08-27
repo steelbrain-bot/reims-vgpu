@@ -666,6 +666,18 @@ struct NamespaceSlot {
     current: Option<AnyResourceId>,
 }
 
+/// What [`ResourceGraph::slot_state`] found for one object-table name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectSlotState {
+    /// No declaration this device admitted has ever named this slot.
+    Undeclared,
+    /// The slot was bound and its object has since been released, so the name
+    /// is free for the guest to reuse under a new generation.
+    Released,
+    /// The slot names a live resource.
+    Bound(AnyResourceId),
+}
+
 /// One authority for object-name reuse and resource/storage/mapping lifetime.
 #[derive(Debug)]
 pub struct ResourceGraph {
@@ -968,6 +980,29 @@ impl ResourceGraph {
         self.slots
             .get(&(task, object))
             .and_then(|slot| slot.current)
+    }
+
+    /// What this device knows about one object-table slot.
+    ///
+    /// [`Self::resolve`] collapses two states a caller usually has to tell
+    /// apart. A slot with no record has never been named by a declaration this
+    /// device admitted, so a later packet can still bind it. A slot whose
+    /// object has been released is a name the guest has already finished with,
+    /// and the resource a reference to it wanted no longer exists -- a wait on
+    /// that is a wait on nothing, because the next declaration for the name
+    /// creates a *different* object under a new generation.
+    pub fn slot_state(
+        &self,
+        task: TaskId,
+        object: ObjectTableRef<ResourceObject>,
+    ) -> ObjectSlotState {
+        match self.slots.get(&(task, object)) {
+            None => ObjectSlotState::Undeclared,
+            Some(slot) => match slot.current {
+                Some(resource) => ObjectSlotState::Bound(resource),
+                None => ObjectSlotState::Released,
+            },
+        }
     }
 
     pub fn resource(&self, id: AnyResourceId) -> Option<&ResourceNode> {
@@ -2137,6 +2172,55 @@ mod tests {
 
     fn object(value: u32) -> ObjectTableRef<ResourceObject> {
         ObjectTableRef::new(value)
+    }
+
+    /// A name nobody has declared and a name whose object is gone are two
+    /// different answers, and [`ResourceGraph::resolve`] gives them the same
+    /// one.
+    ///
+    /// The difference decides whether a reference to the slot is waiting for a
+    /// packet that can still arrive or referring to an object that no longer
+    /// exists, so a refusal that cannot state it cannot be acted on.
+    #[test]
+    fn an_undeclared_slot_and_a_released_one_are_not_the_same_answer() {
+        let mut graph = ResourceGraph::default();
+
+        assert_eq!(
+            graph.slot_state(task(), object(47)),
+            ObjectSlotState::Undeclared
+        );
+
+        let resource = graph
+            .create_resource(task(), object(47), ObjectKind::Buffer, None, [])
+            .unwrap();
+        assert_eq!(
+            graph.slot_state(task(), object(47)),
+            ObjectSlotState::Bound(resource)
+        );
+        assert_eq!(graph.resolve(task(), object(47)), Some(resource));
+
+        graph.release_resource(resource).unwrap();
+        assert_eq!(
+            graph.slot_state(task(), object(47)),
+            ObjectSlotState::Released
+        );
+        assert_eq!(graph.resolve(task(), object(47)), None);
+
+        // The name stays reusable, and the reuse is a different object.
+        let reused = graph
+            .create_resource(task(), object(47), ObjectKind::Buffer, None, [])
+            .unwrap();
+        assert_ne!(reused, resource);
+        assert_eq!(
+            graph.slot_state(task(), object(47)),
+            ObjectSlotState::Bound(reused)
+        );
+
+        // A different task's identically-numbered name is still its own.
+        assert_eq!(
+            graph.slot_state(TaskId::new(9), object(47)),
+            ObjectSlotState::Undeclared
+        );
     }
 
     /// The index must return exactly what walking every storage node returned.
