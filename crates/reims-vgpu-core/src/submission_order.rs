@@ -29,6 +29,7 @@ pub enum SubmissionOrderError {
     UnknownDomain,
     DomainNotDrained,
     AlreadyAbandoned,
+    StillHoldsDomain,
 }
 
 /// One tracked transaction's position and progress, for the census.
@@ -524,11 +525,32 @@ impl SubmissionOrderOwner {
     /// Forget one transaction's order identity. Called from transaction
     /// retirement, which is the point at which no accepted successor can still
     /// name it.
+    ///
+    /// A transaction that still holds its domain claim is refused. Dropping the
+    /// index entry does not drop the claim, so retiring one that never reached
+    /// [`Self::submitted`] or [`Self::abandon`] leaves a `pending` entry no
+    /// caller can name any more: the domain head is held forever, `take_ready`
+    /// never issues behind it, [`Self::retire_domain`] answers
+    /// `DomainNotDrained` for the life of the device, and the census cannot
+    /// show any of it because the census iterates the index this just removed.
+    ///
+    /// Refusing here is what makes that unrepresentable. The two terminal
+    /// transitions each release the claim, so a caller reaching this with a
+    /// live one has skipped a step rather than found a special case.
     pub fn retire(&mut self, transaction: TransactionId) -> Result<(), SubmissionOrderError> {
-        self.transactions
-            .remove(&transaction)
-            .map(|_| ())
-            .ok_or(SubmissionOrderError::UnknownTransaction)
+        let &TransactionOrder {
+            submitted,
+            abandoned,
+            ..
+        } = self
+            .transactions
+            .get(&transaction)
+            .ok_or(SubmissionOrderError::UnknownTransaction)?;
+        if !submitted && !abandoned {
+            return Err(SubmissionOrderError::StillHoldsDomain);
+        }
+        self.transactions.remove(&transaction);
+        Ok(())
     }
 
     pub fn retire_domain(
@@ -887,5 +909,43 @@ mod tests {
             owner.unsubmitted_predecessor(TransactionId::new(9_999)),
             Err(SubmissionOrderError::UnknownTransaction)
         );
+    }
+
+    /// Retiring a transaction that never submitted must not strand its domain.
+    ///
+    /// `retire` drops the index entry, and the index is the only name anyone
+    /// has for the claim. A transaction retired while still pending therefore
+    /// leaves a `pending` entry that cannot be reached, cannot be abandoned,
+    /// and holds the domain head for the life of the device -- and the census
+    /// cannot report it, because the census iterates the index.
+    #[test]
+    fn retiring_a_transaction_that_still_holds_its_domain_is_refused() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 1, 7, 1);
+        accept(&mut owner, 2, 7, 2);
+        assert_eq!(
+            owner.retire(TransactionId::new(1)),
+            Err(SubmissionOrderError::StillHoldsDomain)
+        );
+
+        // Either terminal transition releases the claim and makes retirement
+        // legal. Abandonment is the one a published-but-never-submitted
+        // transaction takes.
+        owner.abandon(TransactionId::new(1)).unwrap();
+        owner.retire(TransactionId::new(1)).unwrap();
+        assert!(
+            owner
+                .unsubmitted_predecessor(TransactionId::new(2))
+                .unwrap()
+                .is_none(),
+            "the released claim leaves nothing ahead of the successor"
+        );
+        owner.recorded(TransactionId::new(2)).unwrap();
+        assert_eq!(owner.take_ready()[0].transaction, TransactionId::new(2));
+        owner.submitted(TransactionId::new(2)).unwrap();
+        owner.retire(TransactionId::new(2)).unwrap();
+        owner
+            .retire_domain(SubmissionDomainId::new(7))
+            .expect("both claims were released, so the domain drained");
     }
 }

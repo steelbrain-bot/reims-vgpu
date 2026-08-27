@@ -1093,6 +1093,20 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
             continuations.retire_transaction(transaction)?;
             // The order identity outlives submission so that a consumer can
             // still be told a producer went first; retirement is where it ends.
+            //
+            // A published transaction has not necessarily submitted: one whose
+            // work was entirely host-side reaches retirement holding the domain
+            // claim it was accepted with. Releasing it is what abandonment is
+            // for, and doing it here rather than leaving it to `retire` is why
+            // `retire` can refuse a live claim at all -- the claim would
+            // otherwise outlive the last name anyone had for it and hold the
+            // domain forever.
+            match submission_order.abandon(transaction) {
+                Ok(())
+                | Err(crate::SubmissionOrderError::AlreadySubmitted)
+                | Err(crate::SubmissionOrderError::AlreadyAbandoned) => {}
+                Err(reason) => return Err(reason.into()),
+            }
             submission_order.retire(transaction)?;
         }
         self.dependencies = dependencies;
