@@ -15166,32 +15166,30 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         // over one range and each carries its own image, so rebuilding one and
         // stopping leaves the others with nothing and every draw naming them
         // parks its channel.
-        let owners = |wanted_texture: bool| {
+        let owners = |wanted: reims_vgpu_protocol::NativeRepresentationClass| {
             storage
                 .owners
                 .iter()
                 .copied()
                 .filter(|resource| {
-                    graph
-                        .resource(*resource)
-                        .is_some_and(|node| match node.descriptor.as_deref() {
-                            Some(reims_vgpu_protocol::ResourceDescriptor::Texture(_)) => {
-                                wanted_texture
-                            }
-                            Some(reims_vgpu_protocol::ResourceDescriptor::Buffer(_)) => {
-                                !wanted_texture
-                            }
-                            _ => false,
-                        })
+                    graph.resource(*resource).is_some_and(|node| {
+                        node.descriptor
+                            .as_deref()
+                            .and_then(|descriptor| descriptor.native_representation_class())
+                            == Some(wanted)
+                    })
                 })
                 .collect::<Vec<_>>()
         };
-        let mut resources = owners(true);
+        let mut resources = owners(reims_vgpu_protocol::NativeRepresentationClass::Image);
         if resources.is_empty() {
             // No texture declared over these bytes: the buffer owner builds
             // the only native object they need, and one is enough because a
             // backing owes at most one buffer.
-            resources = owners(false).into_iter().take(1).collect();
+            resources = owners(reims_vgpu_protocol::NativeRepresentationClass::Bytes)
+                .into_iter()
+                .take(1)
+                .collect();
         }
         if resources.is_empty() {
             return Err(ReplacementTaskAddressMaterializationRefusal::NoDescribedOwner);
