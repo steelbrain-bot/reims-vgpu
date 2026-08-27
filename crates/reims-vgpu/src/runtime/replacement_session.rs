@@ -3936,6 +3936,20 @@ impl<Semantic> ReplacementGuestUploadSuffixPreparationFailure<Semantic> {
     }
 }
 
+/// A suffix whose representation was repaired and which still could not be
+/// returned to the preparing state.
+///
+/// The failure is handed back so the suffix stays retained rather than being
+/// dropped, and the preflight reason travels with it because that is the one
+/// thing the retained failure cannot say: it describes why the *original*
+/// preparation stopped, not why rebuilding the continuation over a freshly
+/// built representation did not work. `preflight` is `None` when the failure
+/// was never a missing-representation one at all.
+pub(crate) struct ReplacementGuestUploadSuffixRetryRefusal<Semantic> {
+    pub failure: Box<ReplacementGuestUploadSuffixPreparationFailure<Semantic>>,
+    pub preflight: Option<ReplacementExecResourceReadinessError>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ReplacementGuestUploadSuffixResolutionFailure<Semantic> {
     pub reason: ReplacementPreparedAdmittedRecordingError<Semantic>,
@@ -18675,10 +18689,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         failure: Box<ReplacementGuestUploadSuffixPreparationFailure<Semantic>>,
     ) -> Result<
         ReplacementContinuingGuestUpload<Semantic>,
-        Box<ReplacementGuestUploadSuffixPreparationFailure<Semantic>>,
+        ReplacementGuestUploadSuffixRetryRefusal<Semantic>,
     > {
         if failure.missing_representation_backing().is_none() {
-            return Err(failure);
+            return Err(ReplacementGuestUploadSuffixRetryRefusal {
+                failure,
+                preflight: None,
+            });
         }
         let ReplacementGuestUploadSuffixPreparationFailure::Resources {
             reason,
@@ -18698,15 +18715,16 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 chain,
                 last_auxiliary,
             }),
-            Err(_) => Err(Box::new(
-                ReplacementGuestUploadSuffixPreparationFailure::Resources {
+            Err(preflight) => Err(ReplacementGuestUploadSuffixRetryRefusal {
+                failure: Box::new(ReplacementGuestUploadSuffixPreparationFailure::Resources {
                     reason,
                     native,
                     prepared,
                     chain,
                     last_auxiliary,
-                },
-            )),
+                }),
+                preflight: Some(preflight),
+            }),
         }
     }
 

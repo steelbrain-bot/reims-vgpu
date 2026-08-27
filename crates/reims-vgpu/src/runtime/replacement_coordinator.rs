@@ -7640,10 +7640,17 @@ impl ReplacementDeviceCoordinator<()> {
                     self.suffix_repairs_resumed = self.suffix_repairs_resumed.saturating_add(1);
                     repaired += 1;
                 }
-                Err(failure) => {
+                Err(refusal) => {
                     self.suffix_repairs_deferred = self.suffix_repairs_deferred.saturating_add(1);
+                    if let Some(preflight) = &refusal.preflight {
+                        report_retained_failure_detail(
+                            "replacement_guest_upload_suffix_retry",
+                            transaction,
+                            &format!("preflight:{preflight:?}"),
+                        );
+                    }
                     self.guest_upload_suffixes
-                        .restore_preparation_failed(transaction, failure);
+                        .restore_preparation_failed(transaction, refusal.failure);
                 }
             }
         }
