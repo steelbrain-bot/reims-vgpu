@@ -31965,11 +31965,44 @@ mod tests {
         unsafe { std::alloc::dealloc(pointer, layout) };
     }
 
-    #[test]
-    fn host_staging_buffer_owns_an_exact_mapped_guest_endpoint_and_retry_reselects_its_route() {
-        let Some(mut runtime) = runtime_session() else {
-            return;
-        };
+    /// Everything a guest-upload test needs before it can ask its own question.
+    ///
+    /// Building this is two hundred lines of exact setup -- a guest-RAM import,
+    /// a host staging endpoint bound as the backing's host representation, a
+    /// device-local execution representation, an EXEC that uploads into it and
+    /// waits on an event, and a second EXEC that signals that event. Every one
+    /// of those is load-bearing: drop the wait and the consumer never parks,
+    /// drop the staging endpoint and the upload never routes through one.
+    /// Written out per test it is unreviewable, and the tests that need it are
+    /// exactly the ones that most need reviewing.
+    ///
+    /// The fixture asserts its own preconditions as it builds. A test standing
+    /// on a broken endpoint fails somewhere far from the breakage and reports
+    /// the wrong thing.
+    ///
+    /// `None` where no device is available, the same as [`runtime_session`].
+    struct GuestUploadScaffold {
+        runtime: ReplacementRuntimeSession<()>,
+        /// The guest-RAM allocation behind `guest`, holding `[9, 8, 7, 6]` at
+        /// offset 8 -- the bytes the ingress EXEC uploads.
+        allocation: Vec<u8>,
+        /// Held so the import outlives every representation built over it.
+        _guest: reims_vgpu_memory::GuestRef,
+        host_staging: reims_vgpu_vulkan::replacement_representation::ReplacementHostStagingBuffer,
+        backing: reims_vgpu_protocol::BackingId,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+        /// The device-local representation the upload targets.
+        execution: reims_vgpu_protocol::RepresentationId,
+        route: reims_vgpu_core::RepresentationRoute,
+        /// The resource state the ingress EXEC's prologue carries.
+        ingress_operation: reims_vgpu_core::ResolvedResourceState,
+        /// Admitted and waiting on the event `producer` signals.
+        admitted_ingress_exec: CanonicalAdmittedExecTransaction<()>,
+        producer: CanonicalAdmittedExecTransaction<()>,
+    }
+
+    fn guest_upload_scaffold() -> Option<GuestUploadScaffold> {
+        let mut runtime = runtime_session()?;
         let mut allocation = vec![0u8; 4096];
         let import = Arc::new(
             reims_vgpu_memory::GuestRamImport::new_host_allocation(
@@ -32208,6 +32241,97 @@ mod tests {
                 },
             )
             .unwrap();
+        Some(GuestUploadScaffold {
+            runtime,
+            allocation,
+            _guest: guest,
+            host_staging: fixed_staging,
+            backing,
+            resource,
+            execution,
+            route,
+            ingress_operation,
+            admitted_ingress_exec,
+            producer,
+        })
+    }
+
+    /// A guest-upload phase that refused before it claimed anything is
+    /// prepared again, not handed back.
+    ///
+    /// These three arms used to return their retained failure unchanged, which
+    /// re-offers the packet, refuses it by construction, and parks the channel
+    /// for the life of the device. Nothing reported that as a stall: the
+    /// retained-failure line kept naming the condition as it stood at the
+    /// *first* refusal, so a transaction submitted forty seconds earlier went
+    /// on being reported as its domain's issued head. What the arm returns is
+    /// therefore the whole observable behaviour, and it is what this asserts.
+    #[test]
+    fn an_unclaimed_guest_upload_phase_failure_is_prepared_again_on_retry() {
+        let Some(mut scaffold) = guest_upload_scaffold() else {
+            return;
+        };
+        let prepared = Box::new(
+            scaffold
+                .runtime
+                .prepare_admitted_exec(scaffold.admitted_ingress_exec)
+                .unwrap(),
+        );
+        let manifest = scaffold
+            .runtime
+            .preflight_prepared_guest_upload_resources(&prepared)
+            .unwrap_or_else(|reason| panic!("the staged ingress must preflight: {reason:?}"));
+        assert!(
+            manifest.requires_guest_upload(),
+            "the fixture's ingress EXEC reads a backing whose content is only current in its \
+             host staging endpoint, so its route is the upload one"
+        );
+
+        // A chain that never built claims nothing, so the retry owes the
+        // packet a fresh preparation from the exec and manifest it arrived
+        // with. `EmptyResourceStatePrefix` stands in for the refusal here --
+        // the arm does not read the reason, and provoking a real one would
+        // have to break the chain builder to observe the retry.
+        let pending = scaffold
+            .runtime
+            .retry_exec_ingress_dispatch(ReplacementExecIngressDispatchFailure::GuestUploadPhase(
+                Box::new(ReplacementGuestUploadPhasePreparationFailure::Chain {
+                    reason:
+                        reims_vgpu_core::ResourceStateExecutionChainError::EmptyResourceStatePrefix,
+                    prepared,
+                    manifest,
+                }),
+            ))
+            .unwrap_or_else(|_| {
+                panic!("an unclaimed chain failure must re-prepare its phase, not refuse again")
+            });
+        assert!(
+            matches!(pending, PendingReplacementIngressExec::GuestUpload(_)),
+            "the re-prepared phase must still take the upload route"
+        );
+
+        drop(scaffold.runtime);
+        drop(scaffold._guest);
+    }
+
+    #[test]
+    fn host_staging_buffer_owns_an_exact_mapped_guest_endpoint_and_retry_reselects_its_route() {
+        let Some(GuestUploadScaffold {
+            mut runtime,
+            mut allocation,
+            _guest,
+            host_staging: fixed_staging,
+            backing,
+            resource,
+            execution,
+            route,
+            ingress_operation,
+            admitted_ingress_exec,
+            producer,
+        }) = guest_upload_scaffold()
+        else {
+            return;
+        };
         let ingress_transaction = admitted_ingress_exec.transaction.id;
         let prepared_ingress = runtime
             .prepare_admitted_exec(admitted_ingress_exec)
@@ -32622,7 +32746,9 @@ mod tests {
             mappings: Box::new([]),
             targets: Box::new([reims_vgpu_core::ResolvedResourceStateTarget {
                 backing,
-                regions: Box::new([region]),
+                regions: Box::new([reims_vgpu_core::BackingRegion::Linear(
+                    reims_vgpu_core::LinearRange::new(0, allocation.len() as u64).unwrap(),
+                )]),
             }]),
             ops: reims_vgpu_protocol::ResourceValidityOps {
                 clear_guest_valid: 1,
@@ -32801,9 +32927,8 @@ mod tests {
                 ..
             }
         ));
-        drop(guest);
         drop(runtime);
-        drop(import);
+        drop(_guest);
     }
 
     #[test]
