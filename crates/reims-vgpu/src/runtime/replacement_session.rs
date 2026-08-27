@@ -1322,6 +1322,26 @@ pub(crate) enum ReplacementPreparedAdmittedRecordingError<Completion> {
 }
 
 impl<Completion> ReplacementPreparedAdmittedRecordingError<Completion> {
+    /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
+    ///
+    /// Recording is where a decoded view meets the native image that already
+    /// exists, so it is the one place a refusal can be settled by two facts a
+    /// retry cannot move.
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::Program(failure) => failure.reason.is_terminal_refusal(),
+            Self::RecordingNotReady(_)
+            | Self::MissingRecordingPlan(_)
+            | Self::Assignment(_)
+            | Self::MissingHazardPlan(_)
+            | Self::BarrierPlan(_)
+            | Self::BarrierResolution(_)
+            | Self::IndirectRangeContinuationRequired(_) => false,
+        }
+    }
+}
+
+impl<Completion> ReplacementPreparedAdmittedRecordingError<Completion> {
     pub fn detail(&self) -> String {
         match self {
             Self::RecordingNotReady(transaction) => {
@@ -5585,10 +5605,13 @@ impl<Completion> ReplacementExecIngressDispatchFailure<Completion> {
     pub(crate) const fn is_terminal_refusal(&self) -> bool {
         match self {
             Self::Ingress(reason) => reason.is_terminal_refusal(),
+            Self::DirectDispatch(ReplacementResourceReadyDispatchFailure::Resolution(failure)) => {
+                failure.reason.is_terminal_refusal()
+            }
+            Self::GuestUploadResolution(failure) => failure.reason.is_terminal_refusal(),
             Self::DirectResources(_)
             | Self::DirectDispatch(_)
             | Self::GuestUploadPhase(_)
-            | Self::GuestUploadResolution(_)
             | Self::GuestUploadDispatch(_)
             | Self::IndirectRangeReadiness { .. }
             | Self::IndirectRange(_) => false,

@@ -567,6 +567,18 @@ pub enum ComputeExecProgramError {
     Record(ComputeRecordError),
 }
 
+impl ComputeExecProgramError {
+    /// Whether a later packet could make this program record.
+    ///
+    /// See [`crate::replacement_image_transition::TextureBindingViewDecline::is_unimplemented`].
+    pub const fn is_terminal_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Record(ComputeRecordError::UnknownImageView { reason, .. }) if reason.is_unimplemented()
+        )
+    }
+}
+
 impl From<ComputeImageStateError> for ComputeExecProgramError {
     fn from(reason: ComputeImageStateError) -> Self {
         Self::ImageState(reason)

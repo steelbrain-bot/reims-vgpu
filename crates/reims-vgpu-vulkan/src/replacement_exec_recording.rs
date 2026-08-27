@@ -97,6 +97,23 @@ pub enum ReplacementExecProgramError {
     Recording(ReplacementRecordingError),
 }
 
+impl ReplacementExecProgramError {
+    /// Whether re-offering this EXEC could ever produce a different answer.
+    ///
+    /// Only the unimplemented image-view arms are terminal today. Everything
+    /// else here is either a device fault or a state a later packet supplies,
+    /// and a wrong `true` throws away guest work that would have recorded.
+    /// See
+    /// [`crate::replacement_image_transition::TextureBindingViewDecline::is_unimplemented`].
+    pub const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::Render(reason) => reason.is_terminal_refusal(),
+            Self::Compute(reason) => reason.is_terminal_refusal(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ReplacementExecProgramFailure<Operation> {
     pub reason: ReplacementExecProgramError,

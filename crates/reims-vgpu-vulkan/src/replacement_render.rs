@@ -1204,6 +1204,18 @@ pub enum RenderExecProgramError {
     NativePassReopenRequired(usize),
 }
 
+impl RenderExecProgramError {
+    /// Whether a later packet could make this program record.
+    ///
+    /// See [`crate::replacement_image_transition::TextureBindingViewDecline::is_unimplemented`].
+    pub const fn is_terminal_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Record(RenderRecordError::UnknownImageView { reason, .. }) if reason.is_unimplemented()
+        )
+    }
+}
+
 impl From<RenderImageStateError> for RenderExecProgramError {
     fn from(reason: RenderImageStateError) -> Self {
         Self::ImageState(reason)

@@ -114,6 +114,21 @@ pub enum TextureBindingViewDecline {
     PartialSubresourceRange,
 }
 
+impl TextureBindingViewDecline {
+    /// Whether asking again can ever produce a different answer.
+    ///
+    /// [`Self::UnknownRepresentation`] is a lifetime fault: the representation
+    /// this key names has not been materialized yet, and materializing it is
+    /// exactly what a later packet does. Every other arm is a decoded view
+    /// this backend does not build a `VkImageView` for, decided by the view
+    /// the guest declared and the image that already exists -- neither of
+    /// which a retry changes. Re-offering one of those parks its channel for
+    /// the life of the device, so a caller that can refuse should.
+    pub const fn is_unimplemented(&self) -> bool {
+        !matches!(self, Self::UnknownRepresentation)
+    }
+}
+
 impl std::fmt::Display for TextureBindingViewDecline {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -691,5 +706,34 @@ mod tests {
         assert!(native.transitions.before.images[0]
             .src_access_mask
             .is_empty());
+    }
+
+    /// An unimplemented view ends the packet; an unmaterialized one waits.
+    ///
+    /// The two arrive at the classifier as one `UnknownImageView` and mean
+    /// opposite things. Reading a `ReinterpretedFormat` as waitable parks the
+    /// channel for the life of the device -- a boot spent five minutes
+    /// re-offering one aliased binding fifty-three thousand times, with every
+    /// later transaction on that channel refusing behind it. Reading an
+    /// `UnknownRepresentation` as terminal throws away an EXEC whose image was
+    /// one packet away from existing.
+    #[test]
+    fn an_unimplemented_image_view_ends_a_packet_and_an_unmaterialized_one_does_not() {
+        assert!(
+            TextureBindingViewDecline::ReinterpretedFormat {
+                declared: 0x50,
+                native: 0x73,
+            }
+            .is_unimplemented(),
+            "a view whose format disagrees with the image that already exists asks a question \
+             neither side can answer differently later"
+        );
+        assert!(TextureBindingViewDecline::SwizzledView.is_unimplemented());
+        assert!(TextureBindingViewDecline::PartialSubresourceRange.is_unimplemented());
+        assert!(TextureBindingViewDecline::AliasedBaseResource.is_unimplemented());
+        assert!(
+            !TextureBindingViewDecline::UnknownRepresentation.is_unimplemented(),
+            "materializing the representation is exactly what a later packet does"
+        );
     }
 }
