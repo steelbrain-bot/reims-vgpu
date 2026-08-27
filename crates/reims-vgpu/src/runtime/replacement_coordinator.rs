@@ -5840,6 +5840,20 @@ pub(crate) struct ReplacementDeviceCoordinator<Semantic> {
     /// reason reported once looks the same either way. This grows once per tick
     /// per stuck packet, which is the difference.
     blocked_drain_retries: u64,
+    /// Cumulative counts of the upload-suffix representation repair.
+    ///
+    /// Three numbers because the repair has three outcomes and only the
+    /// combination says which happened. `built` counts representations
+    /// constructed; `resumed` counts suffixes that went back to preparing over
+    /// one; `deferred` counts repairs whose preflight could not rebuild the
+    /// continuation yet. A repair that runs every tick and never converges
+    /// reports `built` climbing with `resumed` flat, which no other reading in
+    /// this device distinguishes from the repair never firing at all --- and
+    /// the repair says nothing on success, so without these it is invisible
+    /// either way.
+    suffix_repairs_built: u64,
+    suffix_repairs_resumed: u64,
+    suffix_repairs_deferred: u64,
     /// Cumulative count of child packets refused because this backend declared
     /// it does not implement them. Each is one lost guest command, named once
     /// on the failure channel.
@@ -6272,6 +6286,9 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
             root_read_failure: None,
             child_read_failures: std::collections::BTreeMap::new(),
             blocked_drains: std::collections::VecDeque::new(),
+            suffix_repairs_built: 0,
+            suffix_repairs_resumed: 0,
+            suffix_repairs_deferred: 0,
             drain_failures: std::collections::VecDeque::new(),
             last_pipeline_census_ms: 0,
             console_frames: std::collections::BTreeMap::new(),
@@ -6950,7 +6967,7 @@ impl ReplacementDeviceCoordinator<()> {
             .cloned()
             .unwrap_or_default();
         crate::observe::off(format!(
-            "replacement_pipeline_stalls cpu_live={} cpu_failed=[{cpu_failed}] cpu_publications={} timeline_observations={timeline_observations} timeline_semantics={timeline_semantics} abandoned={} refused_packets={} blocked_retries={} blocked_head=[{blocked_head}] upload_resume={} upload_continuation={} indirect_resume={} accepted_routing={} publication_retire={} publish_fail=[{publish_fail}] publish_retire_head=[{publish_retire_head}] cleanup_dispatch={} cleanup_completion={} mmio={} continuing_uploads={} continuing_indirects={}",
+            "replacement_pipeline_stalls cpu_live={} cpu_failed=[{cpu_failed}] cpu_publications={} timeline_observations={timeline_observations} timeline_semantics={timeline_semantics} abandoned={} refused_packets={} blocked_retries={} blocked_head=[{blocked_head}] upload_resume={} upload_continuation={} indirect_resume={} accepted_routing={} publication_retire={} publish_fail=[{publish_fail}] publish_retire_head=[{publish_retire_head}] cleanup_dispatch={} cleanup_completion={} mmio={} continuing_uploads={} continuing_indirects={} suffix_repairs={}/{}/{}",
             self.cpu.live_packets(),
             self.cpu.pending_publications(),
             self.abandoned_transactions,
@@ -6966,6 +6983,9 @@ impl ReplacementDeviceCoordinator<()> {
             self.mmio_failures.len(),
             self.continuing_guest_uploads.len(),
             self.continuing_indirect_ranges.len(),
+            self.suffix_repairs_built,
+            self.suffix_repairs_resumed,
+            self.suffix_repairs_deferred,
         ));
         // Where every tracked transaction sits. A blocked head names the
         // producer it waits for, and the only useful next question is what that
@@ -7606,6 +7626,7 @@ impl ReplacementDeviceCoordinator<()> {
                 );
                 continue;
             }
+            self.suffix_repairs_built = self.suffix_repairs_built.saturating_add(1);
             let Some(failure) = self
                 .guest_upload_suffixes
                 .take_preparation_failed(transaction)
@@ -7616,11 +7637,14 @@ impl ReplacementDeviceCoordinator<()> {
                 Ok(continuing) => {
                     self.guest_upload_suffixes
                         .restore_continuing(transaction, continuing);
+                    self.suffix_repairs_resumed = self.suffix_repairs_resumed.saturating_add(1);
                     repaired += 1;
                 }
-                Err(failure) => self
-                    .guest_upload_suffixes
-                    .restore_preparation_failed(transaction, failure),
+                Err(failure) => {
+                    self.suffix_repairs_deferred = self.suffix_repairs_deferred.saturating_add(1);
+                    self.guest_upload_suffixes
+                        .restore_preparation_failed(transaction, failure);
+                }
             }
         }
         repaired
