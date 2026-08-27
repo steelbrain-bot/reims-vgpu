@@ -279,17 +279,32 @@ fn replacement_host_exec_failure_diagnostic(
 
 /// The submission positions in `order` that `owned` does not account for.
 ///
+/// Two filters, and the second is the one that took a boot to get right.
+///
 /// A settled transaction is not one of these: `submitted` and `abandoned` are
 /// the two transitions that release a domain claim, so an entry carrying either
-/// owes nothing to anybody. Everything else is holding its domain's head, and
-/// something has to be holding *it*.
+/// owes nothing to anybody.
+///
+/// Neither is a transaction that has reached *neither* `recorded` nor `issued`.
+/// That is the ordinary state of an EXEC whose prerequisites are still unmet:
+/// it was accepted into the order, it holds its position, and no coordinator
+/// owns it because none has started it -- the runtime does, and the runtime is
+/// not one of the sets this diffs against. The first boot to carry this census
+/// named exactly such a transaction, waiting on a resource hazard its producer
+/// had not cleared, and reported a healthy device as leaking. An owner is owed
+/// only once one has been taken.
 fn unowned_submission_positions(
     order: &[reims_vgpu_core::SubmissionOrderEntry],
     owned: &std::collections::BTreeSet<reims_vgpu_protocol::TransactionId>,
 ) -> Vec<(reims_vgpu_protocol::TransactionId, String)> {
     order
         .iter()
-        .filter(|entry| !entry.submitted && !entry.abandoned && !owned.contains(&entry.transaction))
+        .filter(|entry| {
+            (entry.recorded || entry.issued)
+                && !entry.submitted
+                && !entry.abandoned
+                && !owned.contains(&entry.transaction)
+        })
         .map(|entry| {
             (
                 entry.transaction,
@@ -10655,22 +10670,23 @@ mod tests {
     /// are "not submitted yet" and no counter distinguishes them.
     #[test]
     fn only_an_unsettled_position_with_no_owner_is_reported_as_unowned() {
-        let entry = |transaction: u64, sequence: u64, submitted, abandoned| {
+        let entry = |transaction: u64, sequence: u64, started, submitted, abandoned| {
             reims_vgpu_core::SubmissionOrderEntry {
                 transaction: reims_vgpu_protocol::TransactionId::new(transaction),
                 domain: reims_vgpu_protocol::SubmissionDomainId::new(1),
                 sequence: reims_vgpu_protocol::DomainSequence::new(sequence),
-                recorded: true,
-                issued: true,
+                recorded: started,
+                issued: started,
                 submitted,
                 abandoned,
             }
         };
         let order = [
-            entry(10, 1, true, false),
-            entry(11, 2, false, true),
-            entry(12, 3, false, false),
-            entry(13, 4, false, false),
+            entry(10, 1, true, true, false),
+            entry(11, 2, true, false, true),
+            entry(12, 3, true, false, false),
+            entry(13, 4, true, false, false),
+            entry(14, 5, false, false, false),
         ];
         let owned = std::collections::BTreeSet::from([reims_vgpu_protocol::TransactionId::new(12)]);
 
@@ -10681,7 +10697,8 @@ mod tests {
                 .map(|(_, position)| position.as_str())
                 .collect::<Vec<_>>(),
             ["13@1.4"],
-            "submitted and abandoned both release the domain claim, and 12 is held"
+            "submitted and abandoned both release the domain claim, 12 is held, and 14 has not \
+             been started by anybody yet so nobody owes it an owner"
         );
     }
 }
