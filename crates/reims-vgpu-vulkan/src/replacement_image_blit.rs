@@ -184,36 +184,42 @@ pub(crate) fn derive_image_uses(
     // Keyed by the texture as well as its backing: two textures declared over
     // one guest range are two images, and a blit between them would otherwise
     // collapse into one entry naming a single object for both endpoints.
-    let mut roles = BTreeMap::<
-        (
-            BackingId,
-            reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
-        ),
-        ImageRoles,
-    >::new();
+    let mut roles = BTreeMap::<(BackingId, reims_vgpu_core::ImageOwner), ImageRoles>::new();
     match operation {
         ResolvedBlit::Fill { .. } | ResolvedBlit::Copy { .. } => {
             unreachable!("PreparedImageBlit cannot contain a buffer-only variant")
         }
         ResolvedBlit::BufferToTexture(blit) => {
             roles
-                .entry((blit.destination.storage, blit.destination.resource))
+                .entry((
+                    blit.destination.storage,
+                    reims_vgpu_core::ImageOwner::base(blit.destination.base),
+                ))
                 .or_default()
                 .destination = true;
         }
         ResolvedBlit::TextureToBuffer(blit) => {
             roles
-                .entry((blit.source.storage, blit.source.resource))
+                .entry((
+                    blit.source.storage,
+                    reims_vgpu_core::ImageOwner::base(blit.source.base),
+                ))
                 .or_default()
                 .source = true;
         }
         ResolvedBlit::TextureToTexture(blit) => {
             roles
-                .entry((blit.source.storage, blit.source.resource))
+                .entry((
+                    blit.source.storage,
+                    reims_vgpu_core::ImageOwner::base(blit.source.base),
+                ))
                 .or_default()
                 .source = true;
             roles
-                .entry((blit.destination.storage, blit.destination.resource))
+                .entry((
+                    blit.destination.storage,
+                    reims_vgpu_core::ImageOwner::base(blit.destination.base),
+                ))
                 .or_default()
                 .destination = true;
         }
@@ -223,11 +229,17 @@ pub(crate) fn derive_image_uses(
                     std::iter::once(&level.first_slice).chain(level.remaining_slices.iter())
                 {
                     roles
-                        .entry((source.storage, source.resource))
+                        .entry((
+                            source.storage,
+                            reims_vgpu_core::ImageOwner::base(source.base),
+                        ))
                         .or_default()
                         .source = true;
                     roles
-                        .entry((destination.storage, destination.resource))
+                        .entry((
+                            destination.storage,
+                            reims_vgpu_core::ImageOwner::base(destination.base),
+                        ))
                         .or_default()
                         .destination = true;
                 }
@@ -236,13 +248,13 @@ pub(crate) fn derive_image_uses(
     }
     roles
         .into_iter()
-        .map(|((backing, resource), roles)| {
+        .map(|((backing, owner), roles)| {
             // Image state is about the image, so it is this texture's image
             // over the backing that the use names — never a buffer view of the
             // same bytes that some other endpoint of the blit reads, and never
             // another texture's image over the same range.
             let representation =
-                ViewRepresentation::lookup(representations, backing, BackingView::Image(resource))
+                ViewRepresentation::lookup(representations, backing, BackingView::Image(owner))
                     .ok_or(ImageBlitStateError::MissingRepresentation(backing))?;
             let image = ReplacementImageKey {
                 backing,
@@ -810,7 +822,7 @@ fn resolve_endpoint(
     let representation = ViewRepresentation::lookup(
         representations,
         endpoint.storage,
-        BackingView::Image(endpoint.resource),
+        BackingView::Image(reims_vgpu_core::ImageOwner::base(endpoint.base)),
     )
     .ok_or(ImageBlitRecordError::MissingRepresentation(
         endpoint.storage,
@@ -1127,6 +1139,7 @@ mod tests {
     fn endpoint(backing: u64, resource: u32) -> ResolvedTextureEndpoint {
         ResolvedTextureEndpoint {
             resource: ResourceId::new(resource, 1),
+            base: ResourceId::new(resource, 1),
             storage: reims_vgpu_protocol::BackingId::new(backing),
             level: 0,
             slice: 0,
@@ -1274,12 +1287,16 @@ mod tests {
             &[
                 ViewRepresentation {
                     backing: BackingId::new(1),
-                    view: BackingView::Image(ResourceId::new(1, 1)),
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(ResourceId::new(
+                        1, 1,
+                    ))),
                     representation: RepresentationId::new(11),
                 },
                 ViewRepresentation {
                     backing: BackingId::new(2),
-                    view: BackingView::Image(ResourceId::new(2, 1)),
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(ResourceId::new(
+                        2, 1,
+                    ))),
                     representation: RepresentationId::new(12),
                 },
             ],
@@ -1312,7 +1329,7 @@ mod tests {
             &operation,
             &[ViewRepresentation {
                 backing: BackingId::new(1),
-                view: BackingView::Image(ResourceId::new(1, 1)),
+                view: BackingView::Image(reims_vgpu_core::ImageOwner::base(ResourceId::new(1, 1))),
                 representation: RepresentationId::new(11),
             }],
             &General,
@@ -1359,12 +1376,14 @@ mod tests {
             &[
                 ViewRepresentation {
                     backing: source.storage,
-                    view: BackingView::Image(source.resource),
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(source.resource)),
                     representation: source_key.representation,
                 },
                 ViewRepresentation {
                     backing: destination.storage,
-                    view: BackingView::Image(destination.resource),
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(
+                        destination.resource,
+                    )),
                     representation: destination_key.representation,
                 },
             ],
@@ -1421,12 +1440,16 @@ mod tests {
                 &[
                     ViewRepresentation {
                         backing: source.storage,
-                        view: BackingView::Image(source.resource),
+                        view: BackingView::Image(reims_vgpu_core::ImageOwner::base(
+                            source.resource
+                        )),
                         representation: source_key.representation,
                     },
                     ViewRepresentation {
                         backing: destination.storage,
-                        view: BackingView::Image(destination.resource),
+                        view: BackingView::Image(reims_vgpu_core::ImageOwner::base(
+                            destination.resource
+                        )),
                         representation: destination_key.representation,
                     },
                 ],
@@ -1526,7 +1549,7 @@ mod tests {
             },
             ViewRepresentation {
                 backing: image.storage,
-                view: BackingView::Image(image.resource),
+                view: BackingView::Image(reims_vgpu_core::ImageOwner::base(image.resource)),
                 representation: image_key.representation,
             },
         ];
@@ -1657,7 +1680,7 @@ mod tests {
                 },
                 ViewRepresentation {
                     backing: image.storage,
-                    view: BackingView::Image(image.resource),
+                    view: BackingView::Image(reims_vgpu_core::ImageOwner::base(image.resource)),
                     representation: image_key.representation,
                 },
             ],

@@ -960,7 +960,7 @@ mod tests {
             .create_execution_representation(
                 destination,
                 RepresentationRoute::HostVisibleWorking,
-                BackingView::Image(destination_texture),
+                BackingView::Image(reims_vgpu_core::ImageOwner::base(destination_texture)),
                 (),
             )
             .unwrap();
@@ -993,6 +993,7 @@ mod tests {
             source_bytes_per_image: 64,
             destination: ResolvedTextureEndpoint {
                 resource: ResourceId::new(2, 1),
+                base: ResourceId::new(2, 1),
                 storage: destination,
                 level: 0,
                 slice: 0,

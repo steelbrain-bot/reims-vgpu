@@ -316,7 +316,9 @@ mod compute_image_bindings_sealed {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplacementComputeImageBinding {
     pub backing: BackingId,
-    pub resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+    /// The texture whose image this binding names. A view binds its base's
+    /// image, so this is never the view the guest named.
+    pub owner: reims_vgpu_core::ImageOwner,
     pub usage: vk::ImageUsageFlags,
     pub storage: bool,
 }
@@ -341,9 +343,12 @@ impl ReplacementComputeImageBindings for ResolvedComputeDispatch {
                     ComputeBindingClass::SampledImage => (vk::ImageUsageFlags::SAMPLED, false),
                     ComputeBindingClass::StorageImage => (vk::ImageUsageFlags::STORAGE, true),
                 };
+                let ComputeBindingView::Image(view) = resource.view else {
+                    return None;
+                };
                 Some(ReplacementComputeImageBinding {
                     backing: resource.backing,
-                    resource: resource.resource,
+                    owner: reims_vgpu_core::ImageOwner::of_view(view),
                     usage,
                     storage,
                 })
@@ -407,7 +412,7 @@ pub fn derive_compute_image_uses<NativePipeline, Operation: ReplacementComputeIm
     for binding in prepared.operation().image_bindings() {
         let ReplacementComputeImageBinding {
             backing,
-            resource,
+            owner,
             usage,
             storage,
         } = binding;
@@ -416,7 +421,7 @@ pub fn derive_compute_image_uses<NativePipeline, Operation: ReplacementComputeIm
         // objects, and two textures declared over one range hold one image
         // each -- only the one this binding names has its image state.
         let representation =
-            ViewRepresentation::lookup(representations, backing, BackingView::Image(resource))
+            ViewRepresentation::lookup(representations, backing, BackingView::Image(owner))
                 .ok_or(ComputeImageStateError::RepresentationUseMismatch(backing))?;
         let image = ReplacementImageKey {
             backing,
@@ -716,7 +721,9 @@ impl ReplacementComputeProgram<ResolvedComputeDispatch> {
             // designated.
             let view = match resource.view {
                 ComputeBindingView::Buffer(_) => BackingView::Bytes,
-                ComputeBindingView::Image(_) => BackingView::Image(resource.resource),
+                ComputeBindingView::Image(view) => {
+                    BackingView::Image(reims_vgpu_core::ImageOwner::of_view(view))
+                }
             };
             let representation =
                 ViewRepresentation::lookup(representations, resource.backing, view).ok_or(
@@ -1743,7 +1750,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
-                BackingView::Image(resource),
+                BackingView::Image(reims_vgpu_core::ImageOwner::base(resource)),
                 (),
             )
             .unwrap();

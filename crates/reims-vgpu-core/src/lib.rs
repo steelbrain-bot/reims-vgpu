@@ -269,9 +269,9 @@ pub use lifecycle::{
 };
 pub use managed_backing::{
     AcceptedRepresentation, BackingView, GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation,
-    ManagedBackingCensus, ManagedBackingError, ManagedBackingOwner, ManagedBackingProgress,
-    ManagedRepresentationFailure, RepresentationCensus, RepresentationRegionCoverage,
-    RepresentationUse, TransferBatchError, ViewRepresentation,
+    ImageOwner, ManagedBackingCensus, ManagedBackingError, ManagedBackingOwner,
+    ManagedBackingProgress, ManagedRepresentationFailure, RepresentationCensus,
+    RepresentationRegionCoverage, RepresentationUse, TransferBatchError, ViewRepresentation,
 };
 pub use managed_resource::{
     plan_representation, HostMemoryTopology, RepresentationCapabilities, RepresentationRefusal,

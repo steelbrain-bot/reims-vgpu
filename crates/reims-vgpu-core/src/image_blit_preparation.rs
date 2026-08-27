@@ -3,7 +3,7 @@
 use crate::{
     pixel_format::{buffer_image_blit_aspect, BlitAspect},
     AccessIntent, AccessMode, AccessScope, AccessTarget, BackingRegion, BackingView,
-    DirectReplayNativeOwner, GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation,
+    DirectReplayNativeOwner, GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation, ImageOwner,
     ManagedBackingError, ManagedBackingProgress, PreparedNativeSubmission, ReplayAcceptance,
     ReplayAcceptanceError, RepresentationUse, ResolvedBlit, ResolvedReplayCompletion,
     ResolvedResourceCompletion, ResolvedTextureEndpoint, ResourceLifecycleOwner,
@@ -272,7 +272,7 @@ fn collect_regions(
             writes
                 .entry((
                     blit.destination.storage,
-                    BackingView::Image(blit.destination.resource),
+                    BackingView::Image(ImageOwner::base(blit.destination.base)),
                 ))
                 .or_default()
                 .extend(image_regions(
@@ -287,7 +287,7 @@ fn collect_regions(
             reads
                 .entry((
                     blit.source.storage,
-                    BackingView::Image(blit.source.resource),
+                    BackingView::Image(ImageOwner::base(blit.source.base)),
                 ))
                 .or_default()
                 .extend(image_regions(
@@ -305,7 +305,7 @@ fn collect_regions(
             reads
                 .entry((
                     blit.source.storage,
-                    BackingView::Image(blit.source.resource),
+                    BackingView::Image(ImageOwner::base(blit.source.base)),
                 ))
                 .or_default()
                 .extend(image_regions(
@@ -317,7 +317,7 @@ fn collect_regions(
             writes
                 .entry((
                     blit.destination.storage,
-                    BackingView::Image(blit.destination.resource),
+                    BackingView::Image(ImageOwner::base(blit.destination.base)),
                 ))
                 .or_default()
                 .extend(image_regions(
@@ -339,13 +339,16 @@ fn collect_regions(
                     };
                     let origin = crate::TextureOrigin { x: 0, y: 0, z: 0 };
                     reads
-                        .entry((source.storage, BackingView::Image(source.resource)))
+                        .entry((
+                            source.storage,
+                            BackingView::Image(ImageOwner::base(source.base)),
+                        ))
                         .or_default()
                         .extend(image_regions(source, origin, extent, BlitAspect::Full)?);
                     writes
                         .entry((
                             destination.storage,
-                            BackingView::Image(destination.resource),
+                            BackingView::Image(ImageOwner::base(destination.base)),
                         ))
                         .or_default()
                         .extend(image_regions(
@@ -775,6 +778,7 @@ mod tests {
     fn texture(backing: BackingId, format: u16) -> ResolvedTextureEndpoint {
         ResolvedTextureEndpoint {
             resource: TEXTURE,
+            base: TEXTURE,
             storage: backing,
             level: 2,
             slice: 3,
@@ -846,14 +850,14 @@ mod tests {
                 RepresentationRoute::HostStagingTransfer {
                     working: crate::WorkingMemoryClass::DeviceLocal,
                 },
-                BackingView::Image(TEXTURE),
+                BackingView::Image(ImageOwner::base(TEXTURE)),
                 "image",
             )
             .unwrap();
         let destination_representation = execution(
             &mut resources,
             destination,
-            BackingView::Image(TEXTURE),
+            BackingView::Image(ImageOwner::base(TEXTURE)),
             "destination",
         );
         materialize(
@@ -893,7 +897,7 @@ mod tests {
             ViewRepresentation::lookup(
                 prepared.representations(),
                 destination,
-                BackingView::Image(TEXTURE)
+                BackingView::Image(ImageOwner::base(TEXTURE))
             ),
             Some(destination_representation)
         );
@@ -919,7 +923,7 @@ mod tests {
         let destination_representation = execution(
             &mut resources,
             destination,
-            BackingView::Image(TEXTURE),
+            BackingView::Image(ImageOwner::base(TEXTURE)),
             "destination",
         );
         materialize(
@@ -958,7 +962,7 @@ mod tests {
                 },
                 ViewRepresentation {
                     backing: destination,
-                    view: BackingView::Image(TEXTURE),
+                    view: BackingView::Image(ImageOwner::base(TEXTURE)),
                     representation: destination_representation,
                 },
             ]
@@ -1029,7 +1033,7 @@ mod tests {
         let mut writes = BTreeMap::new();
         collect_regions(&operation, &mut reads, &mut writes).unwrap();
         assert_eq!(
-            writes[&(destination, BackingView::Image(TEXTURE))].as_slice(),
+            writes[&(destination, BackingView::Image(ImageOwner::base(TEXTURE)))].as_slice(),
             [768, 832, 896, 960]
                 .map(|offset| BackingRegion::Linear(LinearRange::new(offset, 16).unwrap()))
         );
@@ -1090,7 +1094,7 @@ mod tests {
         let destination_representation = execution(
             &mut resources,
             destination,
-            BackingView::Image(TEXTURE),
+            BackingView::Image(ImageOwner::base(TEXTURE)),
             "destination",
         );
         materialize(

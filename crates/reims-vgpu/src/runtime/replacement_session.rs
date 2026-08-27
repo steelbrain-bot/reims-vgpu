@@ -2909,7 +2909,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .create_execution_representation(
                 backing,
                 route,
-                reims_vgpu_core::BackingView::Image(resource),
+                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::base(resource)),
                 native,
             )
             .map_err(|failure| {
@@ -3221,7 +3221,10 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         let representation = self
             .epoch
             .resources
-            .execution_representation_id(backing, reims_vgpu_core::BackingView::Image(view.base))
+            .execution_representation_id(
+                backing,
+                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::base(view.base)),
+            )
             .map_err(ReplacementRepresentationConstructionError::Lifecycle)?;
         let native = self
             .epoch
@@ -6893,6 +6896,9 @@ pub(crate) enum ReplacementRenderAttachmentResolutionError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReplacementRenderAttachmentResource {
     pub resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    /// The texture that owns the image this attachment renders into. Equal to
+    /// `resource` unless the guest named a texture view.
+    pub base: ResourceId<reims_vgpu_protocol::ResourceObject>,
     pub backing: reims_vgpu_protocol::BackingId,
     pub pixel_format: u16,
     pub extent: [u32; 3],
@@ -15242,7 +15248,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         };
         self.execution
             .resources()
-            .view_representation(backing, reims_vgpu_core::BackingView::Image(resource))
+            .view_representation(
+                backing,
+                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::base(resource)),
+            )
             .is_ok()
     }
 
@@ -15453,6 +15462,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         };
         Ok(reims_vgpu_core::ResolvedTextureEndpoint {
             resource,
+            base: view.base,
             storage: backing,
             level,
             slice,
@@ -15553,6 +15563,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 reims_vgpu_core::TexelBox::new([0, 0, 0], extent).ok_or(Error::EmptyExtent)?;
             return Ok(ReplacementRenderAttachmentResource {
                 resource,
+                base: view.base,
                 backing,
                 pixel_format: view.pixel_format,
                 extent,
@@ -15594,6 +15605,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .map_or(1, |declaration| u32::from(declaration.sample_count).max(1));
         Ok(ReplacementRenderAttachmentResource {
             resource,
+            base: view.base,
             backing,
             pixel_format: view.pixel_format,
             extent,
@@ -33383,6 +33395,7 @@ mod tests {
         );
         let texture_endpoint = reims_vgpu_core::ResolvedTextureEndpoint {
             resource,
+            base: resource,
             storage: backing,
             level: 0,
             slice: 0,

@@ -6,10 +6,10 @@
 
 use crate::{
     AccessIntent, AccessMode, AccessScope, AccessTarget, BackingRegion, BackingView,
-    GpuWriteBatchError, GpuWriteId, GpuWriteRequest, GpuWriteReservation, ImageSubresourceRange,
-    ManagedBackingError, ManagedBackingProgress, ReadyPipelineLease, RepresentationUse,
-    ResolvedResourceCompletion, ResourceLifecycleOwner, ResourceUseBatchError, StageScope,
-    ViewRepresentation,
+    GpuWriteBatchError, GpuWriteId, GpuWriteRequest, GpuWriteReservation, ImageOwner,
+    ImageSubresourceRange, ManagedBackingError, ManagedBackingProgress, ReadyPipelineLease,
+    RepresentationUse, ResolvedResourceCompletion, ResourceLifecycleOwner, ResourceUseBatchError,
+    StageScope, ViewRepresentation,
 };
 use reims_vgpu_protocol::{
     BackingId, CullMode, DepthClipMode, DepthStencilObject, FillMode, HazardDomainId, IndexType,
@@ -175,6 +175,11 @@ pub enum RenderAttachmentClear {
 pub struct ResolvedRenderAttachment {
     pub role: RenderAttachmentRole,
     pub resource: ResourceId<ResourceObject>,
+    /// The texture that owns the native image these texels live in.
+    ///
+    /// Equal to `resource` whenever the guest named a texture; a bound texture
+    /// view names its base here, because the view has no image of its own.
+    pub base: ResourceId<ResourceObject>,
     pub backing: BackingId,
     pub regions: Box<[BackingRegion]>,
     pub pixel_format: u16,
@@ -207,6 +212,11 @@ pub struct ResolvedRenderAttachment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedRenderResolveAttachment {
     pub resource: ResourceId<ResourceObject>,
+    /// The texture that owns the native image these texels live in.
+    ///
+    /// Equal to `resource` whenever the guest named a texture; a bound texture
+    /// view names its base here, because the view has no image of its own.
+    pub base: ResourceId<ResourceObject>,
     pub backing: BackingId,
     pub regions: Box<[BackingRegion]>,
     pub pixel_format: u16,
@@ -585,7 +595,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
         // addresses; `validate_shape` has already proved class and view agree.
         let view = match resource.view {
             RenderBindingView::Buffer(_) => BackingView::Bytes,
-            RenderBindingView::Image(_) => BackingView::Image(resource.resource),
+            RenderBindingView::Image(view) => BackingView::Image(ImageOwner::of_view(view)),
         };
         let group = grouped.entry((resource.backing, view)).or_default();
         group.0.extend(resource.regions.iter().copied());
@@ -601,7 +611,10 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
     }
     for attachment in &operation.attachments {
         let group = grouped
-            .entry((attachment.backing, BackingView::Image(attachment.resource)))
+            .entry((
+                attachment.backing,
+                BackingView::Image(ImageOwner::base(attachment.base)),
+            ))
             .or_default();
         group.0.extend(attachment.regions.iter().copied());
         group.1 |= operation.begins_encoder && attachment.load == LoadAction::Load;
@@ -613,7 +626,10 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
         group.3.insert(attachment.resource);
         if let Some(resolve) = &attachment.resolve {
             let group = grouped
-                .entry((resolve.backing, BackingView::Image(resolve.resource)))
+                .entry((
+                    resolve.backing,
+                    BackingView::Image(ImageOwner::base(resolve.base)),
+                ))
                 .or_default();
             group.0.extend(resolve.regions.iter().copied());
             group.2 |= operation.ends_encoder;
@@ -1150,7 +1166,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
-                BackingView::Image(resource),
+                BackingView::Image(ImageOwner::base(resource)),
                 (),
             )
             .unwrap();
@@ -1193,6 +1209,7 @@ mod tests {
             attachments: Box::new([ResolvedRenderAttachment {
                 role: RenderAttachmentRole::Color(0),
                 resource: ResourceId::new(4, 1),
+                base: ResourceId::new(4, 1),
                 backing: target,
                 regions: Box::new([BackingRegion::Whole]),
                 pixel_format: 80,
@@ -1220,6 +1237,43 @@ mod tests {
             null_bindings: Box::new([]),
             samplers: Box::new([]),
         }
+    }
+
+    #[test]
+    fn a_bound_texture_view_names_its_bases_image_and_never_its_own() {
+        // A texture view has no image of its own: it is a `VkImageView` over
+        // the base's image, and its native view is installed onto that image.
+        // Keying it by the resource the guest named asks for an image built
+        // for the view, which carries no installed views and refuses the
+        // binding with the shader view absent.
+        let mut owner = ResourceLifecycleOwner::new(EPOCH);
+        let sampled = backing(&mut owner, true, SAMPLED);
+        let target = backing(&mut owner, false, TARGET);
+        let mut operation = direct(sampled, target, LoadAction::Clear);
+        let view = ResourceId::new(30, 1);
+        operation.resources[0].resource = view;
+        operation.resources[0].view = RenderBindingView::Image(ResolvedTextureBindingView {
+            resource: view,
+            base: SAMPLED,
+            ..image_view(SAMPLED)
+        });
+        let prepared = prepare_render_dispatch(
+            &mut owner,
+            TransactionId::new(7),
+            SubmissionId::new(11),
+            4,
+            operation,
+            pipeline(),
+        )
+        .unwrap();
+        assert!(prepared.representations().iter().any(|entry| {
+            entry.backing == sampled && entry.view == BackingView::Image(ImageOwner::base(SAMPLED))
+        }));
+        assert!(!prepared
+            .representations()
+            .iter()
+            .any(|entry| { entry.view == BackingView::Image(ImageOwner::base(view)) }));
+        cancel_prepared_render_dispatch(&mut owner, prepared).unwrap();
     }
 
     #[test]
@@ -1616,6 +1670,7 @@ mod tests {
         operation.attachments[0].sample_count = 4;
         operation.attachments[0].resolve = Some(ResolvedRenderResolveAttachment {
             resource: ResourceId::new(6, 1),
+            base: ResourceId::new(6, 1),
             backing: resolve,
             regions: Box::new([BackingRegion::Whole]),
             pixel_format: operation.attachments[0].pixel_format,

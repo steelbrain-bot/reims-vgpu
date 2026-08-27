@@ -106,6 +106,47 @@ pub struct GpuWriteReservation {
     pub regions: Box<[RegionVersion]>,
 }
 
+/// The texture that owns a native image.
+///
+/// A native image belongs to the texture that declared the storage it covers.
+/// A texture *view* — a format reinterpretation, a mip or slice window, a
+/// swizzle — is a view onto that image and never owns one, so a view is never
+/// the key. Its own native view is installed onto the base's image and found
+/// there by the resource that names it.
+///
+/// This is a type rather than a convention because the correct key and the
+/// wrong one are one field apart on the same struct and agree on every plain
+/// texture, where the base is the resource. Only a bound view separates them,
+/// and it separates them silently: keying a view by itself resolves an image
+/// that was built for it and had no view installed onto it, so the record
+/// refuses with the shader view absent rather than with anything that names
+/// the substitution.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ImageOwner(ResourceId<ResourceObject>);
+
+impl ImageOwner {
+    /// A base texture, which owns its own image.
+    ///
+    /// For the resolvers this is the `base` an endpoint already carries, and
+    /// for a materialized declaration it is the declared resource: a view
+    /// declares no storage and so reaches no materializer.
+    pub const fn base(texture: ResourceId<ResourceObject>) -> Self {
+        Self(texture)
+    }
+
+    /// The base a resolved binding reads through, which owns the image
+    /// whatever the guest named.
+    pub const fn of_view(view: crate::ResolvedTextureBindingView) -> Self {
+        Self(view.base)
+    }
+
+    /// The owning texture, for diagnostics and for the graph lookups keyed by
+    /// resource identity.
+    pub const fn texture(self) -> ResourceId<ResourceObject> {
+        self.0
+    }
+}
+
 /// Which view of a backing's bytes a native object is.
 ///
 /// A backing is one run of guest bytes and its representations are views of
@@ -133,7 +174,7 @@ pub enum BackingView {
     Bytes,
     /// One texture's texels over the backing, addressed by subresource and
     /// coordinate.
-    Image(ResourceId<ResourceObject>),
+    Image(ImageOwner),
 }
 
 /// One endpoint's native object, named by the backing it addresses and by
@@ -2802,8 +2843,8 @@ mod tests {
     #[test]
     fn two_textures_over_one_backing_each_get_their_own_image() {
         let (mut owner, backing) = owner();
-        let wide = BackingView::Image(ResourceId::new(7, 1));
-        let narrow = BackingView::Image(ResourceId::new(8, 1));
+        let wide = BackingView::Image(ImageOwner::base(ResourceId::new(7, 1)));
+        let narrow = BackingView::Image(ImageOwner::base(ResourceId::new(8, 1)));
 
         let wide_representation = owner
             .create_execution_representation(
@@ -2842,7 +2883,10 @@ mod tests {
         // A third texture over the same bytes has no image yet, and that is
         // named rather than answered with one of the two that do.
         assert_eq!(
-            owner.view_representation(backing, BackingView::Image(ResourceId::new(9, 1))),
+            owner.view_representation(
+                backing,
+                BackingView::Image(ImageOwner::base(ResourceId::new(9, 1)))
+            ),
             Err(ManagedBackingError::MissingExecutionRepresentation)
         );
 

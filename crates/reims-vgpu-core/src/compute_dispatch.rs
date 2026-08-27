@@ -7,10 +7,10 @@
 
 use crate::{
     AccessIntent, AccessMode, AccessScope, AccessTarget, BackingRegion, BackingView,
-    GpuWriteBatchError, GpuWriteId, GpuWriteRequest, GpuWriteReservation, ImageSubresourceRange,
-    ManagedBackingError, ManagedBackingProgress, ReadyPipelineLease, RepresentationUse,
-    ResolvedResourceCompletion, ResourceLifecycleOwner, ResourceUseBatchError, SamplerResource,
-    StageScope, ViewRepresentation,
+    GpuWriteBatchError, GpuWriteId, GpuWriteRequest, GpuWriteReservation, ImageOwner,
+    ImageSubresourceRange, ManagedBackingError, ManagedBackingProgress, ReadyPipelineLease,
+    RepresentationUse, ResolvedResourceCompletion, ResourceLifecycleOwner, ResourceUseBatchError,
+    SamplerResource, StageScope, ViewRepresentation,
 };
 use reims_vgpu_protocol::{
     BackingId, ComputePipelineObject, HazardDomainId, RepresentationId, ResourceId, ResourceObject,
@@ -419,7 +419,7 @@ pub fn prepare_compute_dispatch<T, NativePipeline>(
         // view agree.
         let view = match resource.view {
             ComputeBindingView::Buffer(_) => BackingView::Bytes,
-            ComputeBindingView::Image(_) => BackingView::Image(resource.resource),
+            ComputeBindingView::Image(view) => BackingView::Image(ImageOwner::of_view(view)),
         };
         let grouped = grouped.entry((resource.backing, view)).or_default();
         grouped.0.extend(resource.regions.iter().copied());
@@ -925,7 +925,11 @@ mod tests {
     fn stale_read_in_a_later_backing_refuses_before_reserving_an_earlier_write() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
         let writable = backing(&mut owner, true);
-        let stale = view_backing(&mut owner, false, BackingView::Image(ResourceId::new(6, 1)));
+        let stale = view_backing(
+            &mut owner,
+            false,
+            BackingView::Image(ImageOwner::base(ResourceId::new(6, 1))),
+        );
         let mut operation = dispatch(writable, AccessMode::Write);
         let mut resources = operation.resources.into_vec();
         resources.push(ResolvedComputeResourceBinding {

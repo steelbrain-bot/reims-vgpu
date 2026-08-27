@@ -80,6 +80,11 @@ pub enum ResolvedTextureBacking {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedTextureEndpoint {
     pub resource: ResourceId<ResourceObject>,
+    /// The texture that owns the native image these texels live in.
+    ///
+    /// Equal to `resource` whenever the guest named a texture; a bound texture
+    /// view names its base here, because the view has no image of its own.
+    pub base: ResourceId<ResourceObject>,
     pub storage: BackingId,
     pub level: u32,
     pub slice: u32,
@@ -311,6 +316,7 @@ mod tests {
     fn linear_endpoint(index: u32) -> ResolvedTextureEndpoint {
         ResolvedTextureEndpoint {
             resource: range(index, 1, u64::from(index) << 12).resource,
+            base: range(index, 1, u64::from(index) << 12).resource,
             storage: BackingId::new(u64::from(index)),
             level: 0,
             slice: 0,
@@ -389,6 +395,7 @@ mod tests {
             source_bytes_per_image: 256,
             destination: ResolvedTextureEndpoint {
                 resource: destination,
+                base: destination,
                 storage: BackingId::new(11),
                 level: 0,
                 slice: 0,
@@ -423,6 +430,7 @@ mod tests {
         let operation = ResolvedBlit::TextureToBuffer(ResolvedTextureToBufferBlit {
             source: ResolvedTextureEndpoint {
                 resource: source,
+                base: source,
                 storage: BackingId::new(11),
                 level: 0,
                 slice: 0,
