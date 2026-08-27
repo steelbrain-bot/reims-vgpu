@@ -387,38 +387,45 @@ impl SubmissionOrderOwner {
     /// counter answers, because a count of live recordings cannot say whether
     /// one of them is the producer somebody is parked on. This reports the
     /// per-transaction state so the two readings can be joined.
+    /// One transaction's order entry, without building the whole census.
+    ///
+    /// [`Self::census`] allocates a vector of every tracked transaction, which
+    /// is the wrong shape for a caller that already knows which transaction it
+    /// is asking about -- a refusal path asking once per retry is asking
+    /// thousands of times a second.
+    pub fn entry(&self, transaction: TransactionId) -> Option<SubmissionOrderEntry> {
+        let order = self.transactions.get(&transaction)?;
+        let state = self.domains.get(&order.domain);
+        Some(SubmissionOrderEntry {
+            transaction,
+            domain: order.domain,
+            sequence: order.sequence,
+            submitted: order.submitted,
+            abandoned: order.abandoned,
+            recorded: state.is_some_and(|state| {
+                state
+                    .pending
+                    .get(&order.sequence)
+                    .or_else(|| {
+                        state
+                            .issued
+                            .as_ref()
+                            .filter(|(sequence, _)| *sequence == order.sequence)
+                            .map(|(_, pending)| pending)
+                    })
+                    .is_some_and(|pending| pending.recorded)
+            }),
+            issued: state
+                .and_then(|state| state.issued.as_ref())
+                .is_some_and(|(sequence, _)| *sequence == order.sequence),
+        })
+    }
+
+    /// Every tracked transaction's [`Self::entry`], in transaction order.
     pub fn census(&self) -> Vec<SubmissionOrderEntry> {
         self.transactions
-            .iter()
-            .map(|(&transaction, order)| SubmissionOrderEntry {
-                transaction,
-                domain: order.domain,
-                sequence: order.sequence,
-                submitted: order.submitted,
-                abandoned: order.abandoned,
-                recorded: self
-                    .domains
-                    .get(&order.domain)
-                    .map(|state| {
-                        state
-                            .pending
-                            .get(&order.sequence)
-                            .or_else(|| {
-                                state
-                                    .issued
-                                    .as_ref()
-                                    .filter(|(sequence, _)| *sequence == order.sequence)
-                                    .map(|(_, pending)| pending)
-                            })
-                            .is_some_and(|pending| pending.recorded)
-                    })
-                    .unwrap_or(false),
-                issued: self
-                    .domains
-                    .get(&order.domain)
-                    .and_then(|state| state.issued.as_ref())
-                    .is_some_and(|(sequence, _)| *sequence == order.sequence),
-            })
+            .keys()
+            .filter_map(|&transaction| self.entry(transaction))
             .collect()
     }
 

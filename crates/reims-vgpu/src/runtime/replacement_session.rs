@@ -11559,27 +11559,27 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             Some(runtime) => match runtime.issued_submission_head_other_than(transaction) {
                 Ok(Some(issued)) => {
                     // The head this runtime reports and the head the census
-                    // reports have disagreed, and a refusal that names only
-                    // the head cannot say which of them is wrong. Report the
-                    // answering runtime's own entry for that head next to
-                    // whether the active generation is the one that answered:
-                    // a head the answering runtime calls submitted is a
-                    // contradiction inside one owner, and a head only a
-                    // retired generation still holds is two owners disagreeing
-                    // about one domain. Deduped by head.
-                    if crate::observe::first_sight(
-                        "replacement_behind_issued_head",
-                        issued.transaction.get(),
-                    ) {
-                        let entry = runtime
-                            .submission_order_census()
-                            .into_iter()
-                            .find(|entry| entry.transaction == issued.transaction);
-                        let active = self
-                            .execution
-                            .active
-                            .runtime
-                            .tracks_submission_order(transaction);
+                    // reports have disagreed at one timestamp, and a refusal
+                    // that names only the head cannot say which of them is
+                    // wrong. Report the answering runtime's own entry for that
+                    // head next to whether the active generation is the one
+                    // that answered: a head the answering runtime itself calls
+                    // submitted is a contradiction inside one owner, and a head
+                    // only a retired generation still holds is two owners
+                    // disagreeing about one domain.
+                    //
+                    // Keyed by the head *and* the two answers that can change
+                    // under it, so a head that begins as an honest refusal and
+                    // becomes a contradiction reports twice rather than being
+                    // deduped into its first, correct sighting. That is the
+                    // exact shape this boot showed: correct at the first
+                    // refusal, contradictory forty seconds later.
+                    let entry = runtime.submission_order_entry(issued.transaction);
+                    let active = std::ptr::eq(runtime, &self.execution.active.runtime);
+                    let key = (issued.transaction.get() << 2)
+                        | (u64::from(entry.is_some_and(|entry| entry.submitted)) << 1)
+                        | u64::from(active);
+                    if crate::observe::first_sight("replacement_behind_issued_head", key) {
                         crate::observe::fail(format!(
                             "replacement_behind_issued_head head={} behind={} answered_by_active={} head_entry={:?} reason=claim_behind_issued_head",
                             issued.transaction.get(),

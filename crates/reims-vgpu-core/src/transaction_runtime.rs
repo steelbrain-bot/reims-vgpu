@@ -722,6 +722,14 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
         self.submission_order.census()
     }
 
+    /// See [`SubmissionOrderOwner::entry`].
+    pub fn submission_order_entry(
+        &self,
+        transaction: TransactionId,
+    ) -> Option<crate::SubmissionOrderEntry> {
+        self.submission_order.entry(transaction)
+    }
+
     /// See [`SubmissionOrderOwner::tracks`].
     #[must_use]
     pub fn tracks_submission_order(&self, transaction: TransactionId) -> bool {
