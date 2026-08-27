@@ -90,6 +90,17 @@ defaultCommandBufferRetainsResourceCase()
 indirectCommandMutationCase()
 pipelineInformationCase()
 
+// A bound texture view names its base's storage. Identity first, so a failure
+// there is the view mechanism and nothing else; then a slice of an array, which
+// says the view reached the right storage and not merely some storage; then a
+// view over a surface plane, where the resource that owns the image is not the
+// one at the end of the view chain.
+textureViewIdentityCase(64, 32)
+textureViewIdentityCase(256, 64)
+textureViewArraySliceCase(64, 32, slices: 3)
+textureViewOverSurfaceCase(64, 32)
+textureViewOverSurfaceCase(256, 64)
+
 if texPipeline == nil {
     report("fragsample_pipeline", false, "tex_fs pipeline would not build")
 } else {
