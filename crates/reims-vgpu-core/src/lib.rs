@@ -410,8 +410,8 @@ pub use submission::{
     SubmissionWork,
 };
 pub use submission_order::{
-    SubmissionOrderEntry, SubmissionOrderError, SubmissionOrderOwner, SubmissionOrderRelation,
-    SubmissionReady,
+    IssuedHead, SubmissionOrderEntry, SubmissionOrderError, SubmissionOrderOwner,
+    SubmissionOrderRelation, SubmissionReady,
 };
 pub use synchronization::{
     plan_event, plan_fence, BarrierResource, Decision as SynchronizationDecision,

@@ -722,6 +722,20 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
         self.submission_order.census()
     }
 
+    /// See [`SubmissionOrderOwner::tracks`].
+    #[must_use]
+    pub fn tracks_submission_order(&self, transaction: TransactionId) -> bool {
+        self.submission_order.tracks(transaction)
+    }
+
+    /// See [`SubmissionOrderOwner::issued_head_other_than`].
+    pub fn issued_submission_head_other_than(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<Option<crate::IssuedHead>, crate::SubmissionOrderError> {
+        self.submission_order.issued_head_other_than(transaction)
+    }
+
     /// See [`SubmissionOrderOwner::unsubmitted_predecessor`].
     pub fn unsubmitted_submission_predecessor(
         &self,

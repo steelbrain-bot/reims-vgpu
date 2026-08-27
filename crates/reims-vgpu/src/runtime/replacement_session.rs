@@ -2167,6 +2167,31 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         &self.active.runtime
     }
 
+    /// The runtime whose submission order tracks `transaction`.
+    ///
+    /// [`Self::runtime`] is the *active* generation's, and an exec is not
+    /// active-scoped: a transaction admitted before a generation change has its
+    /// order in `retired`, and the queue paths commit staged work back into the
+    /// exec's own generation rather than into `active`. Asking `active` about
+    /// such a transaction does not fail, it answers about a domain the
+    /// transaction is not in -- which is how two attempts at an ordering rule
+    /// came to report an issued head the census showed as submitted.
+    ///
+    /// A transaction's order lives in exactly one owner, so selecting by that
+    /// removes the question rather than answering it: there is no generation to
+    /// supply and none for a caller to get wrong.
+    pub fn runtime_owning_submission_order(
+        &self,
+        transaction: TransactionId,
+    ) -> Option<&reims_vgpu_core::TransactionRuntime<Semantic>> {
+        if self.active.runtime.tracks_submission_order(transaction) {
+            return Some(&self.active.runtime);
+        }
+        self.retired
+            .values()
+            .find(|runtime| runtime.tracks_submission_order(transaction))
+    }
+
     pub fn runtime_mut(&mut self) -> &mut reims_vgpu_core::TransactionRuntime<Semantic> {
         &mut self.active.runtime
     }
@@ -4320,8 +4345,39 @@ pub(crate) enum ReplacementResourceReadyExecFailure<Completion> {
 
 #[derive(Debug)]
 pub(crate) struct ReplacementExecImagePreparationFailure {
-    pub reason: reims_vgpu_vulkan::replacement_exec_image::ExecImageStateError,
+    pub reason: ReplacementExecImagePreparationRefusal,
     pub resources: PreparedReplacementExecResources,
+}
+
+/// Why one exec could not take its image claims.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementExecImagePreparationRefusal {
+    /// The backend's own image-state rule declined the plan.
+    Images(reims_vgpu_vulkan::replacement_exec_image::ExecImageStateError),
+    /// This transaction's own domain has another transaction issued, so this
+    /// one may not take an exclusive image claim yet.
+    ///
+    /// An image representation carries one prepared transition at a time, and
+    /// an issued head is the one transaction its domain cannot advance past.
+    /// A claim taken behind that head is not merely early, it is unresolvable:
+    /// the head cannot prepare an image the claimant holds, and the claimant
+    /// cannot submit or cancel while the head holds the domain. Both then
+    /// retry for the life of the device with every stall counter reading
+    /// healthy, because neither has failed.
+    ///
+    /// The head's own position travels with the refusal so the log can be read
+    /// against `replacement_submission_order` directly. Two earlier attempts at
+    /// this rule reported a head the census showed as submitted, and neither
+    /// refusal carried enough to tell a wrong owner from a wrong rule.
+    BehindIssuedHead(reims_vgpu_core::IssuedHead),
+    /// No runtime tracks this transaction's order, so nothing can be said
+    /// about what it sits behind.
+    ///
+    /// Distinct from taking the claim: an exec whose order cannot be found is
+    /// not an exec that is free to claim, it is one this device has lost track
+    /// of, and silently allowing it is how an ordering rule stops covering the
+    /// population it was written for.
+    SubmissionOrderUntracked,
 }
 
 type ReplacementExecResourceCancellation = reims_vgpu_core::ExecResourceCancellationResult<
@@ -11455,7 +11511,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 Ok(has_images) => has_images,
                 Err(reason) => {
                     return Err(Box::new(ReplacementExecImagePreparationFailure {
-                        reason,
+                        reason: ReplacementExecImagePreparationRefusal::Images(reason),
                         resources,
                     }));
                 }
@@ -11465,6 +11521,30 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 resources,
                 image_states: None,
             });
+        }
+        // Ordering the claim, not the work: readiness, resource preparation and
+        // the has-images classification above all still run on arrival, and a
+        // transaction with no image uses has already returned. Only the
+        // exclusive claim waits, and only behind its own domain's issued head.
+        //
+        // The order is read from the runtime that tracks this transaction, not
+        // from the active generation, because an exec is not active-scoped.
+        let transaction = resources.transaction();
+        let refusal = match self.execution.runtime_owning_submission_order(transaction) {
+            Some(runtime) => match runtime.issued_submission_head_other_than(transaction) {
+                Ok(Some(issued)) => Some(ReplacementExecImagePreparationRefusal::BehindIssuedHead(
+                    issued,
+                )),
+                Ok(None) => None,
+                Err(_) => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
+            },
+            None => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
+        };
+        if let Some(reason) = refusal {
+            return Err(Box::new(ReplacementExecImagePreparationFailure {
+                reason,
+                resources,
+            }));
         }
         let queue_family = self.session.vulkan().work_queue_family();
         let final_layouts =
@@ -11481,7 +11561,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 image_states: Some(image_states),
             }),
             Err(reason) => Err(Box::new(ReplacementExecImagePreparationFailure {
-                reason,
+                reason: ReplacementExecImagePreparationRefusal::Images(reason),
                 resources,
             })),
         }
