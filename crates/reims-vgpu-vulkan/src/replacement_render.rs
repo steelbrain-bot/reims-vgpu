@@ -1212,6 +1212,12 @@ impl RenderExecProgramError {
         matches!(
             self,
             Self::Record(RenderRecordError::UnknownImageView { reason, .. }) if reason.is_unimplemented()
+        ) || matches!(
+            self,
+            Self::Record(RenderRecordError::AttachmentTargetMismatch {
+                term: AttachmentTargetTerm::PixelFormat { .. },
+                ..
+            })
         )
     }
 }
@@ -1992,13 +1998,33 @@ fn validate_attachment_target(
             required: aspect,
         });
     }
-    if target.pixel_format != attachment.pixel_format
-        || target.extent.width < attachment.extent[0]
-        || target.extent.height < attachment.extent[1]
-        || semantic_samples != samples
-        || target.samples != samples
-    {
-        return Err(RenderRecordError::AttachmentTargetMismatch(attachment.role));
+    let mismatch = |term| RenderRecordError::AttachmentTargetMismatch {
+        role: attachment.role,
+        term,
+    };
+    if target.pixel_format != attachment.pixel_format {
+        return Err(mismatch(AttachmentTargetTerm::PixelFormat {
+            declared: attachment.pixel_format,
+            native: target.pixel_format,
+        }));
+    }
+    if target.extent.width < attachment.extent[0] || target.extent.height < attachment.extent[1] {
+        return Err(mismatch(AttachmentTargetTerm::Extent {
+            declared: [attachment.extent[0], attachment.extent[1]],
+            native: [target.extent.width, target.extent.height],
+        }));
+    }
+    if semantic_samples != samples {
+        return Err(mismatch(AttachmentTargetTerm::DeclaredSamples {
+            declared: semantic_samples,
+            pipeline: samples,
+        }));
+    }
+    if target.samples != samples {
+        return Err(mismatch(AttachmentTargetTerm::NativeSamples {
+            native: target.samples,
+            pipeline: samples,
+        }));
     }
     Ok(())
 }
@@ -2123,6 +2149,43 @@ fn declare(
     Ok(())
 }
 
+/// Which of the four attachment/target agreements a recorder could not meet.
+///
+/// These were one refusal that named only the role, and a driven boot parked a
+/// channel on it and retried forty thousand times with the log repeating that
+/// one role. They are separated because they are different facts and only one
+/// of them is this backend's own limitation.
+///
+/// [`Self::PixelFormat`] is that one, and it is terminal. A backing carries a
+/// single execution image, so two textures declared over one guest range are
+/// both served by whichever of them materialized first, and no `VkImageView`
+/// reinterprets between two formats of different bit widths. Retrying compares
+/// the same two fixed declarations again, so the packet ends by name instead.
+///
+/// The other three are disagreements between an attachment, an image and a
+/// pipeline that a later state change could still settle, so they park under
+/// their own names and the name is what says which one to go and read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentTargetTerm {
+    /// The image serving this backing was built for another declared format.
+    PixelFormat { declared: u16, native: u16 },
+    /// The image is smaller than the area the pass draws into.
+    Extent {
+        declared: [u32; 2],
+        native: [u32; 2],
+    },
+    /// The attachment's own declared sample count is not the pipeline's.
+    DeclaredSamples {
+        declared: vk::SampleCountFlags,
+        pipeline: vk::SampleCountFlags,
+    },
+    /// The image's sample count is not the pipeline's.
+    NativeSamples {
+        native: vk::SampleCountFlags,
+        pipeline: vk::SampleCountFlags,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderRecordError {
     DeviceEpochLost,
@@ -2143,7 +2206,14 @@ pub enum RenderRecordError {
     PipelineDepthStencilMismatch,
     SeparateDepthStencilViews,
     SeparateDepthStencilResolveViews,
-    AttachmentTargetMismatch(RenderAttachmentRole),
+    /// A render pass whose attachment and the native image serving it do not
+    /// agree. The term names which of the four agreements failed, because they
+    /// are unrelated facts with unrelated answers -- see
+    /// [`AttachmentTargetTerm`].
+    AttachmentTargetMismatch {
+        role: RenderAttachmentRole,
+        term: AttachmentTargetTerm,
+    },
     UnsupportedAttachmentSampleCount(RenderAttachmentRole),
     ResolveTargetMismatch(RenderAttachmentRole),
     UnknownImage(ReplacementImageKey),
@@ -2443,6 +2513,137 @@ mod tests {
     };
 
     const EPOCH: VulkanDeviceEpochId = VulkanDeviceEpochId::new(6);
+
+    /// The four attachment agreements are one check and were one refusal. A
+    /// packet that cannot name which of them failed cannot be classified, and
+    /// only the format term is this backend declining to build something.
+    #[test]
+    fn an_attachment_target_names_the_agreement_it_could_not_meet() {
+        let key = ReplacementImageKey {
+            backing: BackingId::new(1),
+            representation: reims_vgpu_protocol::RepresentationId::new(2),
+        };
+        let attachment = |pixel_format, extent: [u32; 3], sample_count| ResolvedRenderAttachment {
+            role: RenderAttachmentRole::Color(0),
+            resource: ResourceId::new(1, 1),
+            backing: BackingId::new(1),
+            regions: Box::new([BackingRegion::Whole]),
+            pixel_format,
+            extent,
+            sample_count,
+            load: LoadAction::Load,
+            store: StoreAction::Store,
+            clear: reims_vgpu_core::RenderAttachmentClear::Color([0; 4]),
+            resolve: None,
+            feedback_loop: false,
+            input_attachment: false,
+        };
+        let target = |pixel_format, width, height, samples| NativeImageTarget {
+            image: vk::Image::from_raw(1),
+            view: vk::ImageView::from_raw(2),
+            image_type: vk::ImageType::TYPE_2D,
+            full_range: vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+            usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            pixel_format,
+            extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+            samples,
+        };
+        let bgra = reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+        let rgba16 = reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA16_FLOAT;
+        let one = vk::SampleCountFlags::TYPE_1;
+
+        assert_eq!(
+            validate_attachment_target(
+                key,
+                &attachment(bgra, [64, 64, 1], 1),
+                target(bgra, 64, 64, one),
+                one,
+            ),
+            Ok(())
+        );
+
+        // An alias materialized at another declared format. Nothing a retry
+        // reaches changes either declaration, so the packet ends.
+        let format = validate_attachment_target(
+            key,
+            &attachment(bgra, [64, 64, 1], 1),
+            target(rgba16, 64, 64, one),
+            one,
+        )
+        .expect_err("a target of another format cannot serve the attachment");
+        assert_eq!(
+            format,
+            RenderRecordError::AttachmentTargetMismatch {
+                role: RenderAttachmentRole::Color(0),
+                term: AttachmentTargetTerm::PixelFormat {
+                    declared: bgra,
+                    native: rgba16,
+                },
+            }
+        );
+        assert!(RenderExecProgramError::Record(format).is_terminal_refusal());
+
+        // An image too small for the area drawn into is a different fact and
+        // is not this backend declining to build anything.
+        let extent = validate_attachment_target(
+            key,
+            &attachment(bgra, [64, 64, 1], 1),
+            target(bgra, 32, 64, one),
+            one,
+        )
+        .expect_err("a target smaller than the pass cannot serve the attachment");
+        assert_eq!(
+            extent,
+            RenderRecordError::AttachmentTargetMismatch {
+                role: RenderAttachmentRole::Color(0),
+                term: AttachmentTargetTerm::Extent {
+                    declared: [64, 64],
+                    native: [32, 64],
+                },
+            }
+        );
+        assert!(!RenderExecProgramError::Record(extent).is_terminal_refusal());
+
+        // The attachment's own declared count and the image's are separate
+        // disagreements with the pipeline, and the format check precedes both.
+        assert_eq!(
+            validate_attachment_target(
+                key,
+                &attachment(bgra, [64, 64, 1], 4),
+                target(bgra, 64, 64, one),
+                one,
+            ),
+            Err(RenderRecordError::AttachmentTargetMismatch {
+                role: RenderAttachmentRole::Color(0),
+                term: AttachmentTargetTerm::DeclaredSamples {
+                    declared: vk::SampleCountFlags::TYPE_4,
+                    pipeline: one,
+                },
+            })
+        );
+        assert_eq!(
+            validate_attachment_target(
+                key,
+                &attachment(bgra, [64, 64, 1], 1),
+                target(bgra, 64, 64, vk::SampleCountFlags::TYPE_4),
+                one,
+            ),
+            Err(RenderRecordError::AttachmentTargetMismatch {
+                role: RenderAttachmentRole::Color(0),
+                term: AttachmentTargetTerm::NativeSamples {
+                    native: vk::SampleCountFlags::TYPE_4,
+                    pipeline: one,
+                },
+            })
+        );
+    }
 
     fn image_view(
         resource: ResourceId<ResourceObject>,
