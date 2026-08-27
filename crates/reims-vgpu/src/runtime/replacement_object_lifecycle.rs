@@ -395,7 +395,7 @@ pub(crate) fn apply_replacement_texture_view<Semantic: Clone>(
             parent_kind,
         ));
     }
-    runtime
+    let declaration = runtime
         .declare_resource_view(
             task,
             reims_vgpu_protocol::ObjectTableRef::new(reference),
@@ -403,7 +403,18 @@ pub(crate) fn apply_replacement_texture_view<Semantic: Clone>(
             Arc::new(descriptor),
             parent,
         )
-        .map_err(ReplacementTextureViewRefusal::Declaration)
+        .map_err(ReplacementTextureViewRefusal::Declaration)?;
+    // Installing the view is part of declaring it, whenever the image it
+    // belongs on already exists.
+    //
+    // The other order needs nothing: a texture materialized after its views
+    // were declared reads them and carries them, so the two rules between them
+    // cover both and neither has to know which happened. Doing it anywhere
+    // else means knowing which resources some later packet will name, and a
+    // binding reached through the object table -- every sampled compute
+    // texture -- is named nowhere a materialization pass can see.
+    runtime.install_declared_texture_view(declaration.resource);
+    Ok(declaration)
 }
 
 pub(crate) fn apply_replacement_iosurface_plane_view<Semantic: Clone>(

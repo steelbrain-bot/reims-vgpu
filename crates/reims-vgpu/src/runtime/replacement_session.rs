@@ -16244,6 +16244,43 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .materialize_texture_view(&self.session.vulkan, resource)
     }
 
+    /// Install a freshly declared view onto its owner's image, if that image
+    /// is already built.
+    ///
+    /// Quiet when the owner has no image yet: that is the other order, where
+    /// the owner's own materialization reads its declared views and carries
+    /// them. A refusal is reported and not fatal -- the image is built and
+    /// every other view over it stays usable, and only a bind naming this one
+    /// is lost, which refuses by name at record time on the same image.
+    pub(crate) fn install_declared_texture_view(
+        &mut self,
+        view: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    ) {
+        let Some(owner) = self.texture_binding_view_image_owner(view) else {
+            return;
+        };
+        if owner == view || !self.resource_has_execution_representation(owner) {
+            return;
+        }
+        if let Err(reason) = self.materialize_texture_view(view) {
+            let reason = format!("{reason:?}");
+            let diagnostic =
+                crate::runtime::replacement_coordinator::ReplacementCoordinatorDiagnostic {
+                    slug: "replacement_texture_view_install_refused",
+                    fields: vec![
+                        ("resource", format!("{view:?}")),
+                        ("owner", format!("{owner:?}")),
+                        ("reason", reason.clone()),
+                    ],
+                    discriminant: crate::runtime::replacement_coordinator::fnv_discriminant(
+                        &reason,
+                    ),
+                };
+            crate::observe::Emit::decline("replacement_texture_view_install", &diagnostic)
+                .fail_once(diagnostic.discriminant);
+        }
+    }
+
     fn resolve_recording_request<Completion: Clone + PartialEq>(
         &self,
         input: CanonicalReplacementRecordingInput<Completion>,

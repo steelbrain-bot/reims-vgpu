@@ -531,27 +531,21 @@ fn report_replaced_physical_representation_refusal(
 
 /// Add the resources an exec *names* to the sets its own constructions filled.
 ///
-/// A packet's construction list holds what it declared; its resource list holds
-/// what it uses, which an earlier packet may have declared. Both need
-/// materializing, and the three kinds are not interchangeable: a linear
-/// allocation needs its own object, a plane view needs its plane's image, and
-/// a texture view needs installing onto the image its owner already has.
+/// A packet's construction list holds what it declared; its resource list
+/// holds what it uses, which an earlier packet may have declared. Both need
+/// materializing.
 ///
-/// The third was missing, and it fails in the narrow window where neither of
-/// the other two paths covers the view: the declaring packet installs it only
-/// if the owner's image existed then, and the owner's own materialization
-/// carries it only if the view was declared first. A view whose owner was
-/// built between the two is in neither, and every bind naming it refuses
-/// `ShaderViewAbsent` against an image that is otherwise correct. Installing is
-/// idempotent, so naming a view that is already there costs nothing.
+/// A texture view is neither, and saying so is the point of the third arm: a
+/// view is declared carrying its base's storage, so it answers the
+/// linear-allocation question exactly as well as its base does and would
+/// otherwise be claimed by the arm ahead of it and built as an allocation of
+/// its own. It has no allocation and no image; it is installed onto its
+/// owner's image when it is declared.
 fn collect_referenced_materializations<Semantic>(
     runtime: &ReplacementRuntimeSession<Semantic>,
     task: reims_vgpu_protocol::TaskId,
     resources: &[crate::runtime::decode::fifo::ExecResourceDesc],
     plane_views: &mut std::collections::BTreeSet<
-        reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
-    >,
-    views: &mut std::collections::BTreeSet<
         reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
     >,
     linears: &mut std::collections::BTreeSet<
@@ -567,16 +561,13 @@ fn collect_referenced_materializations<Semantic>(
         ) else {
             continue;
         };
-        // Order matters, because a view shares its base's storage and so
-        // answers the linear question as well as its base does. A view is
-        // never an allocation of its own, so it is asked about first.
         if runtime
             .io_surface_plane_view_materialization_facts(resource)
             .is_some()
         {
             plane_views.insert(resource);
         } else if runtime.is_texture_binding_view(resource) {
-            views.insert(resource);
+            continue;
         } else if runtime
             .linear_resource_materialization_facts(resource)
             .is_some()
@@ -599,7 +590,6 @@ where
         ReplacementAppliedLoadedObject, ReplacementLoadedObjectApplyEffect,
     };
     let mut plane_views = std::collections::BTreeSet::new();
-    let mut views = std::collections::BTreeSet::new();
     let mut linears = std::collections::BTreeSet::new();
     for applied in ready.constructions.objects.iter() {
         let ReplacementAppliedLoadedObject::Descriptor(effect) = applied else {
@@ -611,10 +601,6 @@ where
             }
             ReplacementLoadedObjectApplyEffect::IOSurfacePlaneView(declaration) => {
                 plane_views.insert(declaration.resource);
-                views.insert(declaration.resource);
-            }
-            ReplacementLoadedObjectApplyEffect::TextureView(declaration) => {
-                views.insert(declaration.resource);
             }
             _ => {}
         }
@@ -624,7 +610,6 @@ where
         ready.task(),
         ready.resources(),
         &mut plane_views,
-        &mut views,
         &mut linears,
     );
     // A registered surface is an allocation, not an image. Each declared plane
@@ -660,40 +645,6 @@ where
         runtime
             .materialize_resource_with_guest_window(resource, guest)
             .map_err(ReplacementObjectRepresentationPreparationError::Construction)?;
-    }
-    // A view declared after its owner's image was built is not in the set that
-    // materialization handed to the image, so it has to be installed on the
-    // image that already exists. A view declared before it needs nothing here:
-    // the materialization ahead reads that texture's views and carries them.
-    // Which of the two happened is the owner's own state, so this asks whether
-    // the owner has an image rather than tracking the order -- and it must be
-    // that resource's image and not merely some image on its backing, since an
-    // aliased texture over the same range has one of its own that this view
-    // does not belong on.
-    for view in views {
-        let Some(owner) = runtime.texture_binding_view_image_owner(view) else {
-            continue;
-        };
-        if !runtime.resource_has_execution_representation(owner) {
-            continue;
-        }
-        if let Err(reason) = runtime.materialize_texture_view(view) {
-            // Reported and not fatal. The image is built and every other view
-            // over it is usable; only a bind naming *this* view is lost, and
-            // that bind refuses by name at record time on the same image.
-            let reason = format!("{reason:?}");
-            let diagnostic = ReplacementCoordinatorDiagnostic {
-                slug: "replacement_texture_view_install_refused",
-                fields: vec![
-                    ("resource", format!("{view:?}")),
-                    ("owner", format!("{owner:?}")),
-                    ("reason", reason.clone()),
-                ],
-                discriminant: fnv_discriminant(&reason),
-            };
-            crate::observe::Emit::decline("replacement_texture_view_install", &diagnostic)
-                .fail_once(diagnostic.discriminant);
-        }
     }
     Ok(())
 }
@@ -5399,7 +5350,7 @@ pub(crate) struct ReplacementTimelineCoordinatorProgress {
 /// Fold one formatted refusal reason into the `u64` the always-on failure path
 /// dedupes by. Two distinct reasons must not share a key or the second is never
 /// printed, so this is a hash of the whole reason and not of its variant alone.
-fn fnv_discriminant(reason: &str) -> u64 {
+pub(crate) fn fnv_discriminant(reason: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in reason.as_bytes() {
         hash ^= u64::from(*byte);
@@ -5930,10 +5881,10 @@ impl<Semantic> ReplacementBlockedDrain<Semantic> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ReplacementCoordinatorDiagnostic {
-    slug: &'static str,
-    fields: Vec<(&'static str, String)>,
-    discriminant: u64,
+pub(crate) struct ReplacementCoordinatorDiagnostic {
+    pub(crate) slug: &'static str,
+    pub(crate) fields: Vec<(&'static str, String)>,
+    pub(crate) discriminant: u64,
 }
 
 impl crate::observe::Decline for ReplacementCoordinatorDiagnostic {
@@ -8840,13 +8791,138 @@ mod tests {
         );
     }
 
-    /// An exec names resources an earlier packet declared, and all three kinds
-    /// of them need materializing. The referenced pass covered linear
-    /// allocations and plane views and silently dropped texture views, so a
-    /// view whose owner's image was built after it was declared reached no
-    /// installer at all and every bind naming it refused `ShaderViewAbsent`.
+    /// Declaring a view is what installs it, whenever the image it belongs on
+    /// already exists.
+    ///
+    /// The other order needs nothing, because a texture materialized after its
+    /// views were declared reads them and carries them. Doing it anywhere else
+    /// means knowing which resources a later packet will name, and a sampled
+    /// compute texture is reached through the object table and named nowhere a
+    /// materialization pass can see -- which is where this was lost, as
+    /// `UnknownImageView { ShaderViewAbsent }` against an otherwise correct
+    /// image, with no install refusal anywhere in the log because no install
+    /// had ever been attempted.
     #[test]
-    fn an_exec_naming_a_view_an_earlier_packet_declared_reaches_the_installer() {
+    fn a_view_declared_after_its_owners_image_is_installed_onto_it() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(7);
+        runtime.define_task(task, 0x10_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        let data = 9u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        host.map_range(data, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        host.write_gpa(root + 0x10 * 4, &9u32.to_le_bytes())
+            .unwrap();
+
+        let base_ref = 31u32;
+        let view_ref = 32u32;
+        let base = crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+            &mut runtime,
+            shift,
+            task,
+            base_ref,
+            reims_vgpu_protocol::ResourceDescriptor::Texture(
+                reims_vgpu_protocol::LinearTextureDescriptor {
+                    allocation_size: 64,
+                    handle: 0x10,
+                    mipmap_level_count: 1,
+                    bytes_per_element: 4,
+                    used_size: 64,
+                    row_stride: 16,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+                        texture_type: reims_vgpu_protocol::TextureType::D2,
+                        framebuffer_only: false,
+                        is_drawable: false,
+                        write_swizzle_enabled: None,
+                        allow_gpu_optimized_contents: false,
+                        usage: 1,
+                        pixel_format: 70,
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                        mipmap_level_count: 1,
+                        sample_count: 1,
+                        array_length: 1,
+                        resource_options: 0,
+                        protection_options: 0,
+                        swizzle: None,
+                    }),
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap();
+
+        // The image first, the view second. This is the order the installer at
+        // declaration exists for.
+        prepare_backing_representation(&mut runtime, &mut host, shift, base.backing).unwrap();
+        assert!(runtime.resource_has_execution_representation(base.resource));
+
+        let view = crate::runtime::replacement_object_lifecycle::apply_replacement_texture_view(
+            &mut runtime,
+            task,
+            view_ref,
+            reims_vgpu_protocol::ResourceDescriptor::TextureView(
+                reims_vgpu_protocol::TextureViewDescriptor {
+                    form: reims_vgpu_protocol::TextureViewForm::Simple,
+                    view_texture_ref: view_ref,
+                    base_texture_ref: base_ref,
+                    pixel_format: 70,
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap();
+
+        let semantic = runtime
+            .execution()
+            .resources()
+            .graph()
+            .resolve_texture_binding_view(view.resource)
+            .unwrap();
+        let representation = runtime
+            .execution()
+            .resources()
+            .execution_representation_id(
+                base.backing,
+                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::owning(
+                    base.resource,
+                )),
+            )
+            .unwrap();
+        let native = runtime
+            .execution()
+            .resources()
+            .representation(base.backing, representation)
+            .unwrap();
+        assert!(
+            native.shader_view(semantic).is_ok(),
+            "the view was declared onto an image that already existed, so it \
+             has to be on it"
+        );
+    }
+
+    /// A texture view is declared carrying its base's storage, so it answers
+    /// the linear-allocation question as well as its base does. Classified as
+    /// one, it would be built as an allocation of its own -- and it has none.
+    #[test]
+    fn a_texture_view_an_exec_names_is_not_classified_as_an_allocation() {
         let Some(mut runtime) = runtime() else {
             return;
         };
@@ -8919,7 +8995,6 @@ mod tests {
         );
 
         let mut plane_views = std::collections::BTreeSet::new();
-        let mut views = std::collections::BTreeSet::new();
         let mut linears = std::collections::BTreeSet::new();
         let named = |object_id| crate::runtime::decode::fifo::ExecResourceDesc {
             object_id,
@@ -8931,14 +9006,16 @@ mod tests {
             task,
             &[named(base_ref), named(view_ref)],
             &mut plane_views,
-            &mut views,
             &mut linears,
         );
         assert!(
-            views.contains(&view.resource),
-            "the exec named the view, so the view has to reach the installer: {views:?}"
+            linears.contains(&base.resource),
+            "the texture is the allocation: {linears:?}"
         );
-        assert!(linears.contains(&base.resource));
+        assert!(
+            !linears.contains(&view.resource),
+            "the view has no allocation of its own: {linears:?}"
+        );
         assert!(plane_views.is_empty());
     }
 
