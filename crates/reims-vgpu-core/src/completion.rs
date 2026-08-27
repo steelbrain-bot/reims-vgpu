@@ -47,18 +47,26 @@ pub struct AbandonedCompletion<T> {
 pub enum CompletionOwnerError {
     WrongEpoch,
     DuplicateTransaction,
-    /// A submission asked to register a point at or below the highest already
-    /// submitted on its queue.
+    /// Two submissions on one queue registered the same signal value.
     ///
-    /// The point is allocated when a submission is prepared and registered
-    /// when the driver accepts it, so anything accepted between those two
-    /// moments takes the higher value and leaves this one behind. The values
-    /// are deliberately *not* carried here: this enum is `Copy` and sits
-    /// inside `ReplayAcceptanceFailure`, which already holds a whole prepared
-    /// submission, and widening it pushes that failure past the size clippy
-    /// refuses. Ask [`TimelineCompletionOwner::last_submitted`] at the
-    /// reporting site instead, which has the point in hand.
-    TimelineDidNotIncrease,
+    /// A queue's points come from one monotonic allocator and each is
+    /// submitted or explicitly skipped exactly once, so two live registrations
+    /// at one value is a real defect: the second signal would satisfy the
+    /// first's waiters, and the completion this owner publishes would name the
+    /// wrong transaction.
+    ///
+    /// This is deliberately *not* an arrival-order check. Registration happens
+    /// when the driver accepts a submission, and nothing promises acceptances
+    /// arrive in point order. What must be ordered is the GPU signal, and the
+    /// queue owner already enforces that itself, admitting only strictly
+    /// consecutive values under a lock it holds across the submit. Requiring
+    /// arrival order here as well refused a submission whose signal order was
+    /// correct: a driven x86/macos-13 boot admitted 85 and then 86 on queue 1
+    /// in that order, had them accepted the other way round, and lost the
+    /// upload at 85 -- which was the upload that would have made a backing's
+    /// execution representation current, so a render behind it then refused
+    /// `StaleExecutionRepresentation` for the life of the device.
+    DuplicateSubmittedPoint,
     TimelineAlreadyCompleted,
     TimelineRegressed,
     TransactionStillPending,
@@ -107,10 +115,9 @@ impl<T> TimelineCompletionOwner<T> {
 
     /// The highest point already submitted on `queue`, if any.
     ///
-    /// A `TimelineDidNotIncrease` refusal says a point was at or below this
-    /// without saying by how much, and the gap is the reading: adjacent values
-    /// mean two submissions raced, a whole queue apart means an acceptance ran
-    /// far out of the order its points were allocated in.
+    /// The high-water mark of registration, which only ever rises. Reported
+    /// beside a refusal so a reading can say how far a queue had run ahead of
+    /// the submission that was refused.
     #[must_use]
     pub fn last_submitted(&self, queue: QueueOwnerId) -> Option<QueueTimelineValue> {
         self.queues
@@ -138,12 +145,13 @@ impl<T> TimelineCompletionOwner<T> {
         {
             return Err(CompletionOwnerError::TimelineAlreadyCompleted);
         }
-        match queue.last_submitted {
-            Some(last) if point.value <= last => {
-                return Err(CompletionOwnerError::TimelineDidNotIncrease);
-            }
-            _ => queue.last_submitted = Some(point.value),
+        if queue.pending.contains_key(&point.value) {
+            return Err(CompletionOwnerError::DuplicateSubmittedPoint);
         }
+        queue.last_submitted = Some(match queue.last_submitted {
+            Some(last) if last > point.value => last,
+            _ => point.value,
+        });
         queue.pending.entry(point.value).or_default().push(Pending {
             transaction,
             session_generation,
@@ -313,8 +321,14 @@ mod tests {
         assert_eq!(abandoned[0].transaction, TransactionId::new(9));
     }
 
+    /// One value per queue may be live, and an epoch is not crossed.
+    ///
+    /// Registration is not required to arrive in point order: acceptances
+    /// come back from the driver in whatever order it returns them, while the
+    /// GPU signal order is the queue owner's to enforce and it does. What must
+    /// not happen is two live registrations at one value.
     #[test]
-    fn completion_points_are_monotonic_per_queue_and_bound_to_one_epoch() {
+    fn one_live_point_per_queue_and_registration_does_not_require_arrival_order() {
         let mut owner = TimelineCompletionOwner::new(VulkanDeviceEpochId::new(2));
         owner
             .register(
@@ -331,11 +345,42 @@ mod tests {
                 point(2, 4, 10),
                 (),
             ),
-            Err(CompletionOwnerError::TimelineDidNotIncrease)
+            Err(CompletionOwnerError::DuplicateSubmittedPoint),
+            "two live registrations at one value would publish the wrong \
+             transaction's completion"
+        );
+        // An acceptance that arrives after a higher one is ordinary and must
+        // register. This is the case that cost a boot its upload: the queue
+        // admitted 85 before 86, the driver returned them the other way round,
+        // and refusing the lower one lost work whose signal order was correct.
+        owner
+            .register(
+                TransactionId::new(3),
+                SessionGenerationId::new(1),
+                point(2, 4, 9),
+                (),
+            )
+            .unwrap();
+        assert_eq!(
+            owner.last_submitted(QueueOwnerId::new(4)),
+            Some(QueueTimelineValue::new(10)),
+            "the high-water mark does not fall back to the last arrival"
+        );
+        // Both are pending, and completion reaches them in point order.
+        let reached = owner
+            .advance(QueueOwnerId::new(4), QueueTimelineValue::new(10))
+            .unwrap();
+        assert_eq!(
+            reached
+                .iter()
+                .map(|fact| fact.transaction)
+                .collect::<Vec<_>>(),
+            vec![TransactionId::new(3), TransactionId::new(1)],
+            "out-of-order arrival still completes in point order"
         );
         assert_eq!(
             owner.register(
-                TransactionId::new(3),
+                TransactionId::new(4),
                 SessionGenerationId::new(1),
                 point(3, 5, 1),
                 (),
@@ -344,9 +389,7 @@ mod tests {
         );
     }
 
-    /// The refusal says a point did not increase; the accessor says by how
-    /// much, which is what separates two submissions racing from an
-    /// acceptance running far out of its allocation order.
+    /// The high-water mark a queue has reached, readable beside a refusal.
     #[test]
     fn the_highest_submitted_point_is_readable_beside_the_refusal() {
         let mut owner = TimelineCompletionOwner::new(VulkanDeviceEpochId::new(2));
@@ -363,17 +406,17 @@ mod tests {
             owner.last_submitted(QueueOwnerId::new(4)),
             Some(QueueTimelineValue::new(10))
         );
-        // A refused registration must not move it: the gap a later report
-        // reads has to describe the queue, not the last thing that asked.
-        assert_eq!(
-            owner.register(
+        // A lower point registers, and does not drag the mark down with it:
+        // a report reading the mark has to describe the queue, not the last
+        // thing that asked.
+        owner
+            .register(
                 TransactionId::new(2),
                 SessionGenerationId::new(1),
                 point(2, 4, 3),
                 (),
-            ),
-            Err(CompletionOwnerError::TimelineDidNotIncrease)
-        );
+            )
+            .unwrap();
         assert_eq!(
             owner.last_submitted(QueueOwnerId::new(4)),
             Some(QueueTimelineValue::new(10))

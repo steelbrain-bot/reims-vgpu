@@ -4714,12 +4714,10 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
                         failure,
                     ) => {
                         // The point this submission was allocated, beside the
-                        // highest its queue has already taken. A
-                        // `TimelineDidNotIncrease` says only that the first is
-                        // not above the second; the gap says whether two
-                        // submissions raced or an acceptance ran far out of
-                        // the order its points were allocated in, and that is
-                        // the difference between a lost race and a lost order.
+                        // high-water mark its queue has reached. The gap says
+                        // how far ahead the queue had run when this acceptance
+                        // came back, which is what a refusal naming a point
+                        // cannot say on its own.
                         let point = failure.failure.submission.prepared.point();
                         report_retained_failure_detail(
                             "replacement_guest_upload_final",
