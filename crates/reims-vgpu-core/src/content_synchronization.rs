@@ -208,6 +208,13 @@ pub fn prepare_content_synchronization<T>(
         let designated = resources
             .designated_views(backing)
             .map_err(|reason| ContentSynchronizationError::Backing { backing, reason })?;
+        // One entry per backing, accumulated across its designated views.
+        // Every view over these bytes holds its own copy and each may need a
+        // different set of representations moved, but a use batch is keyed by
+        // backing and refuses a backing named twice --- so a backing with two
+        // designated views produced `DuplicateBacking` and parked its channel.
+        // `RepresentationUse` carries a set for exactly this reason.
+        let mut backing_uses = BTreeSet::new();
         for (_, destination) in designated {
             let result = (|| {
                 let regions = regions.clone();
@@ -218,7 +225,7 @@ pub fn prepare_content_synchronization<T>(
                     .representation_matches(backing, destination, &snapshot)
                     .map_err(|reason| ContentSynchronizationError::Backing { backing, reason })?
                 {
-                    return Ok(());
+                    return Ok(BTreeSet::new());
                 }
                 let pending = resources
                     .pending_gpu_writes_overlapping(backing, destination, &regions)
@@ -372,27 +379,32 @@ pub fn prepare_content_synchronization<T>(
                         });
                     }
                 }
-                uses.push(RepresentationUse {
-                    backing,
-                    representations: used_representations
-                        .into_iter()
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                });
-                Ok(())
+                Ok(used_representations)
             })();
-            if let Err(error) = result {
-                return match cancel_partial(
-                    resources,
-                    transaction,
-                    &transfers,
-                    &host_ingresses,
-                    &[],
-                ) {
-                    Ok(_) => Err(error),
-                    Err(reason) => Err(ContentSynchronizationError::Cancellation(reason)),
-                };
+            match result {
+                Ok(used) => backing_uses.extend(used),
+                Err(error) => {
+                    return match cancel_partial(
+                        resources,
+                        transaction,
+                        &transfers,
+                        &host_ingresses,
+                        &[],
+                    ) {
+                        Ok(_) => Err(error),
+                        Err(reason) => Err(ContentSynchronizationError::Cancellation(reason)),
+                    };
+                }
             }
+        }
+        if !backing_uses.is_empty() {
+            uses.push(RepresentationUse {
+                backing,
+                representations: backing_uses
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            });
         }
     }
     if let Err(reason) = resources.accept_uses(transaction, &uses) {
@@ -490,6 +502,80 @@ mod tests {
                     && transfer.destination == destination
                     && transfer.region == region
         ));
+        cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
+    }
+
+    /// A backing with two designated views synchronizes both and names the
+    /// backing once.
+    ///
+    /// Every view over one range holds its own copy of the bytes, so all of
+    /// them have to be brought current --- which is why the synchronizer loops
+    /// over the designations. It also emitted one `RepresentationUse` per
+    /// designation, and a use batch is keyed by backing and refuses a backing
+    /// named twice: a second view therefore turned a correct synchronization
+    /// into `Uses(DuplicateBacking(..))`, which is not one lost command but a
+    /// parked channel, because the refusal sits on a submission head. The
+    /// entry carries a set of representations for exactly this reason.
+    #[test]
+    fn two_designated_views_over_one_backing_are_one_use_naming_both() {
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let region = BackingRegion::Linear(LinearRange::new(0, 64).unwrap());
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([region]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        resources
+            .create_representation(backing, RepresentationRoute::HostStagingEndpoint, ())
+            .unwrap();
+        let route = RepresentationRoute::HostStagingTransfer {
+            working: crate::WorkingMemoryClass::DeviceLocal,
+        };
+        let bytes = resources
+            .create_execution_representation(backing, route, BackingView::Bytes, ())
+            .unwrap();
+        // A texture declared over the same range: its own view, its own image,
+        // its own copy of these bytes.
+        let image = resources
+            .create_execution_representation(
+                backing,
+                route,
+                BackingView::Image(crate::ImageOwner::owning(
+                    reims_vgpu_protocol::ResourceId::new(9, 1),
+                )),
+                (),
+            )
+            .unwrap();
+        assert_ne!(bytes, image);
+
+        let prepared = prepare_content_synchronization(
+            &mut resources,
+            TransactionId::new(11),
+            [ContentSynchronizationRequest {
+                backing,
+                regions: Box::new([region]),
+                permitted_pending_writes: Box::new([]),
+            }],
+        )
+        .expect("two designated views over one backing is one use, not a duplicate");
+        // One entry for the backing, naming both destinations and the staging
+        // endpoint they are filled from.
+        assert_eq!(prepared.uses().len(), 1);
+        assert_eq!(prepared.uses()[0].backing, backing);
+        let named = prepared.uses()[0]
+            .representations
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert!(named.contains(&bytes));
+        assert!(named.contains(&image));
+        assert!(named.contains(&HOST_REPRESENTATION));
+        // Both views are brought current, not just the first designation.
+        assert_eq!(prepared.host_ingresses().len(), 2);
         cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
     }
 
