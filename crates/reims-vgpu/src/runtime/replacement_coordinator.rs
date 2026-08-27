@@ -397,14 +397,24 @@ fn materialize_io_surface_plane_view<Semantic>(
 where
     Semantic: Clone,
 {
-    let (task, descriptor, backing) = runtime
+    let (task, descriptor, _backing) = runtime
         .io_surface_plane_view_materialization_facts(plane_view)
         .ok_or(
             ReplacementObjectRepresentationPreparationError::SurfaceDescriptorUnavailable(
                 plane_view,
             ),
         )?;
-    if runtime.backing_has_execution_representation(backing) {
+    // The plane's own image, not "anything on this backing". Materializing a
+    // plane creates its staging endpoint first and its image second, so a
+    // backing can carry a representation while the image is still absent ---
+    // and this guard then returns `Ok` without building it, every time, for as
+    // long as the device runs. That is not a slow repair, it is a repair that
+    // reports success and changes nothing: a driven boot ran it 9 999 times
+    // against one plane, resumed the suffix on every one, and refused
+    // `MissingExecutionRepresentation` identically on every one. It is the
+    // distinction [`ReplacementRuntimeSession::resource_has_execution_representation`]
+    // exists to make and its doc predicts this exact failure.
+    if runtime.resource_has_execution_representation(plane_view) {
         return Ok(());
     }
     let gva = u64::from(descriptor.backing_pfn)
@@ -8903,10 +8913,22 @@ mod tests {
                 ),
             )
             .unwrap();
-        assert!(!runtime.backing_has_execution_representation(view.backing));
+        assert!(!runtime.resource_has_execution_representation(view.resource));
 
         prepare_backing_representation(&mut runtime, &mut host, shift, view.backing).unwrap();
+        // The plane's own image, which is what every binding of it resolves.
+        // The backing carrying *a* representation is not the same statement:
+        // materializing a plane builds its staging endpoint before its image,
+        // so the backing answers yes at a point where the image does not exist.
+        assert!(runtime.resource_has_execution_representation(view.resource));
         assert!(runtime.backing_has_execution_representation(view.backing));
+
+        // Repairing again is a no-op rather than a second image or a duplicate
+        // refusal. The repair runs once per drain tick for as long as anything
+        // is waiting on the backing, so it is called far more often than it
+        // does anything.
+        prepare_backing_representation(&mut runtime, &mut host, shift, view.backing).unwrap();
+        assert!(runtime.resource_has_execution_representation(view.resource));
     }
 
     /// Two textures declared over one guest range are two textures, so both
