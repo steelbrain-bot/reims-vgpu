@@ -3921,6 +3921,20 @@ impl<Semantic> ReplacementGuestUploadSuffixPreparationFailure<Semantic> {
         }
     }
 
+    /// The backing this suffix stopped on because the representation it named
+    /// no longer holds the content the operation requires.
+    ///
+    /// Nothing in this route builds the answer -- the content has to arrive --
+    /// so this is a reading rather than a repair handle. It exists because a
+    /// stale refusal names the backing and stops, and what that backing holds
+    /// *instead* is the other half of the disagreement.
+    pub fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self {
+            Self::Resources { reason, .. } => reason.stale_backing(),
+            Self::Readiness { .. } | Self::Images { .. } => None,
+        }
+    }
+
     /// Why this suffix could not be prepared.
     ///
     /// The coordinator retains the failure and reports only the step it

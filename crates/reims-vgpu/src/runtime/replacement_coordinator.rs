@@ -4531,6 +4531,33 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
             .collect()
     }
 
+    /// Every retained suffix stopped on a stale execution representation, with
+    /// the backing it named.
+    ///
+    /// Not a repair handle: nothing in this route produces the content, so the
+    /// use for this is the reading beside it -- what the backing holds instead
+    /// of what the suffix asked for. The exec-dispatch route has had that
+    /// reading since it was written, and a suffix retained on the same fact
+    /// had none, so a head in this state said only "some content is not
+    /// current" for the life of the boot.
+    pub fn stale_representation_suffixes(
+        &self,
+    ) -> Vec<(
+        reims_vgpu_protocol::TransactionId,
+        reims_vgpu_protocol::BackingId,
+    )> {
+        self.suffixes
+            .iter()
+            .filter_map(|(transaction, state)| {
+                let ReplacementCoordinatedGuestUploadSuffix::PreparationFailed(failure) = state
+                else {
+                    return None;
+                };
+                Some((*transaction, failure.stale_backing()?))
+            })
+            .collect()
+    }
+
     /// Take one retained preparation failure out for repair.
     pub fn take_preparation_failed(
         &mut self,
@@ -7084,7 +7111,11 @@ impl ReplacementDeviceCoordinator<()> {
         // and without it the reading is "some content is not current" -- which
         // is what the refusal already said. One line per distinct backing,
         // deduped, because a head in this state repeats once a second.
-        for backing in self
+        //
+        // Both routes stop on this fact and only one of them used to report
+        // it, so a retained upload suffix held a submission domain while the
+        // log said nothing about which representation disagreed.
+        let stale_backings = self
             .blocked_drains
             .iter()
             .filter_map(|blocked| match blocked.as_ref() {
@@ -7096,7 +7127,14 @@ impl ReplacementDeviceCoordinator<()> {
                 },
                 _ => None,
             })
-        {
+            .chain(
+                self.guest_upload_suffixes
+                    .stale_representation_suffixes()
+                    .into_iter()
+                    .map(|(_, backing)| backing),
+            )
+            .collect::<std::collections::BTreeSet<_>>();
+        for backing in stale_backings {
             for (representation, holds) in self.runtime.execution_representation_coverage(backing) {
                 crate::observe::off(format!(
                     "replacement_stale_representation backing={} representation={} holds=[{holds}]",
