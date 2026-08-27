@@ -3203,7 +3203,12 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .graph()
             .resolve_texture_binding_view(resource)
             .map_err(ReplacementRepresentationConstructionError::TextureView)?;
-        if view.resource == view.base {
+        // A resource that owns the image over its storage has no view to
+        // install: it *is* the image. That is ownership and not the chain ---
+        // a plane view names the surface as its base and still owns the image,
+        // so a chain-keyed guard would try to install a view of the plane onto
+        // the plane's own image.
+        if view.resource == view.image_owner {
             return Err(
                 ReplacementRepresentationConstructionError::UnsupportedDescriptor(
                     reims_vgpu_protocol::ObjectKind::Texture,
@@ -15224,17 +15229,22 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .is_ok()
     }
 
-    /// Whether this resource is a view onto another resource rather than a
-    /// texture of its own.
+    /// Whether this resource is installed onto another resource's image
+    /// rather than owning one of its own.
     ///
-    /// A texture is its own base, so the two are told apart by whether the
-    /// resolution moves.
+    /// Ownership decides it, not the view chain. A resource that owns the
+    /// image over its storage materializes that image and is an allocation
+    /// owner however far its chain runs --- an IOSurface plane view is the
+    /// standing case, owning its plane's image while its chain terminates at
+    /// the parent surface. Answering from the chain calls it a binding view
+    /// and skips the materialization that builds the image everything else
+    /// then fails to find.
     pub(crate) fn is_texture_binding_view(
         &self,
         resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
     ) -> bool {
-        self.texture_binding_view_base(resource)
-            .is_some_and(|base| base != resource)
+        self.texture_binding_view_image_owner(resource)
+            .is_some_and(|owner| owner != resource)
     }
 
     /// The resource that owns the image a binding view is installed onto.
@@ -15253,21 +15263,6 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .resolve_texture_binding_view(view)
             .ok()
             .map(|resolved| resolved.image_owner)
-    }
-
-    /// The texture a binding view ultimately views.
-    ///
-    /// A view's image is its base's, because a view has none of its own.
-    pub(crate) fn texture_binding_view_base(
-        &self,
-        view: ResourceId<reims_vgpu_protocol::ResourceObject>,
-    ) -> Option<ResourceId<reims_vgpu_protocol::ResourceObject>> {
-        self.execution
-            .resources()
-            .graph()
-            .resolve_texture_binding_view(view)
-            .ok()
-            .map(|resolved| resolved.base)
     }
 
     /// The view of its backing one resource materializes into.
@@ -26195,6 +26190,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [nested.resource]
         );
+        // The plane view owns its plane's image, so it is an allocation owner
+        // and not a binding view, however far its chain runs. Answering that
+        // from the chain calls it a view and skips the materialization that
+        // builds the image every binding then fails to find.
+        assert!(!runtime.is_texture_binding_view(view.resource));
+        assert!(runtime.is_texture_binding_view(nested.resource));
         // The surface owns no image, so nothing is gathered onto it.
         assert!(graph
             .texture_binding_views_for_image_owner(declared.resource)

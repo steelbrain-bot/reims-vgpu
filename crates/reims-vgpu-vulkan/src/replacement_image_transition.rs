@@ -41,7 +41,10 @@ pub trait ReplacementImageResolver {
         image: ReplacementImageKey,
         view: reims_vgpu_core::ResolvedTextureBindingView,
     ) -> Result<NativeImageTarget, TextureBindingViewDecline> {
-        if view.resource != view.base {
+        // Ownership, not the chain: this resolver serves only a binding that
+        // is the whole image, and a plane view is exactly that while naming
+        // its parent surface as its base.
+        if view.resource != view.image_owner {
             return Err(TextureBindingViewDecline::AliasedBaseResource);
         }
         if view.pixel_format == 0 {
@@ -710,6 +713,58 @@ mod tests {
 
     /// An unimplemented view ends the packet; an unmaterialized one waits.
     ///
+    /// A binding that owns the image it names resolves to it whole, however
+    /// far its view chain runs.
+    ///
+    /// This resolver serves only the whole-image binding, and it told that
+    /// apart by asking whether the resource is the end of its own view chain.
+    /// An IOSurface plane view is not: it names the parent surface as its
+    /// base, and the surface owns the allocation and no image at all. So the
+    /// one binding class this rail exists to serve on a surface plane was
+    /// refused `AliasedBaseResource` --- an unimplemented refusal, which ends
+    /// the packet.
+    #[test]
+    fn a_binding_that_owns_its_image_resolves_whole_whatever_its_base_is() {
+        let image = key(1);
+        let mut whole = target(vk::ImageUsageFlags::SAMPLED);
+        whole.pixel_format = 70;
+        let resolver = Resolver {
+            key: image,
+            target: whole,
+        };
+        let plane = reims_vgpu_protocol::ResourceId::new(4, 1);
+        let surface = reims_vgpu_protocol::ResourceId::new(3, 1);
+        let view = reims_vgpu_core::ResolvedTextureBindingView {
+            resource: plane,
+            // The chain terminates at the surface; the image is the plane's.
+            base: surface,
+            image_owner: plane,
+            range: reims_vgpu_core::ResolvedTextureViewRange {
+                level_base: 0,
+                level_count: 1,
+                slice_base: 0,
+                slice_count: 1,
+            },
+            texture_type: reims_vgpu_protocol::TextureType::D2,
+            pixel_format: 70,
+            swizzle: reims_vgpu_protocol::swizzle_identity(),
+        };
+        assert_eq!(
+            resolver
+                .resolve_texture_binding_view(image, view)
+                .expect("the plane owns this image")
+                .image,
+            whole.image
+        );
+        // A resource that does not own the image is not this rail's business.
+        let mut aliased = view;
+        aliased.image_owner = surface;
+        assert_eq!(
+            resolver.resolve_texture_binding_view(image, aliased).err(),
+            Some(TextureBindingViewDecline::AliasedBaseResource)
+        );
+    }
+
     /// The two arrive at the classifier as one `UnknownImageView` and mean
     /// opposite things. Reading a `ReinterpretedFormat` as waitable parks the
     /// channel for the life of the device -- a boot spent five minutes
