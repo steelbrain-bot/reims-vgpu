@@ -722,14 +722,6 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
         self.submission_order.census()
     }
 
-    /// See [`SubmissionOrderOwner::issued_head_other_than`].
-    pub fn issued_submission_head_other_than(
-        &self,
-        transaction: TransactionId,
-    ) -> Result<Option<TransactionId>, crate::SubmissionOrderError> {
-        self.submission_order.issued_head_other_than(transaction)
-    }
-
     /// See [`SubmissionOrderOwner::unsubmitted_predecessor`].
     pub fn unsubmitted_submission_predecessor(
         &self,

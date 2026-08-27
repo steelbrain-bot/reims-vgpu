@@ -115,41 +115,6 @@ impl SubmissionOrderOwner {
         })
     }
 
-    /// The transaction actively submitting on `transaction`'s domain, when it
-    /// is some other transaction.
-    ///
-    /// An issued head is the one transaction a domain cannot advance past, so
-    /// it is the exact condition under which a claim taken by anything behind
-    /// it becomes a cycle rather than a wait. An image representation carries
-    /// one prepared transition at a time; if a transaction behind the issued
-    /// head claims an image the head then needs, the head cannot prepare and
-    /// the claimant cannot submit, because the head holds the domain.
-    ///
-    /// This asks only about `issued`, deliberately. A merely *pending*
-    /// predecessor is not part of any cycle -- it has taken no claim and holds
-    /// no domain -- and refusing behind one serialises a domain to a single
-    /// in-flight transaction for no correctness gain. It also keeps the answer
-    /// out of `pending`, which is the map a retired-while-pending transaction
-    /// used to leave an unreachable entry in.
-    pub fn issued_head_other_than(
-        &self,
-        transaction: TransactionId,
-    ) -> Result<Option<TransactionId>, SubmissionOrderError> {
-        let &TransactionOrder { domain, .. } = self
-            .transactions
-            .get(&transaction)
-            .ok_or(SubmissionOrderError::UnknownTransaction)?;
-        let state = self
-            .domains
-            .get(&domain)
-            .expect("transaction index names one submission domain");
-        Ok(state
-            .issued
-            .as_ref()
-            .map(|(_, pending)| pending.transaction)
-            .filter(|&issued| issued != transaction))
-    }
-
     /// The nearest transaction ahead of `transaction` in its own domain that
     /// has not submitted yet.
     ///
@@ -982,65 +947,5 @@ mod tests {
         owner
             .retire_domain(SubmissionDomainId::new(7))
             .expect("both claims were released, so the domain drained");
-    }
-
-    /// The issued head is the exact condition that turns a claim into a cycle,
-    /// and a merely pending predecessor is not.
-    ///
-    /// The shape this reproduces, from a driven macos-13 boot: 630 was issued
-    /// and holding domain 1, 632 sat behind it having already claimed an image
-    /// 630 then needed, and neither could move -- 630 could not prepare and 632
-    /// could not submit past the head. Refusing 632's claim while a head is
-    /// issued is what breaks it. Refusing behind a *pending* predecessor as
-    /// well serialises the domain for nothing, so this asks only about
-    /// `issued`.
-    #[test]
-    fn only_an_issued_head_blocks_a_claim_from_the_transactions_behind_it() {
-        let mut owner = SubmissionOrderOwner::default();
-        accept(&mut owner, 630, 1, 1);
-        accept(&mut owner, 631, 1, 2);
-        accept(&mut owner, 632, 1, 3);
-        accept(&mut owner, 700, 4, 1);
-
-        // Nothing is issued yet, so nothing is blocked -- a pending
-        // predecessor takes no claim and holds no domain.
-        for transaction in [630, 631, 632] {
-            assert_eq!(
-                owner.issued_head_other_than(TransactionId::new(transaction)),
-                Ok(None)
-            );
-        }
-
-        owner.recorded(TransactionId::new(630)).unwrap();
-        owner
-            .reserve_head_transaction_if(TransactionId::new(630), |_| true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(632)),
-            Ok(Some(TransactionId::new(630))),
-            "632 sits behind the issued head and must not claim"
-        );
-        assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(630)),
-            Ok(None),
-            "the head itself is not behind itself, or it could never prepare"
-        );
-        assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(700)),
-            Ok(None),
-            "another domain's head orders nothing here"
-        );
-
-        owner.submitted(TransactionId::new(630)).unwrap();
-        assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(632)),
-            Ok(None),
-            "the head submitted, so the domain can advance and claims are free"
-        );
-        assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(9_999)),
-            Err(SubmissionOrderError::UnknownTransaction)
-        );
     }
 }

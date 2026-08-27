@@ -4320,26 +4320,8 @@ pub(crate) enum ReplacementResourceReadyExecFailure<Completion> {
 
 #[derive(Debug)]
 pub(crate) struct ReplacementExecImagePreparationFailure {
-    pub reason: ReplacementExecImagePreparationRefusal,
+    pub reason: reims_vgpu_vulkan::replacement_exec_image::ExecImageStateError,
     pub resources: PreparedReplacementExecResources,
-}
-
-/// Why one exec could not take its image claims.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReplacementExecImagePreparationRefusal {
-    /// The backend's own image-state rule declined the plan.
-    Images(reims_vgpu_vulkan::replacement_exec_image::ExecImageStateError),
-    /// This transaction's own domain has another transaction issued, so this
-    /// one may not take an exclusive image claim yet.
-    ///
-    /// An image representation carries one prepared transition at a time, and
-    /// an issued head is the one transaction its domain cannot advance past.
-    /// A claim taken behind that head is therefore not merely early, it is
-    /// unresolvable: the head cannot prepare an image the claimant holds, and
-    /// the claimant cannot submit or cancel while the head holds the domain.
-    /// Both sides then retry for the life of the device with every stall
-    /// counter reading healthy, because neither has failed.
-    BehindIssuedHead { issued: TransactionId },
 }
 
 type ReplacementExecResourceCancellation = reims_vgpu_core::ExecResourceCancellationResult<
@@ -11473,7 +11455,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 Ok(has_images) => has_images,
                 Err(reason) => {
                     return Err(Box::new(ReplacementExecImagePreparationFailure {
-                        reason: ReplacementExecImagePreparationRefusal::Images(reason),
+                        reason,
                         resources,
                     }));
                 }
@@ -11483,23 +11465,6 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 resources,
                 image_states: None,
             });
-        }
-        // Ordering the claim, not the work: readiness, resource preparation and
-        // the has-images classification above all still run on arrival, and a
-        // transaction with no image uses has already returned. Only the
-        // exclusive claim waits, and only behind its own domain's issued head.
-        //
-        // A transaction this owner does not track sits in no domain and can be
-        // behind no head, which is an answer rather than a swallowed error.
-        if let Ok(Some(issued)) = self
-            .execution
-            .runtime()
-            .issued_submission_head_other_than(resources.transaction())
-        {
-            return Err(Box::new(ReplacementExecImagePreparationFailure {
-                reason: ReplacementExecImagePreparationRefusal::BehindIssuedHead { issued },
-                resources,
-            }));
         }
         let queue_family = self.session.vulkan().work_queue_family();
         let final_layouts =
@@ -11516,7 +11481,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 image_states: Some(image_states),
             }),
             Err(reason) => Err(Box::new(ReplacementExecImagePreparationFailure {
-                reason: ReplacementExecImagePreparationRefusal::Images(reason),
+                reason,
                 resources,
             })),
         }
