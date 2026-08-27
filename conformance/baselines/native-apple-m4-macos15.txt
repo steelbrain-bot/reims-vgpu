@@ -99,6 +99,7 @@ CASE compute_dispatch_threadgroups_indirect PASS groups=[3,2,1] local=[4,2,1] gr
 CASE synchronize_resource_gpu_to_cpu PASS managed/shared GPU writes visible to CPU after synchronize
 CASE heap_texture_alias_lifecycle PASS one live range was released, reused at offset=0, and addressed as the replacement
 CASE heap_texture_placement_overlap PASS two live definitions at offset=0 executed sequentially and addressed the replacement
+CASE heap_texture_placement_overlap_incompatible_widths PASS two live textures of different bit widths at offset=0 each addressed their own definition
 CASE ebl_same_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_changed_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_same_bind_second_command_buffer PASS the binding re-issued on the second encoder is the one that drew
@@ -229,6 +230,10 @@ CASE srt_cpu_seed_then_load_1000x40 PASS three loaded passes kept every texel th
 CASE srt_glyph_blend_60x32 PASS coverage type blended into a guest-backed layer, and the second pass kept the first
 CASE srt_glyph_blend_256x64 PASS coverage type blended into a guest-backed layer, and the second pass kept the first
 CASE srt_glyph_blend_1000x40 PASS coverage type blended into a guest-backed layer, and the second pass kept the first
+CASE biplanar_luma_64x32 PASS plane 0 reads its own 64x32 one-byte texels
+CASE biplanar_chroma_64x32 PASS plane 1 reads its own 32x16 two-byte texels
+CASE biplanar_luma_256x64 PASS plane 0 reads its own 256x64 one-byte texels
+CASE biplanar_chroma_256x64 PASS plane 1 reads its own 128x32 two-byte texels
 CASE iosrt_draw_60x32 PASS the whole IOSurface-backed target is the drawn colour
 CASE iosrt_load_preserves_60x32 PASS the second pass added to what the first pass left
 CASE iosrt_scissor_keeps_rest_60x32 PASS the scissored write landed on exactly its own rows
@@ -261,5 +266,5 @@ ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_resident_landed
 CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
 CASE command_buffer_cross_queue_shared_event_visibility PASS producer=4 consumer=4 completed_without_host_release=true visible=true
-SUMMARY cases=256 failures=0 skipped=0
+SUMMARY cases=261 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true

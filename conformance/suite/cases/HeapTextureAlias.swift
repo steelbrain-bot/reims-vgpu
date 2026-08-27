@@ -182,3 +182,98 @@ func heapTexturePlacementOverlapCase() {
              ? "two live definitions at offset=0 executed sequentially and addressed the replacement"
              : "wrong=\(bad.count)/\(got.count) first=\(hex(got[bad[0]])) want=\(hex(want))")
 }
+
+// The same overlap, between formats no single image can serve.
+//
+// `heap_texture_placement_overlap` aliases two 32-bit formats, which one
+// native image plus a reinterpreting view can answer. Nothing here can be:
+// rgba16Float and rgba8Unorm are different bit widths, so an implementation
+// that gives a range of storage one image and reinterprets it for the other
+// alias has no view to build and must refuse a binding the API defines.
+//
+// Metal leaves an alias's *contents* undefined after another alias writes, so
+// this claims nothing about bytes crossing between them. It claims only that
+// each live texture addresses its own definition: fill one, read it back, and
+// the value written through that texture is the value that texture reads.
+func heapTexturePlacementOverlapWidthCase() {
+    let label = "heap_texture_placement_overlap_incompatible_widths"
+    let width = 64
+    let height = 64
+    let wide = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba16Float,
+        width: width,
+        height: height,
+        mipmapped: false)
+    let narrow = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .rgba8Unorm,
+        width: width,
+        height: height,
+        mipmapped: false)
+    for descriptor in [wide, narrow] {
+        descriptor.storageMode = .private
+        descriptor.usage = [.shaderRead, .shaderWrite]
+    }
+
+    let wideRequirement = dev.heapTextureSizeAndAlign(descriptor: wide)
+    let narrowRequirement = dev.heapTextureSizeAndAlign(descriptor: narrow)
+    guard wideRequirement.size > 0, wideRequirement.align > 0,
+          narrowRequirement.size > 0, narrowRequirement.align > 0 else {
+        skip(label, "the device reported no heap storage requirement for one texture")
+        return
+    }
+
+    let heapDescriptor = MTLHeapDescriptor()
+    heapDescriptor.type = .placement
+    heapDescriptor.storageMode = .private
+    heapDescriptor.hazardTrackingMode = .untracked
+    heapDescriptor.size = max(wideRequirement.size, narrowRequirement.size)
+    guard let heap = dev.makeHeap(descriptor: heapDescriptor) else {
+        report(label, false, "the placement heap could not be created")
+        return
+    }
+    guard let wideTexture = heap.makeTexture(descriptor: wide, offset: 0) else {
+        report(label, false, "the placement heap refused its rgba16Float texture")
+        return
+    }
+    guard let narrowTexture = heap.makeTexture(descriptor: narrow, offset: 0) else {
+        report(label, false, "the placement heap refused a live overlapping rgba8Unorm texture")
+        return
+    }
+
+    // Components of exactly 0 and 1 survive both storage formats and the
+    // readback's fixed-point packing, so a mismatch is the alias and never the
+    // arithmetic.
+    guard fillHeapTexture(wideTexture, SIMD4<Float>(1, 0, 0, 1)) else {
+        report(label, false, "commands using the rgba16Float alias did not complete")
+        return
+    }
+    guard let wideGot = readBack(readPipe, wideTexture, width, height) else {
+        refused(label)
+        return
+    }
+    let red = pack(255, 0, 0, 255)
+    let wideBad = wideGot.indices.filter { wideGot[$0] != red }
+    guard wideBad.isEmpty else {
+        report(label, false,
+               "the rgba16Float alias did not read its own write: "
+                 + "wrong=\(wideBad.count)/\(wideGot.count) first=\(hex(wideGot[wideBad[0]]))")
+        return
+    }
+
+    guard fillHeapTexture(narrowTexture, SIMD4<Float>(0, 1, 0, 1)) else {
+        report(label, false, "commands using the rgba8Unorm alias did not complete")
+        return
+    }
+    guard let narrowGot = readBack(readPipe, narrowTexture, width, height) else {
+        refused(label)
+        return
+    }
+    let green = pack(0, 255, 0, 255)
+    let narrowBad = narrowGot.indices.filter { narrowGot[$0] != green }
+    report(label,
+           wideTexture.heapOffset == 0 && narrowTexture.heapOffset == 0 && narrowBad.isEmpty,
+           narrowBad.isEmpty
+             ? "two live textures of different bit widths at offset=0 each addressed their own definition"
+             : "the rgba8Unorm alias did not read its own write: "
+                 + "wrong=\(narrowBad.count)/\(narrowGot.count) first=\(hex(narrowGot[narrowBad[0]]))")
+}
