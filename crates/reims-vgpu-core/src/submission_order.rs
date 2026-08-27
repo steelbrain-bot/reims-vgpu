@@ -30,6 +30,7 @@ pub enum SubmissionOrderError {
     DomainNotDrained,
     AlreadyAbandoned,
     StillHoldsDomain,
+    IssuedHeadUntracked(TransactionId),
 }
 
 /// A domain's issued head, and the position of the transaction behind it.
@@ -169,16 +170,28 @@ impl SubmissionOrderOwner {
             .domains
             .get(&domain)
             .expect("transaction index names one submission domain");
-        Ok(state
-            .issued
-            .as_ref()
-            .filter(|(_, pending)| pending.transaction != transaction)
-            .map(|&(issued_sequence, pending)| IssuedHead {
-                transaction: pending.transaction,
-                domain,
-                sequence: issued_sequence,
-                behind: sequence,
-            }))
+        let Some(&(issued_sequence, issued)) = state.issued.as_ref() else {
+            return Ok(None);
+        };
+        if issued.transaction == transaction {
+            return Ok(None);
+        }
+        // A head this owner does not track is not an order, it is corruption:
+        // nothing can name it, so nothing can release it, and every claim
+        // behind it would wait for a transaction that cannot move again.
+        // Saying so is the caller's only chance to tell that apart from an
+        // ordinary wait.
+        if !self.transactions.contains_key(&issued.transaction) {
+            return Err(SubmissionOrderError::IssuedHeadUntracked(
+                issued.transaction,
+            ));
+        }
+        Ok(Some(IssuedHead {
+            transaction: issued.transaction,
+            domain,
+            sequence: issued_sequence,
+            behind: sequence,
+        }))
     }
 
     /// The nearest transaction ahead of `transaction` in its own domain that
@@ -1079,6 +1092,42 @@ mod tests {
         assert_eq!(
             owner.issued_head_other_than(TransactionId::new(9_999)),
             Err(SubmissionOrderError::UnknownTransaction)
+        );
+    }
+
+    /// A domain head no owner tracks is corruption, and must be reported
+    /// rather than waited on.
+    ///
+    /// A driven macos-13 boot held `domains[1].issued` at transaction 141,
+    /// sequence 22, while 141 appeared in no census the whole boot -- the
+    /// index the census iterates did not have it. Nothing could name that head
+    /// and so nothing could release it, and every claim behind it would have
+    /// waited on a transaction that could never move again. Reporting it is
+    /// what tells that apart from an ordinary wait.
+    #[test]
+    fn an_issued_head_the_index_lost_is_reported_and_not_waited_on() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 141, 1, 1);
+        accept(&mut owner, 144, 1, 2);
+        owner.recorded(TransactionId::new(141)).unwrap();
+        owner
+            .reserve_head_transaction_if(TransactionId::new(141), |_| true)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            owner.issued_head_other_than(TransactionId::new(144)),
+            Ok(Some(_)),
+        ));
+
+        // Drop the head from the index without releasing its claim, which is
+        // the state the boot was in.
+        owner.transactions.remove(&TransactionId::new(141));
+        assert_eq!(
+            owner.issued_head_other_than(TransactionId::new(144)),
+            Err(SubmissionOrderError::IssuedHeadUntracked(
+                TransactionId::new(141)
+            )),
+            "an unnameable head is named as corrupt, not returned as an order"
         );
     }
 }

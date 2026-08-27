@@ -11536,6 +11536,24 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     issued,
                 )),
                 Ok(None) => None,
+                // A head no owner tracks cannot be released by anyone, so
+                // ordering behind it is a permanent stall and not a wait. Take
+                // the claim and say so: corrupt order state is a real defect,
+                // and a device that stops is a worse report of it than one
+                // that names it and keeps running. Deduped by head, because
+                // every later exec on that domain meets the same one.
+                Err(reims_vgpu_core::SubmissionOrderError::IssuedHeadUntracked(head)) => {
+                    if crate::observe::first_sight("replacement_issued_head_untracked", head.get())
+                    {
+                        crate::observe::fail(format!(
+                            "replacement_issued_head_untracked head={} behind={} \
+                             reason=issued_head_not_tracked",
+                            head.get(),
+                            transaction.get()
+                        ));
+                    }
+                    None
+                }
                 Err(_) => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
             },
             None => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
