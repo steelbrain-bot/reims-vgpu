@@ -4713,10 +4713,24 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
                     crate::runtime::replacement_session::ReplacementChainedFinalProgress::AcceptanceRefused(
                         failure,
                     ) => {
-                        report_acceptance_refusal(
+                        // The point this submission was allocated, beside the
+                        // highest its queue has already taken. A
+                        // `TimelineDidNotIncrease` says only that the first is
+                        // not above the second; the gap says whether two
+                        // submissions raced or an acceptance ran far out of
+                        // the order its points were allocated in, and that is
+                        // the difference between a lost race and a lost order.
+                        let point = failure.failure.submission.prepared.point();
+                        report_retained_failure_detail(
                             "replacement_guest_upload_final",
                             transaction,
-                            &failure.failure.reason,
+                            &format!(
+                                "{:?} queue={} point={} queue_submitted={:?}",
+                                failure.failure.reason,
+                                point.queue.get(),
+                                point.value.get(),
+                                runtime.last_submitted_point(point.queue).map(|value| value.get()),
+                            ),
                         );
                         self.suffixes.insert(
                             transaction,

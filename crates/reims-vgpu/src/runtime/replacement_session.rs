@@ -6959,6 +6959,15 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         self.execution.epoch.native.parked_candidates()
     }
 
+    /// See [`reims_vgpu_core::DirectReplayNativeOwner::last_submitted_point`].
+    #[must_use]
+    pub fn last_submitted_point(
+        &self,
+        queue: reims_vgpu_protocol::QueueOwnerId,
+    ) -> Option<reims_vgpu_protocol::QueueTimelineValue> {
+        self.execution.epoch.native.last_submitted_point(queue)
+    }
+
     /// See [`reims_vgpu_core::ManagedBackingOwner::representation_census`].
     pub fn representation_census(
         &self,

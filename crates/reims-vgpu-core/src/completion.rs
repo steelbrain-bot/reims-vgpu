@@ -47,6 +47,17 @@ pub struct AbandonedCompletion<T> {
 pub enum CompletionOwnerError {
     WrongEpoch,
     DuplicateTransaction,
+    /// A submission asked to register a point at or below the highest already
+    /// submitted on its queue.
+    ///
+    /// The point is allocated when a submission is prepared and registered
+    /// when the driver accepts it, so anything accepted between those two
+    /// moments takes the higher value and leaves this one behind. The values
+    /// are deliberately *not* carried here: this enum is `Copy` and sits
+    /// inside `ReplayAcceptanceFailure`, which already holds a whole prepared
+    /// submission, and widening it pushes that failure past the size clippy
+    /// refuses. Ask [`TimelineCompletionOwner::last_submitted`] at the
+    /// reporting site instead, which has the point in hand.
     TimelineDidNotIncrease,
     TimelineAlreadyCompleted,
     TimelineRegressed,
@@ -92,6 +103,19 @@ impl<T> TimelineCompletionOwner<T> {
             queues: BTreeMap::new(),
             transactions: BTreeMap::new(),
         }
+    }
+
+    /// The highest point already submitted on `queue`, if any.
+    ///
+    /// A `TimelineDidNotIncrease` refusal says a point was at or below this
+    /// without saying by how much, and the gap is the reading: adjacent values
+    /// mean two submissions raced, a whole queue apart means an acceptance ran
+    /// far out of the order its points were allocated in.
+    #[must_use]
+    pub fn last_submitted(&self, queue: QueueOwnerId) -> Option<QueueTimelineValue> {
+        self.queues
+            .get(&queue)
+            .and_then(|queue| queue.last_submitted)
     }
 
     pub fn register(
@@ -318,6 +342,43 @@ mod tests {
             ),
             Err(CompletionOwnerError::WrongEpoch)
         );
+    }
+
+    /// The refusal says a point did not increase; the accessor says by how
+    /// much, which is what separates two submissions racing from an
+    /// acceptance running far out of its allocation order.
+    #[test]
+    fn the_highest_submitted_point_is_readable_beside_the_refusal() {
+        let mut owner = TimelineCompletionOwner::new(VulkanDeviceEpochId::new(2));
+        assert_eq!(owner.last_submitted(QueueOwnerId::new(4)), None);
+        owner
+            .register(
+                TransactionId::new(1),
+                SessionGenerationId::new(1),
+                point(2, 4, 10),
+                (),
+            )
+            .unwrap();
+        assert_eq!(
+            owner.last_submitted(QueueOwnerId::new(4)),
+            Some(QueueTimelineValue::new(10))
+        );
+        // A refused registration must not move it: the gap a later report
+        // reads has to describe the queue, not the last thing that asked.
+        assert_eq!(
+            owner.register(
+                TransactionId::new(2),
+                SessionGenerationId::new(1),
+                point(2, 4, 3),
+                (),
+            ),
+            Err(CompletionOwnerError::TimelineDidNotIncrease)
+        );
+        assert_eq!(
+            owner.last_submitted(QueueOwnerId::new(4)),
+            Some(QueueTimelineValue::new(10))
+        );
+        assert_eq!(owner.last_submitted(QueueOwnerId::new(9)), None);
     }
 
     #[test]

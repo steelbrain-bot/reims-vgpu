@@ -634,6 +634,12 @@ impl<Semantic: Clone> DirectReplayNativeOwner<Semantic> {
         self.completions.pending()
     }
 
+    /// See [`TimelineCompletionOwner::last_submitted`].
+    #[must_use]
+    pub fn last_submitted_point(&self, queue: QueueOwnerId) -> Option<QueueTimelineValue> {
+        self.completions.last_submitted(queue)
+    }
+
     pub fn retire(&mut self, transaction: TransactionId) -> Result<(), DirectReplayError> {
         self.validate_retire(transaction)?;
         let mut assignments = self.assignments.clone();
