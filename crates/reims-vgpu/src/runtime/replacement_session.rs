@@ -7198,13 +7198,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             let phase = self
                 .prepare_guest_upload_phase(prepared, manifest)
                 .map_err(ReplacementExecIngressDispatchFailure::GuestUploadPhase)?;
-            let resolved = self
-                .resolve_guest_upload_phase_recording(phase)
-                .map_err(ReplacementExecIngressDispatchFailure::GuestUploadResolution)?;
-            return self
-                .dispatch_guest_upload_phase_recording(resolved)
-                .map(|pending| PendingReplacementIngressExec::GuestUpload(Box::new(pending)))
-                .map_err(ReplacementExecIngressDispatchFailure::GuestUploadDispatch);
+            return self.drive_guest_upload_phase(phase);
         }
         let resources = match self.prepare_preflighted_exec_resources(&prepared, manifest) {
             Ok(resources) => resources,
@@ -7256,13 +7250,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             let phase = self
                 .prepare_guest_upload_phase(direct, manifest)
                 .map_err(ReplacementExecIngressDispatchFailure::GuestUploadPhase)?;
-            let resolved = self
-                .resolve_guest_upload_phase_recording(phase)
-                .map_err(ReplacementExecIngressDispatchFailure::GuestUploadResolution)?;
-            return self
-                .dispatch_guest_upload_phase_recording(resolved)
-                .map(|pending| PendingReplacementIngressExec::GuestUpload(Box::new(pending)))
-                .map_err(ReplacementExecIngressDispatchFailure::GuestUploadDispatch);
+            return self.drive_guest_upload_phase(phase);
         }
         let ReplacementPreparedIndirectRangeIngress {
             direct: _,
@@ -8680,15 +8668,76 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 .retry_direct_ingress_dispatch(failure)
                 .map(|pending| PendingReplacementIngressExec::Direct(Box::new(pending)))
                 .map_err(ReplacementExecIngressDispatchFailure::DirectDispatch),
-            ReplacementExecIngressDispatchFailure::GuestUploadPhase(failure) => Err(
-                ReplacementExecIngressDispatchFailure::GuestUploadPhase(failure),
-            ),
+            // Every upload arm re-enters the chain at the step that refused.
+            // These three used to hand their retained failure straight back,
+            // which is not a retry: the packet is re-offered, refuses by
+            // construction, and the channel is parked for the life of the
+            // device while `blocked_retries` climbs and `blocked_head` reports
+            // the condition as it stood at the first refusal. A boot spent a
+            // hundred and twenty seconds reporting a transaction as its
+            // domain's issued head that the submission-order census, read at
+            // the same timestamp, showed as submitted forty seconds earlier.
+            ReplacementExecIngressDispatchFailure::GuestUploadPhase(failure) => match *failure {
+                // Not a wait. The manifest says this exec has no upload phase,
+                // and asking the same manifest again asks the same question.
+                ReplacementGuestUploadPhasePreparationFailure::NoUpload { prepared, manifest } => {
+                    Err(ReplacementExecIngressDispatchFailure::GuestUploadPhase(
+                        Box::new(ReplacementGuestUploadPhasePreparationFailure::NoUpload {
+                            prepared,
+                            manifest,
+                        }),
+                    ))
+                }
+                // Both refused before anything was claimed -- the chain never
+                // built, or the resource preparation cancelled its own prefix
+                // -- so the whole phase is prepared again from the exec and the
+                // manifest it arrived with.
+                ReplacementGuestUploadPhasePreparationFailure::Chain {
+                    prepared, manifest, ..
+                }
+                | ReplacementGuestUploadPhasePreparationFailure::Resources {
+                    prepared,
+                    manifest,
+                    ..
+                } => {
+                    let phase = self
+                        .prepare_guest_upload_phase(prepared, manifest)
+                        .map_err(ReplacementExecIngressDispatchFailure::GuestUploadPhase)?;
+                    self.drive_guest_upload_phase(phase)
+                }
+                // The resources are prepared and held by the retained failure,
+                // so only the image claim is re-asked. Preparing them again
+                // would abandon a claim this transaction already owns.
+                ReplacementGuestUploadPhasePreparationFailure::Images {
+                    reason,
+                    prepared,
+                    manifest,
+                    chain,
+                } => {
+                    let envelope = match self.prepare_exec_image_states(reason.resources) {
+                        Ok(envelope) => envelope,
+                        Err(reason) => {
+                            return Err(ReplacementExecIngressDispatchFailure::GuestUploadPhase(
+                                Box::new(ReplacementGuestUploadPhasePreparationFailure::Images {
+                                    reason,
+                                    prepared,
+                                    manifest,
+                                    chain,
+                                }),
+                            ));
+                        }
+                    };
+                    let phase =
+                        Self::assemble_guest_upload_phase(prepared, manifest, chain, envelope);
+                    self.drive_guest_upload_phase(phase)
+                }
+            },
             ReplacementExecIngressDispatchFailure::GuestUploadResolution(failure) => {
-                Err(ReplacementExecIngressDispatchFailure::GuestUploadResolution(failure))
+                self.drive_guest_upload_phase(failure.phase)
             }
-            ReplacementExecIngressDispatchFailure::GuestUploadDispatch(failure) => Err(
-                ReplacementExecIngressDispatchFailure::GuestUploadDispatch(failure),
-            ),
+            ReplacementExecIngressDispatchFailure::GuestUploadDispatch(failure) => {
+                self.drive_guest_upload_phase(failure.phase)
+            }
             ReplacementExecIngressDispatchFailure::IndirectRangeReadiness { prepared, .. } => {
                 self.dispatch_prepared_indirect_range_ingress(prepared)
             }
@@ -11699,10 +11748,16 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             ));
         }
         if !manifest.content_synchronization.is_empty() {
-            if let Err(reason) = preparation.prepare_content_synchronization(
-                std::mem::take(&mut manifest.content_synchronization).into_vec(),
-            ) {
+            // Taken out of the manifest to be consumed, and put back if it is
+            // not: this failure is retained and re-driven from the manifest it
+            // carries, so a manifest that came back short of the transfers it
+            // arrived with would lose them silently on the retry.
+            let synchronization = std::mem::take(&mut manifest.content_synchronization);
+            if let Err(reason) =
+                preparation.prepare_content_synchronization(synchronization.clone().into_vec())
+            {
                 let prefix = preparation.cancel();
+                manifest.content_synchronization = synchronization;
                 return Err(Box::new(
                     ReplacementGuestUploadPhasePreparationFailure::Resources {
                         reason: Box::new(
@@ -11764,7 +11819,30 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ));
             }
         };
-        Ok(ReplacementPreparedGuestUploadPhase {
+        Ok(Self::assemble_guest_upload_phase(
+            prepared, manifest, chain, envelope,
+        ))
+    }
+
+    /// Build the prepared phase from the four things that survive a refusal.
+    ///
+    /// Both the first pass and the retry after an image claim is granted
+    /// assemble the same phase from the same four values, and the retry enters
+    /// past the resource preparation that already succeeded. Sharing the
+    /// assembly is what keeps the two from drifting into phases that differ in
+    /// their recording prefix or origin window.
+    fn assemble_guest_upload_phase(
+        prepared: Box<ReplacementPreparedAdmittedExec<Semantic>>,
+        manifest: ReplacementExecResourceManifest,
+        chain: reims_vgpu_core::ResourceStateExecutionChain<
+            CanonicalReplacementOperation<Semantic>,
+        >,
+        envelope: ReplacementPreparedExecEnvelope,
+    ) -> ReplacementPreparedGuestUploadPhase<Semantic>
+    where
+        Semantic: Clone,
+    {
+        ReplacementPreparedGuestUploadPhase {
             recording_exec: chain.prefix().clone(),
             recording_origins: prepared.origins()[..chain.suffix_operation_base()]
                 .to_vec()
@@ -11775,7 +11853,29 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             manifest,
             chain,
             envelope,
-        })
+        }
+    }
+
+    /// Drive a prepared upload phase through resolution and dispatch.
+    ///
+    /// The first pass and every retry take the same two steps in the same
+    /// order, and each step's refusal is the one the retry re-enters at.
+    fn drive_guest_upload_phase(
+        &mut self,
+        phase: ReplacementPreparedGuestUploadPhase<Semantic>,
+    ) -> Result<
+        PendingReplacementIngressExec<Semantic>,
+        ReplacementExecIngressDispatchFailure<Semantic>,
+    >
+    where
+        Semantic: Clone + PartialEq + Send + 'static,
+    {
+        let resolved = self
+            .resolve_guest_upload_phase_recording(phase)
+            .map_err(ReplacementExecIngressDispatchFailure::GuestUploadResolution)?;
+        self.dispatch_guest_upload_phase_recording(resolved)
+            .map(|pending| PendingReplacementIngressExec::GuestUpload(Box::new(pending)))
+            .map_err(ReplacementExecIngressDispatchFailure::GuestUploadDispatch)
     }
 
     pub fn resolve_guest_upload_phase_recording(
