@@ -4349,25 +4349,6 @@ pub(crate) struct ReplacementExecImagePreparationFailure {
     pub resources: PreparedReplacementExecResources,
 }
 
-/// Whether an image claim competes for its domain, or belongs to a chain that
-/// has already been ordered.
-///
-/// A transaction's main exec competes: it is one of several transactions a
-/// domain submits in sequence, and a claim it takes ahead of the issued head
-/// is the inversion that deadlocks both.
-///
-/// A guest-upload phase does not. It is a prerequisite native submit *within*
-/// one transaction's own chain -- it exists so that transaction can submit at
-/// all -- so ordering it against another transaction's head asks the wrong
-/// question, and answering it stalls the chain that answer was waiting on.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReplacementImageClaimOrdering {
-    /// Ordered against the domain: refuse behind an issued head.
-    CompetesForDomain,
-    /// Part of one transaction's own chain: already ordered by construction.
-    WithinTransactionChain,
-}
-
 /// Why one exec could not take its image claims.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementExecImagePreparationRefusal {
@@ -7233,9 +7214,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ));
             }
         };
-        let envelope = match self
-            .prepare_exec_image_states(resources, ReplacementImageClaimOrdering::CompetesForDomain)
-        {
+        let envelope = match self.prepare_exec_image_states(resources) {
             Ok(envelope) => envelope,
             Err(reason) => {
                 return Err(ReplacementExecIngressDispatchFailure::DirectResources(
@@ -8681,10 +8660,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     self.dispatch_prepared_direct_ingress(prepared)
                 }
                 ReplacementResourceReadyExecFailure::Images { reason, prepared } => {
-                    let envelope = match self.prepare_exec_image_states(
-                        reason.resources,
-                        ReplacementImageClaimOrdering::CompetesForDomain,
-                    ) {
+                    let envelope = match self.prepare_exec_image_states(reason.resources) {
                         Ok(envelope) => envelope,
                         Err(reason) => {
                             return Err(ReplacementExecIngressDispatchFailure::DirectResources(
@@ -8734,10 +8710,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 self.prepare_direct_ingress_exec(prepared)
             }
             ReplacementResourceReadyExecFailure::Images { reason, prepared } => {
-                let envelope = match self.prepare_exec_image_states(
-                    reason.resources,
-                    ReplacementImageClaimOrdering::CompetesForDomain,
-                ) {
+                let envelope = match self.prepare_exec_image_states(reason.resources) {
                     Ok(envelope) => envelope,
                     Err(reason) => {
                         return Err(ReplacementResourceReadyExecFailure::Images {
@@ -8822,10 +8795,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     ReplacementResourceReadyIndirectRangePhaseFailure::Images {
                         reason,
                         prepared,
-                    } => match self.prepare_exec_image_states(
-                        reason.resources,
-                        ReplacementImageClaimOrdering::CompetesForDomain,
-                    ) {
+                    } => match self.prepare_exec_image_states(reason.resources) {
                         Ok(envelope) => {
                             Ok(ReplacementResourceReadyIndirectRangePhase { prepared, envelope })
                         }
@@ -11512,7 +11482,6 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     fn prepare_exec_image_states(
         &mut self,
         resources: PreparedReplacementExecResources,
-        ordering: ReplacementImageClaimOrdering,
     ) -> Result<ReplacementPreparedExecEnvelope, Box<ReplacementExecImagePreparationFailure>> {
         let linear_image_transfers = resources
             .inputs()
@@ -11570,46 +11539,49 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         // transaction with no image uses has already returned. Only the
         // exclusive claim waits, and only behind its own domain's issued head.
         //
+        // Every claim asks, whatever stage asks it. An image representation
+        // carries one prepared transition, and the backend grants it to
+        // whoever asks first -- so without this the holder is decided by
+        // arrival, while whether the holder can ever release it is decided by
+        // submission order. A guest-upload phase looks like an exception,
+        // because it is a prerequisite inside one transaction's own chain; it
+        // is not, because the transaction that chain belongs to still submits
+        // in domain sequence, and a phase of a transaction behind the head
+        // holds the image exactly as durably as the transaction itself would.
+        // A domain head whose upload suffix needed an image a later
+        // transaction's suffix already held is the deadlock that reading this
+        // as an exception produced.
+        //
         // The order is read from the runtime that tracks this transaction, not
         // from the active generation, because an exec is not active-scoped.
         let transaction = resources.transaction();
-        let refusal = match (
-            ordering,
-            self.execution.runtime_owning_submission_order(transaction),
-        ) {
-            (ReplacementImageClaimOrdering::WithinTransactionChain, _) => None,
-            (ReplacementImageClaimOrdering::CompetesForDomain, owner) => match owner {
-                Some(runtime) => match runtime.issued_submission_head_other_than(transaction) {
-                    Ok(Some(issued)) => Some(
-                        ReplacementExecImagePreparationRefusal::BehindIssuedHead(issued),
-                    ),
-                    Ok(None) => None,
-                    // A head no owner tracks cannot be released by anyone, so
-                    // ordering behind it is a permanent stall and not a wait. Take
-                    // the claim and say so: corrupt order state is a real defect,
-                    // and a device that stops is a worse report of it than one
-                    // that names it and keeps running. Deduped by head, because
-                    // every later exec on that domain meets the same one.
-                    Err(reims_vgpu_core::SubmissionOrderError::IssuedHeadUntracked(head)) => {
-                        if crate::observe::first_sight(
-                            "replacement_issued_head_untracked",
-                            head.get(),
-                        ) {
-                            crate::observe::fail(format!(
-                                "replacement_issued_head_untracked head={} behind={} \
+        let refusal = match self.execution.runtime_owning_submission_order(transaction) {
+            Some(runtime) => match runtime.issued_submission_head_other_than(transaction) {
+                Ok(Some(issued)) => Some(ReplacementExecImagePreparationRefusal::BehindIssuedHead(
+                    issued,
+                )),
+                Ok(None) => None,
+                // A head no owner tracks cannot be released by anyone, so
+                // ordering behind it is a permanent stall and not a wait. Take
+                // the claim and say so: corrupt order state is a real defect,
+                // and a device that stops is a worse report of it than one
+                // that names it and keeps running. Deduped by head, because
+                // every later exec on that domain meets the same one.
+                Err(reims_vgpu_core::SubmissionOrderError::IssuedHeadUntracked(head)) => {
+                    if crate::observe::first_sight("replacement_issued_head_untracked", head.get())
+                    {
+                        crate::observe::fail(format!(
+                            "replacement_issued_head_untracked head={} behind={} \
                              reason=issued_head_not_tracked",
-                                head.get(),
-                                transaction.get()
-                            ));
-                        }
-                        None
+                            head.get(),
+                            transaction.get()
+                        ));
                     }
-                    Err(_) => {
-                        Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked)
-                    }
-                },
-                None => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
+                    None
+                }
+                Err(_) => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
             },
+            None => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
         };
         if let Some(reason) = refusal {
             return Err(Box::new(ReplacementExecImagePreparationFailure {
@@ -11747,10 +11719,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ));
             }
         };
-        let envelope = match self.prepare_exec_image_states(
-            resources,
-            ReplacementImageClaimOrdering::WithinTransactionChain,
-        ) {
+        let envelope = match self.prepare_exec_image_states(resources) {
             Ok(envelope) => envelope,
             Err(reason) => {
                 return Err(Box::new(
@@ -11984,9 +11953,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 return Err(ReplacementResourceReadyExecFailure::Resources { reason, prepared });
             }
         };
-        let envelope = match self
-            .prepare_exec_image_states(resources, ReplacementImageClaimOrdering::CompetesForDomain)
-        {
+        let envelope = match self.prepare_exec_image_states(resources) {
             Ok(envelope) => envelope,
             Err(reason) => {
                 return Err(ReplacementResourceReadyExecFailure::Images { reason, prepared });
@@ -12046,10 +12013,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ));
             }
         };
-        let envelope = match self.prepare_exec_image_states(
-            resources,
-            ReplacementImageClaimOrdering::WithinTransactionChain,
-        ) {
+        let envelope = match self.prepare_exec_image_states(resources) {
             Ok(envelope) => envelope,
             Err(reason) => {
                 return Err(Box::new(
@@ -18221,10 +18185,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     ));
                 }
             };
-            let envelope = match self.prepare_exec_image_states(
-                resources,
-                ReplacementImageClaimOrdering::WithinTransactionChain,
-            ) {
+            let envelope = match self.prepare_exec_image_states(resources) {
                 Ok(envelope) => envelope,
                 Err(reason) => {
                     return Err(Box::new(
@@ -18280,10 +18241,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ));
             }
         };
-        let envelope = match self.prepare_exec_image_states(
-            resources,
-            ReplacementImageClaimOrdering::WithinTransactionChain,
-        ) {
+        let envelope = match self.prepare_exec_image_states(resources) {
             Ok(envelope) => envelope,
             Err(reason) => {
                 return Err(Box::new(
@@ -21388,9 +21346,7 @@ mod tests {
                 }
                 _ => panic!("test EXEC preparation refused outside its expected operation class"),
             });
-        let envelope = runtime
-            .prepare_exec_image_states(resources, ReplacementImageClaimOrdering::CompetesForDomain)
-            .unwrap();
+        let envelope = runtime.prepare_exec_image_states(resources).unwrap();
         let resolved = runtime
             .resolve_prepared_admitted_recording_request(ReplacementResourceReadyExec {
                 prepared: Box::new(prepared),
@@ -22034,9 +21990,7 @@ mod tests {
             .prepare_preflighted_exec_resources(&prepared, manifest)
             .unwrap_or_else(|_| panic!("root-owned resource-state preparation must succeed"));
         assert!(resources.inputs().resource_states.is_some());
-        let envelope = runtime
-            .prepare_exec_image_states(resources, ReplacementImageClaimOrdering::CompetesForDomain)
-            .unwrap();
+        let envelope = runtime.prepare_exec_image_states(resources).unwrap();
         assert!(envelope.image_states.is_none());
     }
 
@@ -30777,9 +30731,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("root-owned Info preparation must succeed"));
         assert_eq!(resources.inputs().info_queries.len(), 1);
         assert_eq!(resources.inputs().info_queries[0].index(), 0);
-        let envelope = runtime
-            .prepare_exec_image_states(resources, ReplacementImageClaimOrdering::CompetesForDomain)
-            .unwrap();
+        let envelope = runtime.prepare_exec_image_states(resources).unwrap();
         assert!(envelope.image_states.is_none());
         let resolved = runtime
             .resolve_prepared_admitted_recording_request(ReplacementResourceReadyExec {
