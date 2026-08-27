@@ -4354,22 +4354,26 @@ pub(crate) struct ReplacementExecImagePreparationFailure {
 pub(crate) enum ReplacementExecImagePreparationRefusal {
     /// The backend's own image-state rule declined the plan.
     Images(reims_vgpu_vulkan::replacement_exec_image::ExecImageStateError),
-    /// This transaction's own domain has another transaction issued, so this
-    /// one may not take an exclusive image claim yet.
+    /// A transaction ahead of this one in its own domain has not submitted, so
+    /// this one may not take an exclusive image claim yet.
     ///
     /// An image representation carries one prepared transition at a time, and
-    /// an issued head is the one transaction its domain cannot advance past.
-    /// A claim taken behind that head is not merely early, it is unresolvable:
-    /// the head cannot prepare an image the claimant holds, and the claimant
-    /// cannot submit or cancel while the head holds the domain. Both then
-    /// retry for the life of the device with every stall counter reading
-    /// healthy, because neither has failed.
+    /// a domain submits in sequence. A claim taken by a later transaction is
+    /// not merely early, it is unresolvable: the earlier one cannot prepare an
+    /// image the later one holds, and the later one cannot submit or cancel
+    /// while the earlier one holds the domain. Both then retry for the life of
+    /// the device with every stall counter reading healthy, because neither
+    /// has failed.
     ///
-    /// The head's own position travels with the refusal so the log can be read
-    /// against `replacement_submission_order` directly. Two earlier attempts at
-    /// this rule reported a head the census showed as submitted, and neither
-    /// refusal carried enough to tell a wrong owner from a wrong rule.
-    BehindIssuedHead(reims_vgpu_core::IssuedHead),
+    /// This asks about *any* unsubmitted predecessor, not only an issued head.
+    /// A rule that asked only about the issued head let the cycle form one
+    /// step earlier: with nothing issued, a transaction at sequence 58 claimed
+    /// an image and the transaction at sequence 56 then became the head and
+    /// needed it.
+    ///
+    /// The predecessor's own position travels with the refusal so the log can
+    /// be read against `replacement_submission_order` directly.
+    BehindUnsubmittedPredecessor(reims_vgpu_core::UnsubmittedPredecessor),
     /// No runtime tracks this transaction's order, so nothing can be said
     /// about what it sits behind.
     ///
@@ -11595,7 +11599,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         // submission order. A guest-upload phase looks like an exception,
         // because it is a prerequisite inside one transaction's own chain; it
         // is not, because the transaction that chain belongs to still submits
-        // in domain sequence, and a phase of a transaction behind the head
+        // in domain sequence, and a phase of a transaction behind another
         // holds the image exactly as durably as the transaction itself would.
         // A domain head whose upload suffix needed an image a later
         // transaction's suffix already held is the deadlock that reading this
@@ -11605,56 +11609,56 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         // from the active generation, because an exec is not active-scoped.
         let transaction = resources.transaction();
         let refusal = match self.execution.runtime_owning_submission_order(transaction) {
-            Some(runtime) => match runtime.issued_submission_head_other_than(transaction) {
-                Ok(Some(issued)) => {
-                    // The head this runtime reports and the head the census
-                    // reports have disagreed at one timestamp, and a refusal
-                    // that names only the head cannot say which of them is
-                    // wrong. Report the answering runtime's own entry for that
-                    // head next to whether the active generation is the one
-                    // that answered: a head the answering runtime itself calls
-                    // submitted is a contradiction inside one owner, and a head
-                    // only a retired generation still holds is two owners
-                    // disagreeing about one domain.
+            Some(runtime) => match runtime.unsubmitted_submission_predecessor(transaction) {
+                Ok(Some(ahead)) => {
+                    // Report the answering runtime's own entry for the
+                    // predecessor it named, next to whether the active
+                    // generation is the one that answered: a predecessor the
+                    // answering runtime itself calls submitted is a
+                    // contradiction inside one owner, and one only a retired
+                    // generation still holds is two owners disagreeing about
+                    // one domain.
                     //
                     // Keyed by the head *and* the two answers that can change
-                    // under it, so a head that begins as an honest refusal and
-                    // becomes a contradiction reports twice rather than being
-                    // deduped into its first, correct sighting. That is the
-                    // exact shape this boot showed: correct at the first
-                    // refusal, contradictory forty seconds later.
-                    let entry = runtime.submission_order_entry(issued.transaction);
+                    // under it, so a predecessor that begins as an honest
+                    // refusal and becomes a contradiction reports twice rather
+                    // than being deduped into its first, correct sighting.
+                    let entry = runtime.submission_order_entry(ahead.transaction);
                     let active = std::ptr::eq(runtime, &self.execution.active.runtime);
-                    let key = (issued.transaction.get() << 2)
+                    let key = (ahead.transaction.get() << 2)
                         | (u64::from(entry.is_some_and(|entry| entry.submitted)) << 1)
                         | u64::from(active);
-                    if crate::observe::first_sight("replacement_behind_issued_head", key) {
+                    if crate::observe::first_sight(
+                        "replacement_behind_unsubmitted_predecessor",
+                        key,
+                    ) {
                         crate::observe::fail(format!(
-                            "replacement_behind_issued_head head={} behind={} answered_by_active={} head_entry={:?} reason=claim_behind_issued_head",
-                            issued.transaction.get(),
+                            "replacement_behind_unsubmitted_predecessor ahead={} behind={} answered_by_active={} ahead_entry={:?} reason=claim_behind_unsubmitted_predecessor",
+                            ahead.transaction.get(),
                             transaction.get(),
                             active,
                             entry,
                         ));
                     }
-                    Some(ReplacementExecImagePreparationRefusal::BehindIssuedHead(
-                        issued,
-                    ))
+                    Some(
+                        ReplacementExecImagePreparationRefusal::BehindUnsubmittedPredecessor(ahead),
+                    )
                 }
                 Ok(None) => None,
-                // A head no owner tracks cannot be released by anyone, so
-                // ordering behind it is a permanent stall and not a wait. Take
-                // the claim and say so: corrupt order state is a real defect,
-                // and a device that stops is a worse report of it than one
-                // that names it and keeps running. Deduped by head, because
-                // every later exec on that domain meets the same one.
-                Err(reims_vgpu_core::SubmissionOrderError::IssuedHeadUntracked(head)) => {
-                    if crate::observe::first_sight("replacement_issued_head_untracked", head.get())
+                // A predecessor no owner tracks cannot be released by anyone,
+                // so ordering behind it is a permanent stall and not a wait.
+                // Take the claim and say so: corrupt order state is a real
+                // defect, and a device that stops is a worse report of it than
+                // one that names it and keeps running. Deduped by the
+                // predecessor, because every later exec on that domain meets
+                // the same one.
+                Err(reims_vgpu_core::SubmissionOrderError::IssuedHeadUntracked(ahead)) => {
+                    if crate::observe::first_sight("replacement_predecessor_untracked", ahead.get())
                     {
                         crate::observe::fail(format!(
-                            "replacement_issued_head_untracked head={} behind={} \
-                             reason=issued_head_not_tracked",
-                            head.get(),
+                            "replacement_predecessor_untracked ahead={} behind={} \
+                             reason=predecessor_not_tracked",
+                            ahead.get(),
                             transaction.get()
                         ));
                     }

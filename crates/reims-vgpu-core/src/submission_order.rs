@@ -30,12 +30,15 @@ pub enum SubmissionOrderError {
     DomainNotDrained,
     AlreadyAbandoned,
     StillHoldsDomain,
+    /// A predecessor holding a domain position that this owner's index does
+    /// not track. Nothing can name it, so nothing can release it.
     IssuedHeadUntracked(TransactionId),
 }
 
-/// A domain's issued head, and the position of the transaction behind it.
+/// A transaction ahead of another in one domain that has not submitted, and
+/// the position of the one that asked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IssuedHead {
+pub struct UnsubmittedPredecessor {
     pub transaction: TransactionId,
     pub domain: SubmissionDomainId,
     pub sequence: DomainSequence,
@@ -138,62 +141,6 @@ impl SubmissionOrderOwner {
         self.transactions.contains_key(&transaction)
     }
 
-    /// The transaction actively submitting on `transaction`'s domain, when it
-    /// is some other transaction, with the position of each.
-    ///
-    /// An issued head is the one transaction a domain cannot advance past, so
-    /// it is the exact condition under which a claim taken by anything behind
-    /// it becomes a cycle rather than a wait. An image representation carries
-    /// one prepared transition at a time; if a transaction behind the issued
-    /// head claims an image the head then needs, the head cannot prepare and
-    /// the claimant cannot submit, because the head holds the domain.
-    ///
-    /// This asks only about `issued`, deliberately. A merely *pending*
-    /// predecessor holds no claim and no domain, so it is in no cycle, and
-    /// refusing behind one serialises a domain for no correctness gain.
-    ///
-    /// The positions come back with the answer because a reading that
-    /// disagrees with the census has to be able to say which domain it read.
-    /// Two attempts at this rule were reverted for exactly that reading, and
-    /// neither refusal carried enough to tell a wrong owner from a wrong rule.
-    pub fn issued_head_other_than(
-        &self,
-        transaction: TransactionId,
-    ) -> Result<Option<IssuedHead>, SubmissionOrderError> {
-        let &TransactionOrder {
-            domain, sequence, ..
-        } = self
-            .transactions
-            .get(&transaction)
-            .ok_or(SubmissionOrderError::UnknownTransaction)?;
-        let state = self
-            .domains
-            .get(&domain)
-            .expect("transaction index names one submission domain");
-        let Some(&(issued_sequence, issued)) = state.issued.as_ref() else {
-            return Ok(None);
-        };
-        if issued.transaction == transaction {
-            return Ok(None);
-        }
-        // A head this owner does not track is not an order, it is corruption:
-        // nothing can name it, so nothing can release it, and every claim
-        // behind it would wait for a transaction that cannot move again.
-        // Saying so is the caller's only chance to tell that apart from an
-        // ordinary wait.
-        if !self.transactions.contains_key(&issued.transaction) {
-            return Err(SubmissionOrderError::IssuedHeadUntracked(
-                issued.transaction,
-            ));
-        }
-        Ok(Some(IssuedHead {
-            transaction: issued.transaction,
-            domain,
-            sequence: issued_sequence,
-            behind: sequence,
-        }))
-    }
-
     /// The nearest transaction ahead of `transaction` in its own domain that
     /// has not submitted yet.
     ///
@@ -205,13 +152,22 @@ impl SubmissionOrderOwner {
     /// cannot submit or cancel because the earlier one holds the domain head.
     /// Neither side can move and nothing times out.
     ///
-    /// Asking this before taking such a claim is what keeps the claim order
-    /// and the submission order the same order. It reports the *nearest*
-    /// predecessor rather than a boolean so the refusal can name who is ahead.
+    /// **A merely pending predecessor counts, and this is the whole point.**
+    /// An earlier rule asked only about the *issued* head, reasoning that a
+    /// pending predecessor holds no claim and no domain and so is in no cycle.
+    /// It holds no claim *yet*. A driven boot formed the cycle in the order the
+    /// narrower rule allows: with nothing issued, a transaction at sequence 58
+    /// took an image; the transaction at sequence 56 then became the head,
+    /// needed that image, and neither could move again. The claim has to be
+    /// ordered against the order the domain will submit in, not against
+    /// whoever happens to hold the head at the moment of asking.
+    ///
+    /// The positions come back with the answer because a reading that
+    /// disagrees with the census has to be able to say which domain it read.
     pub fn unsubmitted_predecessor(
         &self,
         transaction: TransactionId,
-    ) -> Result<Option<TransactionId>, SubmissionOrderError> {
+    ) -> Result<Option<UnsubmittedPredecessor>, SubmissionOrderError> {
         let &TransactionOrder {
             domain, sequence, ..
         } = self
@@ -222,17 +178,40 @@ impl SubmissionOrderOwner {
             .domains
             .get(&domain)
             .expect("transaction index names one submission domain");
-        if let Some((_, pending)) = state.pending.range(..sequence).next_back() {
-            return Ok(Some(pending.transaction));
+        // The issued head is removed from `pending`, so the two have to be
+        // compared against each other: whichever sits at the higher sequence
+        // below this one is the nearest predecessor.
+        let pending = state
+            .pending
+            .range(..sequence)
+            .next_back()
+            .map(|(&sequence, pending)| (sequence, pending.transaction));
+        let issued = state
+            .issued
+            .as_ref()
+            .filter(|(issued_sequence, _)| *issued_sequence < sequence)
+            .map(|&(sequence, pending)| (sequence, pending.transaction));
+        let Some((predecessor_sequence, predecessor)) = [pending, issued]
+            .into_iter()
+            .flatten()
+            .max_by_key(|&(sequence, _)| sequence)
+        else {
+            return Ok(None);
+        };
+        // A predecessor this owner does not track is not an order, it is
+        // corruption: nothing can name it, so nothing can release it, and
+        // every claim behind it would wait for a transaction that cannot move
+        // again. Saying so is the caller's only chance to tell that apart from
+        // an ordinary wait.
+        if !self.transactions.contains_key(&predecessor) {
+            return Err(SubmissionOrderError::IssuedHeadUntracked(predecessor));
         }
-        // The issued head is removed from `pending`, so it is the one
-        // predecessor the range above cannot see.
-        if let Some((issued_sequence, pending)) = state.issued.as_ref() {
-            if *issued_sequence < sequence {
-                return Ok(Some(pending.transaction));
-            }
-        }
-        Ok(None)
+        Ok(Some(UnsubmittedPredecessor {
+            transaction: predecessor,
+            domain,
+            sequence: predecessor_sequence,
+            behind: sequence,
+        }))
     }
 
     /// Take the next position in `domain` for `transaction`.
@@ -961,7 +940,12 @@ mod tests {
         );
         assert_eq!(
             owner.unsubmitted_predecessor(TransactionId::new(541)),
-            Ok(Some(TransactionId::new(540))),
+            Ok(Some(UnsubmittedPredecessor {
+                transaction: TransactionId::new(540),
+                domain: SubmissionDomainId::new(1),
+                sequence: DomainSequence::new(2),
+                behind: DomainSequence::new(3),
+            })),
             "the nearest predecessor is named, not merely reported to exist"
         );
         assert_eq!(
@@ -976,12 +960,22 @@ mod tests {
             .unwrap();
         assert_eq!(
             owner.unsubmitted_predecessor(TransactionId::new(541)),
-            Ok(Some(TransactionId::new(540)))
+            Ok(Some(UnsubmittedPredecessor {
+                transaction: TransactionId::new(540),
+                domain: SubmissionDomainId::new(1),
+                sequence: DomainSequence::new(2),
+                behind: DomainSequence::new(3),
+            }))
         );
         owner.abandon(TransactionId::new(540)).unwrap();
         assert_eq!(
             owner.unsubmitted_predecessor(TransactionId::new(541)),
-            Ok(Some(TransactionId::new(539))),
+            Ok(Some(UnsubmittedPredecessor {
+                transaction: TransactionId::new(539),
+                domain: SubmissionDomainId::new(1),
+                sequence: DomainSequence::new(1),
+                behind: DomainSequence::new(3),
+            })),
             "the issued head is invisible to a scan of the pending map"
         );
 
@@ -1035,29 +1029,43 @@ mod tests {
             .expect("both claims were released, so the domain drained");
     }
 
-    /// The issued head is the exact condition that turns a claim into a cycle,
-    /// and a merely pending predecessor is not.
+    /// Any unsubmitted predecessor blocks a claim, issued or merely pending.
     ///
-    /// The shape this reproduces, from a driven macos-13 boot: 630 was issued
-    /// and holding domain 1, 632 sat behind it having already claimed an image
-    /// 630 then needed, and neither could move -- 630 could not prepare and 632
-    /// could not submit past the head.
+    /// Two driven macos-13 boots formed the same cycle by two routes, and only
+    /// the second says why the pending case counts:
+    ///
+    /// - 630 was issued and holding domain 1; 632 sat behind it having already
+    ///   claimed an image 630 then needed. Neither could move.
+    /// - nothing was issued at all; 503 at sequence 58 claimed an image, 501 at
+    ///   sequence 56 then became the head and needed it. Neither could move.
+    ///
+    /// A rule that asks only about the issued head allows the second, so this
+    /// asks about the nearest unsubmitted predecessor of either kind.
     #[test]
-    fn only_an_issued_head_blocks_a_claim_from_the_transactions_behind_it() {
+    fn any_unsubmitted_predecessor_blocks_a_claim_from_the_transactions_behind_it() {
         let mut owner = SubmissionOrderOwner::default();
         accept(&mut owner, 630, 1, 1);
         accept(&mut owner, 631, 1, 2);
         accept(&mut owner, 632, 1, 3);
         accept(&mut owner, 700, 4, 1);
 
-        // Nothing is issued yet, so nothing is blocked -- a pending
-        // predecessor takes no claim and holds no domain.
-        for transaction in [630, 631, 632] {
-            assert_eq!(
-                owner.issued_head_other_than(TransactionId::new(transaction)),
-                Ok(None)
-            );
-        }
+        // Nothing is issued, and the pending predecessors still order the
+        // claims. This is the case the narrower rule let through.
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(630)),
+            Ok(None),
+            "the first in a domain has nothing ahead of it"
+        );
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(632)),
+            Ok(Some(UnsubmittedPredecessor {
+                transaction: TransactionId::new(631),
+                domain: SubmissionDomainId::new(1),
+                sequence: DomainSequence::new(2),
+                behind: DomainSequence::new(3),
+            })),
+            "the nearest predecessor is reported, not the domain head"
+        );
 
         owner.recorded(TransactionId::new(630)).unwrap();
         owner
@@ -1065,31 +1073,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(632)),
-            Ok(Some(IssuedHead {
+            owner.unsubmitted_predecessor(TransactionId::new(632)),
+            Ok(Some(UnsubmittedPredecessor {
+                transaction: TransactionId::new(631),
+                domain: SubmissionDomainId::new(1),
+                sequence: DomainSequence::new(2),
+                behind: DomainSequence::new(3),
+            })),
+            "issuing 630 does not make the nearer pending 631 stop being ahead"
+        );
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(631)),
+            Ok(Some(UnsubmittedPredecessor {
                 transaction: TransactionId::new(630),
                 domain: SubmissionDomainId::new(1),
                 sequence: DomainSequence::new(1),
-                behind: DomainSequence::new(3),
+                behind: DomainSequence::new(2),
             })),
-            "632 sits behind the issued head and must not claim"
+            "the issued head is the predecessor the pending range cannot see"
         );
         assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(630)),
+            owner.unsubmitted_predecessor(TransactionId::new(630)),
             Ok(None),
-            "the head itself is not behind itself, or it could never prepare"
+            "the head is not behind itself, or it could never prepare"
         );
         assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(700)),
+            owner.unsubmitted_predecessor(TransactionId::new(700)),
             Ok(None),
-            "another domain's head orders nothing here"
+            "another domain's order says nothing here"
         );
 
+        // Submitting clears the claim in order: 630 first, then 631.
         owner.submitted(TransactionId::new(630)).unwrap();
         assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(632)),
+            owner.unsubmitted_predecessor(TransactionId::new(631)),
             Ok(None),
-            "the head submitted, so the domain can advance and claims are free"
+            "630 submitted, so 631 is now first"
+        );
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(632)),
+            Ok(Some(UnsubmittedPredecessor {
+                transaction: TransactionId::new(631),
+                domain: SubmissionDomainId::new(1),
+                sequence: DomainSequence::new(2),
+                behind: DomainSequence::new(3),
+            })),
+            "632 still waits on 631, which has not submitted"
+        );
+        owner.recorded(TransactionId::new(631)).unwrap();
+        owner
+            .reserve_head_transaction_if(TransactionId::new(631), |_| true)
+            .unwrap()
+            .unwrap();
+        owner.submitted(TransactionId::new(631)).unwrap();
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(632)),
+            Ok(None),
+            "the whole prefix submitted, so 632 is free to claim"
         );
 
         // The order lives in exactly one owner, which is what a caller holding
@@ -1097,7 +1137,7 @@ mod tests {
         assert!(owner.tracks(TransactionId::new(632)));
         assert!(!owner.tracks(TransactionId::new(9_999)));
         assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(9_999)),
+            owner.unsubmitted_predecessor(TransactionId::new(9_999)),
             Err(SubmissionOrderError::UnknownTransaction)
         );
     }
@@ -1122,7 +1162,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            owner.issued_head_other_than(TransactionId::new(144)),
+            owner.unsubmitted_predecessor(TransactionId::new(144)),
             Ok(Some(_)),
         ));
 
@@ -1130,7 +1170,7 @@ mod tests {
         // the state the boot was in.
         owner.transactions.remove(&TransactionId::new(141));
         assert_eq!(
-            owner.issued_head_other_than(TransactionId::new(144)),
+            owner.unsubmitted_predecessor(TransactionId::new(144)),
             Err(SubmissionOrderError::IssuedHeadUntracked(
                 TransactionId::new(141)
             )),
