@@ -438,7 +438,7 @@ where
     // them. Two aliased textures share the allocation and need one native
     // object each, so this is a loop rather than a single materialization.
     for resource in facts.resources {
-        if runtime.texture_has_execution_representation(resource) {
+        if runtime.resource_has_execution_representation(resource) {
             continue;
         }
         let guest = resolve_task_guest_window(
@@ -600,7 +600,7 @@ where
         // declared over the same guest range carries its own image, and asking
         // the backing skips it -- every draw naming it then refuses with
         // `MissingExecutionRepresentation` and parks the channel behind it.
-        if runtime.texture_has_execution_representation(resource) {
+        if runtime.resource_has_execution_representation(resource) {
             continue;
         }
         let guest = resolve_task_guest_window(
@@ -628,7 +628,7 @@ where
         let Some(base) = runtime.texture_binding_view_base(view) else {
             continue;
         };
-        if !runtime.texture_has_execution_representation(base) {
+        if !runtime.resource_has_execution_representation(base) {
             continue;
         }
         if let Err(reason) = runtime.materialize_texture_view(view) {
@@ -8780,8 +8780,8 @@ mod tests {
 
         // Both, and each its own. Asking the backing answered yes after the
         // first and the second was never built.
-        assert!(runtime.texture_has_execution_representation(first.resource));
-        assert!(runtime.texture_has_execution_representation(second.resource));
+        assert!(runtime.resource_has_execution_representation(first.resource));
+        assert!(runtime.resource_has_execution_representation(second.resource));
         let designated = runtime
             .execution()
             .resources()
@@ -8792,6 +8792,62 @@ mod tests {
             2,
             "each texture owns one image over the shared range: {designated:?}"
         );
+    }
+
+    /// A buffer owner materializes the backing's *bytes*, not an image, so
+    /// asking it whether it has an image is a question whose answer is always
+    /// no. Materialization then rebuilt it on every pass, the backing refused
+    /// `DuplicateExecutionRepresentation`, and the deferred-exec route retried
+    /// the same packet ~400 times a second for the whole boot with the channel
+    /// parked behind it.
+    #[test]
+    fn a_buffer_owner_is_materialized_once_and_not_rebuilt_on_the_next_pass() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(7);
+        runtime.define_task(task, 0x10_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        let data = 9u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        host.map_range(data, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        host.write_gpa(root + 0x10 * 4, &9u32.to_le_bytes())
+            .unwrap();
+
+        let declaration =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+                &mut runtime,
+                shift,
+                task,
+                19,
+                reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                    reims_vgpu_protocol::BufferDescriptor {
+                        allocation_size: 64,
+                        handle: 0x10,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+
+        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing)
+            .unwrap();
+        assert!(runtime.resource_has_execution_representation(declaration.resource));
+        // The second pass is what the retry loop runs. It must find the bytes
+        // already there and build nothing.
+        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing)
+            .unwrap();
     }
 
     #[test]

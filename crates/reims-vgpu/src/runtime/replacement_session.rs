@@ -15231,7 +15231,30 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .map(|resolved| resolved.base)
     }
 
-    /// Whether this texture's own image over its backing exists.
+    /// The view of its backing one resource materializes into.
+    ///
+    /// A buffer declares the bytes and a texture declares an image of its own,
+    /// so the two answer different questions about the same guest range. The
+    /// descriptor is what says which, and it is the same descriptor
+    /// [`Self::materialize_resource_with_guest_window`] dispatches on, so the
+    /// two cannot disagree about a resource.
+    pub(crate) fn resource_backing_view(
+        &self,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    ) -> Option<reims_vgpu_core::BackingView> {
+        let node = self.execution.resources().graph().resource(resource)?;
+        match node.descriptor.as_deref()? {
+            reims_vgpu_protocol::ResourceDescriptor::Buffer(_) => {
+                Some(reims_vgpu_core::BackingView::Bytes)
+            }
+            reims_vgpu_protocol::ResourceDescriptor::Texture(_) => Some(
+                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::base(resource)),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Whether this resource's own view of its backing has been materialized.
     ///
     /// The question materialization has to ask, and it is not
     /// [`Self::backing_has_execution_representation`]: a backing carries one
@@ -15239,19 +15262,26 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     /// materialized says nothing about this one. Asking the backing skips the
     /// second alias, and every draw that names it then refuses with
     /// `MissingExecutionRepresentation` and parks its channel.
-    pub(crate) fn texture_has_execution_representation(
+    ///
+    /// It asks about the *view this resource materializes into* rather than
+    /// about an image, because a buffer owner over the same range materializes
+    /// bytes. Asking a buffer whether it has an image is a question whose
+    /// answer is always no, so the materializer rebuilt it on every pass and
+    /// the backing refused `DuplicateExecutionRepresentation` -- forever, at
+    /// four hundred retries a second, holding the channel behind it.
+    pub(crate) fn resource_has_execution_representation(
         &self,
         resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
     ) -> bool {
         let Some(backing) = self.resolved_backing(resource) else {
             return false;
         };
+        let Some(view) = self.resource_backing_view(resource) else {
+            return false;
+        };
         self.execution
             .resources()
-            .view_representation(
-                backing,
-                reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::base(resource)),
-            )
+            .view_representation(backing, view)
             .is_ok()
     }
 
