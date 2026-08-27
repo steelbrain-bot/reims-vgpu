@@ -11557,9 +11557,41 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         let transaction = resources.transaction();
         let refusal = match self.execution.runtime_owning_submission_order(transaction) {
             Some(runtime) => match runtime.issued_submission_head_other_than(transaction) {
-                Ok(Some(issued)) => Some(ReplacementExecImagePreparationRefusal::BehindIssuedHead(
-                    issued,
-                )),
+                Ok(Some(issued)) => {
+                    // The head this runtime reports and the head the census
+                    // reports have disagreed, and a refusal that names only
+                    // the head cannot say which of them is wrong. Report the
+                    // answering runtime's own entry for that head next to
+                    // whether the active generation is the one that answered:
+                    // a head the answering runtime calls submitted is a
+                    // contradiction inside one owner, and a head only a
+                    // retired generation still holds is two owners disagreeing
+                    // about one domain. Deduped by head.
+                    if crate::observe::first_sight(
+                        "replacement_behind_issued_head",
+                        issued.transaction.get(),
+                    ) {
+                        let entry = runtime
+                            .submission_order_census()
+                            .into_iter()
+                            .find(|entry| entry.transaction == issued.transaction);
+                        let active = self
+                            .execution
+                            .active
+                            .runtime
+                            .tracks_submission_order(transaction);
+                        crate::observe::fail(format!(
+                            "replacement_behind_issued_head head={} behind={} answered_by_active={} head_entry={:?} reason=claim_behind_issued_head",
+                            issued.transaction.get(),
+                            transaction.get(),
+                            active,
+                            entry,
+                        ));
+                    }
+                    Some(ReplacementExecImagePreparationRefusal::BehindIssuedHead(
+                        issued,
+                    ))
+                }
                 Ok(None) => None,
                 // A head no owner tracks cannot be released by anyone, so
                 // ordering behind it is a permanent stall and not a wait. Take
