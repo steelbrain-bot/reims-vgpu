@@ -5521,6 +5521,81 @@ pub(crate) enum ReplacementExecResourceTableError {
     BackingAbsent(reims_vgpu_protocol::BackingId),
 }
 
+impl ReplacementExecResourceTableError {
+    /// Whether no later guest packet can make this table entry resolvable.
+    ///
+    /// A resource-table entry naming a *released* slot is the one arm that can
+    /// never come good. The guest has finished with that name, its resource is
+    /// gone, and the next declaration for the name creates a different object
+    /// under a new generation -- so re-offering the packet asks a question
+    /// whose answer cannot change, forever, while the channel behind it is
+    /// parked.
+    ///
+    /// An *undeclared* slot is the opposite and must keep waiting: no
+    /// declaration this device admitted has named it yet, and a packet that
+    /// has not arrived is exactly what binds it. The other arms are a decoded
+    /// shape, an alias closure and a backing, none of which is a statement
+    /// about a name the guest has retired.
+    ///
+    /// A terminal refusal here is still a lost EXEC, and it is reported as
+    /// one. That is the trade this makes: one command lost with its reason on
+    /// the fail channel, against a device that stops. If these appear in
+    /// volume the question to ask is not whether to wait longer but whether
+    /// this device released the object too early -- the refusal names the task
+    /// and the slot so that question stays answerable.
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::ResourceAbsent {
+                slot: reims_vgpu_core::ObjectSlotState::Released,
+                ..
+            } => true,
+            Self::ResourceAbsent { .. }
+            | Self::TailPopulated { .. }
+            | Self::AliasClosureAbsent(_)
+            | Self::BackingAbsent(_) => false,
+        }
+    }
+}
+
+impl ReplacementDecodedExecAdmissionError {
+    /// See [`ReplacementExecResourceTableError::is_terminal_refusal`]. Only the
+    /// resource table can refuse in a way a later packet cannot repair;
+    /// decode, access compilation and runtime admission are all repairable or
+    /// are decode-level shapes.
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::ResourceTable(reason) => reason.is_terminal_refusal(),
+            Self::Canonical(_) | Self::Accesses(_) | Self::Admission(_) => false,
+        }
+    }
+}
+
+impl<Completion> ReplacementExecIngressPreparationError<Completion> {
+    /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::Admission(reason) => reason.is_terminal_refusal(),
+            Self::Direct(_) | Self::IndirectRange(_) => false,
+        }
+    }
+}
+
+impl<Completion> ReplacementExecIngressDispatchFailure<Completion> {
+    /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::Ingress(reason) => reason.is_terminal_refusal(),
+            Self::DirectResources(_)
+            | Self::DirectDispatch(_)
+            | Self::GuestUploadPhase(_)
+            | Self::GuestUploadResolution(_)
+            | Self::GuestUploadDispatch(_)
+            | Self::IndirectRangeReadiness { .. }
+            | Self::IndirectRange(_) => false,
+        }
+    }
+}
+
 /// What a standalone invalidation resolved to.
 ///
 /// An invalidation whose records all name slots this device holds no resource
@@ -34984,5 +35059,55 @@ mod tests {
                 }
             ) if object == pipeline
         ));
+    }
+
+    /// A released slot ends the packet; an undeclared one keeps waiting.
+    ///
+    /// The two reach this classifier as the same `ResourceAbsent` refusal and
+    /// they are opposite instructions. Getting it backwards either parks a
+    /// channel forever on a name the guest has retired, or throws away an EXEC
+    /// whose declaration simply had not arrived yet -- and neither shows up as
+    /// a failure, because in both cases the device is doing exactly what it
+    /// was told.
+    #[test]
+    fn a_released_object_slot_ends_an_exec_and_an_undeclared_one_does_not() {
+        let absent = |slot| {
+            ReplacementExecIngressDispatchFailure::<()>::Ingress(
+                ReplacementExecIngressPreparationError::Admission(
+                    ReplacementDecodedExecAdmissionError::ResourceTable(
+                        ReplacementExecResourceTableError::ResourceAbsent {
+                            task: reims_vgpu_protocol::TaskId::new(1),
+                            object: reims_vgpu_protocol::ObjectTableRef::new(63),
+                            slot,
+                        },
+                    ),
+                ),
+            )
+        };
+
+        assert!(
+            absent(reims_vgpu_core::ObjectSlotState::Released).is_terminal_refusal(),
+            "a name the guest has retired cannot be bound again under the same \
+             identity, so re-offering the packet asks a question whose answer \
+             cannot change"
+        );
+        assert!(
+            !absent(reims_vgpu_core::ObjectSlotState::Undeclared).is_terminal_refusal(),
+            "a name no declaration has reached yet is exactly what a later \
+             packet binds"
+        );
+
+        // The other refusals on this path are repairable, and a released slot
+        // reached through any of them is still the only terminal one.
+        assert!(!ReplacementExecIngressDispatchFailure::<()>::Ingress(
+            ReplacementExecIngressPreparationError::Admission(
+                ReplacementDecodedExecAdmissionError::ResourceTable(
+                    ReplacementExecResourceTableError::BackingAbsent(
+                        reims_vgpu_protocol::BackingId::new(7)
+                    ),
+                ),
+            ),
+        )
+        .is_terminal_refusal());
     }
 }

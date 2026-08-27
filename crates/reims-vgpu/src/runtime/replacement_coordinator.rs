@@ -134,7 +134,11 @@ impl<Semantic> ReplacementHostExecDispatchFailure<Semantic> {
             Self::Representation { reason, .. } | Self::BackingRepresentation { reason, .. } => {
                 reason.is_unimplemented_case()
             }
-            Self::Load { .. } | Self::ObjectPreparation(_) | Self::Dispatch { .. } => false,
+            // A dispatch failure naming an object-table slot the guest has
+            // released can never be repaired by a later packet, so re-offering
+            // it parks the channel for the life of the device.
+            Self::Dispatch { reason, .. } => reason.is_terminal_refusal(),
+            Self::Load { .. } | Self::ObjectPreparation(_) => false,
         }
     }
 }
