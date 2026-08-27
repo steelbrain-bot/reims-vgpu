@@ -7,6 +7,7 @@
 use crate::replacement_barriers::{
     stage_flags, BackingBarrierScope, BarrierAccess, BarrierTarget, HazardBarrier,
 };
+use crate::replacement_representation::ReplacementNativeRepresentationLease;
 use ash::vk;
 use reims_vgpu_core::{BarrierOperation, ImageAspect, ResourceGraph};
 use reims_vgpu_protocol::{BackingId, ResourceId, ResourceObject};
@@ -16,6 +17,28 @@ use std::collections::BTreeSet;
 pub struct QueueFamilyTransfer {
     pub source: u32,
     pub destination: u32,
+}
+
+/// An image layout a barrier may name.
+///
+/// `VK_IMAGE_LAYOUT_UNDEFINED` and `VK_IMAGE_LAYOUT_PREINITIALIZED` are not
+/// among them: `newLayout` must be neither, and an image whose representation
+/// still carries one holds no content this device has defined, so there is no
+/// content dependency for a barrier to express.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DefinedImageLayout(vk::ImageLayout);
+
+impl DefinedImageLayout {
+    pub fn new(layout: vk::ImageLayout) -> Option<Self> {
+        match layout {
+            vk::ImageLayout::UNDEFINED | vk::ImageLayout::PREINITIALIZED => None,
+            layout => Some(Self(layout)),
+        }
+    }
+
+    pub const fn get(self) -> vk::ImageLayout {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -28,14 +51,26 @@ pub enum NativeBarrierTarget {
     },
     Image {
         image: vk::Image,
-        layout: vk::ImageLayout,
+        layout: Option<DefinedImageLayout>,
         full_range: vk::ImageSubresourceRange,
         queue_families: Option<QueueFamilyTransfer>,
     },
 }
 
+/// One resolved barrier target together with the ownership token that keeps
+/// its raw handle valid.
+///
+/// A barrier batch copies raw Vulkan handles into a recording that outlives
+/// this resolution, so the handle and the lease are resolved as one value and
+/// never separately.
+#[derive(Clone, Debug)]
+pub struct NativeBarrierResolution {
+    pub target: NativeBarrierTarget,
+    pub lease: ReplacementNativeRepresentationLease,
+}
+
 pub trait ReplacementBarrierResolver {
-    fn resolve(&self, backing: BackingId) -> Option<NativeBarrierTarget>;
+    fn resolve(&self, backing: BackingId) -> Option<NativeBarrierResolution>;
 }
 
 pub trait ReplacementBarrierResourceResolver {
@@ -71,11 +106,20 @@ pub struct NativeBarrierBatch {
     pub memory: Vec<vk::MemoryBarrier2<'static>>,
     pub buffers: Vec<vk::BufferMemoryBarrier2<'static>>,
     pub images: Vec<vk::ImageMemoryBarrier2<'static>>,
+    /// Exact native objects whose raw handles this batch holds. A recording
+    /// that emits the batch retains these until its timeline point retires;
+    /// without them the last arbitrary drop of a representation would destroy
+    /// an object a recorded barrier still names.
+    leases: Vec<ReplacementNativeRepresentationLease>,
 }
 
 impl NativeBarrierBatch {
     pub fn is_empty(&self) -> bool {
         self.memory.is_empty() && self.buffers.is_empty() && self.images.is_empty()
+    }
+
+    pub fn leases(&self) -> &[ReplacementNativeRepresentationLease] {
+        &self.leases
     }
 }
 
@@ -168,7 +212,7 @@ pub fn resolve_hazard_barriers(
                     .dst_access_mask(barrier.destination.access),
             ),
             BarrierTarget::Backing { backing, scope } => {
-                let native = resolver
+                let resolution = resolver
                     .resolve(backing)
                     .ok_or(BarrierRecordError::UnknownBacking(backing))?;
                 resolve_backing(
@@ -176,7 +220,7 @@ pub fn resolve_hazard_barriers(
                     barrier.destination,
                     backing,
                     scope,
-                    native,
+                    resolution,
                     &mut batch,
                 )?;
             }
@@ -234,17 +278,18 @@ pub fn resolve_explicit_barrier(
                 backings.extend(aliases);
             }
             for backing in backings {
-                let target = native
-                    .resolve(backing)
-                    .ok_or(ExplicitBarrierResolveError::Native(
-                        BarrierRecordError::UnknownBacking(backing),
-                    ))?;
+                let resolution =
+                    native
+                        .resolve(backing)
+                        .ok_or(ExplicitBarrierResolveError::Native(
+                            BarrierRecordError::UnknownBacking(backing),
+                        ))?;
                 resolve_backing(
                     source,
                     destination,
                     backing,
                     BackingBarrierScope::WholeBacking,
-                    target,
+                    resolution,
                     &mut batch,
                 )
                 .map_err(ExplicitBarrierResolveError::Native)?;
@@ -303,14 +348,15 @@ fn resolve_backing(
     destination: BarrierAccess,
     backing: BackingId,
     scope: BackingBarrierScope,
-    native: NativeBarrierTarget,
+    resolution: NativeBarrierResolution,
     batch: &mut NativeBarrierBatch,
 ) -> Result<(), BarrierRecordError> {
     // A backing's semantic coordinates describe the API access, while its
     // selected representation determines the native object kind. A barrier
     // moves no content, so when those coordinate systems differ the complete
     // native object is the exact conservative projection of the same backing.
-    match (scope, native) {
+    let NativeBarrierResolution { target, lease } = resolution;
+    match (scope, target) {
         (
             BackingBarrierScope::Linear(range),
             NativeBarrierTarget::Buffer {
@@ -334,6 +380,7 @@ fn resolve_backing(
                 range.end() - range.start(),
                 queue_families,
             ));
+            batch.leases.push(lease);
         }
         (
             BackingBarrierScope::WholeBacking,
@@ -343,14 +390,17 @@ fn resolve_backing(
                 size,
                 queue_families,
             },
-        ) => batch.buffers.push(buffer_barrier(
-            source,
-            destination,
-            buffer,
-            base_offset,
-            size,
-            queue_families,
-        )),
+        ) => {
+            batch.buffers.push(buffer_barrier(
+                source,
+                destination,
+                buffer,
+                base_offset,
+                size,
+                queue_families,
+            ));
+            batch.leases.push(lease);
+        }
         (
             BackingBarrierScope::Image {
                 aspect,
@@ -387,7 +437,7 @@ fn resolve_backing(
             {
                 return Err(BarrierRecordError::RegionOutOfBounds(backing));
             }
-            batch.images.push(image_barrier(
+            push_image_barrier(
                 source,
                 destination,
                 image,
@@ -400,40 +450,28 @@ fn resolve_backing(
                     layer_count,
                 },
                 queue_families,
-            ));
+                lease,
+                batch,
+            );
         }
         (
-            BackingBarrierScope::WholeBacking,
+            BackingBarrierScope::WholeBacking | BackingBarrierScope::Linear(_),
             NativeBarrierTarget::Image {
                 image,
                 layout,
                 full_range,
                 queue_families,
             },
-        ) => batch.images.push(image_barrier(
+        ) => push_image_barrier(
             source,
             destination,
             image,
             layout,
             full_range,
             queue_families,
-        )),
-        (
-            BackingBarrierScope::Linear(_),
-            NativeBarrierTarget::Image {
-                image,
-                layout,
-                full_range,
-                queue_families,
-            },
-        ) => batch.images.push(image_barrier(
-            source,
-            destination,
-            image,
-            layout,
-            full_range,
-            queue_families,
-        )),
+            lease,
+            batch,
+        ),
         (
             BackingBarrierScope::Image { .. },
             NativeBarrierTarget::Buffer {
@@ -442,16 +480,52 @@ fn resolve_backing(
                 size,
                 queue_families,
             },
-        ) => batch.buffers.push(buffer_barrier(
-            source,
-            destination,
-            buffer,
-            base_offset,
-            size,
-            queue_families,
-        )),
+        ) => {
+            batch.buffers.push(buffer_barrier(
+                source,
+                destination,
+                buffer,
+                base_offset,
+                size,
+                queue_families,
+            ));
+            batch.leases.push(lease);
+        }
     }
     Ok(())
+}
+
+/// Record one image barrier, or nothing when the representation carries no
+/// layout a barrier may name.
+///
+/// An image the state owner has never transitioned holds undefined content, so
+/// there is no availability or visibility to establish for it and the batch's
+/// remaining dependencies already carry the execution order. Emitting the
+/// barrier anyway would name `VK_IMAGE_LAYOUT_UNDEFINED` as `newLayout`, which
+/// the specification forbids.
+#[allow(clippy::too_many_arguments)]
+fn push_image_barrier(
+    source: BarrierAccess,
+    destination: BarrierAccess,
+    image: vk::Image,
+    layout: Option<DefinedImageLayout>,
+    range: vk::ImageSubresourceRange,
+    queue_families: Option<QueueFamilyTransfer>,
+    lease: ReplacementNativeRepresentationLease,
+    batch: &mut NativeBarrierBatch,
+) {
+    let Some(layout) = layout else {
+        return;
+    };
+    batch.images.push(image_barrier(
+        source,
+        destination,
+        image,
+        layout.get(),
+        range,
+        queue_families,
+    ));
+    batch.leases.push(lease);
 }
 
 fn buffer_barrier(
@@ -527,8 +601,17 @@ mod tests {
     struct Resolver(BTreeMap<BackingId, NativeBarrierTarget>);
 
     impl ReplacementBarrierResolver for Resolver {
-        fn resolve(&self, backing: BackingId) -> Option<NativeBarrierTarget> {
-            self.0.get(&backing).copied()
+        fn resolve(&self, backing: BackingId) -> Option<NativeBarrierResolution> {
+            self.0
+                .get(&backing)
+                .copied()
+                .map(|target| NativeBarrierResolution {
+                    target,
+                    lease: ReplacementNativeRepresentationLease::synthetic(
+                        backing,
+                        reims_vgpu_protocol::RepresentationId::new(1),
+                    ),
+                })
         }
     }
 
@@ -560,6 +643,103 @@ mod tests {
     }
 
     #[test]
+    fn a_representation_with_no_defined_layout_records_no_image_barrier() {
+        let resource = ResourceId::new(1, 2);
+        let resources = ResourceAliases(BTreeMap::from([(
+            resource,
+            vec![BackingId::new(5)].into_boxed_slice(),
+        )]));
+        let native = Resolver(BTreeMap::from([(
+            BackingId::new(5),
+            NativeBarrierTarget::Image {
+                image: vk::Image::from_raw(50),
+                layout: None,
+                full_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                queue_families: None,
+            },
+        )]));
+        let batch = resolve_explicit_barrier(
+            &BarrierOperation::Resources {
+                resources: Box::new([resource]),
+                before: StageScope::Compute,
+                after: StageScope::Fragment,
+            },
+            &resources,
+            &native,
+        )
+        .unwrap();
+
+        // `newLayout` may name neither UNDEFINED nor PREINITIALIZED, and an
+        // image carrying one holds no content to make visible.
+        assert!(batch.images.is_empty());
+        assert!(batch.leases().is_empty());
+    }
+
+    #[test]
+    fn a_resolved_batch_leases_every_native_object_it_names() {
+        let resource = ResourceId::new(1, 2);
+        let resources = ResourceAliases(BTreeMap::from([(
+            resource,
+            vec![BackingId::new(4), BackingId::new(5)].into_boxed_slice(),
+        )]));
+        let native = Resolver(BTreeMap::from([
+            (
+                BackingId::new(4),
+                NativeBarrierTarget::Buffer {
+                    buffer: vk::Buffer::from_raw(40),
+                    base_offset: 0,
+                    size: 64,
+                    queue_families: None,
+                },
+            ),
+            (
+                BackingId::new(5),
+                NativeBarrierTarget::Image {
+                    image: vk::Image::from_raw(50),
+                    layout: DefinedImageLayout::new(vk::ImageLayout::GENERAL),
+                    full_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    queue_families: None,
+                },
+            ),
+        ]));
+        let batch = resolve_explicit_barrier(
+            &BarrierOperation::Resources {
+                resources: Box::new([resource]),
+                before: StageScope::Compute,
+                after: StageScope::Fragment,
+            },
+            &resources,
+            &native,
+        )
+        .unwrap();
+
+        assert_eq!(
+            batch.buffers.len() + batch.images.len(),
+            batch.leases().len()
+        );
+        assert_eq!(
+            batch
+                .leases()
+                .iter()
+                .map(|lease| lease.backing)
+                .collect::<Vec<_>>(),
+            vec![BackingId::new(4), BackingId::new(5)]
+        );
+    }
+
+    #[test]
     fn explicit_resource_barrier_uses_complete_deduplicated_alias_backings() {
         let first = ResourceId::new(1, 2);
         let second = ResourceId::new(3, 4);
@@ -584,7 +764,7 @@ mod tests {
                 BackingId::new(5),
                 NativeBarrierTarget::Image {
                     image: vk::Image::from_raw(50),
-                    layout: vk::ImageLayout::GENERAL,
+                    layout: DefinedImageLayout::new(vk::ImageLayout::GENERAL),
                     full_range: vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
@@ -734,7 +914,7 @@ mod tests {
             BackingId::new(4),
             NativeBarrierTarget::Image {
                 image: vk::Image::from_raw(8),
-                layout: vk::ImageLayout::GENERAL,
+                layout: DefinedImageLayout::new(vk::ImageLayout::GENERAL),
                 full_range: vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
@@ -814,6 +994,7 @@ mod tests {
                 .dst_access_mask(vk::AccessFlags2::MEMORY_READ)],
             buffers: Vec::new(),
             images: Vec::new(),
+            leases: Vec::new(),
         };
         let legacy = batch.legacy();
         assert_eq!(legacy.source_stages, vk::PipelineStageFlags::ALL_COMMANDS);

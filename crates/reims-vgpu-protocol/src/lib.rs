@@ -43,8 +43,8 @@ pub use identity::{
     ObjectTableRef, PlaneIndex, PreparedShaderId, PresentTicketId, PublicationDomainId,
     PublicationSequence, QueueOwnerId, QueueTimelineValue, RepresentationId, ResourceId,
     ResourceNamespaceId, SerializerRef, SessionGenerationId, SessionId, SubmissionDomainId,
-    SubmissionId, SurfaceBackingId, SurfaceId, SwapchainGenerationId, TaskId, TextureRotation,
-    TransactionId, VulkanDeviceEpochId,
+    SubmissionId, SurfaceId, SwapchainGenerationId, TaskId, TextureRotation, TransactionId,
+    VulkanDeviceEpochId,
 };
 pub use indirect_command::{
     decode_indirect_command_operation, IndirectCommandDecodeError, IndirectCommandOperation,

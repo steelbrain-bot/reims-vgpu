@@ -6,12 +6,12 @@
 //! graph retirement hands the same canonical identity to timeline retirement.
 
 use crate::{
-    BackingRegion, GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation, GraphError,
-    HostIngressKey, HostIngressTransfer, HostLandingKey, ManagedBackingError, ManagedBackingOwner,
-    ManagedBackingProgress, ManagedRepresentationFailure, MappingNode, QueueTimelinePoint,
-    RegionVersion, RepresentationRoute, RepresentationUse, ResourceGraph, ResourceValidity,
-    StorageBacking, StorageNode, TransferBatchError, TransferKey, GUEST_REPRESENTATION,
-    HOST_REPRESENTATION,
+    BackingRegion, BackingView, GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation,
+    GraphError, HostIngressKey, HostIngressTransfer, HostLandingKey, ManagedBackingError,
+    ManagedBackingOwner, ManagedBackingProgress, ManagedRepresentationFailure, MappingNode,
+    QueueTimelinePoint, RegionVersion, RepresentationRoute, RepresentationUse, ResourceGraph,
+    ResourceValidity, StorageBacking, StorageNode, TransferBatchError, TransferKey,
+    GUEST_REPRESENTATION, HOST_REPRESENTATION,
 };
 use reims_vgpu_protocol::{
     BackingGeneration, BackingId, ByteLength, ByteOffset, HeapObject, MappingId, ObjectKind,
@@ -136,10 +136,15 @@ pub enum ResolvedResourceLifecycle {
     ReleaseResource {
         resource: ResourceId<ResourceObject>,
     },
+    /// Release a whole resource subtree and retire every backing it owned.
+    ///
+    /// A registered IOSurface owns no backing itself and its plane views own
+    /// one each, so a tree release retires a *set*: one backing for a single
+    /// plane surface and one per plane for a biplanar one.
     ReleaseResourceTree {
         root: ResourceId<ResourceObject>,
         resources: Box<[ResourceId<ResourceObject>]>,
-        backing: BackingId,
+        backings: Box<[BackingId]>,
     },
     ReleaseTask {
         task: TaskId,
@@ -199,7 +204,7 @@ pub enum ResourceLifecycleEffect<T> {
     ResourceTreeReleased {
         root: ResourceId<ResourceObject>,
         resources: Box<[ResourceId<ResourceObject>]>,
-        retired: RetiredBacking<T>,
+        retired: Box<[RetiredBacking<T>]>,
     },
     TaskReleased {
         task: TaskId,
@@ -402,6 +407,11 @@ impl<T> ResourceLifecycleOwner<T> {
         &self.graph
     }
 
+    /// See [`crate::ManagedBackingOwner::representation_census`].
+    pub fn representation_census(&self, backing: BackingId) -> Vec<crate::RepresentationCensus> {
+        self.native.representation_census(backing)
+    }
+
     pub fn backing_validity(&self, backing: BackingId) -> Option<ResourceValidity> {
         self.native.validity(backing)
     }
@@ -421,6 +431,16 @@ impl<T> ResourceLifecycleOwner<T> {
     ) -> Result<bool, ManagedBackingError> {
         self.native
             .representation_matches(backing, representation, snapshot)
+    }
+
+    pub fn current_native_representation_for_snapshot(
+        &self,
+        backing: BackingId,
+        excluded: &[RepresentationId],
+        snapshot: &[RegionVersion],
+    ) -> Result<Option<RepresentationId>, ManagedBackingError> {
+        self.native
+            .current_native_representation_for_snapshot(backing, excluded, snapshot)
     }
 
     pub fn apply(
@@ -486,7 +506,7 @@ impl<T> ResourceLifecycleOwner<T> {
             ResolvedResourceLifecycle::ReleaseResourceTree {
                 root,
                 resources,
-                backing,
+                backings,
             } => {
                 let expected = self
                     .graph
@@ -495,27 +515,36 @@ impl<T> ResourceLifecycleOwner<T> {
                 if resources.as_ref() != expected.as_ref() {
                     return Err(ResourceLifecycleError::ResourceTreeMismatch);
                 }
-                if self.graph.resolved_backing(root) != Some(backing) {
+                if backings.as_ref() != self.graph.resource_tree_backings(&resources).as_ref() {
                     return Err(ResourceLifecycleError::ResourceTreeMismatch);
                 }
-                self.graph
-                    .validate_storage_retirement_after_resources(backing, &resources)?;
-                self.native.validate_begin_retirement(backing)?;
+                for &backing in backings.iter() {
+                    self.graph
+                        .validate_storage_retirement_after_resources(backing, &resources)?;
+                    self.native.validate_begin_retirement(backing)?;
+                }
                 for &resource in resources.iter() {
                     self.graph.release_resource(resource)?;
                 }
-                let storage = self
-                    .graph
-                    .retire_storage(backing)
-                    .expect("tree release was prevalidated to leave its backing unowned");
-                let native = self
-                    .native
-                    .begin_retirement(backing)
-                    .expect("tree release native retirement was prevalidated");
+                let retired = backings
+                    .iter()
+                    .map(|&backing| {
+                        let storage = self
+                            .graph
+                            .retire_storage(backing)
+                            .expect("tree release was prevalidated to leave its backing unowned");
+                        let native = self
+                            .native
+                            .begin_retirement(backing)
+                            .expect("tree release native retirement was prevalidated");
+                        RetiredBacking { storage, native }
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
                 Ok(ResourceLifecycleEffect::ResourceTreeReleased {
                     root,
                     resources,
-                    retired: RetiredBacking { storage, native },
+                    retired,
                 })
             }
             ResolvedResourceLifecycle::ReleaseTask { task, resources } => {
@@ -1211,10 +1240,32 @@ impl<T> ResourceLifecycleOwner<T> {
         &mut self,
         backing: BackingId,
         route: RepresentationRoute,
+        view: BackingView,
         native: T,
     ) -> Result<RepresentationId, ManagedRepresentationFailure<T>> {
         self.native
-            .create_execution_representation(backing, route, native)
+            .create_execution_representation(backing, route, view, native)
+    }
+
+    /// The representation serving one view of a backing's bytes, when it holds
+    /// the content snapshot the read requires.
+    pub fn view_representation_for_snapshot(
+        &self,
+        backing: BackingId,
+        view: BackingView,
+        snapshot: &[RegionVersion],
+    ) -> Result<RepresentationId, ManagedBackingError> {
+        self.native
+            .view_representation_for_snapshot(backing, view, snapshot)
+    }
+
+    /// The representation serving one view of a backing's bytes.
+    pub fn view_representation(
+        &self,
+        backing: BackingId,
+        view: BackingView,
+    ) -> Result<RepresentationId, ManagedBackingError> {
+        self.native.view_representation(backing, view)
     }
 
     pub fn execution_representation_for_snapshot(
@@ -1251,6 +1302,14 @@ impl<T> ResourceLifecycleOwner<T> {
         representation: RepresentationId,
     ) -> Option<&mut T> {
         self.native.representation_mut(backing, representation)
+    }
+
+    pub fn accepted_representations(
+        &self,
+        transaction: TransactionId,
+        backings: &[BackingId],
+    ) -> Result<Box<[crate::AcceptedRepresentation]>, ResourceUseBatchError> {
+        self.native.accepted_representations(transaction, backings)
     }
 
     pub fn representation_route(
@@ -1461,6 +1520,36 @@ impl<T> ResourceLifecycleOwner<T> {
         regions: &[BackingRegion],
     ) -> Result<Box<[RegionVersion]>, ManagedBackingError> {
         self.native.snapshot_content(backing, regions)
+    }
+
+    pub fn current_native_regions_for_version(
+        &self,
+        backing: BackingId,
+        excluded: &[reims_vgpu_protocol::RepresentationId],
+        required: crate::RegionVersion,
+    ) -> Result<crate::RepresentationRegionCoverage, ManagedBackingError> {
+        self.native
+            .current_native_regions_for_version(backing, excluded, required)
+    }
+
+    pub fn current_regions_in_representation(
+        &self,
+        backing: BackingId,
+        representation: reims_vgpu_protocol::RepresentationId,
+        required: crate::RegionVersion,
+    ) -> Result<Box<[crate::BackingRegion]>, ManagedBackingError> {
+        self.native
+            .current_regions_in_representation(backing, representation, required)
+    }
+
+    pub fn pending_gpu_writes_overlapping(
+        &self,
+        backing: BackingId,
+        representation: RepresentationId,
+        regions: &[BackingRegion],
+    ) -> Result<Box<[crate::GpuWriteId]>, ManagedBackingError> {
+        self.native
+            .pending_gpu_writes_overlapping(backing, representation, regions)
     }
 
     pub fn plan_host_ingress(
@@ -2251,6 +2340,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
                 "old",
             )
             .unwrap();
@@ -2320,7 +2410,7 @@ mod tests {
             .apply(ResolvedResourceLifecycle::ReleaseResourceTree {
                 root,
                 resources,
-                backing,
+                backings: Box::new([backing]),
             })
             .unwrap()
         else {
@@ -2328,7 +2418,8 @@ mod tests {
         };
         assert_eq!(found, root);
         assert_eq!(released.as_ref(), [child, root]);
-        assert_eq!(retired.storage.id, backing);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].storage.id, backing);
     }
 
     #[test]

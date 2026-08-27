@@ -12,8 +12,6 @@ use crate::{
     NativeRetirementError, QueueTimelinePoint, RegionVersion, RepresentationRoute,
     ResourceValidity, TransferKey, GUEST_REPRESENTATION, HOST_REPRESENTATION,
 };
-#[cfg(test)]
-use reims_vgpu_protocol::SubmissionId;
 use reims_vgpu_protocol::{
     BackingId, QueueOwnerId, QueueTimelineValue, RepresentationId, ResourceValidityOps,
     TransactionId, VulkanDeviceEpochId,
@@ -42,9 +40,18 @@ struct ManagedBacking<T> {
     validity: ResourceValidity,
     representations: BTreeMap<RepresentationId, NativeRepresentation<T>>,
     execution_representation: Option<RepresentationId>,
+    /// Which view of the bytes the execution representation is. Meaningless
+    /// until one exists; [`BackingView::Bytes`] until then because a backing
+    /// with no execution representation owes neither view.
+    execution_view: BackingView,
     retiring_representations: BTreeSet<RepresentationId>,
     accepted_uses: BTreeMap<TransactionId, BTreeMap<RepresentationId, usize>>,
 }
+
+/// The subregions a set of native representations currently hold at one
+/// canonical version. A version may be replicated regionally, so a request is
+/// answered by however many representations it takes to cover it.
+pub type RepresentationRegionCoverage = Vec<(RepresentationId, Box<[BackingRegion]>)>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedBackingError {
@@ -56,6 +63,12 @@ pub enum ManagedBackingError {
     UnknownAcceptedUse,
     EmptyRepresentationSet,
     UnknownRepresentation,
+    /// The representation is still owned by its backing, but its native object
+    /// has already been taken for retirement. This is a different fact from
+    /// [`Self::UnknownRepresentation`] and reaches the same call sites: one
+    /// says the identity was never registered or is fully gone, the other says
+    /// a use outlived the object it names.
+    RepresentationNativeReleased,
     DuplicateRepresentation,
     DuplicateExecutionRepresentation,
     MissingExecutionRepresentation,
@@ -89,10 +102,83 @@ pub struct GpuWriteReservation {
     pub regions: Box<[RegionVersion]>,
 }
 
+/// Which view of a backing's bytes a native object is.
+///
+/// A backing is one run of guest bytes and its representations are views of
+/// them, but only one may be the *execution* representation. A guest
+/// allocation may be declared as both a buffer and a linear texture, and those
+/// two views need different native objects — so the execution representation
+/// serves one of them and the other is served by the transfer endpoint the
+/// same materialization built. Which one it serves is stated here by the
+/// materializer, which knows, rather than inferred later by a consumer that
+/// does not.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BackingView {
+    /// The backing's bytes, addressed linearly.
+    Bytes,
+    /// The backing's texels, addressed by subresource and coordinate.
+    Image,
+}
+
+/// One endpoint's native object, named by the backing it addresses and by
+/// which view of that backing the endpoint is.
+///
+/// A guest allocation declared as both a buffer and a linear texture is one
+/// backing with two views. An operation names each endpoint by role — a blit's
+/// buffer side, a binding's descriptor class — and this is that role carried
+/// through preparation, so a recorder asks for the buffer of a backing whose
+/// execution object is an image rather than resolving whichever single
+/// representation the backing designated.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ViewRepresentation {
+    pub backing: BackingId,
+    pub view: BackingView,
+    pub representation: RepresentationId,
+}
+
+impl ViewRepresentation {
+    /// The native object one endpoint resolves to.
+    ///
+    /// Every set is built from a map keyed by backing and view, so it is
+    /// sorted on that pair and a lookup is a search rather than a scan.
+    pub fn lookup(
+        representations: &[Self],
+        backing: BackingId,
+        view: BackingView,
+    ) -> Option<RepresentationId> {
+        representations
+            .binary_search_by_key(&(backing, view), |entry| (entry.backing, entry.view))
+            .ok()
+            .map(|index| representations[index].representation)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepresentationUse {
     pub backing: BackingId,
     pub representations: Box<[RepresentationId]>,
+}
+
+/// One exact native identity retained by an accepted transaction.
+///
+/// Native backends use this list to acquire object-lifetime leases before an
+/// immutable recording request leaves the resource owner. The identity list
+/// comes from the accepted-use ledger itself, so recording does not have to
+/// reconstruct it from raw handles or backing-wide guesses.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AcceptedRepresentation {
+    pub backing: BackingId,
+    pub representation: RepresentationId,
+}
+
+/// See [`ManagedBackingOwner::representation_census`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepresentationCensus {
+    pub representation: RepresentationId,
+    pub has_native: bool,
+    pub retiring: bool,
+    pub accepted_uses: usize,
+    pub last_uses: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +259,7 @@ impl<T> ManagedBackingOwner<T> {
                 validity: ResourceValidity::default(),
                 representations: BTreeMap::new(),
                 execution_representation: None,
+                execution_view: BackingView::Bytes,
                 retiring_representations: BTreeSet::new(),
                 accepted_uses: BTreeMap::new(),
             },
@@ -237,9 +324,7 @@ impl<T> ManagedBackingOwner<T> {
         region_count: usize,
     ) -> Result<(), ManagedBackingError> {
         let record = self.live_backing(backing)?;
-        if !known_representation(record, representation) {
-            return Err(ManagedBackingError::UnknownRepresentation);
-        }
+        known_representation(record, representation)?;
         record
             .authority
             .validate_plan_gpu_write_regions(write, representation, region_count)
@@ -254,9 +339,8 @@ impl<T> ManagedBackingOwner<T> {
         snapshot: &[RegionVersion],
     ) -> Result<(), ManagedBackingError> {
         let record = self.live_backing(backing)?;
-        if !known_representation(record, source) || !known_representation(record, destination) {
-            return Err(ManagedBackingError::UnknownRepresentation);
-        }
+        known_representation(record, source)?;
+        known_representation(record, destination)?;
         record
             .authority
             .validate_plan_transfers(source, destination, snapshot)
@@ -359,6 +443,7 @@ impl<T> ManagedBackingOwner<T> {
         &mut self,
         backing: BackingId,
         route: RepresentationRoute,
+        view: BackingView,
         native: T,
     ) -> Result<RepresentationId, ManagedRepresentationFailure<T>> {
         let Some(record) = self.backings.get(&backing) else {
@@ -380,11 +465,65 @@ impl<T> ManagedBackingOwner<T> {
             });
         }
         let representation = self.create_representation(backing, route, native)?;
-        self.backings
+        let record = self
+            .backings
             .get_mut(&backing)
-            .expect("representation creation retained its live backing")
-            .execution_representation = Some(representation);
+            .expect("representation creation retained its live backing");
+        record.execution_representation = Some(representation);
+        record.execution_view = view;
         Ok(representation)
+    }
+
+    /// The representation serving one view of a backing's bytes.
+    ///
+    /// The execution representation serves the view its materialization built,
+    /// and the *other* view of the same bytes is the transfer endpoint that
+    /// materialization built beside it. So this is a total function over the
+    /// two views rather than a lookup that can miss, and a consumer never has
+    /// to guess which of a backing's representations its endpoint meant.
+    ///
+    /// A backing whose execution representation is a buffer owes no image, and
+    /// that is the one case with no answer: it is named rather than
+    /// substituted, because an image endpoint on such a backing is a
+    /// materialization that has not happened yet.
+    pub fn view_representation(
+        &self,
+        backing: BackingId,
+        view: BackingView,
+    ) -> Result<RepresentationId, ManagedBackingError> {
+        let record = self
+            .backings
+            .get(&backing)
+            .ok_or(ManagedBackingError::UnknownBacking)?;
+        let execution = record
+            .execution_representation
+            .ok_or(ManagedBackingError::MissingExecutionRepresentation)?;
+        if record.execution_view == view {
+            return Ok(execution);
+        }
+        if view == BackingView::Image {
+            return Err(ManagedBackingError::MissingExecutionRepresentation);
+        }
+        // The byte endpoint the execution representation transfers through.
+        // The route names it: an imported or directly aliased backing keeps
+        // the guest's own pages, and a staged one keeps the host copy.
+        let endpoint = match record
+            .representations
+            .get(&execution)
+            .map(|held| held.route)
+        {
+            Some(
+                RepresentationRoute::ImportedGuestTransfer { .. }
+                | RepresentationRoute::DirectGuestAlias,
+            ) => crate::GUEST_REPRESENTATION,
+            Some(RepresentationRoute::HostStagingTransfer { .. }) => crate::HOST_REPRESENTATION,
+            _ => return Err(ManagedBackingError::MissingExecutionRepresentation),
+        };
+        if record.representations.contains_key(&endpoint) {
+            Ok(endpoint)
+        } else {
+            Err(ManagedBackingError::UnknownRepresentation)
+        }
     }
 
     /// Exact execution identity and native object selected at construction.
@@ -411,6 +550,68 @@ impl<T> ManagedBackingOwner<T> {
             .representations
             .get(&representation)
             .and_then(|record| record.native.as_ref())
+    }
+
+    /// Select an owned native representation that contains the exact current
+    /// snapshot. This is used when physical replacement leaves the prior
+    /// execution object as the only current transfer source until its accepted
+    /// uses retire.
+    pub fn current_native_representation_for_snapshot(
+        &self,
+        backing: BackingId,
+        excluded: &[RepresentationId],
+        snapshot: &[RegionVersion],
+    ) -> Result<Option<RepresentationId>, ManagedBackingError> {
+        let record = self.live_backing(backing)?;
+        Ok(record
+            .representations
+            .iter()
+            .find(|(representation, native)| {
+                !excluded.contains(representation)
+                    && native.native.is_some()
+                    && record
+                        .authority
+                        .representation_matches(**representation, snapshot)
+            })
+            .map(|(&representation, _)| representation))
+    }
+
+    /// Return the exact current subregions available from every owned native
+    /// representation. A canonical version may be replicated regionally, so
+    /// no single representation is required to cover the whole request.
+    pub fn current_native_regions_for_version(
+        &self,
+        backing: BackingId,
+        excluded: &[RepresentationId],
+        required: RegionVersion,
+    ) -> Result<RepresentationRegionCoverage, ManagedBackingError> {
+        let record = self.live_backing(backing)?;
+        Ok(record
+            .representations
+            .iter()
+            .filter(|(representation, native)| {
+                !excluded.contains(representation) && native.native.is_some()
+            })
+            .filter_map(|(&representation, _)| {
+                let regions = record
+                    .authority
+                    .current_regions_in_representation(representation, required);
+                (!regions.is_empty()).then_some((representation, regions))
+            })
+            .collect())
+    }
+
+    pub fn current_regions_in_representation(
+        &self,
+        backing: BackingId,
+        representation: RepresentationId,
+        required: RegionVersion,
+    ) -> Result<Box<[BackingRegion]>, ManagedBackingError> {
+        let record = self.live_backing(backing)?;
+        known_representation(record, representation)?;
+        Ok(record
+            .authority
+            .current_regions_in_representation(representation, required))
     }
 
     /// Mutable access to one exact backing-owned representation. Construction
@@ -468,6 +669,33 @@ impl<T> ManagedBackingOwner<T> {
             return Err(ManagedBackingError::ExecutionRepresentationAlreadyRetiring);
         }
         Ok(())
+    }
+
+    /// Select the representation serving one view of a backing only when it
+    /// holds the exact regional content snapshot required by an immutable
+    /// operation.
+    ///
+    /// The currency check is the point on the non-execution view: a backing
+    /// whose execution representation is an image serves its byte view through
+    /// the transfer endpoint, and reading that endpoint is only sound once the
+    /// image's writes have landed back in it. That is the same statement
+    /// [`Self::execution_representation_for_snapshot`] makes about the
+    /// execution object, asked of whichever object the view names.
+    pub fn view_representation_for_snapshot(
+        &self,
+        backing: BackingId,
+        view: BackingView,
+        snapshot: &[RegionVersion],
+    ) -> Result<RepresentationId, ManagedBackingError> {
+        let representation = self.view_representation(backing, view)?;
+        let record = self.live_backing(backing)?;
+        if !record
+            .authority
+            .representation_matches(representation, snapshot)
+        {
+            return Err(ManagedBackingError::StaleExecutionRepresentation);
+        }
+        Ok(representation)
     }
 
     /// Select the construction-designated execution object only when it holds
@@ -530,12 +758,23 @@ impl<T> ManagedBackingOwner<T> {
         snapshot: &[RegionVersion],
     ) -> Result<bool, ManagedBackingError> {
         let record = self.live_backing(backing)?;
-        if !known_representation(record, representation) {
-            return Err(ManagedBackingError::UnknownRepresentation);
-        }
+        known_representation(record, representation)?;
         Ok(record
             .authority
             .representation_matches(representation, snapshot))
+    }
+
+    pub fn pending_gpu_writes_overlapping(
+        &self,
+        backing: BackingId,
+        representation: RepresentationId,
+        regions: &[BackingRegion],
+    ) -> Result<Box<[GpuWriteId]>, ManagedBackingError> {
+        let record = self.live_backing(backing)?;
+        known_representation(record, representation)?;
+        Ok(record
+            .authority
+            .pending_gpu_writes_overlapping(representation, regions))
     }
 
     pub fn guest_write(
@@ -727,9 +966,8 @@ impl<T> ManagedBackingOwner<T> {
             .backings
             .get(&backing)
             .ok_or(ManagedBackingError::UnknownBacking)?;
-        if !known_representation(record, source) || !known_representation(record, destination) {
-            return Err(ManagedBackingError::UnknownRepresentation);
-        }
+        known_representation(record, source)?;
+        known_representation(record, destination)?;
         record
             .authority
             .plan_transfers(source, destination, snapshot)
@@ -747,9 +985,8 @@ impl<T> ManagedBackingOwner<T> {
             .backings
             .get(&backing)
             .ok_or(ManagedBackingError::UnknownBacking)?;
-        if !known_representation(record, source) || !known_representation(record, destination) {
-            return Err(ManagedBackingError::UnknownRepresentation);
-        }
+        known_representation(record, source)?;
+        known_representation(record, destination)?;
         record
             .authority
             .plan_transfer_demands(source, destination, snapshot)
@@ -764,9 +1001,8 @@ impl<T> ManagedBackingOwner<T> {
         snapshot: &[RegionVersion],
     ) -> Result<(), ManagedBackingError> {
         let record = self.live_backing(backing)?;
-        if !known_representation(record, source) || !known_representation(record, destination) {
-            return Err(ManagedBackingError::UnknownRepresentation);
-        }
+        known_representation(record, source)?;
+        known_representation(record, destination)?;
         record
             .authority
             .validate_plan_transfer_demands(source, destination, snapshot)
@@ -911,9 +1147,7 @@ impl<T> ManagedBackingOwner<T> {
         transfer: HostIngressTransfer,
     ) -> Result<(), ManagedBackingError> {
         let record = self.live_backing(transfer.ingress.backing)?;
-        if !known_representation(record, transfer.destination) {
-            return Err(ManagedBackingError::UnknownRepresentation);
-        }
+        known_representation(record, transfer.destination)?;
         record
             .authority
             .validate_host_ingress_transfer(transfer)
@@ -1005,14 +1239,60 @@ impl<T> ManagedBackingOwner<T> {
         Ok(())
     }
 
+    /// Every representation this backing owns, with the four facts that decide
+    /// whether a completion naming one can still be applied.
+    ///
+    /// A resource completion refused for a representation is a lifetime
+    /// question — was the identity never registered, has its native object
+    /// already been taken for retirement, does an accepted use still hold it,
+    /// which queue points does it still owe — and none of those is observable
+    /// from any other reading this device takes. Without them the refusal names
+    /// a representation and nothing about why it is in that state.
+    pub fn representation_census(&self, backing: BackingId) -> Vec<RepresentationCensus> {
+        let Some(record) = self.backings.get(&backing) else {
+            return Vec::new();
+        };
+        record
+            .representations
+            .iter()
+            .map(|(&representation, native)| RepresentationCensus {
+                representation,
+                has_native: native.native.is_some(),
+                retiring: record.retiring_representations.contains(&representation),
+                accepted_uses: record
+                    .accepted_uses
+                    .values()
+                    .filter(|uses| uses.contains_key(&representation))
+                    .count(),
+                last_uses: native.last_uses.len(),
+            })
+            .collect()
+    }
+
+    /// Completing a transfer retires an authority promise; it does not touch a
+    /// native object, so it does not require one.
+    ///
+    /// A physical-incarnation replacement revokes the execution representation
+    /// while a transfer into it is still in flight. Its native object is then
+    /// held by the retirement owner against that very obligation, and its
+    /// authority record deliberately survives — `finish_retirement_if_ready`
+    /// removes the authority record only on `Ready`, never on `Deferred`. The
+    /// completion that arrives afterwards still names the old representation
+    /// and consumes exactly that pending record, which is the case
+    /// `apply_replacement_timeline_observation` orders resource completion
+    /// ahead of native retirement for.
+    ///
+    /// So the gate here is the authority, which already requires the transfer
+    /// to be planned and its destination to be known to it. Requiring a live
+    /// native object as well refused the completion of every transfer whose
+    /// destination had been revoked, which stalls the whole observed batch —
+    /// and [`Self::validate_complete_gpu_write`], the other completion arm over
+    /// the same records, has never required one.
     pub fn validate_complete_transfer(&self, key: TransferKey) -> Result<(), ManagedBackingError> {
         let record = self
             .backings
             .get(&key.backing)
             .ok_or(ManagedBackingError::UnknownBacking)?;
-        if !known_representation(record, key.destination) {
-            return Err(ManagedBackingError::UnknownRepresentation);
-        }
         record
             .authority
             .validate_complete_transfer(key)
@@ -1124,6 +1404,40 @@ impl<T> ManagedBackingOwner<T> {
         uses: &[RepresentationUse],
     ) -> Result<(), crate::ResourceUseBatchError> {
         self.normalized_accept_uses(transaction, uses).map(drop)
+    }
+
+    pub fn accepted_representations(
+        &self,
+        transaction: TransactionId,
+        backings: &[BackingId],
+    ) -> Result<Box<[AcceptedRepresentation]>, crate::ResourceUseBatchError> {
+        let mut unique = BTreeSet::new();
+        let mut accepted = Vec::new();
+        for &backing in backings {
+            if !unique.insert(backing) {
+                return Err(crate::ResourceUseBatchError::DuplicateBacking(backing));
+            }
+            let record =
+                self.backings
+                    .get(&backing)
+                    .ok_or(crate::ResourceUseBatchError::Backing {
+                        backing,
+                        reason: ManagedBackingError::UnknownBacking,
+                    })?;
+            let representations = record.accepted_uses.get(&transaction).ok_or(
+                crate::ResourceUseBatchError::Backing {
+                    backing,
+                    reason: ManagedBackingError::UnknownAcceptedUse,
+                },
+            )?;
+            for &representation in representations.keys() {
+                accepted.push(AcceptedRepresentation {
+                    backing,
+                    representation,
+                });
+            }
+        }
+        Ok(accepted.into_boxed_slice())
     }
 
     fn normalized_accept_uses(
@@ -1472,7 +1786,7 @@ impl<T> ManagedBackingOwner<T> {
         let Some(record) = self.backings.get(&backing) else {
             return Err(ManagedBackingError::UnknownBacking);
         };
-        let retiring_representations = record
+        let retirement_candidates = record
             .retiring_representations
             .iter()
             .copied()
@@ -1483,6 +1797,23 @@ impl<T> ManagedBackingOwner<T> {
                     .all(|uses| !uses.contains_key(representation))
             })
             .collect::<Vec<_>>();
+        let mut unavailable = record
+            .representations
+            .iter()
+            .filter_map(|(&representation, native)| {
+                native.native.is_none().then_some(representation)
+            })
+            .collect::<Vec<_>>();
+        let mut retiring_representations = Vec::new();
+        for representation in retirement_candidates {
+            if record
+                .authority
+                .representation_can_retire(representation, &unavailable)
+            {
+                unavailable.push(representation);
+                retiring_representations.push(representation);
+            }
+        }
 
         for representation in &retiring_representations {
             let native = record
@@ -1691,18 +2022,33 @@ impl<T> ManagedBackingOwner<T> {
     }
 }
 
-fn known_representation<T>(backing: &ManagedBacking<T>, representation: RepresentationId) -> bool {
-    representation == GUEST_REPRESENTATION
-        || backing
-            .representations
-            .get(&representation)
-            .is_some_and(|record| record.native.is_some())
+/// Whether one representation can serve as an end of a transfer or write, and
+/// which way it cannot.
+///
+/// The guest representation is always available: it names guest memory rather
+/// than a native object. Every other identity must be owned by this backing and
+/// still hold its native object, and the two ways that can fail are separate
+/// diagnoses — an identity that was never registered or has fully retired, and
+/// one whose object was taken while a use still named it.
+fn known_representation<T>(
+    backing: &ManagedBacking<T>,
+    representation: RepresentationId,
+) -> Result<(), ManagedBackingError> {
+    if representation == GUEST_REPRESENTATION {
+        return Ok(());
+    }
+    match backing.representations.get(&representation) {
+        Some(record) if record.native.is_some() => Ok(()),
+        Some(_) => Err(ManagedBackingError::RepresentationNativeReleased),
+        None => Err(ManagedBackingError::UnknownRepresentation),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BackingRegion, ContentAuthority};
+    use crate::{BackingRegion, ContentAuthority, ContentAuthorityError};
+    use reims_vgpu_protocol::SubmissionId;
 
     fn point(queue: u32, value: u64) -> QueueTimelinePoint {
         QueueTimelinePoint {
@@ -1739,6 +2085,7 @@ mod tests {
                 RepresentationRoute::NativeWorking {
                     memory: crate::WorkingMemoryClass::DeviceLocal,
                 },
+                BackingView::Bytes,
                 "execution",
             )
             .unwrap();
@@ -1751,6 +2098,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
                 "duplicate",
             )
             .unwrap_err();
@@ -1776,10 +2124,21 @@ mod tests {
                 RepresentationRoute::NativeWorking {
                     memory: crate::WorkingMemoryClass::DeviceLocal,
                 },
+                BackingView::Bytes,
                 "old",
             )
             .unwrap();
         owner.accept_use(backing, transaction, [old]).unwrap();
+        assert_eq!(
+            owner
+                .accepted_representations(transaction, &[backing])
+                .unwrap()
+                .as_ref(),
+            [AcceptedRepresentation {
+                backing,
+                representation: old,
+            }]
+        );
 
         assert_eq!(
             owner.replace_execution_representation(backing).unwrap(),
@@ -1795,6 +2154,7 @@ mod tests {
                 RepresentationRoute::NativeWorking {
                     memory: crate::WorkingMemoryClass::DeviceLocal,
                 },
+                BackingView::Bytes,
                 "new",
             )
             .unwrap();
@@ -1830,6 +2190,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
                 "execution",
             )
             .unwrap();
@@ -1845,10 +2206,62 @@ mod tests {
             .plan_transfers(backing, GUEST_REPRESENTATION, execution, &snapshot)
             .unwrap();
         owner.complete_transfer(transfer[0]).unwrap();
+        let write = SubmissionId::new(11);
+        owner
+            .plan_gpu_write(backing, write, execution, [BackingRegion::Whole])
+            .unwrap();
+        owner.complete_gpu_write(backing, write, execution).unwrap();
+        let snapshot = owner
+            .snapshot_content(backing, &[BackingRegion::Whole])
+            .unwrap();
         assert_eq!(
             owner.execution_representation_for_snapshot(backing, &snapshot),
             Ok((execution, &"execution"))
         );
+
+        let transaction = TransactionId::new(10);
+        owner.accept_use(backing, transaction, [execution]).unwrap();
+        owner.replace_execution_representation(backing).unwrap();
+        let replacement = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                "replacement",
+            )
+            .unwrap();
+        assert_eq!(
+            owner
+                .current_native_representation_for_snapshot(
+                    backing,
+                    &[GUEST_REPRESENTATION, HOST_REPRESENTATION, replacement],
+                    &snapshot,
+                )
+                .unwrap(),
+            Some(execution)
+        );
+        assert_eq!(
+            owner.cancel_use(backing, transaction).unwrap(),
+            ManagedBackingProgress::Live
+        );
+        assert_eq!(owner.representation(backing, execution), Some(&"execution"));
+
+        let transfer = owner
+            .plan_transfers(backing, execution, replacement, &snapshot)
+            .unwrap();
+        owner.complete_transfer(transfer[0]).unwrap();
+        let replacement_use = TransactionId::new(12);
+        owner
+            .accept_use(backing, replacement_use, [replacement])
+            .unwrap();
+        assert_eq!(
+            owner.cancel_use(backing, replacement_use).unwrap(),
+            ManagedBackingProgress::RepresentationsRetired {
+                ready: vec!["execution"],
+                deferred: 0,
+            }
+        );
+        assert_eq!(owner.representation(backing, execution), None);
 
         owner.guest_write(backing, BackingRegion::Whole).unwrap();
         let newer = owner
@@ -1867,6 +2280,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
                 "execution",
             )
             .unwrap();
@@ -1901,6 +2315,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
                 "execution",
             )
             .unwrap();
@@ -2004,6 +2419,60 @@ mod tests {
         assert!(owner
             .representation_matches(backing, destination, &snapshot)
             .unwrap());
+    }
+
+    /// A physical-incarnation replacement revokes the execution representation
+    /// while a transfer into it is still in flight. The retirement owner then
+    /// holds its native object against that obligation and the authority record
+    /// survives, so the completion arriving afterwards must consume that record
+    /// rather than be refused for the object it no longer needs. Refusing it
+    /// fails the entire observed batch, which stops every later retirement on
+    /// that queue for the rest of the boot.
+    #[test]
+    fn a_transfer_completes_into_a_representation_whose_native_object_was_revoked() {
+        let (mut owner, backing) = owner();
+        let destination = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                "working",
+            )
+            .unwrap();
+        owner.guest_write(backing, BackingRegion::Whole).unwrap();
+        let snapshot = owner
+            .snapshot_content(backing, &[BackingRegion::Whole])
+            .unwrap();
+        let key = owner
+            .plan_transfers(backing, GUEST_REPRESENTATION, destination, &snapshot)
+            .unwrap()[0];
+
+        let transaction = TransactionId::new(1);
+        let submitted = point(1, 4);
+        owner
+            .accept_use(backing, transaction, [destination])
+            .unwrap();
+        owner.submit_use(backing, transaction, submitted).unwrap();
+
+        // The guest reconstructs the resource: the execution identity is
+        // revoked while this transfer is still in flight.
+        owner.replace_execution_representation(backing).unwrap();
+        let census = owner
+            .representation_census(backing)
+            .into_iter()
+            .find(|entry| entry.representation == destination)
+            .expect("the revoked representation is retained until its obligation clears");
+        assert!(!census.has_native);
+
+        // The completion consumes the pending authority record, which is the
+        // whole of what completing a transfer owns.
+        owner.complete_transfer(key).unwrap();
+        assert_eq!(
+            owner.complete_transfer(key),
+            Err(ManagedBackingError::Content(
+                ContentAuthorityError::TransferNotPlanned
+            ))
+        );
     }
 
     #[test]

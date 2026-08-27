@@ -37,6 +37,7 @@ use crate::{
     replacement_indirect_range::{record_indirect_range_readback, ReplacementIndirectRangeProgram},
     replacement_info_query::{record_info_query, NativeInfoQuery, ReplacementInfoQueryProgram},
     replacement_render::{record_render_dispatch, NativeRenderDispatch, ReplacementRenderProgram},
+    replacement_representation::ReplacementNativeRepresentationLease,
     replacement_resource_state::{
         ReplacementContentSynchronizationProgram, ReplacementHostLandingProgram,
         ReplacementResourceStateBatchProgram, ReplacementResourceStateProgram,
@@ -65,6 +66,8 @@ pub struct ReplacementNativeRecording {
     /// Canonical backings whose exact native representations were retained by
     /// lifecycle preparation for this recording.
     pub(crate) backings: Box<[BackingId]>,
+    /// Exact native objects referenced by raw handles in this recording.
+    pub(crate) representation_leases: Box<[ReplacementNativeRepresentationLease]>,
     /// Exact resource facts completed by this recording's timeline point.
     /// They are not semantic completion facts before then.
     pub resource_completions: Box<[ResolvedResourceCompletion]>,
@@ -125,6 +128,7 @@ impl ReplacementNativeRecording {
             host_landing_programs: Box::new([]),
             recorded_operations: Box::new([]),
             backings: Box::new([]),
+            representation_leases: Box::new([]),
             resource_completions: Box::new([]),
         }
     }
@@ -297,6 +301,7 @@ fn retain_unique_resource_transfers(
 ) {
     let mut buffers = Vec::new();
     let mut images = Vec::new();
+    let mut newly_recorded = BTreeSet::new();
     for (transfer, command) in program
         .transfers()
         .iter()
@@ -306,7 +311,7 @@ fn retain_unique_resource_transfers(
         if !recorded.insert(transfer) {
             continue;
         }
-        completions.push(ResolvedResourceCompletion::Transfer(transfer));
+        newly_recorded.insert(transfer);
         match command {
             crate::replacement_resource_state::NativeResourceStateTransfer::Buffer(command) => {
                 buffers.push(*command);
@@ -316,6 +321,9 @@ fn retain_unique_resource_transfers(
             }
         }
     }
+    completions.extend(program.completions().iter().copied().filter(|completion| {
+        !matches!(completion, ResolvedResourceCompletion::Transfer(transfer) if !newly_recorded.contains(transfer))
+    }));
     (buffers.into_boxed_slice(), images.into_boxed_slice())
 }
 
@@ -330,9 +338,74 @@ pub struct ReplacementRecordingRequest<Operation> {
     pub barriers: NativeBarrierBatch,
     operations: Box<[ReplacementRecordedOperation]>,
     backings: Box<[BackingId]>,
+    representation_leases: Box<[ReplacementNativeRepresentationLease]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplacementRecordingLeaseError {
+    Duplicate {
+        backing: BackingId,
+        representation: reims_vgpu_protocol::RepresentationId,
+    },
+    UnexpectedBacking(BackingId),
+    MissingBacking(BackingId),
+}
+
+#[derive(Debug)]
+pub struct ReplacementRecordingLeaseFailure<Operation> {
+    pub reason: ReplacementRecordingLeaseError,
+    pub request: Box<ReplacementRecordingRequest<Operation>>,
 }
 
 impl<Operation> ReplacementRecordingRequest<Operation> {
+    pub const fn backings(&self) -> &[BackingId] {
+        &self.backings
+    }
+
+    /// Retain one ownership token per native representation this recording may
+    /// name.
+    ///
+    /// A backing has many representations and one recording can resolve
+    /// several of them at once — a content-state transfer names both the
+    /// source and the destination — so coverage is checked per backing rather
+    /// than per representation, and identity is checked per pair.
+    pub fn attach_representation_leases(
+        mut self,
+        leases: impl Into<Box<[ReplacementNativeRepresentationLease]>>,
+    ) -> Result<Self, Box<ReplacementRecordingLeaseFailure<Operation>>> {
+        let leases = leases.into();
+        let mut identities = BTreeSet::new();
+        for lease in &leases {
+            if !identities.insert((lease.backing, lease.representation)) {
+                return Err(Box::new(ReplacementRecordingLeaseFailure {
+                    reason: ReplacementRecordingLeaseError::Duplicate {
+                        backing: lease.backing,
+                        representation: lease.representation,
+                    },
+                    request: Box::new(self),
+                }));
+            }
+            if self.backings.binary_search(&lease.backing).is_err() {
+                return Err(Box::new(ReplacementRecordingLeaseFailure {
+                    reason: ReplacementRecordingLeaseError::UnexpectedBacking(lease.backing),
+                    request: Box::new(self),
+                }));
+            }
+        }
+        if let Some(&backing) = self
+            .backings
+            .iter()
+            .find(|backing| !leases.iter().any(|lease| lease.backing == **backing))
+        {
+            return Err(Box::new(ReplacementRecordingLeaseFailure {
+                reason: ReplacementRecordingLeaseError::MissingBacking(backing),
+                request: Box::new(self),
+            }));
+        }
+        self.representation_leases = leases;
+        Ok(self)
+    }
+
     pub fn attach_content_synchronization(
         mut self,
         program: &ReplacementContentSynchronizationProgram,
@@ -439,7 +512,11 @@ pub struct ReplacementRecordingResolutionFailure<Operation> {
 fn validate_render_passes(
     operations: &[ReplacementRecordedOperation],
 ) -> Result<(), ReplacementRecordingError> {
-    let mut active: Option<(vk::RenderPass, Box<[vk::ImageView]>, vk::Extent2D)> = None;
+    let mut active: Option<(
+        std::sync::Arc<crate::replacement_render::ReplacementRenderPipelineVariant>,
+        Box<[vk::ImageView]>,
+        vk::Extent2D,
+    )> = None;
     for (index, operation) in operations.iter().enumerate() {
         let ReplacementRecordedOperation::Render { native, .. } = operation else {
             if active.is_some() {
@@ -452,16 +529,18 @@ fn validate_render_passes(
                 return Err(ReplacementRecordingError::RenderPassNested(index));
             }
             active = Some((
-                native.pipeline.render_pass,
+                std::sync::Arc::clone(&native.pipeline),
                 native.attachment_views.clone(),
                 native.extent,
             ));
         } else {
-            let Some((render_pass, attachment_views, extent)) = active.as_ref() else {
+            let Some((pipeline, attachment_views, extent)) = active.as_ref() else {
                 return Err(ReplacementRecordingError::RenderPassMustBegin(index));
             };
-            if *render_pass != native.pipeline.render_pass
-                || attachment_views.as_ref() != native.attachment_views.as_ref()
+            if !crate::replacement_render::render_passes_compatible(
+                pipeline.native(),
+                native.pipeline.native(),
+            ) || attachment_views.as_ref() != native.attachment_views.as_ref()
                 || *extent != native.extent
             {
                 return Err(ReplacementRecordingError::RenderPassMismatch(index));
@@ -527,6 +606,9 @@ pub struct ReplacementSemanticAdmissions<'a, Info, Indirect, Completion> {
     pub indirect_range_programs: &'a [ReplacementIndirectRangeProgram],
 }
 
+/// How the native recorder discharges one semantic operation family. Every
+/// family is discharged; the variants differ only in which owner emits the
+/// native work, not in whether the family is supported.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplacementOperationRecording {
     HazardPlan,
@@ -537,7 +619,6 @@ pub enum ReplacementOperationRecording {
     PreparedSemanticIndirect,
     PreparedNativeResourceState,
     PreparedNativeEmitter(OperationKind),
-    NativeEmitterRequired(OperationKind),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -557,9 +638,9 @@ pub const fn replacement_blit_recording(kind: BlitKind) -> ReplacementBlitRecord
     }
 }
 
-/// Current replacement-recorder disposition for one closed semantic family.
-/// This match is intentionally exhaustive: extending [`OperationKind`]
-/// requires choosing implemented recording or a typed native-emitter refusal.
+/// Replacement-recorder disposition for one closed semantic family. This match
+/// is intentionally exhaustive: extending [`OperationKind`] requires choosing
+/// which owner discharges the new family.
 pub const fn replacement_operation_recording(kind: OperationKind) -> ReplacementOperationRecording {
     match kind {
         OperationKind::EncoderBoundary => {
@@ -1373,7 +1454,7 @@ impl<
                                     matched_resource_states.insert(index);
                                     matched_prepared_resource_states.insert(resource_index);
                                     recording_backings.extend(program.backings().iter().copied());
-                                    let mut completions = program.completions().to_vec();
+                                    let mut completions = Vec::new();
                                     let (commands, image_commands) = retain_unique_resource_transfers(
                                         program,
                                         &mut recorded_transfers,
@@ -1411,7 +1492,7 @@ impl<
                                 matched_resource_states.insert(index);
                                 matched_prepared_resource_states.insert(resource_index);
                                 recording_backings.extend(program.backings().iter().copied());
-                                let mut completions = program.completions().to_vec();
+                                let mut completions = Vec::new();
                                 let (commands, image_commands) = retain_unique_resource_transfers(
                                     program,
                                     &mut recorded_transfers,
@@ -1600,6 +1681,7 @@ impl<
                 .into_iter()
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            representation_leases: Box::new([]),
         })
     }
 }
@@ -1787,6 +1869,7 @@ pub fn dispatch_replacement_recording<
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
+            let mut unique_resource_completions = std::collections::BTreeSet::new();
             let resource_completions = request
                 .operations
                 .iter()
@@ -1804,6 +1887,7 @@ pub fn dispatch_replacement_recording<
                     | ReplacementRecordedOperation::Barrier { .. }
                     | ReplacementRecordedOperation::IndirectRange(_) => Vec::new(),
                 })
+                .filter(|completion| unique_resource_completions.insert(*completion))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
             let mut render_pipeline_variants = Vec::new();
@@ -1850,6 +1934,29 @@ pub fn dispatch_replacement_recording<
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
             let backings = request.backings.clone();
+            // Every raw handle a barrier batch holds keeps its exact native
+            // object alive through the recording's timeline retirement. A
+            // barrier names backings the operation sidecars never do, so its
+            // leases are additional to the ones lifecycle preparation attached.
+            let representation_leases = request
+                .representation_leases
+                .iter()
+                .chain(request.barriers.leases())
+                .chain(
+                    request
+                        .operations
+                        .iter()
+                        .filter_map(|operation| match operation {
+                            ReplacementRecordedOperation::Barrier { native, .. } => {
+                                Some(native.leases())
+                            }
+                            _ => None,
+                        })
+                        .flatten(),
+                )
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
             state
                 .record_barrier_program(
                     request.queue_family,
@@ -1863,6 +1970,7 @@ pub fn dispatch_replacement_recording<
                     recording.indirect_range_programs = indirect_range_programs;
                     recording.host_landing_programs = host_landing_programs;
                     recording.backings = backings;
+                    recording.representation_leases = representation_leases;
                     recording
                 })
                 .map_err(|reason| {
@@ -2111,6 +2219,7 @@ impl ReplacementRecordingWorker {
             recorded_operations: Box::new([]),
             resource_completions: Box::new([]),
             backings: Box::new([]),
+            representation_leases: Box::new([]),
         })
     }
 
@@ -2644,6 +2753,7 @@ mod tests {
     use super::*;
     use crate::engine::context::DeviceContext;
     use ash::vk::Handle;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         admit_indirect_commands, cancel_prepared_buffer_blit, prepare_info_query, AccessIntent,
         AccessMode, BackingRegion, BarrierOperation, BufferFillPattern, ContractDisposition,
@@ -2663,6 +2773,7 @@ mod tests {
         SegmentKind, SessionGenerationId, SubmissionId, SubmissionIdentity, TaskId, TransactionId,
         VulkanDeviceEpochId,
     };
+    use std::convert::Infallible;
 
     type TestOperation = ResolvedOperation<(), (), (), (), ()>;
     type IndirectTestOperation = ResolvedOperation<(), (), (), ResolvedIndirectCommand, ()>;
@@ -2670,7 +2781,11 @@ mod tests {
 
     #[test]
     fn every_resolved_operation_family_has_one_closed_recording_disposition() {
-        let mut ledger = RefusalClosureLedger::new(OperationKind::ALL).unwrap();
+        // `Infallible` as the refusal type is the assertion: no semantic
+        // operation family is refused by the native recorder, so no value can
+        // be constructed to record one.
+        let mut ledger: RefusalClosureLedger<OperationKind, Infallible> =
+            RefusalClosureLedger::new(OperationKind::ALL).unwrap();
         for kind in OperationKind::ALL {
             let disposition = match replacement_operation_recording(kind) {
                 ReplacementOperationRecording::HazardPlan
@@ -2695,24 +2810,20 @@ mod tests {
                 }
                 ReplacementOperationRecording::PreparedSemanticIndirect => {
                     assert_eq!(kind, OperationKind::IndirectCommand);
-                    ContractDisposition::Unsupported(kind)
+                    ContractDisposition::Implemented
                 }
                 ReplacementOperationRecording::PreparedNativeResourceState => {
                     assert_eq!(kind, OperationKind::ResourceState);
                     ContractDisposition::Implemented
-                }
-                ReplacementOperationRecording::NativeEmitterRequired(refused) => {
-                    assert_eq!(refused, kind);
-                    ContractDisposition::Unsupported(refused)
                 }
             };
             ledger.record(kind, disposition).unwrap();
         }
 
         let counts = ledger.audit().unwrap();
-        assert_eq!(counts.implemented, 10);
+        assert_eq!(counts.implemented, OperationKind::ALL.len() - 1);
         assert_eq!(counts.proven_no_op, 1);
-        assert_eq!(counts.unsupported, OperationKind::ALL.len() - 11);
+        assert_eq!(counts.unsupported, 0);
     }
 
     #[test]
@@ -2917,10 +3028,13 @@ mod tests {
                         vertex_buffers: Box::new([]),
                         color_attachments: Box::new([]),
                         depth_stencil_attachment: None,
+                        feedback_loop_aspects: vk::ImageAspectFlags::empty(),
+                        color_input: false,
                         sample_count: vk::SampleCountFlags::TYPE_1,
                         viewport_count: 1,
                         static_state:
                             crate::replacement_render::ReplacementRenderStaticState::default(),
+                        dynamic_states: Default::default(),
                         depth_stencil: None,
                     },
                 ),
@@ -4026,7 +4140,12 @@ mod tests {
             _ => unreachable!(),
         };
         let representation = resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let operation = ResolvedInfoOperation::RenderPipelineState {
             pipeline: ResourceId::<RenderPipelineObject>::new(2, 1),
@@ -4284,6 +4403,7 @@ mod tests {
                 completions: Box::new([]),
             }]),
             backings: Box::new([reims_vgpu_protocol::BackingId::new(1)]),
+            representation_leases: Box::new([]),
         };
         let workers = FixedExecutor::new(1, |worker| {
             ReplacementRecordingWorker::new(
@@ -4559,19 +4679,7 @@ mod tests {
             exec,
             barriers: NativeBarrierBatch::default(),
             operations: Box::new([ReplacementRecordedOperation::ResourceState {
-                completions: program
-                    .completions()
-                    .iter()
-                    .copied()
-                    .chain(
-                        program
-                            .transfers()
-                            .iter()
-                            .copied()
-                            .map(ResolvedResourceCompletion::Transfer),
-                    )
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
+                completions: program.completions().into(),
                 commands: program
                     .native_transfers()
                     .iter()
@@ -4603,6 +4711,7 @@ mod tests {
                 host_landings: program.host_landings().into(),
             }]),
             backings: Box::new([backing]),
+            representation_leases: Box::new([]),
         };
         let workers = FixedExecutor::new(1, |worker| {
             ReplacementRecordingWorker::new(
@@ -4619,8 +4728,8 @@ mod tests {
         assert_eq!(
             recording.resource_completions.as_ref(),
             [
-                validity_completion,
-                ResolvedResourceCompletion::Transfer(transfer)
+                ResolvedResourceCompletion::Transfer(transfer),
+                validity_completion
             ]
         );
         assert_eq!(recording.backings.as_ref(), [backing]);
@@ -4729,6 +4838,7 @@ mod tests {
                 },
             ]),
             backings: Box::new([]),
+            representation_leases: Box::new([]),
         };
 
         assert_eq!(
@@ -4942,7 +5052,7 @@ mod tests {
         fn resolve(
             &self,
             _backing: reims_vgpu_protocol::BackingId,
-        ) -> Option<crate::replacement_barrier_record::NativeBarrierTarget> {
+        ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
             None
         }
     }
@@ -5204,10 +5314,13 @@ mod tests {
                         vertex_buffers: Box::new([]),
                         color_attachments: Box::new([]),
                         depth_stencil_attachment: None,
+                        feedback_loop_aspects: vk::ImageAspectFlags::empty(),
+                        color_input: false,
                         sample_count: vk::SampleCountFlags::TYPE_1,
                         viewport_count: 1,
                         static_state:
                             crate::replacement_render::ReplacementRenderStaticState::default(),
+                        dynamic_states: Default::default(),
                         depth_stencil: None,
                     },
                 ),
@@ -5309,6 +5422,7 @@ mod tests {
                 },
             ]),
             backings: Box::new([]),
+            representation_leases: Box::new([]),
         };
         let workers = FixedExecutor::new(1, |worker| {
             ReplacementRecordingWorker::new(
@@ -5588,7 +5702,12 @@ mod tests {
             _ => unreachable!(),
         };
         let representation = resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let operation = ResolvedBlit::Fill {
             destination: ResolvedBufferRange {
@@ -5639,7 +5758,7 @@ mod tests {
         let prepared = reims_vgpu_core::prepare_buffer_blit_with_write(
             &mut resources,
             transaction,
-            reims_vgpu_core::GpuWriteId::operation(SubmissionId::new(15), 0),
+            reims_vgpu_core::GpuWriteId::operation(transaction, SubmissionId::new(15), 0),
             operation.clone(),
         )
         .unwrap();

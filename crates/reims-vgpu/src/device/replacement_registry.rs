@@ -354,17 +354,25 @@ pub(super) fn poll(id: u64) -> bool {
         Some(ops) => {
             let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
             if let Err(reason) = device.poll_display_online(&mut host) {
-                crate::observe::fail(format!(
-                    "replacement_display_online_refused reason={reason:?}"
-                ));
+                if reason
+                    != crate::runtime::replacement_session::ReplacementDisplayOnlineError::NativeLifetimeClosed
+                {
+                    crate::observe::fail(format!(
+                        "replacement_display_online_refused reason={reason:?}"
+                    ));
+                }
             }
             let _ = device.tick(&mut host);
         }
         None => {
             if let Err(reason) = device.poll_display_online(&mut NullHost) {
-                crate::observe::fail(format!(
-                    "replacement_display_online_refused reason={reason:?}"
-                ));
+                if reason
+                    != crate::runtime::replacement_session::ReplacementDisplayOnlineError::NativeLifetimeClosed
+                {
+                    crate::observe::fail(format!(
+                        "replacement_display_online_refused reason={reason:?}"
+                    ));
+                }
             }
             let _ = device.tick(&mut NullHost);
         }

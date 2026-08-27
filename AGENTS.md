@@ -361,8 +361,9 @@ cache that meets four of them is one of the caches this section still bans.
 4. **A hit and a miss are indistinguishable to the guest.** The value is a pure function of
    contract-owned inputs. If a stale entry could change a pixel, this is a correctness bug wearing
    a performance hat, and note which way that fails: the failure mode is *content*, which no counter
-   in this tree reports. `runtime/gather_witness.rs` is the standing example of how expensive that
-   class is to find after the fact.
+   in this tree reports. The retired `runtime/gather_witness.rs` is the standing example of how
+   expensive that class is to find after the fact — a cache that bound an image with nothing read
+   and nothing compared, whose only alarm was off by default.
 5. **It is on the census.** Live entries, hits, and misses. Without those three a degenerate hit
    rate is invisible, and the "arms did the same work" assumption goes back to being unverifiable.
 
@@ -614,11 +615,10 @@ by name when no backend published a granularity.
 
 **Page recycling is unchanged and still load-bearing.** The guest reassigning a GPA to a different
 allocation while we hold a reference over it is the PTE-corruption class. It applied to the dma-buf
-and it applies here. Three modules carry it now: `runtime/guest_ram.rs` for the surface
-page-ownership guards, `runtime/render_writeback.rs`, whose doc walks the four hazards the retired
-deferred-flush window carried and says why each cannot arise in the direct path, and
-`runtime/node_guard.rs`, the alarm for the worst end of it — a host write landing on a page that
-holds the guest's own page-table entries.
+and it applies here. `runtime/guest_ram.rs` carries the surface page-ownership guards and
+`reims-vgpu-core::content_tracking::HostWrites` is the per-page record of which guest pages this
+device has written; `reims-vgpu-core::released_pages` reads that record to decide when a page the
+guest handed back is safe to reuse.
 
 **The pinning difference is real; do not gloss it.** A udmabuf fd made the pages it named
 unswappable and unmigratable, and closing it revoked the GPU's access. `VK_EXT_external_memory_host`
@@ -641,14 +641,13 @@ resource-shaped alias; uffd and the retired dma-buf rail are unrelated to this r
 
 So the deferred-flush rail — the device's largest cost — is retired, by writing into guest pages
 directly. **`runtime/storage_flush/` went with it and no longer exists**; do not go looking for it,
-and do not read a reference to it in an older commit body or `kb/` entry as a live path. Its two
-halves are now `runtime/render_writeback.rs`, whose module doc lists the four hazards the deferred
-window carried and why each cannot arise in the direct path, and
-`reims-vgpu-core::content_tracking::HostWrites`, the per-page record of which guest pages this
-device has written. Read `render_writeback`'s doc before
-assuming a landing is safe to skip. Note that `runtime/gva_view.rs::ensure_gva_view` hands back a
-host pointer but is not a window resolver — it requires the span to be one contiguous page run and
-returns `None` otherwise.
+and do not read a reference to it in an older commit body or `kb/` entry as a live path. Neither do
+`runtime/render_writeback.rs`, `runtime/node_guard.rs`, `runtime/gva_view.rs` or
+`runtime/gather_witness.rs`, all of which this file named as live and all of which the replacement
+architecture retired along with the drain. What survives of that rail is
+`reims-vgpu-core::content_tracking::HostWrites`; content ordering itself is now owned by
+`reims-vgpu-core::content_authority` and `content_synchronization`, whose module docs carry the
+reasoning the retired ones did.
 
 ### Environment overrides
 
@@ -666,32 +665,20 @@ Two matter for verification rather than for ablation:
 
 - `REIMS_VGPU_GUEST_IMPORT=off` takes a capable host down to the `disabled_by_env` rung, which is
   how the copying rails get exercised without hunting for hardware that lacks the extension.
-- `REIMS_VGPU_GATHER_AUDIT_ALL=on` makes the zero-copy sampled cache's content audit judge **every**
-  vouched bind. Without it the audit does not run at all — `AuditDensity::default()` is `Disabled`,
-  not a stride, so a shipping boot judges **zero** binds and emits no `gw_audit_*` counter of any
-  kind. This file used to describe a one-in-sixty-four sampling rate; there is none, and a boot
-  without the switch cannot answer a content question however long it runs. Nothing the guest
-  observes depends on the switch either way. **The vouch itself is not a statement about bytes, and this file used
-  to say it was.** Its two accounts — the decoded resource-validity transition and this device's own
-  page-exact write record — do not cover disjoint writers: a guest CPU store into unified shared
-  storage bumps neither, because the validity transition is a synchronization statement consumed at
-  submission construction and not a version emitted per write. `runtime/gather_witness.rs` says so in
-  its own first paragraph, and a macos-13 sweep measured the consequence — 876 `gw_audit_unsound`
-  against 254 600 `gw_audit_ok` in one boot. Read that module doc before treating a vouch as evidence
-  about content. **The unsoundness is real; the symptom this file used to attribute to it is not
-  its.** Maps losing its CPU-rasterized type and POI icons while GPU-drawn geometry renders
-  correctly was named here as the consequence, and that attribution is refuted: a gate-verified
-  boot with `REIMS_VGPU_GATHER_VOUCH=off` re-gathered **every** bind (`gw_vouched` 0 against
-  `gw_withheld` 1 618 985) and the type layer was still entirely absent. Do not spend boots on the
-  witness for that defect; `kb/` carries where it actually points.
-  That cache is the only place in this device where an
-  image is bound with nothing read and nothing compared, and a stale bind's failure mode is content,
-  which no counter reports — the audit is the sole instrument, and it is off unless you turn it on.
-  Run a rail sweep under it and read `gw_audit_unsound` against `gw_audit_ok` beside it; a zero is
-  only evidence when the `ok` is large, and **an absent counter is not a zero** — eight driven Maps
-  boots carried 1.8 M vouched binds each and no `gw_audit_*` line between them, which says the alarm
-  never ran and says nothing whatever about the bytes. **Never quote a
-  timing from such a boot** — the fold re-reads the very windows the cache exists to avoid reading.
+- `REIMS_VGPU_PUSH_DESCRIPTORS=off` takes a host that advertises push descriptors down to the
+  descriptor-set rail, which is the only rail on a host without the extension.
+
+**The gather-witness switches are gone with the module they gated.** `REIMS_VGPU_GATHER_AUDIT_ALL`
+and `REIMS_VGPU_GATHER_VOUCH` named a sampled zero-copy cache this device no longer has, and neither
+is parsed any more — `reims-vgpu-config::ALL` is the whole set and it has five entries. The finding
+they were written down for outlives them and is worth keeping: a resource-validity transition is a
+synchronization statement consumed at submission construction, not a version emitted per write, so a
+guest CPU store into unified shared storage moves neither it nor this device's page-exact write
+record. Anything that treats either as evidence about *bytes* is wrong for the same reason it was
+wrong then. And the symptom this file once attributed to that unsoundness — Maps losing its
+CPU-rasterized type and POI icons while GPU-drawn geometry rendered correctly — was refuted by a
+gate-verified boot that re-gathered every bind and still rendered no type layer; `kb/` carries where
+that defect actually points.
 
 ## Verification
 
@@ -709,6 +696,34 @@ do not generalize from one rail to another.
   `scripts/screenshot-when-macos-host/screenshot-when-macos-host.sh /tmp/screen.png`
 - x86: `vm/boot-x86.sh --device reims-vgpu-pci --testing`, then
   `scripts/screenshot-when-kde-plasma-host/screenshot-when-kde-plasma-host.sh -o /tmp/screen.png`
+
+### The drain censuses are gone; read the pipeline ones instead
+
+Everything below that names `drain_duty`, `store_routes`, `gpu_span`, `window_publish`,
+`chain_phase` or `engine_delta` was written against the drain-tranche architecture, and the
+replacement retired all six emitters along with `runtime/drain/`. A boot emits none of them, so a
+harness that bands on `drain_duty duty >= 0.5` or sums `store_routes` samples is filtering an empty
+set and will report a confident zero.
+
+What a boot emits now, all on the `OFF` channel, all carrying `t=`:
+
+| line | says |
+|---|---|
+| `replacement_pipeline_census` | live recordings, submissions, uploads and indirects, plus `upload_stages=[<transaction>:<stage>]` naming the state each retained upload owner is stuck in, `blocked_drains` and `drain_failures` |
+| `replacement_pipeline_stalls` | the retained-failure queues, one count per class |
+| `replacement_host_action_census` | IRQ wait time and coalescing |
+| `host_window_loop` | presenter ticks, redraws asked, draws fresh/stale/held |
+
+`upload_stages` is the one to read first on a boot that stops moving: a transaction sitting in
+`acceptance_refused`, `driver_refused`, `chain_failed`, `preparation_failed` or `enqueue_failed`
+holds its channel's submission head, and every later transaction on that channel then refuses
+behind it with `NotSubmissionHead`. The stage name says *that* something is stuck; the
+`replacement_retained_failure` line on the fail channel says *what*.
+
+**The throughput guidance below has not been re-derived against these.** The rules about
+populations, banding, contention and n≥3 are about how to measure and still hold; the specific
+field names and the numbers measured through them belong to a device that no longer exists. Treat a
+quoted figure from those sections as history, not as a baseline to compare against.
 
 ### Ask the API before you photograph the screen
 
@@ -1264,6 +1279,16 @@ so its `warnings=0` is a rustc count and it cannot see a clippy lint.
 Do not hide warnings, skip an affected arm, or commit a dropped test
 count without calling it out — and **do not read "clippy clean" in a commit body as covering every
 arm**; it means the arms that commit ran.
+
+### Never `git checkout --` a file in this tree
+
+The replacement architecture is many thousands of lines of **uncommitted** work over
+`4f42f714`, and nothing stashes it. `git checkout -- <file>` and `git restore <file>` therefore do
+not undo your last edit, they discard every uncommitted change that file has ever carried,
+including other sessions'. There is no undo: the work was never in the object database.
+
+To undo an edit you just made, re-edit it, or copy the file aside first and copy it back. That is
+the whole rule -- `cp` before an experiment costs nothing and is the only reversal that exists here.
 
 ### Always run `cargo fmt`
 

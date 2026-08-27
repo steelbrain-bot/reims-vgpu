@@ -33,6 +33,13 @@ pub enum WaitDependencyCause {
     Explicit(ExplicitWaitCause),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedWaitDependency {
+    pub producer: TransactionId,
+    pub cause: WaitDependencyCause,
+    pub completed: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WaitCycle {
     /// Closed path: the first and last identities are equal.
@@ -202,6 +209,26 @@ impl WaitGraph {
         true
     }
 
+    /// Complete a transaction that will never run, releasing its dependents.
+    ///
+    /// [`Self::complete`] refuses a transaction that is not ready, which is
+    /// correct for a real completion: work cannot finish before the work it
+    /// waits on. An abandoned transaction is not finishing, it is being given
+    /// up, and it can be given up at any point -- including while its own
+    /// producers are still outstanding. Its dependents must be released either
+    /// way, or a single refusal stalls every transaction that named the
+    /// resources it touched.
+    pub fn abandon(&mut self, transaction: TransactionId) -> bool {
+        let Some(node) = self.nodes.get_mut(&transaction) else {
+            return false;
+        };
+        if !node.accepted || node.completed {
+            return false;
+        }
+        node.completed = true;
+        true
+    }
+
     pub fn is_ready(&self, transaction: TransactionId) -> bool {
         let Some(node) = self.nodes.get(&transaction) else {
             return false;
@@ -251,6 +278,22 @@ impl WaitGraph {
             .get(&transaction)
             .map(|node| node.unresolved.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    pub fn prerequisites(&self, transaction: TransactionId) -> Box<[ResolvedWaitDependency]> {
+        self.nodes
+            .get(&transaction)
+            .into_iter()
+            .flat_map(|node| node.prerequisites.iter())
+            .map(|edge| ResolvedWaitDependency {
+                producer: edge.producer,
+                cause: edge.cause,
+                completed: self
+                    .nodes
+                    .get(&edge.producer)
+                    .is_some_and(|producer| producer.completed),
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -326,9 +369,18 @@ mod tests {
             .add_wait(TransactionId::new(1), TransactionId::new(2), event(7))
             .unwrap();
         assert!(!graph.is_ready(TransactionId::new(1)));
+        assert_eq!(
+            graph.prerequisites(TransactionId::new(1)).as_ref(),
+            [ResolvedWaitDependency {
+                producer: TransactionId::new(2),
+                cause: WaitDependencyCause::Explicit(event(7)),
+                completed: false,
+            }]
+        );
         graph.accept(TransactionId::new(2)).unwrap();
         assert_eq!(graph.ready(), vec![TransactionId::new(2)]);
         assert!(graph.complete(TransactionId::new(2)));
+        assert!(graph.prerequisites(TransactionId::new(1))[0].completed);
         assert_eq!(graph.ready(), vec![TransactionId::new(1)]);
     }
 

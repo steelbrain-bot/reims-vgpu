@@ -116,7 +116,9 @@ impl ReplacementBufferBlitProgram {
         prepared: &PreparedBufferBlit,
         resolver: &impl ReplacementBufferResolver,
     ) -> Result<Self, BufferBlitRecordError> {
-        if prepared.write() != GpuWriteId::operation(prepared.submission(), index) {
+        if prepared.write()
+            != GpuWriteId::operation(prepared.transaction(), prepared.submission(), index)
+        {
             return Err(BufferBlitRecordError::WriteIdentityMismatch);
         }
         Ok(Self {

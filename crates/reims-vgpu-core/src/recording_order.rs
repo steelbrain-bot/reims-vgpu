@@ -118,6 +118,47 @@ impl RecordingOrderOwner {
         Ok(())
     }
 
+    /// Release a transaction's recording claim without it having recorded.
+    ///
+    /// [`Self::recorded`] is the successful end of a recording obligation and
+    /// requires the encoder continuation ahead of it to have recorded first. A
+    /// transaction refused before it records never satisfies that, and every
+    /// continuation successor stays blocked behind it for the life of the
+    /// device. This is the terminal transition for that case: the successors
+    /// are released, exactly as a real recording releases them, because the
+    /// encoder state they were waiting to continue is one that will never
+    /// exist.
+    ///
+    /// Abandoning an already-recorded transaction is not an error. A refusal
+    /// can land after recording finished -- at queue admission or at acceptance
+    /// -- and the claim it must release is the same one.
+    pub fn abandon(&mut self, transaction: TransactionId) -> Result<(), RecordingOrderError> {
+        let node = self
+            .nodes
+            .get(&transaction)
+            .ok_or(RecordingOrderError::UnknownTransaction)?;
+        if node.recorded {
+            return Ok(());
+        }
+        let dependents = self
+            .nodes
+            .get_mut(&transaction)
+            .unwrap()
+            .dependents
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        self.nodes.get_mut(&transaction).unwrap().recorded = true;
+        self.nodes.get_mut(&transaction).unwrap().dependents.clear();
+        for dependent in dependents {
+            self.nodes
+                .get_mut(&dependent)
+                .expect("recording dependent remains admitted")
+                .blocked = false;
+        }
+        Ok(())
+    }
+
     pub fn retire(&mut self, transaction: TransactionId) -> Result<(), RecordingOrderError> {
         let node = self
             .nodes

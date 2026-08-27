@@ -69,3 +69,4 @@ Vulkan-Headers/
 
 # Conformance binaries, built from conformance/suite; regenerate, do not commit.
 conformance/build/
+conformance/build-*/

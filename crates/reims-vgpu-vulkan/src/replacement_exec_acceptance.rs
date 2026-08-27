@@ -526,6 +526,7 @@ mod tests {
         replacement_submit::QueueTimelineSemaphores,
     };
     use ash::vk;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         assemble_prepared_exec_resources, prepare_buffer_blit_with_write,
         prepare_image_blit_with_write, BackingRegion, BufferFillPattern, CompletionStamp,
@@ -577,7 +578,12 @@ mod tests {
             unreachable!()
         };
         lifecycle
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let first = fill(backing, 0);
         let second = fill(backing, 1);
@@ -623,14 +629,14 @@ mod tests {
                     prepare_buffer_blit_with_write(
                         &mut lifecycle,
                         admitted.id,
-                        GpuWriteId::operation(submission, 0),
+                        GpuWriteId::operation(admitted.id, submission, 0),
                         first,
                     )
                     .unwrap(),
                     prepare_buffer_blit_with_write(
                         &mut lifecycle,
                         admitted.id,
-                        GpuWriteId::operation(submission, 1),
+                        GpuWriteId::operation(admitted.id, submission, 1),
                         second,
                     )
                     .unwrap(),
@@ -815,7 +821,12 @@ mod tests {
         };
         assert_eq!(backing, reims_vgpu_protocol::BackingId::new(1));
         lifecycle
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let readback = reims_vgpu_core::prepare_indirect_range_readback(
             &mut lifecycle,
@@ -935,12 +946,18 @@ mod tests {
         )]));
         let destination = create_backing(Box::new([BackingRegion::Whole]));
         let source_representation = lifecycle
-            .create_execution_representation(source, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                source,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let destination_representation = lifecycle
             .create_execution_representation(
                 destination,
                 RepresentationRoute::HostVisibleWorking,
+                BackingView::Image,
                 (),
             )
             .unwrap();
@@ -1046,7 +1063,7 @@ mod tests {
                 image_blits: Box::new([prepare_image_blit_with_write(
                     &mut lifecycle,
                     admitted.id,
-                    GpuWriteId::operation(submission_id, 0),
+                    GpuWriteId::operation(admitted.id, submission_id, 0),
                     operation,
                 )
                 .unwrap()]),

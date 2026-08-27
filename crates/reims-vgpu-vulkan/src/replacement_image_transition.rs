@@ -40,22 +40,99 @@ pub trait ReplacementImageResolver {
         &self,
         image: ReplacementImageKey,
         view: reims_vgpu_core::ResolvedTextureBindingView,
-    ) -> Option<NativeImageTarget> {
-        if view.resource != view.base || view.pixel_format == 0 || !view.swizzle.is_identity() {
-            return None;
+    ) -> Result<NativeImageTarget, TextureBindingViewDecline> {
+        if view.resource != view.base {
+            return Err(TextureBindingViewDecline::AliasedBaseResource);
         }
-        let target = self.resolve_image(image)?;
+        if view.pixel_format == 0 {
+            return Err(TextureBindingViewDecline::UndeclaredFormat);
+        }
+        if !view.swizzle.is_identity() {
+            return Err(TextureBindingViewDecline::SwizzledView);
+        }
+        let target = self
+            .resolve_image(image)
+            .ok_or(TextureBindingViewDecline::UnknownRepresentation)?;
         if target.pixel_format != view.pixel_format {
-            return None;
+            return Err(TextureBindingViewDecline::ReinterpretedFormat {
+                declared: view.pixel_format,
+                native: target.pixel_format,
+            });
         }
+        let subrange = |value: u64| u32::try_from(value).ok();
         let range = vk::ImageSubresourceRange {
             aspect_mask: target.full_range.aspect_mask,
-            base_mip_level: u32::try_from(view.range.level_base).ok()?,
-            level_count: u32::try_from(view.range.level_count).ok()?,
-            base_array_layer: u32::try_from(view.range.slice_base).ok()?,
-            layer_count: u32::try_from(view.range.slice_count).ok()?,
+            base_mip_level: subrange(view.range.level_base)
+                .ok_or(TextureBindingViewDecline::SubresourceRange)?,
+            level_count: subrange(view.range.level_count)
+                .ok_or(TextureBindingViewDecline::SubresourceRange)?,
+            base_array_layer: subrange(view.range.slice_base)
+                .ok_or(TextureBindingViewDecline::SubresourceRange)?,
+            layer_count: subrange(view.range.slice_count)
+                .ok_or(TextureBindingViewDecline::SubresourceRange)?,
         };
-        same_subresource_range(target.full_range, range).then_some(target)
+        if !same_subresource_range(target.full_range, range) {
+            return Err(TextureBindingViewDecline::PartialSubresourceRange);
+        }
+        Ok(target)
+    }
+}
+
+/// Why one decoded texture-binding view has no native image behind it.
+///
+/// Every arm but [`Self::UnknownRepresentation`] is a decoded view this backend
+/// does not yet build a `VkImageView` for. They were one `None` and reached the
+/// log as `UnknownImageView`, which named the representation and said nothing
+/// about which of five unrelated cases the guest had asked for -- a texture
+/// view over a mip range, a format reinterpretation and a swizzle are three
+/// different pieces of work, and only one of them is a lifetime problem.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureBindingViewDecline {
+    /// The representation this key names is not resolvable. Unlike the rest,
+    /// this is a lifetime fault rather than an unimplemented view.
+    UnknownRepresentation,
+    /// The representation resolved, but it is a buffer rather than an image.
+    NotImage,
+    /// The view names another resource as its base and no shader view has been
+    /// installed for it.
+    ShaderViewAbsent,
+    /// An installed shader view exists for this resource but was built for a
+    /// different decoded view.
+    ShaderViewMismatch,
+    /// The view names a base resource other than itself: a texture view onto
+    /// another texture's storage.
+    AliasedBaseResource,
+    /// The decoded view carries no pixel format.
+    UndeclaredFormat,
+    /// The view applies a component swizzle.
+    SwizzledView,
+    /// The view reinterprets its base texture's pixel format.
+    ReinterpretedFormat { declared: u16, native: u16 },
+    /// A level or slice bound does not fit the Vulkan subresource width.
+    SubresourceRange,
+    /// The view covers part of the image rather than all of it.
+    PartialSubresourceRange,
+}
+
+impl std::fmt::Display for TextureBindingViewDecline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownRepresentation => formatter.write_str("unknown_representation"),
+            Self::NotImage => formatter.write_str("not_image"),
+            Self::ShaderViewAbsent => formatter.write_str("shader_view_absent"),
+            Self::ShaderViewMismatch => formatter.write_str("shader_view_mismatch"),
+            Self::AliasedBaseResource => formatter.write_str("aliased_base_resource"),
+            Self::UndeclaredFormat => formatter.write_str("undeclared_format"),
+            Self::SwizzledView => formatter.write_str("swizzled_view"),
+            Self::ReinterpretedFormat { declared, native } => {
+                write!(
+                    formatter,
+                    "reinterpreted_format declared={declared} native={native}"
+                )
+            }
+            Self::SubresourceRange => formatter.write_str("subresource_range"),
+            Self::PartialSubresourceRange => formatter.write_str("partial_subresource_range"),
+        }
     }
 }
 

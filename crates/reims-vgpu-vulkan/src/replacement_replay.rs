@@ -792,6 +792,7 @@ mod tests {
     use crate::replacement_completion::{ReplacementTimelineFailure, ReplacementTimelineProgress};
     use crate::replacement_submit::QueueTimelineSemaphores;
     use ash::vk;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         BackingRegion, CompletionStamp, DeviceTransactionPayload, ExecTransaction,
         RepresentationRoute, ResolvedExecSegment, ResolvedExecStream, ResolvedResourceLifecycle,
@@ -1092,6 +1093,110 @@ mod tests {
     }
 
     #[test]
+    fn one_observation_applies_auxiliary_transfer_before_later_semantic_write() {
+        let epoch = VulkanDeviceEpochId::new(2);
+        let queue = QueueOwnerId::new(1);
+        let transaction = TransactionId::new(1);
+        let mut native =
+            DirectReplayNativeOwner::<ResolvedReplayCompletion<()>>::new(epoch, 1).unwrap();
+        let mut resources = ResourceLifecycleOwner::<()>::new(epoch);
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([BackingRegion::Whole]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let destination = resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
+            .unwrap();
+        let initial = resources
+            .snapshot_content(backing, &[BackingRegion::Whole])
+            .unwrap();
+        let transfer = resources
+            .plan_transfers(backing, GUEST_REPRESENTATION, destination, &initial)
+            .unwrap()[0];
+        let submission = SubmissionId::new(2);
+        resources
+            .plan_gpu_write(backing, submission, destination, [BackingRegion::Whole])
+            .unwrap();
+
+        let auxiliary_point = QueueTimelinePoint {
+            epoch,
+            queue,
+            value: QueueTimelineValue::new(2),
+        };
+        let semantic_point = QueueTimelinePoint {
+            epoch,
+            queue,
+            value: QueueTimelineValue::new(3),
+        };
+        let mut auxiliary = ReplacementNativeRecording::synthetic(
+            RecordingWorkerId::new(0),
+            Box::<[vk::CommandBuffer]>::default(),
+            vk::Fence::null(),
+        );
+        auxiliary.resource_completions = Box::new([ResolvedResourceCompletion::Transfer(transfer)]);
+        let mut semantic = ReplacementNativeRecording::synthetic(
+            RecordingWorkerId::new(0),
+            Box::<[vk::CommandBuffer]>::default(),
+            vk::Fence::null(),
+        );
+        semantic.resource_completions = Box::new([ResolvedResourceCompletion::GpuWrite {
+            backing,
+            write: submission.into(),
+            representation: destination,
+        }]);
+        let mut recordings = ReplacementRecordingOwner::new(epoch);
+        recordings
+            .accept_auxiliary(transaction, auxiliary_point, auxiliary)
+            .unwrap();
+        recordings
+            .accept(transaction, semantic_point, semantic)
+            .unwrap();
+
+        let progress = apply_replacement_timeline_observation(
+            &mut native,
+            &mut resources,
+            &mut recordings,
+            ReplacementTimelineObservation::Progress(ReplacementTimelineProgress {
+                queue,
+                completed: semantic_point.value,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            progress.resource_completions.as_slice(),
+            [
+                ResourceCompletionEffect::Transfer(found_transfer),
+                ResourceCompletionEffect::GpuWrite {
+                    backing: found_backing,
+                    submission: found_submission,
+                    ..
+                }
+            ] if *found_transfer == transfer
+                && *found_backing == backing
+                && *found_submission == submission
+        ));
+        let current = resources
+            .snapshot_content(backing, &[BackingRegion::Whole])
+            .unwrap();
+        assert!(resources
+            .graph()
+            .storage(backing)
+            .unwrap()
+            .content
+            .representation_matches(destination, &current));
+    }
+
+    #[test]
     fn content_completion_precedes_same_point_representation_retirement() {
         let epoch = VulkanDeviceEpochId::new(2);
         let queue = QueueOwnerId::new(1);
@@ -1151,6 +1256,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
                 "old",
             )
             .unwrap();
@@ -1245,7 +1351,12 @@ mod tests {
             unreachable!()
         };
         let representation = resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let submission = SubmissionId::new(8);
         let regions = resources
@@ -1394,7 +1505,12 @@ mod tests {
             unreachable!()
         };
         let representation = resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         resources
             .accept_use(backing, transaction, [representation])

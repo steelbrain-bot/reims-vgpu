@@ -5,15 +5,16 @@
 //! descriptor handles, and Vulkan pipeline state cannot cross this seam.
 
 use crate::{
-    AccessIntent, AccessMode, AccessScope, AccessTarget, BackingRegion, GpuWriteBatchError,
-    GpuWriteId, GpuWriteRequest, GpuWriteReservation, ImageSubresourceRange, ManagedBackingError,
-    ManagedBackingProgress, ReadyPipelineLease, RepresentationUse, ResolvedResourceCompletion,
-    ResourceLifecycleOwner, ResourceUseBatchError, StageScope,
+    AccessIntent, AccessMode, AccessScope, AccessTarget, BackingRegion, BackingView,
+    GpuWriteBatchError, GpuWriteId, GpuWriteRequest, GpuWriteReservation, ImageSubresourceRange,
+    ManagedBackingError, ManagedBackingProgress, ReadyPipelineLease, RepresentationUse,
+    ResolvedResourceCompletion, ResourceLifecycleOwner, ResourceUseBatchError, StageScope,
+    ViewRepresentation,
 };
 use reims_vgpu_protocol::{
     BackingId, CullMode, DepthClipMode, DepthStencilObject, FillMode, HazardDomainId, IndexType,
-    LoadAction, PrimitiveTopology, RenderPipelineObject, RenderStages, ResourceId, ResourceObject,
-    StoreAction, SubmissionId, TransactionId, VisibilityResultMode,
+    LoadAction, PrimitiveTopology, RenderPipelineObject, RenderStages, RepresentationId,
+    ResourceId, ResourceObject, StoreAction, SubmissionId, TransactionId, VisibilityResultMode,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -183,6 +184,24 @@ pub struct ResolvedRenderAttachment {
     pub store: StoreAction,
     pub clear: RenderAttachmentClear,
     pub resolve: Option<ResolvedRenderResolveAttachment>,
+    /// Whether this attachment's backing is also read as a texture somewhere
+    /// in the encoder this draw belongs to.
+    ///
+    /// The fact is the encoder's, not the draw's: one render encoder holds its
+    /// attachments for its whole life, so a read anywhere inside it puts the
+    /// attachment in a feedback loop for every draw in it. A backend that must
+    /// name one access mode per pass reads this rather than re-deriving it
+    /// from the draw in front of it, which would differ draw to draw and leave
+    /// the pass describing only its first one.
+    pub feedback_loop: bool,
+    /// Whether the fragment stage of any draw in this encoder reads this
+    /// attachment through a colour input attachment rather than only writing
+    /// it.
+    ///
+    /// Encoder-wide for the same reason [`Self::feedback_loop`] is: the pass
+    /// declares one layout per attachment for its whole life, so a read by any
+    /// draw in it decides the layout for all of them.
+    pub input_attachment: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,6 +313,7 @@ impl ResolvedRenderDispatch {
             .map(|(backing, regions)| crate::ContentSynchronizationRequest {
                 backing,
                 regions: regions.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                permitted_pending_writes: Box::new([]),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice()
@@ -411,6 +431,10 @@ pub struct PreparedRenderDispatch<NativePipeline, Operation = ResolvedRenderDisp
     operation: Operation,
     pipeline: ReadyPipelineLease<RenderPipelineObject, NativePipeline>,
     uses: Box<[RepresentationUse]>,
+    /// The native object each bound endpoint resolves to, keyed by backing and
+    /// by the view of it the binding names. A backing bound once as a buffer
+    /// and once as a texture appears twice.
+    representations: Box<[ViewRepresentation]>,
     writes: Box<[GpuWriteReservation]>,
     completions: Box<[ResolvedResourceCompletion]>,
 }
@@ -430,6 +454,10 @@ impl<NativePipeline, Operation> PreparedRenderDispatch<NativePipeline, Operation
     }
     pub const fn uses(&self) -> &[RepresentationUse] {
         &self.uses
+    }
+
+    pub const fn representations(&self) -> &[ViewRepresentation] {
+        &self.representations
     }
     pub const fn writes(&self) -> &[GpuWriteReservation] {
         &self.writes
@@ -498,6 +526,7 @@ pub enum RenderDispatchPreparationError {
     Backing {
         backing: BackingId,
         resources: Box<[ResourceId<ResourceObject>]>,
+        regions: Box<[BackingRegion]>,
         reads: bool,
         writes: bool,
         reason: ManagedBackingError,
@@ -523,7 +552,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
     validate_shape(&operation)?;
 
     let mut grouped = BTreeMap::<
-        BackingId,
+        (BackingId, BackingView),
         (
             BTreeSet<BackingRegion>,
             bool,
@@ -532,7 +561,13 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
         ),
     >::new();
     for resource in &operation.resources {
-        let group = grouped.entry(resource.backing).or_default();
+        // The descriptor class says which view of the backing the binding
+        // addresses; `validate_shape` has already proved class and view agree.
+        let view = match resource.view {
+            RenderBindingView::Buffer(_) => BackingView::Bytes,
+            RenderBindingView::Image(_) => BackingView::Image,
+        };
+        let group = grouped.entry((resource.backing, view)).or_default();
         group.0.extend(resource.regions.iter().copied());
         group.1 |= matches!(
             resource.mode,
@@ -545,7 +580,9 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
         group.3.insert(resource.resource);
     }
     for attachment in &operation.attachments {
-        let group = grouped.entry(attachment.backing).or_default();
+        let group = grouped
+            .entry((attachment.backing, BackingView::Image))
+            .or_default();
         group.0.extend(attachment.regions.iter().copied());
         group.1 |= operation.begins_encoder && attachment.load == LoadAction::Load;
         group.2 |= operation.ends_encoder
@@ -555,46 +592,58 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
             );
         group.3.insert(attachment.resource);
         if let Some(resolve) = &attachment.resolve {
-            let group = grouped.entry(resolve.backing).or_default();
+            let group = grouped
+                .entry((resolve.backing, BackingView::Image))
+                .or_default();
             group.0.extend(resolve.regions.iter().copied());
             group.2 |= operation.ends_encoder;
             group.3.insert(resolve.resource);
         }
     }
     if let Some(visibility) = operation.visibility {
-        let group = grouped.entry(visibility.backing).or_default();
+        // The visibility result buffer is written as bytes.
+        let group = grouped
+            .entry((visibility.backing, BackingView::Bytes))
+            .or_default();
         group.0.insert(BackingRegion::Linear(visibility.range));
         group.2 = true;
         group.3.insert(visibility.resource);
     }
 
-    let mut uses = Vec::with_capacity(grouped.len());
+    let mut representations = Vec::with_capacity(grouped.len());
+    let mut grouped_uses = BTreeMap::<BackingId, Vec<RepresentationId>>::new();
     let mut write_requests = Vec::new();
-    for (backing, (regions, reads, writes, resources)) in grouped {
+    for ((backing, view), (regions, reads, writes, resources)) in grouped {
         let regions = regions.into_iter().collect::<Vec<_>>().into_boxed_slice();
         let resources = resources.into_iter().collect::<Vec<_>>().into_boxed_slice();
         let backing_error = |reason| RenderDispatchPreparationError::Backing {
             backing,
             resources: resources.clone(),
+            regions: regions.clone(),
             reads,
             writes,
             reason,
         };
         let representation = owner
-            .execution_representation_id(backing)
+            .view_representation(backing, view)
             .map_err(&backing_error)?;
         if reads {
             let snapshot = owner
                 .snapshot_content(backing, &regions)
                 .map_err(&backing_error)?;
             owner
-                .execution_representation_for_snapshot(backing, &snapshot)
+                .view_representation_for_snapshot(backing, view, &snapshot)
                 .map_err(backing_error)?;
         }
-        uses.push(RepresentationUse {
+        representations.push(ViewRepresentation {
             backing,
-            representations: Box::new([representation]),
+            view,
+            representation,
         });
+        grouped_uses
+            .entry(backing)
+            .or_default()
+            .push(representation);
         if writes {
             write_requests.push(GpuWriteRequest {
                 backing,
@@ -603,8 +652,23 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
             });
         }
     }
+    // One use per backing, naming every view of it this dispatch binds: a
+    // backing bound as both a vertex buffer and a texture holds two native
+    // objects and both have to outlive the transaction.
+    let uses = grouped_uses
+        .into_iter()
+        .map(|(backing, mut representations)| {
+            representations.sort();
+            representations.dedup();
+            RepresentationUse {
+                backing,
+                representations: representations.into_boxed_slice(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let representations = representations.into_boxed_slice();
 
-    let write = GpuWriteId::operation(submission, operation_index);
+    let write = GpuWriteId::operation(transaction, submission, operation_index);
     owner
         .validate_plan_gpu_writes(write, &write_requests)
         .map_err(RenderDispatchPreparationError::Writes)?;
@@ -653,6 +717,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
         operation,
         pipeline,
         uses: uses.into_boxed_slice(),
+        representations,
         writes,
         completions: completions.into_boxed_slice(),
     })
@@ -1036,6 +1101,8 @@ mod tests {
         ready
     }
 
+    /// A backing whose execution representation is an image, which is what
+    /// every sampled binding and every attachment in these fixtures needs.
     fn backing(owner: &mut ResourceLifecycleOwner<()>, current: bool) -> BackingId {
         let ResourceLifecycleEffect::BackingCreated(backing) = owner
             .apply(ResolvedResourceLifecycle::CreateBacking {
@@ -1047,7 +1114,12 @@ mod tests {
             unreachable!()
         };
         let representation = owner
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Image,
+                (),
+            )
             .unwrap();
         if current {
             let snapshot = owner
@@ -1097,6 +1169,8 @@ mod tests {
                 store: StoreAction::Store,
                 clear: RenderAttachmentClear::Color([0; 4]),
                 resolve: None,
+                feedback_loop: false,
+                input_attachment: false,
             }]),
             resources: Box::new([ResolvedRenderResourceBinding {
                 class: RenderBindingClass::SampledImage,

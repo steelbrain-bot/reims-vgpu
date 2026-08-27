@@ -1019,6 +1019,7 @@ impl ReplacementDeviceEpoch {
             declaration,
             memory,
             available,
+            self.context.features.attachment_feedback_loop_layout,
             attachment_views,
             shader_views,
         )
@@ -1089,6 +1090,7 @@ impl ReplacementDeviceEpoch {
             declaration,
             crate::memory::MemoryClass::DeviceLocal,
             available,
+            self.context.features.attachment_feedback_loop_layout,
             Box::new([]),
             Box::new([]),
         )

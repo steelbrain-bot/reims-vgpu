@@ -1646,6 +1646,38 @@ pub(crate) fn mark_render_dispatch_encoder_boundaries<Completion>(
         }
     }
     for group in groups {
+        // A render encoder holds its attachments for its whole life, so an
+        // attachment any draw in it reads as a texture is in a feedback loop
+        // for every draw in it. Deriving that per draw instead would describe
+        // one pass with as many access modes as it has draws.
+        let mut sampled = std::collections::BTreeSet::new();
+        // The same holds for a colour input read: the draw that declares it
+        // stamped its own attachment, and the pass the whole encoder shares
+        // must declare that layout for every draw in it.
+        let mut input_read = std::collections::BTreeSet::new();
+        for &(stream_index, segment_index, operation_index) in &group {
+            let reims_vgpu_core::ResolvedOperation::Render(operation) =
+                &streams[stream_index].segments[segment_index].operations[operation_index]
+            else {
+                unreachable!("the group contains only resolved render operations")
+            };
+            sampled.extend(
+                operation
+                    .resources
+                    .iter()
+                    .filter(|resource| {
+                        resource.class == reims_vgpu_core::RenderBindingClass::SampledImage
+                    })
+                    .map(|resource| resource.backing),
+            );
+            input_read.extend(
+                operation
+                    .attachments
+                    .iter()
+                    .filter(|attachment| attachment.input_attachment)
+                    .map(|attachment| attachment.backing),
+            );
+        }
         let last = group.len().checked_sub(1);
         for (index, (stream_index, segment_index, operation_index)) in group.into_iter().enumerate()
         {
@@ -1656,6 +1688,10 @@ pub(crate) fn mark_render_dispatch_encoder_boundaries<Completion>(
             };
             operation.begins_encoder = index == 0;
             operation.ends_encoder = Some(index) == last;
+            for attachment in operation.attachments.iter_mut() {
+                attachment.feedback_loop = sampled.contains(&attachment.backing);
+                attachment.input_attachment = input_read.contains(&attachment.backing);
+            }
         }
     }
 }
@@ -3005,6 +3041,10 @@ pub(crate) fn resolve_render_pass_attachments<Semantic: Clone>(
                 attachment.clear_color.map(|value| (value as f32).to_bits()),
             ),
             resolve,
+            // The encoder's own reads decide both of these; they are stamped
+            // once the whole encoder is in hand.
+            feedback_loop: false,
+            input_attachment: false,
         });
     }
     for (
@@ -3134,6 +3174,9 @@ pub(crate) fn resolve_render_pass_attachments<Semantic: Clone>(
             store,
             clear,
             resolve,
+            // See the colour arm above: stamped over the whole encoder.
+            feedback_loop: false,
+            input_attachment: false,
         });
     }
     Ok(resolved.into_boxed_slice())
@@ -3234,8 +3277,25 @@ pub(crate) fn resolve_render_draw<Semantic: Clone>(
         return Ok(None);
     }
 
-    let attachments = resolve_render_pass_attachments(runtime, task, state)
+    let mut attachments = resolve_render_pass_attachments(runtime, task, state)
         .map_err(ReplacementRenderDrawResolutionError::Attachment)?;
+    // A fragment stage that declares a colour input attachment reads the
+    // attachment it also writes, and the pass must declare that attachment in
+    // a layout permitting both. Metal names only the first destination this
+    // way, which is the attachment Vulkan wires as the subpass input.
+    if pipeline
+        .fragment
+        .interface
+        .bindings
+        .iter()
+        .any(|binding| binding.kind == reims_vgpu_core::ShaderResourceKind::ColorInput)
+    {
+        for attachment in attachments.iter_mut() {
+            if attachment.role == reims_vgpu_core::RenderAttachmentRole::Color(0) {
+                attachment.input_attachment = true;
+            }
+        }
+    }
     let samplers = resolve_render_samplers(runtime, task, snapshot, &pipeline)?;
     let textures = resolve_render_textures(runtime, task, snapshot, &pipeline)?;
     let buffer_resources = resolve_render_buffers(runtime, task, snapshot, &pipeline, command)?;
@@ -4741,6 +4801,133 @@ mod tests {
     use super::*;
     use reims_vgpu_core::endian::{st16, st32};
     use reims_vgpu_wire::ops::render as wire_render;
+
+    #[test]
+    fn an_encoder_read_of_an_attachment_marks_every_draw_in_it() {
+        use reims_vgpu_core::{
+            AccessMode, BackingRegion, PrimitiveTopology, RenderAttachmentClear,
+            RenderAttachmentRole, RenderBindingClass, RenderBindingView, ResolvedExecSegment,
+            ResolvedExecStream, ResolvedRenderAttachment, ResolvedRenderDraw,
+            ResolvedRenderRasterState, ResolvedRenderResourceBinding, ResolvedTextureBindingView,
+            ResolvedTextureViewRange,
+        };
+        use reims_vgpu_protocol::{
+            BackingId, LoadAction, RenderStages, ResourceId, SegmentKind, StoreAction, TextureType,
+        };
+
+        let attachment_backing = BackingId::new(7);
+        let attachment_resource = ResourceId::new(4, 1);
+        let draw = |samples_attachment: bool, reads_input: bool| {
+            reims_vgpu_core::ResolvedOperation::Render(reims_vgpu_core::ResolvedRenderDispatch {
+                pipeline: ResourceId::new(2, 1),
+                program: Default::default(),
+                depth_stencil: None,
+                render_extent: [32, 16],
+                raster: ResolvedRenderRasterState::default(),
+                visibility: None,
+                begins_encoder: false,
+                ends_encoder: false,
+                draw: ResolvedRenderDraw::Direct {
+                    topology: PrimitiveTopology::Triangle,
+                    vertex_count: 3,
+                    instance_count: 1,
+                    first_vertex: 0,
+                    first_instance: 0,
+                },
+                vertex_buffers: Box::new([]),
+                attachments: Box::new([ResolvedRenderAttachment {
+                    role: RenderAttachmentRole::Color(0),
+                    resource: attachment_resource,
+                    backing: attachment_backing,
+                    regions: Box::new([BackingRegion::Whole]),
+                    pixel_format: 80,
+                    extent: [32, 16, 1],
+                    sample_count: 1,
+                    load: LoadAction::Clear,
+                    store: StoreAction::Store,
+                    clear: RenderAttachmentClear::Color([0; 4]),
+                    resolve: None,
+                    feedback_loop: false,
+                    input_attachment: reads_input,
+                }]),
+                resources: if samples_attachment {
+                    Box::new([ResolvedRenderResourceBinding {
+                        class: RenderBindingClass::SampledImage,
+                        binding: 3,
+                        array_element: 0,
+                        descriptor_count: 1,
+                        stages: RenderStages::from_bits(RenderStages::FRAGMENT.into()).unwrap(),
+                        resource: attachment_resource,
+                        backing: attachment_backing,
+                        view: RenderBindingView::Image(ResolvedTextureBindingView {
+                            resource: attachment_resource,
+                            base: attachment_resource,
+                            range: ResolvedTextureViewRange {
+                                level_base: 0,
+                                level_count: 1,
+                                slice_base: 0,
+                                slice_count: 1,
+                            },
+                            texture_type: TextureType::D2,
+                            pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                            swizzle: reims_vgpu_protocol::swizzle_identity(),
+                        }),
+                        regions: Box::new([BackingRegion::Whole]),
+                        mode: AccessMode::Read,
+                    }])
+                } else {
+                    Box::new([])
+                },
+                null_bindings: Box::new([]),
+                samplers: Box::new([]),
+            })
+        };
+        let mut streams = [ResolvedExecStream::<ProjectedReplacementOperation<()>> {
+            stream_index: 0,
+            segments: Box::new([ResolvedExecSegment {
+                boundary: reims_vgpu_protocol::SegmentBoundary {
+                    stream_index: 0,
+                    index: 0,
+                    kind: SegmentKind::Render,
+                    continues_previous: false,
+                    continues_next: false,
+                },
+                operations: Box::new([
+                    reims_vgpu_core::ResolvedOperation::EncoderBoundary(
+                        reims_vgpu_core::EncoderBoundary::Begin(SegmentKind::Render),
+                    ),
+                    draw(false, true),
+                    draw(true, false),
+                    reims_vgpu_core::ResolvedOperation::EncoderBoundary(
+                        reims_vgpu_core::EncoderBoundary::End(SegmentKind::Render),
+                    ),
+                ]),
+            }]),
+        }];
+
+        mark_render_dispatch_encoder_boundaries(&mut streams);
+
+        // Only the second draw samples the attachment and only the first
+        // reads it as a colour input, but one native render pass covers both,
+        // so both must describe the same layout.
+        for index in [1, 2] {
+            let reims_vgpu_core::ResolvedOperation::Render(operation) =
+                &streams[0].segments[0].operations[index]
+            else {
+                panic!("operation {index} must remain a render dispatch")
+            };
+            assert!(
+                operation.attachments[0].feedback_loop,
+                "draw {index} lost its encoder's feedback loop"
+            );
+            // Only the first draw's fragment stage declares the colour input,
+            // and the same pass covers both, so both name the layout it forces.
+            assert!(
+                operation.attachments[0].input_attachment,
+                "draw {index} lost its encoder's colour input read"
+            );
+        }
+    }
 
     fn segment(
         type_: u8,

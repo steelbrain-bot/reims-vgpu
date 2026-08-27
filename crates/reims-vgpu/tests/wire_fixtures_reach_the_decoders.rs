@@ -452,7 +452,33 @@ fn read_record(class: &str, bytes: &[u8], opcode: u32) -> Option<Reading> {
         "PGSerializerComputeCommandEncoder" => Some(compute_verdict(bytes)),
         "PGSerializerBlitCommandEncoder" => Some(blit_verdict(bytes)),
         "PGSerializerInfoCommandEncoder" => Some(info_verdict(bytes, opcode)),
+        "PGSerializerCommandEncoder" => Some(base_encoder_verdict(bytes)),
         _ => None,
+    }
+}
+
+/// The base encoder class writes the *inherited* `useHeaps:`/`useResources:`
+/// forms — `0x86` and `0x87`, which carry a bare count and no `stages:` — and
+/// every concrete encoder emits them from this base rather than from its own
+/// selector list. So the record has no encoder of its own to be dispatched to:
+/// the device meets it inside whichever segment the guest was encoding, which
+/// is why both the render and the compute reader are asked here and a refusal
+/// from either is a refusal of a record Apple produced.
+fn base_encoder_verdict(bytes: &[u8]) -> Reading {
+    let render = render_verdict(bytes);
+    let compute = compute_verdict(bytes);
+    let verdict = match (&render.verdict, &compute.verdict) {
+        (Verdict::Decoded, Verdict::Decoded) => Verdict::Decoded,
+        (Verdict::WrongShape(slug), _) | (_, Verdict::WrongShape(slug)) => {
+            Verdict::WrongShape(slug)
+        }
+        (Verdict::NotImplemented(slug), _) | (_, Verdict::NotImplemented(slug)) => {
+            Verdict::NotImplemented(slug)
+        }
+    };
+    Reading {
+        verdict,
+        signature: format!("render={} compute={}", render.signature, compute.signature),
     }
 }
 

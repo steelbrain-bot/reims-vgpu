@@ -160,10 +160,10 @@ impl<K: Clone + Ord, T> NativeRetirement<K, T> {
         completed: QueueTimelineValue,
     ) -> Result<Vec<&T>, NativeRetirementError> {
         self.validate_advance(queue, completed)?;
-        Ok(self
+        let mut ready = self
             .deferred
-            .values()
-            .filter(|deferred| {
+            .iter()
+            .filter(|(_, deferred)| {
                 deferred.obligations.iter().all(|point| {
                     if point.queue == queue {
                         point.value <= completed
@@ -174,7 +174,23 @@ impl<K: Clone + Ord, T> NativeRetirement<K, T> {
                     }
                 })
             })
-            .map(|deferred| &deferred.value)
+            .collect::<Vec<_>>();
+        // A single observation can retire semantic and auxiliary recordings
+        // together. Their keys name ownership class, not execution order; all
+        // completion effects must instead follow their actual point on this
+        // queue. The BTreeMap iteration remains the deterministic tie-breaker
+        // for values attached to the same point.
+        ready.sort_by_key(|(_, deferred)| {
+            deferred
+                .obligations
+                .iter()
+                .filter(|point| point.queue == queue)
+                .map(|point| point.value)
+                .max()
+        });
+        Ok(ready
+            .into_iter()
+            .map(|(_, deferred)| &deferred.value)
             .collect())
     }
 
@@ -268,6 +284,20 @@ mod tests {
                 .advance(QueueOwnerId::new(0), QueueTimelineValue::new(2))
                 .unwrap(),
             vec![(1, "first")]
+        );
+    }
+
+    #[test]
+    fn ready_values_follow_queue_points_when_key_order_disagrees() {
+        let mut owner = NativeRetirement::new(VulkanDeviceEpochId::new(1));
+        owner.defer(1, "later", [point(0, 3)]).unwrap();
+        owner.defer(2, "earlier", [point(0, 2)]).unwrap();
+
+        assert_eq!(
+            owner
+                .values_ready_after(QueueOwnerId::new(0), QueueTimelineValue::new(3))
+                .unwrap(),
+            vec![&"earlier", &"later"]
         );
     }
 

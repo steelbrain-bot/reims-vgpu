@@ -78,7 +78,19 @@ pub enum TransactionRuntimeError {
     ChannelHasLiveTransactions,
     UnknownTransaction,
     TransactionNotSubmitted,
+    TransactionAlreadySubmitted,
     TransactionNotPublished,
+}
+
+/// Which of the two ends a transaction reached.
+///
+/// Both settle the same publication position and release the same dependents;
+/// they differ in what the dependency graph is told, because an abandoned
+/// transaction never became ready and never will.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalFact {
+    Completed,
+    Abandoned,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,6 +98,7 @@ pub struct TransactionRuntimeDiagnostic {
     pub transaction: TransactionId,
     pub channel: ChannelId,
     pub unresolved: Box<[ExplicitWaitCause]>,
+    pub prerequisites: Box<[crate::ResolvedWaitDependency]>,
     pub semantic_ready: bool,
     pub continuation_owned: bool,
     pub submitted: bool,
@@ -268,6 +281,15 @@ impl From<PublicationError> for TransactionRuntimeError {
     fn from(error: PublicationError) -> Self {
         Self::Publication(error)
     }
+}
+
+/// The native ordering form of one transaction's semantic prerequisites.
+///
+/// See [`TransactionRuntime::native_submission_dependencies`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeSubmissionProjection {
+    Native(Box<[(TransactionId, WaitDependencyCause)]>),
+    AwaitingHostProducer(TransactionId),
 }
 
 impl From<ConditionOwnerError> for TransactionRuntimeError {
@@ -563,11 +585,7 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
                 transaction.ingress_ordinal,
                 recording_predecessor,
             )?;
-            submission_order.accept(
-                transaction.id,
-                transaction.submission_domain(),
-                transaction.domain_sequence(),
-            )?;
+            submission_order.accept(transaction.id, transaction.submission_domain())?;
         }
         let compiled_dependencies = dependencies.accept_with_unresolved(
             transaction.id,
@@ -638,11 +656,88 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
             .map(Box::as_ref)
     }
 
+    /// Project one transaction's semantic prerequisites onto the native
+    /// ordering vocabulary, or name the producer that has no native form yet.
+    ///
+    /// Not every semantic producer reaches a Vulkan queue. A guest wait bound
+    /// to a signal by [`Self::bind_prerequisite`] or by a later signalling
+    /// transaction may name a producer that owns no encoder continuation:
+    /// such a transaction publishes without ever being submitted, so it never
+    /// receives a native timeline point and a consumer parked on one waits
+    /// forever. Its ordering obligation is discharged by publication instead,
+    /// which is a strictly stronger fact than a wait on a point.
+    ///
+    /// So each prerequisite lands in exactly one of four states, and the
+    /// classification is total because `submitted` and `published` are the two
+    /// terminal facts a transaction can carry:
+    ///
+    /// - submitted: a native point exists (acceptance commits both together),
+    ///   so it stays a native prerequisite;
+    /// - published without being submitted: terminal with no native work, so
+    ///   the obligation is already discharged and it is dropped;
+    /// - neither, but continuation-owning: it will be submitted, so it stays a
+    ///   native prerequisite and the consumer parks on its point;
+    /// - neither and not continuation-owning: it will publish rather than
+    ///   submit, and until it does this transaction has no native form at all.
+    ///
+    /// A producer absent from the population has retired, which requires it to
+    /// have published and to have no accepted successor naming it.
+    pub fn native_submission_dependencies(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<NativeSubmissionProjection, TransactionRuntimeError> {
+        let prerequisites = self
+            .submission_dependencies
+            .get(&transaction)
+            .ok_or(TransactionRuntimeError::UnknownTransaction)?;
+        let mut native = Vec::with_capacity(prerequisites.len());
+        for &(producer, cause) in prerequisites.iter() {
+            let Some(state) = self.transactions.get(&producer) else {
+                continue;
+            };
+            if state.submitted {
+                native.push((producer, cause));
+            } else if state.published {
+                continue;
+            } else if state.continuation_owned {
+                native.push((producer, cause));
+            } else {
+                return Ok(NativeSubmissionProjection::AwaitingHostProducer(producer));
+            }
+        }
+        Ok(NativeSubmissionProjection::Native(
+            native.into_boxed_slice(),
+        ))
+    }
+
     pub fn submission_hazards(
         &self,
         transaction: TransactionId,
     ) -> Option<&[crate::HazardRequirement]> {
         self.submission_hazards.get(&transaction).map(Box::as_ref)
+    }
+
+    /// See [`crate::SubmissionOrderOwner::census`].
+    pub fn submission_order_census(&self) -> Vec<crate::SubmissionOrderEntry> {
+        self.submission_order.census()
+    }
+
+    /// See [`SubmissionOrderOwner::unsubmitted_predecessor`].
+    pub fn unsubmitted_submission_predecessor(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<Option<TransactionId>, crate::SubmissionOrderError> {
+        self.submission_order.unsubmitted_predecessor(transaction)
+    }
+
+    pub fn submission_order_relation(
+        &self,
+        first: TransactionId,
+        second: TransactionId,
+    ) -> Result<crate::SubmissionOrderRelation, TransactionRuntimeError> {
+        self.submission_order
+            .relation(first, second)
+            .map_err(TransactionRuntimeError::Submission)
     }
 
     pub fn recorded(&mut self, transaction: TransactionId) -> Result<(), TransactionRuntimeError> {
@@ -810,11 +905,22 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
         transaction: TransactionId,
     ) -> Result<Option<SubmissionReady>, TransactionRuntimeError> {
         let dependencies = &self.dependencies;
-        self.submission_order
+        match self
+            .submission_order
             .reserve_head_transaction_if(transaction, |transaction| {
                 !dependencies.has_unresolved(transaction)
-            })
-            .map_err(TransactionRuntimeError::Submission)
+            }) {
+            Ok(ready) => Ok(ready),
+            // An issued predecessor is the ordinary state of a FIFO whose
+            // multi-submit head has not reached driver acceptance yet.  For a
+            // later transaction this has the same scheduling meaning as any
+            // other non-head position: retain it and ask again after the head
+            // advances.  Exposing the owner's internal `AlreadyIssued` state
+            // as a transaction error made every later guest-upload recording
+            // look malformed while the earlier upload chain was merely live.
+            Err(crate::SubmissionOrderError::AlreadyIssued) => Ok(None),
+            Err(reason) => Err(TransactionRuntimeError::Submission(reason)),
+        }
     }
 
     /// Record successful native queue acceptance. Driver return is not GPU or
@@ -873,11 +979,73 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
                 return Err(TransactionRuntimeError::TransactionNotSubmitted);
             }
         }
+        self.commit_publication_position(transaction, semantic, TerminalFact::Completed)
+    }
+
+    /// Give up a transaction that reached a typed refusal before it submitted,
+    /// and publish every position that terminal fact releases.
+    ///
+    /// [`Self::semantic_complete`] is the successful end of a GPU transaction
+    /// and demands exactly what a success has: a recorded continuation and an
+    /// accepted queue submission. A transaction refused earlier than that has
+    /// neither and never will, and it holds four claims that nothing else ever
+    /// releases -- its submission-order domain head, its encoder-continuation
+    /// recording, its dependency edges, and its publication position. Every
+    /// later transaction on the same channel then waits behind one refusal for
+    /// the life of the device. A refusal costs the guest one transaction; it
+    /// must not cost it the channel.
+    ///
+    /// The refusal is still published rather than dropped. The guest polls a
+    /// monotonic completion stamp, so a later transaction's stamp already
+    /// implies this one is over; withholding the position would leave the guest
+    /// waiting on a stamp that can never arrive. What the refusal cost is
+    /// reported separately, on the failure channel, by the caller that named
+    /// it.
+    ///
+    /// A submitted transaction is refused: its work is on a queue, its timeline
+    /// point is immutable, and the only thing that can end it is completion or
+    /// device loss.
+    pub fn abandon_transaction(
+        &mut self,
+        transaction: TransactionId,
+        semantic: Completion,
+    ) -> Result<Vec<PublishedFact<Completion>>, TransactionRuntimeError> {
+        let &state = self
+            .transactions
+            .get(&transaction)
+            .ok_or(TransactionRuntimeError::UnknownTransaction)?;
+        if state.submitted {
+            return Err(TransactionRuntimeError::TransactionAlreadySubmitted);
+        }
+        let mut recording = self.recording.clone();
+        let mut submission_order = self.submission_order.clone();
+        if state.continuation_owned {
+            recording.abandon(transaction)?;
+            submission_order.abandon(transaction)?;
+        }
+        let published =
+            self.commit_publication_position(transaction, semantic, TerminalFact::Abandoned)?;
+        self.recording = recording;
+        self.submission_order = submission_order;
+        Ok(published)
+    }
+
+    /// Settle one transaction's publication position from its terminal fact,
+    /// whichever kind it is, and release every position that unblocks.
+    fn commit_publication_position(
+        &mut self,
+        transaction: TransactionId,
+        semantic: Completion,
+        fact: TerminalFact,
+    ) -> Result<Vec<PublishedFact<Completion>>, TransactionRuntimeError> {
         let mut dependencies = self.dependencies.clone();
         let mut publication = self.publication.clone();
         let mut conditions = self.conditions.clone();
         let mut transactions = self.transactions.clone();
-        dependencies.semantic_complete(transaction)?;
+        match fact {
+            TerminalFact::Completed => dependencies.semantic_complete(transaction)?,
+            TerminalFact::Abandoned => dependencies.abandon(transaction)?,
+        }
         publication.complete(PublicationFact {
             transaction,
             semantic,
@@ -917,16 +1085,21 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
         let mut continuations = self.continuations.clone();
         let mut recording = self.recording.clone();
         let mut conditions = self.conditions.clone();
+        let mut submission_order = self.submission_order.clone();
         dependencies.retire(transaction)?;
         conditions.retire_transaction(transaction)?;
         if state.continuation_owned {
             recording.retire(transaction)?;
             continuations.retire_transaction(transaction)?;
+            // The order identity outlives submission so that a consumer can
+            // still be told a producer went first; retirement is where it ends.
+            submission_order.retire(transaction)?;
         }
         self.dependencies = dependencies;
         self.continuations = continuations;
         self.recording = recording;
         self.conditions = conditions;
+        self.submission_order = submission_order;
         self.transactions.remove(&transaction);
         self.submission_dependencies.remove(&transaction);
         self.submission_hazards.remove(&transaction);
@@ -1012,6 +1185,7 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
                 transaction: *transaction,
                 channel: state.channel,
                 unresolved: self.dependencies.unresolved(*transaction),
+                prerequisites: self.dependencies.prerequisites(*transaction),
                 semantic_ready: ready.contains(transaction),
                 continuation_owned: state.continuation_owned,
                 submitted: state.submitted,
@@ -1079,6 +1253,117 @@ mod tests {
                 payload,
             )
             .unwrap()
+    }
+
+    fn admit_exec_with_prerequisites(
+        runtime: &mut TransactionRuntime<&'static str>,
+        channel: ChannelId,
+        prerequisites: Box<[ResolvedTransactionPrerequisite]>,
+        payload: Payload,
+    ) -> DeviceTransaction<(), (), (), (), ()> {
+        runtime
+            .admit_resolved(
+                channel,
+                prerequisites,
+                Some(CompletionStamp::new(channel.get(), 1)),
+                payload,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_later_execution_chain_waits_while_its_fifo_head_is_issued() {
+        let mut runtime = runtime();
+        let channel = ChannelId::new(1);
+        runtime.define_channel(channel).unwrap();
+        let head = admit_exec(
+            &mut runtime,
+            channel,
+            exec(SegmentKind::Render, false, false),
+        );
+        let later = admit_exec(
+            &mut runtime,
+            channel,
+            exec(SegmentKind::Compute, false, false),
+        );
+
+        assert_eq!(
+            runtime
+                .reserve_submission_head_transaction(head.id)
+                .unwrap()
+                .map(|ready| ready.transaction),
+            Some(head.id)
+        );
+        assert_eq!(
+            runtime
+                .reserve_submission_head_transaction(later.id)
+                .unwrap(),
+            None
+        );
+    }
+
+    /// A cross-channel stamp wait binds its consumer to whichever transaction
+    /// carries that stamp, and a transaction that owns no encoder continuation
+    /// carries one without ever reaching a Vulkan queue. Projecting such a
+    /// producer as a native prerequisite parks the consumer on a timeline point
+    /// that nothing will ever signal, which is a deadlock no counter reports:
+    /// the consumer reads as ordinary in-flight work forever.
+    #[test]
+    fn a_stamp_producer_that_never_submits_is_met_by_its_publication() {
+        let mut runtime = runtime();
+        let consumer_channel = ChannelId::new(1);
+        let producer_channel = ChannelId::new(2);
+        runtime.define_channel(consumer_channel).unwrap();
+        runtime.define_channel(producer_channel).unwrap();
+
+        let consumer = admit_exec_with_prerequisites(
+            &mut runtime,
+            consumer_channel,
+            Box::new([ResolvedTransactionPrerequisite {
+                prerequisite: crate::TransactionPrerequisite::Stamp {
+                    wait: reims_vgpu_protocol::StampWait {
+                        index: producer_channel.get(),
+                        value: 7,
+                    },
+                },
+                resolution: PrerequisiteResolution::Pending,
+            }]),
+            exec(SegmentKind::Render, false, false),
+        );
+
+        // A control transaction owns no continuation, so it publishes without
+        // ever being submitted, yet its completion stamp binds the wait above.
+        let producer = runtime
+            .admit_resolved(
+                producer_channel,
+                Box::<[ResolvedTransactionPrerequisite]>::default(),
+                Some(CompletionStamp::new(producer_channel.get(), 7)),
+                DeviceTransactionPayload::<(), (), (), (), ()>::Control(()),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.submission_dependencies(consumer.id).unwrap(),
+            [(
+                producer.id,
+                WaitDependencyCause::Explicit(crate::ExplicitWaitCause::Stamp {
+                    source_channel: producer_channel,
+                    value: 7,
+                }),
+            )]
+        );
+
+        assert_eq!(
+            runtime.native_submission_dependencies(consumer.id),
+            Ok(NativeSubmissionProjection::AwaitingHostProducer(
+                producer.id
+            ))
+        );
+
+        runtime.semantic_complete(producer.id, "done").unwrap();
+        assert_eq!(
+            runtime.native_submission_dependencies(consumer.id),
+            Ok(NativeSubmissionProjection::Native(Box::new([])))
+        );
     }
 
     #[test]
@@ -1249,6 +1534,81 @@ mod tests {
         );
         runtime.submitted(first.id).unwrap();
         assert_eq!(runtime.take_submission_ready()[0].transaction, second.id);
+    }
+
+    /// A refusal costs the guest one transaction, not the channel it arrived on.
+    ///
+    /// Before [`TransactionRuntime::abandon_transaction`] existed, a
+    /// transaction that failed anywhere between admission and submission kept
+    /// its domain head and its publication position forever, so every later
+    /// transaction on that channel was refused behind it and no fact after it
+    /// ever reached the guest.
+    #[test]
+    fn an_abandoned_transaction_releases_its_channel_to_the_next_one() {
+        let mut runtime = runtime();
+        let channel = ChannelId::new(5);
+        runtime.define_channel(channel).unwrap();
+        let refused = admit_exec(
+            &mut runtime,
+            channel,
+            exec(SegmentKind::Render, false, true),
+        );
+        let next = admit_exec(
+            &mut runtime,
+            channel,
+            exec(SegmentKind::Render, true, false),
+        );
+        assert_eq!(
+            runtime.recorded(next.id).err(),
+            Some(TransactionRuntimeError::Recording(
+                RecordingOrderError::NotReady
+            )),
+            "the refused encoder holds the continuation that follows it"
+        );
+        assert!(
+            runtime.take_submission_ready().is_empty(),
+            "and it holds its domain head"
+        );
+
+        let published = runtime.abandon_transaction(refused.id, "refused").unwrap();
+        assert_eq!(
+            published
+                .iter()
+                .map(|fact| fact.transaction)
+                .collect::<Vec<_>>(),
+            vec![refused.id],
+            "the refusal publishes rather than withholding the guest's stamp"
+        );
+        runtime.retire_transaction(refused.id).unwrap();
+
+        runtime.recorded(next.id).unwrap();
+        assert_eq!(runtime.take_submission_ready()[0].transaction, next.id);
+        runtime.submitted(next.id).unwrap();
+        let published = runtime.semantic_complete(next.id, "done").unwrap();
+        assert_eq!(published[0].transaction, next.id);
+        runtime.retire_transaction(next.id).unwrap();
+        runtime.retire_channel(channel).unwrap();
+    }
+
+    /// Submitted work owns a timeline point, so its only ends are completion
+    /// and device loss.
+    #[test]
+    fn a_submitted_transaction_cannot_be_abandoned() {
+        let mut runtime = runtime();
+        let channel = ChannelId::new(5);
+        runtime.define_channel(channel).unwrap();
+        let transaction = admit_exec(
+            &mut runtime,
+            channel,
+            exec(SegmentKind::Render, false, false),
+        );
+        runtime.recorded(transaction.id).unwrap();
+        runtime.take_submission_ready();
+        runtime.submitted(transaction.id).unwrap();
+        assert_eq!(
+            runtime.abandon_transaction(transaction.id, "refused").err(),
+            Some(TransactionRuntimeError::TransactionAlreadySubmitted)
+        );
     }
 
     #[test]

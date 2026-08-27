@@ -285,7 +285,6 @@ impl PreparedResourceStateBatch {
         let mut transfers = BTreeSet::new();
         let mut completions = Vec::new();
         for state in &self.states {
-            completions.extend(state.gpu_completions.iter().copied());
             completions.extend(
                 state
                     .transfers
@@ -294,6 +293,7 @@ impl PreparedResourceStateBatch {
                     .filter(|transfer| transfers.insert(*transfer))
                     .map(ResolvedResourceCompletion::Transfer),
             );
+            completions.extend(state.gpu_completions.iter().copied());
         }
         completions.into_boxed_slice()
     }
@@ -513,8 +513,11 @@ pub fn prepare_resource_state<T>(
         .collect::<Vec<_>>();
     let transition = ResolvedValidityTransition {
         ops: operation.ops,
-        write: (operation.ops.set_host_valid != 0)
-            .then_some(crate::GpuWriteId::operation(submission, index)),
+        write: (operation.ops.set_host_valid != 0).then_some(crate::GpuWriteId::operation(
+            admitted.transaction(),
+            submission,
+            index,
+        )),
         targets: resolved
             .iter()
             .map(|(target, representations)| crate::ResolvedValidityTarget {
@@ -541,6 +544,16 @@ pub fn prepare_resource_state<T>(
             native.push(representation);
         }
         if let Some(representation) = representations.host_ingress_destination {
+            native.push(representation);
+        }
+        // A guest upload plans a content transfer into this representation, and
+        // the transfer's completion is validated against it when the submission
+        // is accepted. Without the use the representation carries no timeline
+        // obligation, so retirement is free to take it while the submission is
+        // still in flight -- and the acceptance then refuses a completion whose
+        // destination no longer exists, which retires nothing and stops the
+        // channel behind it.
+        if let Some(representation) = representations.guest_upload_destination {
             native.push(representation);
         }
         if operation.ops.clear_guest_valid != 0 && operation.ops.clear_host_valid == 0 {
@@ -795,6 +808,7 @@ fn cancel_resource_state_rows<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackingView;
     use crate::{
         BackingRegion, ExecTransaction, RepresentationRoute, ResolvedExecSegment,
         ResolvedExecStream, ResolvedOperation, ResolvedResourceStateTarget, StorageBacking,
@@ -1065,6 +1079,7 @@ mod tests {
                 RepresentationRoute::HostStagingTransfer {
                     working: crate::WorkingMemoryClass::DeviceLocal,
                 },
+                BackingView::Bytes,
                 (),
             )
             .unwrap();
@@ -1150,6 +1165,7 @@ mod tests {
                 RepresentationRoute::HostStagingTransfer {
                     working: crate::WorkingMemoryClass::DeviceLocal,
                 },
+                BackingView::Bytes,
                 (),
             )
             .unwrap();
@@ -1216,6 +1232,77 @@ mod tests {
     }
 
     #[test]
+    fn a_guest_upload_destination_is_a_use_of_the_transaction_that_plans_it() {
+        let mut resources = ResourceLifecycleOwner::<()>::new(VulkanDeviceEpochId::new(1));
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([BackingRegion::Whole]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let working = resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostStagingTransfer {
+                    working: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                BackingView::Bytes,
+                (),
+            )
+            .unwrap();
+        resources
+            .create_representation(backing, RepresentationRoute::HostStagingEndpoint, ())
+            .unwrap();
+        let operation = ResolvedResourceState {
+            resource: None,
+            mappings: Box::new([]),
+            targets: Box::new([ResolvedResourceStateTarget {
+                backing,
+                regions: Box::new([BackingRegion::Whole]),
+            }]),
+            ops: ResourceValidityOps {
+                clear_host_valid: 1,
+                set_guest_valid: 1,
+                ..ResourceValidityOps::default()
+            },
+        };
+        let prepared = prepare_resource_state(
+            &mut resources,
+            &admitted(operation),
+            0,
+            SubmissionId::new(4),
+            |_, _| ValidityRepresentations {
+                host_write: None,
+                host_ingress_destination: Some(crate::HOST_REPRESENTATION),
+                guest_upload_destination: Some(working),
+                guest_visibility_source: None,
+                guest_visibility_destination: GUEST_REPRESENTATION,
+            },
+        )
+        .unwrap();
+
+        // The upload plans a transfer into `working`, and the acceptance of the
+        // submission carrying it validates that completion against the
+        // representation. Declaring the use is what keeps the representation
+        // from retiring underneath the submission.
+        let declares_destination = prepared
+            .uses()
+            .iter()
+            .filter(|use_| use_.backing == backing)
+            .any(|use_| use_.representations.contains(&working));
+        assert!(
+            declares_destination,
+            "the guest-upload destination is not a declared use"
+        );
+
+        let transaction = prepared.transaction();
+        cancel_resource_state_rows(&mut resources, transaction, vec![prepared]);
+    }
+
+    #[test]
     fn repeated_guest_writes_publish_each_ordered_ingress_before_the_next_version() {
         let mut resources = ResourceLifecycleOwner::<()>::new(VulkanDeviceEpochId::new(1));
         let ResourceLifecycleEffect::BackingCreated(backing) = resources
@@ -1233,6 +1320,7 @@ mod tests {
                 RepresentationRoute::HostStagingTransfer {
                     working: crate::WorkingMemoryClass::DeviceLocal,
                 },
+                BackingView::Bytes,
                 (),
             )
             .unwrap();
@@ -1304,6 +1392,7 @@ mod tests {
                 RepresentationRoute::ImportedGuestTransfer {
                     working: crate::WorkingMemoryClass::DeviceLocal,
                 },
+                BackingView::Bytes,
                 (),
             )
             .unwrap();
@@ -1516,11 +1605,11 @@ mod tests {
 
         assert_eq!(
             first.gpu_reservations()[0].write,
-            crate::GpuWriteId::operation(SubmissionId::new(31), 0)
+            crate::GpuWriteId::operation(admissions.transaction(), SubmissionId::new(31), 0,)
         );
         assert_eq!(
             second.gpu_reservations()[0].write,
-            crate::GpuWriteId::operation(SubmissionId::new(31), 1)
+            crate::GpuWriteId::operation(admissions.transaction(), SubmissionId::new(31), 1,)
         );
         let mut batch =
             assemble_prepared_resource_states(&admissions, vec![first, second]).unwrap();
@@ -1528,7 +1617,7 @@ mod tests {
         assert_eq!(batch.resource_completions().len(), 2);
         let exact_write = batch.states[1].gpu_reservations[0].write;
         batch.states[1].gpu_reservations[0].write =
-            crate::GpuWriteId::operation(SubmissionId::new(31), 99);
+            crate::GpuWriteId::operation(admissions.transaction(), SubmissionId::new(31), 99);
         let failure = cancel_prepared_resource_state_batch(&mut resources, batch).unwrap_err();
         assert!(matches!(
             failure.reason,

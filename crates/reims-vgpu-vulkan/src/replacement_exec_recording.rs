@@ -88,6 +88,12 @@ pub enum ReplacementExecProgramError {
     ResourceState(ResourceStateBatchResolveError),
     ContentSynchronization(crate::replacement_resource_state::ResourceStateTransferRecordError),
     ContentSynchronizationTransactionMismatch,
+    RepresentationUses(reims_vgpu_core::ResourceUseBatchError),
+    RepresentationNativeAbsent {
+        backing: reims_vgpu_protocol::BackingId,
+        representation: reims_vgpu_protocol::RepresentationId,
+    },
+    RepresentationLeases(crate::replacement_recording::ReplacementRecordingLeaseError),
     Recording(ReplacementRecordingError),
 }
 
@@ -887,7 +893,7 @@ mod tests {
         fn resolve(
             &self,
             _backing: BackingId,
-        ) -> Option<crate::replacement_barrier_record::NativeBarrierTarget> {
+        ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
             None
         }
     }

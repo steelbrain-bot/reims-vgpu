@@ -488,6 +488,36 @@ pub(crate) enum ReplacementChildInvalidationAdmissionError {
     Admission(reims_vgpu_core::TransactionRuntimeError),
 }
 
+impl ReplacementChildCpuPacketIngressError {
+    /// Whether re-offering this packet asks a question the guest has already
+    /// answered, so the only thing retrying it buys is the channel behind it.
+    ///
+    /// See
+    /// [`crate::runtime::replacement_session::ReplacementStandaloneInvalidationError::is_terminal_refusal`].
+    /// Everything else here waits on state a later packet supplies -- a task, a
+    /// resource, a mapping, a display present's resolution -- and the retry is
+    /// exactly what delivers it.
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::InvalidationAdmission { reason, .. } => match reason {
+                ReplacementChildInvalidationAdmissionError::Resolution(reason) => {
+                    reason.is_terminal_refusal()
+                }
+                ReplacementChildInvalidationAdmissionError::Admission(_) => false,
+            },
+            Self::Decode(_)
+            | Self::RequiresTransport(_)
+            | Self::TypedRefusal { .. }
+            | Self::PresentResolution { .. }
+            | Self::PresentAdmission { .. }
+            | Self::ControlAdmission { .. }
+            | Self::QueryAdmission { .. }
+            | Self::ResourceAdmission { .. }
+            | Self::MappingChangeAdmission { .. } => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementMappingChangeAdmissionError {
     Resolution(crate::runtime::replacement_session::ReplacementTaskAddressReplacementError),
@@ -787,25 +817,7 @@ pub(crate) fn admit_replacement_child_cpu_packet<Semantic: Clone>(
                 },
             ),
         ReplacementChildPacketRoute::InvalidateResources(command) => {
-            if command.records.iter().all(|record| record.object_id == 0) {
-                return runtime
-                    .admit_control(
-                        envelope.channel,
-                        envelope.prerequisites,
-                        Some(envelope.completion_stamp),
-                        crate::runtime::replacement_session::ReplacementControlCommand::ContractNoOp(
-                            envelope.opcode,
-                        ),
-                    )
-                    .map(ReplacementAdmittedChildCpuPacket::Control)
-                    .map_err(|reason| {
-                        ReplacementChildCpuPacketIngressError::ControlAdmission {
-                            reason,
-                            route: route.clone(),
-                        }
-                    });
-            }
-            let lifecycle = runtime
+            let resolved = runtime
                 .resolve_standalone_invalidation(command)
                 .map_err(
                     |reason| ReplacementChildCpuPacketIngressError::InvalidationAdmission {
@@ -813,6 +825,32 @@ pub(crate) fn admit_replacement_child_cpu_packet<Semantic: Clone>(
                         route: route.clone(),
                     },
                 )?;
+            // Nothing left to move: the packet is admitted as a contract no-op
+            // so it consumes its completion stamp and advances its channel,
+            // which is what separates "already true" from "refused".
+            let lifecycle = match resolved {
+                crate::runtime::replacement_session::ReplacementResolvedInvalidation::Lifecycle(
+                    lifecycle,
+                ) => *lifecycle,
+                crate::runtime::replacement_session::ReplacementResolvedInvalidation::Satisfied => {
+                    return runtime
+                        .admit_control(
+                            envelope.channel,
+                            envelope.prerequisites,
+                            Some(envelope.completion_stamp),
+                            crate::runtime::replacement_session::ReplacementControlCommand::ContractNoOp(
+                                envelope.opcode,
+                            ),
+                        )
+                        .map(ReplacementAdmittedChildCpuPacket::Control)
+                        .map_err(|reason| {
+                            ReplacementChildCpuPacketIngressError::ControlAdmission {
+                                reason,
+                                route: route.clone(),
+                            }
+                        });
+                }
+            };
             runtime
                 .admit_resource_lifecycle(
                     envelope.channel,
@@ -1126,6 +1164,16 @@ pub(crate) enum ReplacementDeferredSynchronizeDispatchFailure<Semantic> {
         deferred: ReplacementDeferredSynchronizeResources,
     },
     Admitted(crate::runtime::replacement_session::ReplacementSynchronizeDispatchFailure<Semantic>),
+}
+
+impl<Semantic> ReplacementDeferredSynchronizeDispatchFailure<Semantic> {
+    /// What refused this deferred synchronize, as a diagnostic string.
+    pub(crate) fn diagnostic(&self) -> String {
+        match self {
+            Self::PreAdmission { reason, .. } => format!("pre_admission={reason:?}"),
+            Self::Admitted(failure) => failure.diagnostic(),
+        }
+    }
 }
 
 pub(crate) fn dispatch_deferred_replacement_synchronize<Semantic>(

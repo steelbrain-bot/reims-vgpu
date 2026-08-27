@@ -590,7 +590,14 @@ impl ReplacementResourceStateProgram {
             operation: prepared.operation().clone(),
             backings: prepared.backings(),
             transfers,
-            completions: prepared.resource_completions().into(),
+            completions: prepared
+                .transfers()
+                .iter()
+                .copied()
+                .map(ResolvedResourceCompletion::Transfer)
+                .chain(prepared.resource_completions().iter().copied())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             native_transfers: resolved_commands,
             image_state: native_image_state,
             host_landings,
@@ -1350,11 +1357,18 @@ mod tests {
         assert_eq!(program.transfers(), &[key]);
         assert_eq!(
             program.completions(),
-            &[ResolvedResourceCompletion::ValidityHostWrite {
-                backing: key.backing,
-                write: reims_vgpu_core::GpuWriteId::operation(SubmissionId::new(2), 0),
-                representation: key.source,
-            }]
+            &[
+                ResolvedResourceCompletion::Transfer(key),
+                ResolvedResourceCompletion::ValidityHostWrite {
+                    backing: key.backing,
+                    write: reims_vgpu_core::GpuWriteId::operation(
+                        prepared.transaction(),
+                        SubmissionId::new(2),
+                        0,
+                    ),
+                    representation: key.source,
+                },
+            ]
         );
         assert_eq!(
             program.native_transfers(),
@@ -1444,7 +1458,6 @@ mod tests {
                     width: 4,
                     height: 4,
                     depth: 1,
-                    ..Default::default()
                 },
                 reims_vgpu_protocol::TextureLevelLayout {
                     offset: 40,
@@ -1453,7 +1466,6 @@ mod tests {
                     width: 2,
                     height: 2,
                     depth: 1,
-                    ..Default::default()
                 },
             ],
             ..Default::default()

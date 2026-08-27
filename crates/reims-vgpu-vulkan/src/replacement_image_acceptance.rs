@@ -311,6 +311,7 @@ mod tests {
     use crate::replacement_recording::ReplacementNativeRecording;
     use crate::replacement_submit::QueueTimelineSemaphores;
     use ash::vk;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         prepare_image_blit, BackingRegion, CompletionStamp, DeviceTransactionPayload,
         ExecTransaction, LinearRange, QueueTimelinePoint, RepresentationRoute, ResolvedBufferRange,
@@ -384,6 +385,7 @@ mod tests {
             .create_execution_representation(
                 source,
                 RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
                 "source",
             )
             .unwrap();
@@ -391,6 +393,7 @@ mod tests {
             .create_execution_representation(
                 destination,
                 RepresentationRoute::HostVisibleWorking,
+                BackingView::Image,
                 "destination",
             )
             .unwrap();

@@ -1,5 +1,22 @@
 //! Interruptible timeline completion observation for one actual Vulkan queue.
 //!
+//! **A watch point that does not increase is not an error.** The request queue
+//! is FIFO, the thread waits on one point at a time, and every wake reports the
+//! timeline's *actual* counter rather than the value it was asked for. So a
+//! request below one already queued needs nothing special: the earlier wait
+//! reports a counter that already answers it, and the later wait finds its own
+//! point signalled and returns at once. An admission rule used to refuse those,
+//! and because a guest upload that cannot get its watch is retained, and a
+//! retained upload holds its channel's submission head, one refusal stopped
+//! every later transaction on that channel for the rest of a boot -- reads and
+//! writes alike, out to a second Metal client that then blocked forever
+//! creating its accelerator user client.
+//!
+//! No Rust test reaches this: starting a watcher needs a real `ash::Device`,
+//! and this crate's tests construct none. The gate is the `conformance/`
+//! battery, which cannot obtain a Metal device at all while the refusal is
+//! present.
+//!
 //! The watcher blocks away from recording and guest-publication owners. A
 //! dedicated host-signaled timeline semaphore interrupts teardown without
 //! advancing the queue timeline and therefore cannot manufacture completion.
@@ -9,7 +26,7 @@ use reims_vgpu_core::QueueTimelinePoint;
 use reims_vgpu_protocol::{QueueOwnerId, QueueTimelineValue, VulkanDeviceEpochId};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc,
 };
 
 #[derive(Debug)]
@@ -22,7 +39,10 @@ pub enum ReplacementTimelineWatcherStartError {
 pub enum ReplacementTimelineWatchError {
     WrongEpoch,
     WrongQueue,
-    PointDidNotIncrease,
+    /// A watch request for a point this queue's watcher has already been asked
+    /// for. Both values are carried because the refusal alone cannot say
+    /// whether two submissions shared a timeline value or one arrived behind
+    /// its predecessor, and those are different defects.
     OwnerStopped,
 }
 
@@ -56,23 +76,6 @@ enum Request {
     Stop,
 }
 
-#[derive(Default)]
-struct WatchAdmission(Mutex<Option<QueueTimelineValue>>);
-
-impl WatchAdmission {
-    fn accept(&self, value: QueueTimelineValue) -> Result<(), ReplacementTimelineWatchError> {
-        let mut last = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if last.is_some_and(|last| value <= last) {
-            return Err(ReplacementTimelineWatchError::PointDidNotIncrease);
-        }
-        *last = Some(value);
-        Ok(())
-    }
-}
-
 /// One blocking completion thread for one real queue timeline.
 pub struct ReplacementTimelineWatcher {
     epoch: VulkanDeviceEpochId,
@@ -82,7 +85,6 @@ pub struct ReplacementTimelineWatcher {
     requests: mpsc::Sender<Request>,
     observations: mpsc::Receiver<ReplacementTimelineObservation>,
     stopping: Arc<AtomicBool>,
-    admission: WatchAdmission,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -131,7 +133,6 @@ impl ReplacementTimelineWatcher {
             requests,
             observations,
             stopping,
-            admission: WatchAdmission::default(),
             join: Some(join),
         })
     }
@@ -146,7 +147,6 @@ impl ReplacementTimelineWatcher {
         if self.stopping.load(Ordering::Acquire) {
             return Err(ReplacementTimelineWatchError::OwnerStopped);
         }
-        self.admission.accept(point.value)?;
         self.requests
             .send(Request::Watch(point))
             .map_err(|_| ReplacementTimelineWatchError::OwnerStopped)
@@ -245,25 +245,5 @@ fn run(
                 break;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn watch_admission_is_monotonic_and_allows_skipped_signal_values() {
-        let admission = WatchAdmission::default();
-        assert_eq!(admission.accept(QueueTimelineValue::new(2)), Ok(()));
-        assert_eq!(admission.accept(QueueTimelineValue::new(4)), Ok(()));
-        assert_eq!(
-            admission.accept(QueueTimelineValue::new(3)),
-            Err(ReplacementTimelineWatchError::PointDidNotIncrease)
-        );
-        assert_eq!(
-            admission.accept(QueueTimelineValue::new(4)),
-            Err(ReplacementTimelineWatchError::PointDidNotIncrease)
-        );
     }
 }

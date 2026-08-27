@@ -87,6 +87,23 @@ pub(crate) enum ReplacementObjectDeleteRefusal {
     Pipeline(reims_vgpu_core::PipelineLifecycleError),
 }
 
+impl ReplacementObjectDeleteRefusal {
+    /// Whether no later guest packet can make this delete succeed.
+    ///
+    /// A delete naming an object this device never registered is the one such
+    /// arm: the guest has already stopped tracking that name, so nothing will
+    /// ever create it, and every retry asks the same resolved question again.
+    /// The other three are genuinely pending -- an unresolved resource
+    /// lifecycle, an object still held by live work, a pipeline mid-flight --
+    /// and a later packet is exactly what clears them.
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::UnknownObject(_) => true,
+            Self::ResourceLifecycleUnresolved(_) | Self::Object(_) | Self::Pipeline(_) => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReplacementObjectDeleteFailure {
     pub reason: ReplacementObjectDeleteRefusal,
@@ -216,14 +233,36 @@ pub(crate) enum ReplacementTextureViewRefusal {
 pub(crate) enum ReplacementIOSurfacePlaneViewRefusal {
     NotIOSurfacePlaneView,
     Incomplete(reims_vgpu_protocol::IOSurfacePlaneViewDecodeState),
-    DeclaredReferenceMismatch { declared: Option<u32>, object: u32 },
-    SurfaceUnbound,
+    DeclaredReferenceMismatch {
+        declared: Option<u32>,
+        object: u32,
+    },
+    /// The descriptor's surface field is the unbound reference. An unbound
+    /// `ref == 0` is ordinary control flow elsewhere in this device, so this
+    /// arm is separated from the self-reference below: the two say different
+    /// things about the record and only one of them is a shape this decoder
+    /// does not understand.
+    SurfaceRefUnbound,
+    /// The descriptor's surface field names the plane view's own object slot
+    /// *in its own task's namespace*, which leaves no parent to resolve.
+    ///
+    /// The surface field and the view's own ref are two object ids in two
+    /// object lists: the descriptor carries `owner_task` precisely because the
+    /// surface is registered against the task that owns it while the view
+    /// belongs to the task whose list is being admitted, and the two differ by
+    /// construction. Equal ids across different tasks name different objects
+    /// and are ordinary, so the task has to match before the equality means
+    /// anything at all.
+    SurfaceRefSelf(u32),
     SurfaceUnavailable(u32),
     ParentKindUnsupported(reims_vgpu_protocol::ObjectKind),
     ParentDescriptorUnavailable,
-    PlaneOutOfBounds { plane: u32, count: u8 },
+    PlaneOutOfBounds {
+        plane: u32,
+        count: u8,
+    },
     PlaneGeometryMismatch,
-    Declaration(crate::runtime::replacement_session::ReplacementViewResourceDeclarationError),
+    Declaration(crate::runtime::replacement_session::ReplacementIOSurfacePlaneViewDeclarationError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -393,8 +432,13 @@ pub(crate) fn apply_replacement_iosurface_plane_view<Semantic: Clone>(
         );
     }
     let surface_ref = view_resource.surface.get();
-    if surface_ref == 0 || surface_ref == reference {
-        return Err(ReplacementIOSurfacePlaneViewRefusal::SurfaceUnbound);
+    if surface_ref == 0 {
+        return Err(ReplacementIOSurfacePlaneViewRefusal::SurfaceRefUnbound);
+    }
+    if view_resource.owner_task == task && surface_ref == reference {
+        return Err(ReplacementIOSurfacePlaneViewRefusal::SurfaceRefSelf(
+            surface_ref,
+        ));
     }
     // The descriptor's owner task names the namespace containing the parent
     // surface. The plane view itself belongs to the task whose object list is
@@ -442,12 +486,12 @@ pub(crate) fn apply_replacement_iosurface_plane_view<Semantic: Clone>(
         return Err(ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch);
     }
     runtime
-        .declare_resource_view(
+        .declare_io_surface_plane_view(
             task,
             reims_vgpu_protocol::ObjectTableRef::new(reference),
-            reims_vgpu_protocol::ObjectKind::IOSurfacePlaneView,
             Arc::new(ResourceDescriptor::IOSurfacePlaneView(view_resource)),
             surface,
+            reims_vgpu_protocol::PlaneIndex::new(view.plane_index),
         )
         .map_err(ReplacementIOSurfacePlaneViewRefusal::Declaration)
 }

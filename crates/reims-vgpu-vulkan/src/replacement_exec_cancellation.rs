@@ -102,6 +102,7 @@ mod tests {
         ReplacementImageKey, ReplacementImageSharing, ReplacementImageState, ReplacementImageUse,
     };
     use ash::vk;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         assemble_prepared_exec_resources, prepare_buffer_blit_with_write, BackingRegion,
         BufferFillPattern, ExecTransaction, GpuWriteId, LinearRange, PreparedExecResourceInputs,
@@ -130,7 +131,12 @@ mod tests {
             unreachable!()
         };
         resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let operation = ResolvedBlit::Fill {
             destination: ResolvedBufferRange {
@@ -178,7 +184,7 @@ mod tests {
                 buffer_blits: Box::new([prepare_buffer_blit_with_write(
                     &mut resources,
                     transaction,
-                    GpuWriteId::operation(submission, 0),
+                    GpuWriteId::operation(transaction, submission, 0),
                     operation,
                 )
                 .unwrap()]),

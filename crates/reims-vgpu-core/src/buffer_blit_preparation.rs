@@ -8,11 +8,11 @@
 //! lifetime holds.
 
 use crate::{
-    BackingRegion, BlitKind, BufferFillPattern, DirectReplayNativeOwner, GpuWriteBatchError,
-    GpuWriteRequest, GpuWriteReservation, LinearRange, ManagedBackingError, ManagedBackingProgress,
-    PreparedNativeSubmission, ReplayAcceptance, ReplayAcceptanceError, RepresentationUse,
-    ResolvedBlit, ResolvedReplayCompletion, ResolvedResourceCompletion, ResourceLifecycleOwner,
-    ResourceUseBatchError, TransactionRuntime,
+    BackingRegion, BackingView, BlitKind, BufferFillPattern, DirectReplayNativeOwner,
+    GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation, LinearRange, ManagedBackingError,
+    ManagedBackingProgress, PreparedNativeSubmission, ReplayAcceptance, ReplayAcceptanceError,
+    RepresentationUse, ResolvedBlit, ResolvedReplayCompletion, ResolvedResourceCompletion,
+    ResourceLifecycleOwner, ResourceUseBatchError, TransactionRuntime,
 };
 use reims_vgpu_protocol::{BackingId, RepresentationId, SubmissionId, TransactionId};
 use std::collections::BTreeMap;
@@ -157,7 +157,7 @@ pub fn prepare_buffer_blit_with_write<T>(
                 }));
             }
             let representation = resources
-                .execution_representation_id(destination.storage)
+                .view_representation(destination.storage, BackingView::Bytes)
                 .map_err(|reason| {
                     Box::new(BufferBlitPreparationFailure {
                         reason: BufferBlitPreparationError::Destination {
@@ -194,8 +194,7 @@ pub fn prepare_buffer_blit_with_write<T>(
                     })
                 })?;
             let source_representation = resources
-                .execution_representation_for_snapshot(source.storage, &snapshot)
-                .map(|(representation, _)| representation)
+                .view_representation_for_snapshot(source.storage, BackingView::Bytes, &snapshot)
                 .map_err(|reason| {
                     Box::new(BufferBlitPreparationFailure {
                         reason: BufferBlitPreparationError::Source {
@@ -207,7 +206,7 @@ pub fn prepare_buffer_blit_with_write<T>(
                     })
                 })?;
             let destination_representation = resources
-                .execution_representation_id(destination.storage)
+                .view_representation(destination.storage, BackingView::Bytes)
                 .map_err(|reason| {
                     Box::new(BufferBlitPreparationFailure {
                         reason: BufferBlitPreparationError::Destination {
@@ -472,7 +471,12 @@ mod tests {
         name: &'static str,
     ) -> RepresentationId {
         resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, name)
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                name,
+            )
             .unwrap()
     }
 

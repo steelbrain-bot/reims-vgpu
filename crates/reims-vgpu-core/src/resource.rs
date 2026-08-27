@@ -7,8 +7,8 @@ use crate::content_authority::{
 use reims_vgpu_protocol::{
     BackingGeneration, BackingId, ByteLength, ByteOffset, ContentVersion, GuestVirtualAddress,
     HeapObject, MapperSurfaceRef, MappingId, ObjectKind, ObjectTableRef, PlaneIndex,
-    ResourceDescriptor, ResourceId, ResourceObject, SubmissionId, SurfaceBackingId, SwizzlePlan,
-    TaskId, TextureType, TextureViewForm,
+    ResourceDescriptor, ResourceId, ResourceObject, SubmissionId, SwizzlePlan, TaskId, TextureType,
+    TextureViewForm,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -83,6 +83,7 @@ pub struct ResolvedTextureBindingView {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextureViewResolveError {
+    BackingAbsent(BackingId),
     ResourceAbsent(AnyResourceId),
     NotTextureView(AnyResourceId),
     DescriptorAbsent(AnyResourceId),
@@ -527,12 +528,17 @@ pub enum StorageBacking {
         offset: ByteOffset,
         bytes_per_row: ByteLength,
     },
+    /// One declared plane of a registered IOSurface.
+    ///
+    /// The surface itself is an allocation and owns no backing: it may declare
+    /// several planes at their own offsets with their own extent, row pitch
+    /// and pixel format, and a backing carries one execution representation
+    /// and one layout. The plane's owning surface is named by its generational
+    /// resource identity, so a reused object slot cannot redirect a live
+    /// plane.
     IOSurfacePlane {
-        surface: SurfaceBackingId,
+        surface: AnyResourceId,
         plane: PlaneIndex,
-    },
-    RegisteredSurface {
-        surface: SurfaceBackingId,
     },
     /// Mapper-path surface storage whose shared-backing identity is not yet
     /// established independently of the mapping object.
@@ -553,6 +559,42 @@ pub enum StorageBacking {
         heap: ResourceId<HeapObject>,
         allocation: AnyResourceId,
     },
+}
+
+/// Which class of storage a backing is, without the fields that distinguish
+/// two backings of the same class.
+///
+/// A materializer serves exactly one class and must refuse the rest by name:
+/// only [`StorageBacking::TaskAddress`] carries the guest address and length a
+/// fresh materialization needs, and every other class has its own materializer.
+/// A refusal that says only "this backing is unavailable" cannot tell a backing
+/// this device has never heard of from one whose class is simply somebody
+/// else's job, and those want opposite repairs. Carrying the class rather than
+/// the whole [`StorageBacking`] keeps the refusal `Copy` and keeps a guest
+/// address out of a diagnostic.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StorageClass {
+    Dedicated,
+    TaskAddress,
+    BufferRange,
+    IOSurfacePlane,
+    MapperSurface,
+    HeapPlacement,
+    HeapAllocation,
+}
+
+impl StorageBacking {
+    pub const fn class(&self) -> StorageClass {
+        match self {
+            Self::Dedicated => StorageClass::Dedicated,
+            Self::TaskAddress { .. } => StorageClass::TaskAddress,
+            Self::BufferRange { .. } => StorageClass::BufferRange,
+            Self::IOSurfacePlane { .. } => StorageClass::IOSurfacePlane,
+            Self::MapperSurface { .. } => StorageClass::MapperSurface,
+            Self::HeapPlacement { .. } => StorageClass::HeapPlacement,
+            Self::HeapAllocation { .. } => StorageClass::HeapAllocation,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -746,6 +788,12 @@ impl ResourceGraph {
                     Some(existing) if existing == storage => {}
                     Some(_) => return None,
                 }
+                // A resource owning storage *is* its backing. An IOSurface
+                // plane view owns the plane it names while its parent surface
+                // owns the whole allocation, so climbing past the first owner
+                // would read two disagreeing backings off a graph that is
+                // perfectly well formed.
+                continue;
             }
             pending.extend(resource.parents.iter().copied());
         }
@@ -1257,6 +1305,33 @@ impl ResourceGraph {
         Ok(views.into_boxed_slice())
     }
 
+    /// Resolve every live shader-visible view whose base resolves to one
+    /// canonical backing. A native image representation is backing-owned, so
+    /// rebuilding it must include views below every aliased base resource,
+    /// not only the base which happened to trigger materialization.
+    pub fn texture_binding_views_for_backing(
+        &self,
+        backing: BackingId,
+    ) -> Result<Box<[ResolvedTextureBindingView]>, TextureViewResolveError> {
+        if !self.storage.contains_key(&backing) {
+            return Err(TextureViewResolveError::BackingAbsent(backing));
+        }
+        let mut views = self
+            .resources
+            .values()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    ObjectKind::TextureView | ObjectKind::IOSurfacePlaneView
+                ) && node.lifecycle != LifecycleState::Released
+                    && self.resolved_backing(node.id) == Some(backing)
+            })
+            .map(|node| self.resolve_texture_binding_view(node.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        views.sort_by_key(|view| view.resource);
+        Ok(views.into_boxed_slice())
+    }
+
     pub fn resources_for_task(&self, task: TaskId) -> Box<[AnyResourceId]> {
         self.resources
             .values()
@@ -1420,6 +1495,22 @@ impl ResourceGraph {
         Ok(self.remove_storage_node(id))
     }
 
+    /// Every distinct backing owned by a released resource subtree, in
+    /// canonical order.
+    ///
+    /// Derived rather than passed in: a caller that assembled its own set could
+    /// miss a plane, and a tree release that retires all but one backing leaks
+    /// it with nothing to say so.
+    pub fn resource_tree_backings(&self, resources: &[AnyResourceId]) -> Box<[BackingId]> {
+        resources
+            .iter()
+            .filter_map(|resource| self.resources.get(resource)?.storage)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
     pub fn validate_storage_retirement_after_resources(
         &self,
         id: BackingId,
@@ -1488,23 +1579,35 @@ impl ResourceGraph {
             .into_boxed_slice()
     }
 
-    pub fn registered_surface_storage(
+    /// One canonical backing per declared plane of an IOSurface.
+    ///
+    /// A multi-plane surface is one guest allocation carrying several textures
+    /// at declared offsets with their own geometry, row pitch and pixel format,
+    /// so each plane is its own backing rather than a view aliasing the whole
+    /// allocation. Sharing one backing across planes leaves the surface with
+    /// several plane views and no single layout, which is exactly the shape a
+    /// biplanar guest surface arrives in.
+    pub fn io_surface_plane_storage(
         &mut self,
-        surface: SurfaceBackingId,
+        surface: AnyResourceId,
+        plane: PlaneIndex,
     ) -> Result<BackingId, GraphError> {
-        if let Some(id) = self.storage.values().find_map(|storage| {
-            (storage.backing == StorageBacking::RegisteredSurface { surface }).then_some(storage.id)
-        }) {
+        if let Some(id) = self.find_io_surface_plane_storage(surface, plane) {
             return Ok(id);
         }
-        self.create_storage(StorageBacking::RegisteredSurface { surface })
+        self.create_storage(StorageBacking::IOSurfacePlane { surface, plane })
     }
 
-    /// Resolve an already established registered-surface backing without
-    /// creating storage from a surface name alone.
-    pub fn find_registered_surface_storage(&self, surface: SurfaceBackingId) -> Option<BackingId> {
+    /// Resolve an already established plane backing without creating storage
+    /// from a surface name and plane index alone.
+    pub fn find_io_surface_plane_storage(
+        &self,
+        surface: AnyResourceId,
+        plane: PlaneIndex,
+    ) -> Option<BackingId> {
         self.storage.values().find_map(|storage| {
-            (storage.backing == StorageBacking::RegisteredSurface { surface }).then_some(storage.id)
+            (storage.backing == StorageBacking::IOSurfacePlane { surface, plane })
+                .then_some(storage.id)
         })
     }
 
@@ -2368,36 +2471,58 @@ mod tests {
     }
 
     #[test]
-    fn a_registered_surface_and_its_view_share_one_storage_identity() {
+    fn a_registered_surface_owns_no_backing_and_its_planes_own_one_each() {
         let mut graph = ResourceGraph::default();
-        let storage = graph
-            .registered_surface_storage(SurfaceBackingId::new(44))
-            .unwrap();
         let surface = graph
-            .create_resource(
-                task(),
-                object(1),
-                ObjectKind::SurfaceBacking,
-                Some(storage),
-                [],
-            )
+            .create_resource(task(), object(1), ObjectKind::SurfaceBacking, None, [])
             .unwrap();
-        let view = graph
-            .create_resource(task(), object(2), ObjectKind::IOSurfacePlaneView, None, [])
+        let first = graph
+            .io_surface_plane_storage(surface, PlaneIndex::new(0))
             .unwrap();
+        let second = graph
+            .io_surface_plane_storage(surface, PlaneIndex::new(1))
+            .unwrap();
+        assert_ne!(first, second);
+        // Asking twice for one plane is the same backing: the key is the
+        // surface's generational identity and the declared plane, so nothing
+        // has to be remembered anywhere else.
+        assert_eq!(
+            graph
+                .io_surface_plane_storage(surface, PlaneIndex::new(0))
+                .unwrap(),
+            first
+        );
 
-        graph.link_parent(view, surface).unwrap();
+        let views = [first, second].map(|storage| {
+            graph
+                .create_resource(
+                    task(),
+                    object(if storage == first { 2 } else { 3 }),
+                    ObjectKind::IOSurfacePlaneView,
+                    Some(storage),
+                    [surface],
+                )
+                .unwrap()
+        });
+        assert_eq!(graph.resource(surface).unwrap().storage, None);
+        assert_eq!(graph.resolved_backing(views[0]), Some(first));
+        assert_eq!(graph.resolved_backing(views[1]), Some(second));
+        // The tree's backings are both planes and nothing else, so a release
+        // cannot retire one and leak the other.
+        let resources = graph.live_resource_tree_child_first(surface).unwrap();
+        assert_eq!(
+            graph.resource_tree_backings(&resources).as_ref(),
+            [first, second]
+        );
 
-        assert_eq!(graph.resource(view).unwrap().storage, Some(storage));
-        assert_eq!(graph.storage(storage).unwrap().owners.len(), 2);
-        let surface_content = graph.resource(surface).unwrap().content.clone();
-        let view_content = graph.resource(view).unwrap().content.clone();
-        assert!(surface_content.same_authority(&view_content));
-        let before = view_content.current();
-        surface_content.guest_wrote().unwrap();
-        assert_ne!(view_content.current(), before);
-        graph.release_reference(task(), object(1)).unwrap();
-        assert!(graph.resource(surface).is_some());
+        // A guest write to the allocation reaches both planes, because the
+        // alias closure follows the surface's children whether or not they
+        // share its authority.
+        let before = views.map(|view| graph.resource(view).unwrap().content.current());
+        graph.guest_wrote_aliases(surface).unwrap();
+        for (view, was) in views.into_iter().zip(before) {
+            assert_ne!(graph.resource(view).unwrap().content.current(), was);
+        }
     }
 
     #[test]
@@ -2997,6 +3122,39 @@ mod tests {
             vec![
                 graph.resolve_texture_binding_view(inner).unwrap(),
                 graph.resolve_texture_binding_view(outer).unwrap(),
+            ]
+            .into_boxed_slice()
+        );
+
+        let backing = graph.create_storage(StorageBacking::Dedicated).unwrap();
+        graph.attach_initial_storage(base, backing).unwrap();
+        let aliased_base = graph
+            .create_resource_with_descriptor(
+                task(),
+                object(6),
+                ObjectKind::Texture,
+                graph.resource(base).unwrap().descriptor.clone(),
+                None,
+                [],
+            )
+            .unwrap();
+        graph.attach_initial_storage(aliased_base, backing).unwrap();
+        let aliased_view = graph
+            .create_resource_with_descriptor(
+                task(),
+                object(7),
+                ObjectKind::TextureView,
+                graph.resource(inner).unwrap().descriptor.clone(),
+                None,
+                [aliased_base],
+            )
+            .unwrap();
+        assert_eq!(
+            graph.texture_binding_views_for_backing(backing).unwrap(),
+            vec![
+                graph.resolve_texture_binding_view(inner).unwrap(),
+                graph.resolve_texture_binding_view(outer).unwrap(),
+                graph.resolve_texture_binding_view(aliased_view).unwrap(),
             ]
             .into_boxed_slice()
         );

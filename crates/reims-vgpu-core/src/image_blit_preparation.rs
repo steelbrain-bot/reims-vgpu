@@ -2,30 +2,24 @@
 
 use crate::{
     pixel_format::{buffer_image_blit_aspect, BlitAspect},
-    AccessIntent, AccessMode, AccessScope, AccessTarget, BackingRegion, DirectReplayNativeOwner,
-    GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation, ManagedBackingError,
-    ManagedBackingProgress, PreparedNativeSubmission, ReplayAcceptance, ReplayAcceptanceError,
-    RepresentationUse, ResolvedBlit, ResolvedReplayCompletion, ResolvedResourceCompletion,
-    ResolvedTextureEndpoint, ResourceLifecycleOwner, ResourceUseBatchError, StageScope,
-    TransactionRuntime,
+    AccessIntent, AccessMode, AccessScope, AccessTarget, BackingRegion, BackingView,
+    DirectReplayNativeOwner, GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation,
+    ManagedBackingError, ManagedBackingProgress, PreparedNativeSubmission, ReplayAcceptance,
+    ReplayAcceptanceError, RepresentationUse, ResolvedBlit, ResolvedReplayCompletion,
+    ResolvedResourceCompletion, ResolvedTextureEndpoint, ResourceLifecycleOwner,
+    ResourceUseBatchError, StageScope, TransactionRuntime, ViewRepresentation,
 };
 use reims_vgpu_protocol::{
     BackingId, HazardDomainId, RepresentationId, SubmissionId, TransactionId,
 };
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct PreparedBlitRepresentation {
-    pub backing: BackingId,
-    pub representation: RepresentationId,
-}
-
 #[derive(Debug)]
 pub struct PreparedImageBlit {
     transaction: TransactionId,
     write: crate::GpuWriteId,
     operation: ResolvedBlit,
-    representations: Box<[PreparedBlitRepresentation]>,
+    representations: Box<[ViewRepresentation]>,
     uses: Box<[RepresentationUse]>,
     writes: Box<[GpuWriteReservation]>,
 }
@@ -51,7 +45,7 @@ impl PreparedImageBlit {
         self.operation
     }
 
-    pub const fn representations(&self) -> &[PreparedBlitRepresentation] {
+    pub const fn representations(&self) -> &[ViewRepresentation] {
         &self.representations
     }
 
@@ -127,8 +121,8 @@ pub fn prepare_image_blit_with_write<T>(
     write: crate::GpuWriteId,
     operation: ResolvedBlit,
 ) -> Result<PreparedImageBlit, Box<ImageBlitPreparationFailure>> {
-    let mut reads = BTreeMap::<BackingId, Vec<BackingRegion>>::new();
-    let mut writes = BTreeMap::<BackingId, Vec<BackingRegion>>::new();
+    let mut reads = BTreeMap::<(BackingId, BackingView), Vec<BackingRegion>>::new();
+    let mut writes = BTreeMap::<(BackingId, BackingView), Vec<BackingRegion>>::new();
     collect_regions(&operation, &mut reads, &mut writes).map_err(|reason| {
         Box::new(ImageBlitPreparationFailure {
             reason,
@@ -141,8 +135,8 @@ pub fn prepare_image_blit_with_write<T>(
         regions.dedup();
     }
 
-    let mut representations = BTreeMap::<BackingId, RepresentationId>::new();
-    for (&backing, regions) in &reads {
+    let mut representations = BTreeMap::<(BackingId, BackingView), RepresentationId>::new();
+    for (&(backing, view), regions) in &reads {
         let snapshot = resources
             .snapshot_content(backing, regions)
             .map_err(|reason| {
@@ -153,8 +147,7 @@ pub fn prepare_image_blit_with_write<T>(
                 })
             })?;
         let representation = resources
-            .execution_representation_for_snapshot(backing, &snapshot)
-            .map(|(representation, _)| representation)
+            .view_representation_for_snapshot(backing, view, &snapshot)
             .map_err(|reason| {
                 Box::new(ImageBlitPreparationFailure {
                     reason: ImageBlitPreparationError::Source { backing, reason },
@@ -162,14 +155,14 @@ pub fn prepare_image_blit_with_write<T>(
                     live_writes: Box::new([]),
                 })
             })?;
-        representations.insert(backing, representation);
+        representations.insert((backing, view), representation);
     }
-    for &backing in writes.keys() {
-        if representations.contains_key(&backing) {
+    for &(backing, view) in writes.keys() {
+        if representations.contains_key(&(backing, view)) {
             continue;
         }
         let representation = resources
-            .execution_representation_id(backing)
+            .view_representation(backing, view)
             .map_err(|reason| {
                 Box::new(ImageBlitPreparationFailure {
                     reason: ImageBlitPreparationError::Destination { backing, reason },
@@ -177,7 +170,7 @@ pub fn prepare_image_blit_with_write<T>(
                     live_writes: Box::new([]),
                 })
             })?;
-        representations.insert(backing, representation);
+        representations.insert((backing, view), representation);
     }
 
     let write_reservations = resources
@@ -185,9 +178,9 @@ pub fn prepare_image_blit_with_write<T>(
             write,
             writes
                 .iter()
-                .map(|(&backing, regions)| GpuWriteRequest {
-                    backing,
-                    representation: representations[&backing],
+                .map(|(&key, regions)| GpuWriteRequest {
+                    backing: key.0,
+                    representation: representations[&key],
                     regions: regions.clone().into_boxed_slice(),
                 })
                 .collect::<Vec<_>>()
@@ -200,11 +193,23 @@ pub fn prepare_image_blit_with_write<T>(
                 live_writes: Box::new([]),
             })
         })?;
-    let uses = representations
-        .iter()
-        .map(|(&backing, &representation)| RepresentationUse {
-            backing,
-            representations: Box::new([representation]),
+    // One use per backing, naming every view of it this blit touches: a
+    // backing read through its buffer view and written through its image view
+    // is one backing holding two native objects, and both have to survive the
+    // transaction.
+    let mut uses = BTreeMap::<BackingId, Vec<RepresentationId>>::new();
+    for (&(backing, _), &representation) in &representations {
+        uses.entry(backing).or_default().push(representation);
+    }
+    let uses = uses
+        .into_iter()
+        .map(|(backing, mut representations)| {
+            representations.sort();
+            representations.dedup();
+            RepresentationUse {
+                backing,
+                representations: representations.into_boxed_slice(),
+            }
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
@@ -231,8 +236,9 @@ pub fn prepare_image_blit_with_write<T>(
         operation,
         representations: representations
             .into_iter()
-            .map(|(backing, representation)| PreparedBlitRepresentation {
+            .map(|((backing, view), representation)| ViewRepresentation {
                 backing,
+                view,
                 representation,
             })
             .collect::<Vec<_>>()
@@ -242,10 +248,15 @@ pub fn prepare_image_blit_with_write<T>(
     })
 }
 
+/// Split a blit into the exact regions each endpoint reads and writes, keyed
+/// by the backing *and the view of it* the endpoint is. A buffer endpoint
+/// addresses the bytes and a texture endpoint addresses the texels; which one
+/// an endpoint is is a property of the operation, and nothing downstream can
+/// recover it once the key has dropped it.
 fn collect_regions(
     operation: &ResolvedBlit,
-    reads: &mut BTreeMap<BackingId, Vec<BackingRegion>>,
-    writes: &mut BTreeMap<BackingId, Vec<BackingRegion>>,
+    reads: &mut BTreeMap<(BackingId, BackingView), Vec<BackingRegion>>,
+    writes: &mut BTreeMap<(BackingId, BackingView), Vec<BackingRegion>>,
 ) -> Result<(), ImageBlitPreparationError> {
     match operation {
         ResolvedBlit::Fill { .. } | ResolvedBlit::Copy { .. } => {
@@ -255,11 +266,11 @@ fn collect_regions(
             let aspect =
                 buffer_image_blit_aspect(blit.destination.backing.pixel_format(), blit.aspect);
             reads
-                .entry(blit.source.storage)
+                .entry((blit.source.storage, BackingView::Bytes))
                 .or_default()
                 .push(BackingRegion::Linear(blit.source.region));
             writes
-                .entry(blit.destination.storage)
+                .entry((blit.destination.storage, BackingView::Image))
                 .or_default()
                 .extend(image_regions(
                     &blit.destination,
@@ -271,7 +282,7 @@ fn collect_regions(
         ResolvedBlit::TextureToBuffer(blit) => {
             let aspect = buffer_image_blit_aspect(blit.source.backing.pixel_format(), blit.aspect);
             reads
-                .entry(blit.source.storage)
+                .entry((blit.source.storage, BackingView::Image))
                 .or_default()
                 .extend(image_regions(
                     &blit.source,
@@ -280,13 +291,13 @@ fn collect_regions(
                     aspect,
                 )?);
             writes
-                .entry(blit.destination.storage)
+                .entry((blit.destination.storage, BackingView::Bytes))
                 .or_default()
                 .push(BackingRegion::Linear(blit.destination.region));
         }
         ResolvedBlit::TextureToTexture(blit) => {
             reads
-                .entry(blit.source.storage)
+                .entry((blit.source.storage, BackingView::Image))
                 .or_default()
                 .extend(image_regions(
                     &blit.source,
@@ -295,7 +306,7 @@ fn collect_regions(
                     blit.aspect,
                 )?);
             writes
-                .entry(blit.destination.storage)
+                .entry((blit.destination.storage, BackingView::Image))
                 .or_default()
                 .extend(image_regions(
                     &blit.destination,
@@ -316,11 +327,11 @@ fn collect_regions(
                     };
                     let origin = crate::TextureOrigin { x: 0, y: 0, z: 0 };
                     reads
-                        .entry(source.storage)
+                        .entry((source.storage, BackingView::Image))
                         .or_default()
                         .extend(image_regions(source, origin, extent, BlitAspect::Full)?);
                     writes
-                        .entry(destination.storage)
+                        .entry((destination.storage, BackingView::Image))
                         .or_default()
                         .extend(image_regions(
                             destination,
@@ -333,6 +344,21 @@ fn collect_regions(
         }
     }
     Ok(())
+}
+
+/// Collapse view-keyed regions onto the backings they name.
+///
+/// Content synchronization and scheduler hazards are statements about bytes,
+/// and both views of one backing are the same bytes. Only native-object
+/// selection needs the view.
+fn fold_by_backing(
+    keyed: BTreeMap<(BackingId, BackingView), Vec<BackingRegion>>,
+) -> BTreeMap<BackingId, Vec<BackingRegion>> {
+    let mut folded = BTreeMap::<BackingId, Vec<BackingRegion>>::new();
+    for ((backing, _), regions) in keyed {
+        folded.entry(backing).or_default().extend(regions);
+    }
+    folded
 }
 
 /// Exact canonical source regions a blit consumes. Destination-only fills
@@ -349,7 +375,11 @@ pub fn blit_content_synchronization_requests(
                 .or_default()
                 .push(BackingRegion::Linear(source.region));
         }
-        _ => collect_regions(operation, &mut reads, &mut BTreeMap::new())?,
+        _ => {
+            let mut keyed = BTreeMap::new();
+            collect_regions(operation, &mut keyed, &mut BTreeMap::new())?;
+            reads = fold_by_backing(keyed);
+        }
     }
     Ok(reads
         .into_iter()
@@ -359,6 +389,7 @@ pub fn blit_content_synchronization_requests(
             crate::ContentSynchronizationRequest {
                 backing,
                 regions: regions.into_boxed_slice(),
+                permitted_pending_writes: Box::new([]),
             }
         })
         .collect::<Vec<_>>()
@@ -394,7 +425,13 @@ pub fn resolved_blit_accesses(
                 .or_default()
                 .push(BackingRegion::Linear(destination.region));
         }
-        _ => collect_regions(operation, &mut reads, &mut writes)?,
+        _ => {
+            let mut keyed_reads = BTreeMap::new();
+            let mut keyed_writes = BTreeMap::new();
+            collect_regions(operation, &mut keyed_reads, &mut keyed_writes)?;
+            reads = fold_by_backing(keyed_reads);
+            writes = fold_by_backing(keyed_writes);
+        }
     }
     for regions in reads.values_mut().chain(writes.values_mut()) {
         regions.sort();
@@ -670,13 +707,22 @@ mod tests {
         }
     }
 
+    /// An execution representation for one view of a backing. The view is the
+    /// fixture's own statement about what it built: a buffer endpoint of a
+    /// blit needs a buffer and a texture endpoint needs an image.
     fn execution(
         resources: &mut ResourceLifecycleOwner<&'static str>,
         backing: BackingId,
+        view: BackingView,
         name: &'static str,
     ) -> RepresentationId {
         resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, name)
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                view,
+                name,
+            )
             .unwrap()
     }
 
@@ -754,13 +800,105 @@ mod tests {
         assert_eq!(accesses[1].mode, AccessMode::Write);
     }
 
+    /// One guest allocation declared as both a buffer and a linear texture is
+    /// one backing carrying two native objects: the image the texture owner
+    /// materialized, and the host staging endpoint that image transfers
+    /// through. A blit reading it as a buffer must resolve the endpoint.
+    ///
+    /// Without the view on the key this resolves the backing's single
+    /// execution representation for both endpoints, hands the recorder an
+    /// image where it asked for a buffer, and the copy refuses as
+    /// `UnknownBuffer` on every retry — a permanent submission-head stall
+    /// rather than one lost command.
+    #[test]
+    fn a_backing_read_as_bytes_resolves_its_endpoint_and_not_its_image() {
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let source = backing(&mut resources);
+        let destination = backing(&mut resources);
+        // The texture owner's materialization: a staging endpoint for the
+        // bytes and an image for the texels, both on the one backing.
+        let endpoint = resources
+            .create_representation(source, RepresentationRoute::HostStagingEndpoint, "endpoint")
+            .unwrap();
+        assert_eq!(endpoint, crate::HOST_REPRESENTATION);
+        let image = resources
+            .create_execution_representation(
+                source,
+                RepresentationRoute::HostStagingTransfer {
+                    working: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                BackingView::Image,
+                "image",
+            )
+            .unwrap();
+        let destination_representation = execution(
+            &mut resources,
+            destination,
+            BackingView::Image,
+            "destination",
+        );
+        materialize(
+            &mut resources,
+            source,
+            endpoint,
+            BackingRegion::Linear(LinearRange::new(8, 80).unwrap()),
+        );
+
+        let operation = ResolvedBlit::BufferToTexture(ResolvedBufferToTextureBlit {
+            source: buffer(source),
+            source_bytes_per_row: 16,
+            source_bytes_per_image: 80,
+            destination: texture(destination, MTL_FORMAT_RGBA8_UNORM),
+            destination_origin: TextureOrigin { x: 0, y: 0, z: 0 },
+            extent: TextureExtent {
+                width: 4,
+                height: 5,
+                depth: 1,
+            },
+            aspect: BlitAspect::Full,
+        });
+        let prepared = prepare_image_blit(
+            &mut resources,
+            TransactionId::new(1),
+            SubmissionId::new(2),
+            operation,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ViewRepresentation::lookup(prepared.representations(), source, BackingView::Bytes),
+            Some(endpoint)
+        );
+        assert_ne!(endpoint, image);
+        assert_eq!(
+            ViewRepresentation::lookup(prepared.representations(), destination, BackingView::Image),
+            Some(destination_representation)
+        );
+        // The use keeps the endpoint alive for the transaction; the image is
+        // this blit's business only if it names it.
+        let [use_] = prepared
+            .uses()
+            .iter()
+            .filter(|use_| use_.backing == source)
+            .collect::<Vec<_>>()[..]
+        else {
+            unreachable!("the source backing is used exactly once")
+        };
+        assert_eq!(use_.representations.as_ref(), [endpoint]);
+    }
+
     #[test]
     fn buffer_to_texture_preparation_proves_source_and_reserves_exact_storage_rows() {
         let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
         let source = backing(&mut resources);
         let destination = backing(&mut resources);
-        let source_representation = execution(&mut resources, source, "source");
-        let destination_representation = execution(&mut resources, destination, "destination");
+        let source_representation = execution(&mut resources, source, BackingView::Bytes, "source");
+        let destination_representation = execution(
+            &mut resources,
+            destination,
+            BackingView::Image,
+            "destination",
+        );
         materialize(
             &mut resources,
             source,
@@ -790,12 +928,14 @@ mod tests {
         assert_eq!(
             prepared.representations(),
             [
-                PreparedBlitRepresentation {
+                ViewRepresentation {
                     backing: source,
+                    view: BackingView::Bytes,
                     representation: source_representation,
                 },
-                PreparedBlitRepresentation {
+                ViewRepresentation {
                     backing: destination,
+                    view: BackingView::Image,
                     representation: destination_representation,
                 },
             ]
@@ -866,7 +1006,7 @@ mod tests {
         let mut writes = BTreeMap::new();
         collect_regions(&operation, &mut reads, &mut writes).unwrap();
         assert_eq!(
-            writes[&destination].as_slice(),
+            writes[&(destination, BackingView::Image)].as_slice(),
             [768, 832, 896, 960]
                 .map(|offset| BackingRegion::Linear(LinearRange::new(offset, 16).unwrap()))
         );
@@ -923,8 +1063,13 @@ mod tests {
         let mut resources = ResourceLifecycleOwner::new(epoch);
         let source = backing(&mut resources);
         let destination = backing(&mut resources);
-        let source_representation = execution(&mut resources, source, "source");
-        let destination_representation = execution(&mut resources, destination, "destination");
+        let source_representation = execution(&mut resources, source, BackingView::Bytes, "source");
+        let destination_representation = execution(
+            &mut resources,
+            destination,
+            BackingView::Image,
+            "destination",
+        );
         materialize(
             &mut resources,
             source,

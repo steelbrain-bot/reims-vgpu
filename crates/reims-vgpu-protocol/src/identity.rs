@@ -53,13 +53,12 @@ scalar_newtype!(
     /// a mapper-service reference.
     ///
     /// This is deliberately not [`MapperSurfaceRef`], a page-table
-    /// [`MappingId`], or a canonical [`SurfaceBackingId`]. Adapters may still
+    /// [`MappingId`] or a resource identity. Adapters may still
     /// project it into a legacy integer-keyed table, but the relation is an
     /// explicit edge rather than numeric equivalence.
     MapperResolvedSurfaceId,
     u32
 );
-scalar_newtype!(SurfaceBackingId, u64);
 scalar_newtype!(GuestVirtualAddress, u64);
 scalar_newtype!(GuestPhysicalAddress, u64);
 scalar_newtype!(ByteOffset, u64);

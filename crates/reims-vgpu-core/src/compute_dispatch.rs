@@ -6,14 +6,15 @@
 //! operation's flattened position, and retains the ready pipeline lease.
 
 use crate::{
-    AccessIntent, AccessMode, AccessScope, AccessTarget, BackingRegion, GpuWriteBatchError,
-    GpuWriteId, GpuWriteRequest, GpuWriteReservation, ImageSubresourceRange, ManagedBackingError,
-    ManagedBackingProgress, ReadyPipelineLease, RepresentationUse, ResolvedResourceCompletion,
-    ResourceLifecycleOwner, ResourceUseBatchError, SamplerResource, StageScope,
+    AccessIntent, AccessMode, AccessScope, AccessTarget, BackingRegion, BackingView,
+    GpuWriteBatchError, GpuWriteId, GpuWriteRequest, GpuWriteReservation, ImageSubresourceRange,
+    ManagedBackingError, ManagedBackingProgress, ReadyPipelineLease, RepresentationUse,
+    ResolvedResourceCompletion, ResourceLifecycleOwner, ResourceUseBatchError, SamplerResource,
+    StageScope, ViewRepresentation,
 };
 use reims_vgpu_protocol::{
-    BackingId, ComputePipelineObject, HazardDomainId, ResourceId, ResourceObject, SubmissionId,
-    TransactionId,
+    BackingId, ComputePipelineObject, HazardDomainId, RepresentationId, ResourceId, ResourceObject,
+    SubmissionId, TransactionId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -136,6 +137,7 @@ impl ResolvedComputeDispatch {
             .map(|(backing, regions)| crate::ContentSynchronizationRequest {
                 backing,
                 regions: regions.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                permitted_pending_writes: Box::new([]),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice()
@@ -194,6 +196,10 @@ pub struct PreparedComputeDispatch<NativePipeline, Operation = ResolvedComputeDi
     operation: Operation,
     pipeline: ReadyPipelineLease<ComputePipelineObject, NativePipeline>,
     uses: Box<[RepresentationUse]>,
+    /// The native object each bound endpoint resolves to, keyed by backing and
+    /// by the view of it the binding's descriptor class names. A backing bound
+    /// once as a buffer and once as a texture appears twice.
+    representations: Box<[ViewRepresentation]>,
     writes: Box<[GpuWriteReservation]>,
     completions: Box<[ResolvedResourceCompletion]>,
 }
@@ -217,6 +223,10 @@ impl<NativePipeline, Operation> PreparedComputeDispatch<NativePipeline, Operatio
 
     pub const fn uses(&self) -> &[RepresentationUse] {
         &self.uses
+    }
+
+    pub const fn representations(&self) -> &[ViewRepresentation] {
+        &self.representations
     }
 
     pub const fn writes(&self) -> &[GpuWriteReservation] {
@@ -322,7 +332,8 @@ pub fn prepare_compute_dispatch<T, NativePipeline>(
     let mut samplers = BTreeSet::new();
     let mut descriptor_counts = BTreeMap::<(Option<ComputeBindingClass>, u32), u32>::new();
     let mut descriptor_classes = BTreeMap::<u32, Option<ComputeBindingClass>>::new();
-    let mut grouped = BTreeMap::<BackingId, (BTreeSet<BackingRegion>, bool, bool)>::new();
+    let mut grouped =
+        BTreeMap::<(BackingId, BackingView), (BTreeSet<BackingRegion>, bool, bool)>::new();
     for resource in operation.resources.iter() {
         if descriptor_classes
             .insert(resource.binding, Some(resource.class))
@@ -384,7 +395,14 @@ pub fn prepare_compute_dispatch<T, NativePipeline>(
                 array_element: resource.array_element,
             });
         }
-        let grouped = grouped.entry(resource.backing).or_default();
+        // The descriptor class says which view of the backing this binding
+        // addresses, and the check above has already proved the class and the
+        // view agree.
+        let view = match resource.view {
+            ComputeBindingView::Buffer(_) => BackingView::Bytes,
+            ComputeBindingView::Image(_) => BackingView::Image,
+        };
+        let grouped = grouped.entry((resource.backing, view)).or_default();
         grouped.0.extend(resource.regions.iter().copied());
         grouped.1 |= matches!(
             resource.mode,
@@ -396,7 +414,11 @@ pub fn prepare_compute_dispatch<T, NativePipeline>(
         );
     }
     if let ResolvedComputeLaunch::IndirectThreadgroups { arguments, .. } = operation.launch {
-        let grouped = grouped.entry(arguments.storage).or_default();
+        // Indirect arguments are read as bytes whatever else the backing is
+        // bound as.
+        let grouped = grouped
+            .entry((arguments.storage, BackingView::Bytes))
+            .or_default();
         grouped.0.insert(BackingRegion::Linear(arguments.region));
         grouped.1 = true;
     }
@@ -484,25 +506,31 @@ pub fn prepare_compute_dispatch<T, NativePipeline>(
         }
     }
 
-    let mut uses = Vec::with_capacity(grouped.len());
+    let mut representations = Vec::with_capacity(grouped.len());
+    let mut grouped_uses = BTreeMap::<BackingId, Vec<RepresentationId>>::new();
     let mut write_requests = Vec::new();
-    for (backing, (regions, reads, writes)) in grouped {
+    for ((backing, view), (regions, reads, writes)) in grouped {
         let regions = regions.into_iter().collect::<Vec<_>>().into_boxed_slice();
         let representation = owner
-            .execution_representation_id(backing)
+            .view_representation(backing, view)
             .map_err(|reason| ComputeDispatchPreparationError::Backing { backing, reason })?;
         if reads {
             let snapshot = owner
                 .snapshot_content(backing, &regions)
                 .map_err(|reason| ComputeDispatchPreparationError::Backing { backing, reason })?;
             owner
-                .execution_representation_for_snapshot(backing, &snapshot)
+                .view_representation_for_snapshot(backing, view, &snapshot)
                 .map_err(|reason| ComputeDispatchPreparationError::Backing { backing, reason })?;
         }
-        uses.push(RepresentationUse {
+        representations.push(ViewRepresentation {
             backing,
-            representations: Box::new([representation]),
+            view,
+            representation,
         });
+        grouped_uses
+            .entry(backing)
+            .or_default()
+            .push(representation);
         if writes {
             write_requests.push(GpuWriteRequest {
                 backing,
@@ -511,7 +539,21 @@ pub fn prepare_compute_dispatch<T, NativePipeline>(
             });
         }
     }
-    let write = GpuWriteId::operation(submission, operation_index);
+    // One use per backing, naming every view of it this dispatch binds: both
+    // native objects have to outlive the transaction.
+    let uses = grouped_uses
+        .into_iter()
+        .map(|(backing, mut representations)| {
+            representations.sort();
+            representations.dedup();
+            RepresentationUse {
+                backing,
+                representations: representations.into_boxed_slice(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let representations = representations.into_boxed_slice();
+    let write = GpuWriteId::operation(transaction, submission, operation_index);
     owner
         .validate_plan_gpu_writes(write, &write_requests)
         .map_err(ComputeDispatchPreparationError::Writes)?;
@@ -539,6 +581,7 @@ pub fn prepare_compute_dispatch<T, NativePipeline>(
         operation,
         pipeline,
         uses: uses.into_boxed_slice(),
+        representations,
         writes,
         completions,
     })
@@ -605,7 +648,19 @@ mod tests {
         }
     }
 
+    /// A backing whose execution representation serves one named view. Which
+    /// one it is has to match the descriptor class the fixture binds it
+    /// through: a storage buffer needs a buffer, a sampled image needs an
+    /// image.
     fn backing(owner: &mut ResourceLifecycleOwner<()>, current: bool) -> BackingId {
+        view_backing(owner, current, BackingView::Bytes)
+    }
+
+    fn view_backing(
+        owner: &mut ResourceLifecycleOwner<()>,
+        current: bool,
+        view: BackingView,
+    ) -> BackingId {
         let ResourceLifecycleEffect::BackingCreated(backing) = owner
             .apply(ResolvedResourceLifecycle::CreateBacking {
                 backing: StorageBacking::Dedicated,
@@ -616,7 +671,12 @@ mod tests {
             unreachable!()
         };
         let execution = owner
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                view,
+                (),
+            )
             .unwrap();
         if current {
             let snapshot = owner
@@ -741,13 +801,13 @@ mod tests {
         assert_eq!(prepared.writes().len(), 1);
         assert_eq!(
             prepared.writes()[0].write,
-            GpuWriteId::operation(SubmissionId::new(11), 4)
+            GpuWriteId::operation(TransactionId::new(7), SubmissionId::new(11), 4)
         );
         assert_eq!(
             prepared.completions(),
             [ResolvedResourceCompletion::GpuWrite {
                 backing,
-                write: GpuWriteId::operation(SubmissionId::new(11), 4),
+                write: GpuWriteId::operation(TransactionId::new(7), SubmissionId::new(11), 4,),
                 representation: prepared.writes()[0].representation,
             }]
         );
@@ -846,7 +906,7 @@ mod tests {
     fn stale_read_in_a_later_backing_refuses_before_reserving_an_earlier_write() {
         let mut owner = ResourceLifecycleOwner::new(EPOCH);
         let writable = backing(&mut owner, true);
-        let stale = backing(&mut owner, false);
+        let stale = view_backing(&mut owner, false, BackingView::Image);
         let mut operation = dispatch(writable, AccessMode::Write);
         let mut resources = operation.resources.into_vec();
         resources.push(ResolvedComputeResourceBinding {

@@ -1506,7 +1506,7 @@ pub fn prepare_indirect_range_readback<T>(
         return Err(IndirectRangeReadbackError::LiteralExecutionRequired);
     };
     let arguments_representation = resources
-        .execution_representation_id(arguments_backing)
+        .view_representation(arguments_backing, crate::BackingView::Bytes)
         .map_err(IndirectRangeReadbackError::Arguments)?;
     let uses = vec![crate::RepresentationUse {
         backing: arguments_backing,
@@ -1779,6 +1779,7 @@ pub fn resolve_indirect_execution_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackingView;
     use crate::{
         BackingRegion, EncoderBoundary, RepresentationRoute, ResolvedExecSegment,
         ResolvedExecStream, ResolvedResourceLifecycle, ResolvedResourceState,
@@ -1852,7 +1853,12 @@ mod tests {
         let arguments = arguments.unwrap();
         assert_eq!(arguments, BackingId::new(9));
         resources
-            .create_execution_representation(arguments, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                arguments,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         resources
     }

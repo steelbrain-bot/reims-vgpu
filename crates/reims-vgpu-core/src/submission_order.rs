@@ -4,6 +4,15 @@
 //! nevertheless reaches a queue owner in its contract sequence, while a
 //! blocked domain does not hold an independent one. Taking a ready submission
 //! does not imply GPU or semantic completion.
+//!
+//! A transaction keeps its (domain, sequence) identity from acceptance until
+//! [`SubmissionOrderOwner::retire`], not until it submits. Submission releases
+//! the *domain head* so the next transaction can issue; it does not end the
+//! question [`SubmissionOrderOwner::relation`] answers. A submitted producer is
+//! precisely the case a consumer asks about — "did the work that writes this
+//! content already reach the queue ahead of me?" — and dropping the entry at
+//! submission made that question answer `UnknownTransaction` for every producer
+//! still in flight, which is the only state in which the answer matters.
 
 use reims_vgpu_protocol::{DomainSequence, SubmissionDomainId, TransactionId};
 use std::collections::BTreeMap;
@@ -11,14 +20,27 @@ use std::collections::BTreeMap;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmissionOrderError {
     DuplicateTransaction,
-    SequenceDidNotIncrease,
     SequenceExhausted,
     UnknownTransaction,
     AlreadyRecorded,
     AlreadyIssued,
+    AlreadySubmitted,
     NotIssued,
     UnknownDomain,
     DomainNotDrained,
+    AlreadyAbandoned,
+}
+
+/// One tracked transaction's position and progress, for the census.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubmissionOrderEntry {
+    pub transaction: TransactionId,
+    pub domain: SubmissionDomainId,
+    pub sequence: DomainSequence,
+    pub recorded: bool,
+    pub issued: bool,
+    pub submitted: bool,
+    pub abandoned: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +48,14 @@ pub struct SubmissionReady {
     pub transaction: TransactionId,
     pub domain: SubmissionDomainId,
     pub sequence: DomainSequence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmissionOrderRelation {
+    Same,
+    Before,
+    After,
+    Independent,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -41,32 +71,124 @@ struct Domain {
     last_accepted: Option<DomainSequence>,
 }
 
+/// Where one accepted transaction sits in its domain, for as long as any
+/// consumer may still ask about it.
+#[derive(Clone, Copy, Debug)]
+struct TransactionOrder {
+    domain: SubmissionDomainId,
+    sequence: DomainSequence,
+    submitted: bool,
+    abandoned: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SubmissionOrderOwner {
     domains: BTreeMap<SubmissionDomainId, Domain>,
-    transactions: BTreeMap<TransactionId, (SubmissionDomainId, DomainSequence)>,
+    transactions: BTreeMap<TransactionId, TransactionOrder>,
 }
 
 impl SubmissionOrderOwner {
+    pub fn relation(
+        &self,
+        first: TransactionId,
+        second: TransactionId,
+    ) -> Result<SubmissionOrderRelation, SubmissionOrderError> {
+        let &first_order = self
+            .transactions
+            .get(&first)
+            .ok_or(SubmissionOrderError::UnknownTransaction)?;
+        let &second_order = self
+            .transactions
+            .get(&second)
+            .ok_or(SubmissionOrderError::UnknownTransaction)?;
+        if first == second {
+            return Ok(SubmissionOrderRelation::Same);
+        }
+        if first_order.domain != second_order.domain {
+            return Ok(SubmissionOrderRelation::Independent);
+        }
+        Ok(if first_order.sequence < second_order.sequence {
+            SubmissionOrderRelation::Before
+        } else {
+            SubmissionOrderRelation::After
+        })
+    }
+
+    /// The nearest transaction ahead of `transaction` in its own domain that
+    /// has not submitted yet.
+    ///
+    /// A domain submits in sequence order, so any work a later transaction
+    /// claims exclusively -- an image's one prepared transition, above all --
+    /// is claimed ahead of a transaction that will submit first. That
+    /// inversion is not a slow path, it is a cycle: the earlier transaction
+    /// cannot prepare because the later one holds the claim, and the later one
+    /// cannot submit or cancel because the earlier one holds the domain head.
+    /// Neither side can move and nothing times out.
+    ///
+    /// Asking this before taking such a claim is what keeps the claim order
+    /// and the submission order the same order. It reports the *nearest*
+    /// predecessor rather than a boolean so the refusal can name who is ahead.
+    pub fn unsubmitted_predecessor(
+        &self,
+        transaction: TransactionId,
+    ) -> Result<Option<TransactionId>, SubmissionOrderError> {
+        let &TransactionOrder {
+            domain, sequence, ..
+        } = self
+            .transactions
+            .get(&transaction)
+            .ok_or(SubmissionOrderError::UnknownTransaction)?;
+        let state = self
+            .domains
+            .get(&domain)
+            .expect("transaction index names one submission domain");
+        if let Some((_, pending)) = state.pending.range(..sequence).next_back() {
+            return Ok(Some(pending.transaction));
+        }
+        // The issued head is removed from `pending`, so it is the one
+        // predecessor the range above cannot see.
+        if let Some((issued_sequence, pending)) = state.issued.as_ref() {
+            if *issued_sequence < sequence {
+                return Ok(Some(pending.transaction));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Take the next position in `domain` for `transaction`.
+    ///
+    /// The sequence is assigned here rather than supplied, because this owner
+    /// is the only thing that knows which population it numbers. It accepts
+    /// exactly the transactions that record and submit GPU work, and a
+    /// transaction's channel position counts *every* packet the channel
+    /// carried -- a validity invalidation and a resource synchronize among
+    /// them. Handing this the channel position therefore made the domain's
+    /// numbering skip on the first non-recording packet a channel carried, and
+    /// a contiguity check against a counter over a different population then
+    /// refused every later transaction on that channel forever. The channel's
+    /// own position is still the right thing for publication, which registers
+    /// every packet; it was never the right thing for this.
+    ///
+    /// Assigning removes the question rather than answering it: there is no
+    /// supplied value left to disagree with, so the numbering is contiguous by
+    /// construction and no caller can get it wrong.
     pub fn accept(
         &mut self,
         transaction: TransactionId,
         domain: SubmissionDomainId,
-        sequence: DomainSequence,
-    ) -> Result<(), SubmissionOrderError> {
+    ) -> Result<DomainSequence, SubmissionOrderError> {
         if self.transactions.contains_key(&transaction) {
             return Err(SubmissionOrderError::DuplicateTransaction);
         }
         let state = self.domains.entry(domain).or_default();
-        if let Some(last) = state.last_accepted {
-            let expected = last
-                .get()
-                .checked_add(1)
-                .ok_or(SubmissionOrderError::SequenceExhausted)?;
-            if sequence.get() != expected {
-                return Err(SubmissionOrderError::SequenceDidNotIncrease);
-            }
-        }
+        let sequence = match state.last_accepted {
+            Some(last) => DomainSequence::new(
+                last.get()
+                    .checked_add(1)
+                    .ok_or(SubmissionOrderError::SequenceExhausted)?,
+            ),
+            None => DomainSequence::new(1),
+        };
         state.last_accepted = Some(sequence);
         state.pending.insert(
             sequence,
@@ -75,15 +197,31 @@ impl SubmissionOrderOwner {
                 recorded: false,
             },
         );
-        self.transactions.insert(transaction, (domain, sequence));
-        Ok(())
+        self.transactions.insert(
+            transaction,
+            TransactionOrder {
+                domain,
+                sequence,
+                submitted: false,
+                abandoned: false,
+            },
+        );
+        Ok(sequence)
     }
 
     pub fn recorded(&mut self, transaction: TransactionId) -> Result<(), SubmissionOrderError> {
-        let &(domain, sequence) = self
+        let &TransactionOrder {
+            domain,
+            sequence,
+            submitted,
+            ..
+        } = self
             .transactions
             .get(&transaction)
             .ok_or(SubmissionOrderError::UnknownTransaction)?;
+        if submitted {
+            return Err(SubmissionOrderError::AlreadySubmitted);
+        }
         let state = self
             .domains
             .get_mut(&domain)
@@ -116,10 +254,18 @@ impl SubmissionOrderOwner {
         transaction: TransactionId,
         predicate: impl FnOnce(TransactionId) -> bool,
     ) -> Result<Option<SubmissionReady>, SubmissionOrderError> {
-        let &(domain, sequence) = self
+        let &TransactionOrder {
+            domain,
+            sequence,
+            submitted,
+            ..
+        } = self
             .transactions
             .get(&transaction)
             .ok_or(SubmissionOrderError::UnknownTransaction)?;
+        if submitted {
+            return Err(SubmissionOrderError::AlreadySubmitted);
+        }
         let state = self
             .domains
             .get(&domain)
@@ -154,6 +300,48 @@ impl SubmissionOrderOwner {
 
     /// Issue at most one recorded head from each domain. A domain advances
     /// only after its current head is accepted by a native queue owner.
+    /// Where every tracked transaction sits, for the census.
+    ///
+    /// A blocked head names the transaction it is waiting for, and the next
+    /// question is always what *that* transaction is waiting for -- which no
+    /// counter answers, because a count of live recordings cannot say whether
+    /// one of them is the producer somebody is parked on. This reports the
+    /// per-transaction state so the two readings can be joined.
+    pub fn census(&self) -> Vec<SubmissionOrderEntry> {
+        self.transactions
+            .iter()
+            .map(|(&transaction, order)| SubmissionOrderEntry {
+                transaction,
+                domain: order.domain,
+                sequence: order.sequence,
+                submitted: order.submitted,
+                abandoned: order.abandoned,
+                recorded: self
+                    .domains
+                    .get(&order.domain)
+                    .map(|state| {
+                        state
+                            .pending
+                            .get(&order.sequence)
+                            .or_else(|| {
+                                state
+                                    .issued
+                                    .as_ref()
+                                    .filter(|(sequence, _)| *sequence == order.sequence)
+                                    .map(|(_, pending)| pending)
+                            })
+                            .is_some_and(|pending| pending.recorded)
+                    })
+                    .unwrap_or(false),
+                issued: self
+                    .domains
+                    .get(&order.domain)
+                    .and_then(|state| state.issued.as_ref())
+                    .is_some_and(|(sequence, _)| *sequence == order.sequence),
+            })
+            .collect()
+    }
+
     pub fn take_ready(&mut self) -> Vec<SubmissionReady> {
         self.take_ready_if(|_| true)
     }
@@ -205,10 +393,18 @@ impl SubmissionOrderOwner {
         transaction: TransactionId,
         predicate: impl FnOnce(TransactionId) -> bool,
     ) -> Result<Option<SubmissionReady>, SubmissionOrderError> {
-        let &(domain, sequence) = self
+        let &TransactionOrder {
+            domain,
+            sequence,
+            submitted,
+            ..
+        } = self
             .transactions
             .get(&transaction)
             .ok_or(SubmissionOrderError::UnknownTransaction)?;
+        if submitted {
+            return Err(SubmissionOrderError::AlreadySubmitted);
+        }
         let state = self
             .domains
             .get(&domain)
@@ -241,11 +437,22 @@ impl SubmissionOrderOwner {
         }))
     }
 
+    /// Release the domain head this transaction was holding. The transaction
+    /// keeps its order identity until [`Self::retire`]: it is exactly while a
+    /// submission is in flight that a consumer needs to know it went first.
     pub fn submitted(&mut self, transaction: TransactionId) -> Result<(), SubmissionOrderError> {
-        let &(domain, sequence) = self
+        let &TransactionOrder {
+            domain,
+            sequence,
+            submitted,
+            ..
+        } = self
             .transactions
             .get(&transaction)
             .ok_or(SubmissionOrderError::UnknownTransaction)?;
+        if submitted {
+            return Err(SubmissionOrderError::AlreadySubmitted);
+        }
         let issued = self.domains.get(&domain).and_then(|state| state.issued);
         if !issued.is_some_and(|(issued_sequence, pending)| {
             issued_sequence == sequence && pending.transaction == transaction
@@ -253,8 +460,75 @@ impl SubmissionOrderOwner {
             return Err(SubmissionOrderError::NotIssued);
         }
         self.domains.get_mut(&domain).unwrap().issued = None;
-        self.transactions.remove(&transaction);
+        self.transactions
+            .get_mut(&transaction)
+            .expect("the order entry was just read")
+            .submitted = true;
         Ok(())
+    }
+
+    /// Release every order claim of a transaction that will never submit.
+    ///
+    /// [`Self::retire`] ends an order identity that has already been through
+    /// [`Self::submitted`], so it drops the index entry and leaves the domain
+    /// alone -- by then the domain head has moved on. A transaction that
+    /// reaches a terminal refusal before submission still holds one, either
+    /// pending at its own sequence or issued as its domain's head, and nothing
+    /// ever releases it: every later transaction on that domain is refused
+    /// behind it for the life of the device.
+    ///
+    /// This is the terminal transition for that case: the domain claim goes and
+    /// the next transaction becomes the head. The order *identity* survives to
+    /// [`Self::retire`] exactly as a submitted one does, so a consumer that
+    /// already named this transaction as a producer is still told where it sat
+    /// rather than being handed `UnknownTransaction`.
+    ///
+    /// `last_accepted` deliberately survives: abandoning work does not make its
+    /// sequence available again, and a domain whose numbering rewound would
+    /// admit a successor as the head of an order it was not accepted into.
+    pub fn abandon(&mut self, transaction: TransactionId) -> Result<(), SubmissionOrderError> {
+        let &TransactionOrder {
+            domain,
+            sequence,
+            submitted,
+            abandoned,
+        } = self
+            .transactions
+            .get(&transaction)
+            .ok_or(SubmissionOrderError::UnknownTransaction)?;
+        if submitted {
+            return Err(SubmissionOrderError::AlreadySubmitted);
+        }
+        if abandoned {
+            return Err(SubmissionOrderError::AlreadyAbandoned);
+        }
+        let state = self
+            .domains
+            .get_mut(&domain)
+            .expect("transaction index names one submission domain");
+        if state.pending.remove(&sequence).is_none() {
+            let issued = state.issued.take();
+            let Some((issued_sequence, pending)) = issued else {
+                unreachable!("an unsubmitted transaction is pending or issued")
+            };
+            assert_eq!(issued_sequence, sequence);
+            assert_eq!(pending.transaction, transaction);
+        }
+        self.transactions
+            .get_mut(&transaction)
+            .expect("the order entry was just read")
+            .abandoned = true;
+        Ok(())
+    }
+
+    /// Forget one transaction's order identity. Called from transaction
+    /// retirement, which is the point at which no accepted successor can still
+    /// name it.
+    pub fn retire(&mut self, transaction: TransactionId) -> Result<(), SubmissionOrderError> {
+        self.transactions
+            .remove(&transaction)
+            .map(|_| ())
+            .ok_or(SubmissionOrderError::UnknownTransaction)
     }
 
     pub fn retire_domain(
@@ -269,6 +543,7 @@ impl SubmissionOrderOwner {
             return Err(SubmissionOrderError::DomainNotDrained);
         }
         self.domains.remove(&domain);
+        self.transactions.retain(|_, order| order.domain != domain);
         Ok(())
     }
 }
@@ -277,14 +552,103 @@ impl SubmissionOrderOwner {
 mod tests {
     use super::*;
 
+    /// Accept and assert the position the owner chose.
+    ///
+    /// `sequence` is no longer an input, so every existing case that named the
+    /// position it expected now checks that the assignment is the contiguous
+    /// one -- which is the property that used to be a runtime refusal.
     fn accept(owner: &mut SubmissionOrderOwner, id: u64, domain: u64, sequence: u64) {
-        owner
-            .accept(
-                TransactionId::new(id),
-                SubmissionDomainId::new(domain),
-                DomainSequence::new(sequence),
-            )
-            .unwrap();
+        assert_eq!(
+            owner
+                .accept(TransactionId::new(id), SubmissionDomainId::new(domain))
+                .unwrap(),
+            DomainSequence::new(sequence),
+        );
+    }
+
+    /// A transaction that fails before submission must not hold its domain.
+    #[test]
+    fn an_abandoned_pending_transaction_releases_the_domain_to_its_successor() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 1, 7, 1);
+        accept(&mut owner, 2, 7, 2);
+        owner.recorded(TransactionId::new(2)).unwrap();
+        assert!(
+            owner.take_ready().is_empty(),
+            "the unrecorded head blocks its successor"
+        );
+        owner.abandon(TransactionId::new(1)).unwrap();
+        assert_eq!(owner.take_ready()[0].transaction, TransactionId::new(2));
+        assert_eq!(
+            owner.relation(TransactionId::new(1), TransactionId::new(2)),
+            Ok(SubmissionOrderRelation::Before),
+            "the order identity survives abandonment, as it survives submission"
+        );
+        assert_eq!(
+            owner.abandon(TransactionId::new(1)),
+            Err(SubmissionOrderError::AlreadyAbandoned)
+        );
+        owner.retire(TransactionId::new(1)).unwrap();
+    }
+
+    /// A refusal that lands after the head was issued releases the same claim.
+    #[test]
+    fn an_abandoned_issued_head_releases_the_domain_to_its_successor() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 1, 7, 1);
+        accept(&mut owner, 2, 7, 2);
+        owner.recorded(TransactionId::new(1)).unwrap();
+        owner.recorded(TransactionId::new(2)).unwrap();
+        assert_eq!(owner.take_ready()[0].transaction, TransactionId::new(1));
+        assert!(owner.take_ready().is_empty());
+        owner.abandon(TransactionId::new(1)).unwrap();
+        assert_eq!(owner.take_ready()[0].transaction, TransactionId::new(2));
+    }
+
+    /// Abandonment is a pre-submission transition. A submitted transaction owns
+    /// a timeline point, and forgetting it would answer the order question with
+    /// `UnknownTransaction` for work that is still in flight.
+    #[test]
+    fn a_submitted_transaction_cannot_be_abandoned() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 1, 7, 1);
+        owner.recorded(TransactionId::new(1)).unwrap();
+        owner.take_ready();
+        owner.submitted(TransactionId::new(1)).unwrap();
+        assert_eq!(
+            owner.abandon(TransactionId::new(1)),
+            Err(SubmissionOrderError::AlreadySubmitted)
+        );
+        owner.retire(TransactionId::new(1)).unwrap();
+    }
+
+    /// Abandoning the last claim leaves the domain drained rather than stuck
+    /// reporting `DomainNotDrained` for the life of the device.
+    #[test]
+    fn an_abandoned_domain_drains() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 1, 7, 1);
+        assert_eq!(
+            owner.retire_domain(SubmissionDomainId::new(7)),
+            Err(SubmissionOrderError::DomainNotDrained)
+        );
+        owner.abandon(TransactionId::new(1)).unwrap();
+        owner.retire(TransactionId::new(1)).unwrap();
+        owner.retire_domain(SubmissionDomainId::new(7)).unwrap();
+    }
+
+    /// An abandoned sequence is not reusable: numbering only ever moves
+    /// forward, so the successor takes the next position and not the abandoned
+    /// one, even though nothing occupies it any more.
+    #[test]
+    fn abandonment_does_not_rewind_domain_numbering() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 1, 7, 1);
+        owner.abandon(TransactionId::new(1)).unwrap();
+        owner.retire(TransactionId::new(1)).unwrap();
+        accept(&mut owner, 3, 7, 2);
+        owner.recorded(TransactionId::new(3)).unwrap();
+        assert_eq!(owner.take_ready()[0].transaction, TransactionId::new(3));
     }
 
     #[test]
@@ -305,6 +669,95 @@ mod tests {
         );
         owner.submitted(TransactionId::new(1)).unwrap();
         assert_eq!(owner.take_ready()[0].transaction, TransactionId::new(2));
+    }
+
+    /// A consumer asking about a producer that is already on the queue gets an
+    /// order, not `UnknownTransaction`.
+    ///
+    /// This is the only state in which the question is ever asked: content
+    /// readiness looks up the producer of a *pending* GPU write, and a write is
+    /// pending precisely because its producer has submitted and not yet
+    /// completed. Releasing the order identity at submission answered every one
+    /// of those with an error, which the readiness check reports as a refusal
+    /// and retries forever.
+    #[test]
+    fn a_submitted_producer_still_answers_the_order_question() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 88, 7, 1);
+        accept(&mut owner, 89, 7, 2);
+        owner.recorded(TransactionId::new(88)).unwrap();
+        assert_eq!(owner.take_ready()[0].transaction, TransactionId::new(88));
+        owner.submitted(TransactionId::new(88)).unwrap();
+
+        assert_eq!(
+            owner.relation(TransactionId::new(88), TransactionId::new(89)),
+            Ok(SubmissionOrderRelation::Before),
+            "the producer submitted first and the consumer must be told so"
+        );
+        // The head it was holding is free, so the consumer can still issue.
+        owner.recorded(TransactionId::new(89)).unwrap();
+        assert_eq!(owner.take_ready()[0].transaction, TransactionId::new(89));
+
+        // And retirement is what ends the question.
+        owner.retire(TransactionId::new(88)).unwrap();
+        assert_eq!(
+            owner.relation(TransactionId::new(88), TransactionId::new(89)),
+            Err(SubmissionOrderError::UnknownTransaction)
+        );
+    }
+
+    /// A submitted transaction has released its domain head and may not be
+    /// re-recorded, re-issued, or submitted twice through its surviving entry.
+    #[test]
+    fn a_submitted_transaction_refuses_every_pre_submission_transition() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 1, 3, 1);
+        owner.recorded(TransactionId::new(1)).unwrap();
+        assert_eq!(owner.take_ready()[0].transaction, TransactionId::new(1));
+        owner.submitted(TransactionId::new(1)).unwrap();
+        assert_eq!(
+            owner.recorded(TransactionId::new(1)),
+            Err(SubmissionOrderError::AlreadySubmitted)
+        );
+        assert_eq!(
+            owner.submitted(TransactionId::new(1)),
+            Err(SubmissionOrderError::AlreadySubmitted)
+        );
+        assert_eq!(
+            owner.take_ready_transaction_if(TransactionId::new(1), |_| true),
+            Err(SubmissionOrderError::AlreadySubmitted)
+        );
+        assert_eq!(
+            owner.reserve_head_transaction_if(TransactionId::new(1), |_| true),
+            Err(SubmissionOrderError::AlreadySubmitted)
+        );
+    }
+
+    #[test]
+    fn relation_uses_contract_domain_sequence_not_transaction_identity() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 90, 7, 1);
+        accept(&mut owner, 91, 7, 2);
+        // A higher transaction id at a lower sequence is still earlier.
+        accept(&mut owner, 20, 7, 3);
+        assert_eq!(
+            owner.relation(TransactionId::new(90), TransactionId::new(91)),
+            Ok(SubmissionOrderRelation::Before)
+        );
+        assert_eq!(
+            owner.relation(TransactionId::new(20), TransactionId::new(91)),
+            Ok(SubmissionOrderRelation::After)
+        );
+        assert_eq!(
+            owner.relation(TransactionId::new(90), TransactionId::new(90)),
+            Ok(SubmissionOrderRelation::Same)
+        );
+        // A different domain orders nothing.
+        accept(&mut owner, 92, 8, 1);
+        assert_eq!(
+            owner.relation(TransactionId::new(90), TransactionId::new(92)),
+            Ok(SubmissionOrderRelation::Independent)
+        );
     }
 
     #[test]
@@ -361,19 +814,78 @@ mod tests {
     #[test]
     fn domain_reuse_requires_explicit_drained_retirement() {
         let mut owner = SubmissionOrderOwner::default();
-        accept(&mut owner, 1, 7, 9);
+        accept(&mut owner, 1, 7, 1);
         owner.recorded(TransactionId::new(1)).unwrap();
         owner.take_ready();
         owner.submitted(TransactionId::new(1)).unwrap();
-        assert_eq!(
-            owner.accept(
-                TransactionId::new(2),
-                SubmissionDomainId::new(7),
-                DomainSequence::new(1),
-            ),
-            Err(SubmissionOrderError::SequenceDidNotIncrease)
-        );
+        // Until the domain is retired its numbering carries on from where it
+        // was. Retirement is what restarts it at the first position.
+        accept(&mut owner, 2, 7, 2);
+        owner.recorded(TransactionId::new(2)).unwrap();
+        owner.take_ready();
+        owner.submitted(TransactionId::new(2)).unwrap();
+        owner.retire(TransactionId::new(1)).unwrap();
+        owner.retire(TransactionId::new(2)).unwrap();
         owner.retire_domain(SubmissionDomainId::new(7)).unwrap();
-        accept(&mut owner, 2, 7, 1);
+        accept(&mut owner, 3, 7, 1);
+    }
+
+    /// The predecessor query sees the issued head, which `pending` no longer
+    /// holds.
+    ///
+    /// This is the shape that deadlocked a boot: 539 reserved its domain head
+    /// and then needed an image, 541 had already claimed that image, and 541
+    /// could not submit or cancel because 539 held the head. The query has to
+    /// answer for the *issued* transaction as well as the pending ones, or a
+    /// gate built on it opens at exactly the moment the cycle forms.
+    #[test]
+    fn an_issued_head_is_still_an_unsubmitted_predecessor() {
+        let mut owner = SubmissionOrderOwner::default();
+        accept(&mut owner, 539, 1, 1);
+        accept(&mut owner, 540, 1, 2);
+        accept(&mut owner, 541, 1, 3);
+        accept(&mut owner, 546, 4, 1);
+
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(539)),
+            Ok(None),
+            "the domain head has nothing ahead of it"
+        );
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(541)),
+            Ok(Some(TransactionId::new(540))),
+            "the nearest predecessor is named, not merely reported to exist"
+        );
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(546)),
+            Ok(None),
+            "another domain orders nothing here"
+        );
+
+        owner
+            .reserve_head_transaction_if(TransactionId::new(539), |_| true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(541)),
+            Ok(Some(TransactionId::new(540)))
+        );
+        owner.abandon(TransactionId::new(540)).unwrap();
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(541)),
+            Ok(Some(TransactionId::new(539))),
+            "the issued head is invisible to a scan of the pending map"
+        );
+
+        owner.submitted(TransactionId::new(539)).unwrap();
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(541)),
+            Ok(None),
+            "a submitted predecessor no longer holds the claim order"
+        );
+        assert_eq!(
+            owner.unsubmitted_predecessor(TransactionId::new(9_999)),
+            Err(SubmissionOrderError::UnknownTransaction)
+        );
     }
 }

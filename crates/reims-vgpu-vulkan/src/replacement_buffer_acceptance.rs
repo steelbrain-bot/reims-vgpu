@@ -143,6 +143,7 @@ mod tests {
         replacement_submit::QueueTimelineSemaphores,
     };
     use ash::vk;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         prepare_buffer_blit, BackingRegion, BufferFillPattern, CompletionStamp,
         DeviceTransactionPayload, ExecTransaction, LinearRange, RepresentationRoute,
@@ -190,7 +191,12 @@ mod tests {
             unreachable!()
         };
         resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let blit = prepare_buffer_blit(
             &mut resources,

@@ -118,6 +118,31 @@ impl NativeDependencyOwner {
         Ok(())
     }
 
+    /// Candidates still parked, each with the producers that have no native
+    /// submission point yet.
+    ///
+    /// A candidate is released only by a producer being submitted, so a parked
+    /// set whose unmet producers never shrink is a native deadlock: nothing
+    /// remaining will submit them. That is invisible from any other reading —
+    /// the consumer looks like ordinary in-flight work — so it is reported
+    /// rather than inferred.
+    pub fn parked_candidates(&self) -> Vec<(TransactionId, Vec<TransactionId>)> {
+        self.candidates
+            .iter()
+            .map(|(&transaction, candidate)| {
+                (
+                    transaction,
+                    candidate
+                        .prerequisites
+                        .iter()
+                        .filter(|(producer, _)| !self.points.contains_key(producer))
+                        .map(|&(producer, _)| producer)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
     fn take_ready(&mut self) -> Vec<NativeSubmissionPlan> {
         let ready = self
             .candidates

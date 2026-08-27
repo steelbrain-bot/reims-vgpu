@@ -218,8 +218,7 @@ pub use image_blit_preparation::{
     commit_image_blit_acceptance, prepare_image_blit, prepare_image_blit_with_write,
     resolved_blit_accesses, AcceptedImageBlit, CancelledImageBlit, ImageBlitAcceptanceError,
     ImageBlitAcceptanceFailure, ImageBlitCancellationError, ImageBlitCancellationFailure,
-    ImageBlitPreparationError, ImageBlitPreparationFailure, PreparedBlitRepresentation,
-    PreparedImageBlit,
+    ImageBlitPreparationError, ImageBlitPreparationFailure, PreparedImageBlit,
 };
 pub use indirect_command::{
     admit_indirect_commands, admit_indirect_commands_with_owner,
@@ -269,9 +268,10 @@ pub use lifecycle::{
     VulkanDeviceEpochLease, VulkanDeviceEpochState,
 };
 pub use managed_backing::{
-    GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation, ManagedBackingCensus,
-    ManagedBackingError, ManagedBackingOwner, ManagedBackingProgress, ManagedRepresentationFailure,
-    RepresentationUse, TransferBatchError,
+    AcceptedRepresentation, BackingView, GpuWriteBatchError, GpuWriteRequest, GpuWriteReservation,
+    ManagedBackingCensus, ManagedBackingError, ManagedBackingOwner, ManagedBackingProgress,
+    ManagedRepresentationFailure, RepresentationCensus, RepresentationRegionCoverage,
+    RepresentationUse, TransferBatchError, ViewRepresentation,
 };
 pub use managed_resource::{
     plan_representation, HostMemoryTopology, RepresentationCapabilities, RepresentationRefusal,
@@ -371,7 +371,7 @@ pub use resource::{
     ContentError, ContentStamp, ContentState, GraphError, LifecycleState, MappingNode,
     PendingContentWrite, ReplicaVersions, ResolvedTextureBindingView, ResolvedTextureView,
     ResolvedTextureViewRange, ResourceGraph, ResourceLifetime, ResourceLifetimeRef, ResourceNode,
-    StorageBacking, StorageNode, TextureViewResolveError, MAX_TEXTURE_VIEW_CHAIN,
+    StorageBacking, StorageClass, StorageNode, TextureViewResolveError, MAX_TEXTURE_VIEW_CHAIN,
 };
 pub use resource_lifecycle::{
     HostIngressBatchError, HostLandingBatchError, ResolvedResourceCompletion,
@@ -409,7 +409,10 @@ pub use submission::{
     SubmissionFootprint, SubmissionRecordError, SubmissionScheduler, SubmissionTracker,
     SubmissionWork,
 };
-pub use submission_order::{SubmissionOrderError, SubmissionOrderOwner, SubmissionReady};
+pub use submission_order::{
+    SubmissionOrderEntry, SubmissionOrderError, SubmissionOrderOwner, SubmissionOrderRelation,
+    SubmissionReady,
+};
 pub use synchronization::{
     plan_event, plan_fence, BarrierResource, Decision as SynchronizationDecision,
     Domain as SynchronizationDomain, EventKind, FenceAction, FenceSignal, MemoryBarrierScope,
@@ -435,14 +438,15 @@ pub use transaction::{
 };
 pub use transaction_runtime::{
     AdmittedExecTransaction, AdmittedExpandedExecProofs, ExpandedExecProofError,
-    PrerequisiteResolution, ResolvedExecDeviceTransaction, ResolvedTransactionPrerequisite,
-    TransactionRecordingPlan, TransactionRuntime, TransactionRuntimeError,
+    NativeSubmissionProjection, PrerequisiteResolution, ResolvedExecDeviceTransaction,
+    ResolvedTransactionPrerequisite, TransactionRecordingPlan, TransactionRuntime,
+    TransactionRuntimeError,
 };
 pub use transaction_state::{
     ResetDisposition, TransactionState, TransactionStateMachine, TransactionTransitionError,
 };
 pub use viewport::{aspect_fit_viewport, pointer_to_guest, PresentationViewport};
 pub use wait_graph::{
-    ExplicitWaitCause, WaitCycle, WaitDependencyCause, WaitGraph, WaitGraphError,
-    WaitGraphRetireError,
+    ExplicitWaitCause, ResolvedWaitDependency, WaitCycle, WaitDependencyCause, WaitGraph,
+    WaitGraphError, WaitGraphRetireError,
 };

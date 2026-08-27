@@ -147,7 +147,7 @@ pub fn prepare_info_query<T>(
             live_writes: Box::new([]),
         }));
     }
-    let representation = match resources.execution_representation_id(backing) {
+    let representation = match resources.view_representation(backing, crate::BackingView::Bytes) {
         Ok(representation) => representation,
         Err(reason) => {
             return Err(Box::new(InfoQueryPreparationFailure {
@@ -157,7 +157,7 @@ pub fn prepare_info_query<T>(
             }));
         }
     };
-    let write = crate::GpuWriteId::operation(submission, index);
+    let write = crate::GpuWriteId::operation(transaction, submission, index);
     let writes = resources
         .plan_gpu_writes(
             write,
@@ -268,6 +268,7 @@ pub fn cancel_prepared_info_query<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackingView;
     use crate::{
         LinearRange, RepresentationRoute, ResolvedInfoReplyTarget, ResolvedResourceLifecycle,
         ResourceLifecycleEffect, StorageBacking,
@@ -295,7 +296,12 @@ mod tests {
             _ => unreachable!(),
         };
         let representation = resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let operation = ResolvedInfoOperation::RenderPipelineState {
             pipeline: ResourceId::<RenderPipelineObject>::new(3, 1),

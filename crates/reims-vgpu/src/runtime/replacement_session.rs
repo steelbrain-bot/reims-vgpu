@@ -309,6 +309,7 @@ impl ComputeTranslation for ReplacementComputeTranslation {
     fn prepare_program(
         &self,
         requests: &[(u32, reims_vgpu_protocol::StorageImageFormat)],
+        samplers: &[reims_vgpu_core::SamplerResource],
         dispatch: reims_vgpu_core::ComputeProgramDispatchContract,
     ) -> Result<PreparedComputeProgram, crate::runtime::replacement_services::ComputeProgramDecline>
     {
@@ -368,7 +369,7 @@ impl ComputeTranslation for ReplacementComputeTranslation {
         };
         let prepared = self
             .shader
-            .prepare_kernel_for_dispatch(&native, native_dispatch)
+            .prepare_kernel_for_dispatch(&native, samplers, native_dispatch)
             .map_err(ComputeProgramDecline::Specialization)?;
         Ok(PreparedComputeProgram {
             stage: reims_vgpu_vulkan::m2v_cache::prepared_stage(&prepared.variant),
@@ -898,6 +899,13 @@ pub(crate) enum ReplacementRecordedIndirectRangeQueueError {
     FinalPhaseCannotReserveHead(TransactionId),
     SubmissionHeadAlreadyReserved(TransactionId),
     MissingDependencies(TransactionId),
+    /// A semantic producer that owns no native submission has not published
+    /// yet, so this recording has no native form to queue. See
+    /// [`reims_vgpu_core::TransactionRuntime::native_submission_dependencies`].
+    AwaitingHostProducer {
+        transaction: TransactionId,
+        producer: TransactionId,
+    },
     MissingHazards(TransactionId),
     NotSubmissionHead(TransactionId),
     DuplicateParked(TransactionId),
@@ -1313,6 +1321,29 @@ pub(crate) enum ReplacementPreparedAdmittedRecordingError<Completion> {
     Program(Box<CanonicalReplacementProgramFailure<Completion>>),
 }
 
+impl<Completion> ReplacementPreparedAdmittedRecordingError<Completion> {
+    pub fn detail(&self) -> String {
+        match self {
+            Self::RecordingNotReady(transaction) => {
+                format!("RecordingNotReady({transaction:?})")
+            }
+            Self::MissingRecordingPlan(transaction) => {
+                format!("MissingRecordingPlan({transaction:?})")
+            }
+            Self::Assignment(reason) => format!("Assignment({reason:?})"),
+            Self::MissingHazardPlan(transaction) => {
+                format!("MissingHazardPlan({transaction:?})")
+            }
+            Self::BarrierPlan(reason) => format!("BarrierPlan({reason:?})"),
+            Self::BarrierResolution(reason) => format!("BarrierResolution({reason:?})"),
+            Self::IndirectRangeContinuationRequired(transaction) => {
+                format!("IndirectRangeContinuationRequired({transaction:?})")
+            }
+            Self::Program(failure) => format!("Program({:?})", failure.reason),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ReplacementPreparedAdmittedRecordingFailure<Completion> {
     pub reason: ReplacementPreparedAdmittedRecordingError<Completion>,
@@ -1388,6 +1419,13 @@ pub(crate) struct ReplacementRecordedExecTransitionFailure {
 pub(crate) enum ReplacementRecordedExecQueueError {
     UnknownGeneration(SessionGenerationId),
     MissingDependencies(TransactionId),
+    /// A semantic producer that owns no native submission has not published
+    /// yet, so this recording has no native form to queue. See
+    /// [`reims_vgpu_core::TransactionRuntime::native_submission_dependencies`].
+    AwaitingHostProducer {
+        transaction: TransactionId,
+        producer: TransactionId,
+    },
     MissingHazards(TransactionId),
     NotSubmissionHead(TransactionId),
     DuplicateParked(TransactionId),
@@ -1971,8 +2009,6 @@ pub(crate) enum ReplacementRepresentationConstructionError {
         expected: u64,
         actual: u64,
     },
-    RegisteredSurfacePlaneViewAbsent(ResourceId<reims_vgpu_protocol::ResourceObject>),
-    RegisteredSurfacePlaneViewAmbiguous(ResourceId<reims_vgpu_protocol::ResourceObject>),
     RegisteredSurfacePlaneLayout(reims_vgpu_protocol::SurfacePlaneLayoutError),
     GuestWindow(reims_vgpu_memory::GuestWindowError),
     TextureAllocation(
@@ -1983,6 +2019,56 @@ pub(crate) enum ReplacementRepresentationConstructionError {
         reims_vgpu_vulkan::replacement_representation::ReplacementShaderViewInstallError,
     ),
     Lifecycle(reims_vgpu_core::ManagedBackingError),
+}
+
+impl ReplacementRepresentationConstructionError {
+    /// Whether re-offering this construction could ever answer differently.
+    ///
+    /// The ingress path re-offers a refused packet on every tick, which is
+    /// right for a state that has not arrived: a resource, descriptor or
+    /// storage the guest is about to create reaches this device on another
+    /// channel, and the next attempt then lands. It is wrong for a case this
+    /// backend has declared it does not build. That question has no pending
+    /// state behind it, so the same answer comes back forever and the packet
+    /// never leaves the head of its channel.
+    ///
+    /// Measured on a macos-13 desktop: one construction this backend did not
+    /// build was re-offered about four hundred times a second for a whole
+    /// boot. Every pipeline owner read zero throughout, so the device looked
+    /// idle and healthy while its compositor channel was stopped and nothing
+    /// after that packet ever ran.
+    ///
+    /// Only the arms this backend genuinely declines are named here.
+    /// Everything else keeps the retry, because a wrong `true` throws guest
+    /// work away and a wrong `false` costs only what today already costs.
+    pub const fn is_unimplemented_case(&self) -> bool {
+        match self {
+            // A descriptor kind or a route this backend does not build. No
+            // later packet turns one of these into a case it does build.
+            Self::UnsupportedDescriptor(_) | Self::RouteHasNoOwnedWorkingRepresentation(_) => true,
+            // A resource, descriptor, declaration or storage that has not
+            // arrived yet, an allocation or import that can succeed on a later
+            // attempt, and every refusal whose input this device does not own.
+            Self::ResourceAbsent(_)
+            | Self::DescriptorAbsent(_)
+            | Self::TextureDeclarationAbsent(_)
+            | Self::TextureView(_)
+            | Self::MapperPlane(_)
+            | Self::StorageAbsent(_)
+            | Self::RepresentationPlan(_)
+            | Self::TransferEndpointAbsent(_)
+            | Self::BufferAllocation(_)
+            | Self::GuestBufferImport(_)
+            | Self::GuestBufferLengthMismatch { .. }
+            | Self::GuestTextureLengthMismatch { .. }
+            | Self::RegisteredSurfacePlaneLayout(_)
+            | Self::GuestWindow(_)
+            | Self::TextureAllocation(_)
+            | Self::TextureEndpoint(_)
+            | Self::ShaderViewInstall(_)
+            | Self::Lifecycle(_) => false,
+        }
+    }
 }
 
 impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
@@ -2111,6 +2197,95 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
     /// operation sidecar under the exact Vulkan epoch's active gate. Packet
     /// ingress cannot supply independent handle tables or an indirect staging
     /// allocator through this composition seam.
+    fn attach_recording_representation_leases<Operation: Clone>(
+        &self,
+        request: reims_vgpu_vulkan::replacement_recording::ReplacementRecordingRequest<Operation>,
+    ) -> Result<
+        reims_vgpu_vulkan::replacement_recording::ReplacementRecordingRequest<Operation>,
+        Box<
+            reims_vgpu_vulkan::replacement_exec_recording::ReplacementExecProgramFailure<Operation>,
+        >,
+    > {
+        use reims_vgpu_vulkan::replacement_exec_recording::{
+            ReplacementExecProgramError, ReplacementExecProgramFailure,
+        };
+        let failure =
+            |reason,
+             request: reims_vgpu_vulkan::replacement_recording::ReplacementRecordingRequest<
+                Operation,
+            >| {
+                Box::new(ReplacementExecProgramFailure {
+                    reason,
+                    input: reims_vgpu_vulkan::replacement_recording::ReplacementRecordingInput {
+                        transaction: request.transaction,
+                        worker: request.worker,
+                        queue_family: request.queue_family,
+                        exec: request.exec,
+                        barriers: request.barriers,
+                    },
+                })
+            };
+        // The transaction's accepted uses are not the set of native objects a
+        // recording names: a content-state transfer resolves both the source
+        // and the destination representation of one backing, and the source is
+        // the one being retired. Every native representation of a declared
+        // backing is leased, so no raw handle the recording can hold outlives
+        // the object it names.
+        let accepted = self
+            .epoch
+            .resources
+            .accepted_representations(request.transaction, request.backings())
+            .map_err(|reason| {
+                failure(
+                    ReplacementExecProgramError::RepresentationUses(reason),
+                    request.clone(),
+                )
+            })?;
+        let mut leases = Vec::with_capacity(accepted.len());
+        for &backing in request.backings() {
+            for census in self.epoch.resources.representation_census(backing) {
+                if !census.has_native {
+                    continue;
+                }
+                let Some(native) = self
+                    .epoch
+                    .resources
+                    .representation(backing, census.representation)
+                else {
+                    return Err(failure(
+                        ReplacementExecProgramError::RepresentationNativeAbsent {
+                            backing,
+                            representation: census.representation,
+                        },
+                        request,
+                    ));
+                };
+                leases.push(native.lease(backing, census.representation));
+            }
+        }
+        for accepted in accepted.iter().copied() {
+            if !leases.iter().any(|lease: &reims_vgpu_vulkan::replacement_representation::ReplacementNativeRepresentationLease| {
+                lease.backing == accepted.backing && lease.representation == accepted.representation
+            }) {
+                return Err(failure(
+                    ReplacementExecProgramError::RepresentationNativeAbsent {
+                        backing: accepted.backing,
+                        representation: accepted.representation,
+                    },
+                    request,
+                ));
+            }
+        }
+        request
+            .attach_representation_leases(leases.into_boxed_slice())
+            .map_err(|lease_failure| {
+                failure(
+                    ReplacementExecProgramError::RepresentationLeases(lease_failure.reason),
+                    *lease_failure.request,
+                )
+            })
+    }
+
     fn resolve_recording_request<Completion: Clone + PartialEq>(
         &self,
         device: &ReplacementDeviceEpoch,
@@ -2145,7 +2320,14 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         >,
     > {
         let resolver = device.execution_resolver(&self.epoch.resources, &self.epoch.images);
-        device.resolve_prepared_exec_recording(input, resources, image_states, semantics, &resolver)
+        let request = device.resolve_prepared_exec_recording(
+            input,
+            resources,
+            image_states,
+            semantics,
+            &resolver,
+        )?;
+        self.attach_recording_representation_leases(request)
     }
 
     fn resolve_continuation_recording_request<Completion: Clone + PartialEq>(
@@ -2183,14 +2365,15 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         >,
     > {
         let resolver = device.execution_resolver(&self.epoch.resources, &self.epoch.images);
-        device.resolve_prepared_exec_continuation_recording(
+        let request = device.resolve_prepared_exec_continuation_recording(
             input,
             resources,
             image_states,
             semantics,
             &resolver,
             operation_origins,
-        )
+        )?;
+        self.attach_recording_representation_leases(request)
     }
 
     pub fn indirect_mut(
@@ -2376,7 +2559,12 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .map_err(ReplacementRepresentationConstructionError::BufferAllocation)?;
         self.epoch
             .resources
-            .create_execution_representation(backing, route, native)
+            .create_execution_representation(
+                backing,
+                route,
+                reims_vgpu_core::BackingView::Bytes,
+                native,
+            )
             .map_err(|failure| {
                 ReplacementRepresentationConstructionError::Lifecycle(failure.reason)
             })
@@ -2660,7 +2848,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .epoch
             .resources
             .graph()
-            .texture_binding_views_for_base(resource)
+            .texture_binding_views_for_backing(backing)
             .map_err(ReplacementRepresentationConstructionError::TextureView)?;
         let native = device
             .create_owned_texture(declaration, Box::new([]), shader_views, memory)
@@ -2668,7 +2856,12 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         let representation = self
             .epoch
             .resources
-            .create_execution_representation(backing, route, native)
+            .create_execution_representation(
+                backing,
+                route,
+                reims_vgpu_core::BackingView::Image,
+                native,
+            )
             .map_err(|failure| {
                 ReplacementRepresentationConstructionError::Lifecycle(failure.reason)
             })?;
@@ -2689,11 +2882,17 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         Ok(representation)
     }
 
-    /// Materialize a registered surface through its exact page-backed staging
-    /// allocation and the one plane view which gives that backing image
-    /// semantics. Fragmentation is represented by the guest window itself and
-    /// therefore selects staging independently of host import capability.
-    pub fn materialize_registered_surface_with_guest_window(
+    /// Materialize one registered-surface plane view over its own plane
+    /// backing, through the surface's exact page-backed staging allocation.
+    ///
+    /// The plane, not the surface, is the thing with image semantics: a
+    /// surface allocation may declare several planes, each with its own
+    /// offset, geometry, row pitch and pixel format, and a backing carries one
+    /// execution representation and one layout. The staging allocation spans
+    /// the whole surface because the plane's layout is allocation-relative;
+    /// fragmentation is represented by the guest window itself and therefore
+    /// selects staging independently of host import capability.
+    pub fn materialize_io_surface_plane_view_with_guest_window(
         &mut self,
         device: &ReplacementDeviceEpoch,
         resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
@@ -2704,12 +2903,36 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         let node = graph.resource(resource).ok_or(
             ReplacementRepresentationConstructionError::ResourceAbsent(resource),
         )?;
-        let Some(reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(surface)) =
+        let Some(reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(view_descriptor)) =
             node.descriptor.as_deref()
         else {
             return Err(
                 ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind),
             );
+        };
+        let plane = view_descriptor
+            .view
+            .ok_or(ReplacementRepresentationConstructionError::DescriptorAbsent(resource))?;
+        let backing =
+            node.storage
+                .ok_or(ReplacementRepresentationConstructionError::StorageAbsent(
+                    resource,
+                ))?;
+        let mut parents = node.parents.iter().copied();
+        let (Some(parent), None) = (parents.next(), parents.next()) else {
+            return Err(ReplacementRepresentationConstructionError::ResourceAbsent(
+                resource,
+            ));
+        };
+        let Some(reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(surface)) = graph
+            .resource(parent)
+            .ok_or(ReplacementRepresentationConstructionError::ResourceAbsent(
+                parent,
+            ))?
+            .descriptor
+            .as_deref()
+        else {
+            return Err(ReplacementRepresentationConstructionError::DescriptorAbsent(parent));
         };
         if guest.requested() != surface.length {
             return Err(
@@ -2719,29 +2942,6 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                 },
             );
         }
-        let mut plane_views = node.children.iter().filter_map(|child| {
-            let child = graph.resource(*child)?;
-            let reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(descriptor) =
-                child.descriptor.as_deref()?
-            else {
-                return None;
-            };
-            descriptor.view.map(|view| (child.id, view))
-        });
-        let Some((_plane_resource, plane)) = plane_views.next() else {
-            return Err(
-                ReplacementRepresentationConstructionError::RegisteredSurfacePlaneViewAbsent(
-                    resource,
-                ),
-            );
-        };
-        if plane_views.next().is_some() {
-            return Err(
-                ReplacementRepresentationConstructionError::RegisteredSurfacePlaneViewAmbiguous(
-                    resource,
-                ),
-            );
-        }
         let layout =
             Arc::new(surface.plane_linear_texture(plane).map_err(
                 ReplacementRepresentationConstructionError::RegisteredSurfacePlaneLayout,
@@ -2749,11 +2949,6 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         let declaration = layout
             .declaration
             .expect("a validated surface-plane layout carries its native declaration");
-        let backing =
-            node.storage
-                .ok_or(ReplacementRepresentationConstructionError::StorageAbsent(
-                    resource,
-                ))?;
         let (topology, mut capabilities) = device.representation_environment();
         capabilities.imported_transfer = false;
         let route = Self::guest_transfer_route(
@@ -2768,6 +2963,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                 ),
             );
         };
+        let surface_length = surface.length;
         if self
             .epoch
             .resources
@@ -2775,7 +2971,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .is_none()
         {
             let mut endpoint = device
-                .create_host_staging_buffer_for_window(surface.length, guest)
+                .create_host_staging_buffer_for_window(surface_length, guest)
                 .map_err(ReplacementRepresentationConstructionError::BufferAllocation)?;
             endpoint
                 .attach_linear_texture_layout(Arc::clone(&layout))
@@ -2957,13 +3153,16 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                 ),
             );
         }
+        // The view's own resolved backing, not the base's: a view over an
+        // IOSurface plane resolves to that plane's backing, which is where the
+        // image it derives from was materialized.
         let backing = self
             .epoch
             .resources
             .graph()
-            .resolved_backing(view.base)
+            .resolved_backing(resource)
             .ok_or(ReplacementRepresentationConstructionError::StorageAbsent(
-                view.base,
+                resource,
             ))?;
         let representation = self
             .epoch
@@ -3246,7 +3445,27 @@ pub(crate) struct ReplacementExecResourceManifest {
     info: BTreeMap<usize, reims_vgpu_core::EvaluatedInfoQuery>,
     validity:
         BTreeMap<(usize, reims_vgpu_protocol::BackingId), reims_vgpu_core::ValidityRepresentations>,
+    content_requirements: Box<[reims_vgpu_core::ContentSynchronizationRequest]>,
     content_synchronization: Box<[reims_vgpu_core::ContentSynchronizationRequest]>,
+    upload_representations:
+        BTreeMap<reims_vgpu_protocol::BackingId, reims_vgpu_protocol::RepresentationId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplacementExecResourcePreflightMode {
+    Complete,
+    GuestUploadInitial,
+    GuestUploadSuffix,
+}
+
+impl ReplacementExecResourcePreflightMode {
+    const fn allows_guest_upload_continuation(self) -> bool {
+        matches!(self, Self::GuestUploadInitial | Self::GuestUploadSuffix)
+    }
+
+    const fn includes_resource_states(self) -> bool {
+        !matches!(self, Self::GuestUploadSuffix)
+    }
 }
 
 impl ReplacementExecResourceManifest {
@@ -3257,6 +3476,34 @@ impl ReplacementExecResourceManifest {
                 .values()
                 .any(|representations| representations.guest_upload_destination.is_some())
     }
+
+    fn upload_representations_match(
+        &self,
+        resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
+    ) -> bool {
+        self.upload_representations
+            .iter()
+            .all(|(&backing, &representation)| {
+                resources.execution_representation_id(backing) == Ok(representation)
+            })
+    }
+
+    fn upload_content_matches(
+        &self,
+        resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
+    ) -> bool {
+        self.content_requirements.iter().all(|request| {
+            let Ok(representation) = resources.execution_representation_id(request.backing) else {
+                return false;
+            };
+            let Ok(snapshot) = resources.snapshot_content(request.backing, &request.regions) else {
+                return false;
+            };
+            resources
+                .representation_matches(request.backing, representation, &snapshot)
+                .unwrap_or(false)
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -3266,10 +3513,20 @@ pub(crate) struct ReplacementPreparedExecEnvelope {
 }
 
 #[derive(Debug)]
+pub(crate) struct ReplacementGuestUploadContinuationOwner<Semantic> {
+    native: reims_vgpu_core::PreparedNativeExecutionChain<ResolvedReplayCompletion<Semantic>>,
+    last_auxiliary: reims_vgpu_core::QueueTimelinePoint,
+}
+
+#[derive(Debug)]
 pub(crate) struct ReplacementPreparedGuestUploadPhase<Completion> {
     prepared: Box<ReplacementPreparedAdmittedExec<Completion>>,
     manifest: ReplacementExecResourceManifest,
     chain: reims_vgpu_core::ResourceStateExecutionChain<CanonicalReplacementOperation<Completion>>,
+    recording_exec: CanonicalReplacementExecTransaction<Completion>,
+    recording_origins: Box<[reims_vgpu_core::ExpandedIndirectOperationOrigin]>,
+    include_resource_state_admission: bool,
+    continuation: Option<ReplacementGuestUploadContinuationOwner<Completion>>,
     envelope: ReplacementPreparedExecEnvelope,
 }
 
@@ -3279,6 +3536,10 @@ pub(crate) struct ReplacementResolvedGuestUploadPhase<Completion> {
     prepared: Box<ReplacementPreparedAdmittedExec<Completion>>,
     manifest: ReplacementExecResourceManifest,
     chain: reims_vgpu_core::ResourceStateExecutionChain<CanonicalReplacementOperation<Completion>>,
+    recording_exec: CanonicalReplacementExecTransaction<Completion>,
+    recording_origins: Box<[reims_vgpu_core::ExpandedIndirectOperationOrigin]>,
+    include_resource_state_admission: bool,
+    continuation: Option<ReplacementGuestUploadContinuationOwner<Completion>>,
     generation: SessionGenerationId,
     envelope: ReplacementPreparedExecEnvelope,
 }
@@ -3289,6 +3550,10 @@ pub(crate) struct PendingReplacementGuestUploadRecording<Completion> {
     prepared: Box<ReplacementPreparedAdmittedExec<Completion>>,
     manifest: ReplacementExecResourceManifest,
     chain: reims_vgpu_core::ResourceStateExecutionChain<CanonicalReplacementOperation<Completion>>,
+    recording_exec: CanonicalReplacementExecTransaction<Completion>,
+    recording_origins: Box<[reims_vgpu_core::ExpandedIndirectOperationOrigin]>,
+    include_resource_state_admission: bool,
+    continuation: Option<ReplacementGuestUploadContinuationOwner<Completion>>,
 }
 
 #[derive(Debug)]
@@ -3297,6 +3562,7 @@ pub(crate) struct ReplacementRecordedGuestUploadPhase<Completion> {
     prepared: Box<ReplacementPreparedAdmittedExec<Completion>>,
     manifest: ReplacementExecResourceManifest,
     chain: reims_vgpu_core::ResourceStateExecutionChain<CanonicalReplacementOperation<Completion>>,
+    continuation: Option<ReplacementGuestUploadContinuationOwner<Completion>>,
 }
 
 #[derive(Debug)]
@@ -3333,6 +3599,7 @@ pub(crate) struct ReplacementRecordedGuestUploadTransitionFailure<Completion> {
 pub(crate) struct ReplacementPreparedGuestUploadChain<Semantic> {
     native: reims_vgpu_core::PreparedNativeExecutionChain<ResolvedReplayCompletion<Semantic>>,
     recorded: ReplacementRecordedGuestUploadPhase<Semantic>,
+    predecessor: Option<reims_vgpu_core::QueueTimelinePoint>,
 }
 
 #[derive(Debug)]
@@ -3354,6 +3621,9 @@ pub(crate) enum ReplacementGuestUploadChainPreparationFailure<Semantic> {
 }
 
 pub(crate) enum ReplacementRecordedGuestUploadPreparationFailure<Semantic> {
+    ContinuationAbsent {
+        recorded: ReplacementRecordedGuestUploadPhase<Semantic>,
+    },
     Native {
         reason: reims_vgpu_core::DirectReplayError,
         chain: ReplacementPreparedGuestUploadChain<Semantic>,
@@ -3451,6 +3721,28 @@ pub(crate) struct ReplacementPreparedGuestUploadSuffix<Semantic> {
     envelope: ReplacementPreparedExecEnvelope,
 }
 
+impl<Semantic> ReplacementPreparedGuestUploadSuffix<Semantic> {
+    /// Everything this suffix reserved, for a caller giving it up.
+    ///
+    /// Only a terminal refusal calls this. A suffix that is still going to run
+    /// keeps its parts together, because they are what running it consumes.
+    pub fn into_abandoned_reservations(
+        self,
+    ) -> (
+        TransactionId,
+        reims_vgpu_core::PreparedNativeExecutionChain<ResolvedReplayCompletion<Semantic>>,
+        ReplacementPreparedExecEnvelope,
+    ) {
+        (self.chain.transaction(), self.native, self.envelope)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ReplacementPreparedGuestUploadContinuation<Semantic> {
+    Refresh(Box<ReplacementPreparedGuestUploadPhase<Semantic>>),
+    Suffix(Box<ReplacementPreparedGuestUploadSuffix<Semantic>>),
+}
+
 #[derive(Debug)]
 pub(crate) struct ReplacementResolvedGuestUploadSuffix<Semantic> {
     request: CanonicalReplacementRecordingRequest<Semantic>,
@@ -3475,6 +3767,15 @@ pub(crate) struct ReplacementRecordedGuestUploadSuffix<Semantic> {
 }
 
 pub(crate) enum ReplacementGuestUploadSuffixPreparationFailure<Semantic> {
+    Readiness {
+        reason: ReplacementExecResourceReadinessError,
+        native: reims_vgpu_core::PreparedNativeExecutionChain<ResolvedReplayCompletion<Semantic>>,
+        prepared: Box<ReplacementPreparedAdmittedExec<Semantic>>,
+        manifest: Box<ReplacementExecResourceManifest>,
+        chain:
+            reims_vgpu_core::ResourceStateExecutionChain<CanonicalReplacementOperation<Semantic>>,
+        last_auxiliary: reims_vgpu_core::QueueTimelinePoint,
+    },
     Resources {
         reason: Box<ReplacementExecAutomaticPreparationError>,
         native: reims_vgpu_core::PreparedNativeExecutionChain<ResolvedReplayCompletion<Semantic>>,
@@ -3493,10 +3794,64 @@ pub(crate) enum ReplacementGuestUploadSuffixPreparationFailure<Semantic> {
     },
 }
 
+impl<Semantic> ReplacementGuestUploadSuffixPreparationFailure<Semantic> {
+    pub fn into_content_producer_retry(
+        self: Box<Self>,
+    ) -> Result<ReplacementContinuingGuestUpload<Semantic>, Box<Self>> {
+        if !matches!(
+            *self,
+            Self::Readiness {
+                reason: ReplacementExecResourceReadinessError::ContentProducerPending { .. },
+                ..
+            }
+        ) {
+            return Err(self);
+        }
+        let Self::Readiness {
+            native,
+            prepared,
+            manifest,
+            chain,
+            last_auxiliary,
+            ..
+        } = *self
+        else {
+            unreachable!("the readiness variant was matched immediately above")
+        };
+        Ok(ReplacementContinuingGuestUpload {
+            native,
+            prepared,
+            manifest: *manifest,
+            chain,
+            last_auxiliary,
+        })
+    }
+
+    /// Why this suffix could not be prepared.
+    ///
+    /// The coordinator retains the failure and reports only the step it
+    /// stopped at, which names the phase and not the refusal. A suffix that
+    /// stops here holds its whole upload chain, so the reason is the only
+    /// thing that says what to repair.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Readiness { reason, .. } => format!("readiness:{reason:?}"),
+            Self::Resources { reason, .. } => format!("resources:{}", reason.name()),
+            Self::Images { reason, .. } => format!("images:{reason:?}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ReplacementGuestUploadSuffixResolutionFailure<Semantic> {
     pub reason: ReplacementPreparedAdmittedRecordingError<Semantic>,
     pub suffix: ReplacementPreparedGuestUploadSuffix<Semantic>,
+}
+
+impl<Semantic> ReplacementGuestUploadSuffixResolutionFailure<Semantic> {
+    pub fn detail(&self) -> String {
+        self.reason.detail()
+    }
 }
 
 pub(crate) struct ReplacementGuestUploadSuffixDispatchFailure<Semantic> {
@@ -3696,9 +4051,18 @@ pub(crate) struct ReplacementGuestUploadRecordingResolutionFailure<Completion> {
     pub phase: ReplacementPreparedGuestUploadPhase<Completion>,
 }
 
+impl<Completion> ReplacementGuestUploadRecordingResolutionFailure<Completion> {
+    pub fn detail(&self) -> String {
+        self.reason.detail()
+    }
+}
+
 pub(crate) struct ReplacementGuestUploadRecordingDispatchFailure<Completion> {
     pub reason: ReplacementAdmittedRecordingDispatchError<Completion>,
     pub phase: ReplacementPreparedGuestUploadPhase<Completion>,
+    /// The semantic generation the refused recording belongs to, retained so a
+    /// worker refusal can be redispatched from its own immutable request.
+    pub generation: SessionGenerationId,
 }
 
 impl<Completion> PendingReplacementGuestUploadRecording<Completion> {
@@ -3712,6 +4076,10 @@ impl<Completion> PendingReplacementGuestUploadRecording<Completion> {
             prepared,
             manifest,
             chain,
+            recording_exec,
+            recording_origins,
+            include_resource_state_admission,
+            continuation,
         } = self;
         match pending.try_complete() {
             ReplacementAdmittedRecordingPoll::Pending(pending) => {
@@ -3720,6 +4088,10 @@ impl<Completion> PendingReplacementGuestUploadRecording<Completion> {
                     prepared,
                     manifest,
                     chain,
+                    recording_exec,
+                    recording_origins,
+                    include_resource_state_admission,
+                    continuation,
                 })
             }
             ReplacementAdmittedRecordingPoll::Completed(Ok(recorded)) => {
@@ -3729,13 +4101,14 @@ impl<Completion> PendingReplacementGuestUploadRecording<Completion> {
                         prepared,
                         manifest,
                         chain,
+                        continuation,
                     },
                 ))
             }
             ReplacementAdmittedRecordingPoll::Completed(Err(failure)) => {
                 let ReplacementAdmittedRecordingDispatchFailure {
                     reason,
-                    generation: _,
+                    generation,
                     resources,
                     image_states,
                 } = *failure;
@@ -3746,11 +4119,16 @@ impl<Completion> PendingReplacementGuestUploadRecording<Completion> {
                             prepared,
                             manifest,
                             chain,
+                            recording_exec,
+                            recording_origins,
+                            include_resource_state_admission,
+                            continuation,
                             envelope: ReplacementPreparedExecEnvelope {
                                 resources,
                                 image_states,
                             },
                         },
+                        generation,
                     },
                 )))
             }
@@ -3769,6 +4147,10 @@ impl<Completion> PendingReplacementGuestUploadRecording<Completion> {
             prepared,
             manifest,
             chain,
+            recording_exec,
+            recording_origins,
+            include_resource_state_admission,
+            continuation,
         } = self;
         match pending.wait() {
             Ok(recorded) => Ok(ReplacementRecordedGuestUploadPhase {
@@ -3776,11 +4158,12 @@ impl<Completion> PendingReplacementGuestUploadRecording<Completion> {
                 prepared,
                 manifest,
                 chain,
+                continuation,
             }),
             Err(failure) => {
                 let ReplacementAdmittedRecordingDispatchFailure {
                     reason,
-                    generation: _,
+                    generation,
                     resources,
                     image_states,
                 } = *failure;
@@ -3790,11 +4173,16 @@ impl<Completion> PendingReplacementGuestUploadRecording<Completion> {
                         prepared,
                         manifest,
                         chain,
+                        recording_exec,
+                        recording_origins,
+                        include_resource_state_admission,
+                        continuation,
                         envelope: ReplacementPreparedExecEnvelope {
                             resources,
                             image_states,
                         },
                     },
+                    generation,
                 }))
             }
         }
@@ -3932,8 +4320,25 @@ pub(crate) enum ReplacementResourceReadyExecFailure<Completion> {
 
 #[derive(Debug)]
 pub(crate) struct ReplacementExecImagePreparationFailure {
-    pub reason: reims_vgpu_vulkan::replacement_exec_image::ExecImageStateError,
+    pub reason: ReplacementExecImagePreparationRefusal,
     pub resources: PreparedReplacementExecResources,
+}
+
+/// Why one exec could not take its image claims.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementExecImagePreparationRefusal {
+    /// The backend's own image-state rule declined the plan.
+    Images(reims_vgpu_vulkan::replacement_exec_image::ExecImageStateError),
+    /// An earlier transaction in this one's own submission domain has not
+    /// submitted yet, so this one may not claim an image ahead of it.
+    ///
+    /// An image representation carries one prepared transition at a time and a
+    /// domain submits in sequence order. Letting a later transaction take the
+    /// claim first inverts those two orders against each other, and the result
+    /// is a cycle rather than a delay: the earlier transaction cannot prepare
+    /// because the later one holds the claim, and the later one cannot submit
+    /// or cancel because the earlier one holds the domain head.
+    EarlierInDomainUnsubmitted { predecessor: TransactionId },
 }
 
 type ReplacementExecResourceCancellation = reims_vgpu_core::ExecResourceCancellationResult<
@@ -3957,6 +4362,26 @@ type ReplacementRenderPreparationStepFailure = reims_vgpu_core::ExecResourcePrep
     ),
     reims_vgpu_core::RenderDispatchPreparationInput<ReplacementRenderPipelineVariant>,
 >;
+
+/// Which render preparation step refused, and why.
+///
+/// Every arm of [`reims_vgpu_core::RenderDispatchPreparationError`] is a hard
+/// refusal — none of them is a "not ready yet" — so this names lost guest work
+/// rather than expected control flow, and the variant is what says which
+/// contract term the dispatch failed to satisfy.
+fn render_step_failure_name(failure: &ReplacementRenderPreparationStepFailure) -> String {
+    match failure {
+        reims_vgpu_core::ExecResourcePreparationStepFailure::TransactionMismatch { .. } => {
+            "TransactionMismatch".to_string()
+        }
+        reims_vgpu_core::ExecResourcePreparationStepFailure::PositionOccupied { .. } => {
+            "PositionOccupied".to_string()
+        }
+        reims_vgpu_core::ExecResourcePreparationStepFailure::Preparation((reason, _)) => {
+            format!("{reason:?}")
+        }
+    }
+}
 
 pub(crate) enum ReplacementExecAutomaticPreparationError {
     OriginCountMismatch {
@@ -4045,9 +4470,70 @@ pub(crate) enum ReplacementExecAutomaticPreparationError {
     },
 }
 
+impl ReplacementExecAutomaticPreparationError {
+    /// Which preparation step refused.
+    ///
+    /// This tree carries owners that cannot derive `Debug`, so the name is
+    /// what crosses into a diagnostic. It is the phase, not the reason, and
+    /// that is the level a retained coordinator failure can report.
+    pub fn name(&self) -> String {
+        match self {
+            Self::Render {
+                position, failure, ..
+            } => {
+                format!("Render[{position}]:{}", render_step_failure_name(failure))
+            }
+            Self::ContentSynchronization { reason, .. } => {
+                format!("ContentSynchronization:{reason:?}")
+            }
+            Self::HostIngress { reason, .. } => format!("HostIngress:{reason:?}"),
+            Self::Assembly { reason, .. } => format!("Assembly:{reason:?}"),
+            _ => self.variant().to_string(),
+        }
+    }
+
+    const fn variant(&self) -> &'static str {
+        match self {
+            Self::OriginCountMismatch { .. } => "OriginCountMismatch",
+            Self::ManifestTransactionMismatch { .. } => "ManifestTransactionMismatch",
+            Self::ManifestSubmissionMismatch { .. } => "ManifestSubmissionMismatch",
+            Self::ComputeLeaseAbsent { .. } => "ComputeLeaseAbsent",
+            Self::RenderLeaseAbsent { .. } => "RenderLeaseAbsent",
+            Self::InfoEvaluationAbsent { .. } => "InfoEvaluationAbsent",
+            Self::BufferBlit { .. } => "BufferBlit",
+            Self::ImageBlit { .. } => "ImageBlit",
+            Self::Compute { .. } => "Compute",
+            Self::Render { .. } => "Render",
+            Self::Info { .. } => "Info",
+            Self::IndirectRange { .. } => "IndirectRange",
+            Self::ResourceStates { .. } => "ResourceStates",
+            Self::ContentSynchronization { .. } => "ContentSynchronization",
+            Self::HostIngress { .. } => "HostIngress",
+            Self::Assembly { .. } => "Assembly",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ReplacementExecResourceReadinessError {
     GuestUploadContinuationRequired(Box<[reims_vgpu_protocol::BackingId]>),
+    /// A pending GPU write to this backing is not ordered ahead of the reader.
+    ///
+    /// `relation` is why the write was not permitted, and it is the field worth
+    /// reading first: a wait is only ever satisfiable if the producer can still
+    /// run, and which relation held says whether it can.
+    ContentProducerPending {
+        backing: reims_vgpu_protocol::BackingId,
+        representation: reims_vgpu_protocol::RepresentationId,
+        consumer: SubmissionId,
+        write: reims_vgpu_core::GpuWriteId,
+        relation: Option<reims_vgpu_core::SubmissionOrderRelation>,
+    },
+    ContentProducerOrder {
+        consumer: TransactionId,
+        producer: TransactionId,
+        reason: reims_vgpu_core::TransactionRuntimeError,
+    },
     RenderAcquire {
         position: usize,
         reason: RenderVariantAcquireError,
@@ -4160,16 +4646,438 @@ pub(crate) enum ReplacementExecIngressDispatchFailure<Completion> {
     IndirectRange(ReplacementInitialIndirectRangePhaseDispatchFailure<Completion>),
 }
 
+/// What an EXEC ingress recording can become. Every terminal arm carries the
+/// exact owner together with the route it takes, so a progress value cannot
+/// report readiness while erasing which coordinator owns the ready work next.
 pub(crate) enum ReplacementExecIngressRecordingProgress<Completion> {
     Direct(ReplacementDirectRecordingProgress<Completion>),
     GuestUpload(ReplacementGuestUploadIngressRecordingProgress<Completion>),
-    IndirectRange(Box<ReplacementIndirectRangeRecordingProgress<Completion>>),
+    IndirectRange(Box<ReplacementIndirectRangeIngressRecordingProgress<Completion>>),
+}
+
+/// The indirect-range phases an EXEC ingress recording can reach. Ingress
+/// dispatches only the initial readback phase, so the continuation phases owned
+/// by `progress_continuing_indirect_range_recording` are not representable here
+/// and cannot be mistaken for a route out of the ingress coordinator.
+pub(crate) enum ReplacementIndirectRangeIngressRecordingProgress<Completion> {
+    Pending(Box<PendingReplacementIndirectRangeRecording<Completion>>),
+    Initial(ReplacementRecordedIndirectRangeQueueDisposition<Completion>),
 }
 
 pub(crate) enum ReplacementExecIngressRecordingProgressFailure<Completion> {
     Direct(ReplacementDirectRecordingProgressFailure<Completion>),
     GuestUpload(ReplacementGuestUploadIngressRecordingProgressFailure<Completion>),
     IndirectRange(ReplacementIndirectRangeRecordingProgressFailure<Completion>),
+    /// A phase owned by the indirect continuation state machine arrived at the
+    /// ingress boundary. The exact recorded owner is retained so the refusal
+    /// names the transaction rather than dropping its work.
+    UnexpectedIndirectContinuation(Box<ReplacementRecordedIndirectRangePhase<Completion>>),
+}
+
+impl<Completion> ReplacementExecIngressRecordingProgressFailure<Completion> {
+    /// Name the refusal for the always-on failure path.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Direct(ReplacementDirectRecordingProgressFailure::Recording(_)) => {
+                "direct_recording"
+            }
+            Self::Direct(ReplacementDirectRecordingProgressFailure::Transition(_)) => {
+                "direct_transition"
+            }
+            Self::Direct(ReplacementDirectRecordingProgressFailure::Queue(_)) => "direct_queue",
+            Self::GuestUpload(
+                ReplacementGuestUploadIngressRecordingProgressFailure::Recording(_),
+            ) => "guest_upload_recording",
+            Self::GuestUpload(
+                ReplacementGuestUploadIngressRecordingProgressFailure::Transition(_),
+            ) => "guest_upload_transition",
+            Self::GuestUpload(ReplacementGuestUploadIngressRecordingProgressFailure::Queue(_)) => {
+                "guest_upload_queue"
+            }
+            Self::IndirectRange(ReplacementIndirectRangeRecordingProgressFailure::Recording(_)) => {
+                "indirect_range_recording"
+            }
+            Self::IndirectRange(ReplacementIndirectRangeRecordingProgressFailure::Queue(_)) => {
+                "indirect_range_queue"
+            }
+            Self::UnexpectedIndirectContinuation(_) => "indirect_continuation_at_ingress",
+        }
+    }
+
+    /// The typed reason behind a transition or queue refusal, so the failure
+    /// path names why the EXEC was lost rather than only which stage lost it.
+    /// The recording arms carry a driver refusal that names itself elsewhere.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::Direct(ReplacementDirectRecordingProgressFailure::Transition(failure)) => {
+                Some(format!("{:?}", failure.reason))
+            }
+            Self::Direct(ReplacementDirectRecordingProgressFailure::Queue(failure)) => {
+                Some(format!("{:?}", failure.reason))
+            }
+            Self::GuestUpload(
+                ReplacementGuestUploadIngressRecordingProgressFailure::Transition(failure),
+            ) => Some(format!("{:?}", failure.reason)),
+            Self::GuestUpload(ReplacementGuestUploadIngressRecordingProgressFailure::Queue(
+                failure,
+            )) => Some(format!("{:?}", failure.reason)),
+            Self::IndirectRange(ReplacementIndirectRangeRecordingProgressFailure::Queue(
+                failure,
+            )) => Some(format!("{:?}", failure.reason)),
+            Self::Direct(ReplacementDirectRecordingProgressFailure::Recording(_))
+            | Self::GuestUpload(
+                ReplacementGuestUploadIngressRecordingProgressFailure::Recording(_),
+            )
+            | Self::IndirectRange(ReplacementIndirectRangeRecordingProgressFailure::Recording(_))
+            | Self::UnexpectedIndirectContinuation(_) => None,
+        }
+    }
+}
+
+/// Narrow a shared indirect-range recording progress to what EXEC ingress may
+/// own. The continuation phases belong to the continuing state machine, so
+/// meeting one here is a typed refusal carrying the exact recorded owner.
+fn ingress_indirect_range_recording_progress<Completion>(
+    progress: ReplacementIndirectRangeRecordingProgress<Completion>,
+) -> Result<
+    ReplacementExecIngressRecordingProgress<Completion>,
+    ReplacementExecIngressRecordingProgressFailure<Completion>,
+> {
+    let narrowed = match progress {
+        ReplacementIndirectRangeRecordingProgress::Pending(pending) => {
+            ReplacementIndirectRangeIngressRecordingProgress::Pending(pending)
+        }
+        ReplacementIndirectRangeRecordingProgress::Initial(disposition) => {
+            ReplacementIndirectRangeIngressRecordingProgress::Initial(disposition)
+        }
+        ReplacementIndirectRangeRecordingProgress::Continuing(recorded)
+        | ReplacementIndirectRangeRecordingProgress::Final(recorded) => {
+            return Err(
+                ReplacementExecIngressRecordingProgressFailure::UnexpectedIndirectContinuation(
+                    Box::new(recorded),
+                ),
+            );
+        }
+    };
+    Ok(ReplacementExecIngressRecordingProgress::IndirectRange(
+        Box::new(narrowed),
+    ))
+}
+
+/// The buffer whose guest-authored bytes an EXEC can declare as the source of
+/// truth, together with the backing that carries them.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct StagedGuestUploadResources {
+    resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+    backing: reims_vgpu_protocol::BackingId,
+}
+
+/// Materialize a buffer with a host staging endpoint, so an EXEC declaring the
+/// guest side valid selects the staged guest-upload chain at ingress.
+///
+/// The host allocation is leaked deliberately: the import holds a raw host
+/// pointer for the life of the runtime, and the runtime outlives this call.
+#[cfg(test)]
+pub(crate) fn stage_guest_upload_resources_for_test(
+    runtime: &mut ReplacementRuntimeSession<()>,
+) -> StagedGuestUploadResources {
+    let allocation = vec![0u8; 4096].leak();
+    let length = allocation.len() as u64;
+    let import = std::sync::Arc::new(
+        reims_vgpu_memory::GuestRamImport::new_host_allocation(
+            allocation.as_mut_ptr() as usize,
+            length,
+            1,
+        )
+        .unwrap(),
+    );
+    let guest = reims_vgpu_memory::GuestRef::new(
+        std::sync::Arc::clone(&import),
+        import.slice(0, length).unwrap(),
+    )
+    .unwrap();
+    let staging = runtime
+        .session
+        .vulkan
+        .create_host_staging_buffer(length, guest)
+        .unwrap();
+    let region = reims_vgpu_core::BackingRegion::Linear(
+        reims_vgpu_core::LinearRange::new(0, length).unwrap(),
+    );
+    let backing = match runtime
+        .apply_resource_lifecycle(reims_vgpu_core::ResolvedResourceLifecycle::CreateBacking {
+            backing: reims_vgpu_core::StorageBacking::Dedicated,
+            regions: Box::new([region]),
+        })
+        .unwrap()
+    {
+        reims_vgpu_core::ResourceLifecycleEffect::BackingCreated(backing) => backing,
+        _ => unreachable!("a backing create yields exactly one backing"),
+    };
+    let resource = match runtime
+        .apply_resource_lifecycle(reims_vgpu_core::ResolvedResourceLifecycle::CreateResource {
+            task: reims_vgpu_protocol::TaskId::new(1),
+            object: reims_vgpu_protocol::ObjectTableRef::new(9),
+            kind: reims_vgpu_protocol::ObjectKind::Buffer,
+            descriptor: std::sync::Arc::new(reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                reims_vgpu_protocol::BufferDescriptor {
+                    allocation_size: length,
+                    ..Default::default()
+                },
+            )),
+            storage: Some(backing),
+            parents: Box::new([]),
+        })
+        .unwrap()
+    {
+        reims_vgpu_core::ResourceLifecycleEffect::ResourceCreated(resource) => resource,
+        _ => unreachable!("a resource create yields exactly one resource"),
+    };
+    assert_eq!(
+        runtime
+            .execution
+            .resources_mut()
+            .create_representation(
+                backing,
+                reims_vgpu_core::RepresentationRoute::HostStagingEndpoint,
+                staging,
+            )
+            .unwrap(),
+        reims_vgpu_core::HOST_REPRESENTATION
+    );
+    let (_, capabilities) = runtime.session.vulkan.representation_environment();
+    let working = if capabilities.device_local_working {
+        reims_vgpu_core::WorkingMemoryClass::DeviceLocal
+    } else {
+        reims_vgpu_core::WorkingMemoryClass::HostVisible
+    };
+    let route = reims_vgpu_core::RepresentationRoute::HostStagingTransfer { working };
+    runtime
+        .execution
+        .materialize_buffer(&runtime.session.vulkan, resource, route)
+        .unwrap();
+    allocation[8..12].copy_from_slice(&[9, 8, 7, 6]);
+    StagedGuestUploadResources { resource, backing }
+}
+
+/// Admit one EXEC whose declared resource state makes the guest side the source
+/// of truth for `staged`. With no prerequisite its recording settles
+/// queue-ready; with one it parks behind the transaction that clears it.
+#[cfg(test)]
+pub(crate) fn stage_guest_upload_ingress_for_test(
+    runtime: &mut ReplacementRuntimeSession<()>,
+    staged: StagedGuestUploadResources,
+    channel: reims_vgpu_protocol::ChannelId,
+    submission: u64,
+    prerequisite: Option<reims_vgpu_core::EventOperation>,
+) -> Option<PendingReplacementIngressExec<()>> {
+    let StagedGuestUploadResources { resource, backing } = staged;
+    let mut segments = vec![reims_vgpu_core::ResolvedExecSegment {
+        boundary: reims_vgpu_protocol::SegmentBoundary {
+            stream_index: 0,
+            index: 0,
+            kind: reims_vgpu_protocol::SegmentKind::Blit,
+            continues_previous: false,
+            continues_next: false,
+        },
+        operations: Box::new([reims_vgpu_core::ResolvedOperation::Blit(Box::new(
+            reims_vgpu_core::ResolvedBlit::Copy {
+                source: reims_vgpu_core::ResolvedBufferRange {
+                    resource,
+                    storage: backing,
+                    region: reims_vgpu_core::LinearRange::new(8, 4).unwrap(),
+                    address: reims_vgpu_protocol::GuestVirtualAddress::new(8),
+                    length: reims_vgpu_protocol::ByteLength::new(4),
+                },
+                destination: reims_vgpu_core::ResolvedBufferRange {
+                    resource,
+                    storage: backing,
+                    region: reims_vgpu_core::LinearRange::new(16, 4).unwrap(),
+                    address: reims_vgpu_protocol::GuestVirtualAddress::new(16),
+                    length: reims_vgpu_protocol::ByteLength::new(4),
+                },
+            },
+        ))]),
+    }];
+    if let Some(event) = prerequisite {
+        segments.push(reims_vgpu_core::ResolvedExecSegment {
+            boundary: reims_vgpu_protocol::SegmentBoundary {
+                stream_index: 0,
+                index: 1,
+                kind: reims_vgpu_protocol::SegmentKind::Compute,
+                continues_previous: false,
+                continues_next: false,
+            },
+            operations: Box::new([reims_vgpu_core::ResolvedOperation::Event(event)]),
+        });
+    }
+    let admitted = runtime
+        .admit_exec_operations(
+            channel,
+            Box::<[reims_vgpu_core::ResolvedTransactionPrerequisite]>::default(),
+            Some(reims_vgpu_core::CompletionStamp::new(channel.get(), 1)),
+            CanonicalReplacementExecTransaction::<()> {
+                identity: reims_vgpu_protocol::SubmissionIdentity {
+                    id: SubmissionId::new(submission),
+                    task: reims_vgpu_protocol::TaskId::new(1),
+                },
+                prologue: reims_vgpu_core::ExecPrologue::resource_states([
+                    reims_vgpu_core::ResolvedResourceState {
+                        resource: Some(resource),
+                        mappings: Box::new([]),
+                        targets: Box::new([reims_vgpu_core::ResolvedResourceStateTarget {
+                            backing,
+                            regions: Box::new([reims_vgpu_core::BackingRegion::Linear(
+                                reims_vgpu_core::LinearRange::new(8, 4).unwrap(),
+                            )]),
+                        }]),
+                        ops: reims_vgpu_protocol::ResourceValidityOps {
+                            clear_host_valid: 1,
+                            set_guest_valid: 1,
+                            ..Default::default()
+                        },
+                    },
+                ]),
+                streams: Box::new([reims_vgpu_core::ResolvedExecStream {
+                    stream_index: 0,
+                    segments: segments.into_boxed_slice(),
+                }]),
+                accesses: Box::new([]),
+            },
+        )
+        .unwrap();
+    let prepared = runtime.prepare_admitted_exec(admitted).unwrap();
+    runtime
+        .dispatch_prepared_direct_ingress(Box::new(prepared))
+        .ok()
+}
+
+/// Admit one EXEC carrying an execute-indirect-range operation, so ingress
+/// dispatches the initial readback phase of the indirect continuation chain.
+#[cfg(test)]
+pub(crate) fn stage_initial_indirect_range_ingress_for_test(
+    runtime: &mut ReplacementRuntimeSession<()>,
+    channel: reims_vgpu_protocol::ChannelId,
+) -> Option<PendingReplacementIngressExec<()>> {
+    let icb = ResourceId::new(12, 1);
+    runtime.execution.active.indirect.register(icb, 4).unwrap();
+    let task = reims_vgpu_protocol::TaskId::new(8);
+    let arguments =
+        crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+            runtime,
+            12,
+            task,
+            13,
+            reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                reims_vgpu_protocol::BufferDescriptor {
+                    allocation_size: 64,
+                    handle: 0x440,
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap();
+    runtime.materialize_resource(arguments.resource).unwrap();
+    let range = reims_vgpu_core::ResolvedIndirectCommand::ExecuteIndirectRange {
+        icb,
+        arguments_resource: arguments.resource,
+        arguments_backing: arguments.backing,
+        arguments_range: reims_vgpu_core::LinearRange::new(24, 8).unwrap(),
+        kind: reims_vgpu_core::IndirectCommandExecutionKind::Compute,
+    };
+    let fill = reims_vgpu_core::ResolvedBlit::Fill {
+        destination: reims_vgpu_core::ResolvedBufferRange {
+            resource: arguments.resource,
+            storage: arguments.backing,
+            region: reims_vgpu_core::LinearRange::new(0, 16).unwrap(),
+            address: reims_vgpu_protocol::GuestVirtualAddress::new(0),
+            length: reims_vgpu_protocol::ByteLength::new(16),
+        },
+        pattern: reims_vgpu_core::BufferFillPattern::Byte(0x5a),
+    };
+    let admitted = runtime
+        .admit_exec_operations(
+            channel,
+            Box::<[reims_vgpu_core::ResolvedTransactionPrerequisite]>::default(),
+            Some(reims_vgpu_core::CompletionStamp::new(channel.get(), 1)),
+            CanonicalReplacementExecTransaction::<()> {
+                identity: reims_vgpu_protocol::SubmissionIdentity {
+                    id: SubmissionId::new(26),
+                    task,
+                },
+                prologue: reims_vgpu_core::ExecPrologue::default(),
+                streams: Box::new([reims_vgpu_core::ResolvedExecStream {
+                    stream_index: 0,
+                    segments: Box::new([reims_vgpu_core::ResolvedExecSegment {
+                        boundary: reims_vgpu_protocol::SegmentBoundary {
+                            stream_index: 0,
+                            index: 0,
+                            kind: reims_vgpu_protocol::SegmentKind::Compute,
+                            continues_previous: false,
+                            continues_next: false,
+                        },
+                        operations: Box::new([
+                            reims_vgpu_core::ResolvedOperation::Blit(Box::new(fill)),
+                            reims_vgpu_core::ResolvedOperation::IndirectCommand(range),
+                            reims_vgpu_core::ResolvedOperation::CompletionEffect(()),
+                        ]),
+                    }]),
+                }]),
+                accesses: Box::new([]),
+            },
+        )
+        .unwrap();
+    let continuation = runtime
+        .begin_admitted_indirect_range_execution(admitted)
+        .unwrap();
+    runtime
+        .dispatch_initial_indirect_range_phase(continuation)
+        .ok()
+        .map(|pending| PendingReplacementIngressExec::IndirectRange(Box::new(pending)))
+}
+
+/// Admit one EXEC that only signals `event`, so it records directly and clears
+/// the prerequisite a staged upload parked behind.
+#[cfg(test)]
+pub(crate) fn stage_event_signal_ingress_for_test(
+    runtime: &mut ReplacementRuntimeSession<()>,
+    channel: reims_vgpu_protocol::ChannelId,
+    submission: u64,
+    event: reims_vgpu_core::EventOperation,
+) -> Option<PendingReplacementIngressExec<()>> {
+    let admitted = runtime
+        .admit_exec_operations(
+            channel,
+            Box::<[reims_vgpu_core::ResolvedTransactionPrerequisite]>::default(),
+            Some(reims_vgpu_core::CompletionStamp::new(channel.get(), 1)),
+            CanonicalReplacementExecTransaction::<()> {
+                identity: reims_vgpu_protocol::SubmissionIdentity {
+                    id: SubmissionId::new(submission),
+                    task: reims_vgpu_protocol::TaskId::new(1),
+                },
+                prologue: reims_vgpu_core::ExecPrologue::default(),
+                streams: Box::new([reims_vgpu_core::ResolvedExecStream {
+                    stream_index: 0,
+                    segments: Box::new([reims_vgpu_core::ResolvedExecSegment {
+                        boundary: reims_vgpu_protocol::SegmentBoundary {
+                            stream_index: 0,
+                            index: 0,
+                            kind: reims_vgpu_protocol::SegmentKind::Compute,
+                            continues_previous: false,
+                            continues_next: false,
+                        },
+                        operations: Box::new([reims_vgpu_core::ResolvedOperation::Event(event)]),
+                    }]),
+                }]),
+                accesses: Box::new([]),
+            },
+        )
+        .unwrap();
+    let prepared = runtime.prepare_admitted_exec(admitted).unwrap();
+    runtime
+        .dispatch_prepared_direct_ingress(Box::new(prepared))
+        .ok()
 }
 
 impl<Completion> PendingReplacementIngressExec<Completion> {
@@ -4562,10 +5470,22 @@ pub(crate) enum ReplacementExecResourceTableError {
     BackingAbsent(reims_vgpu_protocol::BackingId),
 }
 
+/// What a standalone invalidation resolved to.
+///
+/// An invalidation whose records all name slots this device holds no resource
+/// for asked for a validity move that is already true, so it is a contract
+/// no-op rather than a refusal. Making that an outcome rather than an error is
+/// what lets the packet be admitted, consume its completion stamp and advance
+/// its channel, which a refusal cannot do.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ReplacementResolvedInvalidation {
+    Lifecycle(Box<reims_vgpu_core::ResolvedResourceLifecycle>),
+    Satisfied,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementStandaloneInvalidationError {
     UnknownTask(reims_vgpu_protocol::TaskId),
-    Empty,
     ConflictingAliasValidity {
         backing: reims_vgpu_protocol::BackingId,
         first: crate::runtime::decode::fifo::InvalidateValidityOps,
@@ -4573,6 +5493,33 @@ pub(crate) enum ReplacementStandaloneInvalidationError {
         found: crate::runtime::decode::fifo::InvalidateValidityOps,
     },
     ResourceTable(ReplacementExecResourceTableError),
+}
+
+impl ReplacementStandaloneInvalidationError {
+    /// Whether no later guest packet can make this invalidation applicable.
+    ///
+    /// An invalidation record names one object-table slot and moves that
+    /// resource's host/guest validity bits. A slot this device holds no
+    /// resource for has no validity state to move, so the record is a no-op --
+    /// and holding it is worse than dropping it, because a resource that
+    /// arrives in that slot later arrives with its own initial validity and a
+    /// deferred record would then overwrite it.
+    ///
+    /// The other arms are not this. An unknown task and an empty record are
+    /// decode-level shapes, and a conflicting alias validity is a disagreement
+    /// inside one record rather than a wait.
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::ResourceTable(ReplacementExecResourceTableError::ResourceAbsent { .. }) => true,
+            Self::ResourceTable(
+                ReplacementExecResourceTableError::TailPopulated { .. }
+                | ReplacementExecResourceTableError::AliasClosureAbsent(_)
+                | ReplacementExecResourceTableError::BackingAbsent(_),
+            )
+            | Self::UnknownTask(_)
+            | Self::ConflictingAliasValidity { .. } => false,
+        }
+    }
 }
 
 fn replacement_backing_access(
@@ -4827,6 +5774,25 @@ pub(crate) enum ReplacementControlApplyReason {
     Fifo(reims_vgpu_core::TransactionRuntimeError),
     SharedState(ReplacementDisplaySharedStateError),
     DeleteObject(crate::runtime::replacement_object_lifecycle::ReplacementObjectDeleteFailure),
+}
+
+impl ReplacementControlApplyReason {
+    /// See
+    /// [`crate::runtime::replacement_object_lifecycle::ReplacementObjectDeleteRefusal::is_terminal_refusal`].
+    ///
+    /// Only object deletion carries a declared-permanent arm. Task retirement,
+    /// object-list publication, task deletion, the fifo and the display shared
+    /// state all fail on state a later packet supplies.
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::DeleteObject(failure) => failure.reason.is_terminal_refusal(),
+            Self::Task(_)
+            | Self::ObjectList(_)
+            | Self::DeleteTask(_)
+            | Self::Fifo(_)
+            | Self::SharedState(_) => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -5460,6 +6426,25 @@ pub(crate) enum ReplacementSynchronizeDispatchFailure<Semantic> {
     Dispatch(ReplacementResourceReadyDispatchFailure<Semantic>),
 }
 
+impl<Semantic> ReplacementSynchronizeDispatchFailure<Semantic> {
+    /// What refused this synchronize, as a diagnostic string.
+    ///
+    /// The variants carrying a `Semantic` cannot derive `Debug` — the backend
+    /// semantic is not required to be printable — so the arms that can name
+    /// their reason do, and the arms that cannot name their own phase. A
+    /// blocked head with no reason at all is what this exists to prevent.
+    pub(crate) fn diagnostic(&self) -> String {
+        match self {
+            Self::Resolution(reason) => format!("resolution={reason:?}"),
+            Self::Accesses(reason) => format!("accesses={reason:?}"),
+            Self::Admission(reason) => format!("admission={reason:?}"),
+            Self::Preparation(failure) => format!("preparation={:?}", failure.reason),
+            Self::Resources(_) => "resources".to_owned(),
+            Self::Dispatch(_) => "dispatch".to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementLinearResourceDeclarationError {
     ConflictingDeclaration,
@@ -5565,6 +6550,12 @@ pub(crate) enum ReplacementDisplayPresentResolutionError {
         surface: u32,
     },
     RegisteredSurfaceDescriptorUnavailable,
+    /// The surface's first plane has no backing yet, because the guest has not
+    /// declared a plane view over it. A scanout is that plane, so there is
+    /// nothing to present until it arrives.
+    RegisteredSurfacePlaneUnavailable {
+        plane: u32,
+    },
     UnsupportedRegisteredSurfaceFormat(u32),
     MapperSurfaceUnavailable(reims_vgpu_protocol::MapperResolvedSurfaceId),
     MapperBackingUnavailable(reims_vgpu_protocol::MapperResolvedSurfaceId),
@@ -5617,15 +6608,19 @@ pub(crate) enum ReplacementRegisteredSurfaceDeclarationError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReplacementRegisteredSurfaceDeclaration {
     pub resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
-    pub backing: reims_vgpu_protocol::BackingId,
     pub newly_declared: bool,
-    pub newly_created_backing: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementViewResourceDeclarationError {
     ConflictingDeclaration,
     ParentStorageAbsent,
+    Lifecycle(ReplacementResourceLifecycleError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementIOSurfacePlaneViewDeclarationError {
+    ConflictingDeclaration,
     Lifecycle(ReplacementResourceLifecycleError),
 }
 
@@ -5801,6 +6796,14 @@ pub(crate) struct ReplacementRuntimeSession<Semantic> {
     )>,
 }
 
+/// Recorded owners the Vulkan epoch holds parked behind a predecessor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReplacementParkedRecordingCensus {
+    pub execs: usize,
+    pub guest_uploads: usize,
+    pub indirect_ranges: usize,
+}
+
 pub(crate) struct ReplacementRuntimeResetEffect {
     pub pipelines: ReplacementResetEffect,
     pub execution_generation: SessionGenerationId,
@@ -5894,6 +6897,40 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         self.retired_swapchains.len()
     }
 
+    /// Parked native candidates and the producers they are still waiting on.
+    /// See `reims_vgpu_core::NativeDependencyOwner::parked_candidates`.
+    /// See [`reims_vgpu_core::SubmissionOrderOwner::census`].
+    pub fn submission_order_census(&self) -> Vec<reims_vgpu_core::SubmissionOrderEntry> {
+        self.execution.runtime().submission_order_census()
+    }
+
+    pub fn parked_native_candidates(&self) -> Vec<(TransactionId, Vec<TransactionId>)> {
+        self.execution.epoch.native.parked_candidates()
+    }
+
+    /// See [`reims_vgpu_core::ManagedBackingOwner::representation_census`].
+    pub fn representation_census(
+        &self,
+        backing: reims_vgpu_protocol::BackingId,
+    ) -> Vec<reims_vgpu_core::RepresentationCensus> {
+        self.execution
+            .epoch
+            .resources
+            .representation_census(backing)
+    }
+
+    /// How many recorded owners the Vulkan epoch is holding parked behind a
+    /// predecessor, by route. A parked owner is released only by that
+    /// predecessor's acceptance, so a count that stops falling names the exact
+    /// place guest work stopped moving.
+    pub fn parked_recordings(&self) -> ReplacementParkedRecordingCensus {
+        ReplacementParkedRecordingCensus {
+            execs: self.execution.epoch.recorded_execs.len(),
+            guest_uploads: self.execution.epoch.recorded_guest_uploads.len(),
+            indirect_ranges: self.execution.epoch.recorded_indirect_ranges.len(),
+        }
+    }
+
     pub const fn execution(&self) -> &ReplacementExecutionOwners<Semantic> {
         &self.execution
     }
@@ -5912,9 +6949,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 (
                     diagnostic.transaction.get(),
                     format!(
-                        "channel={} unresolved={:?} semantic_ready={} continuation_owned={} submitted={} published={}",
+                        "channel={} unresolved={:?} prerequisites={:?} semantic_ready={} continuation_owned={} submitted={} published={}",
                         diagnostic.channel.get(),
                         diagnostic.unresolved,
+                        diagnostic.prerequisites,
                         diagnostic.semantic_ready,
                         diagnostic.continuation_owned,
                         diagnostic.submitted,
@@ -7255,10 +8293,8 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 .map_err(ReplacementExecIngressRecordingProgressFailure::GuestUpload),
             PendingReplacementIngressExec::IndirectRange(pending) => self
                 .progress_indirect_range_recording(*pending)
-                .map(|progress| {
-                    ReplacementExecIngressRecordingProgress::IndirectRange(Box::new(progress))
-                })
-                .map_err(ReplacementExecIngressRecordingProgressFailure::IndirectRange),
+                .map_err(ReplacementExecIngressRecordingProgressFailure::IndirectRange)
+                .and_then(ingress_indirect_range_recording_progress),
         }
     }
 
@@ -7317,16 +8353,101 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 .retry_direct_recording_progress(failure)
                 .map(ReplacementExecIngressRecordingProgress::Direct)
                 .map_err(ReplacementExecIngressRecordingProgressFailure::Direct),
-            ReplacementExecIngressRecordingProgressFailure::GuestUpload(failure) => Err(
-                ReplacementExecIngressRecordingProgressFailure::GuestUpload(failure),
-            ),
+            ReplacementExecIngressRecordingProgressFailure::GuestUpload(failure) => self
+                .retry_guest_upload_recording_progress(failure)
+                .map(ReplacementExecIngressRecordingProgress::GuestUpload)
+                .map_err(ReplacementExecIngressRecordingProgressFailure::GuestUpload),
             ReplacementExecIngressRecordingProgressFailure::IndirectRange(failure) => self
                 .retry_indirect_range_recording_progress(failure)
-                .map(|progress| {
-                    ReplacementExecIngressRecordingProgress::IndirectRange(Box::new(progress))
-                })
-                .map_err(ReplacementExecIngressRecordingProgressFailure::IndirectRange),
+                .map_err(ReplacementExecIngressRecordingProgressFailure::IndirectRange)
+                .and_then(ingress_indirect_range_recording_progress),
+            failure @ ReplacementExecIngressRecordingProgressFailure::UnexpectedIndirectContinuation(
+                _,
+            ) => Err(failure),
         }
+    }
+
+    /// Resume the exact owner returned after a refused guest-upload recording.
+    /// This mirrors [`Self::retry_direct_recording_progress`]: a worker refusal
+    /// is redispatched from its own immutable native request, and structural or
+    /// queue refusals retry from the returned recording. Without it a staged
+    /// upload that was not yet its domain's submission head would be refused
+    /// once and never asked again, stalling every later transaction behind it.
+    fn retry_guest_upload_recording_progress(
+        &mut self,
+        failure: ReplacementGuestUploadIngressRecordingProgressFailure<Semantic>,
+    ) -> Result<
+        ReplacementGuestUploadIngressRecordingProgress<Semantic>,
+        ReplacementGuestUploadIngressRecordingProgressFailure<Semantic>,
+    >
+    where
+        Semantic: Clone + PartialEq + Send + 'static,
+    {
+        let disposition = match failure {
+            ReplacementGuestUploadIngressRecordingProgressFailure::Recording(failure) => {
+                let ReplacementGuestUploadRecordingDispatchFailure {
+                    reason,
+                    phase,
+                    generation,
+                } = *failure;
+                let ReplacementAdmittedRecordingDispatchError::Dispatch(dispatch) = reason else {
+                    return Err(
+                        ReplacementGuestUploadIngressRecordingProgressFailure::Recording(Box::new(
+                            ReplacementGuestUploadRecordingDispatchFailure {
+                                reason,
+                                phase,
+                                generation,
+                            },
+                        )),
+                    );
+                };
+                let ReplacementPreparedGuestUploadPhase {
+                    prepared,
+                    manifest,
+                    chain,
+                    recording_exec,
+                    recording_origins,
+                    include_resource_state_admission,
+                    continuation,
+                    envelope,
+                } = phase;
+                return self
+                    .dispatch_guest_upload_phase_recording(ReplacementResolvedGuestUploadPhase {
+                        request: dispatch.request,
+                        prepared,
+                        manifest,
+                        chain,
+                        recording_exec,
+                        recording_origins,
+                        include_resource_state_admission,
+                        continuation,
+                        generation,
+                        envelope,
+                    })
+                    .map(|pending| {
+                        ReplacementGuestUploadIngressRecordingProgress::Pending(Box::new(pending))
+                    })
+                    .map_err(ReplacementGuestUploadIngressRecordingProgressFailure::Recording);
+            }
+            ReplacementGuestUploadIngressRecordingProgressFailure::Transition(failure) => self
+                .recorded_guest_upload(failure.recorded)
+                .map_err(ReplacementGuestUploadIngressRecordingProgressFailure::Transition)
+                .and_then(|recorded| {
+                    self.queue_recorded_guest_upload(recorded)
+                        .map_err(ReplacementGuestUploadIngressRecordingProgressFailure::Queue)
+                })?,
+            ReplacementGuestUploadIngressRecordingProgressFailure::Queue(failure) => self
+                .queue_recorded_guest_upload(failure.recorded)
+                .map_err(ReplacementGuestUploadIngressRecordingProgressFailure::Queue)?,
+        };
+        Ok(match disposition {
+            ReplacementGuestUploadQueueDisposition::Ready(ready) => {
+                ReplacementGuestUploadIngressRecordingProgress::Ready(ready)
+            }
+            ReplacementGuestUploadQueueDisposition::Parked(transaction) => {
+                ReplacementGuestUploadIngressRecordingProgress::Parked(transaction)
+            }
+        })
     }
 
     fn retry_direct_recording_progress(
@@ -7988,21 +9109,37 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     pub fn resolve_standalone_invalidation(
         &self,
         command: &crate::runtime::decode::fifo::InvalidateResourcesCommand,
-    ) -> Result<reims_vgpu_core::ResolvedResourceLifecycle, ReplacementStandaloneInvalidationError>
-    {
+    ) -> Result<ReplacementResolvedInvalidation, ReplacementStandaloneInvalidationError> {
         let task = reims_vgpu_protocol::TaskId::new(command.task_id);
         if !self.tasks.is_active(task.get()) {
             return Err(ReplacementStandaloneInvalidationError::UnknownTask(task));
         }
+        // A record naming a slot this device holds no resource for moves no
+        // validity, because there is no validity state to move -- the reasoning
+        // already recorded on
+        // [`ReplacementStandaloneInvalidationError::is_terminal_refusal`]. It
+        // is dropped here rather than refused, and dropped *per record*: an
+        // invalidation naming three slots of which one is unknown still has two
+        // slots whose validity the guest asked us to move, and refusing the
+        // packet lost those too.
+        let graph = self.execution.epoch.resources.graph();
         let records = command
             .records
             .iter()
             .copied()
             .filter(|record| record.object_id != 0)
+            .filter(|record| {
+                graph
+                    .resolve(
+                        task,
+                        reims_vgpu_protocol::ObjectTableRef::new(record.object_id),
+                    )
+                    .is_some()
+            })
             .collect::<Vec<_>>();
-        records
-            .first()
-            .ok_or(ReplacementStandaloneInvalidationError::Empty)?;
+        if records.is_empty() {
+            return Ok(ReplacementResolvedInvalidation::Satisfied);
+        }
         let descriptors = records
             .iter()
             .map(|record| crate::runtime::decode::fifo::ExecResourceDesc {
@@ -8080,17 +9217,26 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 },
             )
             .collect::<Vec<_>>();
-        if transitions.len() == 1 {
-            Ok(reims_vgpu_core::ResolvedResourceLifecycle::ApplyValidity(
-                transitions.pop().unwrap(),
-            ))
-        } else {
-            Ok(
-                reims_vgpu_core::ResolvedResourceLifecycle::ApplyValidityBatch(
-                    transitions.into_boxed_slice(),
-                ),
-            )
+        // A record can name a resource this device holds and still move
+        // nothing: a registered surface owns no backing of its own, so it
+        // contributes no target and no transition. Resolving the object is
+        // therefore not the same question as moving some validity, and only the
+        // second one decides whether there is a lifecycle to apply -- an empty
+        // batch is refused at apply, which strands the packet exactly as a
+        // refusal at resolution did.
+        if transitions.is_empty() {
+            return Ok(ReplacementResolvedInvalidation::Satisfied);
         }
+        let lifecycle = if transitions.len() == 1 {
+            reims_vgpu_core::ResolvedResourceLifecycle::ApplyValidity(transitions.pop().unwrap())
+        } else {
+            reims_vgpu_core::ResolvedResourceLifecycle::ApplyValidityBatch(
+                transitions.into_boxed_slice(),
+            )
+        };
+        Ok(ReplacementResolvedInvalidation::Lifecycle(Box::new(
+            lifecycle,
+        )))
     }
 
     /// Stage ICB mutation and literal execution expansion before any
@@ -9413,7 +10559,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             prepared.origins(),
             prepared.info_queries_for_resource_preparation(),
             prepared.resource_states_for_preparation(),
-            false,
+            ReplacementExecResourcePreflightMode::Complete,
         )
     }
 
@@ -9427,7 +10573,21 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             prepared.origins(),
             prepared.info_queries_for_resource_preparation(),
             prepared.resource_states_for_preparation(),
-            true,
+            ReplacementExecResourcePreflightMode::GuestUploadInitial,
+        )
+    }
+
+    fn preflight_prepared_guest_upload_suffix_resources<Completion>(
+        &self,
+        prepared: &ReplacementPreparedAdmittedExec<Completion>,
+    ) -> Result<ReplacementExecResourceManifest, ReplacementExecResourceReadinessError> {
+        self.preflight_exec_resources(
+            prepared.admitted.transaction.id,
+            prepared.exec(),
+            prepared.origins(),
+            prepared.info_queries_for_resource_preparation(),
+            prepared.resource_states_for_preparation(),
+            ReplacementExecResourcePreflightMode::GuestUploadSuffix,
         )
     }
 
@@ -9438,7 +10598,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         origins: &[reims_vgpu_core::ExpandedIndirectOperationOrigin],
         info_queries: &reims_vgpu_core::AdmittedInfoQueries<reims_vgpu_core::ResolvedInfoOperation>,
         resource_states: &reims_vgpu_core::AdmittedResourceStates,
-        allow_guest_upload_continuation: bool,
+        mode: ReplacementExecResourcePreflightMode,
     ) -> Result<ReplacementExecResourceManifest, ReplacementExecResourceReadinessError> {
         let submission = exec.identity.id;
         let mut compute = BTreeMap::new();
@@ -9607,9 +10767,11 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             }
         }
         let resources = &self.execution.epoch.resources;
-        let validity = resource_states
-            .operations()
-            .iter()
+        let validity = mode
+            .includes_resource_states()
+            .then(|| resource_states.operations())
+            .into_iter()
+            .flatten()
             .flat_map(|(position, operation)| {
                 operation
                     .operation()
@@ -9734,13 +10896,11 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, ReplacementExecResourceReadinessError>>()?;
-        let validity_upload_backings = validity
-            .iter()
-            .filter_map(|(&(_, backing), representations)| {
-                representations.guest_upload_destination.map(|_| backing)
-            })
-            .collect::<std::collections::BTreeSet<_>>();
         let mut synchronization_regions = BTreeMap::<
+            reims_vgpu_protocol::BackingId,
+            std::collections::BTreeSet<reims_vgpu_core::BackingRegion>,
+        >::new();
+        let mut required_content_regions = BTreeMap::<
             reims_vgpu_protocol::BackingId,
             std::collections::BTreeSet<reims_vgpu_core::BackingRegion>,
         >::new();
@@ -9763,19 +10923,72 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 _ => Box::new([]),
             };
             for request in requests {
-                if validity_upload_backings.contains(&request.backing) {
-                    continue;
-                }
-                synchronization_regions
+                required_content_regions
                     .entry(request.backing)
                     .or_default()
-                    .extend(request.regions);
+                    .extend(request.regions.iter().copied());
+                let destination = resources
+                    .execution_representation_id(request.backing)
+                    .map_err(|reason| {
+                        ReplacementExecResourceReadinessError::ValidityRepresentation {
+                            backing: request.backing,
+                            reason,
+                        }
+                    })?;
+                for region in request.regions {
+                    let missing = if mode == ReplacementExecResourcePreflightMode::GuestUploadSuffix
+                    {
+                        vec![region]
+                    } else {
+                        resource_states.regions_not_written_before(
+                            origin.expanded_position,
+                            request.backing,
+                            region,
+                            |position| {
+                                validity
+                                    .get(&(position, request.backing))
+                                    .and_then(|representations| representations.host_write)
+                                    == Some(destination)
+                            },
+                        )
+                    };
+                    if !missing.is_empty() {
+                        synchronization_regions
+                            .entry(request.backing)
+                            .or_default()
+                            .extend(missing);
+                    }
+                }
             }
         }
-        let content_synchronization = synchronization_regions
-            .into_iter()
-            .filter_map(|(backing, regions)| {
-                let regions = regions.into_iter().collect::<Vec<_>>().into_boxed_slice();
+        let requests_for = |regions: &BTreeMap<
+            reims_vgpu_protocol::BackingId,
+            std::collections::BTreeSet<reims_vgpu_core::BackingRegion>,
+        >| {
+            regions
+                .iter()
+                .map(|(&backing, regions)| (backing, regions.iter().copied().collect::<Vec<_>>()))
+                .map(
+                    |(backing, regions)| reims_vgpu_core::ContentSynchronizationRequest {
+                        backing,
+                        permitted_pending_writes: Box::new([]),
+                        regions: regions.into_boxed_slice(),
+                    },
+                )
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        };
+        let content_requirements = requests_for(&required_content_regions);
+        let synchronization_requests = requests_for(&synchronization_regions);
+        let content_synchronization = synchronization_requests
+            .iter()
+            .cloned()
+            .filter_map(|request| {
+                let reims_vgpu_core::ContentSynchronizationRequest {
+                    backing,
+                    regions,
+                    permitted_pending_writes,
+                } = request;
                 let destination = match resources.execution_representation_id(backing) {
                     Ok(destination) => destination,
                     Err(reason) => {
@@ -9800,10 +11013,94 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 };
                 match resources.representation_matches(backing, destination, &snapshot) {
                     Ok(true) => None,
-                    Ok(false) => Some(Ok(reims_vgpu_core::ContentSynchronizationRequest {
+                    Ok(false) => match resources.pending_gpu_writes_overlapping(
                         backing,
-                        regions,
-                    })),
+                        destination,
+                        &regions,
+                    ) {
+                        Ok(pending) => {
+                            let mut permitted = permitted_pending_writes.into_vec();
+                            let mut denied_by = std::collections::BTreeMap::new();
+                            for write in pending.iter().copied() {
+                                if permitted.contains(&write) {
+                                    continue;
+                                }
+                                let Some(producer) = write.transaction() else {
+                                    continue;
+                                };
+                                match self
+                                    .execution
+                                    .runtime()
+                                    .submission_order_relation(transaction, producer)
+                                {
+                                    // The producer is ordered behind this
+                                    // reader, so its write lands after the read
+                                    // and does not concern it.
+                                    Ok(reims_vgpu_core::SubmissionOrderRelation::Before)
+                                    // Or the two are on queues with no order
+                                    // between them at all. A queue that is
+                                    // blocked does not impose its own
+                                    // completion-publication order on an
+                                    // independent queue: with no ordering
+                                    // declared, either order is a valid
+                                    // execution, so serializing the reader
+                                    // ahead of the writer is one of them. The
+                                    // guest orders across queues by committing
+                                    // an explicit shared-event wait, and that
+                                    // arrives as a prerequisite rather than as
+                                    // a pending write discovered here -- so
+                                    // waiting on this one invents an order the
+                                    // guest never asked for, and deadlocks
+                                    // whenever the producer's own progress runs
+                                    // through the queue now parked on it.
+                                    | Ok(reims_vgpu_core::SubmissionOrderRelation::Independent) => {
+                                        permitted.push(write);
+                                    }
+                                    Ok(
+                                        relation @ (reims_vgpu_core::SubmissionOrderRelation::Same
+                                        | reims_vgpu_core::SubmissionOrderRelation::After),
+                                    ) => {
+                                        denied_by.insert(write, relation);
+                                    }
+                                    Err(reason) => {
+                                        return Some(Err(
+                                            ReplacementExecResourceReadinessError::ContentProducerOrder {
+                                                consumer: transaction,
+                                                producer,
+                                                reason,
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                            match pending
+                                .iter()
+                                .find(|write| !permitted.contains(write))
+                                .copied()
+                            {
+                                Some(write) => Some(Err(
+                                    ReplacementExecResourceReadinessError::ContentProducerPending {
+                                        backing,
+                                        representation: destination,
+                                        consumer: submission,
+                                        write,
+                                        relation: denied_by.get(&write).copied(),
+                                    },
+                                )),
+                                None => Some(Ok(reims_vgpu_core::ContentSynchronizationRequest {
+                                    backing,
+                                    regions,
+                                    permitted_pending_writes: permitted.into_boxed_slice(),
+                                })),
+                            }
+                        }
+                        Err(reason) => Some(Err(
+                            ReplacementExecResourceReadinessError::ValidityRepresentation {
+                                backing,
+                                reason,
+                            },
+                        )),
+                    },
                     Err(reason) => Some(Err(
                         ReplacementExecResourceReadinessError::ValidityRepresentation {
                             backing,
@@ -9820,6 +11117,24 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 representations.guest_upload_destination.map(|_| backing)
             })
             .collect::<Vec<_>>();
+        let upload_representations = required_content_regions
+            .keys()
+            .copied()
+            .chain(guest_uploads.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|backing| {
+                resources
+                    .execution_representation_id(backing)
+                    .map(|representation| (backing, representation))
+                    .map_err(|reason| {
+                        ReplacementExecResourceReadinessError::ValidityRepresentation {
+                            backing,
+                            reason,
+                        }
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let has_native_suffix = exec.streams.iter().any(|stream| {
             stream.segments.iter().any(|segment| {
                 segment.operations.iter().any(|operation| {
@@ -9834,7 +11149,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 })
             })
         });
-        if !allow_guest_upload_continuation && has_native_suffix && !guest_uploads.is_empty() {
+        if !mode.allows_guest_upload_continuation()
+            && has_native_suffix
+            && !guest_uploads.is_empty()
+        {
             return Err(
                 ReplacementExecResourceReadinessError::GuestUploadContinuationRequired(
                     guest_uploads.into_boxed_slice(),
@@ -9848,7 +11166,9 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             render,
             info,
             validity,
+            content_requirements,
             content_synchronization,
+            upload_representations,
         })
     }
 
@@ -10152,7 +11472,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 Ok(has_images) => has_images,
                 Err(reason) => {
                     return Err(Box::new(ReplacementExecImagePreparationFailure {
-                        reason,
+                        reason: ReplacementExecImagePreparationRefusal::Images(reason),
                         resources,
                     }));
                 }
@@ -10162,6 +11482,26 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 resources,
                 image_states: None,
             });
+        }
+        // Ordering the claim, not the work: everything above this point --
+        // readiness, resource preparation, the has-images classification --
+        // still runs as soon as the transaction arrives, and a transaction
+        // with no image uses has already returned. Only the exclusive claim
+        // waits, and only behind this transaction's own domain.
+        // An untracked transaction sits in no domain, so nothing can be ahead
+        // of it -- the order is assigned once, at admission, and never later.
+        // That is an answer rather than a swallowed error.
+        if let Ok(Some(predecessor)) = self
+            .execution
+            .runtime()
+            .unsubmitted_submission_predecessor(resources.transaction())
+        {
+            return Err(Box::new(ReplacementExecImagePreparationFailure {
+                reason: ReplacementExecImagePreparationRefusal::EarlierInDomainUnsubmitted {
+                    predecessor,
+                },
+                resources,
+            }));
         }
         let queue_family = self.session.vulkan().work_queue_family();
         let final_layouts =
@@ -10178,7 +11518,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 image_states: Some(image_states),
             }),
             Err(reason) => Err(Box::new(ReplacementExecImagePreparationFailure {
-                reason,
+                reason: ReplacementExecImagePreparationRefusal::Images(reason),
                 resources,
             })),
         }
@@ -10219,25 +11559,6 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         let submission = prepared.exec().identity.id;
         let states = prepared.resource_states_for_preparation().clone();
         let mut preparation = self.execution.begin_exec_resource_preparation(transaction);
-        if !manifest.content_synchronization.is_empty() {
-            if let Err(reason) = preparation.prepare_content_synchronization(
-                std::mem::take(&mut manifest.content_synchronization).into_vec(),
-            ) {
-                let prefix = preparation.cancel();
-                return Err(Box::new(
-                    ReplacementGuestUploadPhasePreparationFailure::Resources {
-                        reason: Box::new(
-                            ReplacementExecAutomaticPreparationError::ContentSynchronization {
-                                reason,
-                                prefix,
-                            },
-                        ),
-                        prepared,
-                        manifest,
-                    },
-                ));
-            }
-        }
         if let Err(failure) =
             preparation.prepare_resource_states(states, submission, |position, backing| {
                 manifest
@@ -10258,6 +11579,25 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     manifest,
                 },
             ));
+        }
+        if !manifest.content_synchronization.is_empty() {
+            if let Err(reason) = preparation.prepare_content_synchronization(
+                std::mem::take(&mut manifest.content_synchronization).into_vec(),
+            ) {
+                let prefix = preparation.cancel();
+                return Err(Box::new(
+                    ReplacementGuestUploadPhasePreparationFailure::Resources {
+                        reason: Box::new(
+                            ReplacementExecAutomaticPreparationError::ContentSynchronization {
+                                reason,
+                                prefix,
+                            },
+                        ),
+                        prepared,
+                        manifest,
+                    },
+                ));
+            }
         }
         if let Err(reason) = preparation.prepare_host_ingress_uploads() {
             let prefix = preparation.cancel();
@@ -10307,6 +11647,12 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             }
         };
         Ok(ReplacementPreparedGuestUploadPhase {
+            recording_exec: chain.prefix().clone(),
+            recording_origins: prepared.origins()[..chain.suffix_operation_base()]
+                .to_vec()
+                .into_boxed_slice(),
+            include_resource_state_admission: true,
+            continuation: None,
             prepared,
             manifest,
             chain,
@@ -10391,10 +11737,12 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             transaction,
             worker,
             queue_family: self.session.vulkan.work_queue_family(),
-            exec: phase.chain.prefix().clone(),
+            exec: phase.recording_exec.clone(),
             barriers,
         };
-        let origins = &phase.prepared.origins()[..phase.chain.suffix_operation_base()];
+        let resource_states = phase
+            .include_resource_state_admission
+            .then(|| phase.prepared.semantic_proofs.resource_states());
         let request = match self.execution.resolve_continuation_recording_request(
             &self.session.vulkan,
             input,
@@ -10404,9 +11752,9 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 conditions: None,
                 completion_effects: None,
                 indirect_commands: None,
-                resource_states: Some(phase.prepared.semantic_proofs.resource_states()),
+                resource_states,
             },
-            origins,
+            &phase.recording_origins,
         ) {
             Ok(request) => request,
             Err(reason) => {
@@ -10421,6 +11769,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             prepared,
             manifest,
             chain,
+            recording_exec,
+            recording_origins,
+            include_resource_state_admission,
+            continuation,
             envelope,
         } = phase;
         Ok(ReplacementResolvedGuestUploadPhase {
@@ -10428,6 +11780,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             prepared,
             manifest,
             chain,
+            recording_exec,
+            recording_origins,
+            include_resource_state_admission,
+            continuation,
             generation,
             envelope,
         })
@@ -10448,6 +11804,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             prepared,
             manifest,
             chain,
+            recording_exec,
+            recording_origins,
+            include_resource_state_admission,
+            continuation,
             generation,
             envelope,
         } = resolved;
@@ -10463,8 +11823,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                         prepared,
                         manifest,
                         chain,
+                        recording_exec,
+                        recording_origins,
+                        include_resource_state_admission,
+                        continuation,
                         envelope,
                     },
+                    generation,
                 }));
             }
         };
@@ -10478,6 +11843,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             prepared,
             manifest,
             chain,
+            recording_exec,
+            recording_origins,
+            include_resource_state_admission,
+            continuation,
         })
     }
 
@@ -10529,7 +11898,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             prepared.origins(),
             prepared.info_queries_for_resource_preparation(),
             prepared.resource_states_for_preparation(),
-            false,
+            ReplacementExecResourcePreflightMode::Complete,
         ) {
             Ok(manifest) => manifest,
             Err(reason) => {
@@ -10669,6 +12038,12 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .graph()
             .live_resource_tree_child_first(resource)
             .expect("the resolved surface root remains in its canonical graph");
+        let backings = self
+            .execution
+            .epoch
+            .resources
+            .graph()
+            .resource_tree_backings(&resources);
         self.admit_resource_lifecycle(
             channel,
             prerequisites,
@@ -10676,13 +12051,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             reims_vgpu_core::ResolvedResourceLifecycle::ReleaseResourceTree {
                 root: resource,
                 resources,
-                backing: self
-                    .execution
-                    .epoch
-                    .resources
-                    .graph()
-                    .resolved_backing(resource)
-                    .expect("a registered surface root owns its canonical backing"),
+                backings,
             },
         )
         .map_err(ReplacementNamedResourceLifecycleAdmissionError::Admission)
@@ -10810,6 +12179,26 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .map_err(ReplacementSynchronizeDispatchFailure::Dispatch)
     }
 
+    /// Project a synchronize's object list onto the resource states it names.
+    ///
+    /// A synchronize asks that this device's outstanding writes to the named
+    /// resources have landed before the guest unwires their backing. It is a
+    /// teardown statement: the guest is taking the backing out of its GPU page
+    /// table, and the record names the resource by the identity the guest was
+    /// given when the resource was constructed.
+    ///
+    /// **An object this device holds no resource for is skipped, not refused.**
+    /// There are no outstanding writes against a resource that does not exist,
+    /// so the synchronize is already satisfied for that object, and the same
+    /// holds for a resource with no backing. Refusing instead is not a
+    /// conservative choice: the packet sits at its channel's submission head
+    /// and every later packet on that channel waits behind a resource that a
+    /// teardown has just told us is going away. The whole channel then stops,
+    /// permanently, for a record whose correct effect was to do nothing.
+    ///
+    /// The skip is reported rather than silent, because the other reading — a
+    /// resource this device should have had and does not — is a real defect and
+    /// looks identical from here.
     fn resolve_synchronize_resource_states(
         &self,
         task: reims_vgpu_protocol::TaskId,
@@ -10823,32 +12212,79 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         let mut states = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for &object in objects {
-            let resource = graph
-                .resolve(task, object)
-                .ok_or(ReplacementSynchronizeResolutionError::UnknownResource { task, object })?;
-            let backing = graph.resolved_backing(resource).ok_or(
-                ReplacementSynchronizeResolutionError::BackingUnavailable(resource),
-            )?;
-            if !seen.insert(backing) {
+            // The guest names an object this device has no resource for. That
+            // is a real gap: the object id is the device-side identity the
+            // guest assigned, so a miss means this device lost track of
+            // something the guest still holds. Deduped because the guest
+            // re-sends the same unwire on every attempt.
+            let Some(resource) = graph.resolve(task, object) else {
+                if crate::observe::first_sight(
+                    "replacement_synchronize_object_unknown",
+                    synchronize_object_discriminant(task, object),
+                ) {
+                    crate::observe::fail(format!(
+                        "replacement_synchronize_object_unknown task={} object={} \
+                         reason=no_resource",
+                        task.get(),
+                        object.get()
+                    ));
+                }
+                continue;
+            };
+            // Every backing the object names, not the single one an endpoint
+            // would inherit. A registered IOSurface owns no backing of its own
+            // and its declared planes own one each, so asking for one backing
+            // answers `None` for the very allocation the guest most often
+            // synchronizes -- and a synchronize that resolved nothing would
+            // silently skip the writes it was sent to flush. This is the same
+            // accessor exec resource-state resolution uses, so the two cannot
+            // disagree about which backings one object names.
+            let backings = graph.alias_backings(resource).unwrap_or_default();
+            // A resource that owns no storage owns no bytes, so it carries no
+            // outstanding GPU writes and the flush the guest asked for is
+            // already satisfied. That is expected control flow rather than a
+            // loss, so it is a notice and not a failure -- and it is the
+            // ordinary case for the display resources the guest unwires and
+            // re-pages continuously, which is why it also has to be deduped.
+            if backings.is_empty() {
+                if crate::observe::first_sight(
+                    "replacement_synchronize_object_unbacked",
+                    synchronize_object_discriminant(task, object),
+                ) {
+                    crate::observe::off(format!(
+                        "replacement_synchronize_object_unbacked task={} object={} \
+                         reason=no_storage_nothing_to_flush",
+                        task.get(),
+                        object.get()
+                    ));
+                }
                 continue;
             }
-            let regions = graph
-                .storage(backing)
-                .expect("a resolved backing remains in the canonical graph")
-                .content
-                .snapshot_all()
-                .into_vec()
-                .into_iter()
-                .map(|version| version.region)
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
+            let targets = backings
+                .iter()
+                .copied()
+                .filter(|backing| seen.insert(*backing))
+                .map(|backing| {
+                    let regions = graph
+                        .storage(backing)
+                        .expect("an aliased backing remains in the canonical graph")
+                        .content
+                        .snapshot_all()
+                        .into_vec()
+                        .into_iter()
+                        .map(|version| version.region)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    reims_vgpu_core::ResolvedResourceStateTarget { backing, regions }
+                })
+                .collect::<Vec<_>>();
+            if targets.is_empty() {
+                continue;
+            }
             states.push(reims_vgpu_core::ResolvedResourceState {
                 resource: Some(resource),
                 mappings: Box::new([]),
-                targets: Box::new([reims_vgpu_core::ResolvedResourceStateTarget {
-                    backing,
-                    regions,
-                }]),
+                targets: targets.into_boxed_slice(),
                 ops: reims_vgpu_protocol::ResourceValidityOps {
                     clear_guest_valid: 1,
                     set_guest_valid: 1,
@@ -11865,6 +13301,90 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         }
     }
 
+    /// Give up one transaction that reached a typed refusal it cannot recover
+    /// from, releasing every reservation it still holds.
+    ///
+    /// A refused transaction is terminal, but terminal is not the same as
+    /// finished: until this ran, it kept its submission-order domain head, its
+    /// encoder continuation, its publication position, its prepared image-state
+    /// transitions and its prepared resource uses. Every later transaction on
+    /// the same channel then refused behind it, and the resources it named
+    /// could never retire. One unimplemented case cost the whole device.
+    ///
+    /// `resources` and `image_states` are what the failing stage had already
+    /// prepared, if it got that far. Both are cancelled before the runtime
+    /// place is given up, because cancellation is what proves nothing else
+    /// still depends on them.
+    /// Give up one refused guest-upload suffix, with the native chain it had
+    /// already reserved a queue point for.
+    ///
+    /// The chain is cancelled before the transaction is given up, because the
+    /// queue assignment it holds is what a later transaction on the same
+    /// recording worker would otherwise wait behind.
+    pub fn abandon_guest_upload_suffix(
+        &mut self,
+        suffix: ReplacementPreparedGuestUploadSuffix<Semantic>,
+        semantic: Semantic,
+    ) -> Result<
+        Vec<reims_vgpu_core::PublishedFact<Semantic>>,
+        reims_vgpu_core::TransactionRuntimeError,
+    > {
+        let (transaction, native, envelope) = suffix.into_abandoned_reservations();
+        self.execution
+            .native_mut()
+            .cancel_execution_chain(native)
+            .unwrap_or_else(|failure| {
+                unreachable!(
+                    "a refused suffix reserved its queue point and never submitted it: {:?}",
+                    failure.reason
+                )
+            });
+        self.abandon_transaction(
+            transaction,
+            Some(envelope.resources),
+            envelope.image_states,
+            semantic,
+        )
+    }
+
+    pub fn abandon_transaction(
+        &mut self,
+        transaction: TransactionId,
+        resources: Option<PreparedReplacementExecResources>,
+        image_states: Option<reims_vgpu_vulkan::replacement_image_state::PreparedImageStateBatch>,
+        semantic: Semantic,
+    ) -> Result<
+        Vec<reims_vgpu_core::PublishedFact<Semantic>>,
+        reims_vgpu_core::TransactionRuntimeError,
+    > {
+        if let Some(image_states) = image_states {
+            self.execution
+                .epoch
+                .images
+                .cancel_batch(image_states)
+                .unwrap_or_else(|reason| {
+                    unreachable!(
+                        "a refused transaction's image states were prepared and never accepted: {reason:?}"
+                    )
+                });
+        }
+        if let Some(resources) = resources {
+            reims_vgpu_core::cancel_prepared_exec_resources(
+                &mut self.execution.epoch.resources,
+                resources,
+            )
+            .unwrap_or_else(|failure| {
+                unreachable!(
+                    "a refused transaction's resource uses were prepared and never accepted: {:?}",
+                    failure.reason
+                )
+            });
+        }
+        self.execution
+            .runtime_mut()
+            .abandon_transaction(transaction, semantic)
+    }
+
     pub fn retry_present_completion(
         &mut self,
         completion: ReplacementPresentCompletion<Semantic>,
@@ -12103,6 +13623,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         }
     }
 
+    /// Declare a registered IOSurface as the allocation it is.
+    ///
+    /// The surface owns no backing of its own: each declared plane view
+    /// carries the plane it names, and the surface's bytes are exactly the
+    /// union of those planes. Giving the allocation a backing as well would
+    /// put an aggregate with no layout into every exec's resource-state target
+    /// set, where it can only ever be missing an execution representation.
     pub fn declare_registered_surface_resource(
         &mut self,
         task: reims_vgpu_protocol::TaskId,
@@ -12110,95 +13637,45 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         descriptor: Arc<reims_vgpu_protocol::SurfaceBackingDescriptor>,
     ) -> Result<ReplacementRegisteredSurfaceDeclaration, ReplacementRegisteredSurfaceDeclarationError>
     {
-        let surface = reims_vgpu_protocol::SurfaceBackingId::new(u64::from(object.get()));
+        let semantic_descriptor = Arc::new(
+            reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking((*descriptor).clone()),
+        );
         if let Some(resource) = self.resolve_resource(task, object) {
-            let graph = self.execution.epoch.resources.graph();
-            let node = graph
+            let node = self
+                .execution
+                .epoch
+                .resources
+                .graph()
                 .resource(resource)
                 .expect("a resolved resource remains in the canonical graph");
-            let backing = node
-                .storage
-                .ok_or(ReplacementRegisteredSurfaceDeclarationError::ConflictingDeclaration)?;
-            let exact_backing = graph.storage(backing).is_some_and(|storage| {
-                storage.backing == reims_vgpu_core::StorageBacking::RegisteredSurface { surface }
-            });
             if node.kind != reims_vgpu_protocol::ObjectKind::SurfaceBacking
-                || node.descriptor.as_deref()
-                    != Some(&reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(
-                        (*descriptor).clone(),
-                    ))
-                || !exact_backing
+                || node.descriptor.as_deref() != Some(semantic_descriptor.as_ref())
+                || node.storage.is_some()
                 || !node.parents.is_empty()
             {
                 return Err(ReplacementRegisteredSurfaceDeclarationError::ConflictingDeclaration);
             }
             return Ok(ReplacementRegisteredSurfaceDeclaration {
                 resource,
-                backing,
                 newly_declared: false,
-                newly_created_backing: false,
             });
         }
-
-        let existing_backing = self
-            .execution
-            .epoch
-            .resources
-            .graph()
-            .find_registered_surface_storage(surface);
-        let (backing, newly_created_backing) = match existing_backing {
-            Some(backing) => (backing, false),
-            None => {
-                let effect = self
-                    .apply_resource_lifecycle(
-                        reims_vgpu_core::ResolvedResourceLifecycle::CreateBacking {
-                            backing: reims_vgpu_core::StorageBacking::RegisteredSurface { surface },
-                            regions: Box::new([reims_vgpu_core::BackingRegion::Whole]),
-                        },
-                    )
-                    .map_err(ReplacementRegisteredSurfaceDeclarationError::Lifecycle)?;
-                let reims_vgpu_core::ResourceLifecycleEffect::BackingCreated(backing) = effect
-                else {
-                    unreachable!("registered backing creation returns its canonical identity")
-                };
-                (backing, true)
-            }
-        };
-        let semantic_descriptor = Arc::new(
-            reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking((*descriptor).clone()),
-        );
-        let creation = self.apply_resource_lifecycle(
-            reims_vgpu_core::ResolvedResourceLifecycle::CreateResource {
+        let effect = self
+            .apply_resource_lifecycle(reims_vgpu_core::ResolvedResourceLifecycle::CreateResource {
                 task,
                 object,
                 kind: reims_vgpu_protocol::ObjectKind::SurfaceBacking,
                 descriptor: semantic_descriptor,
-                storage: Some(backing),
+                storage: None,
                 parents: Box::new([]),
-            },
-        );
-        let effect = match creation {
-            Ok(effect) => effect,
-            Err(error) => {
-                if newly_created_backing {
-                    self.apply_resource_lifecycle(
-                        reims_vgpu_core::ResolvedResourceLifecycle::RetireBacking { backing },
-                    )
-                    .expect("an unowned just-created registered backing can always retire");
-                }
-                return Err(ReplacementRegisteredSurfaceDeclarationError::Lifecycle(
-                    error,
-                ));
-            }
-        };
+            })
+            .map_err(ReplacementRegisteredSurfaceDeclarationError::Lifecycle)?;
         let reims_vgpu_core::ResourceLifecycleEffect::ResourceCreated(resource) = effect else {
             unreachable!("registered-surface creation returns its generational identity")
         };
         Ok(ReplacementRegisteredSurfaceDeclaration {
             resource,
-            backing,
             newly_declared: true,
-            newly_created_backing,
         })
     }
 
@@ -12429,9 +13906,22 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     display_index: *pipe,
                     task: Some(*task),
                     resource: Some(resource),
-                    backing: node.storage.ok_or(
-                        ReplacementDisplayPresentResolutionError::RegisteredSurfaceDescriptorUnavailable,
-                    )?,
+                    // A scanout is the surface's first plane, which is also
+                    // what the descriptor's own whole-surface geometry and
+                    // format describe.
+                    backing: self
+                        .execution
+                        .resources()
+                        .graph()
+                        .find_io_surface_plane_storage(
+                            resource,
+                            reims_vgpu_protocol::PlaneIndex::new(0),
+                        )
+                        .ok_or(
+                            ReplacementDisplayPresentResolutionError::RegisteredSurfacePlaneUnavailable {
+                                plane: 0,
+                            },
+                        )?,
                     width: descriptor.width,
                     height: descriptor.height,
                     pixel_format,
@@ -12845,6 +14335,115 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         })
     }
 
+    /// Declare one registered-surface plane view over its own plane backing.
+    ///
+    /// A plane view does not alias the surface's whole allocation: each
+    /// declared plane is its own texture, at its own offset, with its own row
+    /// pitch and pixel format. Giving every plane one backing is what lets a
+    /// biplanar surface materialize both of them, because a backing carries at
+    /// most one execution representation and one layout.
+    pub fn declare_io_surface_plane_view(
+        &mut self,
+        task: reims_vgpu_protocol::TaskId,
+        object: reims_vgpu_protocol::ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
+        descriptor: Arc<reims_vgpu_protocol::ResourceDescriptor>,
+        parent: ResourceId<reims_vgpu_protocol::ResourceObject>,
+        plane: reims_vgpu_protocol::PlaneIndex,
+    ) -> Result<ReplacementViewResourceDeclaration, ReplacementIOSurfacePlaneViewDeclarationError>
+    {
+        if let Some(resource) = self.resolve_resource(task, object) {
+            let graph = self.execution.epoch.resources.graph();
+            let node = graph
+                .resource(resource)
+                .expect("a resolved resource remains in the canonical graph");
+            let exact_backing = node.storage.is_some_and(|backing| {
+                graph.storage(backing).is_some_and(|storage| {
+                    storage.backing
+                        == reims_vgpu_core::StorageBacking::IOSurfacePlane {
+                            surface: parent,
+                            plane,
+                        }
+                })
+            });
+            if node.kind != reims_vgpu_protocol::ObjectKind::IOSurfacePlaneView
+                || node.descriptor.as_deref() != Some(descriptor.as_ref())
+                || !exact_backing
+                || node.parents.len() != 1
+                || !node.parents.contains(&parent)
+            {
+                return Err(ReplacementIOSurfacePlaneViewDeclarationError::ConflictingDeclaration);
+            }
+            return Ok(ReplacementViewResourceDeclaration {
+                resource,
+                backing: node
+                    .storage
+                    .expect("an exact plane backing was just matched"),
+                newly_declared: false,
+            });
+        }
+
+        let existing_backing = self
+            .execution
+            .epoch
+            .resources
+            .graph()
+            .find_io_surface_plane_storage(parent, plane);
+        let (backing, newly_created_backing) = match existing_backing {
+            Some(backing) => (backing, false),
+            None => {
+                let effect = self
+                    .apply_resource_lifecycle(
+                        reims_vgpu_core::ResolvedResourceLifecycle::CreateBacking {
+                            backing: reims_vgpu_core::StorageBacking::IOSurfacePlane {
+                                surface: parent,
+                                plane,
+                            },
+                            regions: Box::new([reims_vgpu_core::BackingRegion::Whole]),
+                        },
+                    )
+                    .map_err(ReplacementIOSurfacePlaneViewDeclarationError::Lifecycle)?;
+                let reims_vgpu_core::ResourceLifecycleEffect::BackingCreated(backing) = effect
+                else {
+                    unreachable!("plane backing creation returns its canonical identity")
+                };
+                (backing, true)
+            }
+        };
+
+        let creation = self.apply_resource_lifecycle(
+            reims_vgpu_core::ResolvedResourceLifecycle::CreateResource {
+                task,
+                object,
+                kind: reims_vgpu_protocol::ObjectKind::IOSurfacePlaneView,
+                descriptor,
+                storage: Some(backing),
+                parents: Box::new([parent]),
+            },
+        );
+        let effect = match creation {
+            Ok(effect) => effect,
+            Err(error) => {
+                if newly_created_backing {
+                    self.apply_resource_lifecycle(
+                        reims_vgpu_core::ResolvedResourceLifecycle::RetireBacking { backing },
+                    )
+                    .expect("an unowned just-created plane backing can always retire");
+                }
+                return Err(ReplacementIOSurfacePlaneViewDeclarationError::Lifecycle(
+                    error,
+                ));
+            }
+        };
+        let reims_vgpu_core::ResourceLifecycleEffect::ResourceCreated(resource) = effect else {
+            unreachable!("plane-view creation returns its generational identity")
+        };
+        Ok(ReplacementViewResourceDeclaration {
+            resource,
+            backing,
+            newly_declared: true,
+        })
+    }
+
     pub fn declare_buffer_texture(
         &mut self,
         task: reims_vgpu_protocol::TaskId,
@@ -12956,7 +14555,33 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .copied()
     }
 
-    pub(crate) fn registered_surface_materialization_facts(
+    /// The surface allocation one plane view is cut from, and the plane's own
+    /// backing. The task is the surface's, because `backing_pfn` names a page
+    /// in the address space the surface was registered in.
+    /// The plane view a registered surface's plane backing belongs to.
+    ///
+    /// An [`reims_vgpu_core::StorageClass::IOSurfacePlane`] backing is owned by
+    /// the plane view declared over it, and that view is what carries the
+    /// descriptor, extent and page a materialization needs. Asking the storage
+    /// node for it lets a repair that starts from a backing reach the same
+    /// materializer the object-ready route reaches from a resource, rather than
+    /// carrying a second idea of which resource describes a plane.
+    pub(crate) fn io_surface_plane_view_owner(
+        &self,
+        backing: reims_vgpu_protocol::BackingId,
+    ) -> Option<ResourceId<reims_vgpu_protocol::ResourceObject>> {
+        let graph = self.execution.resources().graph();
+        let storage = graph.storage(backing)?;
+        if storage.backing.class() != reims_vgpu_core::StorageClass::IOSurfacePlane {
+            return None;
+        }
+        storage.owners.iter().copied().find(|owner| {
+            self.io_surface_plane_view_materialization_facts(*owner)
+                .is_some()
+        })
+    }
+
+    pub(crate) fn io_surface_plane_view_materialization_facts(
         &self,
         resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
     ) -> Option<(
@@ -12964,13 +14589,25 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         reims_vgpu_protocol::SurfaceBackingDescriptor,
         reims_vgpu_protocol::BackingId,
     )> {
-        let node = self.execution.resources().graph().resource(resource)?;
-        let reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(descriptor) =
+        let graph = self.execution.resources().graph();
+        let node = graph.resource(resource)?;
+        let reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(view) =
             node.descriptor.as_deref()?
         else {
             return None;
         };
-        Some((node.task, descriptor.clone(), node.storage?))
+        view.view?;
+        let mut parents = node.parents.iter().copied();
+        let (Some(parent), None) = (parents.next(), parents.next()) else {
+            return None;
+        };
+        let surface = graph.resource(parent)?;
+        let reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(descriptor) =
+            surface.descriptor.as_deref()?
+        else {
+            return None;
+        };
+        Some((surface.task, descriptor.clone(), node.storage?))
     }
 
     pub(crate) fn linear_resource_materialization_facts(
@@ -12994,38 +14631,98 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         };
         Some((task, address, length))
     }
+}
 
+/// Separate one synchronized object from another in the emitters' latch.
+///
+/// The latch fires once per distinct `(reason, discriminant)`, so the
+/// discriminant has to carry both halves of the object's identity: the same
+/// object number under two tasks is two objects, and a guest cycling through
+/// several still gets one line each rather than one line total.
+fn synchronize_object_discriminant(
+    task: reims_vgpu_protocol::TaskId,
+    object: reims_vgpu_protocol::ObjectTableRef<reims_vgpu_protocol::ResourceObject>,
+) -> u64 {
+    (u64::from(task.get()) << 32) | u64::from(object.get())
+}
+
+/// Why a backing cannot be materialized from the guest task address it names.
+///
+/// The three are distinct repairs and a single "unavailable" cannot tell them
+/// apart: a backing with no storage record is one this device has not interned
+/// yet or has retired, a backing of another class belongs to another
+/// materializer, and a task-address backing with no described owner has no
+/// descriptor to build a native object from at all. Only the first is ever
+/// resolved by a later packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementTaskAddressMaterializationRefusal {
+    StorageAbsent,
+    UnservedStorageClass(reims_vgpu_core::StorageClass),
+    NoDescribedOwner,
+}
+
+impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     pub(crate) fn task_address_backing_materialization_facts(
         &self,
         backing: reims_vgpu_protocol::BackingId,
-    ) -> Option<(
-        ResourceId<reims_vgpu_protocol::ResourceObject>,
-        reims_vgpu_protocol::TaskId,
-        reims_vgpu_protocol::GuestVirtualAddress,
-        reims_vgpu_protocol::ByteLength,
-    )> {
+    ) -> Result<
+        (
+            ResourceId<reims_vgpu_protocol::ResourceObject>,
+            reims_vgpu_protocol::TaskId,
+            reims_vgpu_protocol::GuestVirtualAddress,
+            reims_vgpu_protocol::ByteLength,
+        ),
+        ReplacementTaskAddressMaterializationRefusal,
+    > {
         let graph = self.execution.resources().graph();
-        let storage = graph.storage(backing)?;
+        let storage = graph
+            .storage(backing)
+            .ok_or(ReplacementTaskAddressMaterializationRefusal::StorageAbsent)?;
         let reims_vgpu_core::StorageBacking::TaskAddress {
             task,
             address,
             length,
         } = storage.backing
         else {
-            return None;
+            return Err(
+                ReplacementTaskAddressMaterializationRefusal::UnservedStorageClass(
+                    storage.backing.class(),
+                ),
+            );
         };
-        let resource = storage.owners.iter().copied().find(|resource| {
-            graph.resource(*resource).is_some_and(|node| {
-                matches!(
-                    node.descriptor.as_deref(),
-                    Some(
-                        reims_vgpu_protocol::ResourceDescriptor::Buffer(_)
-                            | reims_vgpu_protocol::ResourceDescriptor::Texture(_)
-                    )
-                )
+        // One guest allocation may be declared as both a buffer and a linear
+        // texture, and both owners land on this backing. The texture is the
+        // one to materialize from: it builds an image *and* the byte endpoint
+        // the image transfers through, so a later buffer view of the same
+        // bytes resolves through that endpoint. Materializing the buffer owner
+        // builds only a buffer, and the texture view then has nothing.
+        let owner = |wanted_texture: bool| {
+            storage.owners.iter().copied().find(|resource| {
+                graph
+                    .resource(*resource)
+                    .is_some_and(|node| match node.descriptor.as_deref() {
+                        Some(reims_vgpu_protocol::ResourceDescriptor::Texture(_)) => wanted_texture,
+                        Some(reims_vgpu_protocol::ResourceDescriptor::Buffer(_)) => !wanted_texture,
+                        _ => false,
+                    })
             })
-        })?;
-        Some((resource, task, address, length))
+        };
+        let resource = owner(true)
+            .or_else(|| owner(false))
+            .ok_or(ReplacementTaskAddressMaterializationRefusal::NoDescribedOwner)?;
+        Ok((resource, task, address, length))
+    }
+}
+
+impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
+    pub(crate) fn resolved_backing(
+        &self,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    ) -> Option<reims_vgpu_protocol::BackingId> {
+        self.execution
+            .resources()
+            .graph()
+            .resolved_backing(resource)
     }
 
     pub(crate) fn backing_has_execution_representation(
@@ -13884,14 +15581,18 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         }
     }
 
-    pub fn materialize_registered_surface_with_guest_window(
+    pub fn materialize_io_surface_plane_view_with_guest_window(
         &mut self,
         resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
         guest: reims_vgpu_memory::GuestWindow,
     ) -> Result<reims_vgpu_protocol::RepresentationId, ReplacementRepresentationConstructionError>
     {
         self.execution
-            .materialize_registered_surface_with_guest_window(&self.session.vulkan, resource, guest)
+            .materialize_io_surface_plane_view_with_guest_window(
+                &self.session.vulkan,
+                resource,
+                guest,
+            )
     }
 
     pub fn materialize_resource_with_guest_window(
@@ -14859,14 +16560,25 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 recorded,
             ));
         };
-        let Some(dependencies) = runtime
-            .submission_dependencies(transaction)
-            .map(<[_]>::to_vec)
-        else {
-            return Err(failure(
-                ReplacementRecordedIndirectRangeQueueError::MissingDependencies(transaction),
-                recorded,
-            ));
+        let dependencies = match runtime.native_submission_dependencies(transaction) {
+            Ok(reims_vgpu_core::NativeSubmissionProjection::Native(dependencies)) => {
+                dependencies.into_vec()
+            }
+            Ok(reims_vgpu_core::NativeSubmissionProjection::AwaitingHostProducer(producer)) => {
+                return Err(failure(
+                    ReplacementRecordedIndirectRangeQueueError::AwaitingHostProducer {
+                        transaction,
+                        producer,
+                    },
+                    recorded,
+                ));
+            }
+            Err(_) => {
+                return Err(failure(
+                    ReplacementRecordedIndirectRangeQueueError::MissingDependencies(transaction),
+                    recorded,
+                ));
+            }
         };
         let Some(hazards) = runtime.submission_hazards(transaction).map(<[_]>::to_vec) else {
             return Err(failure(
@@ -15644,14 +17356,25 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 recorded,
             }));
         };
-        let Some(dependencies) = runtime
-            .submission_dependencies(transaction)
-            .map(<[_]>::to_vec)
-        else {
-            return Err(Box::new(ReplacementRecordedExecQueueFailure {
-                reason: ReplacementRecordedExecQueueError::MissingDependencies(transaction),
-                recorded,
-            }));
+        let dependencies = match runtime.native_submission_dependencies(transaction) {
+            Ok(reims_vgpu_core::NativeSubmissionProjection::Native(dependencies)) => {
+                dependencies.into_vec()
+            }
+            Ok(reims_vgpu_core::NativeSubmissionProjection::AwaitingHostProducer(producer)) => {
+                return Err(Box::new(ReplacementRecordedExecQueueFailure {
+                    reason: ReplacementRecordedExecQueueError::AwaitingHostProducer {
+                        transaction,
+                        producer,
+                    },
+                    recorded,
+                }));
+            }
+            Err(_) => {
+                return Err(Box::new(ReplacementRecordedExecQueueFailure {
+                    reason: ReplacementRecordedExecQueueError::MissingDependencies(transaction),
+                    recorded,
+                }));
+            }
         };
         let Some(hazards) = runtime.submission_hazards(transaction).map(<[_]>::to_vec) else {
             return Err(Box::new(ReplacementRecordedExecQueueFailure {
@@ -15774,14 +17497,25 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 recorded,
             ));
         };
-        let Some(dependencies) = runtime
-            .submission_dependencies(transaction)
-            .map(<[_]>::to_vec)
-        else {
-            return Err(failure(
-                ReplacementRecordedIndirectRangeQueueError::MissingDependencies(transaction),
-                recorded,
-            ));
+        let dependencies = match runtime.native_submission_dependencies(transaction) {
+            Ok(reims_vgpu_core::NativeSubmissionProjection::Native(dependencies)) => {
+                dependencies.into_vec()
+            }
+            Ok(reims_vgpu_core::NativeSubmissionProjection::AwaitingHostProducer(producer)) => {
+                return Err(failure(
+                    ReplacementRecordedIndirectRangeQueueError::AwaitingHostProducer {
+                        transaction,
+                        producer,
+                    },
+                    recorded,
+                ));
+            }
+            Err(_) => {
+                return Err(failure(
+                    ReplacementRecordedIndirectRangeQueueError::MissingDependencies(transaction),
+                    recorded,
+                ));
+            }
         };
         let Some(hazards) = runtime.submission_hazards(transaction).map(<[_]>::to_vec) else {
             return Err(failure(
@@ -15931,7 +17665,11 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .native
             .prepare_execution_chain(plan, generation, completion)
         {
-            Ok(native) => Ok(ReplacementPreparedGuestUploadChain { native, recorded }),
+            Ok(native) => Ok(ReplacementPreparedGuestUploadChain {
+                native,
+                recorded,
+                predecessor: None,
+            }),
             Err(failure) => Err(Box::new(
                 ReplacementGuestUploadChainPreparationFailure::Native { failure, recorded },
             )),
@@ -15945,12 +17683,22 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         ReplacementPreparedRecordedGuestUpload<Semantic>,
         Box<ReplacementRecordedGuestUploadPreparationFailure<Semantic>>,
     > {
-        let allocated = match self
-            .execution
-            .epoch
-            .native
-            .prepare_execution_chain_auxiliary(&prepared.native, self.session.vulkan.work_queue())
-        {
+        let allocation = match prepared.predecessor {
+            Some(predecessor) => self
+                .execution
+                .epoch
+                .native
+                .prepare_execution_chain_auxiliary_after(&prepared.native, predecessor),
+            None => self
+                .execution
+                .epoch
+                .native
+                .prepare_execution_chain_auxiliary(
+                    &prepared.native,
+                    self.session.vulkan.work_queue(),
+                ),
+        };
+        let allocated = match allocation {
             Ok(allocated) => allocated,
             Err(reason) => {
                 return Err(Box::new(
@@ -15961,13 +17709,19 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ));
             }
         };
-        let ReplacementPreparedGuestUploadChain { native, recorded } = prepared;
+        let ReplacementPreparedGuestUploadChain {
+            native,
+            recorded,
+            predecessor,
+        } = prepared;
         let ReplacementRecordedGuestUploadPhase {
             recorded,
             prepared,
             manifest,
             chain,
+            continuation,
         } = recorded;
+        debug_assert!(continuation.is_none());
         let ReplacementRecordedExec {
             generation,
             recording,
@@ -16002,7 +17756,9 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                                 prepared,
                                 manifest,
                                 chain,
+                                continuation,
                             },
+                            predecessor,
                         },
                         allocated,
                     },
@@ -16017,6 +17773,25 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             chain,
             resources,
             image_states,
+        })
+    }
+
+    pub fn prepare_recorded_guest_upload_refresh(
+        &mut self,
+        mut recorded: ReplacementRecordedGuestUploadPhase<Semantic>,
+    ) -> Result<
+        ReplacementPreparedRecordedGuestUpload<Semantic>,
+        Box<ReplacementRecordedGuestUploadPreparationFailure<Semantic>>,
+    > {
+        let Some(continuation) = recorded.continuation.take() else {
+            return Err(Box::new(
+                ReplacementRecordedGuestUploadPreparationFailure::ContinuationAbsent { recorded },
+            ));
+        };
+        self.prepare_recorded_guest_upload(ReplacementPreparedGuestUploadChain {
+            native: continuation.native,
+            recorded,
+            predecessor: Some(continuation.last_auxiliary),
         })
     }
 
@@ -16219,7 +17994,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         &mut self,
         continuing: ReplacementContinuingGuestUpload<Semantic>,
     ) -> Result<
-        ReplacementPreparedGuestUploadSuffix<Semantic>,
+        ReplacementPreparedGuestUploadContinuation<Semantic>,
         Box<ReplacementGuestUploadSuffixPreparationFailure<Semantic>>,
     >
     where
@@ -16228,10 +18003,132 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         let ReplacementContinuingGuestUpload {
             native,
             prepared,
-            manifest,
+            manifest: retained,
             chain,
             last_auxiliary,
         } = continuing;
+        // The retained requirements remain valid while their contract-owned
+        // execution identities and exact regional content still match.
+        // Physical replacement or a content-version transition requires a
+        // fresh preflight before the suffix may read them.
+        let upload_state_changed = !retained
+            .upload_representations_match(&self.execution.epoch.resources)
+            || !retained.upload_content_matches(&self.execution.epoch.resources);
+        let mut manifest = if upload_state_changed {
+            match self.preflight_prepared_guest_upload_suffix_resources(&prepared) {
+                Ok(manifest) => manifest,
+                Err(reason) => {
+                    return Err(Box::new(
+                        ReplacementGuestUploadSuffixPreparationFailure::Readiness {
+                            reason,
+                            native,
+                            prepared,
+                            manifest: Box::new(retained),
+                            chain,
+                            last_auxiliary,
+                        },
+                    ));
+                }
+            }
+        } else {
+            retained
+        };
+        if upload_state_changed && manifest.requires_guest_upload() {
+            let transaction = chain.transaction();
+            let recording_exec = CanonicalReplacementExecTransaction {
+                identity: chain.suffix().identity,
+                prologue: reims_vgpu_core::ExecPrologue::default(),
+                streams: Box::new([]),
+                accesses: Box::new([]),
+            };
+            let mut preparation = self.execution.begin_exec_resource_preparation(transaction);
+            if let Err(reason) = preparation.prepare_content_synchronization(
+                std::mem::take(&mut manifest.content_synchronization).into_vec(),
+            ) {
+                let prefix = preparation.cancel();
+                return Err(Box::new(
+                    ReplacementGuestUploadSuffixPreparationFailure::Resources {
+                        reason: Box::new(
+                            ReplacementExecAutomaticPreparationError::ContentSynchronization {
+                                reason,
+                                prefix,
+                            },
+                        ),
+                        native,
+                        prepared,
+                        chain,
+                        last_auxiliary,
+                    },
+                ));
+            }
+            if let Err(reason) = preparation.prepare_host_ingress_uploads() {
+                let prefix = preparation.cancel();
+                return Err(Box::new(
+                    ReplacementGuestUploadSuffixPreparationFailure::Resources {
+                        reason: Box::new(ReplacementExecAutomaticPreparationError::HostIngress {
+                            reason,
+                            prefix,
+                        }),
+                        native,
+                        prepared,
+                        chain,
+                        last_auxiliary,
+                    },
+                ));
+            }
+            let resources = match preparation.finish(&recording_exec, 0) {
+                Ok(resources) => resources,
+                Err(failure) => {
+                    let reason = failure.reason;
+                    let cancellation = reims_vgpu_core::cancel_prepared_exec_resource_inputs(
+                        &mut self.execution.epoch.resources,
+                        transaction,
+                        failure.inputs,
+                    );
+                    return Err(Box::new(
+                        ReplacementGuestUploadSuffixPreparationFailure::Resources {
+                            reason: Box::new(ReplacementExecAutomaticPreparationError::Assembly {
+                                reason,
+                                cancellation,
+                            }),
+                            native,
+                            prepared,
+                            chain,
+                            last_auxiliary,
+                        },
+                    ));
+                }
+            };
+            let envelope = match self.prepare_exec_image_states(resources) {
+                Ok(envelope) => envelope,
+                Err(reason) => {
+                    return Err(Box::new(
+                        ReplacementGuestUploadSuffixPreparationFailure::Images {
+                            reason,
+                            native,
+                            prepared,
+                            chain,
+                            last_auxiliary,
+                        },
+                    ));
+                }
+            };
+            return Ok(ReplacementPreparedGuestUploadContinuation::Refresh(
+                Box::new(ReplacementPreparedGuestUploadPhase {
+                    prepared,
+                    manifest,
+                    chain,
+                    recording_exec,
+                    recording_origins: Box::new([]),
+                    include_resource_state_admission: false,
+                    continuation: Some(ReplacementGuestUploadContinuationOwner {
+                        native,
+                        last_auxiliary,
+                    }),
+                    envelope,
+                }),
+            ));
+        }
         let transaction = chain.transaction();
         let base = chain.suffix_operation_base();
         let origins = &prepared.origins()[base..];
@@ -16272,13 +18169,15 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ));
             }
         };
-        Ok(ReplacementPreparedGuestUploadSuffix {
-            native,
-            prepared,
-            chain,
-            last_auxiliary,
-            envelope,
-        })
+        Ok(ReplacementPreparedGuestUploadContinuation::Suffix(
+            Box::new(ReplacementPreparedGuestUploadSuffix {
+                native,
+                prepared,
+                chain,
+                last_auxiliary,
+                envelope,
+            }),
+        ))
     }
 
     /// Route the exact post-upload suffix into its owning execution state
@@ -17292,10 +19191,7 @@ impl ReplacementSession {
                 compute: compilers.1.clone(),
                 completions: completion_sender.clone(),
             },
-            move || {
-                crate::observe::off("replacement_pipeline_worker_wake");
-                executor_wake.wake();
-            },
+            move || executor_wake.wake(),
         )
         .map_err(ReplacementSessionStartError::PipelineWorkers)?;
         let session = Self {
@@ -17316,10 +19212,7 @@ impl ReplacementSession {
         self.vulkan
             .queues()
             .recording_workers()
-            .install_event_wake(move || {
-                crate::observe::off("replacement_recording_worker_wake");
-                completion_wake.wake();
-            })
+            .install_event_wake(move || completion_wake.wake())
             .expect("each recording-worker population receives one scheduler wake");
     }
 
@@ -17819,8 +19712,17 @@ impl ReplacementSession {
             )
             .map_err(ReplacementComputeProgramPreparationError::Translation)?;
         let requests = compute_storage_image_requests(operation)?;
+        let samplers = operation
+            .samplers
+            .iter()
+            .map(|binding| binding.sampler)
+            .collect::<Vec<_>>();
         let program = translation
-            .prepare_program(&requests, operation.launch.program_dispatch_contract())
+            .prepare_program(
+                &requests,
+                &samplers,
+                operation.launch.program_dispatch_contract(),
+            )
             .map_err(ReplacementComputeProgramPreparationError::Program)?;
         self.compute_variant_with_program(operation, transaction, program)
             .map_err(ReplacementComputeProgramPreparationError::Variant)
@@ -18824,6 +20726,7 @@ mod tests {
         fn prepare_program(
             &self,
             _: &[(u32, StorageImageFormat)],
+            _: &[reims_vgpu_core::SamplerResource],
             _: reims_vgpu_core::ComputeProgramDispatchContract,
         ) -> Result<PreparedComputeProgram, ComputeProgramDecline> {
             unreachable!("pipeline publication does not specialize a dispatch")
@@ -18864,6 +20767,7 @@ mod tests {
         fn prepare_program(
             &self,
             _: &[(u32, StorageImageFormat)],
+            _: &[reims_vgpu_core::SamplerResource],
             _: reims_vgpu_core::ComputeProgramDispatchContract,
         ) -> Result<PreparedComputeProgram, ComputeProgramDecline> {
             unreachable!("decoded projection does not specialize a native program")
@@ -18904,6 +20808,7 @@ mod tests {
         fn prepare_program(
             &self,
             _: &[(u32, StorageImageFormat)],
+            _: &[reims_vgpu_core::SamplerResource],
             _: reims_vgpu_core::ComputeProgramDispatchContract,
         ) -> Result<PreparedComputeProgram, ComputeProgramDecline> {
             unreachable!("decoded projection does not specialize a native program")
@@ -19037,6 +20942,126 @@ mod tests {
                 }
             )
         );
+    }
+
+    /// A staged guest upload behind an unqueued transaction on its own channel
+    /// is not its source domain's submission head, so the queue refuses it. The
+    /// refusal is an ordering fact and the recording must be asked again once
+    /// the head has been taken — the direct and indirect arms both retry their
+    /// queue refusals, and an upload arm that does not loses the EXEC outright
+    /// along with every later transaction on the channel behind it.
+    #[test]
+    fn a_refused_guest_upload_queue_retries_from_its_exact_recording() {
+        let Some(mut runtime) = runtime_session() else {
+            return;
+        };
+        let channel = reims_vgpu_protocol::ChannelId::new(26);
+        runtime.define_channel(channel).unwrap();
+        let staged = stage_guest_upload_resources_for_test(&mut runtime);
+        let Some(head) = stage_event_signal_ingress_for_test(
+            &mut runtime,
+            channel,
+            68,
+            reims_vgpu_core::EventOperation {
+                event: ResourceId::new(41, 1),
+                kind: reims_vgpu_core::EventOperationKind::Signal,
+                value: 1,
+            },
+        ) else {
+            return;
+        };
+        let Some(upload) =
+            stage_guest_upload_ingress_for_test(&mut runtime, staged, channel, 69, None)
+        else {
+            return;
+        };
+        let PendingReplacementIngressExec::Direct(head) = head else {
+            panic!("the channel head must remain a direct EXEC")
+        };
+        let upload_transaction = upload.transaction();
+
+        // The head is deliberately left unqueued, so the upload behind it
+        // cannot reserve the domain head and its queue must refuse.
+        let mut pending = upload;
+        let refusal = loop {
+            match runtime.progress_exec_ingress_recording(pending) {
+                Ok(ReplacementExecIngressRecordingProgress::GuestUpload(
+                    ReplacementGuestUploadIngressRecordingProgress::Pending(next),
+                )) => {
+                    pending = PendingReplacementIngressExec::GuestUpload(next);
+                    std::thread::yield_now();
+                }
+                Ok(_) => panic!("a staged upload behind its channel head cannot be queued"),
+                Err(failure) => break failure,
+            }
+        };
+        assert_eq!(refusal.reason(), "guest_upload_queue");
+        assert_eq!(
+            refusal.detail().as_deref(),
+            Some(
+                format!(
+                    "{:?}",
+                    ReplacementRecordedIndirectRangeQueueError::NotSubmissionHead(
+                        upload_transaction
+                    )
+                )
+                .as_str()
+            )
+        );
+
+        // Take the head, exactly as its own acceptance would.
+        let mut head = head;
+        let head_ready = loop {
+            match runtime
+                .progress_exec_ingress_recording(PendingReplacementIngressExec::Direct(head))
+                .unwrap_or_else(|_| panic!("the channel head recording must progress"))
+            {
+                ReplacementExecIngressRecordingProgress::Direct(
+                    ReplacementDirectRecordingProgress::Pending(next),
+                ) => {
+                    head = next;
+                    std::thread::yield_now();
+                }
+                ReplacementExecIngressRecordingProgress::Direct(
+                    ReplacementDirectRecordingProgress::Ready(ready),
+                ) => break ready,
+                _ => panic!("the channel head has no prerequisite and no upload"),
+            }
+        };
+        assert!(head_ready.plan.transaction < upload_transaction);
+
+        // Driver acceptance, not the take, is what releases the next FIFO head.
+        let mut head = runtime
+            .submit_queue_ready_exec(*head_ready, ())
+            .unwrap_or_else(|_| panic!("the channel head must enter the work queue"));
+        loop {
+            match runtime.poll_queue_exec_driver(head) {
+                reims_vgpu_vulkan::replacement_exec_queue::ReplacementExecSubmitPoll::Pending(
+                    next,
+                ) => {
+                    head = next;
+                    std::thread::yield_now();
+                }
+                reims_vgpu_vulkan::replacement_exec_queue::ReplacementExecSubmitPoll::Accepted(
+                    _,
+                ) => break,
+                _ => panic!("the channel head must be accepted by the driver"),
+            }
+        }
+
+        // The retained upload recording now resumes from its exact recording.
+        match runtime
+            .retry_exec_ingress_recording_progress(refusal)
+            .unwrap_or_else(|failure| panic!("the refused upload must retry: {}", failure.reason()))
+        {
+            ReplacementExecIngressRecordingProgress::GuestUpload(
+                ReplacementGuestUploadIngressRecordingProgress::Ready(ready),
+            ) => assert_eq!(ready.transaction(), upload_transaction),
+            ReplacementExecIngressRecordingProgress::GuestUpload(
+                ReplacementGuestUploadIngressRecordingProgress::Parked(parked),
+            ) => assert_eq!(parked, upload_transaction),
+            _ => panic!("a retried upload cannot change recording routes"),
+        }
     }
 
     fn runtime_session() -> Option<ReplacementRuntimeSession<()>> {
@@ -23385,14 +25410,9 @@ mod tests {
             )
             .unwrap();
         assert!(declared.newly_declared);
-        assert!(declared.newly_created_backing);
+        // The allocation owns no backing. Its planes do.
         let graph = runtime.execution().resources().graph();
-        assert_eq!(
-            graph.storage(declared.backing).unwrap().backing,
-            reims_vgpu_core::StorageBacking::RegisteredSurface {
-                surface: reims_vgpu_protocol::SurfaceBackingId::new(u64::from(object)),
-            }
-        );
+        assert_eq!(graph.resource(declared.resource).unwrap().storage, None);
         assert_eq!(
             graph
                 .resource(declared.resource)
@@ -23412,7 +25432,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(repeated.resource, declared.resource);
-        assert_eq!(repeated.backing, declared.backing);
         assert!(!repeated.newly_declared);
 
         let view_object = 18;
@@ -23441,14 +25460,37 @@ mod tests {
                 reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(plane_view),
             )
             .unwrap();
-        assert_eq!(view.backing, declared.backing);
+        // The plane view owns the plane, not the surface allocation: a
+        // multi-plane surface needs one backing per plane, because a backing
+        // carries one execution representation and one layout.
         let node = runtime
             .execution()
             .resources()
             .graph()
             .resource(view.resource)
             .unwrap();
-        assert_eq!(node.storage, Some(declared.backing));
+        assert_eq!(node.storage, Some(view.backing));
+        assert_eq!(
+            runtime
+                .execution()
+                .resources()
+                .graph()
+                .storage(view.backing)
+                .unwrap()
+                .backing,
+            reims_vgpu_core::StorageBacking::IOSurfacePlane {
+                surface: declared.resource,
+                plane: reims_vgpu_protocol::PlaneIndex::new(0),
+            }
+        );
+        assert_eq!(
+            runtime
+                .execution()
+                .resources()
+                .graph()
+                .resolved_backing(view.resource),
+            Some(view.backing)
+        );
         assert_eq!(node.parents.len(), 1);
         assert!(node.parents.contains(&declared.resource));
         assert_eq!(
@@ -23513,7 +25555,19 @@ mod tests {
                 reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(cross_task_plane_view),
             )
             .unwrap();
-        assert_eq!(cross_task_view.backing, cross_task_surface.backing);
+        assert_eq!(
+            runtime
+                .execution()
+                .resources()
+                .graph()
+                .storage(cross_task_view.backing)
+                .unwrap()
+                .backing,
+            reims_vgpu_core::StorageBacking::IOSurfacePlane {
+                surface: cross_task_surface.resource,
+                plane: reims_vgpu_protocol::PlaneIndex::new(0),
+            }
+        );
         let cross_task_node = runtime
             .execution()
             .resources()
@@ -23592,7 +25646,8 @@ mod tests {
                 retired,
             } if *root == declared.resource
                 && resources.as_ref() == [view.resource, declared.resource]
-                && retired.storage.id == declared.backing
+                && retired.len() == 1
+                && retired[0].storage.id == view.backing
         ));
         assert_eq!(
             runtime.complete_resource_lifecycle(deletion, ()).unwrap()[0].completion_stamp,
@@ -23600,12 +25655,287 @@ mod tests {
         );
     }
 
+    /// A plane view whose own object id equals its surface's is a distinct
+    /// object, because the two ids are read out of different tasks' lists.
+    ///
+    /// The descriptor carries `owner_task` for exactly this reason: the surface
+    /// is registered against the task that owns it while the view belongs to
+    /// the task whose object list is being admitted. Treating equal ids as a
+    /// self-reference refuses a legal view, and a refusal here parks the whole
+    /// object-preparation apply -- and with it every later transaction on that
+    /// channel.
     #[test]
-    fn registered_surface_materializes_from_one_exact_scattered_guest_window() {
+    fn a_plane_view_may_carry_its_surfaces_id_when_the_surface_is_another_tasks() {
+        let Some(mut runtime) = runtime_session() else {
+            return;
+        };
+        let owner = reims_vgpu_protocol::TaskId::new(0);
+        let task = reims_vgpu_protocol::TaskId::new(2);
+        let object = 5;
+        let mut planes = [reims_vgpu_protocol::SurfaceBackingPlane::default();
+            reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP];
+        planes[0] = reims_vgpu_protocol::SurfaceBackingPlane {
+            offset: 0,
+            width: 640,
+            height: 480,
+            bytes_per_row: 2560,
+            bytes_per_element: 4,
+        };
+        let surface = reims_vgpu_protocol::SurfaceBackingDescriptor {
+            length: 2560 * 480,
+            backing_pfn: 0x123,
+            pixel_format: 0x4247_5241,
+            plane_count: 1,
+            planes,
+            width: 640,
+            height: 480,
+            bytes_per_row: 2560,
+        };
+        crate::runtime::replacement_object_lifecycle::apply_replacement_registered_surface(
+            &mut runtime,
+            owner,
+            object,
+            reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(surface),
+        )
+        .unwrap();
+
+        // The view's own ref and the surface's id are both 5, in task 2 and
+        // task 0 respectively.
+        let plane_view = reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor {
+            surface: reims_vgpu_protocol::ObjectTableRef::new(object),
+            owner_task: owner,
+            operation_kind: Some(5),
+            operation_length: Some(32),
+            own_ref: Some(reims_vgpu_protocol::ObjectTableRef::new(object)),
+            record_kind: Some(reims_vgpu_protocol::IOSurfacePlaneViewRecordKind::Plane),
+            unidentified_record_flags: 0,
+            view: Some(reims_vgpu_protocol::IOSurfacePlaneViewDescriptor {
+                pixel_format: 80,
+                width: 640,
+                height: 480,
+                depth: 1,
+                plane_index: 0,
+            }),
+            decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
+        };
+        let view =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                object,
+                reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(plane_view),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .execution()
+                .resources()
+                .graph()
+                .resource(view.resource)
+                .unwrap()
+                .storage,
+            Some(view.backing)
+        );
+
+        // Same id, same task, is still the shape with no parent to resolve.
+        let itself = reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor {
+            owner_task: task,
+            ..plane_view
+        };
+        assert_eq!(
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                object,
+                reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(itself),
+            )
+            .unwrap_err(),
+            crate::runtime::replacement_object_lifecycle::ReplacementIOSurfacePlaneViewRefusal::SurfaceRefSelf(object)
+        );
+    }
+
+    /// A synchronize naming a resource that owns no storage is satisfied, not
+    /// refused and not reported as a loss.
+    ///
+    /// The guest sends a synchronize when it unwires an allocation, and it
+    /// sends one per unwire of the same object -- continuously, for the display
+    /// resources it pages in and out. A resource with no storage owns no bytes,
+    /// so it carries no outstanding GPU writes and the flush is already
+    /// satisfied; treating that as a failure put tens of thousands of identical
+    /// lines on the fail channel in one boot and said nothing that the first
+    /// line had not.
+    /// An invalidation record naming a slot this device holds no resource for
+    /// is dropped, and the records beside it still move.
+    ///
+    /// The guest sends these continuously from its paging paths, naming
+    /// device-side object identities under a task it reports as 0 when the
+    /// resource has no owning task. There is no validity state to move for a
+    /// slot we hold nothing for, so the record is already satisfied -- but
+    /// refusing the whole packet for it also lost every *other* record in the
+    /// same invalidation, and a refused packet cannot consume its completion
+    /// stamp.
+    #[test]
+    fn an_invalidation_drops_unknown_slots_and_still_moves_the_known_ones() {
+        let Some(mut runtime) = runtime_session() else {
+            return;
+        };
+        let task = reims_vgpu_protocol::TaskId::new(63);
+        runtime.define_task(task, 0x40_000, 7).unwrap();
+        let declared =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+                &mut runtime,
+                12,
+                task,
+                71,
+                reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                    reims_vgpu_protocol::BufferDescriptor {
+                        allocation_size: 0x2000,
+                        handle: 0x30,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+
+        let record = |object_id: u32| crate::runtime::decode::fifo::InvalidateResourceRecord {
+            object_id,
+            flags: 0x100_0001,
+            ops: Default::default(),
+        };
+        // Slot 99 was never declared; it sits ahead of the declared one so a
+        // resolver that refuses on the first miss loses the rest of the list.
+        let mixed = crate::runtime::decode::fifo::InvalidateResourcesCommand {
+            task_id: task.get(),
+            count: 2,
+            records: vec![record(99), record(71)],
+        };
+        let resolved = runtime.resolve_standalone_invalidation(&mixed).unwrap();
+        let ReplacementResolvedInvalidation::Lifecycle(lifecycle) = resolved else {
+            panic!("one known slot is still a validity move")
+        };
+        let reims_vgpu_core::ResolvedResourceLifecycle::ApplyValidity(transition) = *lifecycle
+        else {
+            panic!("one surviving record is one transition")
+        };
+        assert_eq!(
+            transition
+                .targets
+                .iter()
+                .map(|target| target.backing)
+                .collect::<Vec<_>>(),
+            vec![declared.backing],
+        );
+
+        // Every record unknown is a contract no-op, not a refusal: the packet
+        // still has to consume its completion stamp and advance its channel.
+        let none_known = crate::runtime::decode::fifo::InvalidateResourcesCommand {
+            task_id: task.get(),
+            count: 1,
+            records: vec![record(99)],
+        };
+        assert_eq!(
+            runtime.resolve_standalone_invalidation(&none_known),
+            Ok(ReplacementResolvedInvalidation::Satisfied),
+        );
+
+        // Resolving the object is not the same question as moving some
+        // validity. A registered surface with no plane declared over it owns no
+        // backing of its own, so it resolves and contributes no transition --
+        // and an empty batch is refused at *apply*, one stage later, which
+        // strands the packet exactly as a refusal at resolution did.
+        let surface_object = 73;
+        crate::runtime::replacement_object_lifecycle::apply_replacement_registered_surface(
+            &mut runtime,
+            task,
+            surface_object,
+            reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(
+                reims_vgpu_protocol::SurfaceBackingDescriptor {
+                    length: 4096,
+                    backing_pfn: 0x400,
+                    pixel_format: u32::from_be_bytes(*b"BGRA"),
+                    plane_count: 0,
+                    planes: [reims_vgpu_protocol::SurfaceBackingPlane::default();
+                        reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP],
+                    width: 4,
+                    height: 4,
+                    bytes_per_row: 16,
+                },
+            ),
+        )
+        .unwrap();
+        let resolves_but_moves_nothing = crate::runtime::decode::fifo::InvalidateResourcesCommand {
+            task_id: task.get(),
+            count: 1,
+            records: vec![record(surface_object)],
+        };
+        assert_eq!(
+            runtime.resolve_standalone_invalidation(&resolves_but_moves_nothing),
+            Ok(ReplacementResolvedInvalidation::Satisfied),
+        );
+    }
+
+    #[test]
+    fn synchronizing_a_resource_that_owns_no_storage_is_satisfied_rather_than_refused() {
+        let Some(mut runtime) = runtime_session() else {
+            return;
+        };
+        let task = reims_vgpu_protocol::TaskId::new(53);
+        runtime.define_task(task, 0x40_000, 7).unwrap();
+        let surface_object = 61;
+        // A registered surface with no plane view declared over it yet. The
+        // surface is an allocation, so it owns no backing of its own, and no
+        // plane has claimed one.
+        let surface =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_registered_surface(
+                &mut runtime,
+                task,
+                surface_object,
+                reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(
+                    reims_vgpu_protocol::SurfaceBackingDescriptor {
+                        length: 4096,
+                        backing_pfn: 0x300,
+                        pixel_format: u32::from_be_bytes(*b"BGRA"),
+                        plane_count: 0,
+                        planes: [reims_vgpu_protocol::SurfaceBackingPlane::default();
+                            reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP],
+                        width: 4,
+                        height: 4,
+                        bytes_per_row: 16,
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime
+                .execution()
+                .resources()
+                .graph()
+                .resource(surface.resource)
+                .unwrap()
+                .storage,
+            None
+        );
+
+        // Resolved, not refused: the packet carries on rather than parking its
+        // channel's submission head behind an object with nothing to flush.
+        let states = runtime
+            .resolve_synchronize_resource_states(
+                task,
+                &[reims_vgpu_protocol::ObjectTableRef::new(surface_object)],
+            )
+            .unwrap();
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn a_biplanar_registered_surface_materializes_one_image_per_plane() {
         let Some(mut runtime) = runtime_session() else {
             return;
         };
         let task = reims_vgpu_protocol::TaskId::new(51);
+        // Synchronize resolution asks the task table whether the task is live,
+        // so the fixture declares it the way the guest would.
+        runtime.define_task(task, 0x40_000, 7).unwrap();
         let surface_object = 31;
         let mut planes = [reims_vgpu_protocol::SurfaceBackingPlane::default();
             reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP];
@@ -23614,6 +25944,13 @@ mod tests {
             width: 4,
             height: 4,
             bytes_per_row: 16,
+            bytes_per_element: 4,
+        };
+        planes[1] = reims_vgpu_protocol::SurfaceBackingPlane {
+            offset: 2048,
+            width: 2,
+            height: 2,
+            bytes_per_row: 8,
             bytes_per_element: 4,
         };
         let surface =
@@ -23626,7 +25963,7 @@ mod tests {
                         length: 4096,
                         backing_pfn: 0x200,
                         pixel_format: u32::from_be_bytes(*b"BGRA"),
-                        plane_count: 1,
+                        plane_count: 2,
                         planes,
                         width: 4,
                         height: 4,
@@ -23635,31 +25972,75 @@ mod tests {
                 ),
             )
             .unwrap();
-        crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
-            &mut runtime,
-            task,
-            32,
+        let plane_view = |plane: u32| {
+            let object = 32 + plane;
             reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(
                 reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor {
                     surface: reims_vgpu_protocol::ObjectTableRef::new(surface_object),
                     owner_task: task,
                     operation_kind: Some(5),
                     operation_length: Some(32),
-                    own_ref: Some(reims_vgpu_protocol::ObjectTableRef::new(32)),
+                    own_ref: Some(reims_vgpu_protocol::ObjectTableRef::new(object)),
                     record_kind: Some(reims_vgpu_protocol::IOSurfacePlaneViewRecordKind::Plane),
                     unidentified_record_flags: 0,
                     view: Some(reims_vgpu_protocol::IOSurfacePlaneViewDescriptor {
                         pixel_format: 80,
-                        width: 4,
-                        height: 4,
+                        width: planes[plane as usize].width,
+                        height: planes[plane as usize].height,
                         depth: 1,
-                        plane_index: 0,
+                        plane_index: plane,
                     }),
                     decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
                 },
-            ),
-        )
-        .unwrap();
+            )
+        };
+        let views = [0u32, 1].map(|plane| {
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                32 + plane,
+                plane_view(plane),
+            )
+            .unwrap()
+        });
+        // The two planes are two textures over one allocation, so they may not
+        // share a backing: a backing carries one execution representation and
+        // one layout, and the surface's own backing has neither.
+        assert_ne!(views[0].backing, views[1].backing);
+        assert_eq!(
+            runtime
+                .execution()
+                .resources()
+                .graph()
+                .resource(surface.resource)
+                .unwrap()
+                .storage,
+            None
+        );
+
+        // The guest synchronizes the surface, never its plane views: it is the
+        // allocation it unwires. Since the surface owns no backing of its own,
+        // resolving one backing per object answers `None` here and would skip
+        // the flush the guest asked for -- so the surface must resolve to every
+        // backing its planes own.
+        let states = runtime
+            .resolve_synchronize_resource_states(
+                task,
+                &[reims_vgpu_protocol::ObjectTableRef::new(surface_object)],
+            )
+            .unwrap();
+        let [state] = states.as_ref() else {
+            panic!("one synchronized object is one resource state")
+        };
+        let mut synchronized = state
+            .targets
+            .iter()
+            .map(|target| target.backing)
+            .collect::<Vec<_>>();
+        synchronized.sort();
+        let mut expected = vec![views[0].backing, views[1].backing];
+        expected.sort();
+        assert_eq!(synchronized, expected);
 
         let allocation_layout = std::alloc::Layout::from_size_align(4096, 4096).unwrap();
         let pointer = unsafe { std::alloc::alloc_zeroed(allocation_layout) };
@@ -23668,51 +26049,57 @@ mod tests {
             reims_vgpu_memory::GuestRamImport::new_host_allocation(pointer as usize, 4096, 4096)
                 .unwrap(),
         );
-        let guest = reims_vgpu_memory::GuestWindow::new(vec![
-            reims_vgpu_memory::GuestWindowRun {
-                window_offset: 0,
-                guest: reims_vgpu_memory::GuestRef::new(
-                    Arc::clone(&import),
-                    import.slice(0, 1536).unwrap(),
+        // A scattered window, because fragmentation is what selects staging
+        // and it must select it identically for every plane.
+        let window = || {
+            reims_vgpu_memory::GuestWindow::new(vec![
+                reims_vgpu_memory::GuestWindowRun {
+                    window_offset: 0,
+                    guest: reims_vgpu_memory::GuestRef::new(
+                        Arc::clone(&import),
+                        import.slice(0, 1536).unwrap(),
+                    )
+                    .unwrap(),
+                },
+                reims_vgpu_memory::GuestWindowRun {
+                    window_offset: 1536,
+                    guest: reims_vgpu_memory::GuestRef::new(
+                        Arc::clone(&import),
+                        import.slice(1536, 4096 - 1536).unwrap(),
+                    )
+                    .unwrap(),
+                },
+            ])
+            .unwrap()
+        };
+        for view in views {
+            let representation = runtime
+                .materialize_io_surface_plane_view_with_guest_window(view.resource, window())
+                .unwrap();
+            assert!(runtime
+                .execution()
+                .resources()
+                .representation(view.backing, reims_vgpu_core::HOST_REPRESENTATION)
+                .and_then(ReplacementNativeRepresentation::buffer)
+                .is_some());
+            assert!(runtime
+                .execution()
+                .resources()
+                .representation(view.backing, representation)
+                .and_then(ReplacementNativeRepresentation::image)
+                .is_some());
+            assert!(runtime
+                .execution
+                .epoch
+                .images
+                .state(
+                    reims_vgpu_vulkan::replacement_image_state::ReplacementImageKey {
+                        backing: view.backing,
+                        representation,
+                    }
                 )
-                .unwrap(),
-            },
-            reims_vgpu_memory::GuestWindowRun {
-                window_offset: 1536,
-                guest: reims_vgpu_memory::GuestRef::new(
-                    Arc::clone(&import),
-                    import.slice(1536, 4096 - 1536).unwrap(),
-                )
-                .unwrap(),
-            },
-        ])
-        .unwrap();
-        let representation = runtime
-            .materialize_registered_surface_with_guest_window(surface.resource, guest)
-            .unwrap();
-        assert!(runtime
-            .execution()
-            .resources()
-            .representation(surface.backing, reims_vgpu_core::HOST_REPRESENTATION)
-            .and_then(ReplacementNativeRepresentation::buffer)
-            .is_some());
-        assert!(runtime
-            .execution()
-            .resources()
-            .representation(surface.backing, representation)
-            .and_then(ReplacementNativeRepresentation::image)
-            .is_some());
-        assert!(runtime
-            .execution
-            .epoch
-            .images
-            .state(
-                reims_vgpu_vulkan::replacement_image_state::ReplacementImageKey {
-                    backing: surface.backing,
-                    representation,
-                }
-            )
-            .is_some());
+                .is_some());
+        }
 
         drop(runtime);
         drop(import);
@@ -25954,8 +28341,12 @@ mod tests {
         };
         assert!(matches!(
             runtime.resolve_standalone_invalidation(&heterogeneous),
-            Ok(reims_vgpu_core::ResolvedResourceLifecycle::ApplyValidityBatch(transitions))
-                if transitions.len() == 2
+            Ok(ReplacementResolvedInvalidation::Lifecycle(lifecycle))
+                if matches!(
+                    &*lifecycle,
+                    reims_vgpu_core::ResolvedResourceLifecycle::ApplyValidityBatch(transitions)
+                        if transitions.len() == 2
+                )
         ));
         let mut payload = vec![0u8; 24];
         reims_vgpu_core::endian::st32(&mut payload[0..], task.get());
@@ -26132,6 +28523,66 @@ mod tests {
                 ..reims_vgpu_protocol::ResourceValidityOps::default()
             }
         );
+    }
+
+    /// A synchronize is a teardown statement: the guest is unwiring a backing
+    /// and asks that this device's outstanding writes to the named resources
+    /// have landed first. An object this device holds no resource for is
+    /// already satisfied — it owes no writes against a resource it does not
+    /// have — so it is skipped and the rest of the list still synchronizes.
+    ///
+    /// Refusing instead parks the packet at its channel's submission head and
+    /// stops every later packet on that channel behind a resource a teardown
+    /// has just said is going away. That is a permanent stall bought for a
+    /// record whose correct effect was to do nothing.
+    #[test]
+    fn synchronize_skips_objects_this_device_holds_no_resource_for() {
+        let Some(mut runtime) = runtime_session() else {
+            return;
+        };
+        let task = reims_vgpu_protocol::TaskId::new(9);
+        runtime.define_task(task, 0x40_000, 7).unwrap();
+        let declared =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+                &mut runtime,
+                12,
+                task,
+                17,
+                reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                    reims_vgpu_protocol::BufferDescriptor {
+                        allocation_size: 0x2000,
+                        handle: 0x20,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+
+        // Object 23 was never declared. It sits between two declared objects
+        // so a resolver that stops at the first miss loses the rest of the
+        // list as well as the packet.
+        let states = runtime
+            .resolve_synchronize_resource_states(
+                task,
+                &[
+                    reims_vgpu_protocol::ObjectTableRef::new(23),
+                    reims_vgpu_protocol::ObjectTableRef::new(17),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].targets[0].backing, declared.backing);
+
+        // A list naming nothing this device holds is satisfied outright rather
+        // than refused, which is what keeps the channel moving.
+        let empty = runtime
+            .resolve_synchronize_resource_states(
+                task,
+                &[reims_vgpu_protocol::ObjectTableRef::new(23)],
+            )
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]
@@ -26634,7 +29085,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             runtime.task_address_backing_materialization_facts(declaration.backing),
-            Some((
+            Ok((
                 declaration.resource,
                 task,
                 reims_vgpu_protocol::GuestVirtualAddress::new(0x900 << 12),
@@ -28375,16 +30826,12 @@ mod tests {
             {
                 ReplacementExecIngressRecordingProgress::IndirectRange(progress) => match *progress
                 {
-                    ReplacementIndirectRangeRecordingProgress::Pending(next) => {
+                    ReplacementIndirectRangeIngressRecordingProgress::Pending(next) => {
                         pending = PendingReplacementIngressExec::IndirectRange(next);
                         std::thread::yield_now();
                     }
-                    ReplacementIndirectRangeRecordingProgress::Initial(initial) => {
+                    ReplacementIndirectRangeIngressRecordingProgress::Initial(initial) => {
                         break initial;
-                    }
-                    ReplacementIndirectRangeRecordingProgress::Continuing(_)
-                    | ReplacementIndirectRangeRecordingProgress::Final(_) => {
-                        panic!("the first indirect phase must reserve its source head")
                     }
                 },
                 ReplacementExecIngressRecordingProgress::Direct(_) => {
@@ -29580,14 +32027,18 @@ mod tests {
             .execution
             .commit_completion(producer_completion)
             .unwrap();
-        assert!(matches!(
-            ready.recorded.recorded.recording.resource_completions.as_ref(),
-            [reims_vgpu_core::ResolvedResourceCompletion::Transfer(upload)]
-                if upload.backing == backing
-                    && upload.region == ingress_operation.targets[0].regions[0]
-                    && upload.source == reims_vgpu_core::HOST_REPRESENTATION
-                    && upload.destination == execution
-        ));
+        assert!(
+            matches!(
+                ready.recorded.recorded.recording.resource_completions.as_ref(),
+                [reims_vgpu_core::ResolvedResourceCompletion::Transfer(upload)]
+                    if upload.backing == backing
+                        && upload.region == ingress_operation.targets[0].regions[0]
+                        && upload.source == reims_vgpu_core::HOST_REPRESENTATION
+                        && upload.destination == execution
+            ),
+            "unexpected upload completions: {:?}",
+            ready.recorded.recorded.recording.resource_completions
+        );
         assert!(ready.recorded.recorded.image_states.is_none());
         let staged = fixed_staging.read_after_timeline().unwrap();
         assert_eq!(&staged[8..12], &[9, 8, 7, 6]);
@@ -29653,13 +32104,110 @@ mod tests {
             outputs.resource_completions.len() + outputs.retirement.resource_completions.len(),
             1
         );
-        let suffix = runtime
+        assert!(continuing
+            .manifest
+            .upload_representations_match(&runtime.execution.epoch.resources));
+        let replaced = runtime
+            .apply_resource_lifecycle(
+                reims_vgpu_core::ResolvedResourceLifecycle::ReplacePhysical { resource },
+            )
+            .unwrap();
+        assert!(matches!(
+            replaced,
+            reims_vgpu_core::ResourceLifecycleEffect::PhysicalReplaced { .. }
+        ));
+        let replacement = runtime
+            .execution
+            .materialize_buffer(&runtime.session.vulkan, resource, route)
+            .unwrap();
+        assert_ne!(replacement, execution);
+        assert!(!continuing
+            .manifest
+            .upload_representations_match(&runtime.execution.epoch.resources));
+
+        let refresh = runtime
+            .prepare_guest_upload_suffix(continuing)
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "the replaced suffix must prepare a fresh upload: {:?}",
+                    failure.detail()
+                )
+            });
+        let ReplacementPreparedGuestUploadContinuation::Refresh(refresh) = refresh else {
+            panic!("a fresh execution representation cannot be read before its upload")
+        };
+        assert!(refresh.recording_exec.operations().next().is_none());
+        assert!(refresh.recording_exec.accesses.is_empty());
+        assert_eq!(
+            refresh
+                .envelope
+                .resources
+                .inputs()
+                .content_synchronization
+                .as_ref()
+                .map(|batch| batch.transfers().len()),
+            Some(1)
+        );
+        let refresh = runtime
+            .resolve_guest_upload_phase_recording(*refresh)
+            .unwrap_or_else(|failure| panic!("refresh resolution failed: {:?}", failure.reason));
+        let refresh = runtime
+            .dispatch_guest_upload_phase_recording(refresh)
+            .unwrap_or_else(|_| panic!("refresh recording must dispatch"))
+            .wait()
+            .unwrap_or_else(|_| panic!("refresh recording must complete"));
+        let refresh = runtime
+            .prepare_recorded_guest_upload_refresh(refresh)
+            .unwrap_or_else(|_| panic!("refresh must allocate after the first auxiliary"));
+        let mut refresh = runtime
+            .enqueue_recorded_guest_upload(refresh)
+            .unwrap_or_else(|_| panic!("refresh must enter the work queue"));
+        let refresh = loop {
+            match runtime.progress_guest_upload_auxiliary(refresh) {
+                ReplacementGuestUploadAuxiliaryProgress::Pending(next) => {
+                    refresh = *next;
+                    std::thread::yield_now();
+                }
+                ReplacementGuestUploadAuxiliaryProgress::Accepted(accepted) => break accepted,
+                ReplacementGuestUploadAuxiliaryProgress::DriverRefused { reason, .. } => {
+                    panic!("refresh driver refused: {reason:?}")
+                }
+                ReplacementGuestUploadAuxiliaryProgress::AcceptanceRefused(_) => {
+                    panic!("refresh acceptance refused")
+                }
+            }
+        };
+        let refresh_point = refresh.point();
+        assert!(refresh_point.value > auxiliary_point.value);
+        let retirement = loop {
+            let mut retirement = None;
+            for progress in runtime.try_retire_replacement_timelines() {
+                let progress = progress.unwrap();
+                assert!(progress.replay.completions.is_empty());
+                if progress.observed.queue == refresh_point.queue
+                    && progress.observed.completed >= refresh_point.value
+                {
+                    retirement = Some(progress);
+                }
+            }
+            if let Some(retirement) = retirement {
+                break retirement;
+            }
+            std::thread::yield_now();
+        };
+        let (continuing, _) = runtime
+            .resume_guest_upload_after_retirement(*refresh, retirement)
+            .unwrap();
+        let continuation = runtime
             .prepare_guest_upload_suffix(continuing)
             .unwrap_or_else(|_| panic!("the upload-dependent suffix must prepare"));
+        let ReplacementPreparedGuestUploadContinuation::Suffix(suffix) = continuation else {
+            panic!("the already-current suffix cannot require another upload")
+        };
         assert_eq!(suffix.envelope.resources.inputs().buffer_blits.len(), 1);
         assert!(suffix.envelope.resources.inputs().resource_states.is_none());
         let resolved = runtime
-            .resolve_guest_upload_suffix_recording(suffix)
+            .resolve_guest_upload_suffix_recording(*suffix)
             .unwrap_or_else(|failure| {
                 panic!(
                     "the upload-dependent suffix must resolve: {:?}",
@@ -29678,7 +32226,7 @@ mod tests {
         assert!(prepared
             .submission()
             .auxiliary_waits()
-            .contains(&auxiliary_point));
+            .contains(&refresh_point));
         let mut pending = runtime
             .submit_chained_final(prepared)
             .unwrap_or_else(|_| panic!("the upload-dependent suffix must enter the work queue"));
@@ -30477,7 +33025,7 @@ mod tests {
     }
 
     #[test]
-    fn texture_view_created_after_base_materialization_installs_exact_native_view() {
+    fn texture_views_survive_backing_wide_physical_rematerialization_across_aliased_bases() {
         let Some(session) = session() else {
             return;
         };
@@ -30582,12 +33130,97 @@ mod tests {
         let derived = native.shader_view(semantic).unwrap();
         assert_ne!(derived.view, base_view);
         assert_eq!(derived.pixel_format, semantic.pixel_format);
+        // Installing the same view again is the same statement twice. The
+        // caller cannot know whether the image was built before or after the
+        // view was declared, so it says it either way and the second one has
+        // nothing left to do.
         assert_eq!(
             owners.materialize_texture_view(session.vulkan(), view),
-            Err(ReplacementRepresentationConstructionError::ShaderViewInstall(
-                reims_vgpu_vulkan::replacement_representation::ReplacementShaderViewInstallError::Duplicate(view)
-            ))
+            Ok(())
         );
+        assert_eq!(
+            owners
+                .resources()
+                .representation(backing, representation)
+                .unwrap()
+                .shader_view(semantic)
+                .unwrap()
+                .view,
+            derived.view
+        );
+
+        let base_descriptor = owners
+            .resources()
+            .graph()
+            .resource(base)
+            .unwrap()
+            .descriptor
+            .clone()
+            .unwrap();
+        let aliased_base = match owners
+            .resources_mut()
+            .apply(reims_vgpu_core::ResolvedResourceLifecycle::CreateResource {
+                task: reims_vgpu_protocol::TaskId::new(1),
+                object: reims_vgpu_protocol::ObjectTableRef::new(6),
+                kind: reims_vgpu_protocol::ObjectKind::Texture,
+                descriptor: base_descriptor,
+                storage: Some(backing),
+                parents: Box::new([]),
+            })
+            .unwrap()
+        {
+            reims_vgpu_core::ResourceLifecycleEffect::ResourceCreated(resource) => resource,
+            _ => unreachable!(),
+        };
+        let aliased_view = match owners
+            .resources_mut()
+            .apply(reims_vgpu_core::ResolvedResourceLifecycle::CreateResource {
+                task: reims_vgpu_protocol::TaskId::new(1),
+                object: reims_vgpu_protocol::ObjectTableRef::new(7),
+                kind: reims_vgpu_protocol::ObjectKind::TextureView,
+                descriptor: Arc::new(reims_vgpu_protocol::ResourceDescriptor::TextureView(
+                    reims_vgpu_protocol::TextureViewDescriptor {
+                        form: reims_vgpu_protocol::TextureViewForm::Ranged,
+                        view_texture_ref: 7,
+                        base_texture_ref: 6,
+                        pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+                        texture_type: u16::from(reims_vgpu_protocol::TextureType::D2),
+                        level_base: 1,
+                        level_count: 1,
+                        slice_base: 1,
+                        slice_count: 1,
+                        swizzle: [0; 4],
+                    },
+                )),
+                storage: None,
+                parents: Box::new([aliased_base]),
+            })
+            .unwrap()
+        {
+            reims_vgpu_core::ResourceLifecycleEffect::ResourceCreated(resource) => resource,
+            _ => unreachable!(),
+        };
+        let aliased_semantic = owners
+            .resources()
+            .graph()
+            .resolve_texture_binding_view(aliased_view)
+            .unwrap();
+        let replaced = owners
+            .resources_mut()
+            .apply(reims_vgpu_core::ResolvedResourceLifecycle::ReplacePhysical { resource: base })
+            .unwrap();
+        assert!(matches!(
+            replaced,
+            reims_vgpu_core::ResourceLifecycleEffect::PhysicalReplaced { .. }
+        ));
+        let replacement = owners.materialize_resource(session.vulkan(), base).unwrap();
+        assert_ne!(replacement, representation);
+        assert!(owners
+            .resources()
+            .representation(backing, replacement)
+            .unwrap()
+            .shader_view(aliased_semantic)
+            .is_ok());
     }
 
     #[test]
@@ -31268,13 +33901,50 @@ mod tests {
                 task,
                 trailing: Box::new([]),
         };
+        // A scanout is the surface's first plane, so a surface whose plane view
+        // has not arrived yet refuses by name rather than presenting an
+        // allocation with no image.
+        assert_eq!(
+            runtime.resolve_display_present(command.clone()),
+            Err(
+                ReplacementDisplayPresentResolutionError::RegisteredSurfacePlaneUnavailable {
+                    plane: 0
+                }
+            )
+        );
+        let plane =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                4,
+                reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(
+                    reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor {
+                        surface: object,
+                        owner_task: task,
+                        operation_kind: Some(5),
+                        operation_length: Some(32),
+                        own_ref: Some(reims_vgpu_protocol::ObjectTableRef::new(4)),
+                        record_kind: Some(reims_vgpu_protocol::IOSurfacePlaneViewRecordKind::Plane),
+                        unidentified_record_flags: 0,
+                        view: Some(reims_vgpu_protocol::IOSurfacePlaneViewDescriptor {
+                            pixel_format: 80,
+                            width: 64,
+                            height: 32,
+                            depth: 1,
+                            plane_index: 0,
+                        }),
+                        decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
+                    },
+                ),
+            )
+            .unwrap();
         let resolved = ReplacementResolvedDisplayPresent {
             command: command.clone(),
             source: ReplacementResolvedPresentationSource {
                 display_index: 2,
                 task: Some(task),
                 resource: Some(declaration.resource),
-                backing: declaration.backing,
+                backing: plane.backing,
                 width: 64,
                 height: 32,
                 pixel_format: reims_vgpu_protocol::metal_pixel::MTL_FORMAT_BGRA8_UNORM,

@@ -14,15 +14,42 @@ use crate::{
 use reims_vgpu_protocol::{BackingId, TransactionId};
 use std::collections::{BTreeMap, BTreeSet};
 
+fn take_available_regions(
+    remaining: &mut Vec<BackingRegion>,
+    available: &[BackingRegion],
+) -> Vec<BackingRegion> {
+    let mut claimed = Vec::new();
+    for available in available.iter().copied() {
+        for region in remaining.iter().copied() {
+            if let Some(overlap) = crate::content_authority::intersection(region, available) {
+                claimed.push(overlap);
+            }
+        }
+        *remaining = remaining
+            .drain(..)
+            .flat_map(|region| crate::content_authority::subtract(region, available))
+            .collect();
+    }
+    claimed
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContentSynchronizationRequest {
     pub backing: BackingId,
     pub regions: Box<[BackingRegion]>,
+    /// Pending writes owned by the ordered EXEC suffix for which this
+    /// synchronization is the queue prefix.
+    pub permitted_pending_writes: Box<[crate::GpuWriteId]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentSynchronizationError {
     EmptyRegions(BackingId),
+    PendingGpuWrite {
+        backing: BackingId,
+        representation: reims_vgpu_protocol::RepresentationId,
+        write: crate::GpuWriteId,
+    },
     Backing {
         backing: BackingId,
         reason: ManagedBackingError,
@@ -30,6 +57,10 @@ pub enum ContentSynchronizationError {
     RouteCannotSynchronize {
         backing: BackingId,
         route: RepresentationRoute,
+    },
+    CurrentSourceAbsent {
+        backing: BackingId,
+        required: crate::RegionVersion,
     },
     Uses(ResourceUseBatchError),
     Cancellation(ContentSynchronizationCancellationError),
@@ -150,6 +181,7 @@ pub fn prepare_content_synchronization<T>(
     requests: impl IntoIterator<Item = ContentSynchronizationRequest>,
 ) -> Result<PreparedContentSynchronizationBatch, ContentSynchronizationError> {
     let mut grouped = BTreeMap::<BackingId, BTreeSet<BackingRegion>>::new();
+    let mut permitted_pending = BTreeMap::<BackingId, BTreeSet<crate::GpuWriteId>>::new();
     for request in requests {
         if request.regions.is_empty() {
             return Err(ContentSynchronizationError::EmptyRegions(request.backing));
@@ -158,6 +190,10 @@ pub fn prepare_content_synchronization<T>(
             .entry(request.backing)
             .or_default()
             .extend(request.regions);
+        permitted_pending
+            .entry(request.backing)
+            .or_default()
+            .extend(request.permitted_pending_writes);
     }
 
     let mut transfers = Vec::new();
@@ -179,48 +215,147 @@ pub fn prepare_content_synchronization<T>(
             {
                 return Ok(());
             }
+            let pending = resources
+                .pending_gpu_writes_overlapping(backing, destination, &regions)
+                .map_err(|reason| ContentSynchronizationError::Backing { backing, reason })?;
+            if let Some(write) = pending
+                .iter()
+                .find(|write| {
+                    permitted_pending
+                        .get(&backing)
+                        .is_none_or(|permitted| !permitted.contains(write))
+                })
+                .copied()
+            {
+                return Err(ContentSynchronizationError::PendingGpuWrite {
+                    backing,
+                    representation: destination,
+                    write,
+                });
+            }
             let route = resources
                 .representation_route(backing, destination)
                 .expect("the execution representation has an owned route");
-            let source = match route {
+            if !matches!(
+                route,
+                RepresentationRoute::ImportedGuestTransfer { .. }
+                    | RepresentationRoute::HostStagingTransfer { .. }
+            ) {
+                return Err(ContentSynchronizationError::RouteCannotSynchronize { backing, route });
+            }
+            let endpoint = match route {
                 RepresentationRoute::ImportedGuestTransfer { .. } => GUEST_REPRESENTATION,
-                RepresentationRoute::HostStagingTransfer { .. } => {
-                    for write in snapshot.iter().copied() {
-                        let ingress =
-                            resources
-                                .plan_host_ingress(backing, write)
-                                .map_err(|reason| ContentSynchronizationError::Backing {
-                                    backing,
-                                    reason,
-                                })?;
+                RepresentationRoute::HostStagingTransfer { .. } => HOST_REPRESENTATION,
+                _ => unreachable!("the synchronizable routes were matched above"),
+            };
+            let mut used_representations = BTreeSet::from([destination]);
+            for required in snapshot.iter().copied() {
+                let destination_regions = resources
+                    .current_regions_in_representation(backing, destination, required)
+                    .map_err(|reason| ContentSynchronizationError::Backing { backing, reason })?;
+                let mut remaining = vec![required.region];
+                take_available_regions(&mut remaining, &destination_regions);
+                if remaining.is_empty() {
+                    continue;
+                }
+
+                let endpoint_regions = resources
+                    .current_regions_in_representation(backing, endpoint, required)
+                    .map_err(|reason| ContentSynchronizationError::Backing { backing, reason })?;
+                let endpoint_claimed = take_available_regions(&mut remaining, &endpoint_regions);
+                if !endpoint_claimed.is_empty() {
+                    let snapshot = endpoint_claimed
+                        .into_iter()
+                        .map(|region| crate::RegionVersion {
+                            region,
+                            version: required.version,
+                        })
+                        .collect::<Vec<_>>();
+                    transfers.extend(
+                        resources
+                            .plan_transfers(backing, endpoint, destination, &snapshot)
+                            .map_err(|reason| ContentSynchronizationError::Backing {
+                                backing,
+                                reason,
+                            })?,
+                    );
+                    used_representations.insert(endpoint);
+                }
+
+                for (source, source_regions) in resources
+                    .current_native_regions_for_version(
+                        backing,
+                        &[GUEST_REPRESENTATION, HOST_REPRESENTATION, destination],
+                        required,
+                    )
+                    .map_err(|reason| ContentSynchronizationError::Backing { backing, reason })?
+                {
+                    let claimed = take_available_regions(&mut remaining, &source_regions);
+                    if claimed.is_empty() {
+                        continue;
+                    }
+                    let snapshot = claimed
+                        .into_iter()
+                        .map(|region| crate::RegionVersion {
+                            region,
+                            version: required.version,
+                        })
+                        .collect::<Vec<_>>();
+                    transfers.extend(
+                        resources
+                            .plan_transfers(backing, source, destination, &snapshot)
+                            .map_err(|reason| ContentSynchronizationError::Backing {
+                                backing,
+                                reason,
+                            })?,
+                    );
+                    used_representations.insert(source);
+                }
+
+                if endpoint == HOST_REPRESENTATION && !remaining.is_empty() {
+                    let guest_regions = resources
+                        .current_regions_in_representation(backing, GUEST_REPRESENTATION, required)
+                        .map_err(|reason| ContentSynchronizationError::Backing {
+                            backing,
+                            reason,
+                        })?;
+                    for region in take_available_regions(&mut remaining, &guest_regions) {
+                        let ingress = resources
+                            .plan_host_ingress(
+                                backing,
+                                crate::RegionVersion {
+                                    region,
+                                    version: required.version,
+                                },
+                            )
+                            .map_err(|reason| ContentSynchronizationError::Backing {
+                                backing,
+                                reason,
+                            })?;
                         host_ingresses.push(ingress);
                         deferred.push(HostIngressTransfer {
                             ingress,
                             destination,
                         });
+                        used_representations.insert(HOST_REPRESENTATION);
                     }
-                    HOST_REPRESENTATION
                 }
-                route => {
-                    return Err(ContentSynchronizationError::RouteCannotSynchronize {
+                if let Some(region) = remaining.first().copied() {
+                    return Err(ContentSynchronizationError::CurrentSourceAbsent {
                         backing,
-                        route,
+                        required: crate::RegionVersion {
+                            region,
+                            version: required.version,
+                        },
                     });
                 }
-            };
-            if source == GUEST_REPRESENTATION {
-                transfers.extend(
-                    resources
-                        .plan_transfers(backing, source, destination, &snapshot)
-                        .map_err(|reason| ContentSynchronizationError::Backing {
-                            backing,
-                            reason,
-                        })?,
-                );
             }
             uses.push(RepresentationUse {
                 backing,
-                representations: Box::new([source, destination]),
+                representations: used_representations
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
             });
             Ok(())
         })();
@@ -249,8 +384,9 @@ pub fn prepare_content_synchronization<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackingView;
     use crate::{LinearRange, ResolvedResourceLifecycle, ResourceLifecycleEffect, StorageBacking};
-    use reims_vgpu_protocol::VulkanDeviceEpochId;
+    use reims_vgpu_protocol::{SubmissionId, VulkanDeviceEpochId};
 
     #[test]
     fn staging_synchronization_preserves_the_guest_version_and_owns_one_ordered_transfer() {
@@ -274,6 +410,7 @@ mod tests {
                 RepresentationRoute::HostStagingTransfer {
                     working: crate::WorkingMemoryClass::DeviceLocal,
                 },
+                BackingView::Bytes,
                 (),
             )
             .unwrap();
@@ -284,6 +421,7 @@ mod tests {
             [ContentSynchronizationRequest {
                 backing,
                 regions: Box::new([region]),
+                permitted_pending_writes: Box::new([]),
             }],
         )
         .unwrap();
@@ -303,6 +441,179 @@ mod tests {
             prepared.resource_completions().as_ref(),
             [crate::ResolvedResourceCompletion::Transfer(transfers[0])]
         );
+        cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
+
+        let prepared = prepare_content_synchronization(
+            &mut resources,
+            TransactionId::new(8),
+            [ContentSynchronizationRequest {
+                backing,
+                regions: Box::new([region]),
+                permitted_pending_writes: Box::new([]),
+            }],
+        )
+        .unwrap();
+        assert!(prepared.host_ingresses().is_empty());
+        assert!(matches!(
+            prepared.transfers(),
+            [transfer]
+                if transfer.source == HOST_REPRESENTATION
+                    && transfer.destination == destination
+                    && transfer.region == region
+        ));
+        cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
+    }
+
+    #[test]
+    fn synchronization_waits_for_an_overlapping_execution_write_instead_of_overwriting_it() {
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let region = BackingRegion::Linear(LinearRange::new(0, 64).unwrap());
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([region]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        resources
+            .create_representation(backing, RepresentationRoute::HostStagingEndpoint, ())
+            .unwrap();
+        let destination = resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostStagingTransfer {
+                    working: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                BackingView::Bytes,
+                (),
+            )
+            .unwrap();
+        let submission = SubmissionId::new(4);
+        resources
+            .plan_gpu_write(backing, submission, destination, [region])
+            .unwrap();
+
+        assert_eq!(
+            prepare_content_synchronization(
+                &mut resources,
+                TransactionId::new(7),
+                [ContentSynchronizationRequest {
+                    backing,
+                    regions: Box::new([region]),
+                    permitted_pending_writes: Box::new([]),
+                }],
+            ),
+            Err(ContentSynchronizationError::PendingGpuWrite {
+                backing,
+                representation: destination,
+                write: submission.into(),
+            })
+        );
+
+        let permitted = prepare_content_synchronization(
+            &mut resources,
+            TransactionId::new(8),
+            [ContentSynchronizationRequest {
+                backing,
+                regions: Box::new([region]),
+                permitted_pending_writes: Box::new([submission.into()]),
+            }],
+        )
+        .unwrap();
+        assert_eq!(permitted.host_ingresses().len(), 1);
+        cancel_prepared_content_synchronization(&mut resources, permitted).unwrap();
+
+        resources
+            .complete_gpu_write(backing, submission, destination)
+            .unwrap();
+        let prepared = prepare_content_synchronization(
+            &mut resources,
+            TransactionId::new(7),
+            [ContentSynchronizationRequest {
+                backing,
+                regions: Box::new([region]),
+                permitted_pending_writes: Box::new([]),
+            }],
+        )
+        .unwrap();
+        assert!(prepared.transfers().is_empty());
+        assert!(prepared.host_ingresses().is_empty());
+        cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
+    }
+
+    #[test]
+    fn staging_synchronization_combines_current_regions_from_distinct_representations() {
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let first = BackingRegion::Linear(LinearRange::new(0, 64).unwrap());
+        let second = BackingRegion::Linear(LinearRange::new(64, 64).unwrap());
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([first, second]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let host = resources
+            .create_representation(backing, RepresentationRoute::HostStagingEndpoint, ())
+            .unwrap();
+        let retained = resources
+            .create_representation(
+                backing,
+                RepresentationRoute::HostStagingTransfer {
+                    working: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                (),
+            )
+            .unwrap();
+        let destination = resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostStagingTransfer {
+                    working: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                BackingView::Bytes,
+                (),
+            )
+            .unwrap();
+
+        let first_snapshot = resources.snapshot_content(backing, &[first]).unwrap();
+        let first_transfer = resources
+            .plan_transfers(backing, GUEST_REPRESENTATION, host, &first_snapshot)
+            .unwrap();
+        resources.complete_transfer(first_transfer[0]).unwrap();
+        let second_snapshot = resources.snapshot_content(backing, &[second]).unwrap();
+        let second_transfer = resources
+            .plan_transfers(backing, GUEST_REPRESENTATION, retained, &second_snapshot)
+            .unwrap();
+        resources.complete_transfer(second_transfer[0]).unwrap();
+
+        let prepared = prepare_content_synchronization(
+            &mut resources,
+            TransactionId::new(7),
+            [ContentSynchronizationRequest {
+                backing,
+                regions: Box::new([first, second]),
+                permitted_pending_writes: Box::new([]),
+            }],
+        )
+        .unwrap();
+
+        assert!(prepared.host_ingresses().is_empty());
+        assert_eq!(prepared.transfers().len(), 2);
+        assert!(prepared.transfers().iter().any(|transfer| {
+            transfer.source == host
+                && transfer.destination == destination
+                && transfer.region == first
+        }));
+        assert!(prepared.transfers().iter().any(|transfer| {
+            transfer.source == retained
+                && transfer.destination == destination
+                && transfer.region == second
+        }));
         cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
     }
 }

@@ -15,8 +15,8 @@ use crate::{
 };
 use ash::vk;
 use reims_vgpu_core::{
-    ComputeBindingClass, ComputeBindingView, PreparedComputeDispatch, ResolvedComputeDispatch,
-    ResolvedComputeLaunch, ResolvedResourceCompletion,
+    BackingView, ComputeBindingClass, ComputeBindingView, PreparedComputeDispatch,
+    ResolvedComputeDispatch, ResolvedComputeLaunch, ResolvedResourceCompletion, ViewRepresentation,
 };
 use reims_vgpu_protocol::{BackingId, RepresentationId};
 use std::{collections::BTreeMap, sync::Arc};
@@ -385,23 +385,18 @@ pub enum NativeComputeLaunch {
 pub fn derive_compute_image_uses<NativePipeline, Operation: ReplacementComputeImageBindings>(
     prepared: &PreparedComputeDispatch<NativePipeline, Operation>,
 ) -> Result<Box<[ReplacementImageUse]>, ComputeImageStateError> {
-    let representations = prepared
-        .uses()
-        .iter()
-        .map(|use_| {
-            let [representation] = use_.representations.as_ref() else {
-                return Err(ComputeImageStateError::RepresentationUseMismatch(
-                    use_.backing,
-                ));
-            };
-            Ok((use_.backing, *representation))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let representations = prepared.representations();
     let mut images = BTreeMap::<ReplacementImageKey, (vk::ImageUsageFlags, bool)>::new();
     for (backing, usage, storage) in prepared.operation().image_bindings() {
+        // An image binding names the backing's image view. A backing bound
+        // once as a buffer and once as a texture holds both objects, and only
+        // the image one has image state.
+        let representation =
+            ViewRepresentation::lookup(representations, backing, BackingView::Image)
+                .ok_or(ComputeImageStateError::RepresentationUseMismatch(backing))?;
         let image = ReplacementImageKey {
             backing,
-            representation: representations[&backing],
+            representation,
         };
         let entry = images.entry(image).or_default();
         entry.0 |= usage;
@@ -664,16 +659,7 @@ impl ReplacementComputeProgram<ResolvedComputeDispatch> {
         {
             return Err(ComputeRecordError::InvalidPipeline);
         }
-        let representations = prepared
-            .uses()
-            .iter()
-            .map(|use_| {
-                let [representation] = use_.representations.as_ref() else {
-                    return Err(ComputeRecordError::RepresentationUseMismatch(use_.backing));
-                };
-                Ok((use_.backing, *representation))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let representations = prepared.representations();
         let mut descriptors = Vec::new();
         let mut declarations = BTreeMap::<u32, (vk::DescriptorType, u32)>::new();
         for resource in prepared.operation().resources.iter() {
@@ -688,7 +674,18 @@ impl ReplacementComputeProgram<ResolvedComputeDispatch> {
                 descriptor_type,
                 resource.descriptor_count,
             )?;
-            let representation = representations[&resource.backing];
+            // The descriptor class picks the view, so a backing bound as both
+            // a storage buffer and a texture resolves to the right native
+            // object at each binding rather than to whichever one execution
+            // designated.
+            let view = match resource.view {
+                ComputeBindingView::Buffer(_) => BackingView::Bytes,
+                ComputeBindingView::Image(_) => BackingView::Image,
+            };
+            let representation =
+                ViewRepresentation::lookup(representations, resource.backing, view).ok_or(
+                    ComputeRecordError::RepresentationUseMismatch(resource.backing),
+                )?;
             match (resource.class, resource.view) {
                 (ComputeBindingClass::Buffer, ComputeBindingView::Buffer(range)) => {
                     let target = resolver
@@ -717,12 +714,14 @@ impl ReplacementComputeProgram<ResolvedComputeDispatch> {
                         backing: resource.backing,
                         representation,
                     };
-                    let target = resolver.resolve_texture_binding_view(image, view).ok_or(
-                        ComputeRecordError::UnknownImageView {
-                            image,
-                            resource: view.resource,
-                        },
-                    )?;
+                    let target =
+                        resolver
+                            .resolve_texture_binding_view(image, view)
+                            .map_err(|reason| ComputeRecordError::UnknownImageView {
+                                image,
+                                resource: view.resource,
+                                reason,
+                            })?;
                     if target.view == vk::ImageView::null() {
                         return Err(ComputeRecordError::MissingImageView(image));
                     }
@@ -843,7 +842,14 @@ impl ReplacementComputeProgram<ResolvedComputeDispatch> {
                 if pipeline.thread_grid_push_offset.is_some() {
                     return Err(ComputeRecordError::IndirectPipelineRequiresThreadGridPushConstant);
                 }
-                let representation = representations[&arguments.storage];
+                let representation = ViewRepresentation::lookup(
+                    representations,
+                    arguments.storage,
+                    BackingView::Bytes,
+                )
+                .ok_or(ComputeRecordError::RepresentationUseMismatch(
+                    arguments.storage,
+                ))?;
                 let target = resolver
                     .resolve_buffer(arguments.storage, representation)
                     .ok_or(ComputeRecordError::UnknownBuffer {
@@ -869,7 +875,10 @@ impl ReplacementComputeProgram<ResolvedComputeDispatch> {
                 }
             }
         };
-        let mut backings = representations.keys().copied().collect::<Vec<_>>();
+        let mut backings = representations
+            .iter()
+            .map(|representation| representation.backing)
+            .collect::<Vec<_>>();
         backings.sort_unstable();
         backings.dedup();
         Ok(Self {
@@ -917,9 +926,14 @@ pub enum ComputeRecordError {
     ImageTransition(ImageTransitionResolveError),
     ImageReleasePending,
     UnknownImage(ReplacementImageKey),
+    /// A decoded texture-binding view this backend has no `VkImageView` for.
+    /// The reason names which of the view's terms it could not build, because
+    /// they are unrelated pieces of work -- see
+    /// [`crate::replacement_image_transition::TextureBindingViewDecline`].
     UnknownImageView {
         image: ReplacementImageKey,
         resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+        reason: crate::replacement_image_transition::TextureBindingViewDecline,
     },
     MissingImageView(ReplacementImageKey),
     MissingImageUsage {
@@ -1338,8 +1352,13 @@ mod tests {
             &self,
             image: ReplacementImageKey,
             _: reims_vgpu_core::ResolvedTextureBindingView,
-        ) -> Option<crate::replacement_image_transition::NativeImageTarget> {
-            self.resolve_image(image)
+        ) -> Result<
+            crate::replacement_image_transition::NativeImageTarget,
+            crate::replacement_image_transition::TextureBindingViewDecline,
+        > {
+            self.resolve_image(image).ok_or(
+                crate::replacement_image_transition::TextureBindingViewDecline::UnknownRepresentation,
+            )
         }
     }
 
@@ -1421,7 +1440,12 @@ mod tests {
             unreachable!()
         };
         let representation = owner
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let snapshot = owner
             .snapshot_content(backing, &[BackingRegion::Whole])
@@ -1523,7 +1547,12 @@ mod tests {
             unreachable!()
         };
         let representation = owner
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let snapshot = owner
             .snapshot_content(backing, &[BackingRegion::Whole])
@@ -1674,7 +1703,12 @@ mod tests {
             unreachable!()
         };
         let representation = owner
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Image,
+                (),
+            )
             .unwrap();
         let snapshot = owner
             .snapshot_content(backing, &[BackingRegion::Whole])

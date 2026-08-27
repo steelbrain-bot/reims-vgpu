@@ -296,6 +296,11 @@ impl<Semantic: Clone> DirectReplayNativeOwner<Semantic> {
         Ok(PreparedPresentNativeSubmission { transaction, point })
     }
 
+    /// See [`NativeDependencyOwner::parked_candidates`].
+    pub fn parked_candidates(&self) -> Vec<(TransactionId, Vec<TransactionId>)> {
+        self.dependencies.parked_candidates()
+    }
+
     pub fn queue_candidate(
         &mut self,
         transaction: TransactionId,

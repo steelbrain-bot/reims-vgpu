@@ -134,6 +134,7 @@ pub enum ReplacementRenderPipelineCompileError {
         requested: u32,
         supported: u32,
     },
+    AttachmentFeedbackLoopUnsupported(vk::ImageAspectFlags),
     VertexBindingCollision(u32),
     VertexLayoutMissing(u32),
     VertexDivisorUnsupported(u32),
@@ -243,6 +244,13 @@ fn validate_capabilities(
     context: &SharedDeviceContext,
     plan: &ReplacementRenderPipelinePlan,
 ) -> Result<(), ReplacementRenderPipelineCompileError> {
+    if !plan.feedback_loop_aspects.is_empty() && !context.features.attachment_feedback_loop_layout {
+        return Err(
+            ReplacementRenderPipelineCompileError::AttachmentFeedbackLoopUnsupported(
+                plan.feedback_loop_aspects,
+            ),
+        );
+    }
     let max_viewports = if context.features.multi_viewport {
         context.features.max_viewports
     } else {
@@ -721,7 +729,7 @@ unsafe fn create_variant_handles(
             return Err(vk_error("create_pipeline_layout", result));
         }
     };
-    let render_pass = match create_render_pass(context, semantic, plan) {
+    let render_pass = match create_render_pass(context, plan) {
         Ok(pass) => pass,
         Err(error) => {
             context
@@ -766,11 +774,30 @@ unsafe fn create_variant_handles(
         vertex_buffers: plan.vertex_buffers.clone(),
         color_attachments: plan.color_attachments.clone(),
         depth_stencil_attachment: plan.depth_stencil_attachment,
+        feedback_loop_aspects: plan.feedback_loop_aspects,
+        color_input: plan_uses_color_input(plan),
         sample_count: plan.sample_count,
         viewport_count: plan.viewport_count,
         static_state: plan.static_state,
+        dynamic_states: plan_dynamic_states(plan, semantic, depth),
         depth_stencil: plan.depth_stencil,
     })
+}
+
+/// The one derivation of a pipeline's dynamic-state set.
+///
+/// The compiled pipeline and the recorder both read this, so a state cannot be
+/// set without having been declared.
+fn plan_dynamic_states(
+    plan: &ReplacementRenderPipelinePlan,
+    semantic: &ResolvedRenderPipeline,
+    depth: Option<&DepthStencilState>,
+) -> crate::replacement_render::ReplacementRenderDynamicStates {
+    crate::replacement_render::ReplacementRenderDynamicStates {
+        depth_bias: plan.static_state.depth_bias_enabled,
+        stencil_reference: depth.is_some_and(|state| state.front.is_some() || state.back.is_some()),
+        blend_constants: semantic_uses_blend_constants(semantic),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -837,21 +864,27 @@ fn validate_descriptor_capabilities(
 
 unsafe fn create_render_pass(
     context: &SharedDeviceContext,
-    semantic: &ResolvedRenderPipeline,
     plan: &ReplacementRenderPipelinePlan,
 ) -> Result<vk::RenderPass, ReplacementRenderPipelineCompileError> {
-    let color_input = semantic
-        .fragment
-        .interface
-        .bindings
-        .iter()
-        .any(|binding| binding.kind == ShaderResourceKind::ColorInput);
+    let color_input = plan_uses_color_input(plan);
     let color_layout = |slot: usize| {
-        if color_input && slot == 0 {
-            vk::ImageLayout::GENERAL
-        } else {
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-        }
+        let attachment = plan.color_attachments[slot];
+        crate::replacement_render::render_attachment_layout(
+            reims_vgpu_core::RenderAttachmentRole::Color(slot as u32),
+            attachment.feedback_loop,
+            attachment.input_attachment,
+        )
+    };
+    // A resolve target is written by the pass and never read by it, so it
+    // takes the plain attachment layout however the attachment it resolves is
+    // read. This is the same statement the image-state derivation makes about
+    // the same image; both call one function so they cannot drift apart.
+    let resolve_layout = |slot: usize| {
+        crate::replacement_render::render_attachment_layout(
+            reims_vgpu_core::RenderAttachmentRole::Color(slot as u32),
+            false,
+            false,
+        )
     };
     let mut attachments = Vec::new();
     let mut color_refs = Vec::new();
@@ -885,7 +918,7 @@ unsafe fn create_render_pass(
     let mut resolve_refs = Vec::new();
     if has_color_resolve {
         for (slot, color) in plan.color_attachments.iter().enumerate() {
-            let layout = color_layout(slot);
+            let layout = resolve_layout(slot);
             if let Some(format) = color.resolve_format {
                 resolve_refs.push(
                     vk::AttachmentReference2::default()
@@ -922,7 +955,11 @@ unsafe fn create_render_pass(
     if let Some(depth) = plan.depth_stencil_attachment {
         validate_depth_resolve_actions(depth)?;
         let format = combined_depth_stencil_format(depth.depth_format, depth.stencil_format)?;
-        let layout = vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        let layout = crate::replacement_render::render_attachment_layout(
+            reims_vgpu_core::RenderAttachmentRole::Depth,
+            !depth.feedback_loop_aspects.is_empty(),
+            false,
+        );
         let (depth_load, depth_initial) = load_ops(depth.depth_load, layout);
         let (stencil_load, stencil_initial) = load_ops(depth.stencil_load, layout);
         let initial = if depth_initial == layout || stencil_initial == layout {
@@ -947,10 +984,15 @@ unsafe fn create_render_pass(
                 .final_layout(layout),
         );
         if depth.depth_resolve_format.is_some() || depth.stencil_resolve_format.is_some() {
+            let resolve_layout = crate::replacement_render::render_attachment_layout(
+                reims_vgpu_core::RenderAttachmentRole::Depth,
+                false,
+                false,
+            );
             depth_resolve_ref = Some(
                 vk::AttachmentReference2::default()
                     .attachment(attachments.len() as u32)
-                    .layout(layout),
+                    .layout(resolve_layout),
             );
             attachments.push(
                 vk::AttachmentDescription2::default()
@@ -1010,6 +1052,17 @@ unsafe fn create_render_pass(
         .device
         .create_render_pass2(&render_pass_info, None)
         .map_err(|result| vk_error("create_render_pass2", result))
+}
+
+/// Whether the pass declares its first colour attachment as a subpass input.
+///
+/// The plan carries the fact, stamped over the whole encoder from the fragment
+/// interfaces of the draws in it, because the pass declares one layout per
+/// attachment for its life and a read by any draw decides it for all of them.
+fn plan_uses_color_input(plan: &ReplacementRenderPipelinePlan) -> bool {
+    plan.color_attachments
+        .first()
+        .is_some_and(|attachment| attachment.input_attachment)
 }
 
 fn validate_depth_resolve_actions(
@@ -1147,16 +1200,7 @@ unsafe fn create_graphics_pipeline(
     let blend = vk::PipelineColorBlendStateCreateInfo::default()
         .attachments(colors)
         .blend_constants([0.0; 4]);
-    let mut dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    if plan.static_state.depth_bias_enabled {
-        dynamic_states.push(vk::DynamicState::DEPTH_BIAS);
-    }
-    if depth.is_some_and(|state| state.front.is_some() || state.back.is_some()) {
-        dynamic_states.push(vk::DynamicState::STENCIL_REFERENCE);
-    }
-    if semantic_uses_blend_constants(semantic) {
-        dynamic_states.push(vk::DynamicState::BLEND_CONSTANTS);
-    }
+    let dynamic_states = plan_dynamic_states(plan, semantic, depth).declarations();
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let mut depth_info = vk::PipelineDepthStencilStateCreateInfo::default();
     if let Some(depth) = depth {
@@ -1168,7 +1212,21 @@ unsafe fn create_graphics_pipeline(
             .front(depth.front.unwrap_or_default())
             .back(depth.back.unwrap_or_default());
     }
+    let mut flags = vk::PipelineCreateFlags::empty();
+    if plan
+        .feedback_loop_aspects
+        .contains(vk::ImageAspectFlags::COLOR)
+    {
+        flags |= vk::PipelineCreateFlags::COLOR_ATTACHMENT_FEEDBACK_LOOP_EXT;
+    }
+    if plan
+        .feedback_loop_aspects
+        .intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
+    {
+        flags |= vk::PipelineCreateFlags::DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_EXT;
+    }
     let mut info = vk::GraphicsPipelineCreateInfo::default()
+        .flags(flags)
         .stages(&stages)
         .vertex_input_state(&vertex_input)
         .input_assembly_state(&input_assembly)
@@ -1507,6 +1565,7 @@ mod tests {
             vertex_buffers: Box::new([]),
             color_attachments: Box::new([]),
             depth_stencil_attachment: None,
+            feedback_loop_aspects: vk::ImageAspectFlags::empty(),
             sample_count: vk::SampleCountFlags::TYPE_1,
             viewport_count: 1,
             static_state: Default::default(),

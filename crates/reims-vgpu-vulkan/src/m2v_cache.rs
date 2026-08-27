@@ -363,6 +363,14 @@ impl KernelDispatchContract {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct KernelSpecializationKey {
     storage_images: Vec<RuntimeStorageImageRequest>,
+    /// Pixel-coordinate sampler states bound to this dispatch, by Metal index.
+    ///
+    /// A kernel's sampling operations are specialized against these the same
+    /// way a fragment shader's are: an unnormalized-coordinates sampler
+    /// reaching an image operation that carries a LOD bias or an offset has no
+    /// defined result in Vulkan, and only the translator can rewrite the
+    /// operation once it knows the state.
+    samplers: RuntimeSamplerKey,
     dispatch: KernelDispatchContract,
 }
 
@@ -715,6 +723,100 @@ fn runtime_sampler_state(
     })
 }
 
+/// The pixel-coordinate sampler states one stage must be specialized against,
+/// in the translator's own coordinate: Metal sampler index, not Vulkan binding.
+///
+/// Only a *runtime* sampler needs this. A sampler the executable declares
+/// `constexpr` is already baked into the AIR, and one whose coordinates are
+/// normalized needs no rewrite because every image operation is defined for it.
+/// Several AIR parameters may alias one Metal index deliberately; the
+/// translator takes one state per index, so aliases must agree.
+fn canonical_runtime_samplers(
+    reflected: &[reims_vgpu_core::ReflectedSamplerDescriptor],
+    bound: &[reims_vgpu_core::SamplerResource],
+    stage: Stage,
+) -> M2vResult<RuntimeSamplerKey> {
+    let mut states = reflected
+        .iter()
+        .filter(|reflected| reflected.static_state.is_none())
+        .filter_map(|reflected| {
+            bound
+                .iter()
+                .find(|sampler| {
+                    sampler.binding == reflected.binding
+                        && sampler.source == reims_vgpu_core::SamplerSource::State
+                        && sampler.unnormalized_coordinates
+                })
+                .cloned()
+                .map(|sampler| (reflected.metal_index, sampler))
+        })
+        .collect::<Vec<_>>();
+    states.sort_by_key(|(metal_index, _)| *metal_index);
+    let mut canonical: RuntimeSamplerKey = Vec::with_capacity(states.len());
+    for (metal_index, mut sampler) in states {
+        // The Vulkan binding is not part of the Metal sampler contract handed
+        // to translation, so it is normalized out before it can split a key.
+        sampler.binding = 0;
+        if let Some((previous_index, previous)) = canonical.last() {
+            if *previous_index == metal_index {
+                if *previous != sampler {
+                    return Err(M2vCacheDecline::RuntimeSamplerSpecialize {
+                        stage: stage_name(stage),
+                        detail: format!(
+                            "aliased Metal sampler {metal_index} has conflicting runtime states"
+                        ),
+                    });
+                }
+                continue;
+            }
+        }
+        canonical.push((metal_index, sampler));
+    }
+    Ok(canonical)
+}
+
+/// Confirm the translator applied exactly the states it was handed.
+///
+/// A silent partial application is the failure this guards: the module would
+/// execute, sample with an undefined result, and report nothing.
+fn verify_runtime_sampler_specializations(
+    reflection: &ShaderReflection,
+    states: &[(u32, reims_vgpu_core::SamplerResource)],
+    stage: Stage,
+) -> M2vResult<()> {
+    if reflection.runtime_sampler_specializations.len() != states.len() {
+        return Err(M2vCacheDecline::RuntimeSamplerSpecialize {
+            stage: stage_name(stage),
+            detail: format!(
+                "translator applied {} of {} runtime sampler states",
+                reflection.runtime_sampler_specializations.len(),
+                states.len()
+            ),
+        });
+    }
+    for (metal_index, sampler) in states {
+        let expected = runtime_sampler_state(sampler).map_err(|detail| {
+            M2vCacheDecline::RuntimeSamplerSpecialize {
+                stage: stage_name(stage),
+                detail,
+            }
+        })?;
+        let reflected = reflection
+            .runtime_sampler_specializations
+            .iter()
+            .find(|specialization| specialization.metal_index == *metal_index);
+        if reflected.map(|specialization| specialization.state) != Some(expected) {
+            return Err(M2vCacheDecline::RuntimeSamplerSpecialize {
+                stage: stage_name(stage),
+                detail: format!(
+                    "translator reflected a different runtime state for Metal sampler {metal_index}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn translate_render_with_samplers(
     source: &RenderTranslationSource,
     states: &[(u32, reims_vgpu_core::SamplerResource)],
@@ -766,36 +868,7 @@ fn translate_render_with_samplers(
         stage: stage_name(source.stage),
         detail,
     })?;
-    if reflection.runtime_sampler_specializations.len() != states.len() {
-        return Err(M2vCacheDecline::RuntimeSamplerSpecialize {
-            stage: stage_name(source.stage),
-            detail: format!(
-                "translator applied {} of {} runtime sampler states",
-                reflection.runtime_sampler_specializations.len(),
-                states.len()
-            ),
-        });
-    }
-    for (metal_index, sampler) in states {
-        let expected = runtime_sampler_state(sampler).map_err(|detail| {
-            M2vCacheDecline::RuntimeSamplerSpecialize {
-                stage: stage_name(source.stage),
-                detail,
-            }
-        })?;
-        let reflected = reflection
-            .runtime_sampler_specializations
-            .iter()
-            .find(|specialization| specialization.metal_index == *metal_index);
-        if reflected.map(|specialization| specialization.state) != Some(expected) {
-            return Err(M2vCacheDecline::RuntimeSamplerSpecialize {
-                stage: stage_name(source.stage),
-                detail: format!(
-                    "translator reflected a different runtime state for Metal sampler {metal_index}"
-                ),
-            });
-        }
-    }
+    verify_runtime_sampler_specializations(&reflection, states, source.stage)?;
     finish_translated(spirv, reflection, source.stage, None, None)
 }
 
@@ -817,46 +890,7 @@ pub fn specialize_render_samplers(
     let Some(source) = shader.render_source.as_ref() else {
         return Ok(base.clone());
     };
-    let mut states = base
-        .samplers
-        .iter()
-        .filter(|reflected| reflected.static_state.is_none())
-        .filter_map(|reflected| {
-            samplers
-                .iter()
-                .find(|sampler| {
-                    sampler.binding == reflected.binding
-                        && sampler.source == reims_vgpu_core::SamplerSource::State
-                        && sampler.unnormalized_coordinates
-                })
-                .cloned()
-                .map(|sampler| (reflected.metal_index, sampler))
-        })
-        .collect::<Vec<_>>();
-    states.sort_by_key(|(metal_index, _)| *metal_index);
-    let mut canonical = Vec::with_capacity(states.len());
-    for (metal_index, mut sampler) in states {
-        // Multiple AIR parameters may intentionally alias one Metal sampler
-        // index. The translator accepts one runtime state per Metal index, so
-        // aliases must agree on that state; the Vulkan binding is not part of
-        // the Metal sampler contract supplied to translation.
-        sampler.binding = 0;
-        if let Some((previous_index, previous)) = canonical.last() {
-            if *previous_index == metal_index {
-                if *previous != sampler {
-                    return Err(M2vCacheDecline::RuntimeSamplerSpecialize {
-                        stage: stage_name(source.stage),
-                        detail: format!(
-                            "aliased Metal sampler {metal_index} has conflicting runtime states"
-                        ),
-                    });
-                }
-                continue;
-            }
-        }
-        canonical.push((metal_index, sampler));
-    }
-    let states = canonical;
+    let states = canonical_runtime_samplers(&base.samplers, samplers, source.stage)?;
     if states.is_empty() {
         return Ok(base.clone());
     }
@@ -1282,6 +1316,7 @@ fn reflected_storage_format(
 fn translate_kernel_with_storage(
     source: &KernelTranslationSource,
     requests: &[RuntimeStorageImageRequest],
+    samplers: &RuntimeSamplerKey,
     dispatch: KernelDispatchContract,
 ) -> M2vResult<CachedShader> {
     let _guard = translation_lock()
@@ -1339,6 +1374,22 @@ fn translate_kernel_with_storage(
             )
             .map_err(|detail| M2vCacheDecline::RuntimeStorageImageSpecialize { detail })?;
     }
+    for (metal_index, sampler) in samplers {
+        options = options
+            .with_runtime_sampler(
+                *metal_index,
+                runtime_sampler_state(sampler).map_err(|detail| {
+                    M2vCacheDecline::RuntimeSamplerSpecialize {
+                        stage: stage_name(Stage::Kernel),
+                        detail,
+                    }
+                })?,
+            )
+            .map_err(|detail| M2vCacheDecline::RuntimeSamplerSpecialize {
+                stage: stage_name(Stage::Kernel),
+                detail,
+            })?;
+    }
     let (spirv, reflection) = metal2vulkan::translate_reflected_with_options(
         path.to_str().unwrap_or("k.air"),
         Stage::Kernel,
@@ -1346,6 +1397,7 @@ fn translate_kernel_with_storage(
         options,
     )
     .map_err(|detail| M2vCacheDecline::RuntimeStorageImageSpecialize { detail })?;
+    verify_runtime_sampler_specializations(&reflection, samplers, Stage::Kernel)?;
     if reflection.local_size != Some(source.local_size)
         || reflection.runtime_storage_image_specializations.len() != unique.len()
     {
@@ -1419,19 +1471,25 @@ impl CachedShader {
         self: &Arc<Self>,
         requests: &[RuntimeStorageImageRequest],
     ) -> M2vResult<PreparedKernelVariant> {
-        self.prepare_kernel_for_dispatch(requests, KernelDispatchContract::DynamicThreads)
+        self.prepare_kernel_for_dispatch(requests, &[], KernelDispatchContract::DynamicThreads)
     }
 
     pub fn prepare_kernel_for_dispatch(
         self: &Arc<Self>,
         requests: &[RuntimeStorageImageRequest],
+        samplers: &[reims_vgpu_core::SamplerResource],
         dispatch: KernelDispatchContract,
     ) -> M2vResult<PreparedKernelVariant> {
+        let samplers =
+            canonical_runtime_samplers(&self.variant().samplers, samplers, Stage::Kernel)?;
         let key = KernelSpecializationKey {
             storage_images: requests.to_vec(),
+            samplers: samplers.clone(),
             dispatch,
         };
-        let is_base = requests.is_empty() && dispatch == KernelDispatchContract::DynamicThreads;
+        let is_base = requests.is_empty()
+            && samplers.is_empty()
+            && dispatch == KernelDispatchContract::DynamicThreads;
         let cached = (!is_base)
             .then(|| {
                 self.kernel_specializations
@@ -1451,7 +1509,9 @@ impl CachedShader {
                     detail: "kernel translation source lifetime ended".to_string(),
                 }
             })?;
-            let specialized = Arc::new(translate_kernel_with_storage(source, requests, dispatch)?);
+            let specialized = Arc::new(translate_kernel_with_storage(
+                source, requests, &samplers, dispatch,
+            )?);
             self.kernel_specializations
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -2629,10 +2689,12 @@ mod tests {
             Some(metal2vulkan::reflect::KernelDispatch::Workgroups)
         );
         let dynamic = KernelSpecializationKey {
+            samplers: Vec::new(),
             storage_images: Vec::new(),
             dispatch: KernelDispatchContract::DynamicThreads,
         };
         let workgroups = KernelSpecializationKey {
+            samplers: Vec::new(),
             storage_images: Vec::new(),
             dispatch: KernelDispatchContract::Workgroups,
         };
@@ -3062,6 +3124,105 @@ mod tests {
         fragment
             .validate()
             .expect("fragment layout is translator-valid");
+    }
+
+    #[test]
+    fn only_a_bound_pixel_coordinate_runtime_sampler_reaches_specialization() {
+        use reims_vgpu_core::{ReflectedSamplerDescriptor, SamplerResource, SamplerSource};
+
+        fn constexpr_sampler() -> reims_vgpu_core::ReflectedStaticSamplerState {
+            use reims_vgpu_core as semantic;
+            semantic::ReflectedStaticSamplerState {
+                min_filter: semantic::ReflectedSamplerFilter::Nearest,
+                mag_filter: semantic::ReflectedSamplerFilter::Nearest,
+                mip_filter: semantic::ReflectedSamplerMipFilter::None,
+                address_mode_s: semantic::ReflectedSamplerAddressMode::ClampToEdge,
+                address_mode_t: semantic::ReflectedSamplerAddressMode::ClampToEdge,
+                address_mode_r: semantic::ReflectedSamplerAddressMode::ClampToEdge,
+                coordinates: semantic::ReflectedSamplerCoordinates::Pixel,
+                compare_function: semantic::ReflectedSamplerCompareFunction::None,
+                max_anisotropy: 1,
+                lod_min_clamp: 0.0,
+                lod_max_clamp: 0.0,
+                border_color: semantic::ReflectedSamplerBorderColor::TransparentBlack,
+                reduction: semantic::ReflectedSamplerReduction::WeightedAverage,
+                lod_bias: 0.0,
+                raw_words: [0; 2],
+            }
+        }
+
+        let reflected = |metal_index, binding, static_state| ReflectedSamplerDescriptor {
+            metal_index,
+            binding,
+            static_state,
+        };
+        let bound = |binding, unnormalized| {
+            let mut sampler = SamplerResource::normalized_default(binding);
+            sampler.source = SamplerSource::State;
+            sampler.unnormalized_coordinates = unnormalized;
+            sampler
+        };
+
+        let descriptors = [
+            reflected(1, 10, None),
+            reflected(2, 11, None),
+            reflected(3, 12, Some(constexpr_sampler())),
+        ];
+        let states = canonical_runtime_samplers(
+            &descriptors,
+            &[bound(10, true), bound(11, false), bound(12, true)],
+            Stage::Kernel,
+        )
+        .expect("no Metal index is aliased here");
+
+        // 11 samples with normalized coordinates, so every image operation is
+        // already defined for it; 12 is constexpr in the executable and its
+        // state is baked into the AIR. Neither is the translator's business.
+        assert_eq!(
+            states.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            vec![1]
+        );
+        // The Vulkan binding is normalized out so it cannot split a cache key.
+        assert_eq!(states[0].1.binding, 0);
+    }
+
+    #[test]
+    fn one_metal_sampler_index_with_two_runtime_states_is_refused_by_name() {
+        use reims_vgpu_core::{ReflectedSamplerDescriptor, SamplerResource, SamplerSource};
+
+        let descriptors = [
+            ReflectedSamplerDescriptor {
+                metal_index: 4,
+                binding: 20,
+                static_state: None,
+            },
+            ReflectedSamplerDescriptor {
+                metal_index: 4,
+                binding: 21,
+                static_state: None,
+            },
+        ];
+        let mut first = SamplerResource::normalized_default(20);
+        first.source = SamplerSource::State;
+        first.unnormalized_coordinates = true;
+        let mut second = SamplerResource::normalized_default(21);
+        second.source = SamplerSource::State;
+        second.unnormalized_coordinates = true;
+        second.lod_max = 1f32.to_bits();
+
+        assert!(matches!(
+            canonical_runtime_samplers(&descriptors, &[first, second], Stage::Kernel),
+            Err(M2vCacheDecline::RuntimeSamplerSpecialize { .. })
+        ));
+        // Two spellings of the same state are one state, not a conflict.
+        let mut agreeing = first;
+        agreeing.binding = 21;
+        assert_eq!(
+            canonical_runtime_samplers(&descriptors, &[first, agreeing], Stage::Kernel)
+                .expect("the aliases agree")
+                .len(),
+            1
+        );
     }
 
     #[test]

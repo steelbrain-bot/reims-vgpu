@@ -152,6 +152,13 @@ impl DependencyCoordinator {
             .collect()
     }
 
+    pub fn prerequisites(
+        &self,
+        transaction: TransactionId,
+    ) -> Box<[crate::ResolvedWaitDependency]> {
+        self.waits.prerequisites(transaction)
+    }
+
     /// Semantic completion satisfies dependents and retires this transaction's
     /// live hazard records. Native lifetime retirement remains separate.
     pub fn semantic_complete(
@@ -167,8 +174,31 @@ impl DependencyCoordinator {
         if !self.waits.is_ready(transaction) {
             return Err(CoordinationError::NotReady);
         }
-        debug_assert!(self.waits.complete(transaction));
-        debug_assert!(self.hazards.retire(transaction));
+        let completed = self.waits.complete(transaction);
+        let hazards_retired = self.hazards.retire(transaction);
+        debug_assert!(completed);
+        debug_assert!(hazards_retired);
+        Ok(())
+    }
+
+    /// Give up a transaction that reached a typed refusal, releasing everything
+    /// that was waiting on it.
+    ///
+    /// Unlike [`Self::semantic_complete`] this does not require the transaction
+    /// to be ready, because a refusal can land at any stage. Its live hazard
+    /// records retire with it: the writes it declared will never happen, so a
+    /// later transaction must not order itself behind them.
+    pub fn abandon(&mut self, transaction: TransactionId) -> Result<(), CoordinationError> {
+        if !self.waits.is_accepted(transaction) {
+            return Err(CoordinationError::UnknownTransaction);
+        }
+        if self.waits.is_completed(transaction) {
+            return Err(CoordinationError::AlreadyCompleted);
+        }
+        let abandoned = self.waits.abandon(transaction);
+        let hazards_retired = self.hazards.retire(transaction);
+        debug_assert!(abandoned);
+        debug_assert!(hazards_retired);
         Ok(())
     }
 

@@ -119,6 +119,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::replacement_buffer_blit::{NativeBufferTarget, ReplacementBufferResolver};
     use ash::vk::Handle;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         evaluate_info_query, prepare_info_query, BackingRegion, ComputePipelineStateInfo,
         EvaluatedInfoQuery, ExecTransaction, GpuAddressInfo, HeapTextureSizeAndAlignInfo,
@@ -312,7 +313,12 @@ pub(crate) mod tests {
             _ => unreachable!(),
         };
         let representation = resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let operation = reims_vgpu_core::ResolvedInfoOperation::RenderPipelineState {
             pipeline: ResourceId::<RenderPipelineObject>::new(2, 1),

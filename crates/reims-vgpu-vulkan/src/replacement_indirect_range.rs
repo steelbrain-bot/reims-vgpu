@@ -438,6 +438,7 @@ pub unsafe fn record_indirect_range_readback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reims_vgpu_core::BackingView;
 
     struct Resolver {
         backing: BackingId,
@@ -462,7 +463,7 @@ mod tests {
         fn resolve(
             &self,
             _: BackingId,
-        ) -> Option<crate::replacement_barrier_record::NativeBarrierTarget> {
+        ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
             None
         }
     }
@@ -592,6 +593,7 @@ mod tests {
             .create_execution_representation(
                 backing,
                 reims_vgpu_core::RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
                 (),
             )
             .unwrap();

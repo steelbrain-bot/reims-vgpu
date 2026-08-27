@@ -122,9 +122,16 @@ pub trait ComputeTranslation: std::fmt::Debug + Send + Sync {
     ) -> Option<u64>;
     fn storage_image_access(&self, binding: u32) -> Option<reims_vgpu_core::StorageImageAccess>;
     fn samplers(&self) -> Arc<[reims_vgpu_core::ReflectedSamplerDescriptor]>;
+    /// Select the exact translated kernel this dispatch needs.
+    ///
+    /// `samplers` are the dispatch's bound sampler states. A pixel-coordinate
+    /// sampler changes what an image operation in the kernel means, so the
+    /// module is specialized against them the same way it is against runtime
+    /// storage-image formats.
     fn prepare_program(
         &self,
         requests: &[(u32, StorageImageFormat)],
+        samplers: &[reims_vgpu_core::SamplerResource],
         dispatch: reims_vgpu_core::ComputeProgramDispatchContract,
     ) -> Result<PreparedComputeProgram, ComputeProgramDecline>;
 }

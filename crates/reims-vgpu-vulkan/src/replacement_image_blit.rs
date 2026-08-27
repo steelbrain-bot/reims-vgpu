@@ -15,8 +15,9 @@ use reims_vgpu_core::{
         blit_aspect_bytes_per_pixel, buffer_image_blit_aspect, format_has_depth_aspect,
         format_has_stencil_aspect, BlitAspect,
     },
-    PreparedBlitRepresentation, PreparedExecResources, PreparedImageBlit, ResolvedBlit,
+    BackingView, PreparedExecResources, PreparedImageBlit, ResolvedBlit,
     ResolvedResourceCompletion, ResolvedTextureEndpoint, TextureExtent, TextureOrigin,
+    ViewRepresentation,
 };
 use reims_vgpu_protocol::BackingId;
 use std::collections::BTreeMap;
@@ -177,7 +178,7 @@ struct ImageRoles {
 
 pub(crate) fn derive_image_uses(
     operation: &ResolvedBlit,
-    representations: &[PreparedBlitRepresentation],
+    representations: &[ViewRepresentation],
     final_layouts: &impl ReplacementImageFinalLayout,
 ) -> Result<Box<[ReplacementImageUse]>, ImageBlitStateError> {
     let mut roles = BTreeMap::<BackingId, ImageRoles>::new();
@@ -215,11 +216,12 @@ pub(crate) fn derive_image_uses(
     roles
         .into_iter()
         .map(|(backing, roles)| {
-            let representation = representations
-                .binary_search_by_key(&backing, |representation| representation.backing)
-                .ok()
-                .map(|index| representations[index].representation)
-                .ok_or(ImageBlitStateError::MissingRepresentation(backing))?;
+            // Image state is about the image, so it is the backing's image
+            // view that this use names — never a buffer view of the same
+            // bytes that some other endpoint of the blit reads.
+            let representation =
+                ViewRepresentation::lookup(representations, backing, BackingView::Image)
+                    .ok_or(ImageBlitStateError::MissingRepresentation(backing))?;
             let image = ReplacementImageKey {
                 backing,
                 representation,
@@ -336,7 +338,12 @@ impl ReplacementImageBlitProgram {
         state: &PreparedImageState,
         resolver: &(impl ReplacementImageResolver + ReplacementBufferResolver),
     ) -> Result<Self, ImageBlitRecordError> {
-        if prepared.write() != reims_vgpu_core::GpuWriteId::operation(prepared.submission(), index)
+        if prepared.write()
+            != reims_vgpu_core::GpuWriteId::operation(
+                prepared.transaction(),
+                prepared.submission(),
+                index,
+            )
         {
             return Err(ImageBlitRecordError::WriteIdentityMismatch);
         }
@@ -578,7 +585,7 @@ fn resolve_image_copies(
     destination_origin: TextureOrigin,
     extent: TextureExtent,
     aspect: BlitAspect,
-    representations: &[PreparedBlitRepresentation],
+    representations: &[ViewRepresentation],
     state: &PreparedImageState,
     resolver: &impl ReplacementImageResolver,
 ) -> Result<Box<[NativeImageCopy]>, ImageBlitRecordError> {
@@ -665,7 +672,7 @@ fn resolve_buffer_image_copy(
     copy_extent: TextureExtent,
     aspect: BlitAspect,
     required_buffer_usage: vk::BufferUsageFlags,
-    representations: &[PreparedBlitRepresentation],
+    representations: &[ViewRepresentation],
     state: &PreparedImageState,
     resolver: &(impl ReplacementImageResolver + ReplacementBufferResolver),
 ) -> Result<NativeBufferImageCopy, ImageBlitRecordError> {
@@ -680,11 +687,14 @@ fn resolve_buffer_image_copy(
     if !image_target.full_range.aspect_mask.contains(aspect) {
         return Err(ImageBlitRecordError::AspectUnavailable(image_key));
     }
-    let representation = representations
-        .binary_search_by_key(&buffer.storage, |representation| representation.backing)
-        .ok()
-        .map(|index| representations[index].representation)
-        .ok_or(ImageBlitRecordError::MissingRepresentation(buffer.storage))?;
+    // The buffer endpoint reads or writes the bytes, so it resolves the
+    // backing's byte view. A guest allocation declared as both a buffer and a
+    // linear texture is one backing serving both, and taking whichever
+    // representation it designated for execution would hand a copy an image
+    // where it asked for a buffer.
+    let representation =
+        ViewRepresentation::lookup(representations, buffer.storage, BackingView::Bytes)
+            .ok_or(ImageBlitRecordError::MissingRepresentation(buffer.storage))?;
     let buffer_target = resolver
         .resolve_buffer(buffer.storage, representation)
         .ok_or(ImageBlitRecordError::UnknownBuffer {
@@ -771,17 +781,14 @@ fn aspect_from_native(aspect: vk::ImageAspectFlags) -> Result<BlitAspect, ImageB
 
 fn resolve_endpoint(
     endpoint: &ResolvedTextureEndpoint,
-    representations: &[PreparedBlitRepresentation],
+    representations: &[ViewRepresentation],
     state: &PreparedImageState,
     resolver: &impl ReplacementImageResolver,
 ) -> Result<(ReplacementImageKey, NativeImageTarget, vk::ImageLayout), ImageBlitRecordError> {
-    let representation = representations
-        .binary_search_by_key(&endpoint.storage, |representation| representation.backing)
-        .ok()
-        .map(|index| representations[index].representation)
-        .ok_or(ImageBlitRecordError::MissingRepresentation(
-            endpoint.storage,
-        ))?;
+    let representation =
+        ViewRepresentation::lookup(representations, endpoint.storage, BackingView::Image).ok_or(
+            ImageBlitRecordError::MissingRepresentation(endpoint.storage),
+        )?;
     let key = ReplacementImageKey {
         backing: endpoint.storage,
         representation,
@@ -1239,12 +1246,14 @@ mod tests {
         let uses = derive_image_uses(
             &operation,
             &[
-                PreparedBlitRepresentation {
+                ViewRepresentation {
                     backing: BackingId::new(1),
+                    view: BackingView::Image,
                     representation: RepresentationId::new(11),
                 },
-                PreparedBlitRepresentation {
+                ViewRepresentation {
                     backing: BackingId::new(2),
+                    view: BackingView::Image,
                     representation: RepresentationId::new(12),
                 },
             ],
@@ -1273,8 +1282,9 @@ mod tests {
         });
         let uses = derive_image_uses(
             &operation,
-            &[PreparedBlitRepresentation {
+            &[ViewRepresentation {
                 backing: BackingId::new(1),
+                view: BackingView::Image,
                 representation: RepresentationId::new(11),
             }],
             &General,
@@ -1319,12 +1329,14 @@ mod tests {
             },
             BlitAspect::Full,
             &[
-                PreparedBlitRepresentation {
+                ViewRepresentation {
                     backing: source.storage,
+                    view: BackingView::Image,
                     representation: source_key.representation,
                 },
-                PreparedBlitRepresentation {
+                ViewRepresentation {
                     backing: destination.storage,
+                    view: BackingView::Image,
                     representation: destination_key.representation,
                 },
             ],
@@ -1379,12 +1391,14 @@ mod tests {
                 },
                 BlitAspect::Full,
                 &[
-                    PreparedBlitRepresentation {
+                    ViewRepresentation {
                         backing: source.storage,
+                        view: BackingView::Image,
                         representation: source_key.representation,
                     },
-                    PreparedBlitRepresentation {
+                    ViewRepresentation {
                         backing: destination.storage,
+                        view: BackingView::Image,
                         representation: destination_key.representation,
                     },
                 ],
@@ -1477,12 +1491,14 @@ mod tests {
             length: ByteLength::new(112),
         };
         let representations = [
-            PreparedBlitRepresentation {
+            ViewRepresentation {
                 backing: buffer_backing,
+                view: BackingView::Bytes,
                 representation: buffer_representation,
             },
-            PreparedBlitRepresentation {
+            ViewRepresentation {
                 backing: image.storage,
+                view: BackingView::Image,
                 representation: image_key.representation,
             },
         ];
@@ -1606,12 +1622,14 @@ mod tests {
             BlitAspect::Full,
             vk::BufferUsageFlags::TRANSFER_SRC,
             &[
-                PreparedBlitRepresentation {
+                ViewRepresentation {
                     backing: buffer_backing,
+                    view: BackingView::Bytes,
                     representation: buffer_representation,
                 },
-                PreparedBlitRepresentation {
+                ViewRepresentation {
                     backing: image.storage,
+                    view: BackingView::Image,
                     representation: image_key.representation,
                 },
             ],

@@ -15,8 +15,9 @@ use crate::{
 };
 use ash::vk;
 use reims_vgpu_core::{
-    PreparedRenderDispatch, RenderAttachmentClear, RenderAttachmentRole, RenderBindingClass,
-    RenderBindingView, ResolvedRenderDispatch, ResolvedRenderDraw, ResolvedResourceCompletion,
+    BackingView, PreparedRenderDispatch, RenderAttachmentClear, RenderAttachmentRole,
+    RenderBindingClass, RenderBindingView, ResolvedRenderDispatch, ResolvedRenderDraw,
+    ResolvedResourceCompletion, ViewRepresentation,
 };
 use reims_vgpu_protocol::{
     BackingId, CullMode, DepthClipMode, FillMode, PrimitiveTopology, RepresentationId, StoreAction,
@@ -32,6 +33,36 @@ const _: () = assert!(
         == std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u64
 );
 
+/// The dynamic states one compiled render pipeline declared.
+///
+/// Viewport and scissor are always dynamic here. The remaining three are
+/// declared only when the resolved pipeline actually varies them, and a
+/// recording may issue a `vkCmdSet*` for exactly the states named: setting one
+/// the pipeline specified statically invalidates every draw that follows the
+/// bind.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReplacementRenderDynamicStates {
+    pub depth_bias: bool,
+    pub stencil_reference: bool,
+    pub blend_constants: bool,
+}
+
+impl ReplacementRenderDynamicStates {
+    pub fn declarations(self) -> Vec<vk::DynamicState> {
+        let mut states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        if self.depth_bias {
+            states.push(vk::DynamicState::DEPTH_BIAS);
+        }
+        if self.stencil_reference {
+            states.push(vk::DynamicState::STENCIL_REFERENCE);
+        }
+        if self.blend_constants {
+            states.push(vk::DynamicState::BLEND_CONSTANTS);
+        }
+        states
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ReplacementRenderPipeline {
     pub pipeline: vk::Pipeline,
@@ -42,9 +73,14 @@ pub struct ReplacementRenderPipeline {
     pub vertex_buffers: Box<[reims_vgpu_core::ResolvedVertexBufferLayout]>,
     pub color_attachments: Box<[ReplacementRenderColorAttachment]>,
     pub depth_stencil_attachment: Option<ReplacementRenderDepthStencilAttachment>,
+    pub feedback_loop_aspects: vk::ImageAspectFlags,
+    pub color_input: bool,
     pub sample_count: vk::SampleCountFlags,
     pub viewport_count: u32,
     pub static_state: ReplacementRenderStaticState,
+    /// The states this pipeline left dynamic. The recorder sets these and no
+    /// others.
+    pub dynamic_states: ReplacementRenderDynamicStates,
     pub depth_stencil:
         Option<reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::DepthStencilObject>>,
 }
@@ -57,6 +93,7 @@ pub struct ReplacementRenderPipelinePlan {
     pub vertex_buffers: Box<[reims_vgpu_core::ResolvedVertexBufferLayout]>,
     pub color_attachments: Box<[ReplacementRenderColorAttachment]>,
     pub depth_stencil_attachment: Option<ReplacementRenderDepthStencilAttachment>,
+    pub feedback_loop_aspects: vk::ImageAspectFlags,
     pub sample_count: vk::SampleCountFlags,
     pub viewport_count: u32,
     pub static_state: ReplacementRenderStaticState,
@@ -160,8 +197,9 @@ pub type RenderDepthStencilVariantKey = (
     u16,
     u16,
     u16,
+    u32,
 );
-pub type RenderColorVariantKey = (u16, Option<u16>, u16, u16);
+pub type RenderColorVariantKey = (u16, Option<u16>, u16, u16, bool);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ReplacementRenderPipelineVariantKey {
@@ -177,6 +215,7 @@ pub struct ReplacementRenderPipelineVariantKey {
     pub vertex_buffers: Box<[reims_vgpu_core::ResolvedVertexBufferLayout]>,
     pub color_attachments: Box<[RenderColorVariantKey]>,
     pub depth_stencil_attachment: Option<RenderDepthStencilVariantKey>,
+    pub feedback_loop_aspects: u32,
     pub sample_count: u32,
     pub viewport_count: u32,
     pub depth_stencil:
@@ -324,6 +363,7 @@ impl ReplacementRenderPipeline {
             vertex_buffers: &self.vertex_buffers,
             color_attachments: &self.color_attachments,
             depth_stencil_attachment: self.depth_stencil_attachment,
+            feedback_loop_aspects: self.feedback_loop_aspects,
             sample_count: self.sample_count,
             viewport_count: self.viewport_count,
             static_state: self.static_state,
@@ -339,6 +379,7 @@ impl ReplacementRenderPipelinePlan {
             vertex_buffers: &self.vertex_buffers,
             color_attachments: &self.color_attachments,
             depth_stencil_attachment: self.depth_stencil_attachment,
+            feedback_loop_aspects: self.feedback_loop_aspects,
             sample_count: self.sample_count,
             viewport_count: self.viewport_count,
             static_state: self.static_state,
@@ -353,6 +394,63 @@ pub struct ReplacementRenderColorAttachment {
     pub resolve_format: Option<u16>,
     pub load: reims_vgpu_protocol::LoadAction,
     pub store: StoreAction,
+    pub feedback_loop: bool,
+    pub input_attachment: bool,
+}
+
+/// The layout one render-pass attachment is declared in.
+///
+/// This is the only derivation of that layout. The compiled pass names it in
+/// `initialLayout`, `finalLayout` and every attachment reference, and the
+/// image-state transition that runs before the pass delivers it -- so the two
+/// cannot be computed from different inputs and disagree. A disagreement does
+/// not stop at one pass: `finalLayout` then leaves the image in a layout the
+/// layout record never committed, and the next recording's barrier names a
+/// stale `oldLayout` for as long as the image lives.
+pub const fn render_attachment_layout(
+    role: RenderAttachmentRole,
+    feedback_loop: bool,
+    input_attachment: bool,
+) -> vk::ImageLayout {
+    if feedback_loop {
+        return vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+    }
+    match role {
+        // A subpass input read and a colour write of one attachment is the one
+        // pair Vulkan expresses with a single general layout rather than an
+        // attachment-optimal one.
+        RenderAttachmentRole::Color(_) if input_attachment => vk::ImageLayout::GENERAL,
+        RenderAttachmentRole::Color(_) => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        RenderAttachmentRole::Depth | RenderAttachmentRole::Stencil => {
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+        }
+    }
+}
+
+/// The image usage one render-pass attachment must have been created with.
+pub const fn render_attachment_usage(
+    role: RenderAttachmentRole,
+    feedback_loop: bool,
+    input_attachment: bool,
+) -> vk::ImageUsageFlags {
+    let role_usage = match role {
+        RenderAttachmentRole::Color(_) => vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        RenderAttachmentRole::Depth | RenderAttachmentRole::Stencil => {
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+        }
+    };
+    let mut usage = role_usage;
+    if feedback_loop {
+        usage = vk::ImageUsageFlags::from_raw(
+            usage.as_raw() | vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT.as_raw(),
+        );
+    }
+    if input_attachment {
+        usage = vk::ImageUsageFlags::from_raw(
+            usage.as_raw() | vk::ImageUsageFlags::INPUT_ATTACHMENT.as_raw(),
+        );
+    }
+    usage
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,6 +463,7 @@ pub struct ReplacementRenderDepthStencilAttachment {
     pub depth_store: StoreAction,
     pub stencil_load: reims_vgpu_protocol::LoadAction,
     pub stencil_store: StoreAction,
+    pub feedback_loop_aspects: vk::ImageAspectFlags,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,6 +496,7 @@ struct ReplacementRenderPipelineKeyInput<'a> {
     vertex_buffers: &'a [reims_vgpu_core::ResolvedVertexBufferLayout],
     color_attachments: &'a [ReplacementRenderColorAttachment],
     depth_stencil_attachment: Option<ReplacementRenderDepthStencilAttachment>,
+    feedback_loop_aspects: vk::ImageAspectFlags,
     sample_count: vk::SampleCountFlags,
     viewport_count: u32,
     static_state: ReplacementRenderStaticState,
@@ -411,6 +511,7 @@ fn render_pipeline_variant_key(
         vertex_buffers,
         color_attachments,
         depth_stencil_attachment,
+        feedback_loop_aspects,
         sample_count,
         viewport_count,
         static_state,
@@ -445,6 +546,7 @@ fn render_pipeline_variant_key(
                     attachment.resolve_format,
                     attachment.load.guest_ordinal(),
                     attachment.store.guest_ordinal(),
+                    attachment.feedback_loop,
                 )
             })
             .collect::<Vec<_>>()
@@ -459,8 +561,10 @@ fn render_pipeline_variant_key(
                 attachment.depth_store.guest_ordinal(),
                 attachment.stencil_load.guest_ordinal(),
                 attachment.stencil_store.guest_ordinal(),
+                attachment.feedback_loop_aspects.as_raw(),
             )
         }),
+        feedback_loop_aspects: feedback_loop_aspects.as_raw(),
         sample_count: sample_count.as_raw(),
         viewport_count,
         depth_stencil,
@@ -488,6 +592,7 @@ pub fn resolve_render_pipeline_plan(
             ))
         }
     };
+    let mut feedback_loop_aspects = vk::ImageAspectFlags::empty();
     let mut colors = operation
         .attachments
         .iter()
@@ -511,6 +616,9 @@ pub fn resolve_render_pipeline_plan(
                 ReplacementRenderPipelinePlanError::AttachmentSampleCountMismatch(attachment.role),
             );
         }
+        if attachment.feedback_loop {
+            feedback_loop_aspects |= vk::ImageAspectFlags::COLOR;
+        }
         color_attachments.push(ReplacementRenderColorAttachment {
             format: attachment.pixel_format,
             resolve_format: attachment
@@ -519,6 +627,8 @@ pub fn resolve_render_pipeline_plan(
                 .map(|resolve| resolve.pixel_format),
             load: attachment.load,
             store: attachment.store,
+            feedback_loop: attachment.feedback_loop,
+            input_attachment: attachment.input_attachment,
         });
     }
     let depth = operation
@@ -534,6 +644,13 @@ pub fn resolve_render_pipeline_plan(
             return Err(
                 ReplacementRenderPipelinePlanError::AttachmentSampleCountMismatch(attachment.role),
             );
+        }
+        if attachment.feedback_loop {
+            feedback_loop_aspects |= match attachment.role {
+                RenderAttachmentRole::Depth => vk::ImageAspectFlags::DEPTH,
+                RenderAttachmentRole::Stencil => vk::ImageAspectFlags::STENCIL,
+                RenderAttachmentRole::Color(_) => unreachable!(),
+            };
         }
     }
     let depth_stencil_attachment =
@@ -560,6 +677,8 @@ pub fn resolve_render_pipeline_plan(
                 attachment.load
             }),
             stencil_store: stencil.map_or(StoreAction::DontCare, |attachment| attachment.store),
+            feedback_loop_aspects: feedback_loop_aspects
+                & (vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL),
         });
     let topology = match operation.draw {
         ResolvedRenderDraw::Direct { topology, .. }
@@ -580,6 +699,7 @@ pub fn resolve_render_pipeline_plan(
         vertex_buffers: operation.vertex_buffers.clone(),
         color_attachments: color_attachments.into_boxed_slice(),
         depth_stencil_attachment,
+        feedback_loop_aspects,
         sample_count,
         viewport_count,
         static_state: ReplacementRenderStaticState {
@@ -647,46 +767,41 @@ impl ReplacementRenderImageBindings for () {
 
 impl ReplacementRenderImageBindings for ResolvedRenderDispatch {
     fn render_image_bindings(&self) -> Box<[RenderImageBinding]> {
+        // The layouts here are the ones the compiled render pass declares for
+        // the same attachments, from the same derivation, and the pass is the
+        // encoder's rather than this draw's -- so a feedback loop or an input
+        // read anywhere in the encoder decides the layout for every draw in it.
+        fn attachment_binding(
+            backing: BackingId,
+            role: RenderAttachmentRole,
+            feedback_loop: bool,
+            input_attachment: bool,
+            is_resolve: bool,
+        ) -> RenderImageBinding {
+            (
+                backing,
+                render_attachment_usage(role, feedback_loop, input_attachment),
+                render_attachment_layout(role, feedback_loop, input_attachment),
+                Some(role),
+                is_resolve,
+            )
+        }
+
         self.attachments
             .iter()
             .flat_map(|attachment| {
-                std::iter::once((
+                std::iter::once(attachment_binding(
                     attachment.backing,
-                    match attachment.role {
-                        RenderAttachmentRole::Color(_) => vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                        RenderAttachmentRole::Depth | RenderAttachmentRole::Stencil => {
-                            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                        }
-                    },
-                    match attachment.role {
-                        RenderAttachmentRole::Color(_) => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                        RenderAttachmentRole::Depth | RenderAttachmentRole::Stencil => {
-                            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                        }
-                    },
-                    Some(attachment.role),
+                    attachment.role,
+                    attachment.feedback_loop,
+                    attachment.input_attachment,
                     false,
                 ))
                 .chain(attachment.resolve.iter().map(|resolve| {
-                    (
-                        resolve.backing,
-                        match attachment.role {
-                            RenderAttachmentRole::Color(_) => vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                            RenderAttachmentRole::Depth | RenderAttachmentRole::Stencil => {
-                                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                            }
-                        },
-                        match attachment.role {
-                            RenderAttachmentRole::Color(_) => {
-                                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
-                            }
-                            RenderAttachmentRole::Depth | RenderAttachmentRole::Stencil => {
-                                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                            }
-                        },
-                        Some(attachment.role),
-                        true,
-                    )
+                    // A resolve target is written by the pass and never read
+                    // by it, so it is in no feedback loop and is no input
+                    // attachment however the attachment it resolves is read.
+                    attachment_binding(resolve.backing, attachment.role, false, false, true)
                 }))
             })
             .chain(
@@ -721,18 +836,7 @@ impl ReplacementRenderImageBindings for ResolvedRenderDispatch {
 pub fn derive_render_image_uses<NativePipeline, Operation: ReplacementRenderImageBindings>(
     prepared: &PreparedRenderDispatch<NativePipeline, Operation>,
 ) -> Result<Box<[ReplacementImageUse]>, RenderImageStateError> {
-    let representations = prepared
-        .uses()
-        .iter()
-        .map(|use_| {
-            let [representation] = use_.representations.as_ref() else {
-                return Err(RenderImageStateError::RepresentationUseMismatch(
-                    use_.backing,
-                ));
-            };
-            Ok((use_.backing, *representation))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let representations = prepared.representations();
     let mut images = BTreeMap::<
         ReplacementImageKey,
         (
@@ -744,9 +848,16 @@ pub fn derive_render_image_uses<NativePipeline, Operation: ReplacementRenderImag
     >::new();
     let bindings = prepared.operation().render_image_bindings();
     for (backing, usage, layout, role, is_resolve) in bindings.into_vec() {
+        // Every render image binding names the backing's image view; a buffer
+        // view of the same bytes has no image state.
         let image = ReplacementImageKey {
             backing,
-            representation: representations[&backing],
+            representation: ViewRepresentation::lookup(
+                representations,
+                backing,
+                BackingView::Image,
+            )
+            .ok_or(RenderImageStateError::RepresentationUseMismatch(backing))?,
         };
         match images.get_mut(&image) {
             Some((found_usage, found_layout, found_role, found_is_resolve)) => {
@@ -768,12 +879,49 @@ pub fn derive_render_image_uses<NativePipeline, Operation: ReplacementRenderImag
                                 Some(RenderAttachmentRole::Depth)
                             )
                         );
+                    let sampled_attachment_feedback = found_role.is_some() != role.is_some()
+                        && if found_role.is_some() {
+                            usage == vk::ImageUsageFlags::SAMPLED
+                        } else {
+                            *found_usage == vk::ImageUsageFlags::SAMPLED
+                        };
+                    if sampled_attachment_feedback {
+                        // The attachment carries the encoder-wide feedback
+                        // layout already; this pair only adds the usage the
+                        // sampled read needs. Re-deriving the layout here
+                        // would be the pass's rule written a second time, so
+                        // an attachment that does not already carry it is a
+                        // refusal rather than a local repair.
+                        let attachment_layout = if found_role.is_some() {
+                            *found_layout
+                        } else {
+                            layout
+                        };
+                        if attachment_layout
+                            != vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                        {
+                            return Err(RenderImageStateError::FeedbackRepresentationRequired(
+                                image,
+                            ));
+                        }
+                        *found_usage |= usage;
+                        *found_layout = attachment_layout;
+                        continue;
+                    }
                     if !depth_stencil_pair {
                         return Err(RenderImageStateError::FeedbackRepresentationRequired(image));
                     }
                 }
                 *found_usage |= usage;
-                if layout == vk::ImageLayout::GENERAL {
+                // A combined depth/stencil attachment is one pass attachment
+                // with one layout, and the pass unions the feedback-loop
+                // aspects of both -- so a loop on either aspect is the layout
+                // for both.
+                if *found_layout == vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                    || layout == vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                {
+                    *found_layout = vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+                } else if layout == vk::ImageLayout::GENERAL {
                     *found_layout = layout;
                 }
             }
@@ -852,6 +1000,46 @@ pub struct NativeRenderBufferBinding {
     pub binding: u32,
     pub buffer: vk::Buffer,
     pub offset: u64,
+}
+
+/// One dynamic-state value a draw recording issues after binding its pipeline.
+///
+/// A `vkCmdSet*` for a state the bound pipeline specified statically
+/// invalidates every draw that follows, so the settings a dispatch emits are
+/// derived from the pipeline's own declarations rather than from whether the
+/// resolved draw happened to carry a value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReplacementRenderDynamicSetting {
+    DepthBias([f32; 3]),
+    BlendConstants([f32; 4]),
+    StencilReference([u32; 2]),
+}
+
+impl ReplacementRenderDynamicSetting {
+    pub const fn state(self) -> vk::DynamicState {
+        match self {
+            Self::DepthBias(_) => vk::DynamicState::DEPTH_BIAS,
+            Self::BlendConstants(_) => vk::DynamicState::BLEND_CONSTANTS,
+            Self::StencilReference(_) => vk::DynamicState::STENCIL_REFERENCE,
+        }
+    }
+}
+
+pub fn dynamic_settings(native: &NativeRenderDispatch) -> Vec<ReplacementRenderDynamicSetting> {
+    let declared = native.pipeline.native().dynamic_states;
+    let mut settings = Vec::new();
+    if let Some(bias) = native.depth_bias.filter(|_| declared.depth_bias) {
+        settings.push(ReplacementRenderDynamicSetting::DepthBias(bias));
+    }
+    if let Some(color) = native.blend_color.filter(|_| declared.blend_constants) {
+        settings.push(ReplacementRenderDynamicSetting::BlendConstants(color));
+    }
+    if declared.stencil_reference {
+        settings.push(ReplacementRenderDynamicSetting::StencilReference(
+            native.stencil_reference,
+        ));
+    }
+    settings
 }
 
 #[derive(Clone, Debug)]
@@ -960,10 +1148,11 @@ fn join_native_render_passes(
         if !continues_encoder {
             continue;
         }
-        let compatible = programs[index].native.pipeline.render_pass
-            == programs[index + 1].native.pipeline.render_pass
-            && programs[index].native.attachment_views
-                == programs[index + 1].native.attachment_views
+        let compatible = render_passes_compatible(
+            programs[index].native.pipeline.native(),
+            programs[index + 1].native.pipeline.native(),
+        ) && programs[index].native.attachment_views
+            == programs[index + 1].native.attachment_views
             && programs[index].native.extent == programs[index + 1].native.extent;
         if !compatible {
             return Err(RenderExecProgramError::NativePassReopenRequired(
@@ -974,6 +1163,35 @@ fn join_native_render_passes(
         programs[index + 1].native.begins_native_pass = false;
     }
     Ok(())
+}
+
+pub(crate) fn render_passes_compatible(
+    first: &ReplacementRenderPipeline,
+    second: &ReplacementRenderPipeline,
+) -> bool {
+    first.sample_count == second.sample_count
+        && first.color_input == second.color_input
+        && first.color_attachments.len() == second.color_attachments.len()
+        && first
+            .color_attachments
+            .iter()
+            .zip(&second.color_attachments)
+            .all(|(first, second)| {
+                first.format == second.format && first.resolve_format == second.resolve_format
+            })
+        && match (
+            first.depth_stencil_attachment,
+            second.depth_stencil_attachment,
+        ) {
+            (None, None) => true,
+            (Some(first), Some(second)) => {
+                first.depth_format == second.depth_format
+                    && first.stencil_format == second.stencil_format
+                    && first.depth_resolve_format == second.depth_resolve_format
+                    && first.stencil_resolve_format == second.stencil_resolve_format
+            }
+            _ => false,
+        }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1121,16 +1339,19 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
         if !image_state.releases.is_empty() {
             return Err(RenderRecordError::ImageReleasePending);
         }
-        let representations = prepared
-            .uses()
-            .iter()
-            .map(|use_| {
-                let [representation] = use_.representations.as_ref() else {
-                    return Err(RenderRecordError::RepresentationUseMismatch(use_.backing));
-                };
-                Ok((use_.backing, *representation))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let representations = prepared.representations();
+        // Attachments, resolves and sampled bindings all name a backing's
+        // image view; a bound buffer names its byte view. `image_view` and
+        // `byte_view` say which, so a backing carrying both objects resolves
+        // correctly at every site below.
+        let image_view = |backing: BackingId| {
+            ViewRepresentation::lookup(representations, backing, BackingView::Image)
+                .ok_or(RenderRecordError::RepresentationUseMismatch(backing))
+        };
+        let byte_view = |backing: BackingId| {
+            ViewRepresentation::lookup(representations, backing, BackingView::Bytes)
+                .ok_or(RenderRecordError::RepresentationUseMismatch(backing))
+        };
         let mut attachment_views = Vec::new();
         let mut clear_values = Vec::new();
         for (expected_index, expected) in pipeline.color_attachments.iter().enumerate() {
@@ -1148,10 +1369,10 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                     attachment.role,
                 ));
             }
-            let target = attachment_target(attachment, &representations, resolver)?;
+            let target = attachment_target(attachment, representations, resolver)?;
             let key = ReplacementImageKey {
                 backing: attachment.backing,
-                representation: representations[&attachment.backing],
+                representation: image_view(attachment.backing)?,
             };
             validate_attachment_target(key, attachment, target, pipeline.sample_count)?;
             attachment_views.push(target.view);
@@ -1186,10 +1407,10 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                 return Err(RenderRecordError::PipelineAttachmentMismatch(role));
             }
             if let Some(resolve) = &attachment.resolve {
-                let target = resolve_target(resolve, &representations, resolver)?;
+                let target = resolve_target(resolve, representations, resolver)?;
                 let key = ReplacementImageKey {
                     backing: resolve.backing,
-                    representation: representations[&resolve.backing],
+                    representation: image_view(resolve.backing)?,
                 };
                 validate_resolve_target(key, attachment.role, resolve, target)?;
                 attachment_views.push(target.view);
@@ -1239,17 +1460,17 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                 let first = depth
                     .or(stencil)
                     .expect("a depth/stencil plan names one aspect");
-                let first_target = attachment_target(first, &representations, resolver)?;
+                let first_target = attachment_target(first, representations, resolver)?;
                 let first_key = ReplacementImageKey {
                     backing: first.backing,
-                    representation: representations[&first.backing],
+                    representation: image_view(first.backing)?,
                 };
                 validate_attachment_target(first_key, first, first_target, pipeline.sample_count)?;
                 if let Some(second) = stencil.filter(|_| depth.is_some()) {
-                    let second_target = attachment_target(second, &representations, resolver)?;
+                    let second_target = attachment_target(second, representations, resolver)?;
                     let second_key = ReplacementImageKey {
                         backing: second.backing,
-                        representation: representations[&second.backing],
+                        representation: image_view(second.backing)?,
                     };
                     validate_attachment_target(
                         second_key,
@@ -1284,10 +1505,10 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                     let first_resolve = depth_resolve
                         .or(stencil_resolve)
                         .expect("a depth/stencil resolve plan names one aspect");
-                    let first_target = resolve_target(first_resolve, &representations, resolver)?;
+                    let first_target = resolve_target(first_resolve, representations, resolver)?;
                     let first_key = ReplacementImageKey {
                         backing: first_resolve.backing,
-                        representation: representations[&first_resolve.backing],
+                        representation: image_view(first_resolve.backing)?,
                     };
                     validate_resolve_target(
                         first_key,
@@ -1300,10 +1521,10 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                         first_target,
                     )?;
                     if let Some(second) = stencil_resolve.filter(|_| depth_resolve.is_some()) {
-                        let second_target = resolve_target(second, &representations, resolver)?;
+                        let second_target = resolve_target(second, representations, resolver)?;
                         let second_key = ReplacementImageKey {
                             backing: second.backing,
-                            representation: representations[&second.backing],
+                            representation: image_view(second.backing)?,
                         };
                         validate_resolve_target(
                             second_key,
@@ -1328,7 +1549,17 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
         let mut declarations = BTreeMap::<u32, (vk::DescriptorType, u32)>::new();
         let mut vertex_buffers = Vec::new();
         for resource in &prepared.operation().resources {
-            let representation = representations[&resource.backing];
+            // The descriptor class picks the view: a vertex or uniform buffer
+            // binding names the bytes, a sampled or storage image binding
+            // names the texels.
+            let view = match resource.view {
+                RenderBindingView::Buffer(_) => BackingView::Bytes,
+                RenderBindingView::Image(_) => BackingView::Image,
+            };
+            let representation =
+                ViewRepresentation::lookup(representations, resource.backing, view).ok_or(
+                    RenderRecordError::RepresentationUseMismatch(resource.backing),
+                )?;
             match (resource.class, resource.view) {
                 (RenderBindingClass::VertexBuffer, RenderBindingView::Buffer(range)) => {
                     let target = buffer_target(resource.backing, representation, resolver)?;
@@ -1412,12 +1643,14 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                         backing: resource.backing,
                         representation,
                     };
-                    let target = resolver.resolve_texture_binding_view(key, view).ok_or(
-                        RenderRecordError::UnknownImageView {
-                            image: key,
-                            resource: view.resource,
-                        },
-                    )?;
+                    let target =
+                        resolver
+                            .resolve_texture_binding_view(key, view)
+                            .map_err(|reason| RenderRecordError::UnknownImageView {
+                                image: key,
+                                resource: view.resource,
+                                reason,
+                            })?;
                     if target.view == vk::ImageView::null() {
                         return Err(RenderRecordError::MissingImageView(key));
                     }
@@ -1517,11 +1750,8 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                 let RenderBindingView::Buffer(_) = semantic.view else {
                     unreachable!()
                 };
-                let target = buffer_target(
-                    semantic.backing,
-                    representations[&semantic.backing],
-                    resolver,
-                )?;
+                let target =
+                    buffer_target(semantic.backing, byte_view(semantic.backing)?, resolver)?;
                 if !target.usage.contains(vk::BufferUsageFlags::INDEX_BUFFER) {
                     return Err(RenderRecordError::MissingIndexBufferUsage(semantic.backing));
                 }
@@ -1554,11 +1784,8 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
                 let RenderBindingView::Buffer(range) = semantic.view else {
                     unreachable!()
                 };
-                let target = buffer_target(
-                    semantic.backing,
-                    representations[&semantic.backing],
-                    resolver,
-                )?;
+                let target =
+                    buffer_target(semantic.backing, byte_view(semantic.backing)?, resolver)?;
                 if !target.usage.contains(vk::BufferUsageFlags::INDIRECT_BUFFER) {
                     return Err(RenderRecordError::MissingIndirectBufferUsage(
                         semantic.backing,
@@ -1575,8 +1802,12 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
             }
             ResolvedRenderDraw::Direct { .. } | ResolvedRenderDraw::Indexed { .. } => None,
         };
-        let mut backings = representations.keys().copied().collect::<Vec<_>>();
+        let mut backings = representations
+            .iter()
+            .map(|representation| representation.backing)
+            .collect::<Vec<_>>();
         backings.sort_unstable();
+        backings.dedup();
         Ok(Self {
             index: prepared.operation_index(),
             transaction: prepared.transaction(),
@@ -1617,7 +1848,7 @@ impl ReplacementRenderProgram<ResolvedRenderDispatch> {
 
 fn attachment_target(
     attachment: &reims_vgpu_core::ResolvedRenderAttachment,
-    representations: &BTreeMap<BackingId, RepresentationId>,
+    representations: &[ViewRepresentation],
     resolver: &impl ReplacementRenderResolver,
 ) -> Result<NativeImageTarget, RenderRecordError> {
     let [region] = attachment.regions.as_ref() else {
@@ -1627,7 +1858,14 @@ fn attachment_target(
     };
     let key = ReplacementImageKey {
         backing: attachment.backing,
-        representation: representations[&attachment.backing],
+        representation: ViewRepresentation::lookup(
+            representations,
+            attachment.backing,
+            BackingView::Image,
+        )
+        .ok_or(RenderRecordError::RepresentationUseMismatch(
+            attachment.backing,
+        ))?,
     };
     resolver.resolve_attachment_view(key, *region).ok_or(
         RenderRecordError::AttachmentRegionUnsupported(attachment.role),
@@ -1636,7 +1874,7 @@ fn attachment_target(
 
 fn resolve_target(
     resolve: &reims_vgpu_core::ResolvedRenderResolveAttachment,
-    representations: &BTreeMap<BackingId, RepresentationId>,
+    representations: &[ViewRepresentation],
     resolver: &impl ReplacementRenderResolver,
 ) -> Result<NativeImageTarget, RenderRecordError> {
     let [region] = resolve.regions.as_ref() else {
@@ -1644,27 +1882,27 @@ fn resolve_target(
     };
     let key = ReplacementImageKey {
         backing: resolve.backing,
-        representation: representations[&resolve.backing],
+        representation: ViewRepresentation::lookup(
+            representations,
+            resolve.backing,
+            BackingView::Image,
+        )
+        .ok_or(RenderRecordError::RepresentationUseMismatch(
+            resolve.backing,
+        ))?,
     };
     resolver
         .resolve_attachment_view(key, *region)
         .ok_or(RenderRecordError::ResolveRegionUnsupported)
 }
 
+/// The visibility result is written as bytes, so it resolves the backing's
+/// byte view whatever else the same allocation is bound as.
 fn representations_for_visibility<NativePipeline>(
     prepared: &PreparedRenderDispatch<NativePipeline>,
     backing: BackingId,
 ) -> Result<RepresentationId, RenderRecordError> {
-    prepared
-        .uses()
-        .iter()
-        .find(|use_| use_.backing == backing)
-        .and_then(|use_| {
-            let [representation] = use_.representations.as_ref() else {
-                return None;
-            };
-            Some(*representation)
-        })
+    ViewRepresentation::lookup(prepared.representations(), backing, BackingView::Bytes)
         .ok_or(RenderRecordError::RepresentationUseMismatch(backing))
 }
 fn buffer_target(
@@ -1897,9 +2135,14 @@ pub enum RenderRecordError {
     UnsupportedAttachmentSampleCount(RenderAttachmentRole),
     ResolveTargetMismatch(RenderAttachmentRole),
     UnknownImage(ReplacementImageKey),
+    /// A decoded texture-binding view this backend has no `VkImageView` for.
+    /// The reason names which of the view's terms it could not build, because
+    /// they are unrelated pieces of work -- see
+    /// [`crate::replacement_image_transition::TextureBindingViewDecline`].
     UnknownImageView {
         image: ReplacementImageKey,
         resource: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+        reason: crate::replacement_image_transition::TextureBindingViewDecline,
     },
     MissingImageView(ReplacementImageKey),
     MissingImageUsage {
@@ -2061,22 +2304,24 @@ pub unsafe fn record_render_dispatch(
     );
     device.cmd_set_viewport(command_buffer, 0, &native.viewports);
     device.cmd_set_scissor(command_buffer, 0, &native.scissors);
-    if let Some([constant_factor, slope_factor, clamp]) = native.depth_bias {
-        device.cmd_set_depth_bias(command_buffer, constant_factor, clamp, slope_factor);
+    for setting in dynamic_settings(native) {
+        match setting {
+            ReplacementRenderDynamicSetting::DepthBias([constant_factor, slope_factor, clamp]) => {
+                device.cmd_set_depth_bias(command_buffer, constant_factor, clamp, slope_factor);
+            }
+            ReplacementRenderDynamicSetting::BlendConstants(color) => {
+                device.cmd_set_blend_constants(command_buffer, &color);
+            }
+            ReplacementRenderDynamicSetting::StencilReference([front, back]) => {
+                device.cmd_set_stencil_reference(
+                    command_buffer,
+                    vk::StencilFaceFlags::FRONT,
+                    front,
+                );
+                device.cmd_set_stencil_reference(command_buffer, vk::StencilFaceFlags::BACK, back);
+            }
+        }
     }
-    if let Some(color) = native.blend_color {
-        device.cmd_set_blend_constants(command_buffer, &color);
-    }
-    device.cmd_set_stencil_reference(
-        command_buffer,
-        vk::StencilFaceFlags::FRONT,
-        native.stencil_reference[0],
-    );
-    device.cmd_set_stencil_reference(
-        command_buffer,
-        vk::StencilFaceFlags::BACK,
-        native.stencil_reference[1],
-    );
     if let Some(set) = descriptor_set {
         device.cmd_bind_descriptor_sets(
             command_buffer,
@@ -2172,6 +2417,7 @@ pub unsafe fn record_render_dispatch(
 mod tests {
     use super::*;
     use ash::vk::Handle;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         prepare_render_dispatch, AccessMode, BackingRegion, PipelineLifecycle, PipelineReadiness,
         RepresentationRoute, ResolvedRenderAttachment, ResolvedRenderResourceBinding,
@@ -2304,8 +2550,11 @@ mod tests {
             &self,
             image: ReplacementImageKey,
             _: reims_vgpu_core::ResolvedTextureBindingView,
-        ) -> Option<NativeImageTarget> {
-            self.resolve_image(image)
+        ) -> Result<NativeImageTarget, crate::replacement_image_transition::TextureBindingViewDecline>
+        {
+            self.resolve_image(image).ok_or(
+                crate::replacement_image_transition::TextureBindingViewDecline::UnknownRepresentation,
+            )
         }
     }
 
@@ -2367,11 +2616,16 @@ mod tests {
                         resolve_format: None,
                         load: reims_vgpu_protocol::LoadAction::Clear,
                         store: StoreAction::Store,
+                        feedback_loop: false,
+                        input_attachment: false,
                     }]),
                     depth_stencil_attachment: None,
+                    feedback_loop_aspects: vk::ImageAspectFlags::empty(),
+                    color_input: false,
                     sample_count: vk::SampleCountFlags::TYPE_1,
                     viewport_count: 1,
                     static_state: ReplacementRenderStaticState::default(),
+                    dynamic_states: ReplacementRenderDynamicStates::default(),
                     depth_stencil: None,
                 }),
             )
@@ -2421,10 +2675,14 @@ mod tests {
                         depth_store: StoreAction::Store,
                         stencil_load: LoadAction::Clear,
                         stencil_store: StoreAction::Store,
+                        feedback_loop_aspects: vk::ImageAspectFlags::empty(),
                     }),
+                    feedback_loop_aspects: vk::ImageAspectFlags::empty(),
+                    color_input: false,
                     sample_count: vk::SampleCountFlags::TYPE_1,
                     viewport_count: 1,
                     static_state: ReplacementRenderStaticState::default(),
+                    dynamic_states: ReplacementRenderDynamicStates::default(),
                     depth_stencil: None,
                 }),
             )
@@ -2469,11 +2727,16 @@ mod tests {
                         resolve_format: Some(80),
                         load: LoadAction::Clear,
                         store: StoreAction::MultisampleResolve,
+                        feedback_loop: false,
+                        input_attachment: false,
                     }]),
                     depth_stencil_attachment: None,
+                    feedback_loop_aspects: vk::ImageAspectFlags::empty(),
+                    color_input: false,
                     sample_count: vk::SampleCountFlags::TYPE_4,
                     viewport_count: 1,
                     static_state: ReplacementRenderStaticState::default(),
+                    dynamic_states: ReplacementRenderDynamicStates::default(),
                     depth_stencil: None,
                 }),
             )
@@ -2485,7 +2748,19 @@ mod tests {
         ready
     }
 
+    /// A backing whose execution representation is an image, which is what
+    /// every attachment and sampled binding in these fixtures needs. A
+    /// fixture binding a backing as a buffer — a visibility result, an
+    /// indirect argument — asks for [`BackingView::Bytes`] instead.
     fn backing(owner: &mut ResourceLifecycleOwner<()>, current: bool) -> BackingId {
+        view_backing(owner, current, BackingView::Image)
+    }
+
+    fn view_backing(
+        owner: &mut ResourceLifecycleOwner<()>,
+        current: bool,
+        view: BackingView,
+    ) -> BackingId {
         let ResourceLifecycleEffect::BackingCreated(backing) = owner
             .apply(ResolvedResourceLifecycle::CreateBacking {
                 backing: StorageBacking::Dedicated,
@@ -2496,7 +2771,12 @@ mod tests {
             unreachable!()
         };
         let representation = owner
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                view,
+                (),
+            )
             .unwrap();
         if current {
             let snapshot = owner
@@ -2529,6 +2809,8 @@ mod tests {
                 RenderAttachmentRole::Stencil => RenderAttachmentClear::Stencil(0),
             },
             resolve: None,
+            feedback_loop: false,
+            input_attachment: false,
         }
     }
 
@@ -2604,12 +2886,280 @@ mod tests {
             vertex_buffers: plan.vertex_buffers.clone(),
             color_attachments: plan.color_attachments.clone(),
             depth_stencil_attachment: plan.depth_stencil_attachment,
+            feedback_loop_aspects: plan.feedback_loop_aspects,
+            color_input: false,
             sample_count: plan.sample_count,
             viewport_count: plan.viewport_count,
             static_state: plan.static_state,
+            dynamic_states: ReplacementRenderDynamicStates::default(),
             depth_stencil: plan.depth_stencil,
         };
         assert_eq!(plan.variant_key(), native.variant_key());
+    }
+
+    #[test]
+    fn render_pipeline_plan_carries_attachment_sampling_feedback() {
+        let mut attachment = plan_attachment(RenderAttachmentRole::Color(0), 80);
+        // The encoder decides this, not the draw: see
+        // `ResolvedRenderAttachment::feedback_loop`.
+        attachment.feedback_loop = true;
+        let mut operation = plan_operation([attachment.clone()]);
+        operation.resources = Box::new([ResolvedRenderResourceBinding {
+            class: RenderBindingClass::SampledImage,
+            binding: 4,
+            array_element: 0,
+            descriptor_count: 1,
+            stages: RenderStages::from_bits(RenderStages::FRAGMENT.into()).unwrap(),
+            resource: attachment.resource,
+            backing: attachment.backing,
+            view: RenderBindingView::Image(image_view(attachment.resource)),
+            regions: Box::new([BackingRegion::Whole]),
+            mode: AccessMode::Read,
+        }]);
+
+        let plan = resolve_render_pipeline_plan(&operation, 4).unwrap();
+        assert_eq!(plan.feedback_loop_aspects, vk::ImageAspectFlags::COLOR);
+        assert!(plan.color_attachments[0].feedback_loop);
+        let mut without_loop = attachment;
+        without_loop.feedback_loop = false;
+        assert_ne!(
+            plan.variant_key(),
+            resolve_render_pipeline_plan(&plan_operation([without_loop]), 4)
+                .unwrap()
+                .variant_key()
+        );
+    }
+
+    #[test]
+    fn attachment_sampling_uses_the_feedback_layout_on_one_representation() {
+        let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
+        let backing = backing(&mut lifecycle, true);
+        let resource = ResourceId::new(80, 1);
+        let mut attachment = plan_attachment(RenderAttachmentRole::Color(0), 80);
+        attachment.resource = resource;
+        attachment.backing = backing;
+        attachment.sample_count = 1;
+        // The encoder stamped the loop, which is what the pass reads.
+        attachment.feedback_loop = true;
+        let sampled_binding = ResolvedRenderResourceBinding {
+            class: RenderBindingClass::SampledImage,
+            binding: 4,
+            array_element: 0,
+            descriptor_count: 1,
+            stages: RenderStages::from_bits(RenderStages::FRAGMENT.into()).unwrap(),
+            resource,
+            backing,
+            view: RenderBindingView::Image(image_view(resource)),
+            regions: Box::new([BackingRegion::Whole]),
+            mode: AccessMode::Read,
+        };
+        let mut operation = plan_operation([attachment.clone()]);
+        operation.vertex_buffers = Box::new([]);
+        operation.resources = Box::new([sampled_binding.clone()]);
+        let prepared = prepare_render_dispatch(
+            &mut lifecycle,
+            TransactionId::new(9),
+            SubmissionId::new(10),
+            0,
+            operation,
+            pipeline(),
+        )
+        .unwrap();
+
+        let uses = derive_render_image_uses(&prepared).unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(
+            uses[0].use_layout,
+            vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+        );
+
+        // Without the stamp the pass would declare a plain attachment layout
+        // while this bind asks for the loop's. The barrier may not repair that
+        // on its own -- the pass would still declare the other layout -- so it
+        // is refused by name.
+        let mut unstamped = attachment;
+        unstamped.feedback_loop = false;
+        let mut operation = plan_operation([unstamped]);
+        operation.vertex_buffers = Box::new([]);
+        operation.resources = Box::new([sampled_binding]);
+        let prepared = prepare_render_dispatch(
+            &mut lifecycle,
+            TransactionId::new(11),
+            SubmissionId::new(12),
+            0,
+            operation,
+            pipeline(),
+        )
+        .unwrap();
+        assert!(matches!(
+            derive_render_image_uses(&prepared),
+            Err(RenderImageStateError::FeedbackRepresentationRequired(_))
+        ));
+        assert!(uses[0]
+            .required_usage
+            .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT));
+    }
+
+    #[test]
+    fn a_draw_that_samples_nothing_still_takes_its_encoder_feedback_layout() {
+        let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
+        let backing = backing(&mut lifecycle, true);
+        let resource = ResourceId::new(80, 1);
+        let mut attachment = plan_attachment(RenderAttachmentRole::Color(0), 80);
+        attachment.resource = resource;
+        attachment.backing = backing;
+        attachment.sample_count = 1;
+        // Another draw in the same encoder reads this attachment; this one
+        // does not. One native render pass covers both, so both must name the
+        // one layout the pass declares.
+        attachment.feedback_loop = true;
+        let mut operation = plan_operation([attachment]);
+        operation.vertex_buffers = Box::new([]);
+        operation.resources = Box::new([]);
+        let prepared = prepare_render_dispatch(
+            &mut lifecycle,
+            TransactionId::new(9),
+            SubmissionId::new(10),
+            0,
+            operation,
+            pipeline(),
+        )
+        .unwrap();
+
+        let uses = derive_render_image_uses(&prepared).unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(
+            uses[0].use_layout,
+            vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+        );
+        assert_eq!(
+            uses[0].final_layout,
+            vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+        );
+        assert!(uses[0]
+            .required_usage
+            .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT));
+    }
+
+    #[test]
+    fn a_resolve_target_of_a_feedback_attachment_is_no_feedback_attachment() {
+        let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
+        let target = backing(&mut lifecycle, true);
+        let resolved = backing(&mut lifecycle, true);
+        let mut attachment = plan_attachment(RenderAttachmentRole::Color(0), 80);
+        attachment.backing = target;
+        attachment.sample_count = 4;
+        // Another draw in the encoder reads the multisampled attachment, so
+        // the pass declares it in the feedback layout. Its resolve target is
+        // written by the pass and never read by it.
+        attachment.feedback_loop = true;
+        attachment.store = StoreAction::StoreAndMultisampleResolve;
+        attachment.resolve = Some(reims_vgpu_core::ResolvedRenderResolveAttachment {
+            resource: ResourceId::new(81, 1),
+            backing: resolved,
+            regions: Box::new([BackingRegion::Whole]),
+            pixel_format: 80,
+            extent: [32, 16, 1],
+            sample_count: 1,
+        });
+        let mut operation = plan_operation([attachment]);
+        operation.vertex_buffers = Box::new([]);
+        operation.resources = Box::new([]);
+        let prepared = prepare_render_dispatch(
+            &mut lifecycle,
+            TransactionId::new(9),
+            SubmissionId::new(10),
+            0,
+            operation,
+            pipeline(),
+        )
+        .unwrap();
+
+        let uses = derive_render_image_uses(&prepared).unwrap();
+        let resolve_use = uses
+            .iter()
+            .find(|use_| use_.image.backing == resolved)
+            .expect("the resolve target is one of the pass's images");
+        assert_eq!(
+            resolve_use.use_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+        assert!(!resolve_use
+            .required_usage
+            .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT));
+    }
+
+    #[test]
+    fn a_color_input_attachment_binds_in_the_layout_its_pass_declares() {
+        let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
+        let target = backing(&mut lifecycle, true);
+        let mut attachment = plan_attachment(RenderAttachmentRole::Color(0), 80);
+        attachment.backing = target;
+        attachment.sample_count = 1;
+        // The fragment stage reads this attachment through a subpass input,
+        // which the pass can only express as one general layout.
+        attachment.input_attachment = true;
+        let mut operation = plan_operation([attachment.clone()]);
+        operation.vertex_buffers = Box::new([]);
+        operation.resources = Box::new([]);
+        let prepared = prepare_render_dispatch(
+            &mut lifecycle,
+            TransactionId::new(9),
+            SubmissionId::new(10),
+            0,
+            operation,
+            pipeline(),
+        )
+        .unwrap();
+
+        let uses = derive_render_image_uses(&prepared).unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].use_layout, vk::ImageLayout::GENERAL);
+        assert!(uses[0]
+            .required_usage
+            .contains(vk::ImageUsageFlags::INPUT_ATTACHMENT));
+
+        let mut sampled = attachment;
+        sampled.sample_count = 4;
+        let plan = resolve_render_pipeline_plan(&plan_operation([sampled]), 4).unwrap();
+        assert!(plan.color_attachments[0].input_attachment);
+    }
+
+    #[test]
+    fn one_feedback_aspect_puts_the_whole_depth_stencil_attachment_in_the_loop() {
+        let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
+        let combined = backing(&mut lifecycle, true);
+        let resource = ResourceId::new(252, 1);
+        let mut depth = plan_attachment(RenderAttachmentRole::Depth, 252);
+        depth.resource = resource;
+        depth.backing = combined;
+        depth.sample_count = 1;
+        let mut stencil = plan_attachment(RenderAttachmentRole::Stencil, 252);
+        stencil.resource = resource;
+        stencil.backing = combined;
+        stencil.sample_count = 1;
+        // The encoder reads the depth aspect; the pass declares one layout for
+        // the combined attachment and unions the two aspects to reach it.
+        depth.feedback_loop = true;
+        let mut operation = plan_operation([depth, stencil]);
+        operation.vertex_buffers = Box::new([]);
+        operation.resources = Box::new([]);
+        let prepared = prepare_render_dispatch(
+            &mut lifecycle,
+            TransactionId::new(9),
+            SubmissionId::new(10),
+            0,
+            operation,
+            pipeline(),
+        )
+        .unwrap();
+
+        let uses = derive_render_image_uses(&prepared).unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(
+            uses[0].use_layout,
+            vk::ImageLayout::ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+        );
     }
 
     #[test]
@@ -2808,8 +3358,8 @@ mod tests {
         let mut lifecycle = ResourceLifecycleOwner::new(EPOCH);
         let sampled = backing(&mut lifecycle, true);
         let attachment = backing(&mut lifecycle, false);
-        let visibility = backing(&mut lifecycle, false);
-        let arguments = backing(&mut lifecycle, true);
+        let visibility = view_backing(&mut lifecycle, false, BackingView::Bytes);
+        let arguments = view_backing(&mut lifecycle, true, BackingView::Bytes);
         let operation = ResolvedRenderDispatch {
             pipeline: ResourceId::new(2, 1),
             program: Default::default(),
@@ -2867,6 +3417,8 @@ mod tests {
                     1f32.to_bits(),
                 ]),
                 resolve: None,
+                feedback_loop: false,
+                input_attachment: false,
             }]),
             resources: Box::new([ResolvedRenderResourceBinding {
                 class: RenderBindingClass::SampledImage,
@@ -3132,6 +3684,16 @@ mod tests {
         incompatible.render_pass = vk::RenderPass::from_raw(99);
         joined[1].native.pipeline =
             Arc::new(ReplacementRenderPipelineVariant::synthetic(incompatible));
+        join_native_render_passes(&mut joined).unwrap();
+        assert!(!joined[0].native.ends_native_pass);
+        assert!(!joined[1].native.begins_native_pass);
+
+        joined[0].native.ends_native_pass = true;
+        joined[1].native.begins_native_pass = true;
+        let mut incompatible = joined[1].native.pipeline.native().clone();
+        incompatible.color_attachments[0].format = 81;
+        joined[1].native.pipeline =
+            Arc::new(ReplacementRenderPipelineVariant::synthetic(incompatible));
         assert_eq!(
             join_native_render_passes(&mut joined),
             Err(RenderExecProgramError::NativePassReopenRequired(4))
@@ -3172,6 +3734,8 @@ mod tests {
                     store: StoreAction::Store,
                     clear: RenderAttachmentClear::Depth(0.75f32.to_bits()),
                     resolve: None,
+                    feedback_loop: false,
+                    input_attachment: false,
                 },
                 ResolvedRenderAttachment {
                     role: RenderAttachmentRole::Stencil,
@@ -3185,6 +3749,8 @@ mod tests {
                     store: StoreAction::Store,
                     clear: RenderAttachmentClear::Stencil(27),
                     resolve: None,
+                    feedback_loop: false,
+                    input_attachment: false,
                 },
             ]),
             resources: Box::new([]),
@@ -3294,6 +3860,8 @@ mod tests {
                     extent: [32, 16, 1],
                     sample_count: 1,
                 }),
+                feedback_loop: false,
+                input_attachment: false,
             }]),
             resources: Box::new([]),
             null_bindings: Box::new([]),

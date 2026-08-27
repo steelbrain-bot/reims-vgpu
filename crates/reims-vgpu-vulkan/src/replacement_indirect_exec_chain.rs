@@ -1692,7 +1692,7 @@ mod tests {
         fn resolve(
             &self,
             _: BackingId,
-        ) -> Option<crate::replacement_barrier_record::NativeBarrierTarget> {
+        ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
             None
         }
     }

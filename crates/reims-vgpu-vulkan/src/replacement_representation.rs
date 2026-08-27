@@ -13,6 +13,7 @@ use crate::{
     replacement_image_state::{ReplacementImageKey, ReplacementImageStateOwner},
     replacement_image_transition::{
         same_subresource_range, NativeImageTarget, ReplacementImageResolver,
+        TextureBindingViewDecline,
     },
 };
 use ash::vk;
@@ -196,6 +197,7 @@ pub(crate) fn plan_owned_texture(
     declaration: reims_vgpu_protocol::TextureDeclaration,
     memory_class: crate::memory::MemoryClass,
     available: vk::FormatFeatureFlags,
+    attachment_feedback_loop_layout: bool,
     attachment_views: Box<[ReplacementAttachmentViewPlan]>,
     shader_views: Box<[reims_vgpu_core::ResolvedTextureBindingView]>,
 ) -> Result<ReplacementImageCreatePlan, ReplacementTexturePlanError> {
@@ -421,6 +423,14 @@ pub(crate) fn plan_owned_texture(
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
         };
         required |= attachment_feature;
+    }
+    if attachment_feedback_loop_layout
+        && usage.contains(vk::ImageUsageFlags::SAMPLED)
+        && usage.intersects(
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        )
+    {
+        usage |= vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
     }
     let missing = required & !available;
     if !missing.is_empty() {
@@ -728,9 +738,7 @@ impl ReplacementAllocation {
 }
 
 pub struct ReplacementBufferRepresentation {
-    device: Arc<dyn ReplacementRepresentationDevice>,
-    allocation: ReplacementAllocation,
-    owns_buffer: bool,
+    lifetime: Arc<ReplacementRepresentationLifetime>,
     target: NativeBufferTarget,
     host_staging: Option<ReplacementHostStagingBuffer>,
     linear_texture: Option<Arc<reims_vgpu_protocol::LinearTextureDescriptor>>,
@@ -909,21 +917,8 @@ impl fmt::Debug for ReplacementBufferRepresentation {
     }
 }
 
-impl Drop for ReplacementBufferRepresentation {
-    fn drop(&mut self) {
-        unsafe {
-            if self.owns_buffer {
-                self.device.destroy_buffer(self.target.buffer);
-            }
-            let allocation = std::mem::replace(&mut self.allocation, ReplacementAllocation::None);
-            allocation.retire(&*self.device);
-        }
-    }
-}
-
 pub struct ReplacementImageRepresentation {
-    device: Arc<dyn ReplacementRepresentationDevice>,
-    allocation: ReplacementAllocation,
+    lifetime: Arc<ReplacementRepresentationLifetime>,
     target: NativeImageTarget,
     flags: vk::ImageCreateFlags,
     attachment_views: BTreeMap<ReplacementImageViewKey, vk::ImageView>,
@@ -966,27 +961,137 @@ impl fmt::Debug for ReplacementImageRepresentation {
     }
 }
 
-impl Drop for ReplacementImageRepresentation {
-    fn drop(&mut self) {
-        unsafe {
-            for view in std::mem::take(&mut self.shader_views).into_values() {
-                self.device.destroy_image_view(view.view);
-            }
-            for view in std::mem::take(&mut self.attachment_views).into_values() {
-                self.device.destroy_image_view(view);
-            }
-            self.device.destroy_image_view(self.target.view);
-            self.device.destroy_image(self.target.image);
-            let allocation = std::mem::replace(&mut self.allocation, ReplacementAllocation::None);
-            allocation.retire(&*self.device);
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum ReplacementNativeRepresentation {
     Buffer(ReplacementBufferRepresentation),
     Image(ReplacementImageRepresentation),
+}
+
+enum ReplacementRepresentationLifetimeKind {
+    Buffer {
+        allocation: ReplacementAllocation,
+        buffer: vk::Buffer,
+        owns_buffer: bool,
+    },
+    Image {
+        allocation: ReplacementAllocation,
+        image: vk::Image,
+        views: std::sync::Mutex<Vec<vk::ImageView>>,
+    },
+}
+
+struct ReplacementRepresentationLifetime {
+    device: Arc<dyn ReplacementRepresentationDevice>,
+    kind: ReplacementRepresentationLifetimeKind,
+}
+
+impl fmt::Debug for ReplacementRepresentationLifetime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReplacementRepresentationLifetime")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplacementRepresentationLifetime {
+    fn retain_image_view(&self, view: vk::ImageView) {
+        let ReplacementRepresentationLifetimeKind::Image { views, .. } = &self.kind else {
+            unreachable!("only an image representation can retain an image view")
+        };
+        views
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(view);
+    }
+}
+
+impl Drop for ReplacementRepresentationLifetime {
+    fn drop(&mut self) {
+        unsafe {
+            match &mut self.kind {
+                ReplacementRepresentationLifetimeKind::Buffer {
+                    allocation,
+                    buffer,
+                    owns_buffer,
+                } => {
+                    if *owns_buffer {
+                        self.device.destroy_buffer(*buffer);
+                    }
+                    std::mem::replace(allocation, ReplacementAllocation::None)
+                        .retire(&*self.device);
+                }
+                ReplacementRepresentationLifetimeKind::Image {
+                    allocation,
+                    image,
+                    views,
+                } => {
+                    for view in views
+                        .get_mut()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .drain(..)
+                    {
+                        self.device.destroy_image_view(view);
+                    }
+                    self.device.destroy_image(*image);
+                    std::mem::replace(allocation, ReplacementAllocation::None)
+                        .retire(&*self.device);
+                }
+            }
+        }
+    }
+}
+
+/// An opaque ownership token for one exact native representation.
+///
+/// Raw Vulkan handles may be copied into immutable command sidecars, but the
+/// handles remain valid only while this token is owned. Recording requests
+/// move these tokens into their completed recordings, whose timeline
+/// retirement is therefore also the native-object retirement boundary.
+#[derive(Clone)]
+pub struct ReplacementNativeRepresentationLease {
+    pub backing: BackingId,
+    pub representation: RepresentationId,
+    _lifetime: Arc<ReplacementRepresentationLifetime>,
+}
+
+impl fmt::Debug for ReplacementNativeRepresentationLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReplacementNativeRepresentationLease")
+            .field("backing", &self.backing)
+            .field("representation", &self.representation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+impl ReplacementNativeRepresentationLease {
+    /// A lease whose native object is a null buffer owned by nothing. Tests
+    /// that resolve barrier targets exercise the projection, not destruction,
+    /// and need an ownership token without a device to hold one against.
+    pub(crate) fn synthetic(backing: BackingId, representation: RepresentationId) -> Self {
+        struct NoDevice;
+
+        impl ReplacementRepresentationDevice for NoDevice {
+            unsafe fn destroy_buffer(&self, _: vk::Buffer) {}
+            unsafe fn destroy_image_view(&self, _: vk::ImageView) {}
+            unsafe fn destroy_image(&self, _: vk::Image) {}
+            unsafe fn free_memory(&self, _: vk::DeviceMemory) {}
+        }
+
+        Self {
+            backing,
+            representation,
+            _lifetime: Arc::new(ReplacementRepresentationLifetime {
+                device: Arc::new(NoDevice),
+                kind: ReplacementRepresentationLifetimeKind::Buffer {
+                    allocation: ReplacementAllocation::None,
+                    buffer: vk::Buffer::null(),
+                    owns_buffer: false,
+                },
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1050,6 +1155,22 @@ pub fn validate_replacement_present_image(
 }
 
 impl ReplacementNativeRepresentation {
+    pub fn lease(
+        &self,
+        backing: BackingId,
+        representation: RepresentationId,
+    ) -> ReplacementNativeRepresentationLease {
+        let lifetime = match self {
+            Self::Buffer(buffer) => Arc::clone(&buffer.lifetime),
+            Self::Image(image) => Arc::clone(&image.lifetime),
+        };
+        ReplacementNativeRepresentationLease {
+            backing,
+            representation,
+            _lifetime: lifetime,
+        }
+    }
+
     pub const fn buffer(&self) -> Option<NativeBufferTarget> {
         match self {
             Self::Buffer(buffer) => Some(buffer.target),
@@ -1111,24 +1232,41 @@ impl ReplacementNativeRepresentation {
         })
     }
 
+    /// Resolve one decoded texture-binding view to its native image, or name
+    /// the term this backend could not build it from.
+    ///
+    /// The refusal is typed because the arms are unrelated work: a swizzle, a
+    /// format reinterpretation, a partial mip or slice range and a view onto
+    /// another resource's storage are four separate features, and only
+    /// [`TextureBindingViewDecline::UnknownRepresentation`] is a lifetime
+    /// fault. One shared `None` reached the log as `UnknownImageView` and said
+    /// which representation, which is the one thing all five have in common.
     pub fn shader_view(
         &self,
         semantic: reims_vgpu_core::ResolvedTextureBindingView,
-    ) -> Option<NativeImageTarget> {
+    ) -> Result<NativeImageTarget, TextureBindingViewDecline> {
         let Self::Image(image) = self else {
-            return None;
+            return Err(TextureBindingViewDecline::NotImage);
         };
         if semantic.resource == semantic.base {
-            let base_mip_level = u32::try_from(semantic.range.level_base).ok()?;
-            let level_count = u32::try_from(semantic.range.level_count).ok()?;
-            let mut base_array_layer = u32::try_from(semantic.range.slice_base).ok()?;
-            let mut layer_count = u32::try_from(semantic.range.slice_count).ok()?;
+            let bound = |value: u64| {
+                u32::try_from(value).map_err(|_| TextureBindingViewDecline::SubresourceRange)
+            };
+            let base_mip_level = bound(semantic.range.level_base)?;
+            let level_count = bound(semantic.range.level_count)?;
+            let mut base_array_layer = bound(semantic.range.slice_base)?;
+            let mut layer_count = bound(semantic.range.slice_count)?;
             if matches!(
                 semantic.texture_type,
                 TextureType::Cube | TextureType::CubeArray
             ) {
-                base_array_layer = base_array_layer.checked_mul(reims_vgpu_protocol::CUBE_FACES)?;
-                layer_count = layer_count.checked_mul(reims_vgpu_protocol::CUBE_FACES)?;
+                let faces = |value: u32| {
+                    value
+                        .checked_mul(reims_vgpu_protocol::CUBE_FACES)
+                        .ok_or(TextureBindingViewDecline::SubresourceRange)
+                };
+                base_array_layer = faces(base_array_layer)?;
+                layer_count = faces(layer_count)?;
             }
             let range = vk::ImageSubresourceRange {
                 aspect_mask: image.target.full_range.aspect_mask,
@@ -1137,13 +1275,28 @@ impl ReplacementNativeRepresentation {
                 base_array_layer,
                 layer_count,
             };
-            return (semantic.swizzle.is_identity()
-                && semantic.pixel_format == image.target.pixel_format
-                && same_subresource_range(range, image.target.full_range))
-            .then_some(image.target);
+            if !semantic.swizzle.is_identity() {
+                return Err(TextureBindingViewDecline::SwizzledView);
+            }
+            if semantic.pixel_format != image.target.pixel_format {
+                return Err(TextureBindingViewDecline::ReinterpretedFormat {
+                    declared: semantic.pixel_format,
+                    native: image.target.pixel_format,
+                });
+            }
+            if !same_subresource_range(range, image.target.full_range) {
+                return Err(TextureBindingViewDecline::PartialSubresourceRange);
+            }
+            return Ok(image.target);
         }
-        let shader_view = image.shader_views.get(&semantic.resource)?;
-        (shader_view.semantic == semantic).then_some(NativeImageTarget {
+        let shader_view = image
+            .shader_views
+            .get(&semantic.resource)
+            .ok_or(TextureBindingViewDecline::ShaderViewAbsent)?;
+        if shader_view.semantic != semantic {
+            return Err(TextureBindingViewDecline::ShaderViewMismatch);
+        }
+        Ok(NativeImageTarget {
             view: shader_view.view,
             pixel_format: semantic.pixel_format,
             ..image.target
@@ -1158,10 +1311,18 @@ impl ReplacementNativeRepresentation {
         let Self::Image(image) = self else {
             return Err(ReplacementShaderViewInstallError::NotImage);
         };
-        if image.shader_views.contains_key(&semantic.resource) {
-            return Err(ReplacementShaderViewInstallError::Duplicate(
-                semantic.resource,
-            ));
+        // Installing the view a resource already has is the same statement
+        // twice, not a conflict: the caller cannot know whether the image was
+        // built before or after the view was declared, and only a *different*
+        // view under one generational resource identity is a real duplicate.
+        if let Some(installed) = image.shader_views.get(&semantic.resource) {
+            return if installed.semantic == semantic {
+                Ok(())
+            } else {
+                Err(ReplacementShaderViewInstallError::Duplicate(
+                    semantic.resource,
+                ))
+            };
         }
         let format = crate::translate::pixel::translate(image.target.pixel_format)
             .map_err(ReplacementTexturePlanError::ShaderViewFormat)
@@ -1187,6 +1348,7 @@ impl ReplacementNativeRepresentation {
             )
         }
         .map_err(ReplacementShaderViewInstallError::Create)?;
+        image.lifetime.retain_image_view(view);
         image
             .shader_views
             .insert(semantic.resource, ReplacementShaderView { semantic, view });
@@ -1212,7 +1374,7 @@ impl ReplacementNativeRepresentation {
             },
             Self::Image(image) => NativeBarrierTarget::Image {
                 image: image.target.image,
-                layout: layout.unwrap_or(vk::ImageLayout::UNDEFINED),
+                layout: layout.and_then(crate::replacement_barrier_record::DefinedImageLayout::new),
                 full_range: image.target.full_range,
                 queue_families: None,
             },
@@ -1337,14 +1499,18 @@ impl ReplacementImageResolver for ReplacementRepresentationResolver<'_> {
         &self,
         image: ReplacementImageKey,
         view: reims_vgpu_core::ResolvedTextureBindingView,
-    ) -> Option<NativeImageTarget> {
-        self.representation(image.backing, image.representation)?
+    ) -> Result<NativeImageTarget, TextureBindingViewDecline> {
+        self.representation(image.backing, image.representation)
+            .ok_or(TextureBindingViewDecline::UnknownRepresentation)?
             .shader_view(view)
     }
 }
 
 impl ReplacementBarrierResolver for ReplacementRepresentationResolver<'_> {
-    fn resolve(&self, backing: BackingId) -> Option<NativeBarrierTarget> {
+    fn resolve(
+        &self,
+        backing: BackingId,
+    ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
         let (representation, native) = self.resources.execution_representation(backing)?;
         let layout = native.image().and_then(|_| {
             self.images
@@ -1354,7 +1520,10 @@ impl ReplacementBarrierResolver for ReplacementRepresentationResolver<'_> {
                 })
                 .map(|state| state.layout)
         });
-        Some(native.barrier(layout))
+        Some(crate::replacement_barrier_record::NativeBarrierResolution {
+            target: native.barrier(layout),
+            lease: native.lease(backing, representation),
+        })
     }
 }
 
@@ -1407,14 +1576,17 @@ impl ReplacementImageResolver for ReplacementExecutionResolver<'_> {
         &self,
         image: ReplacementImageKey,
         view: reims_vgpu_core::ResolvedTextureBindingView,
-    ) -> Option<NativeImageTarget> {
+    ) -> Result<NativeImageTarget, TextureBindingViewDecline> {
         self.representations
             .resolve_texture_binding_view(image, view)
     }
 }
 
 impl ReplacementBarrierResolver for ReplacementExecutionResolver<'_> {
-    fn resolve(&self, backing: BackingId) -> Option<NativeBarrierTarget> {
+    fn resolve(
+        &self,
+        backing: BackingId,
+    ) -> Option<crate::replacement_barrier_record::NativeBarrierResolution> {
         self.representations.resolve(backing)
     }
 }
@@ -1488,10 +1660,16 @@ pub(crate) unsafe fn owned_buffer(
     memory: vk::DeviceMemory,
     queue_families: Option<crate::replacement_barrier_record::QueueFamilyTransfer>,
 ) -> ReplacementNativeRepresentation {
-    ReplacementNativeRepresentation::Buffer(ReplacementBufferRepresentation {
+    let lifetime = Arc::new(ReplacementRepresentationLifetime {
         device,
-        allocation: ReplacementAllocation::Owned(memory),
-        owns_buffer: true,
+        kind: ReplacementRepresentationLifetimeKind::Buffer {
+            allocation: ReplacementAllocation::Owned(memory),
+            buffer: target.buffer,
+            owns_buffer: true,
+        },
+    });
+    ReplacementNativeRepresentation::Buffer(ReplacementBufferRepresentation {
+        lifetime,
         target,
         host_staging: None,
         linear_texture: None,
@@ -1504,10 +1682,16 @@ pub(crate) unsafe fn imported_guest_buffer(
     target: NativeBufferTarget,
     allocation: Arc<dyn Any + Send + Sync>,
 ) -> ReplacementNativeRepresentation {
-    ReplacementNativeRepresentation::Buffer(ReplacementBufferRepresentation {
+    let lifetime = Arc::new(ReplacementRepresentationLifetime {
         device,
-        allocation: ReplacementAllocation::External(Box::new(allocation)),
-        owns_buffer: false,
+        kind: ReplacementRepresentationLifetimeKind::Buffer {
+            allocation: ReplacementAllocation::External(Box::new(allocation)),
+            buffer: target.buffer,
+            owns_buffer: false,
+        },
+    });
+    ReplacementNativeRepresentation::Buffer(ReplacementBufferRepresentation {
+        lifetime,
         target,
         host_staging: None,
         linear_texture: None,
@@ -1652,18 +1836,25 @@ pub(crate) fn allocate_host_staging_buffer(
         guest,
     }));
     let device: Arc<dyn ReplacementRepresentationDevice> = context;
+    let target = NativeBufferTarget {
+        buffer,
+        base_offset: 0,
+        accessible_size: size,
+        size,
+        usage,
+    };
+    let lifetime = Arc::new(ReplacementRepresentationLifetime {
+        device,
+        kind: ReplacementRepresentationLifetimeKind::Buffer {
+            allocation: ReplacementAllocation::External(Box::new(staging.clone())),
+            buffer,
+            owns_buffer: false,
+        },
+    });
     Ok(ReplacementNativeRepresentation::Buffer(
         ReplacementBufferRepresentation {
-            device,
-            allocation: ReplacementAllocation::External(Box::new(staging.clone())),
-            owns_buffer: false,
-            target: NativeBufferTarget {
-                buffer,
-                base_offset: 0,
-                accessible_size: size,
-                size,
-                usage,
-            },
+            lifetime,
+            target,
             host_staging: Some(staging),
             linear_texture: None,
             queue_families: None,
@@ -1854,20 +2045,31 @@ pub(crate) fn allocate_owned_image(
         );
     }
     let device: Arc<dyn ReplacementRepresentationDevice> = context;
+    let target = NativeImageTarget {
+        image,
+        view,
+        image_type: plan.image_type,
+        full_range: plan.full_range,
+        usage: plan.usage,
+        pixel_format: plan.pixel_format,
+        extent: plan.extent,
+        samples: plan.samples,
+    };
+    let mut retained_views = vec![view];
+    retained_views.extend(attachment_views.values().copied());
+    retained_views.extend(shader_views.values().map(|view| view.view));
+    let lifetime = Arc::new(ReplacementRepresentationLifetime {
+        device,
+        kind: ReplacementRepresentationLifetimeKind::Image {
+            allocation: ReplacementAllocation::Owned(memory),
+            image,
+            views: std::sync::Mutex::new(retained_views),
+        },
+    });
     Ok(ReplacementNativeRepresentation::Image(
         ReplacementImageRepresentation {
-            device,
-            allocation: ReplacementAllocation::Owned(memory),
-            target: NativeImageTarget {
-                image,
-                view,
-                image_type: plan.image_type,
-                full_range: plan.full_range,
-                usage: plan.usage,
-                pixel_format: plan.pixel_format,
-                extent: plan.extent,
-                samples: plan.samples,
-            },
+            lifetime,
+            target,
             flags: plan.flags,
             attachment_views,
             shader_views,
@@ -1881,10 +2083,16 @@ pub(crate) unsafe fn external_buffer(
     owner: Box<dyn Any + Send + Sync>,
     queue_families: Option<crate::replacement_barrier_record::QueueFamilyTransfer>,
 ) -> ReplacementNativeRepresentation {
-    ReplacementNativeRepresentation::Buffer(ReplacementBufferRepresentation {
+    let lifetime = Arc::new(ReplacementRepresentationLifetime {
         device,
-        allocation: ReplacementAllocation::External(owner),
-        owns_buffer: true,
+        kind: ReplacementRepresentationLifetimeKind::Buffer {
+            allocation: ReplacementAllocation::External(owner),
+            buffer: target.buffer,
+            owns_buffer: true,
+        },
+    });
+    ReplacementNativeRepresentation::Buffer(ReplacementBufferRepresentation {
+        lifetime,
         target,
         host_staging: None,
         linear_texture: None,
@@ -1897,9 +2105,16 @@ pub(crate) unsafe fn owned_image(
     target: NativeImageTarget,
     memory: vk::DeviceMemory,
 ) -> ReplacementNativeRepresentation {
-    ReplacementNativeRepresentation::Image(ReplacementImageRepresentation {
+    let lifetime = Arc::new(ReplacementRepresentationLifetime {
         device,
-        allocation: ReplacementAllocation::Owned(memory),
+        kind: ReplacementRepresentationLifetimeKind::Image {
+            allocation: ReplacementAllocation::Owned(memory),
+            image: target.image,
+            views: std::sync::Mutex::new(vec![target.view]),
+        },
+    });
+    ReplacementNativeRepresentation::Image(ReplacementImageRepresentation {
+        lifetime,
         target,
         flags: vk::ImageCreateFlags::empty(),
         attachment_views: BTreeMap::new(),
@@ -1912,9 +2127,16 @@ pub(crate) unsafe fn external_image(
     target: NativeImageTarget,
     owner: Box<dyn Any + Send + Sync>,
 ) -> ReplacementNativeRepresentation {
-    ReplacementNativeRepresentation::Image(ReplacementImageRepresentation {
+    let lifetime = Arc::new(ReplacementRepresentationLifetime {
         device,
-        allocation: ReplacementAllocation::External(owner),
+        kind: ReplacementRepresentationLifetimeKind::Image {
+            allocation: ReplacementAllocation::External(owner),
+            image: target.image,
+            views: std::sync::Mutex::new(vec![target.view]),
+        },
+    });
+    ReplacementNativeRepresentation::Image(ReplacementImageRepresentation {
+        lifetime,
         target,
         flags: vk::ImageCreateFlags::empty(),
         attachment_views: BTreeMap::new(),
@@ -1927,6 +2149,7 @@ mod tests {
     use super::*;
     use ash::vk::Handle;
     use parking_lot::Mutex;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         BackingRegion, RepresentationRoute, ResolvedResourceLifecycle, ResourceLifecycleEffect,
         StorageBacking, WorkingMemoryClass,
@@ -2057,6 +2280,7 @@ mod tests {
             texture_declaration(),
             crate::memory::MemoryClass::DeviceLocal,
             texture_features(),
+            false,
             Box::new([]),
             Box::new([]),
         )
@@ -2093,11 +2317,28 @@ mod tests {
     }
 
     #[test]
+    fn attachment_feedback_capability_adds_the_required_image_usage() {
+        let plan = plan_owned_texture(
+            texture_declaration(),
+            crate::memory::MemoryClass::DeviceLocal,
+            texture_features(),
+            true,
+            Box::new([]),
+            Box::new([]),
+        )
+        .unwrap();
+        assert!(plan
+            .usage
+            .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT));
+    }
+
+    #[test]
     fn shader_view_plan_preserves_exact_identity_range_type_and_swizzle() {
         let base = plan_owned_texture(
             texture_declaration(),
             crate::memory::MemoryClass::DeviceLocal,
             texture_features(),
+            false,
             Box::new([]),
             Box::new([]),
         )
@@ -2143,6 +2384,7 @@ mod tests {
             declaration,
             crate::memory::MemoryClass::DeviceLocal,
             texture_features(),
+            false,
             Box::new([]),
             Box::new([]),
         )
@@ -2161,6 +2403,7 @@ mod tests {
                 declaration,
                 crate::memory::MemoryClass::DeviceLocal,
                 vk::FormatFeatureFlags::TRANSFER_SRC | vk::FormatFeatureFlags::TRANSFER_DST,
+                false,
                 Box::new([]),
                 Box::new([]),
             )
@@ -2183,6 +2426,7 @@ mod tests {
                 declaration,
                 crate::memory::MemoryClass::DeviceLocal,
                 texture_features(),
+                false,
                 Box::new([]),
                 Box::new([]),
             )
@@ -2201,6 +2445,7 @@ mod tests {
                 declaration,
                 crate::memory::MemoryClass::DeviceLocal,
                 texture_features(),
+                false,
                 Box::new([]),
                 Box::new([]),
             )
@@ -2221,6 +2466,7 @@ mod tests {
                 declaration,
                 crate::memory::MemoryClass::DeviceLocal,
                 texture_features(),
+                false,
                 Box::new([]),
                 Box::new([]),
             )
@@ -2240,6 +2486,7 @@ mod tests {
             declaration,
             crate::memory::MemoryClass::DeviceLocal,
             texture_features(),
+            false,
             Box::new([]),
             Box::new([]),
         )
@@ -2258,6 +2505,7 @@ mod tests {
                 vk::FormatFeatureFlags::TRANSFER_SRC
                     | vk::FormatFeatureFlags::TRANSFER_DST
                     | vk::FormatFeatureFlags::STORAGE_IMAGE,
+                false,
                 Box::new([]),
                 Box::new([]),
             )
@@ -2270,6 +2518,7 @@ mod tests {
             declaration,
             crate::memory::MemoryClass::DeviceLocal,
             texture_features() | vk::FormatFeatureFlags::STORAGE_IMAGE_ATOMIC,
+            false,
             Box::new([]),
             Box::new([]),
         )
@@ -2283,6 +2532,7 @@ mod tests {
             texture_declaration(),
             crate::memory::MemoryClass::DeviceLocal,
             texture_features(),
+            false,
             Box::new([]),
             Box::new([]),
         )
@@ -2359,6 +2609,7 @@ mod tests {
                 RepresentationRoute::NativeWorking {
                     memory: WorkingMemoryClass::DeviceLocal,
                 },
+                BackingView::Bytes,
                 native,
             )
             .unwrap();
@@ -2370,7 +2621,7 @@ mod tests {
                 Some(buffer_target())
             );
             assert!(matches!(
-                resolver.resolve(backing),
+                resolver.resolve(backing).map(|resolution| resolution.target),
                 Some(NativeBarrierTarget::Buffer {
                     buffer,
                     base_offset: 16,
@@ -2381,6 +2632,170 @@ mod tests {
         }
         drop(resources);
         assert_eq!(&*fake.0.lock(), &["buffer", "memory"]);
+    }
+
+    #[test]
+    fn a_resolved_barrier_target_outlives_its_representation_registry() {
+        let fake = Arc::new(FakeDevice::default());
+        let device: Arc<dyn ReplacementRepresentationDevice> = fake.clone();
+        let native =
+            unsafe { owned_buffer(device, buffer_target(), vk::DeviceMemory::from_raw(7), None) };
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([BackingRegion::Whole]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::NativeWorking {
+                    memory: WorkingMemoryClass::DeviceLocal,
+                },
+                BackingView::Bytes,
+                native,
+            )
+            .unwrap();
+        let images = ReplacementImageStateOwner::new(VulkanDeviceEpochId::new(1));
+        let resolution = {
+            let resolver = ReplacementRepresentationResolver::new(&resources, &images, None);
+            resolver.resolve(backing).expect("the backing is installed")
+        };
+        drop(resources);
+        // The raw handle in `resolution.target` is still named by the caller,
+        // so the lease it arrived with must have held the native object.
+        assert_eq!(&*fake.0.lock(), &[] as &[&str]);
+        drop(resolution);
+        assert_eq!(&*fake.0.lock(), &["buffer", "memory"]);
+    }
+
+    #[test]
+    fn each_unbuildable_texture_view_term_refuses_by_its_own_name() {
+        let fake = Arc::new(FakeDevice::default());
+        let device: Arc<dyn ReplacementRepresentationDevice> = fake.clone();
+        let target = NativeImageTarget {
+            image: vk::Image::from_raw(21),
+            view: vk::ImageView::from_raw(22),
+            image_type: vk::ImageType::TYPE_2D,
+            full_range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 2,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            usage: vk::ImageUsageFlags::SAMPLED,
+            pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            extent: vk::Extent3D {
+                width: 4,
+                height: 4,
+                depth: 1,
+            },
+            samples: vk::SampleCountFlags::TYPE_1,
+        };
+        let native = ReplacementNativeRepresentation::Image(ReplacementImageRepresentation {
+            lifetime: Arc::new(ReplacementRepresentationLifetime {
+                device,
+                kind: ReplacementRepresentationLifetimeKind::Image {
+                    allocation: ReplacementAllocation::Owned(vk::DeviceMemory::from_raw(23)),
+                    image: target.image,
+                    views: std::sync::Mutex::new(vec![target.view]),
+                },
+            }),
+            target,
+            flags: vk::ImageCreateFlags::empty(),
+            attachment_views: BTreeMap::new(),
+            shader_views: BTreeMap::new(),
+        });
+
+        let resource = ResourceId::new(5, 1);
+        let whole = reims_vgpu_core::ResolvedTextureBindingView {
+            resource,
+            base: resource,
+            range: reims_vgpu_core::ResolvedTextureViewRange {
+                level_base: 0,
+                level_count: 2,
+                slice_base: 0,
+                slice_count: 1,
+            },
+            texture_type: TextureType::D2,
+            pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            swizzle: reims_vgpu_protocol::swizzle_identity(),
+        };
+        assert_eq!(
+            native
+                .shader_view(whole)
+                .expect("the whole image resolves")
+                .view,
+            vk::ImageView::from_raw(22)
+        );
+
+        let mut swizzled = whole;
+        swizzled.swizzle = reims_vgpu_protocol::SwizzlePlan {
+            source: [
+                reims_vgpu_protocol::SwizzleSource::B,
+                reims_vgpu_protocol::SwizzleSource::G,
+                reims_vgpu_protocol::SwizzleSource::R,
+                reims_vgpu_protocol::SwizzleSource::A,
+            ],
+        };
+        assert_eq!(
+            native.shader_view(swizzled).unwrap_err(),
+            TextureBindingViewDecline::SwizzledView
+        );
+
+        let mut reinterpreted = whole;
+        reinterpreted.pixel_format = reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM + 1;
+        assert_eq!(
+            native.shader_view(reinterpreted).unwrap_err(),
+            TextureBindingViewDecline::ReinterpretedFormat {
+                declared: reinterpreted.pixel_format,
+                native: reims_vgpu_core::pixel_format::MTL_FORMAT_RGBA8_UNORM,
+            }
+        );
+
+        let mut one_level = whole;
+        one_level.range.level_count = 1;
+        assert_eq!(
+            native.shader_view(one_level).unwrap_err(),
+            TextureBindingViewDecline::PartialSubresourceRange
+        );
+
+        let mut aliased = whole;
+        aliased.base = ResourceId::new(6, 1);
+        assert_eq!(
+            native.shader_view(aliased).unwrap_err(),
+            TextureBindingViewDecline::ShaderViewAbsent
+        );
+
+        let buffer = ReplacementNativeRepresentation::Buffer(ReplacementBufferRepresentation {
+            lifetime: Arc::new(ReplacementRepresentationLifetime {
+                device: fake.clone(),
+                kind: ReplacementRepresentationLifetimeKind::Buffer {
+                    allocation: ReplacementAllocation::Owned(vk::DeviceMemory::from_raw(24)),
+                    buffer: vk::Buffer::from_raw(25),
+                    owns_buffer: true,
+                },
+            }),
+            target: NativeBufferTarget {
+                buffer: vk::Buffer::from_raw(25),
+                base_offset: 0,
+                accessible_size: 64,
+                size: 64,
+                usage: vk::BufferUsageFlags::TRANSFER_SRC,
+            },
+            host_staging: None,
+            linear_texture: None,
+            queue_families: None,
+        });
+        assert_eq!(
+            buffer.shader_view(whole).unwrap_err(),
+            TextureBindingViewDecline::NotImage
+        );
     }
 
     #[test]
@@ -2414,9 +2829,16 @@ mod tests {
             base_array_layer: 1,
             layer_count: 1,
         };
-        let native = ReplacementNativeRepresentation::Image(ReplacementImageRepresentation {
+        let lifetime = Arc::new(ReplacementRepresentationLifetime {
             device,
-            allocation: ReplacementAllocation::Owned(vk::DeviceMemory::from_raw(13)),
+            kind: ReplacementRepresentationLifetimeKind::Image {
+                allocation: ReplacementAllocation::Owned(vk::DeviceMemory::from_raw(13)),
+                image: target.image,
+                views: std::sync::Mutex::new(vec![target.view, vk::ImageView::from_raw(14)]),
+            },
+        });
+        let native = ReplacementNativeRepresentation::Image(ReplacementImageRepresentation {
+            lifetime,
             target,
             flags: vk::ImageCreateFlags::empty(),
             attachment_views: BTreeMap::from([(
@@ -2429,7 +2851,13 @@ mod tests {
             native.image_view(derived_range).unwrap().view,
             vk::ImageView::from_raw(14)
         );
+        let lease = native.lease(BackingId::new(3), RepresentationId::new(7));
         drop(native);
+        assert!(
+            fake.0.lock().is_empty(),
+            "retiring semantic ownership must not destroy an object still leased by recording"
+        );
+        drop(lease);
         assert_eq!(&*fake.0.lock(), &["view", "view", "image", "memory"]);
     }
 }

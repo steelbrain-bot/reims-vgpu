@@ -7,7 +7,9 @@
 //! source/destination representations and cannot be planned twice while live.
 
 use crate::{ImageAspect, LinearRange, TexelBox};
-use reims_vgpu_protocol::{BackingId, ContentVersion, RepresentationId, SubmissionId};
+use reims_vgpu_protocol::{
+    BackingId, ContentVersion, RepresentationId, SubmissionId, TransactionId,
+};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -49,14 +51,30 @@ pub struct RegionVersion {
 pub enum GpuWriteId {
     Submission(SubmissionId),
     Operation {
+        transaction: TransactionId,
         submission: SubmissionId,
         index: usize,
     },
 }
 
 impl GpuWriteId {
-    pub const fn operation(submission: SubmissionId, index: usize) -> Self {
-        Self::Operation { submission, index }
+    pub const fn operation(
+        transaction: TransactionId,
+        submission: SubmissionId,
+        index: usize,
+    ) -> Self {
+        Self::Operation {
+            transaction,
+            submission,
+            index,
+        }
+    }
+
+    pub const fn transaction(self) -> Option<TransactionId> {
+        match self {
+            Self::Submission(_) => None,
+            Self::Operation { transaction, .. } => Some(transaction),
+        }
     }
 
     pub const fn submission(self) -> SubmissionId {
@@ -464,7 +482,7 @@ impl RegionContentState {
             .get_mut(&representation)
             .expect("GPU-write representation was prevalidated");
         for write in planned.regions.iter().copied() {
-            native.assign(write.region, write.version);
+            native.assign_if_newer(write.region, write.version);
             self.canonical.assign_if_newer(write.region, write.version);
         }
         Ok(planned.regions)
@@ -539,6 +557,85 @@ impl RegionContentState {
                     .iter()
                     .all(|required| coverage.covers(required.region, required.version))
             })
+    }
+
+    pub(crate) fn current_regions_in_representation(
+        &self,
+        representation: RepresentationId,
+        required: RegionVersion,
+    ) -> Box<[BackingRegion]> {
+        self.representations
+            .get(&representation)
+            .into_iter()
+            .flat_map(|coverage| coverage.entries.iter())
+            .filter(|current| current.version == required.version)
+            .filter_map(|current| intersection(current.region, required.region))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    /// Whether removing one representation preserves every current canonical
+    /// byte in the remaining available representations and abandons no
+    /// content-producing obligation owned by the representation.
+    pub(crate) fn representation_can_retire(
+        &self,
+        representation: RepresentationId,
+        unavailable: &[RepresentationId],
+    ) -> bool {
+        if self
+            .pending_gpu_writes
+            .values()
+            .any(|write| write.representation == representation)
+            || self
+                .pending_transfers
+                .keys()
+                .any(|transfer| transfer.source == representation)
+        {
+            return false;
+        }
+
+        self.canonical.entries.iter().all(|required| {
+            let mut missing = vec![required.region];
+            for (&candidate, coverage) in &self.representations {
+                if candidate == representation || unavailable.contains(&candidate) {
+                    continue;
+                }
+                for current in coverage
+                    .entries
+                    .iter()
+                    .filter(|current| current.version == required.version)
+                {
+                    missing = missing
+                        .into_iter()
+                        .flat_map(|region| subtract(region, current.region))
+                        .collect();
+                    if missing.is_empty() {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+    }
+
+    pub(crate) fn pending_gpu_writes_overlapping(
+        &self,
+        representation: RepresentationId,
+        regions: &[BackingRegion],
+    ) -> Box<[GpuWriteId]> {
+        self.pending_gpu_writes
+            .iter()
+            .filter_map(|(&identity, write)| {
+                (write.representation == representation
+                    && write.regions.iter().any(|write| {
+                        regions
+                            .iter()
+                            .any(|required| intersection(write.region, *required).is_some())
+                    }))
+                .then_some(identity)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 
     pub fn plan_transfers(
@@ -1050,6 +1147,39 @@ impl ContentAuthority {
             .representation_matches(representation, snapshot)
     }
 
+    pub(crate) fn current_regions_in_representation(
+        &self,
+        representation: RepresentationId,
+        required: RegionVersion,
+    ) -> Box<[BackingRegion]> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current_regions_in_representation(representation, required)
+    }
+
+    pub(crate) fn pending_gpu_writes_overlapping(
+        &self,
+        representation: RepresentationId,
+        regions: &[BackingRegion],
+    ) -> Box<[GpuWriteId]> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending_gpu_writes_overlapping(representation, regions)
+    }
+
+    pub(crate) fn representation_can_retire(
+        &self,
+        representation: RepresentationId,
+        unavailable: &[RepresentationId],
+    ) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .representation_can_retire(representation, unavailable)
+    }
+
     pub fn ensure_representation(&self, representation: RepresentationId) {
         self.0
             .lock()
@@ -1416,7 +1546,7 @@ impl PartialEq for ContentAuthority {
 
 impl Eq for ContentAuthority {}
 
-fn intersection(left: BackingRegion, right: BackingRegion) -> Option<BackingRegion> {
+pub(crate) fn intersection(left: BackingRegion, right: BackingRegion) -> Option<BackingRegion> {
     match (left, right) {
         (BackingRegion::Whole, BackingRegion::Whole) => Some(BackingRegion::Whole),
         (BackingRegion::Linear(left), BackingRegion::Linear(right)) => {
@@ -1453,7 +1583,7 @@ fn intersection(left: BackingRegion, right: BackingRegion) -> Option<BackingRegi
     }
 }
 
-fn subtract(region: BackingRegion, cut: BackingRegion) -> Vec<BackingRegion> {
+pub(crate) fn subtract(region: BackingRegion, cut: BackingRegion) -> Vec<BackingRegion> {
     let Some(overlap) = intersection(region, cut) else {
         return vec![region];
     };
@@ -1629,9 +1759,10 @@ mod tests {
     #[test]
     fn operation_identity_separates_two_writes_in_one_submission() {
         let mut state = state(linear(0, 128));
+        let transaction = TransactionId::new(3);
         let submission = SubmissionId::new(4);
-        let first = GpuWriteId::operation(submission, 2);
-        let second = GpuWriteId::operation(submission, 5);
+        let first = GpuWriteId::operation(transaction, submission, 2);
+        let second = GpuWriteId::operation(transaction, submission, 5);
         let older = state.plan_gpu_write(first, GPU, [linear(0, 128)]).unwrap()[0];
         let newer = state.plan_gpu_write(second, GPU, [linear(32, 32)]).unwrap()[0];
 
@@ -1659,6 +1790,23 @@ mod tests {
         assert_eq!(state.snapshot(&[linear(32, 32)]).as_ref(), [guest]);
         let outside = state.snapshot(&[linear(0, 32), linear(64, 64)]);
         assert!(outside.iter().all(|version| version.version.get() == 2));
+    }
+
+    #[test]
+    fn stale_gpu_completion_observation_cannot_replace_newer_representation_coverage() {
+        let mut state = state(linear(0, 128));
+        let older = SubmissionId::new(1);
+        let newer = SubmissionId::new(2);
+        state.plan_gpu_write(older, GPU, [linear(0, 128)]).unwrap();
+        state.plan_gpu_write(newer, GPU, [linear(0, 128)]).unwrap();
+
+        state.complete_gpu_write(newer, GPU).unwrap();
+        let newest = state.snapshot(&[linear(0, 128)]);
+        assert!(state.representation_matches(GPU, &newest));
+
+        state.complete_gpu_write(older, GPU).unwrap();
+        assert_eq!(state.snapshot(&[linear(0, 128)]), newest);
+        assert!(state.representation_matches(GPU, &newest));
     }
 
     #[test]

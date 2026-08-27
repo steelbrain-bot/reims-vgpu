@@ -472,7 +472,7 @@ impl<NativeCompute, NativeRender>
         let prepared = crate::prepare_buffer_blit_with_write(
             resources,
             self.transaction,
-            crate::GpuWriteId::operation(submission, position),
+            crate::GpuWriteId::operation(self.transaction, submission, position),
             operation,
         )
         .map_err(|failure| Box::new(ExecResourcePreparationStepFailure::Preparation(failure)))?;
@@ -499,7 +499,7 @@ impl<NativeCompute, NativeRender>
         let prepared = crate::prepare_image_blit_with_write(
             resources,
             self.transaction,
-            crate::GpuWriteId::operation(submission, position),
+            crate::GpuWriteId::operation(self.transaction, submission, position),
             operation,
         )
         .map_err(|failure| Box::new(ExecResourcePreparationStepFailure::Preparation(failure)))?;
@@ -1391,8 +1391,14 @@ where
     let mut host_landings = BTreeSet::new();
     if let Some(synchronization) = &inputs.content_synchronization {
         backings.extend(synchronization.backings());
-        completions.extend(synchronization.resource_completions());
-        transfers.extend(synchronization.transfers().iter().copied());
+        completions.extend(
+            synchronization
+                .transfers()
+                .iter()
+                .copied()
+                .filter(|transfer| transfers.insert(*transfer))
+                .map(ResolvedResourceCompletion::Transfer),
+        );
     }
     for (local_index, operation) in operations.into_iter().enumerate() {
         let index = operation_positions[local_index];
@@ -1424,7 +1430,6 @@ where
             ResolvedOperation::ResourceState(_) => {
                 let prepared = resource_states[&index];
                 backings.extend(prepared.backings());
-                completions.extend(prepared.resource_completions().iter().copied());
                 completions.extend(
                     prepared
                         .transfers()
@@ -1433,6 +1438,7 @@ where
                         .filter(|transfer| transfers.insert(*transfer))
                         .map(ResolvedResourceCompletion::Transfer),
                 );
+                completions.extend(prepared.resource_completions().iter().copied());
                 host_landings.extend(prepared.host_landings().iter().copied());
             }
             ResolvedOperation::IndirectCommand(operation)
@@ -1458,6 +1464,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BackingView;
     use crate::{
         prepare_buffer_blit_with_write, BackingRegion, BufferFillPattern, GpuWriteId, LinearRange,
         RepresentationRoute, ResolvedBufferRange, ResolvedExecSegment, ResolvedExecStream,
@@ -1494,7 +1501,12 @@ mod tests {
             unreachable!()
         };
         resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let transaction = TransactionId::new(6);
         let submission = SubmissionId::new(8);
@@ -1502,7 +1514,7 @@ mod tests {
         let prepared = prepare_buffer_blit_with_write(
             &mut resources,
             transaction,
-            GpuWriteId::operation(submission, 0),
+            GpuWriteId::operation(transaction, submission, 0),
             operation.clone(),
         )
         .unwrap();
@@ -1518,7 +1530,7 @@ mod tests {
         assert!(prepare_buffer_blit_with_write(
             &mut resources,
             transaction,
-            GpuWriteId::operation(submission, 0),
+            GpuWriteId::operation(transaction, submission, 0),
             operation,
         )
         .is_ok());
@@ -1537,7 +1549,12 @@ mod tests {
             unreachable!()
         };
         resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let transaction = TransactionId::new(7);
         let submission = SubmissionId::new(9);
@@ -1546,14 +1563,14 @@ mod tests {
         let first = prepare_buffer_blit_with_write(
             &mut resources,
             transaction,
-            GpuWriteId::operation(submission, 0),
+            GpuWriteId::operation(transaction, submission, 0),
             first_operation.clone(),
         )
         .unwrap();
         let second = prepare_buffer_blit_with_write(
             &mut resources,
             transaction,
-            GpuWriteId::operation(submission, 1),
+            GpuWriteId::operation(transaction, submission, 1),
             second_operation.clone(),
         )
         .unwrap();
@@ -1624,8 +1641,8 @@ mod tests {
             prepared.resource_completions(),
             [ResolvedResourceCompletion::GpuWrite { write: first, .. },
              ResolvedResourceCompletion::GpuWrite { write: second, .. }]
-                if *first == GpuWriteId::operation(submission, 0)
-                    && *second == GpuWriteId::operation(submission, 1)
+                if *first == GpuWriteId::operation(transaction, submission, 0)
+                    && *second == GpuWriteId::operation(transaction, submission, 1)
         ));
         let cancelled = cancel_prepared_exec_resources(&mut resources, prepared).unwrap();
         assert_eq!(cancelled.buffer_blits.len(), 2);
@@ -1639,14 +1656,14 @@ mod tests {
                     prepare_buffer_blit_with_write(
                         &mut resources,
                         transaction,
-                        GpuWriteId::operation(submission, 0),
+                        GpuWriteId::operation(transaction, submission, 0),
                         fill(backing, 0),
                     )
                     .unwrap(),
                     prepare_buffer_blit_with_write(
                         &mut resources,
                         transaction,
-                        GpuWriteId::operation(submission, 1),
+                        GpuWriteId::operation(transaction, submission, 1),
                         fill(backing, 1),
                     )
                     .unwrap(),
@@ -1677,7 +1694,12 @@ mod tests {
             unreachable!()
         };
         resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let transaction = TransactionId::new(18);
         let operation = crate::ResolvedIndirectCommand::ExecuteIndirectRange {

@@ -4,7 +4,8 @@
 
 use ash::vk;
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use super::init_decline::InitDecline;
 use crate::api_floor;
@@ -188,31 +189,141 @@ impl reims_vgpu_observe::Decline for PipelineCacheDecline {
     }
 }
 
-/// Write `data` to `tmp`, then atomically `rename(tmp → path)` with a
-/// best-effort newest-wins guard on `persisted_len` (the largest blob length
-/// landed so far). `tmp` MUST be unique per concurrent save (the caller keys it
-/// on a per-save sequence) so two in-flight saves never share a tmp file — the
-/// bug that made one save's rename move the tmp out from under another's,
-/// failing ENOENT. Returns which stage failed (`write`/`rename`) on error so the
-/// caller can name the reason. Pure w.r.t. Vulkan (fs + atomic only) → unit-testable.
+/// Write `data` to `tmp`, then atomically `rename(tmp → path)`, keeping
+/// `landed_len` (the largest blob length this saver has landed) monotonic so a
+/// smaller snapshot never regresses the on-disk cache to a stale subset. Only
+/// [`PipelineCacheSaver`]'s single worker calls this, so `tmp` needs to be
+/// unique against other *processes* and nothing more. Returns which stage
+/// failed (`write`/`rename`) on error so the caller can name the reason. Pure
+/// w.r.t. Vulkan (fs only) → unit-testable.
 fn write_cache_atomic(
     path: &std::path::Path,
     tmp: &std::path::Path,
     data: &[u8],
-    persisted_len: &AtomicUsize,
+    landed_len: &mut usize,
 ) -> Result<CacheSaveOutcome, PipelineCacheDecline> {
     std::fs::write(tmp, data).map_err(|error| PipelineCacheDecline::write(&error))?;
-    // Claim newest-wins before the rename: if a larger snapshot already landed,
-    // drop this one rather than regress the on-disk cache to a stale subset.
-    if persisted_len.fetch_max(data.len(), Ordering::Relaxed) > data.len() {
+    if *landed_len > data.len() {
         let _ = std::fs::remove_file(tmp);
         return Ok(CacheSaveOutcome::Superseded);
     }
+    *landed_len = data.len();
     match std::fs::rename(tmp, path) {
         Ok(()) => Ok(CacheSaveOutcome::Landed),
         Err(e) => {
             let _ = std::fs::remove_file(tmp);
             Err(PipelineCacheDecline::rename(&e))
+        }
+    }
+}
+
+/// The device context's own pipeline-cache saver.
+///
+/// One worker for the lifetime of the context, fed a single-slot latest-wins
+/// mailbox. Persisting used to spawn a thread per save, which made the live
+/// thread count a function of how fast the guest compiled and forced both a
+/// per-save tmp name and a cross-thread newest-wins guard so two renames could
+/// not collide. A single writer removes the need for either: saves land in
+/// submission order, and one that arrives while a write is in flight replaces
+/// the pending blob instead of queueing behind it — the older snapshot is a
+/// strict subset of the newer one, so dropping it costs nothing.
+struct PipelineCacheSaver {
+    mailbox: Arc<CacheSaveMailbox>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct CacheSaveMailbox {
+    state: Mutex<CacheSaveMailboxState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct CacheSaveMailboxState {
+    pending: Option<Vec<u8>>,
+    closed: bool,
+}
+
+impl PipelineCacheSaver {
+    fn start(path: std::path::PathBuf) -> Self {
+        let mailbox = Arc::new(CacheSaveMailbox::default());
+        let worker = std::thread::spawn({
+            let mailbox = Arc::clone(&mailbox);
+            move || run_pipeline_cache_saver(&path, &mailbox)
+        });
+        Self {
+            mailbox,
+            worker: Some(worker),
+        }
+    }
+
+    /// Make `data` the blob to land next, superseding any save not yet written.
+    fn submit(&self, data: Vec<u8>) {
+        let mut state = self
+            .mailbox
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            return;
+        }
+        state.pending = Some(data);
+        drop(state);
+        self.mailbox.ready.notify_one();
+    }
+}
+
+impl Drop for PipelineCacheSaver {
+    fn drop(&mut self) {
+        {
+            let mut state = self
+                .mailbox
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.closed = true;
+        }
+        self.mailbox.ready.notify_one();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Land every blob the mailbox holds, newest-wins, until the context closes it.
+/// A blob already in the mailbox when the context closes is still written: the
+/// testing boot SIGKILLs QEMU, so the last save before an orderly shutdown is
+/// the only one a warm start can rely on.
+fn run_pipeline_cache_saver(path: &std::path::Path, mailbox: &CacheSaveMailbox) {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let mut landed_len = 0usize;
+    loop {
+        let data = {
+            let mut state = mailbox
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while state.pending.is_none() && !state.closed {
+                state = mailbox
+                    .ready
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            match state.pending.take() {
+                Some(data) => data,
+                None => return,
+            }
+        };
+        match write_cache_atomic(path, &tmp, &data, &mut landed_len) {
+            Ok(CacheSaveOutcome::Landed) => reims_vgpu_observe::off(format!(
+                "vk_pipeline_cache_save bytes={} path={}",
+                data.len(),
+                path.display()
+            )),
+            Ok(CacheSaveOutcome::Superseded) => {}
+            Err(decline) => {
+                reims_vgpu_observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0)
+            }
         }
     }
 }
@@ -343,10 +454,12 @@ pub(crate) struct DeviceContext {
     /// this rather than re-querying: a feature asked about in two places is a
     /// feature that will eventually be enabled in one of them.
     pub features: crate::device_features::DeviceFeatures,
-    /// On-disk VkPipelineCache blob for this device (keyed by
-    /// pipelineCacheUUID), or None when persistence is unavailable.
-    pub pipeline_cache_path: Option<std::path::PathBuf>,
-    /// Byte length of the last persisted cache blob — the growth debounce
+    /// Context-owned saver for this device's on-disk VkPipelineCache blob
+    /// (keyed by pipelineCacheUUID), or None when persistence is unavailable.
+    /// It owns the only thread that writes the blob and is joined when the
+    /// context is destroyed.
+    pipeline_cache_saver: Option<PipelineCacheSaver>,
+    /// Byte length of the last submitted cache blob — the growth debounce
     /// for [`Self::persist_pipeline_cache`].
     pub pipeline_cache_saved_len: AtomicUsize,
     /// `VK_KHR_swapchain` was enabled for the engine-owned host window.
@@ -949,7 +1062,7 @@ impl DeviceContext {
             max_sampler_anisotropy: features.max_sampler_anisotropy,
             sampler_anisotropy: features.sampler_anisotropy,
             features,
-            pipeline_cache_path: Some(pipeline_cache_path),
+            pipeline_cache_saver: Some(PipelineCacheSaver::start(pipeline_cache_path)),
             pipeline_cache_saved_len: AtomicUsize::new(initial_len),
             #[cfg(feature = "host-window")]
             swapchain,
@@ -959,13 +1072,13 @@ impl DeviceContext {
     /// Persist the pipeline cache to disk when it has grown since the last
     /// save. Called after each actual pipeline creation (cache misses only —
     /// warm hits never reach this). The serialize under the engine lock is a
-    /// memcpy; the file write runs on a detached thread so nothing on the
-    /// draw path blocks on disk. Saving on creation rather than at context
-    /// destroy is deliberate: the testing boot SIGKILLs QEMU, so destroy
-    /// never runs there. The tmp-then-rename keeps a concurrent reader (or a
-    /// second QEMU process) from ever seeing a torn blob.
+    /// memcpy; the file write happens on the context's own saver thread so
+    /// nothing on the draw path blocks on disk. Saving on creation rather than
+    /// at context destroy is deliberate: the testing boot SIGKILLs QEMU, so
+    /// destroy never runs there. The tmp-then-rename keeps a concurrent reader
+    /// (or a second QEMU process) from ever seeing a torn blob.
     pub(crate) fn persist_pipeline_cache(&self) {
-        let Some(path) = self.pipeline_cache_path.clone() else {
+        let Some(saver) = self.pipeline_cache_saver.as_ref() else {
             return;
         };
         let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
@@ -1001,45 +1114,13 @@ impl DeviceContext {
         {
             return;
         }
-        // Unique tmp name PER SAVE. Keying only on the (constant) pid meant two
-        // concurrent saves — spawned when two calls with different data lengths
-        // both clear the growth debounce — wrote the SAME tmp file, so the first
-        // thread's rename(tmp→path) moved it out from under the second thread's
-        // rename, which then failed ENOENT (the intermittent
-        // `vk_pipeline_cache_save reason=vk_pipeline_cache_rename errno=2 ...`).
-        // A per-save sequence number makes each thread's tmp file private, so the
-        // write→rename is race-free and the newest save always lands.
-        static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
-        // Largest cache length already landed on disk. The VkPipelineCache only
-        // grows, so `data.len()` orders the snapshots. Best-effort newest-wins:
-        // if a strictly larger snapshot already landed by the time this thread is
-        // about to rename, drop this smaller one rather than regress the on-disk
-        // cache to a stale subset. This narrows (does not fully serialize) the
-        // concurrent-save window — a residual reorder only costs one pipeline a
-        // warm-start miss next boot and self-heals on the next compile, so a lock
-        // is not warranted for a best-effort cache. Keyed per physical device via
-        // the UUID-derived path (a DEVICE_LOST recreate reuses the same file), so
-        // a process-wide static is correct.
-        static PERSISTED_LEN: AtomicUsize = AtomicUsize::new(0);
-        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-        std::thread::spawn(move || {
-            let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
-            match write_cache_atomic(&path, &tmp, &data, &PERSISTED_LEN) {
-                Ok(CacheSaveOutcome::Landed) => reims_vgpu_observe::off(format!(
-                    "vk_pipeline_cache_save bytes={} path={}",
-                    data.len(),
-                    path.display()
-                )),
-                Ok(CacheSaveOutcome::Superseded) => {}
-                Err(decline) => {
-                    reims_vgpu_observe::Emit::decline("vk_pipeline_cache_save", &decline)
-                        .fail_once(0)
-                }
-            }
-        });
+        saver.submit(data);
     }
 
     pub(crate) unsafe fn destroy(&mut self) {
+        // Land whatever the saver still holds and join it before the cache it
+        // was serialized from goes away.
+        self.pipeline_cache_saver = None;
         self.device
             .destroy_pipeline_cache(self.pipeline_cache, None);
         self.device.destroy_device(None);
@@ -1484,31 +1565,29 @@ mod pipeline_cache_blob_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cache.bin");
         let tmp = dir.join("cache.tmp.0");
-        let persisted = AtomicUsize::new(0);
-        let out = write_cache_atomic(&path, &tmp, b"pipelines-v1", &persisted).unwrap();
+        let mut landed = 0usize;
+        let out = write_cache_atomic(&path, &tmp, b"pipelines-v1", &mut landed).unwrap();
         assert_eq!(out, CacheSaveOutcome::Landed);
         assert_eq!(std::fs::read(&path).unwrap(), b"pipelines-v1");
         assert!(!tmp.exists(), "tmp file consumed by rename");
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Newest-wins: a smaller snapshot arriving after a larger one already landed
-    /// is dropped (Superseded) and does NOT regress the on-disk cache — and its
-    /// tmp file is cleaned up. This is the ordering the concurrent-save guard
-    /// protects; each save uses a DISTINCT tmp path (per-seq) so they never
-    /// collide (the ENOENT bug).
+    /// Newest-wins: a smaller snapshot arriving after a larger one already
+    /// landed is dropped (Superseded) and does NOT regress the on-disk cache —
+    /// and its tmp file is cleaned up.
     #[test]
-    fn write_cache_atomic_newest_wins_and_no_tmp_collision() {
+    fn write_cache_atomic_newest_wins() {
         let dir =
             std::env::temp_dir().join(format!("reims-vgpu-cache-test2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cache.bin");
-        let persisted = AtomicUsize::new(0);
+        let mut landed = 0usize;
         // Larger snapshot lands first.
         let big = vec![0xABu8; 4096];
         let tmp_big = dir.join("cache.tmp.1");
         assert_eq!(
-            write_cache_atomic(&path, &tmp_big, &big, &persisted).unwrap(),
+            write_cache_atomic(&path, &tmp_big, &big, &mut landed).unwrap(),
             CacheSaveOutcome::Landed
         );
         // A smaller, later save (distinct tmp path) is superseded, leaves the
@@ -1516,7 +1595,7 @@ mod pipeline_cache_blob_tests {
         let small = vec![0xCDu8; 512];
         let tmp_small = dir.join("cache.tmp.2");
         assert_eq!(
-            write_cache_atomic(&path, &tmp_small, &small, &persisted).unwrap(),
+            write_cache_atomic(&path, &tmp_small, &small, &mut landed).unwrap(),
             CacheSaveOutcome::Superseded
         );
         assert_eq!(
@@ -1529,6 +1608,34 @@ mod pipeline_cache_blob_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The context's saver owns the only writer thread: whatever is pending
+    /// when the context drops it is still landed, and a save submitted while an
+    /// earlier one is in flight supersedes it rather than queueing behind it.
+    ///
+    /// Written as one save immediately followed by the drop, which is the case
+    /// a per-save detached thread could not make: there was nothing to join, so
+    /// the last blob before shutdown landed only if its thread happened to win.
+    #[test]
+    fn the_saver_lands_the_blob_pending_at_shutdown() {
+        let dir =
+            std::env::temp_dir().join(format!("reims-vgpu-cache-saver-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.bin");
+
+        let saver = PipelineCacheSaver::start(path.clone());
+        saver.submit(b"small".to_vec());
+        let big = vec![0x5Au8; 8192];
+        saver.submit(big.clone());
+        drop(saver);
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            big,
+            "the newest submitted blob is on disk once the saver has been joined"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A larger snapshot after a smaller one lands (upgrade path).
     #[test]
     fn write_cache_atomic_larger_upgrades() {
@@ -1536,14 +1643,14 @@ mod pipeline_cache_blob_tests {
             std::env::temp_dir().join(format!("reims-vgpu-cache-test3-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cache.bin");
-        let persisted = AtomicUsize::new(0);
+        let mut landed = 0usize;
         assert_eq!(
-            write_cache_atomic(&path, &dir.join("t.0"), b"small", &persisted).unwrap(),
+            write_cache_atomic(&path, &dir.join("t.0"), b"small", &mut landed).unwrap(),
             CacheSaveOutcome::Landed
         );
         let big = vec![0x11u8; 2048];
         assert_eq!(
-            write_cache_atomic(&path, &dir.join("t.1"), &big, &persisted).unwrap(),
+            write_cache_atomic(&path, &dir.join("t.1"), &big, &mut landed).unwrap(),
             CacheSaveOutcome::Landed
         );
         assert_eq!(
@@ -1562,20 +1669,20 @@ mod pipeline_cache_blob_tests {
             std::process::id()
         ));
         std::fs::remove_dir_all(&root).ok();
-        let persisted = AtomicUsize::new(0);
+        let mut landed = 0usize;
 
         let write = write_cache_atomic(
             &root.join("cache.bin"),
             &root.join("missing").join("cache.tmp"),
             b"cache",
-            &persisted,
+            &mut landed,
         )
         .expect_err("missing tmp parent must fail the write stage");
         assert_eq!(write.slug(), "vk_pipeline_cache_write");
 
         std::fs::create_dir_all(&root).unwrap();
         let rename =
-            write_cache_atomic(&root, &root.join("cache.tmp"), b"cache-larger", &persisted)
+            write_cache_atomic(&root, &root.join("cache.tmp"), b"cache-larger", &mut landed)
                 .expect_err("renaming a file over a directory must fail");
         assert_eq!(rename.slug(), "vk_pipeline_cache_rename");
         for decline in [write, rename] {

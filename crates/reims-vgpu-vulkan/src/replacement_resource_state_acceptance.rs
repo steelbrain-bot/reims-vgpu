@@ -147,6 +147,7 @@ mod tests {
         replacement_submit::QueueTimelineSemaphores,
     };
     use ash::vk;
+    use reims_vgpu_core::BackingView;
     use reims_vgpu_core::{
         assemble_prepared_resource_states, prepare_resource_state, BackingRegion, CompletionStamp,
         ExecTransaction, RepresentationRoute, ResolvedExecSegment, ResolvedExecStream,
@@ -176,7 +177,12 @@ mod tests {
             unreachable!()
         };
         let representation = resources
-            .create_execution_representation(backing, RepresentationRoute::HostVisibleWorking, ())
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                (),
+            )
             .unwrap();
         let operation = ResolvedResourceState {
             resource: None,

@@ -96,10 +96,77 @@ pub(crate) enum ReplacementObjectRepresentationPreparationError {
         task: reims_vgpu_protocol::TaskId,
         page: u64,
     },
-    BackingUnavailable(reims_vgpu_protocol::BackingId),
+    BackingUnavailable {
+        backing: reims_vgpu_protocol::BackingId,
+        reason: crate::runtime::replacement_session::ReplacementTaskAddressMaterializationRefusal,
+    },
     GuestMap(crate::runtime::guest_ram_map::MapRefusal),
     GuestWindow(reims_vgpu_memory::GuestWindowError),
     Construction(crate::runtime::replacement_session::ReplacementRepresentationConstructionError),
+}
+
+impl ReplacementObjectRepresentationPreparationError {
+    /// See [`crate::runtime::replacement_session::ReplacementRepresentationConstructionError::is_unimplemented_case`].
+    ///
+    /// Only construction carries a declared refusal. Everything else here is a
+    /// task, page, mapping or backing this device is waiting to learn about,
+    /// and a later packet on another channel is exactly what delivers it.
+    const fn is_unimplemented_case(&self) -> bool {
+        match self {
+            Self::Construction(reason) => reason.is_unimplemented_case(),
+            Self::SurfaceDescriptorUnavailable(_)
+            | Self::TaskUnavailable(_)
+            | Self::UnsupportedPageShift(_)
+            | Self::PageCountOverflow(_)
+            | Self::PageAddressOverflow { .. }
+            | Self::PageUnmapped { .. }
+            | Self::BackingUnavailable { .. }
+            | Self::GuestMap(_)
+            | Self::GuestWindow(_) => false,
+        }
+    }
+}
+
+impl<Semantic> ReplacementHostExecDispatchFailure<Semantic> {
+    /// See [`crate::runtime::replacement_session::ReplacementRepresentationConstructionError::is_unimplemented_case`].
+    const fn is_unimplemented_case(&self) -> bool {
+        match self {
+            Self::Representation { reason, .. } | Self::BackingRepresentation { reason, .. } => {
+                reason.is_unimplemented_case()
+            }
+            Self::Load { .. } | Self::ObjectPreparation(_) | Self::Dispatch { .. } => false,
+        }
+    }
+}
+
+/// A deferred child packet this backend has declared it does not implement,
+/// carrying the ring lease that refusing it must consume.
+///
+/// A refusal cannot be expressed without a lease, which is the invariant: an
+/// arm that classified itself as unimplemented but held no lease would consume
+/// nothing, and the channel would go back to being blocked by a packet nothing
+/// could spend.
+pub(crate) struct ReplacementRefusedChildPacket {
+    lease: crate::runtime::replacement_transport::ReplacementChildPacketLease,
+    detail: String,
+}
+
+impl ReplacementDeferredChildDispatchFailure<()> {
+    /// Classify a dispatch failure as a declared refusal, or hand it back to be
+    /// re-offered.
+    ///
+    /// See
+    /// [`crate::runtime::replacement_session::ReplacementRepresentationConstructionError::is_unimplemented_case`]
+    /// for what makes a reason declared rather than pending.
+    fn into_refusal(self: Box<Self>) -> Result<ReplacementRefusedChildPacket, Box<Self>> {
+        match *self {
+            Self::Exec { failure, lease } if failure.is_unimplemented_case() => {
+                let detail = replacement_host_exec_failure_diagnostic(&failure);
+                Ok(ReplacementRefusedChildPacket { lease, detail })
+            }
+            failure => Err(Box::new(failure)),
+        }
+    }
 }
 
 fn replacement_prepared_recording_error_diagnostic<Completion>(
@@ -227,6 +294,75 @@ fn missing_execution_representation<Semantic>(
     }
 }
 
+/// Build the execution representation a backing is missing, whatever class of
+/// storage it is.
+///
+/// This is the late repair: a dispatch that met a backing with no execution
+/// representation names it, and this builds it and the dispatch is retried. The
+/// object-ready route ahead of it materializes from the *resources* a packet
+/// declares, and it is the only route that knows a plane view from a linear
+/// allocation. A backing that reaches here did not come through that route --
+/// it was declared by an earlier packet, or replaced -- so the class has to be
+/// recovered from the storage node.
+///
+/// Dispatching on the class is what keeps the two routes from disagreeing. A
+/// repair that served only task-address storage refused every plane of a
+/// registered surface by name, and because a missing execution representation
+/// holds the whole recorded chain, that refusal parked its channel's submission
+/// head rather than costing one command. The classes with no materializer here
+/// still refuse -- but they refuse saying which class, which is the difference
+/// between a gap someone can go and close and a backing that is simply
+/// "unavailable".
+fn prepare_backing_representation<Semantic>(
+    runtime: &mut ReplacementRuntimeSession<Semantic>,
+    host: &mut (impl HostMemory + crate::runtime::host::HostOps),
+    page_shift: u32,
+    backing: reims_vgpu_protocol::BackingId,
+) -> Result<(), ReplacementObjectRepresentationPreparationError>
+where
+    Semantic: Clone,
+{
+    if let Some(plane_view) = runtime.io_surface_plane_view_owner(backing) {
+        return materialize_io_surface_plane_view(runtime, host, page_shift, plane_view);
+    }
+    prepare_task_address_backing_representation(runtime, host, page_shift, backing)
+}
+
+/// Build the image one declared plane of a registered surface is.
+///
+/// A registered surface is an allocation, not an image: it may declare several
+/// planes at their own offsets with their own extent, row pitch and pixel
+/// format, and a backing carries one representation and one layout. So the
+/// plane is what becomes a native image, over the plane's own backing.
+fn materialize_io_surface_plane_view<Semantic>(
+    runtime: &mut ReplacementRuntimeSession<Semantic>,
+    host: &mut (impl HostMemory + crate::runtime::host::HostOps),
+    page_shift: u32,
+    plane_view: reims_vgpu_protocol::ResourceId<reims_vgpu_protocol::ResourceObject>,
+) -> Result<(), ReplacementObjectRepresentationPreparationError>
+where
+    Semantic: Clone,
+{
+    let (task, descriptor, backing) = runtime
+        .io_surface_plane_view_materialization_facts(plane_view)
+        .ok_or(
+            ReplacementObjectRepresentationPreparationError::SurfaceDescriptorUnavailable(
+                plane_view,
+            ),
+        )?;
+    if runtime.backing_has_execution_representation(backing) {
+        return Ok(());
+    }
+    let gva = u64::from(descriptor.backing_pfn)
+        .checked_shl(page_shift)
+        .ok_or(ReplacementObjectRepresentationPreparationError::PageAddressOverflow { page: 0 })?;
+    let guest = resolve_task_guest_window(runtime, host, page_shift, task, gva, descriptor.length)?;
+    runtime
+        .materialize_io_surface_plane_view_with_guest_window(plane_view, guest)
+        .map_err(ReplacementObjectRepresentationPreparationError::Construction)?;
+    Ok(())
+}
+
 fn prepare_task_address_backing_representation<Semantic>(
     runtime: &mut ReplacementRuntimeSession<Semantic>,
     host: &mut (impl HostMemory + crate::runtime::host::HostOps),
@@ -238,13 +374,91 @@ where
 {
     let (resource, task, address, length) = runtime
         .task_address_backing_materialization_facts(backing)
-        .ok_or(ReplacementObjectRepresentationPreparationError::BackingUnavailable(backing))?;
+        .map_err(
+            |reason| ReplacementObjectRepresentationPreparationError::BackingUnavailable {
+                backing,
+                reason,
+            },
+        )?;
     let guest =
         resolve_task_guest_window(runtime, host, page_shift, task, address.get(), length.get())?;
     runtime
         .materialize_resource_with_guest_window(resource, guest)
         .map_err(ReplacementObjectRepresentationPreparationError::Construction)?;
     Ok(())
+}
+
+/// Name the backings whose execution representation a lifecycle effect revoked.
+fn replaced_physical_backings<Native>(
+    effect: &reims_vgpu_core::ResourceLifecycleEffect<Native>,
+) -> Vec<reims_vgpu_protocol::BackingId> {
+    match effect {
+        reims_vgpu_core::ResourceLifecycleEffect::PhysicalReplaced { backing, .. } => {
+            backing.iter().copied().collect()
+        }
+        reims_vgpu_core::ResourceLifecycleEffect::PhysicalBatchReplaced { native, .. } => {
+            native.iter().map(|(backing, _)| *backing).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Reinstall the execution representations a physical replacement revoked.
+///
+/// `ManagedBackingOwner::replace_execution_representation` retires the
+/// construction-designated object and states that a subsequent materialization
+/// installs a fresh representation identity. This is that materialization, and
+/// it runs where the replacement lands rather than where some later preparation
+/// trips over the absence. Every EXEC ingress route resolves a backing's
+/// execution representation — direct, guest-upload suffix and indirect range
+/// alike — so a repair attached to one route's refusal shape leaves the other
+/// two meeting a revoked backing as a terminal refusal that still holds the
+/// whole recorded chain.
+///
+/// A backing this cannot serve is reported by name rather than guessed at: only
+/// task-address storage carries the guest address and length a fresh
+/// materialization needs, and the other backing classes have their own
+/// materializers.
+fn prepare_replaced_physical_representations<Semantic>(
+    runtime: &mut ReplacementRuntimeSession<Semantic>,
+    host: &mut (impl HostMemory + crate::runtime::host::HostOps),
+    page_shift: u32,
+    backings: &[reims_vgpu_protocol::BackingId],
+) where
+    Semantic: Clone,
+{
+    for &backing in backings {
+        if runtime.backing_has_execution_representation(backing) {
+            crate::observe::off(format!(
+                "replacement_replaced_physical_representation backing={backing:?} status=retained"
+            ));
+            continue;
+        }
+        match prepare_backing_representation(runtime, host, page_shift, backing) {
+            Ok(()) => crate::observe::off(format!(
+                "replacement_replaced_physical_representation backing={backing:?} \
+                 status=materialized"
+            )),
+            Err(reason) => report_replaced_physical_representation_refusal(backing, &reason),
+        }
+    }
+}
+
+fn report_replaced_physical_representation_refusal(
+    backing: reims_vgpu_protocol::BackingId,
+    reason: &ReplacementObjectRepresentationPreparationError,
+) {
+    let reason = format!("{reason:?}");
+    let diagnostic = ReplacementCoordinatorDiagnostic {
+        slug: "replacement_replaced_physical_representation_refused",
+        fields: vec![
+            ("backing", format!("{backing:?}")),
+            ("reason", reason.clone()),
+        ],
+        discriminant: fnv_discriminant(&reason),
+    };
+    crate::observe::Emit::decline("replacement_replaced_physical_representation", &diagnostic)
+        .fail_once(diagnostic.discriminant);
 }
 
 fn prepare_object_ready_representations<Semantic>(
@@ -259,7 +473,8 @@ where
     use crate::runtime::replacement_session::{
         ReplacementAppliedLoadedObject, ReplacementLoadedObjectApplyEffect,
     };
-    let mut surfaces = std::collections::BTreeSet::new();
+    let mut plane_views = std::collections::BTreeSet::new();
+    let mut views = std::collections::BTreeSet::new();
     let mut linears = std::collections::BTreeSet::new();
     for applied in ready.constructions.objects.iter() {
         let ReplacementAppliedLoadedObject::Descriptor(effect) = applied else {
@@ -269,16 +484,12 @@ where
             ReplacementLoadedObjectApplyEffect::Linear(declaration) => {
                 linears.insert(declaration.resource);
             }
-            ReplacementLoadedObjectApplyEffect::RegisteredSurface(declaration) => {
-                surfaces.insert(declaration.resource);
-            }
             ReplacementLoadedObjectApplyEffect::IOSurfacePlaneView(declaration) => {
-                let parent = runtime.resource_parent(declaration.resource).ok_or(
-                    ReplacementObjectRepresentationPreparationError::SurfaceDescriptorUnavailable(
-                        declaration.resource,
-                    ),
-                )?;
-                surfaces.insert(parent);
+                plane_views.insert(declaration.resource);
+                views.insert(declaration.resource);
+            }
+            ReplacementLoadedObjectApplyEffect::TextureView(declaration) => {
+                views.insert(declaration.resource);
             }
             _ => {}
         }
@@ -296,40 +507,18 @@ where
         {
             linears.insert(resource);
         } else if runtime
-            .registered_surface_materialization_facts(resource)
+            .io_surface_plane_view_materialization_facts(resource)
             .is_some()
         {
-            surfaces.insert(resource);
-        } else if let Some(parent) = runtime.resource_parent(resource) {
-            if runtime
-                .registered_surface_materialization_facts(parent)
-                .is_some()
-            {
-                surfaces.insert(parent);
-            }
+            plane_views.insert(resource);
         }
     }
-    for surface_resource in surfaces {
-        let (task, descriptor, backing) = runtime
-            .registered_surface_materialization_facts(surface_resource)
-            .ok_or(
-                ReplacementObjectRepresentationPreparationError::SurfaceDescriptorUnavailable(
-                    surface_resource,
-                ),
-            )?;
-        if runtime.backing_has_execution_representation(backing) {
-            continue;
-        }
-        let gva = u64::from(descriptor.backing_pfn)
-            .checked_shl(page_shift)
-            .ok_or(
-                ReplacementObjectRepresentationPreparationError::PageAddressOverflow { page: 0 },
-            )?;
-        let guest =
-            resolve_task_guest_window(runtime, host, page_shift, task, gva, descriptor.length)?;
-        runtime
-            .materialize_registered_surface_with_guest_window(surface_resource, guest)
-            .map_err(ReplacementObjectRepresentationPreparationError::Construction)?;
+    // A registered surface is an allocation, not an image. Each declared plane
+    // view is materialized over its own backing, so a multi-plane surface
+    // reaches the executor as several textures rather than as one allocation
+    // with no single layout.
+    for plane_view in plane_views {
+        materialize_io_surface_plane_view(runtime, host, page_shift, plane_view)?;
     }
     for resource in linears {
         let (task, address, length) = runtime
@@ -364,6 +553,37 @@ where
         runtime
             .materialize_resource_with_guest_window(resource, guest)
             .map_err(ReplacementObjectRepresentationPreparationError::Construction)?;
+    }
+    // A view declared after its base image was built is not in the set that
+    // materialization handed to the image, so it has to be installed on the
+    // image that already exists. A view declared before it needs nothing here:
+    // the materialization ahead reads every view over the backing and carries
+    // it. Which of the two happened is the backing's own state, so this asks
+    // the backing rather than tracking the order.
+    for view in views {
+        let Some(backing) = runtime.resolved_backing(view) else {
+            continue;
+        };
+        if !runtime.backing_has_execution_representation(backing) {
+            continue;
+        }
+        if let Err(reason) = runtime.materialize_texture_view(view) {
+            // Reported and not fatal. The image is built and every other view
+            // over it is usable; only a bind naming *this* view is lost, and
+            // that bind refuses by name at record time on the same image.
+            let reason = format!("{reason:?}");
+            let diagnostic = ReplacementCoordinatorDiagnostic {
+                slug: "replacement_texture_view_install_refused",
+                fields: vec![
+                    ("resource", format!("{view:?}")),
+                    ("backing", format!("{backing:?}")),
+                    ("reason", reason.clone()),
+                ],
+                discriminant: fnv_discriminant(&reason),
+            };
+            crate::observe::Emit::decline("replacement_texture_view_install", &diagnostic)
+                .fail_once(diagnostic.discriminant);
+        }
     }
     Ok(())
 }
@@ -777,7 +997,7 @@ where
             );
             if let Some(backing) = missing_execution_representation(&reason) {
                 if let Err(preparation) =
-                    prepare_task_address_backing_representation(runtime, host, page_shift, backing)
+                    prepare_backing_representation(runtime, host, page_shift, backing)
                 {
                     return Err(Box::new(
                         ReplacementHostExecDispatchFailure::BackingRepresentation {
@@ -814,8 +1034,7 @@ where
             ready,
             ..
         } => {
-            if let Err(reason) =
-                prepare_task_address_backing_representation(runtime, host, page_shift, backing)
+            if let Err(reason) = prepare_backing_representation(runtime, host, page_shift, backing)
             {
                 return Err(Box::new(
                     ReplacementHostExecDispatchFailure::BackingRepresentation {
@@ -993,6 +1212,25 @@ pub(crate) enum ReplacementChildPacketLeaseFailure<Semantic> {
         admitted:
             crate::runtime::replacement_child_packet::ReplacementAdmittedChildCpuPacket<Semantic>,
     },
+}
+
+impl ReplacementChildPacketLeaseFailure<()> {
+    /// Classify an ingress failure as a declared refusal, or hand it back to be
+    /// re-offered.
+    ///
+    /// See
+    /// [`crate::runtime::replacement_child_packet::ReplacementChildCpuPacketIngressError::is_terminal_refusal`].
+    fn into_refusal(self: Box<Self>) -> Result<ReplacementRefusedChildPacket, Box<Self>> {
+        match *self {
+            Self::Ingress { reason, lease } if reason.is_terminal_refusal() => {
+                Ok(ReplacementRefusedChildPacket {
+                    lease,
+                    detail: format!("stage=child_ingress reason={reason:?}"),
+                })
+            }
+            failure => Err(Box::new(failure)),
+        }
+    }
 }
 
 pub(crate) fn commit_child_packet_after_admission<T>(
@@ -1698,6 +1936,30 @@ pub(crate) enum ReplacementCpuApplyError<Semantic> {
     ResourceLifecycle(Box<ReplacementResourceLifecycleApplyError<Semantic>>),
 }
 
+impl<Semantic> ReplacementCpuApplyError<Semantic> {
+    /// The refusal reason when no later guest packet can make this apply
+    /// succeed, so retrying it only holds the channel.
+    ///
+    /// See
+    /// [`crate::runtime::replacement_session::ReplacementControlApplyReason::is_terminal_refusal`].
+    fn terminal_refusal(
+        &self,
+    ) -> Option<&crate::runtime::replacement_session::ReplacementControlApplyReason> {
+        match self {
+            Self::Control(failure) => match failure.as_ref() {
+                ReplacementControlApplyError::Apply { reason, .. }
+                    if reason.is_terminal_refusal() =>
+                {
+                    Some(reason)
+                }
+                ReplacementControlApplyError::Apply { .. }
+                | ReplacementControlApplyError::NotReady(_) => None,
+            },
+            Self::Query(_) | Self::ResourceLifecycle(_) => None,
+        }
+    }
+}
+
 pub(crate) fn apply_ready_cpu_packet<Semantic: Clone>(
     runtime: &mut ReplacementRuntimeSession<Semantic>,
     page_shift: u32,
@@ -1812,12 +2074,16 @@ fn apply_control_host_effect<Semantic>(
 }
 
 pub(crate) fn apply_cpu_host_effect<Semantic: Clone>(
-    runtime: &ReplacementRuntimeSession<Semantic>,
-    host: &mut (impl HostMemory + HostControl),
+    runtime: &mut ReplacementRuntimeSession<Semantic>,
+    host: &mut (impl HostMemory + crate::runtime::host::HostOps),
     page_shift: u32,
     applied: ReplacementAppliedCpuPacket<Semantic>,
 ) -> Result<ReplacementHostAppliedCpuPacket<Semantic>, Box<ReplacementCpuHostEffectFailure<Semantic>>>
 {
+    if let ReplacementAppliedCpuPacket::ResourceLifecycle(lifecycle) = &applied {
+        let backings = replaced_physical_backings(&lifecycle.effect);
+        prepare_replaced_physical_representations(runtime, host, page_shift, &backings);
+    }
     let result = match &applied {
         ReplacementAppliedCpuPacket::Control(control) => {
             apply_control_host_effect(host, control);
@@ -1987,7 +2253,7 @@ impl<Semantic: Clone> ReplacementCpuCoordinator<Semantic> {
     pub fn progress(
         &mut self,
         runtime: &mut ReplacementRuntimeSession<Semantic>,
-        host: &mut (impl HostMemory + HostControl),
+        host: &mut (impl HostMemory + crate::runtime::host::HostOps),
         page_shift: u32,
         version: u32,
         transaction: reims_vgpu_protocol::TransactionId,
@@ -2012,6 +2278,15 @@ impl<Semantic: Clone> ReplacementCpuCoordinator<Semantic> {
                 match apply_ready_cpu_packet(runtime, page_shift, version, packet) {
                     Ok(applied) => (applied, semantic),
                     Err(failure) => {
+                        if let Some(reason) = failure.terminal_refusal() {
+                            let reason = format!("{reason:?}");
+                            return Some(self.refuse_cpu_packet(
+                                runtime,
+                                transaction,
+                                &reason,
+                                semantic,
+                            ));
+                        }
                         self.packets.insert(
                             transaction,
                             ReplacementCoordinatedCpuState::ApplyFailed { failure, semantic },
@@ -2058,6 +2333,41 @@ impl<Semantic: Clone> ReplacementCpuCoordinator<Semantic> {
             }
         };
         Some(self.finish_host_applied(runtime, host_applied, semantic))
+    }
+
+    /// Give up a control transaction this device has declared it cannot apply,
+    /// publishing its completion so the channel's stamp still advances.
+    ///
+    /// The guest loses the command and is told so by name. Retaining it instead
+    /// cost the whole device: a permanently-refused apply was re-offered every
+    /// tick forever, its completion stamp never posted, and the guest driver
+    /// blocked on that stamp for the rest of the boot with nothing in any
+    /// census saying which packet it was waiting for.
+    fn refuse_cpu_packet(
+        &mut self,
+        runtime: &mut ReplacementRuntimeSession<Semantic>,
+        transaction: reims_vgpu_protocol::TransactionId,
+        reason: &str,
+        semantic: Semantic,
+    ) -> ReplacementCpuProgress {
+        match runtime.abandon_transaction(transaction, None, None, semantic) {
+            Ok(facts) => {
+                let count = facts.len();
+                self.published.extend(facts);
+                crate::observe::fail(format!(
+                    "replacement_cpu_transaction_abandoned transaction={} reason={reason}",
+                    transaction.get()
+                ));
+                ReplacementCpuProgress::Published { facts: count }
+            }
+            Err(failure) => {
+                crate::observe::fail(format!(
+                    "replacement_cpu_transaction_abandon_refused transaction={} reason={reason} detail={failure:?}",
+                    transaction.get()
+                ));
+                ReplacementCpuProgress::Failed(ReplacementCpuFailureStage::Apply)
+            }
+        }
     }
 
     fn finish_host_applied(
@@ -3266,9 +3576,6 @@ impl<Semantic: Clone> ReplacementPresentCoordinator<Semantic> {
 
 pub(crate) enum ReplacementCoordinatedExecRecording<Semantic> {
     Pending(crate::runtime::replacement_session::PendingReplacementIngressExec<Semantic>),
-    Progress(
-        Box<crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress<Semantic>>,
-    ),
     Failed(
         Box<
             crate::runtime::replacement_session::ReplacementExecIngressRecordingProgressFailure<
@@ -3278,12 +3585,35 @@ pub(crate) enum ReplacementCoordinatedExecRecording<Semantic> {
     ),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReplacementExecRecordingCoordinatorProgress {
+/// What one poll of an admitted EXEC recording settled. Every arm states where
+/// the exact owner lives afterwards, so a caller cannot observe readiness
+/// without also receiving the owner and the route it takes. A terminal owner is
+/// never retained here: readiness hands the owner out and parking hands it to
+/// the runtime epoch, which is why a stale route-erased marker cannot exist.
+pub(crate) enum ReplacementExecRecordingDisposition<Semantic> {
+    /// Recording is still in flight. The coordinator retains the exact owner.
     Pending,
-    Ready,
-    ParkedOrContinuing,
-    Failed,
+    /// The recording became queue-ready. The owner has left this coordinator
+    /// and the caller routes it by its own variant.
+    Ready(crate::runtime::replacement_session::ReplacementQueueReadyRecording<Semantic>),
+    /// Ownership moved into the runtime epoch parked map behind a predecessor.
+    /// Nothing remains here for the transaction; the epoch releases it through
+    /// `take_newly_ready_recorded_execs` once that predecessor is accepted.
+    Parked(reims_vgpu_protocol::TransactionId),
+    /// Progress refused on this attempt, named for the always-on failure path.
+    /// The coordinator retains the exact failure so the next poll resumes from
+    /// it rather than decoding or preparing the EXEC again. A refusal is
+    /// therefore not proof of lost work — an ordering refusal is expected to
+    /// clear once the transaction ahead of it is accepted — but it is reported
+    /// so a refusal that never clears is visible instead of silent.
+    Failed(ReplacementExecRecordingRefusal),
+}
+
+/// One refused EXEC recording, named for the always-on failure path: the stage
+/// that refused, and the typed reason that stage carried.
+pub(crate) struct ReplacementExecRecordingRefusal {
+    pub stage: &'static str,
+    pub detail: Option<String>,
 }
 
 pub(crate) struct ReplacementExecRecordingCoordinator<Semantic> {
@@ -3330,7 +3660,8 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementExecRecordingCoord
         &mut self,
         runtime: &mut ReplacementRuntimeSession<Semantic>,
         transaction: reims_vgpu_protocol::TransactionId,
-    ) -> Option<ReplacementExecRecordingCoordinatorProgress> {
+    ) -> Option<ReplacementExecRecordingDisposition<Semantic>> {
+        use crate::runtime::replacement_session as session;
         let state = self.recordings.remove(&transaction)?;
         let result = match state {
             ReplacementCoordinatedExecRecording::Pending(pending) => {
@@ -3339,82 +3670,71 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementExecRecordingCoord
             ReplacementCoordinatedExecRecording::Failed(failure) => {
                 runtime.retry_exec_ingress_recording_progress(*failure)
             }
-            ready @ ReplacementCoordinatedExecRecording::Progress(_) => {
-                self.recordings.insert(transaction, ready);
-                return Some(ReplacementExecRecordingCoordinatorProgress::Ready);
-            }
         };
-        match result {
-            Ok(progress) => match pending_exec_recording_progress(progress) {
-                Ok(pending) => {
-                    self.recordings.insert(
-                        transaction,
-                        ReplacementCoordinatedExecRecording::Pending(pending),
-                    );
-                    Some(ReplacementExecRecordingCoordinatorProgress::Pending)
-                }
-                Err(progress) => {
-                    let ready = exec_recording_progress_is_queue_ready(&progress);
-                    self.recordings.insert(
-                        transaction,
-                        ReplacementCoordinatedExecRecording::Progress(Box::new(progress)),
-                    );
-                    Some(if ready {
-                        ReplacementExecRecordingCoordinatorProgress::Ready
-                    } else {
-                        ReplacementExecRecordingCoordinatorProgress::ParkedOrContinuing
-                    })
-                }
-            },
+        let progress = match result {
+            Ok(progress) => progress,
             Err(failure) => {
+                let refusal = ReplacementExecRecordingRefusal {
+                    stage: failure.reason(),
+                    detail: failure.detail(),
+                };
                 self.recordings.insert(
                     transaction,
                     ReplacementCoordinatedExecRecording::Failed(Box::new(failure)),
                 );
-                Some(ReplacementExecRecordingCoordinatorProgress::Failed)
+                return Some(ReplacementExecRecordingDisposition::Failed(refusal));
             }
-        }
-    }
-
-    pub fn take_progress(
-        &mut self,
-        transaction: reims_vgpu_protocol::TransactionId,
-    ) -> Option<
-        crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress<Semantic>,
-    > {
-        match self.recordings.remove(&transaction)? {
-            ReplacementCoordinatedExecRecording::Progress(progress) => Some(*progress),
-            unchanged => {
-                self.recordings.insert(transaction, unchanged);
-                None
+        };
+        let pending = match progress {
+            session::ReplacementExecIngressRecordingProgress::Direct(
+                session::ReplacementDirectRecordingProgress::Pending(pending),
+            ) => session::PendingReplacementIngressExec::Direct(pending),
+            session::ReplacementExecIngressRecordingProgress::Direct(
+                session::ReplacementDirectRecordingProgress::Ready(ready),
+            ) => {
+                return Some(ReplacementExecRecordingDisposition::Ready(
+                    session::ReplacementQueueReadyRecording::Exec(ready),
+                ));
             }
-        }
-    }
-
-    pub fn take_direct_ready(
-        &mut self,
-        transaction: reims_vgpu_protocol::TransactionId,
-    ) -> Option<Box<crate::runtime::replacement_session::ReplacementQueueReadyExec>> {
-        match self.recordings.remove(&transaction)? {
-            ReplacementCoordinatedExecRecording::Progress(progress) => match *progress {
-                crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress::Direct(
-                    crate::runtime::replacement_session::ReplacementDirectRecordingProgress::Ready(
-                        ready,
-                    ),
-                ) => Some(ready),
-                unchanged => {
-                    self.recordings.insert(
-                        transaction,
-                        ReplacementCoordinatedExecRecording::Progress(Box::new(unchanged)),
-                    );
-                    None
+            session::ReplacementExecIngressRecordingProgress::Direct(
+                session::ReplacementDirectRecordingProgress::Parked(parked),
+            ) => return Some(ReplacementExecRecordingDisposition::Parked(parked)),
+            session::ReplacementExecIngressRecordingProgress::GuestUpload(
+                session::ReplacementGuestUploadIngressRecordingProgress::Pending(pending),
+            ) => session::PendingReplacementIngressExec::GuestUpload(pending),
+            session::ReplacementExecIngressRecordingProgress::GuestUpload(
+                session::ReplacementGuestUploadIngressRecordingProgress::Ready(ready),
+            ) => {
+                return Some(ReplacementExecRecordingDisposition::Ready(
+                    session::ReplacementQueueReadyRecording::GuestUpload(ready),
+                ));
+            }
+            session::ReplacementExecIngressRecordingProgress::GuestUpload(
+                session::ReplacementGuestUploadIngressRecordingProgress::Parked(parked),
+            ) => return Some(ReplacementExecRecordingDisposition::Parked(parked)),
+            session::ReplacementExecIngressRecordingProgress::IndirectRange(progress) => {
+                match *progress {
+                    session::ReplacementIndirectRangeIngressRecordingProgress::Pending(pending) => {
+                        session::PendingReplacementIngressExec::IndirectRange(pending)
+                    }
+                    session::ReplacementIndirectRangeIngressRecordingProgress::Initial(
+                        session::ReplacementRecordedIndirectRangeQueueDisposition::Ready(ready),
+                    ) => {
+                        return Some(ReplacementExecRecordingDisposition::Ready(
+                            session::ReplacementQueueReadyRecording::IndirectRange(ready),
+                        ));
+                    }
+                    session::ReplacementIndirectRangeIngressRecordingProgress::Initial(
+                        session::ReplacementRecordedIndirectRangeQueueDisposition::Parked(parked),
+                    ) => return Some(ReplacementExecRecordingDisposition::Parked(parked)),
                 }
-            },
-            unchanged => {
-                self.recordings.insert(transaction, unchanged);
-                None
             }
-        }
+        };
+        self.recordings.insert(
+            transaction,
+            ReplacementCoordinatedExecRecording::Pending(pending),
+        );
+        Some(ReplacementExecRecordingDisposition::Pending)
     }
 
     pub fn live_recordings(&self) -> usize {
@@ -3424,66 +3744,6 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementExecRecordingCoord
     pub fn transaction_ids(&self) -> Vec<reims_vgpu_protocol::TransactionId> {
         self.recordings.keys().copied().collect()
     }
-}
-
-fn pending_exec_recording_progress<Semantic>(
-    progress: crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress<
-        Semantic,
-    >,
-) -> Result<
-    crate::runtime::replacement_session::PendingReplacementIngressExec<Semantic>,
-    crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress<Semantic>,
-> {
-    match progress {
-        crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress::Direct(
-            crate::runtime::replacement_session::ReplacementDirectRecordingProgress::Pending(
-                pending,
-            ),
-        ) => Ok(
-            crate::runtime::replacement_session::PendingReplacementIngressExec::Direct(pending),
-        ),
-        crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress::GuestUpload(
-            crate::runtime::replacement_session::ReplacementGuestUploadIngressRecordingProgress::Pending(
-                pending,
-            ),
-        ) => Ok(
-            crate::runtime::replacement_session::PendingReplacementIngressExec::GuestUpload(
-                pending,
-            ),
-        ),
-        crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress::IndirectRange(
-            progress,
-        ) => match *progress {
-            crate::runtime::replacement_session::ReplacementIndirectRangeRecordingProgress::Pending(
-                pending,
-            ) => Ok(
-                crate::runtime::replacement_session::PendingReplacementIngressExec::IndirectRange(
-                    pending,
-                ),
-            ),
-            terminal => Err(
-                crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress::IndirectRange(
-                    Box::new(terminal),
-                ),
-            ),
-        },
-        terminal => Err(terminal),
-    }
-}
-
-fn exec_recording_progress_is_queue_ready<Semantic>(
-    progress: &crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress<
-        Semantic,
-    >,
-) -> bool {
-    matches!(
-        progress,
-        crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress::Direct(
-            crate::runtime::replacement_session::ReplacementDirectRecordingProgress::Ready(_)
-        ) | crate::runtime::replacement_session::ReplacementExecIngressRecordingProgress::GuestUpload(
-            crate::runtime::replacement_session::ReplacementGuestUploadIngressRecordingProgress::Ready(_)
-        )
-    )
 }
 
 pub(crate) enum ReplacementCoordinatedExecSubmit<Semantic> {
@@ -3506,6 +3766,17 @@ pub(crate) enum ReplacementExecSubmitCoordinatorProgress {
     AcceptanceRefused,
     FailedSubmit,
     WrongStage,
+}
+
+impl ReplacementExecSubmitCoordinatorProgress {
+    /// Whether this step is guest work that stopped moving. `WrongStage` is the
+    /// poll another arm already owns and is expected control flow, not a loss.
+    const fn is_refusal(self) -> bool {
+        match self {
+            Self::Pending | Self::Accepted | Self::WrongStage => false,
+            Self::DriverRefused | Self::AcceptanceRefused | Self::FailedSubmit => true,
+        }
+    }
 }
 
 pub(crate) struct ReplacementExecSubmitCoordinator<Semantic> {
@@ -3626,6 +3897,16 @@ impl<Semantic: Clone> ReplacementExecSubmitCoordinator<Semantic> {
                 Some(ReplacementExecSubmitCoordinatorProgress::DriverRefused)
             }
             terminal @ reims_vgpu_vulkan::replacement_exec_queue::ReplacementExecSubmitPoll::AcceptanceRefused(_) => {
+                if let reims_vgpu_vulkan::replacement_exec_queue::ReplacementExecSubmitPoll::AcceptanceRefused(
+                    failure,
+                ) = &terminal
+                {
+                    report_acceptance_refusal(
+                        "replacement_exec_submit",
+                        transaction,
+                        &failure.reason,
+                    );
+                }
                 self.submissions.insert(
                     transaction,
                     ReplacementCoordinatedExecSubmit::Terminal(Box::new(terminal)),
@@ -3715,6 +3996,42 @@ pub(crate) enum ReplacementGuestUploadCoordinatorProgress {
     WrongStage,
 }
 
+impl ReplacementGuestUploadCoordinatorProgress {
+    /// See [`ReplacementExecSubmitCoordinatorProgress::is_refusal`].
+    const fn is_refusal(self) -> bool {
+        match self {
+            Self::Pending | Self::Accepted | Self::WrongStage => false,
+            Self::FailedPreparation
+            | Self::FailedEnqueue
+            | Self::DriverRefused
+            | Self::AcceptanceRefused => true,
+        }
+    }
+}
+
+impl<Semantic> ReplacementCoordinatedGuestUpload<Semantic> {
+    /// The name of the state this owner is retained in.
+    ///
+    /// Only `Ready` and `Pending` are advanced by
+    /// [`ReplacementGuestUploadCoordinator::progress`]; every other state is
+    /// retained until a different caller claims it. An owner stuck in one of
+    /// those holds its source domain's submission head, which every later
+    /// transaction on that channel then refuses behind, so the census names
+    /// the exact state rather than reporting only a live count.
+    const fn stage(&self) -> &'static str {
+        match self {
+            Self::Ready { .. } => "ready",
+            Self::ChainFailed(_) => "chain_failed",
+            Self::PreparationFailed(_) => "preparation_failed",
+            Self::EnqueueFailed(_) => "enqueue_failed",
+            Self::Pending(_) => "pending",
+            Self::DriverRefused { .. } => "driver_refused",
+            Self::AcceptanceRefused(_) => "acceptance_refused",
+            Self::Accepted(_) => "accepted",
+        }
+    }
+}
+
 pub(crate) struct ReplacementGuestUploadCoordinator<Semantic> {
     uploads: std::collections::BTreeMap<
         reims_vgpu_protocol::TransactionId,
@@ -3731,6 +4048,26 @@ impl<Semantic> Default for ReplacementGuestUploadCoordinator<Semantic> {
 }
 
 impl<Semantic: Clone> ReplacementGuestUploadCoordinator<Semantic> {
+    pub fn admit_accepted(
+        &mut self,
+        accepted: Box<
+            crate::runtime::replacement_session::ReplacementAcceptedGuestUploadAuxiliary<Semantic>,
+        >,
+    ) -> Result<
+        reims_vgpu_protocol::TransactionId,
+        Box<crate::runtime::replacement_session::ReplacementAcceptedGuestUploadAuxiliary<Semantic>>,
+    > {
+        let transaction = accepted.transaction();
+        if self.uploads.contains_key(&transaction) {
+            return Err(accepted);
+        }
+        self.uploads.insert(
+            transaction,
+            ReplacementCoordinatedGuestUpload::Accepted(accepted),
+        );
+        Ok(transaction)
+    }
+
     pub fn admit(
         &mut self,
         ready: Box<crate::runtime::replacement_session::ReplacementQueueReadyGuestUpload<Semantic>>,
@@ -3822,6 +4159,11 @@ impl<Semantic: Clone> ReplacementGuestUploadCoordinator<Semantic> {
                         reason,
                         prepared,
                     } => {
+                        report_retained_failure_detail(
+                            "replacement_guest_upload_driver",
+                            transaction,
+                            &format!("{reason:?}"),
+                        );
                         self.uploads.insert(
                             transaction,
                             ReplacementCoordinatedGuestUpload::DriverRefused { reason, prepared },
@@ -3831,6 +4173,11 @@ impl<Semantic: Clone> ReplacementGuestUploadCoordinator<Semantic> {
                     crate::runtime::replacement_session::ReplacementGuestUploadAuxiliaryProgress::AcceptanceRefused(
                         failure,
                     ) => {
+                        report_acceptance_refusal(
+                            "replacement_guest_upload",
+                            transaction,
+                            &failure.failure.reason,
+                        );
                         self.uploads.insert(
                             transaction,
                             ReplacementCoordinatedGuestUpload::AcceptanceRefused(failure),
@@ -3879,6 +4226,14 @@ impl<Semantic: Clone> ReplacementGuestUploadCoordinator<Semantic> {
         self.uploads.len()
     }
 
+    /// See [`ReplacementCoordinatedGuestUpload::stage`].
+    pub fn stages(&self) -> Vec<(reims_vgpu_protocol::TransactionId, &'static str)> {
+        self.uploads
+            .iter()
+            .map(|(&transaction, upload)| (transaction, upload.stage()))
+            .collect()
+    }
+
     pub fn has_accepted_at_or_before(
         &self,
         queue: reims_vgpu_protocol::QueueOwnerId,
@@ -3910,6 +4265,34 @@ pub(crate) enum ReplacementCoordinatedGuestUploadSuffix<Semantic> {
     PendingRecording(
         Box<crate::runtime::replacement_session::PendingReplacementGuestUploadSuffixRecording<Semantic>>,
     ),
+    PendingRefreshRecording(
+        Box<crate::runtime::replacement_session::PendingReplacementGuestUploadRecording<Semantic>>,
+    ),
+    RefreshResolutionFailed(
+        Box<crate::runtime::replacement_session::ReplacementGuestUploadRecordingResolutionFailure<Semantic>>,
+    ),
+    RefreshDispatchFailed(
+        Box<crate::runtime::replacement_session::ReplacementGuestUploadRecordingDispatchFailure<Semantic>>,
+    ),
+    RefreshPreparationFailed(
+        Box<crate::runtime::replacement_session::ReplacementRecordedGuestUploadPreparationFailure<Semantic>>,
+    ),
+    RefreshEnqueueFailed(
+        Box<crate::runtime::replacement_session::ReplacementGuestUploadAuxiliaryEnqueueFailure<Semantic>>,
+    ),
+    PendingRefresh(
+        Box<crate::runtime::replacement_session::PendingReplacementGuestUploadAuxiliary<Semantic>>,
+    ),
+    RefreshDriverRefused {
+        reason: reims_vgpu_vulkan::replacement_queue::ReplacementQueueError,
+        prepared: Box<crate::runtime::replacement_session::ReplacementPreparedRecordedGuestUpload<Semantic>>,
+    },
+    RefreshAcceptanceRefused(
+        Box<crate::runtime::replacement_session::ReplacementGuestUploadAuxiliaryAcceptanceFailure<Semantic>>,
+    ),
+    RefreshAccepted(
+        Box<crate::runtime::replacement_session::ReplacementAcceptedGuestUploadAuxiliary<Semantic>>,
+    ),
     FinalPreparationFailed(
         Box<crate::runtime::replacement_session::ReplacementGuestUploadFinalPreparationFailure<Semantic>>,
     ),
@@ -3939,6 +4322,7 @@ pub(crate) enum ReplacementCoordinatedGuestUploadSuffix<Semantic> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementGuestUploadSuffixProgress {
+    WaitingForProducer,
     PendingRecording,
     PendingFinal,
     Accepted,
@@ -3948,6 +4332,24 @@ pub(crate) enum ReplacementGuestUploadSuffixProgress {
     DriverRefused,
     AcceptanceRefused,
     WrongStage,
+}
+
+impl ReplacementGuestUploadSuffixProgress {
+    /// See [`ReplacementExecSubmitCoordinatorProgress::is_refusal`].
+    const fn is_refusal(self) -> bool {
+        match self {
+            Self::WaitingForProducer
+            | Self::PendingRecording
+            | Self::PendingFinal
+            | Self::Accepted
+            | Self::WrongStage => false,
+            Self::FailedPreparation
+            | Self::FailedRecording
+            | Self::FailedEnqueue
+            | Self::DriverRefused
+            | Self::AcceptanceRefused => true,
+        }
+    }
 }
 
 pub(crate) struct ReplacementGuestUploadSuffixCoordinator<Semantic> {
@@ -3994,19 +4396,86 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
         let state = self.suffixes.remove(&transaction)?;
         match state {
             ReplacementCoordinatedGuestUploadSuffix::Continuing(continuing) => {
-                let suffix = match runtime.prepare_guest_upload_suffix(*continuing) {
-                    Ok(suffix) => suffix,
+                let continuation = match runtime.prepare_guest_upload_suffix(*continuing) {
+                    Ok(continuation) => continuation,
                     Err(failure) => {
+                        match failure.into_content_producer_retry() {
+                            Ok(continuing) => {
+                                self.suffixes.insert(
+                                    transaction,
+                                    ReplacementCoordinatedGuestUploadSuffix::Continuing(Box::new(
+                                        continuing,
+                                    )),
+                                );
+                                return Some(
+                                    ReplacementGuestUploadSuffixProgress::WaitingForProducer,
+                                );
+                            }
+                        Err(failure) => {
+                        report_retained_failure_detail(
+                            "replacement_guest_upload_suffix_preparation",
+                            transaction,
+                            &failure.detail(),
+                        );
                         self.suffixes.insert(
                             transaction,
                             ReplacementCoordinatedGuestUploadSuffix::PreparationFailed(failure),
                         );
-                        return Some(ReplacementGuestUploadSuffixProgress::FailedPreparation);
+                            return Some(ReplacementGuestUploadSuffixProgress::FailedPreparation);
+                        }
+                    }
                     }
                 };
-                let resolved = match runtime.resolve_guest_upload_suffix_recording(suffix) {
+                let crate::runtime::replacement_session::ReplacementPreparedGuestUploadContinuation::Suffix(suffix) = continuation else {
+                    let crate::runtime::replacement_session::ReplacementPreparedGuestUploadContinuation::Refresh(refresh) = continuation else {
+                        unreachable!()
+                    };
+                    let resolved = match runtime.resolve_guest_upload_phase_recording(*refresh) {
+                        Ok(resolved) => resolved,
+                        Err(failure) => {
+                            report_retained_failure_detail(
+                                "replacement_guest_upload_refresh_resolution",
+                                transaction,
+                                &failure.detail(),
+                            );
+                            self.suffixes.insert(
+                                transaction,
+                                ReplacementCoordinatedGuestUploadSuffix::RefreshResolutionFailed(
+                                    failure,
+                                ),
+                            );
+                            return Some(ReplacementGuestUploadSuffixProgress::FailedPreparation);
+                        }
+                    };
+                    return match runtime.dispatch_guest_upload_phase_recording(resolved) {
+                        Ok(pending) => {
+                            self.suffixes.insert(
+                                transaction,
+                                ReplacementCoordinatedGuestUploadSuffix::PendingRefreshRecording(
+                                    Box::new(pending),
+                                ),
+                            );
+                            Some(ReplacementGuestUploadSuffixProgress::PendingRecording)
+                        }
+                        Err(failure) => {
+                            self.suffixes.insert(
+                                transaction,
+                                ReplacementCoordinatedGuestUploadSuffix::RefreshDispatchFailed(
+                                    failure,
+                                ),
+                            );
+                            Some(ReplacementGuestUploadSuffixProgress::FailedRecording)
+                        }
+                    };
+                };
+                let resolved = match runtime.resolve_guest_upload_suffix_recording(*suffix) {
                     Ok(resolved) => resolved,
                     Err(failure) => {
+                        report_retained_failure_detail(
+                            "replacement_guest_upload_suffix_resolution",
+                            transaction,
+                            &failure.detail(),
+                        );
                         self.suffixes.insert(
                             transaction,
                             ReplacementCoordinatedGuestUploadSuffix::ResolutionFailed(failure),
@@ -4030,6 +4499,119 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
                             ReplacementCoordinatedGuestUploadSuffix::DispatchFailed(failure),
                         );
                         Some(ReplacementGuestUploadSuffixProgress::FailedRecording)
+                    }
+                }
+            }
+            ReplacementCoordinatedGuestUploadSuffix::PendingRefreshRecording(pending) => {
+                match (*pending).try_complete() {
+                    crate::runtime::replacement_session::ReplacementGuestUploadRecordingPoll::Pending(
+                        pending,
+                    ) => {
+                        self.suffixes.insert(
+                            transaction,
+                            ReplacementCoordinatedGuestUploadSuffix::PendingRefreshRecording(
+                                Box::new(pending),
+                            ),
+                        );
+                        Some(ReplacementGuestUploadSuffixProgress::PendingRecording)
+                    }
+                    crate::runtime::replacement_session::ReplacementGuestUploadRecordingPoll::Completed(
+                        Err(failure),
+                    ) => {
+                        self.suffixes.insert(
+                            transaction,
+                            ReplacementCoordinatedGuestUploadSuffix::RefreshDispatchFailed(failure),
+                        );
+                        Some(ReplacementGuestUploadSuffixProgress::FailedRecording)
+                    }
+                    crate::runtime::replacement_session::ReplacementGuestUploadRecordingPoll::Completed(
+                        Ok(recorded),
+                    ) => {
+                        let prepared = match runtime.prepare_recorded_guest_upload_refresh(recorded) {
+                            Ok(prepared) => prepared,
+                            Err(failure) => {
+                                self.suffixes.insert(
+                                    transaction,
+                                    ReplacementCoordinatedGuestUploadSuffix::RefreshPreparationFailed(
+                                        failure,
+                                    ),
+                                );
+                                return Some(
+                                    ReplacementGuestUploadSuffixProgress::FailedPreparation,
+                                );
+                            }
+                        };
+                        match runtime.enqueue_recorded_guest_upload(prepared) {
+                            Ok(pending) => {
+                                self.suffixes.insert(
+                                    transaction,
+                                    ReplacementCoordinatedGuestUploadSuffix::PendingRefresh(
+                                        Box::new(pending),
+                                    ),
+                                );
+                                Some(ReplacementGuestUploadSuffixProgress::PendingFinal)
+                            }
+                            Err(failure) => {
+                                self.suffixes.insert(
+                                    transaction,
+                                    ReplacementCoordinatedGuestUploadSuffix::RefreshEnqueueFailed(
+                                        failure,
+                                    ),
+                                );
+                                Some(ReplacementGuestUploadSuffixProgress::FailedEnqueue)
+                            }
+                        }
+                    }
+                }
+            }
+            ReplacementCoordinatedGuestUploadSuffix::PendingRefresh(pending) => {
+                match runtime.progress_guest_upload_auxiliary(*pending) {
+                    crate::runtime::replacement_session::ReplacementGuestUploadAuxiliaryProgress::Pending(
+                        pending,
+                    ) => {
+                        self.suffixes.insert(
+                            transaction,
+                            ReplacementCoordinatedGuestUploadSuffix::PendingRefresh(pending),
+                        );
+                        Some(ReplacementGuestUploadSuffixProgress::PendingFinal)
+                    }
+                    crate::runtime::replacement_session::ReplacementGuestUploadAuxiliaryProgress::Accepted(
+                        accepted,
+                    ) => {
+                        self.suffixes.insert(
+                            transaction,
+                            ReplacementCoordinatedGuestUploadSuffix::RefreshAccepted(accepted),
+                        );
+                        Some(ReplacementGuestUploadSuffixProgress::Accepted)
+                    }
+                    crate::runtime::replacement_session::ReplacementGuestUploadAuxiliaryProgress::DriverRefused {
+                        reason,
+                        prepared,
+                    } => {
+                        self.suffixes.insert(
+                            transaction,
+                            ReplacementCoordinatedGuestUploadSuffix::RefreshDriverRefused {
+                                reason,
+                                prepared,
+                            },
+                        );
+                        Some(ReplacementGuestUploadSuffixProgress::DriverRefused)
+                    }
+                    crate::runtime::replacement_session::ReplacementGuestUploadAuxiliaryProgress::AcceptanceRefused(
+                        failure,
+                    ) => {
+                        report_acceptance_refusal(
+                            "replacement_guest_upload_refresh",
+                            transaction,
+                            &failure.failure.reason,
+                        );
+                        self.suffixes.insert(
+                            transaction,
+                            ReplacementCoordinatedGuestUploadSuffix::RefreshAcceptanceRefused(
+                                failure,
+                            ),
+                        );
+                        Some(ReplacementGuestUploadSuffixProgress::AcceptanceRefused)
                     }
                 }
             }
@@ -4131,6 +4713,11 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
                     crate::runtime::replacement_session::ReplacementChainedFinalProgress::AcceptanceRefused(
                         failure,
                     ) => {
+                        report_acceptance_refusal(
+                            "replacement_guest_upload_final",
+                            transaction,
+                            &failure.failure.reason,
+                        );
                         self.suffixes.insert(
                             transaction,
                             ReplacementCoordinatedGuestUploadSuffix::AcceptanceRefused(failure),
@@ -4146,6 +4733,40 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
         }
     }
 
+    /// Take one suffix retained in a terminal refusal, so its caller can give
+    /// it up.
+    ///
+    /// Only `ResolutionFailed` is offered here, because it is the one terminal
+    /// state whose owner holds exactly what abandonment releases -- a prepared
+    /// native chain and a prepared resource envelope, both still cancellable.
+    /// The other terminal states of this coordinator hold a native submission
+    /// the driver has already seen, and giving one of those up is a different
+    /// release that this does not pretend to perform.
+    pub fn take_refused_resolution(
+        &mut self,
+    ) -> Option<(
+        reims_vgpu_protocol::TransactionId,
+        Box<
+            crate::runtime::replacement_session::ReplacementGuestUploadSuffixResolutionFailure<
+                Semantic,
+            >,
+        >,
+    )> {
+        let transaction = self.suffixes.iter().find_map(|(&transaction, suffix)| {
+            matches!(
+                suffix,
+                ReplacementCoordinatedGuestUploadSuffix::ResolutionFailed(_)
+            )
+            .then_some(transaction)
+        })?;
+        let Some(ReplacementCoordinatedGuestUploadSuffix::ResolutionFailed(failure)) =
+            self.suffixes.remove(&transaction)
+        else {
+            unreachable!("the refused resolution was just located by its state")
+        };
+        Some((transaction, failure))
+    }
+
     pub fn take_accepted(
         &mut self,
         transaction: reims_vgpu_protocol::TransactionId,
@@ -4157,6 +4778,41 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
                 None
             }
         }
+    }
+
+    pub fn take_refresh_accepted(
+        &mut self,
+        transaction: reims_vgpu_protocol::TransactionId,
+    ) -> Option<
+        Box<crate::runtime::replacement_session::ReplacementAcceptedGuestUploadAuxiliary<Semantic>>,
+    > {
+        match self.suffixes.remove(&transaction)? {
+            ReplacementCoordinatedGuestUploadSuffix::RefreshAccepted(accepted) => Some(accepted),
+            unchanged => {
+                self.suffixes.insert(transaction, unchanged);
+                None
+            }
+        }
+    }
+
+    pub fn restore_refresh_accepted(
+        &mut self,
+        accepted: Box<
+            crate::runtime::replacement_session::ReplacementAcceptedGuestUploadAuxiliary<Semantic>,
+        >,
+    ) -> Result<
+        (),
+        Box<crate::runtime::replacement_session::ReplacementAcceptedGuestUploadAuxiliary<Semantic>>,
+    > {
+        let transaction = accepted.transaction();
+        if self.suffixes.contains_key(&transaction) {
+            return Err(accepted);
+        }
+        self.suffixes.insert(
+            transaction,
+            ReplacementCoordinatedGuestUploadSuffix::RefreshAccepted(accepted),
+        );
+        Ok(())
     }
 
     pub fn transaction_ids(&self) -> Vec<reims_vgpu_protocol::TransactionId> {
@@ -4239,6 +4895,21 @@ pub(crate) enum ReplacementIndirectCoordinatorProgress {
     FinalAccepted,
     Failed,
     WrongStage,
+}
+
+impl ReplacementIndirectCoordinatorProgress {
+    /// See [`ReplacementExecSubmitCoordinatorProgress::is_refusal`].
+    const fn is_refusal(self) -> bool {
+        match self {
+            Self::PendingRecording
+            | Self::PendingAuxiliary
+            | Self::AuxiliaryAccepted
+            | Self::PendingFinal
+            | Self::FinalAccepted
+            | Self::WrongStage => false,
+            Self::Failed => true,
+        }
+    }
 }
 
 pub(crate) struct ReplacementIndirectCoordinator<Semantic> {
@@ -4445,6 +5116,11 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementIndirectCoordinato
                     crate::runtime::replacement_session::ReplacementIndirectAuxiliaryProgress::AcceptanceRefused(
                         failure,
                     ) => {
+                        report_acceptance_refusal(
+                            "replacement_indirect_auxiliary",
+                            transaction,
+                            &failure.failure.reason,
+                        );
                         self.ranges.insert(
                             transaction,
                             ReplacementCoordinatedIndirect::Failed(Box::new(
@@ -4495,6 +5171,11 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementIndirectCoordinato
                     crate::runtime::replacement_session::ReplacementChainedFinalProgress::AcceptanceRefused(
                         failure,
                     ) => {
+                        report_acceptance_refusal(
+                            "replacement_indirect_final",
+                            transaction,
+                            &failure.failure.reason,
+                        );
                         self.ranges.insert(
                             transaction,
                             ReplacementCoordinatedIndirect::Failed(Box::new(
@@ -4580,7 +5261,6 @@ type ReplacementTimelineProgressOwner<Semantic> =
     >;
 
 pub(crate) struct ReplacementPendingTimelineSemanticCompletion<Semantic> {
-    failure: crate::runtime::replacement_session::ReplacementExecutionCompletionError<Semantic>,
     progress: ReplacementTimelineProgressOwner<Semantic>,
     completions: std::collections::VecDeque<reims_vgpu_core::CompletionFact<Semantic>>,
 }
@@ -4594,6 +5274,106 @@ pub(crate) struct ReplacementTimelineCoordinatorProgress {
     pub retired_batches: usize,
 }
 
+/// Fold one formatted refusal reason into the `u64` the always-on failure path
+/// dedupes by. Two distinct reasons must not share a key or the second is never
+/// printed, so this is a hash of the whole reason and not of its variant alone.
+fn fnv_discriminant(reason: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in reason.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Name one queue observation this device could not apply.
+///
+/// The observation is retained for retry and is invisible to every live count,
+/// so a refusal that repeats forever reads as an idle device rather than as
+/// lost guest work.
+fn report_timeline_observation_refusal<Semantic: Clone>(
+    failure: &crate::runtime::replacement_session::ReplacementTimelineRetirementFailure,
+    runtime: &ReplacementRuntimeSession<Semantic>,
+) {
+    let reason = format!("{:?}", failure.reason);
+    let mut fields = vec![("reason", reason.clone())];
+    // A completion refused for a representation is a lifetime question, so the
+    // refusal is only actionable beside the state of every representation on
+    // the backing it names.
+    if let reims_vgpu_vulkan::replacement_replay::ReplacementReplayObservationError::ResourceCompletions(
+        reims_vgpu_core::ResourceCompletionBatchError::Duplicate(completion)
+        | reims_vgpu_core::ResourceCompletionBatchError::Completion { completion, .. },
+    ) = failure.reason
+    {
+        let backing = completion.backing();
+        fields.push((
+            "census",
+            runtime
+                .representation_census(backing)
+                .into_iter()
+                .map(|entry| {
+                    format!(
+                        "{}:native={},retiring={},accepted={},last={}",
+                        entry.representation.get(),
+                        u8::from(entry.has_native),
+                        u8::from(entry.retiring),
+                        entry.accepted_uses,
+                        entry.last_uses,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+    }
+    let diagnostic = ReplacementCoordinatorDiagnostic {
+        slug: "replacement_timeline_observation_refused",
+        fields,
+        discriminant: fnv_discriminant(&reason),
+    };
+    crate::observe::Emit::decline("replacement_timeline_observation", &diagnostic)
+        .fail_once(diagnostic.discriminant);
+}
+
+/// Name one GPU completion the semantic runtime refused. See
+/// [`report_timeline_observation_refusal`] for why it is reported rather than
+/// only retained.
+fn report_timeline_completion_refusal<Semantic: Clone>(
+    failure: &crate::runtime::replacement_session::ReplacementExecutionCompletionError<Semantic>,
+    runtime: &ReplacementRuntimeSession<Semantic>,
+) {
+    let (stage, transaction, reason) = match failure {
+        crate::runtime::replacement_session::ReplacementExecutionCompletionError::UnknownGeneration {
+            generation,
+            fact,
+        } => (
+            "unknown_generation",
+            fact.transaction,
+            format!("{generation:?}"),
+        ),
+        crate::runtime::replacement_session::ReplacementExecutionCompletionError::Commit(
+            failure,
+        ) => ("commit", failure.fact.transaction, format!("{:?}", failure.reason)),
+    };
+    let state = runtime
+        .transaction_state_diagnostics()
+        .into_iter()
+        .find_map(|(candidate, state)| (candidate == transaction.get()).then_some(state))
+        .unwrap_or_else(|| "absent".to_string());
+    let discriminant = format!("{transaction:?}:{reason}");
+    let diagnostic = ReplacementCoordinatorDiagnostic {
+        slug: "replacement_timeline_completion_refused",
+        fields: vec![
+            ("stage", stage.to_string()),
+            ("transaction", transaction.get().to_string()),
+            ("reason", reason),
+            ("state", state),
+        ],
+        discriminant: fnv_discriminant(&discriminant),
+    };
+    crate::observe::Emit::decline("replacement_timeline_completion", &diagnostic)
+        .fail_once(diagnostic.discriminant);
+}
+
 pub(crate) struct ReplacementTimelineCoordinator<Semantic> {
     observation_failures: std::collections::VecDeque<
         crate::runtime::replacement_session::ReplacementTimelineRetirementFailure,
@@ -4602,6 +5382,33 @@ pub(crate) struct ReplacementTimelineCoordinator<Semantic> {
         std::collections::VecDeque<ReplacementPendingTimelineSemanticCompletion<Semantic>>,
     published: std::collections::VecDeque<reims_vgpu_core::PublishedFact<Semantic>>,
     retired: std::collections::VecDeque<ReplacementTimelineProgressOwner<Semantic>>,
+}
+
+fn attempt_each_once<Fact, Publication, Failure>(
+    mut facts: std::collections::VecDeque<Fact>,
+    mut attempt: impl FnMut(Fact) -> Result<Vec<Publication>, (Failure, Fact)>,
+) -> (
+    std::collections::VecDeque<Fact>,
+    Vec<Publication>,
+    Vec<Failure>,
+) {
+    let attempts = facts.len();
+    let mut unresolved = std::collections::VecDeque::new();
+    let mut publications = Vec::new();
+    let mut failures = Vec::new();
+    for _ in 0..attempts {
+        let fact = facts
+            .pop_front()
+            .expect("the attempt count came from this fact queue");
+        match attempt(fact) {
+            Ok(published) => publications.extend(published),
+            Err((failure, fact)) => {
+                failures.push(failure);
+                unresolved.push_back(fact);
+            }
+        }
+    }
+    (unresolved, publications, failures)
 }
 
 impl<Semantic> Default for ReplacementTimelineCoordinator<Semantic> {
@@ -4626,6 +5433,7 @@ impl<Semantic: Clone> ReplacementTimelineCoordinator<Semantic> {
             match observation {
                 Ok(progress) => self.finish_progress(runtime, progress, &mut result),
                 Err(failure) => {
+                    report_timeline_observation_refusal(&failure, runtime);
                     self.observation_failures.push_back(failure);
                     result.observation_failures += 1;
                 }
@@ -4643,7 +5451,7 @@ impl<Semantic: Clone> ReplacementTimelineCoordinator<Semantic> {
         match runtime.apply_replacement_timeline_observation(failure.observation) {
             Ok(progress) => self.finish_progress(runtime, progress, &mut result),
             Err(failure) => {
-                self.observation_failures.push_front(failure);
+                self.observation_failures.push_back(failure);
                 result.observation_failures = 1;
             }
         }
@@ -4656,28 +5464,12 @@ impl<Semantic: Clone> ReplacementTimelineCoordinator<Semantic> {
     ) -> Option<ReplacementTimelineCoordinatorProgress> {
         let pending = self.semantic_failures.pop_front()?;
         let mut result = ReplacementTimelineCoordinatorProgress::default();
-        let fact = replacement_execution_completion_failure_fact(pending.failure);
-        match runtime.execution_mut().commit_completion(fact) {
-            Ok(facts) => {
-                result.published += facts.len();
-                self.published.extend(facts);
-                self.finish_progress_completions(
-                    runtime,
-                    pending.progress,
-                    pending.completions,
-                    &mut result,
-                );
-            }
-            Err(failure) => {
-                self.semantic_failures
-                    .push_front(ReplacementPendingTimelineSemanticCompletion {
-                        failure,
-                        progress: pending.progress,
-                        completions: pending.completions,
-                    });
-                result.semantic_failures = 1;
-            }
-        }
+        self.finish_progress_completions(
+            runtime,
+            pending.progress,
+            pending.completions,
+            &mut result,
+        );
         Some(result)
     }
 
@@ -4695,30 +5487,32 @@ impl<Semantic: Clone> ReplacementTimelineCoordinator<Semantic> {
         &mut self,
         runtime: &mut ReplacementRuntimeSession<Semantic>,
         progress: ReplacementTimelineProgressOwner<Semantic>,
-        mut completions: std::collections::VecDeque<reims_vgpu_core::CompletionFact<Semantic>>,
+        completions: std::collections::VecDeque<reims_vgpu_core::CompletionFact<Semantic>>,
         result: &mut ReplacementTimelineCoordinatorProgress,
     ) {
-        while let Some(fact) = completions.pop_front() {
-            match runtime.execution_mut().commit_completion(fact) {
-                Ok(facts) => {
-                    result.published += facts.len();
-                    self.published.extend(facts);
-                }
-                Err(failure) => {
-                    self.semantic_failures.push_back(
-                        ReplacementPendingTimelineSemanticCompletion {
-                            failure,
-                            progress,
-                            completions,
-                        },
-                    );
-                    result.semantic_failures += 1;
-                    return;
-                }
-            }
+        let (unresolved, published, _failures) = attempt_each_once(completions, |fact| {
+            runtime
+                .execution_mut()
+                .commit_completion(fact)
+                .map_err(|failure| {
+                    report_timeline_completion_refusal(&failure, runtime);
+                    let fact = replacement_execution_completion_failure_fact(failure);
+                    ((), fact)
+                })
+        });
+        result.published += published.len();
+        self.published.extend(published);
+        if unresolved.is_empty() {
+            self.retired.push_back(progress);
+            result.retired_batches += 1;
+        } else {
+            result.semantic_failures += unresolved.len();
+            self.semantic_failures
+                .push_back(ReplacementPendingTimelineSemanticCompletion {
+                    progress,
+                    completions: unresolved,
+                });
         }
-        self.retired.push_back(progress);
-        result.retired_batches += 1;
     }
 
     pub fn take_published(&mut self) -> Option<reims_vgpu_core::PublishedFact<Semantic>> {
@@ -4727,6 +5521,20 @@ impl<Semantic: Clone> ReplacementTimelineCoordinator<Semantic> {
 
     pub fn take_retired(&mut self) -> Option<ReplacementTimelineProgressOwner<Semantic>> {
         self.retired.pop_front()
+    }
+
+    /// Observations this coordinator could not apply, and completions the
+    /// semantic runtime refused. Both are retained for retry and neither is
+    /// visible from any live count, so a queue that stops draining reads as an
+    /// idle device until the census names it.
+    pub fn retained_failures(&self) -> (usize, usize) {
+        (
+            self.observation_failures.len(),
+            self.semantic_failures
+                .iter()
+                .map(|pending| pending.completions.len())
+                .sum(),
+        )
     }
 
     pub fn pending_publications(&self) -> usize {
@@ -4825,6 +5633,27 @@ impl<Semantic> ReplacementPublicationCoordinator<Semantic> {
 pub(crate) struct ReplacementDeviceCoordinator<Semantic> {
     runtime: ReplacementRuntimeSession<Semantic>,
     pipeline_wake_installed: bool,
+    /// Cumulative count of blocked-drain retries that failed again.
+    ///
+    /// Every blocked drain is re-offered unconditionally, so a packet whose
+    /// refusal can never change is re-offered for the life of the device. The
+    /// queue length alone cannot say which happened -- one packet stuck forever
+    /// and one packet that failed once and then landed both read as a moment of
+    /// `blocked_drains=1` -- and the diagnostic list dedupes by reason, so a
+    /// reason reported once looks the same either way. This grows once per tick
+    /// per stuck packet, which is the difference.
+    blocked_drain_retries: u64,
+    /// Cumulative count of child packets refused because this backend declared
+    /// it does not implement them. Each is one lost guest command, named once
+    /// on the failure channel.
+    refused_child_packets: usize,
+    /// Cumulative count of transactions given up after a terminal refusal.
+    ///
+    /// A high-water, not a per-window sample: it never resets, so the last
+    /// census line carries the boot total. A non-zero reading is guest work
+    /// lost -- the reason for each is on the failure channel, named by the
+    /// stage that refused it.
+    abandoned_transactions: usize,
     transport: crate::runtime::replacement_transport::ReplacementTransportOwner,
     cpu: ReplacementCpuCoordinator<Semantic>,
     present: ReplacementPresentCoordinator<Semantic>,
@@ -4896,6 +5725,8 @@ pub(crate) struct ReplacementDeviceCoordinator<Semantic> {
     >,
     blocked_drains: std::collections::VecDeque<Box<ReplacementBlockedDrain<Semantic>>>,
     drain_failures: std::collections::VecDeque<Box<ReplacementDeviceDrainFailure<Semantic>>>,
+    /// Cadence latch for [`Self::report_pipeline_census`].
+    last_pipeline_census_ms: u64,
     console_frames: std::collections::BTreeMap<
         (u32, u32),
         reims_vgpu_vulkan::replacement_console_present::ReplacementConsoleFrame,
@@ -4988,6 +5819,65 @@ impl crate::observe::Decline for ReplacementCoordinatorDiagnostic {
     fn fields(&self) -> Vec<(&'static str, String)> {
         self.fields.clone()
     }
+}
+
+/// Report one coordinator step that refused, on the always-on failure path.
+///
+/// A transaction that leaves the recording coordinator and stops inside a
+/// downstream one is invisible otherwise: every `progress_*` result was
+/// discarded, so a chain that could not prepare, enqueue, or be accepted read
+/// exactly like one still in flight. Ordinary progress stays quiet.
+/// Name why one retained coordinator failure refused.
+///
+/// [`report_coordinator_refusal`] reports the step an owner stopped at, which
+/// names the phase and not the refusal. Where a phase retains a typed reason,
+/// this reports that reason beside it, because an owner stuck in a terminal
+/// phase holds every transaction behind it on its channel.
+/// Report why an acceptance refused a transaction whose owner is then retained.
+///
+/// A retained refusal holds its source domain's submission head, so every later
+/// transaction on that channel refuses behind it. The stage name and the live
+/// count say that something is stuck; only the acceptance reason says what.
+fn report_acceptance_refusal(
+    stage: &'static str,
+    transaction: reims_vgpu_protocol::TransactionId,
+    reason: &impl std::fmt::Debug,
+) {
+    report_retained_failure_detail(stage, transaction, &format!("{reason:?}"));
+}
+
+fn report_retained_failure_detail(
+    stage: &'static str,
+    transaction: reims_vgpu_protocol::TransactionId,
+    detail: &str,
+) {
+    let diagnostic = ReplacementCoordinatorDiagnostic {
+        slug: "replacement_retained_failure",
+        fields: vec![
+            ("stage", stage.to_string()),
+            ("transaction", transaction.get().to_string()),
+            ("detail", detail.to_string()),
+        ],
+        discriminant: fnv_discriminant(detail),
+    };
+    crate::observe::Emit::decline(stage, &diagnostic).fail_once(diagnostic.discriminant);
+}
+
+fn report_coordinator_refusal(
+    coordinator: &'static str,
+    transaction: reims_vgpu_protocol::TransactionId,
+    step: impl std::fmt::Debug,
+) {
+    let diagnostic = ReplacementCoordinatorDiagnostic {
+        slug: "replacement_coordinator_refused",
+        fields: vec![
+            ("coordinator", coordinator.to_string()),
+            ("transaction", transaction.get().to_string()),
+            ("step", format!("{step:?}")),
+        ],
+        discriminant: transaction.get(),
+    };
+    crate::observe::Emit::decline(coordinator, &diagnostic).fail_once(diagnostic.discriminant);
 }
 
 fn replacement_root_read_diagnostic(
@@ -5145,6 +6035,9 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
         page_shift: u32,
     ) -> Result<Self, crate::runtime::replacement_transport::ReplacementTransportStartError> {
         Ok(Self {
+            abandoned_transactions: 0,
+            blocked_drain_retries: 0,
+            refused_child_packets: 0,
             runtime,
             pipeline_wake_installed: false,
             transport: crate::runtime::replacement_transport::ReplacementTransportOwner::new(
@@ -5179,6 +6072,7 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
             child_read_failures: std::collections::BTreeMap::new(),
             blocked_drains: std::collections::VecDeque::new(),
             drain_failures: std::collections::VecDeque::new(),
+            last_pipeline_census_ms: 0,
             console_frames: std::collections::BTreeMap::new(),
             next_console_frame: 0,
             console_frame_failure: None,
@@ -5341,6 +6235,49 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
 
     pub fn vulkan_state(&self) -> reims_vgpu_core::VulkanDeviceEpochState {
         self.runtime.session().vulkan().state()
+    }
+
+    /// Re-offer every retained timeline fact to a fixed point. One observation
+    /// may release a semantic fact in another retained batch, so stopping at
+    /// the first unchanged head can leave a ready producer unvisited.
+    pub fn retry_timeline_failures(&mut self) -> ReplacementTimelineCoordinatorProgress {
+        let mut progress = ReplacementTimelineCoordinatorProgress::default();
+        loop {
+            let before = self.timelines.retained_failures();
+            let observation_attempts = self.timelines.observation_failures.len();
+            let semantic_attempts = self.timelines.semantic_failures.len();
+            for _ in 0..observation_attempts {
+                let step = self
+                    .timelines
+                    .retry_observation_failure(&mut self.runtime)
+                    .expect("the attempt count came from the observation queue");
+                progress.observed += step.observed;
+                progress.observation_failures += step.observation_failures;
+                progress.semantic_failures += step.semantic_failures;
+                progress.published += step.published;
+                progress.retired_batches += step.retired_batches;
+            }
+            for _ in 0..semantic_attempts {
+                let step = self
+                    .timelines
+                    .retry_semantic_failure(&mut self.runtime)
+                    .expect("the attempt count came from the semantic queue");
+                progress.observed += step.observed;
+                progress.observation_failures += step.observation_failures;
+                progress.semantic_failures += step.semantic_failures;
+                progress.published += step.published;
+                progress.retired_batches += step.retired_batches;
+            }
+            let after = self.timelines.retained_failures();
+            if after == before || after == (0, 0) {
+                break;
+            }
+        }
+        self.absorb_publications();
+        while let Some(retired) = self.timelines.take_retired() {
+            self.retired_batches.push_back(retired);
+        }
+        progress
     }
 
     pub fn poll_timelines(&mut self) -> ReplacementTimelineCoordinatorProgress {
@@ -5573,14 +6510,21 @@ impl ReplacementDeviceCoordinator<()> {
                         lease.channel.get(),
                         replacement_host_exec_failure_diagnostic(failure)
                     ),
-                    ReplacementDeferredChildDispatchFailure::Cursor { lease, .. } => format!(
-                        "route=deferred_cursor channel={} reason=cursor_dispatch_refused",
-                        lease.channel.get()
+                    // A blocked head names *what* refused it. A route tag
+                    // alone says a channel is stuck and nothing about why,
+                    // which is the one question this line exists to answer.
+                    ReplacementDeferredChildDispatchFailure::Cursor { failure, lease } => format!(
+                        "route=deferred_cursor channel={} reason=cursor_dispatch_refused refusal={:?}",
+                        lease.channel.get(),
+                        failure.as_ref()
                     ),
-                    ReplacementDeferredChildDispatchFailure::Synchronize { lease, .. } => format!(
-                        "route=deferred_synchronize channel={} reason=synchronize_dispatch_refused",
-                        lease.channel.get()
-                    ),
+                    ReplacementDeferredChildDispatchFailure::Synchronize { failure, lease } => {
+                        format!(
+                            "route=deferred_synchronize channel={} reason=synchronize_dispatch_refused refusal={}",
+                            lease.channel.get(),
+                            failure.diagnostic()
+                        )
+                    }
                     ReplacementDeferredChildDispatchFailure::Blocked { lease, .. } => format!(
                         "route=deferred_unknown channel={} reason=transport_classification_blocked",
                         lease.channel.get()
@@ -5621,29 +6565,39 @@ impl ReplacementDeviceCoordinator<()> {
             self.recordings_to_cleanup.push_back(recording);
         }
         for ready in newly_ready {
-            match ready {
-                crate::runtime::replacement_session::ReplacementQueueReadyRecording::Exec(
-                    ready,
-                ) => {
-                    if let Err(failure) = self.exec_submissions.admit(ready, ()) {
-                        self.drain_failures.push_back(Box::new(
-                            ReplacementDeviceDrainFailure::ExecSubmitCoordinator(failure),
-                        ));
-                    }
-                }
-                crate::runtime::replacement_session::ReplacementQueueReadyRecording::GuestUpload(
-                    ready,
-                ) => {
-                    if let Err((ready, _semantic)) = self.guest_uploads.admit(ready, ()) {
-                        self.ready_guest_uploads.push_back(ready);
-                    }
-                }
-                crate::runtime::replacement_session::ReplacementQueueReadyRecording::IndirectRange(
-                    ready,
-                ) => self.ready_indirect_ranges.push_back(ready),
-            }
+            self.route_ready_recording(ready);
         }
         Ok(())
+    }
+
+    /// Hand one queue-ready recorded owner to the coordinator its own variant
+    /// names. This is the single route out of readiness: recordings settled by
+    /// `progress_exec_recordings` and owners released from the epoch parked map
+    /// after a predecessor is accepted both pass through here, so neither can
+    /// grow a route the other lacks.
+    fn route_ready_recording(
+        &mut self,
+        ready: crate::runtime::replacement_session::ReplacementQueueReadyRecording<()>,
+    ) {
+        match ready {
+            crate::runtime::replacement_session::ReplacementQueueReadyRecording::Exec(ready) => {
+                if let Err(failure) = self.exec_submissions.admit(ready, ()) {
+                    self.drain_failures.push_back(Box::new(
+                        ReplacementDeviceDrainFailure::ExecSubmitCoordinator(failure),
+                    ));
+                }
+            }
+            crate::runtime::replacement_session::ReplacementQueueReadyRecording::GuestUpload(
+                ready,
+            ) => {
+                if let Err((ready, _semantic)) = self.guest_uploads.admit(ready, ()) {
+                    self.ready_guest_uploads.push_back(ready);
+                }
+            }
+            crate::runtime::replacement_session::ReplacementQueueReadyRecording::IndirectRange(
+                ready,
+            ) => self.ready_indirect_ranges.push_back(ready),
+        }
     }
 
     pub fn gfx_write(&mut self, host: &mut impl HostControl, offset: u64, data: u64, size: u32) {
@@ -5685,6 +6639,174 @@ impl ReplacementDeviceCoordinator<()> {
         }
     }
 
+    /// One-per-second census of where guest work is sitting.
+    ///
+    /// A transaction that leaves one coordinator and stops inside the next is
+    /// otherwise indistinguishable from one that completed: the refusal
+    /// reporters name work that was *refused*, and this names work that is
+    /// merely *held*. Read the two together — a live count that stops falling
+    /// with no refusal beside it is a stage that is waiting for something that
+    /// will not arrive. Parked counts are the epoch's, so they say whether an
+    /// owner is waiting on a predecessor rather than on its own chain.
+    ///
+    /// It reports only while the pipeline holds work, so an idle device is
+    /// silent, and it is on the `OFF` channel because holding work is not a
+    /// loss.
+    fn report_pipeline_census(&mut self) {
+        let parked = self.runtime.parked_recordings();
+        // The gate is [`Self::owned_phase_count`] and nothing else, because a
+        // second hand-written sum of "is this device holding work" is a second
+        // rule that silently disagrees with the first. Both spellings of it
+        // have now been wrong in the same direction: one left out the blocked
+        // drains, so a packet the device could never admit went unreported once
+        // the pipeline emptied, and the next left out the CPU coordinator, so
+        // three control transactions stuck in a permanent apply failure -- with
+        // the guest waiting on the completion stamps behind them -- read as a
+        // quiet, healthy, idle device for the remaining nine minutes of a boot.
+        if self.owned_phase_count() + parked.execs + parked.guest_uploads + parked.indirect_ranges
+            == 0
+        {
+            return;
+        }
+        let now_ms = crate::observe::elapsed_us() / 1_000;
+        if now_ms.saturating_sub(self.last_pipeline_census_ms) < 1_000 {
+            return;
+        }
+        self.last_pipeline_census_ms = now_ms;
+        let waiting = self
+            .runtime
+            .parked_native_candidates()
+            .into_iter()
+            .filter(|(_, unmet)| !unmet.is_empty())
+            .map(|(transaction, unmet)| {
+                format!(
+                    "{}<-[{}]",
+                    transaction.get(),
+                    unmet
+                        .iter()
+                        .map(|producer| producer.get().to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let upload_stages = self
+            .guest_uploads
+            .stages()
+            .into_iter()
+            .map(|(transaction, stage)| format!("{}:{stage}", transaction.get()))
+            .collect::<Vec<_>>()
+            .join(",");
+        crate::observe::off(format!(
+            "replacement_pipeline_census recordings={} submissions={} uploads={} upload_stages=[{upload_stages}] retired_batches={} upload_suffixes={} indirects={} ready_uploads={} ready_indirects={} parked_execs={} parked_uploads={} parked_indirects={} blocked_drains={} drain_failures={}",
+            self.exec_recordings.live_recordings(),
+            self.exec_submissions.live_submissions(),
+            self.guest_uploads.live_uploads(),
+            self.retired_batches.len(),
+            self.guest_upload_suffixes.live_suffixes(),
+            self.indirects.live_ranges(),
+            self.ready_guest_uploads.len(),
+            self.ready_indirect_ranges.len(),
+            parked.execs,
+            parked.guest_uploads,
+            parked.indirect_ranges,
+            self.blocked_drains.len(),
+            self.drain_failures.len(),
+        ));
+        let (timeline_observations, timeline_semantics) = self.timelines.retained_failures();
+        let cpu_failed = self
+            .cpu_failure_diagnostics()
+            .into_iter()
+            .map(|(transaction, stage, _)| format!("{}:{stage}", transaction.get()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let publish_fail = self
+            .publication_failure
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_default();
+        let publish_retire_head = self
+            .publication_retirement_failures
+            .front()
+            .map(|failure| {
+                format!(
+                    "{}:{:?}",
+                    failure.published.0.transaction.get(),
+                    failure.reason
+                )
+            })
+            .unwrap_or_default();
+        let blocked_head = self
+            .blocked_drain_diagnostics()
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        crate::observe::off(format!(
+            "replacement_pipeline_stalls cpu_live={} cpu_failed=[{cpu_failed}] cpu_publications={} timeline_observations={timeline_observations} timeline_semantics={timeline_semantics} abandoned={} refused_packets={} blocked_retries={} blocked_head=[{blocked_head}] upload_resume={} upload_continuation={} indirect_resume={} accepted_routing={} publication_retire={} publish_fail=[{publish_fail}] publish_retire_head=[{publish_retire_head}] cleanup_dispatch={} cleanup_completion={} mmio={} continuing_uploads={} continuing_indirects={}",
+            self.cpu.live_packets(),
+            self.cpu.pending_publications(),
+            self.abandoned_transactions,
+            self.refused_child_packets,
+            self.blocked_drain_retries,
+            self.guest_upload_resume_failures.len(),
+            self.guest_upload_continuation_failures.len(),
+            self.indirect_resume_failures.len(),
+            self.accepted_routing_failures.len(),
+            self.publication_retirement_failures.len(),
+            self.recording_cleanup_dispatch_failures.len(),
+            self.recording_cleanup_completion_failures.len(),
+            self.mmio_failures.len(),
+            self.continuing_guest_uploads.len(),
+            self.continuing_indirect_ranges.len(),
+        ));
+        // Where every tracked transaction sits. A blocked head names the
+        // producer it waits for, and the only useful next question is what that
+        // producer is itself waiting for -- which the live-recording gauge
+        // cannot answer, because a count cannot say which of the six is the one
+        // somebody is parked on. Flags are terse on purpose: this is one line a
+        // second on a device that may hold many transactions.
+        let order = self
+            .runtime
+            .submission_order_census()
+            .into_iter()
+            .map(|entry| {
+                let mut flags = String::new();
+                for (set, mark) in [
+                    (entry.recorded, 'r'),
+                    (entry.issued, 'i'),
+                    (entry.submitted, 's'),
+                    (entry.abandoned, 'a'),
+                ] {
+                    if set {
+                        flags.push(mark);
+                    }
+                }
+                format!(
+                    "{}@{}.{}{}",
+                    entry.transaction.get(),
+                    entry.domain.get(),
+                    entry.sequence.get(),
+                    if flags.is_empty() {
+                        String::from(":-")
+                    } else {
+                        format!(":{flags}")
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !order.is_empty() {
+            crate::observe::off(format!(
+                "replacement_submission_order transaction@domain.sequence:rias {order}"
+            ));
+        }
+        if !waiting.is_empty() {
+            crate::observe::off(format!(
+                "replacement_pipeline_waits consumer<-unmet_producers {waiting}"
+            ));
+        }
+    }
+
     pub fn tick(
         &mut self,
         host: &mut (impl HostMemory + crate::runtime::host::HostOps),
@@ -5704,7 +6826,7 @@ impl ReplacementDeviceCoordinator<()> {
                 ) => self.pipeline_wake_installed = true,
             }
         }
-        let pipeline_completions = self.runtime.session().progress_pipeline_completions();
+        let _ = self.runtime.session().progress_pipeline_completions();
         let drained = self.drain(host);
         let cpu_completed = self.progress_cpu_packets(host);
         let _ = self.progress_present_preparations();
@@ -5716,24 +6838,21 @@ impl ReplacementDeviceCoordinator<()> {
         let exec_acceptances = self.harvest_exec_acceptances();
         let _ = self.progress_guest_uploads();
         let timeline = self.poll_timelines();
+        // Both queues are retained for retry and nothing else drains them, so
+        // without one attempt per tick a single refused observation or
+        // completion stops every later retirement for the boot's life.
+        let _ = self.retry_timeline_failures();
         let guest_uploads_resumed = self.resume_completed_guest_uploads();
         let _ = self.progress_guest_upload_suffixes();
+        // A refused suffix is terminal and nothing else claims it, so without
+        // one release per tick a single unimplemented case holds the channel's
+        // submission head and publication position for the boot's life.
+        let _ = self.release_refused_guest_upload_suffixes();
         let _ = self.progress_indirect_ranges();
         let _ = self.progress_present_completions(host);
         let retired_batches = self.harvest_retired_batches();
         let recording_cleanups = self.progress_recording_cleanup();
-        if pipeline_completions != 0 || recordings_handed_off != 0 || exec_acceptances != 0 {
-            crate::observe::off(format!(
-                "replacement_tick_progress pipeline_completions={pipeline_completions} drained_root={} drained_child={} drained_failures={} recordings_handed_off={recordings_handed_off} exec_acceptances={exec_acceptances} timeline_observations={} recording_cleanups={recording_cleanups} blocked={} live_recordings={} live_submissions={}",
-                drained.root_packets,
-                drained.child_packets,
-                drained.failures,
-                timeline.observed,
-                self.blocked_drains.len(),
-                self.exec_recordings.live_recordings(),
-                self.exec_submissions.live_submissions(),
-            ));
-        }
+        self.report_pipeline_census();
         if self.terminalize_device_loss() {
             return ReplacementDeviceTickProgress {
                 drained,
@@ -5784,7 +6903,10 @@ impl ReplacementDeviceCoordinator<()> {
         }
     }
 
-    pub fn progress_cpu_packets(&mut self, host: &mut (impl HostMemory + HostControl)) -> usize {
+    pub fn progress_cpu_packets(
+        &mut self,
+        host: &mut (impl HostMemory + crate::runtime::host::HostOps),
+    ) -> usize {
         let ids = self.cpu.transaction_ids();
         let mut progressed = 0;
         for transaction in ids {
@@ -5945,23 +7067,44 @@ impl ReplacementDeviceCoordinator<()> {
         progress
     }
 
+    /// Settle every admitted EXEC recording and route each owner that became
+    /// queue-ready. The count returned is recordings that left this coordinator
+    /// owning ready work; a parked recording is progress too, but its owner now
+    /// belongs to the runtime epoch and is released by predecessor acceptance.
     pub fn progress_exec_recordings(&mut self) -> usize {
         let ids = self.exec_recordings.transaction_ids();
         let mut handed_off = 0;
         for transaction in ids {
-            if self.exec_recordings.poll(&mut self.runtime, transaction)
-                != Some(ReplacementExecRecordingCoordinatorProgress::Ready)
-            {
-                continue;
-            }
-            let Some(ready) = self.exec_recordings.take_direct_ready(transaction) else {
+            let Some(disposition) = self.exec_recordings.poll(&mut self.runtime, transaction)
+            else {
                 continue;
             };
-            match self.exec_submissions.admit(ready, ()) {
-                Ok(_) => handed_off += 1,
-                Err(failure) => self.drain_failures.push_back(Box::new(
-                    ReplacementDeviceDrainFailure::ExecSubmitCoordinator(failure),
-                )),
+            match disposition {
+                ReplacementExecRecordingDisposition::Pending
+                | ReplacementExecRecordingDisposition::Parked(_) => {}
+                ReplacementExecRecordingDisposition::Ready(ready) => {
+                    self.route_ready_recording(ready);
+                    handed_off += 1;
+                }
+                ReplacementExecRecordingDisposition::Failed(refusal) => {
+                    let mut fields = vec![
+                        ("transaction", transaction.get().to_string()),
+                        ("stage", refusal.stage.to_string()),
+                    ];
+                    if let Some(detail) = refusal.detail {
+                        fields.push(("detail", detail));
+                    }
+                    let diagnostic = ReplacementCoordinatorDiagnostic {
+                        slug: "replacement_exec_recording_refused",
+                        fields,
+                        discriminant: transaction.get(),
+                    };
+                    crate::observe::Emit::decline(
+                        "replacement_exec_recording_progress",
+                        &diagnostic,
+                    )
+                    .fail_once(diagnostic.discriminant);
+                }
             }
         }
         handed_off
@@ -5978,6 +7121,9 @@ impl ReplacementDeviceCoordinator<()> {
                 step => step,
             };
             if let Some(step) = step {
+                if step.is_refusal() {
+                    report_coordinator_refusal("replacement_exec_submit", transaction, step);
+                }
                 progress.push(step);
             }
         }
@@ -6030,6 +7176,9 @@ impl ReplacementDeviceCoordinator<()> {
         let mut progress = Vec::with_capacity(ids.len());
         for transaction in ids {
             if let Some(step) = self.guest_uploads.progress(&mut self.runtime, transaction) {
+                if step.is_refusal() {
+                    report_coordinator_refusal("replacement_guest_upload", transaction, step);
+                }
                 progress.push(step);
             }
         }
@@ -6094,6 +7243,38 @@ impl ReplacementDeviceCoordinator<()> {
         resumed
     }
 
+    /// Give up every guest-upload suffix retained in a terminal resolution
+    /// refusal, so one unimplemented case costs the guest that transaction and
+    /// not the channel it arrived on.
+    ///
+    /// A retained refusal holds its domain's submission head, its encoder
+    /// continuation and its publication position, so without this every later
+    /// transaction on the channel refuses behind it and no fact after it ever
+    /// reaches the guest. The refusal itself was already named on the failure
+    /// channel by the stage that produced it; this is the release, not the
+    /// report.
+    pub fn release_refused_guest_upload_suffixes(&mut self) -> usize {
+        let mut released = 0;
+
+        while let Some((transaction, failure)) =
+            self.guest_upload_suffixes.take_refused_resolution()
+        {
+            match self.runtime.abandon_guest_upload_suffix(failure.suffix, ()) {
+                Ok(published) => {
+                    self.publications.enqueue(published);
+                    self.abandoned_transactions += 1;
+                    released += 1;
+                }
+                Err(reason) => report_retained_failure_detail(
+                    "replacement_guest_upload_suffix_abandonment",
+                    transaction,
+                    &format!("{reason:?}"),
+                ),
+            }
+        }
+        released
+    }
+
     pub fn progress_guest_upload_suffixes(&mut self) -> Vec<ReplacementGuestUploadSuffixProgress> {
         while let Some(continuing) = self.continuing_guest_uploads.pop_front() {
             if let Err(continuing) = self.guest_upload_suffixes.admit(continuing) {
@@ -6108,7 +7289,27 @@ impl ReplacementDeviceCoordinator<()> {
                 .guest_upload_suffixes
                 .progress(&mut self.runtime, transaction)
             {
+                if step.is_refusal() {
+                    report_coordinator_refusal(
+                        "replacement_guest_upload_suffix",
+                        transaction,
+                        step,
+                    );
+                }
                 progress.push(step);
+            }
+        }
+        for transaction in ids.iter().copied() {
+            let Some(accepted) = self
+                .guest_upload_suffixes
+                .take_refresh_accepted(transaction)
+            else {
+                continue;
+            };
+            if let Err(accepted) = self.guest_uploads.admit_accepted(accepted) {
+                self.guest_upload_suffixes
+                    .restore_refresh_accepted(accepted)
+                    .expect("the refresh owner was just removed from this coordinator");
             }
         }
         for transaction in ids {
@@ -6139,6 +7340,9 @@ impl ReplacementDeviceCoordinator<()> {
         let mut progress = Vec::with_capacity(ids.len());
         for transaction in ids.iter().copied() {
             if let Some(step) = self.indirects.progress(&mut self.runtime, transaction) {
+                if step.is_refusal() {
+                    report_coordinator_refusal("replacement_indirect_range", transaction, step);
+                }
                 progress.push(step);
             }
         }
@@ -6242,7 +7446,7 @@ impl ReplacementDeviceCoordinator<()> {
 
     fn admit_cpu_and_progress(
         &mut self,
-        host: &mut (impl HostMemory + HostControl),
+        host: &mut (impl HostMemory + crate::runtime::host::HostOps),
         admitted: ReplacementAdmittedCpuPacket<()>,
     ) -> Result<(), Box<ReplacementCpuCoordinatorAdmissionFailure<()>>> {
         let transaction = admitted.transaction();
@@ -6260,7 +7464,7 @@ impl ReplacementDeviceCoordinator<()> {
 
     fn admit_child_owner(
         &mut self,
-        host: &mut (impl HostMemory + HostControl),
+        host: &mut (impl HostMemory + crate::runtime::host::HostOps),
         admitted: crate::runtime::replacement_child_packet::ReplacementAdmittedChildCpuPacket<()>,
     ) {
         match ReplacementAdmittedCpuPacket::try_from(admitted) {
@@ -6277,6 +7481,46 @@ impl ReplacementDeviceCoordinator<()> {
                         ReplacementDeviceDrainFailure::PresentCoordinator(failure),
                     ));
                 }
+            }
+        }
+    }
+
+    /// Refuse one child packet whose reason the guest has already settled,
+    /// consuming its ring lease so the channel advances past it.
+    ///
+    /// Both phases reach here: an ingress admission that named an object the
+    /// guest's own table does not hold, and a deferred dispatch that named a
+    /// case this backend has declared it does not build.
+    ///
+    /// This is the ingress counterpart of giving up a refused transaction. The
+    /// packet is lost and the guest is told what was lost, once, by name -- the
+    /// alternative was re-offering it on every tick for the life of the device,
+    /// which cost the guest the whole channel rather than one packet and left
+    /// nothing in any census to say so.
+    fn refuse_child_packet(
+        &mut self,
+        host: &mut impl HostMemory,
+        refused: ReplacementRefusedChildPacket,
+    ) -> usize {
+        let ReplacementRefusedChildPacket { lease, detail } = refused;
+        let channel = lease.channel;
+        let opcode = lease.packet.opcode;
+        match self.transport.commit_child_packet(host, lease) {
+            Ok(()) => {
+                self.refused_child_packets += 1;
+                crate::observe::fail(format!(
+                    "replacement_child_packet_refused channel={} opcode={opcode:#x} {detail}",
+                    channel.get()
+                ));
+                1
+            }
+            Err(failure) => {
+                crate::observe::fail(format!(
+                    "replacement_child_packet_refusal_uncommitted channel={} opcode={opcode:#x} reason={:?} {detail}",
+                    channel.get(),
+                    failure.reason
+                ));
+                0
             }
         }
     }
@@ -6342,11 +7586,17 @@ impl ReplacementDeviceCoordinator<()> {
                             }
                         }
                     }
-                    Err(failure) => {
-                        self.blocked_drains
-                            .push_back(Box::new(ReplacementBlockedDrain::ChildIngress(failure)));
-                        return Err(());
-                    }
+                    Err(failure) => match failure.into_refusal() {
+                        Ok(refused) => {
+                            return Ok((0, 0, self.refuse_child_packet(host, refused)));
+                        }
+                        Err(failure) => {
+                            self.blocked_drains.push_back(Box::new(
+                                ReplacementBlockedDrain::ChildIngress(failure),
+                            ));
+                            return Err(());
+                        }
+                    },
                 }
             }
             ReplacementBlockedDrain::DeferredChild(failure) => {
@@ -6357,11 +7607,17 @@ impl ReplacementDeviceCoordinator<()> {
                     *failure,
                 ) {
                     Ok((admitted, channel)) => (Some(admitted), channel),
-                    Err(failure) => {
-                        self.blocked_drains
-                            .push_back(Box::new(ReplacementBlockedDrain::DeferredChild(failure)));
-                        return Err(());
-                    }
+                    Err(failure) => match failure.into_refusal() {
+                        Ok(refused) => {
+                            return Ok((0, 0, self.refuse_child_packet(host, refused)));
+                        }
+                        Err(failure) => {
+                            self.blocked_drains.push_back(Box::new(
+                                ReplacementBlockedDrain::DeferredChild(failure),
+                            ));
+                            return Err(());
+                        }
+                    },
                 }
             }
             ReplacementBlockedDrain::Mapper(failure) => {
@@ -6459,7 +7715,10 @@ impl ReplacementDeviceCoordinator<()> {
                     progress.child_packets += child;
                     progress.mapper_entries += mapper;
                 }
-                Err(()) => progress.failures += 1,
+                Err(()) => {
+                    self.blocked_drain_retries = self.blocked_drain_retries.saturating_add(1);
+                    progress.failures += 1;
+                }
             }
         }
         let work = self.transport.take_work();
@@ -6787,6 +8046,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn guest_upload_suffix_waiting_for_a_content_producer_is_retryable() {
+        assert!(!ReplacementGuestUploadSuffixProgress::WaitingForProducer.is_refusal());
+        assert!(ReplacementGuestUploadSuffixProgress::FailedPreparation.is_refusal());
+    }
+
+    #[test]
+    fn one_completion_pass_does_not_hide_a_later_producer_behind_its_consumer() {
+        let mut producer_completed = false;
+        let facts = std::collections::VecDeque::from(["consumer", "producer"]);
+        let (pending, published, failures) = attempt_each_once(facts, |fact| match fact {
+            "consumer" if !producer_completed => Err(("not ready", fact)),
+            "producer" => {
+                producer_completed = true;
+                Ok(vec![fact])
+            }
+            _ => Ok(vec![fact]),
+        });
+
+        assert_eq!(published, ["producer"]);
+        assert_eq!(failures, ["not ready"]);
+        assert_eq!(pending, ["consumer"]);
+        let (pending, published, failures) =
+            attempt_each_once(pending, |fact| Ok::<_, (&str, &str)>(vec![fact]));
+        assert!(pending.is_empty());
+        assert_eq!(published, ["consumer"]);
+        assert!(failures.is_empty());
+    }
+
+    #[test]
     fn object_apply_diagnostic_reports_identity_and_typed_reason_only() {
         let diagnostic = replacement_loaded_object_apply_refusal_diagnostic(
             reims_vgpu_protocol::ObjectTableRef::new(11),
@@ -7026,9 +8314,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(host.get_u32(reply_gpa), 0);
-        let applied =
-            apply_cpu_host_effect(&runtime, &mut host, crate::model::PAGE_SHIFT_X86, applied)
-                .unwrap();
+        let applied = apply_cpu_host_effect(
+            &mut runtime,
+            &mut host,
+            crate::model::PAGE_SHIFT_X86,
+            applied,
+        )
+        .unwrap();
         assert_ne!(host.get_u32(reply_gpa), 0);
         let published = complete_host_applied_cpu_packet(&mut runtime, applied, ()).unwrap();
         assert_eq!(published.len(), 1);
@@ -7064,9 +8356,13 @@ mod tests {
         )
         .unwrap();
         let mut host = crate::runtime::host::FakeHost::new();
-        let applied =
-            apply_cpu_host_effect(&runtime, &mut host, crate::model::PAGE_SHIFT_X86, applied)
-                .unwrap();
+        let applied = apply_cpu_host_effect(
+            &mut runtime,
+            &mut host,
+            crate::model::PAGE_SHIFT_X86,
+            applied,
+        )
+        .unwrap();
         assert_eq!(host.action_count(HostActionKind::CursorUpdate), 1);
         let published = complete_host_applied_cpu_packet(&mut runtime, applied, ()).unwrap();
         assert_eq!(published.len(), 1);
@@ -7125,6 +8421,194 @@ mod tests {
         assert_eq!(host.action_count(HostActionKind::IrqGfxPulse), 1);
     }
 
+    /// A physical replacement revokes the backing's construction-designated
+    /// execution object, and the contract says a subsequent materialization
+    /// installs a fresh representation identity. Nothing performed that
+    /// materialization where the replacement landed: one EXEC ingress route
+    /// carried a repair keyed to its own refusal shape, so the guest-upload
+    /// suffix and indirect-range routes met a revoked backing as a terminal
+    /// refusal holding their whole recorded chain.
+    /// A plane of a registered surface reaches the late repair as a backing,
+    /// and the repair has to know what class of storage that is.
+    ///
+    /// The object-ready route materializes from the *resources* a packet
+    /// declares, so it is the only route that can tell a plane view from a
+    /// linear allocation. A backing that arrives at the late repair came from
+    /// somewhere else -- an earlier packet's declaration, or a replacement --
+    /// and the storage node is the only thing left that says which class it is.
+    /// A repair that assumed task-address storage refused every plane by name,
+    /// and a missing execution representation holds the whole recorded chain,
+    /// so that refusal parked the channel's submission head instead of costing
+    /// one command.
+    #[test]
+    fn the_late_repair_builds_a_registered_surface_plane_and_not_only_a_task_address() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(11);
+        runtime.define_task(task, 0x40_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        // The surface names guest page 0x200 and spans one page, so the task's
+        // page table has to resolve exactly that page.
+        let backing_pfn = 0x200u64;
+        host.map_range(9u64 << shift, 1usize << shift, 0);
+        host.write_gpa(root + backing_pfn * 4, &9u32.to_le_bytes())
+            .unwrap();
+
+        let surface_object = 41;
+        let mut planes = [reims_vgpu_protocol::SurfaceBackingPlane::default();
+            reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP];
+        planes[0] = reims_vgpu_protocol::SurfaceBackingPlane {
+            offset: 0,
+            width: 4,
+            height: 4,
+            bytes_per_row: 16,
+            bytes_per_element: 4,
+        };
+        crate::runtime::replacement_object_lifecycle::apply_replacement_registered_surface(
+            &mut runtime,
+            task,
+            surface_object,
+            reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(
+                reims_vgpu_protocol::SurfaceBackingDescriptor {
+                    length: 1 << shift,
+                    backing_pfn: backing_pfn as u32,
+                    pixel_format: u32::from_be_bytes(*b"BGRA"),
+                    plane_count: 1,
+                    planes,
+                    width: 4,
+                    height: 4,
+                    bytes_per_row: 16,
+                },
+            ),
+        )
+        .unwrap();
+        let view =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                42,
+                reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(
+                    reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor {
+                        surface: reims_vgpu_protocol::ObjectTableRef::new(surface_object),
+                        owner_task: task,
+                        operation_kind: Some(5),
+                        operation_length: Some(32),
+                        own_ref: Some(reims_vgpu_protocol::ObjectTableRef::new(42)),
+                        record_kind: Some(reims_vgpu_protocol::IOSurfacePlaneViewRecordKind::Plane),
+                        unidentified_record_flags: 0,
+                        view: Some(reims_vgpu_protocol::IOSurfacePlaneViewDescriptor {
+                            pixel_format: 80,
+                            width: 4,
+                            height: 4,
+                            depth: 1,
+                            plane_index: 0,
+                        }),
+                        decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(!runtime.backing_has_execution_representation(view.backing));
+
+        prepare_backing_representation(&mut runtime, &mut host, shift, view.backing).unwrap();
+        assert!(runtime.backing_has_execution_representation(view.backing));
+    }
+
+    #[test]
+    fn a_physical_replacement_reinstalls_the_backing_execution_representation() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(7);
+        runtime.define_task(task, 0x10_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        let data = 9u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        host.map_range(data, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        host.write_gpa(root + 0x10 * 4, &9u32.to_le_bytes())
+            .unwrap();
+
+        let channel = reims_vgpu_protocol::ChannelId::new(5);
+        runtime.define_channel(channel).unwrap();
+        let object = reims_vgpu_protocol::ObjectTableRef::new(17);
+        let declaration =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+                &mut runtime,
+                shift,
+                task,
+                object.get(),
+                reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                    reims_vgpu_protocol::BufferDescriptor {
+                        allocation_size: 64,
+                        handle: 0x10,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing)
+            .unwrap();
+        let first = runtime
+            .execution()
+            .resources()
+            .execution_representation_id(declaration.backing)
+            .unwrap();
+
+        let replacement =
+            crate::runtime::replacement_child_packet::admit_replacement_physical_replacement(
+                &mut runtime,
+                channel,
+                Box::default(),
+                None,
+                crate::runtime::replacement_child_packet::DecodedReplacementPhysicalReplacement {
+                    task,
+                    object,
+                },
+            )
+            .unwrap();
+        let applied = runtime
+            .apply_admitted_resource_lifecycle(replacement)
+            .unwrap();
+        let applied = apply_cpu_host_effect(
+            &mut runtime,
+            &mut host,
+            shift,
+            ReplacementAppliedCpuPacket::ResourceLifecycle(applied),
+        )
+        .unwrap();
+        let second = runtime
+            .execution()
+            .resources()
+            .execution_representation_id(declaration.backing)
+            .expect("a physical replacement reinstalls the execution representation");
+        assert_ne!(first, second);
+        complete_host_applied_cpu_packet(&mut runtime, applied, ()).unwrap();
+    }
+
     #[test]
     fn replacement_task_reader_walks_the_exact_declared_address_space() {
         use crate::runtime::host::HostMemory;
@@ -7169,6 +8653,307 @@ mod tests {
                 )
             )
         );
+    }
+
+    /// A recording that becomes queue-ready as a staged guest upload must leave
+    /// the exec-recording coordinator owning its upload route. Erasing the
+    /// route at this seam strands the owner: the recording keeps reporting
+    /// ready while no coordinator holds the work, and every later transaction
+    /// in the same source domain queues behind it.
+    #[test]
+    fn a_queue_ready_guest_upload_recording_routes_into_its_own_coordinator() {
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let channel = reims_vgpu_protocol::ChannelId::new(26);
+        runtime.define_channel(channel).unwrap();
+        let resources = crate::runtime::replacement_session::stage_guest_upload_resources_for_test(
+            &mut runtime,
+        );
+        let Some(staged) = crate::runtime::replacement_session::stage_guest_upload_ingress_for_test(
+            &mut runtime,
+            resources,
+            channel,
+            69,
+            None,
+        ) else {
+            return;
+        };
+        assert!(matches!(
+            &staged,
+            crate::runtime::replacement_session::PendingReplacementIngressExec::GuestUpload(_)
+        ));
+        let transaction = staged.transaction();
+        let mut device =
+            ReplacementDeviceCoordinator::new(runtime, crate::model::PAGE_SHIFT_X86).unwrap();
+        device
+            .exec_recordings
+            .admit(staged)
+            .unwrap_or_else(|_| panic!("the recording transaction must be unique"));
+        let mut handed_off = false;
+        for _ in 0..100_000 {
+            if device.progress_exec_recordings() == 1 {
+                handed_off = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            handed_off,
+            "a queue-ready staged upload must leave the recording coordinator"
+        );
+        assert_eq!(
+            device.exec_recordings.live_recordings(),
+            0,
+            "no route-erased marker may remain once the owner has left"
+        );
+        assert_eq!(
+            device.exec_submissions.live_submissions(),
+            0,
+            "a staged upload is not a direct submission"
+        );
+        assert!(device.ready_guest_uploads.is_empty());
+        assert_eq!(device.guest_uploads.transaction_ids(), vec![transaction]);
+    }
+
+    /// When a recorded owner parks behind a predecessor, ownership moves into
+    /// the runtime epoch and nothing may remain in the recording coordinator.
+    /// Retaining a marker there keeps the transaction live forever and holds
+    /// every later transaction in its source domain behind it. Accepting the
+    /// predecessor must then release the parked owner exactly once, into the
+    /// coordinator its own route names.
+    #[test]
+    fn a_parked_recording_leaves_the_coordinator_and_returns_through_its_predecessor() {
+        use crate::runtime::replacement_session as session;
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let upload_channel = reims_vgpu_protocol::ChannelId::new(26);
+        let producer_channel = reims_vgpu_protocol::ChannelId::new(28);
+        runtime.define_channel(upload_channel).unwrap();
+        runtime.define_channel(producer_channel).unwrap();
+        let resources = session::stage_guest_upload_resources_for_test(&mut runtime);
+        let event = reims_vgpu_protocol::ResourceId::new(41, 1);
+        let Some(upload) = session::stage_guest_upload_ingress_for_test(
+            &mut runtime,
+            resources,
+            upload_channel,
+            69,
+            Some(reims_vgpu_core::EventOperation {
+                event,
+                kind: reims_vgpu_core::EventOperationKind::Wait,
+                value: 1,
+            }),
+        ) else {
+            return;
+        };
+        let Some(producer) = session::stage_event_signal_ingress_for_test(
+            &mut runtime,
+            producer_channel,
+            71,
+            reims_vgpu_core::EventOperation {
+                event,
+                kind: reims_vgpu_core::EventOperationKind::Signal,
+                value: 1,
+            },
+        ) else {
+            return;
+        };
+        assert!(matches!(
+            &upload,
+            session::PendingReplacementIngressExec::GuestUpload(_)
+        ));
+        assert!(matches!(
+            &producer,
+            session::PendingReplacementIngressExec::Direct(_)
+        ));
+        let upload_transaction = upload.transaction();
+        let mut device =
+            ReplacementDeviceCoordinator::new(runtime, crate::model::PAGE_SHIFT_X86).unwrap();
+        device
+            .exec_recordings
+            .admit(upload)
+            .unwrap_or_else(|_| panic!("the upload transaction must be unique"));
+        device
+            .exec_recordings
+            .admit(producer)
+            .unwrap_or_else(|_| panic!("the producer transaction must be unique"));
+
+        let mut settled = false;
+        for _ in 0..100_000 {
+            device.progress_exec_recordings();
+            if device.exec_recordings.live_recordings() == 0 {
+                settled = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            settled,
+            "a parked owner belongs to the runtime epoch, not to the recording coordinator"
+        );
+        assert_eq!(
+            device.guest_uploads.live_uploads(),
+            0,
+            "the parked upload may not reach its queue before its predecessor"
+        );
+        assert_eq!(device.exec_submissions.live_submissions(), 1);
+
+        let mut accepted = false;
+        for _ in 0..100_000 {
+            let _ = device.progress_exec_submissions();
+            if device.harvest_exec_acceptances() == 1 {
+                accepted = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(accepted, "the producer must return driver acceptance");
+        assert_eq!(
+            device.guest_uploads.transaction_ids(),
+            vec![upload_transaction],
+            "predecessor acceptance must release the parked owner into its own coordinator"
+        );
+        assert!(device.ready_guest_uploads.is_empty());
+        assert_eq!(device.exec_recordings.live_recordings(), 0);
+        assert!(device.drain_failures.is_empty());
+    }
+
+    /// An indirect range reserves its own source head at the initial readback
+    /// phase, so its queue-ready owner belongs to the indirect coordinator.
+    /// Routing it as a direct submission, or leaving it behind in the recording
+    /// coordinator, loses the continuation chain the guest asked for.
+    #[test]
+    fn an_initial_indirect_range_recording_routes_into_the_indirect_coordinator() {
+        use crate::runtime::replacement_session as session;
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let channel = reims_vgpu_protocol::ChannelId::new(16);
+        runtime.define_channel(channel).unwrap();
+        let Some(pending) =
+            session::stage_initial_indirect_range_ingress_for_test(&mut runtime, channel)
+        else {
+            return;
+        };
+        let transaction = pending.transaction();
+        let mut device =
+            ReplacementDeviceCoordinator::new(runtime, crate::model::PAGE_SHIFT_X86).unwrap();
+        device
+            .exec_recordings
+            .admit(pending)
+            .unwrap_or_else(|_| panic!("the recording transaction must be unique"));
+        let mut handed_off = false;
+        for _ in 0..100_000 {
+            if device.progress_exec_recordings() == 1 {
+                handed_off = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            handed_off,
+            "a queue-ready initial indirect range must leave the recording coordinator"
+        );
+        assert_eq!(device.exec_recordings.live_recordings(), 0);
+        assert_eq!(device.exec_submissions.live_submissions(), 0);
+        assert_eq!(device.guest_uploads.live_uploads(), 0);
+        assert_eq!(
+            device
+                .ready_indirect_ranges
+                .iter()
+                .map(|ready| ready.transaction())
+                .collect::<Vec<_>>(),
+            vec![transaction]
+        );
+    }
+
+    /// A staged upload behind an earlier transaction on its own channel is not
+    /// yet its source domain's submission head, so the queue refuses it. That
+    /// refusal is an ordering fact, not a verdict: the recording must be asked
+    /// again once the transaction ahead of it is accepted, exactly as a direct
+    /// recording is. A guest-upload arm that refuses once and never retries
+    /// loses the EXEC and every later transaction on the channel behind it.
+    #[test]
+    fn a_staged_upload_behind_its_channel_head_is_retried_until_the_head_is_accepted() {
+        use crate::runtime::replacement_session as session;
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let channel = reims_vgpu_protocol::ChannelId::new(26);
+        runtime.define_channel(channel).unwrap();
+        let resources = session::stage_guest_upload_resources_for_test(&mut runtime);
+        let Some(head) = session::stage_event_signal_ingress_for_test(
+            &mut runtime,
+            channel,
+            68,
+            reims_vgpu_core::EventOperation {
+                event: reims_vgpu_protocol::ResourceId::new(41, 1),
+                kind: reims_vgpu_core::EventOperationKind::Signal,
+                value: 1,
+            },
+        ) else {
+            return;
+        };
+        let Some(upload) = session::stage_guest_upload_ingress_for_test(
+            &mut runtime,
+            resources,
+            channel,
+            69,
+            None,
+        ) else {
+            return;
+        };
+        assert!(matches!(
+            &head,
+            session::PendingReplacementIngressExec::Direct(_)
+        ));
+        assert!(matches!(
+            &upload,
+            session::PendingReplacementIngressExec::GuestUpload(_)
+        ));
+        let head_transaction = head.transaction();
+        let upload_transaction = upload.transaction();
+        assert!(
+            head_transaction < upload_transaction,
+            "the head must be the earlier transaction on this channel"
+        );
+        let mut device =
+            ReplacementDeviceCoordinator::new(runtime, crate::model::PAGE_SHIFT_X86).unwrap();
+        device
+            .exec_recordings
+            .admit(head)
+            .unwrap_or_else(|_| panic!("the head transaction must be unique"));
+        device
+            .exec_recordings
+            .admit(upload)
+            .unwrap_or_else(|_| panic!("the upload transaction must be unique"));
+
+        let mut routed = false;
+        for _ in 0..100_000 {
+            device.progress_exec_recordings();
+            let _ = device.progress_exec_submissions();
+            let _ = device.harvest_exec_acceptances();
+            if device.guest_uploads.transaction_ids() == vec![upload_transaction] {
+                routed = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            routed,
+            "the staged upload must be retried until its channel head is accepted"
+        );
+        assert_eq!(
+            device.exec_recordings.live_recordings(),
+            0,
+            "no refused recording may remain once it has been routed"
+        );
+        assert!(device.ready_guest_uploads.is_empty());
+        assert!(device.drain_failures.is_empty());
     }
 
     #[test]
@@ -7945,33 +9730,20 @@ mod tests {
             host.get_u32(registers_gpa + crate::model::CHILD_REG_HEAD),
             0
         );
+        // The task arriving is what the retry was waiting for. The object it
+        // names is still absent, and that is not a second wait: a synchronize
+        // is a teardown statement about writes this device might still owe,
+        // and it owes none against a resource it does not have. So the packet
+        // dispatches, consumes its ring lease, and advances the head — rather
+        // than holding the channel for a resource that is going away.
         runtime.define_task(task, 0x1_0000, 2).unwrap();
-        let retried = retry_deferred_child_dispatch_failure(
-            &mut runtime,
-            &mut transport,
-            &mut host,
-            *failure,
-        );
-        assert!(matches!(
-            retried,
-            Err(failure) if matches!(
-                failure.as_ref(),
-                ReplacementDeferredChildDispatchFailure::Synchronize { failure, lease }
-                    if lease.channel == channel
-                        && matches!(
-                            failure.as_ref(),
-                            crate::runtime::replacement_child_packet::ReplacementDeferredSynchronizeDispatchFailure::PreAdmission {
-                                reason: crate::runtime::replacement_child_packet::ReplacementSynchronizePreAdmissionError::Resolution(
-                                    crate::runtime::replacement_session::ReplacementSynchronizeResolutionError::UnknownResource { task: found_task, .. },
-                                ),
-                                ..
-                            } if *found_task == task
-                        )
-            )
-        ));
+        retry_deferred_child_dispatch_failure(&mut runtime, &mut transport, &mut host, *failure)
+            .unwrap_or_else(|_| {
+                panic!("a synchronize naming no resource this device holds is already satisfied")
+            });
         assert_eq!(
             host.get_u32(registers_gpa + crate::model::CHILD_REG_HEAD),
-            0
+            crate::model::PACKET_HEADER_LEN + payload.len() as u32
         );
     }
 
@@ -8194,6 +9966,150 @@ mod tests {
             2
         );
         assert!(coordinator.take_published().is_none());
+    }
+
+    /// The record is dropped and the packet still lands.
+    ///
+    /// The concern is unchanged: a record naming a slot nothing ever populated
+    /// must not be *deferred*, or it would overwrite whatever a later resource
+    /// brings into that slot. Dropping the record meets that and refusing the
+    /// packet also met it -- but refusing threw away the packet's completion
+    /// stamp and, in an invalidation naming several slots, every other record
+    /// beside the unknown one. This is the same shape
+    /// `a_delete_of_an_object_this_device_never_had_does_not_hold_the_channel`
+    /// already required of the delete route.
+    #[test]
+    fn an_invalidation_of_a_slot_this_device_never_filled_lands_without_deferring() {
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let channel = reims_vgpu_protocol::ChannelId::new(4);
+        runtime.define_channel(channel).unwrap();
+        runtime
+            .define_task(reims_vgpu_protocol::TaskId::new(0), 0x1_0000, 2)
+            .unwrap();
+        // One record naming an object-table slot nothing ever populated. There
+        // is no validity state to move, and deferring it would let it overwrite
+        // whatever a later resource brings into that slot.
+        let mut invalidate =
+            vec![
+                0;
+                crate::runtime::decode::fifo::CHILD_RESOURCE_LIST_HEADER_LEN as usize
+                    + crate::runtime::decode::fifo::CHILD_INVALIDATE_RECORD_LEN as usize
+            ];
+        reims_vgpu_core::endian::st32(
+            &mut invalidate[crate::runtime::decode::fifo::CHILD_RESOURCE_LIST_COUNT as usize..],
+            1,
+        );
+        reims_vgpu_core::endian::st32(
+            &mut invalidate
+                [crate::runtime::decode::fifo::CHILD_RESOURCE_LIST_HEADER_LEN as usize..],
+            10,
+        );
+        let admitted =
+            crate::runtime::replacement_child_packet::admit_replacement_child_cpu_packet(
+                &mut runtime,
+                channel,
+                packet(crate::model::CHILD_OP_INVALIDATE_RESOURCES, invalidate, 1),
+            )
+            .unwrap();
+        let admitted = ReplacementAdmittedCpuPacket::try_from(admitted).unwrap();
+        let admitted_id = admitted.transaction();
+        let mut coordinator = ReplacementCpuCoordinator::default();
+        coordinator.admit(admitted, ()).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        assert_eq!(
+            coordinator.progress(
+                &mut runtime,
+                &mut host,
+                crate::model::PAGE_SHIFT_X86,
+                u32::MAX,
+                admitted_id,
+            ),
+            Some(ReplacementCpuProgress::Published { facts: 1 })
+        );
+        // The stamp is consumed rather than thrown away with the packet.
+        assert_eq!(
+            coordinator
+                .take_published()
+                .unwrap()
+                .completion_stamp
+                .unwrap()
+                .value,
+            1
+        );
+        assert_eq!(coordinator.live_packets(), 0);
+    }
+
+    #[test]
+    fn a_delete_of_an_object_this_device_never_had_does_not_hold_the_channel() {
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let channel = reims_vgpu_protocol::ChannelId::new(4);
+        runtime.define_channel(channel).unwrap();
+        // A delete naming a sampler reference nothing ever created. No later
+        // packet can make it succeed, so retaining it would hold the channel's
+        // completion stamps for the life of the device.
+        let mut delete = vec![0; 4 + reims_vgpu_wire::ops::destroy::DELETE_TOTAL_LEN as usize];
+        reims_vgpu_core::endian::st32(&mut delete[0..], 7);
+        reims_vgpu_core::endian::st32(
+            &mut delete[4..],
+            reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE,
+        );
+        reims_vgpu_core::endian::st32(
+            &mut delete[8..],
+            reims_vgpu_wire::ops::destroy::DELETE_TOTAL_LEN,
+        );
+        reims_vgpu_core::endian::st32(&mut delete[12..], 3);
+        let refused = crate::runtime::replacement_child_packet::admit_replacement_child_cpu_packet(
+            &mut runtime,
+            channel,
+            packet(crate::model::CHILD_OP_DELETE_OBJECT, delete, 1),
+        )
+        .unwrap();
+        let behind = crate::runtime::replacement_child_packet::admit_replacement_child_cpu_packet(
+            &mut runtime,
+            channel,
+            packet(crate::model::CHILD_OP_NOP, [], 2),
+        )
+        .unwrap();
+        let refused = ReplacementAdmittedCpuPacket::try_from(refused).unwrap();
+        let behind = ReplacementAdmittedCpuPacket::try_from(behind).unwrap();
+        let refused_id = refused.transaction();
+        let behind_id = behind.transaction();
+        let mut coordinator = ReplacementCpuCoordinator::default();
+        coordinator.admit(refused, ()).unwrap();
+        coordinator.admit(behind, ()).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+
+        assert_eq!(
+            coordinator.progress(
+                &mut runtime,
+                &mut host,
+                crate::model::PAGE_SHIFT_X86,
+                u32::MAX,
+                refused_id,
+            ),
+            Some(ReplacementCpuProgress::Published { facts: 1 })
+        );
+        assert_eq!(
+            coordinator.progress(
+                &mut runtime,
+                &mut host,
+                crate::model::PAGE_SHIFT_X86,
+                u32::MAX,
+                behind_id,
+            ),
+            Some(ReplacementCpuProgress::Published { facts: 1 })
+        );
+        assert_eq!(coordinator.live_packets(), 0);
+        // Both stamps post, in order: the guest is told the refused command is
+        // finished and never waits on the one behind it.
+        let stamps = std::iter::from_fn(|| coordinator.take_published())
+            .map(|fact| fact.completion_stamp.unwrap().value)
+            .collect::<Vec<_>>();
+        assert_eq!(stamps, vec![1, 2]);
     }
 
     #[test]

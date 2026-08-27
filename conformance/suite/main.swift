@@ -179,6 +179,10 @@ sharedTargetGlyphCase(256, 64)
 
 sharedTargetGlyphCase(1000, 40)
 
+biplanarSurfaceCase(64, 32)
+
+biplanarSurfaceCase(256, 64)
+
 iosurfaceCases(60, 32)
 
 iosurfaceCases(256, 64)

@@ -6,8 +6,8 @@
 //! clear-host may need a host-to-guest transfer, so it remains a distinct
 //! native-emitter case until the current representation snapshot is prepared.
 
-use crate::{ExecTransaction, ResolvedOperation, ResolvedResourceState};
-use reims_vgpu_protocol::TransactionId;
+use crate::{BackingRegion, ExecTransaction, ResolvedOperation, ResolvedResourceState};
+use reims_vgpu_protocol::{BackingId, TransactionId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdmittedResourceStateOperation {
@@ -45,6 +45,43 @@ impl AdmittedResourceStates {
                 AdmittedResourceStateOperation::Semantic(operation) => Some(operation),
                 AdmittedResourceStateOperation::NativeTransferMayBeRequired(_) => None,
             })
+    }
+
+    /// Parts of `region` not established by an earlier ordered GPU write in
+    /// this EXEC's resource-state prologue.
+    pub fn regions_not_written_before(
+        &self,
+        position: usize,
+        backing: BackingId,
+        region: BackingRegion,
+        mut write_targets_current_representation: impl FnMut(usize) -> bool,
+    ) -> Vec<BackingRegion> {
+        let mut missing = vec![region];
+        for (write_position, state) in self.operations.iter() {
+            if *write_position >= position
+                || state.operation().ops.set_host_valid == 0
+                || !write_targets_current_representation(*write_position)
+            {
+                continue;
+            }
+            for target in state
+                .operation()
+                .targets
+                .iter()
+                .filter(|target| target.backing == backing)
+            {
+                for written in target.regions.iter().copied() {
+                    missing = missing
+                        .into_iter()
+                        .flat_map(|required| crate::content_authority::subtract(required, written))
+                        .collect();
+                    if missing.is_empty() {
+                        return missing;
+                    }
+                }
+            }
+        }
+        missing
     }
 
     pub fn for_operation_range(&self, start: usize, end: usize) -> Self {
@@ -200,5 +237,45 @@ mod tests {
             AdmittedResourceStateOperation::Semantic(_)
         ));
         assert_eq!(admitted.semantic_operations().count(), 2);
+    }
+
+    #[test]
+    fn earlier_resource_state_writes_remove_only_their_exact_read_regions() {
+        let backing = BackingId::new(3);
+        let linear = |offset, length| {
+            BackingRegion::Linear(crate::LinearRange::new(offset, length).unwrap())
+        };
+        let write = |region| {
+            AdmittedResourceStateOperation::Semantic(ResolvedResourceState {
+                resource: None,
+                mappings: Box::new([]),
+                targets: Box::new([crate::ResolvedResourceStateTarget {
+                    backing,
+                    regions: Box::new([region]),
+                }]),
+                ops: ResourceValidityOps {
+                    set_host_valid: 1,
+                    ..ResourceValidityOps::default()
+                },
+            })
+        };
+        let admitted = AdmittedResourceStates {
+            transaction: TransactionId::new(8),
+            operations: Box::new([(2, write(linear(32, 32))), (8, write(linear(64, 32)))]),
+        };
+
+        assert_eq!(
+            admitted.regions_not_written_before(5, backing, linear(0, 96), |_| true),
+            [linear(0, 32), linear(64, 32)]
+        );
+        assert_eq!(
+            admitted.regions_not_written_before(9, backing, linear(0, 96), |_| true),
+            [linear(0, 32)]
+        );
+        assert_eq!(
+            admitted
+                .regions_not_written_before(9, backing, linear(0, 96), |position| position == 8),
+            [linear(0, 64)]
+        );
     }
 }
