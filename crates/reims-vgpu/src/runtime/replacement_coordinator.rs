@@ -4449,6 +4449,85 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
         Ok(transaction)
     }
 
+    /// Every retained suffix that stopped because a backing it reads has no
+    /// execution representation, with the backing it named.
+    ///
+    /// A suffix in this state is not waiting for anything: nothing else builds
+    /// that representation, so it holds its whole upload chain and every later
+    /// transaction in its submission domain refuses behind it for the life of
+    /// the device. The exec-dispatch route has had the repair for this since
+    /// it was written; this is the same fact arriving through a different
+    /// route, and it gets the same answer.
+    pub fn missing_representation_suffixes(
+        &self,
+    ) -> Vec<(
+        reims_vgpu_protocol::TransactionId,
+        reims_vgpu_protocol::BackingId,
+    )> {
+        self.suffixes
+            .iter()
+            .filter_map(|(transaction, state)| {
+                let ReplacementCoordinatedGuestUploadSuffix::PreparationFailed(failure) = state
+                else {
+                    return None;
+                };
+                Some((*transaction, failure.missing_representation_backing()?))
+            })
+            .collect()
+    }
+
+    /// Take one retained preparation failure out for repair.
+    pub fn take_preparation_failed(
+        &mut self,
+        transaction: reims_vgpu_protocol::TransactionId,
+    ) -> Option<
+        Box<
+            crate::runtime::replacement_session::ReplacementGuestUploadSuffixPreparationFailure<
+                Semantic,
+            >,
+        >,
+    > {
+        let ReplacementCoordinatedGuestUploadSuffix::PreparationFailed(_) =
+            self.suffixes.get(&transaction)?
+        else {
+            return None;
+        };
+        let Some(ReplacementCoordinatedGuestUploadSuffix::PreparationFailed(failure)) =
+            self.suffixes.remove(&transaction)
+        else {
+            unreachable!("the preparation-failed state was matched immediately above")
+        };
+        Some(failure)
+    }
+
+    /// Put a repaired suffix back where the next pass will prepare it.
+    pub fn restore_continuing(
+        &mut self,
+        transaction: reims_vgpu_protocol::TransactionId,
+        continuing: crate::runtime::replacement_session::ReplacementContinuingGuestUpload<Semantic>,
+    ) {
+        self.suffixes.insert(
+            transaction,
+            ReplacementCoordinatedGuestUploadSuffix::Continuing(Box::new(continuing)),
+        );
+    }
+
+    /// Put a failure back after a repair that could not complete.
+    pub fn restore_preparation_failed(
+        &mut self,
+        transaction: reims_vgpu_protocol::TransactionId,
+        failure: Box<
+            crate::runtime::replacement_session::ReplacementGuestUploadSuffixPreparationFailure<
+                Semantic,
+            >,
+        >,
+    ) {
+        self.suffixes.insert(
+            transaction,
+            ReplacementCoordinatedGuestUploadSuffix::PreparationFailed(failure),
+        );
+    }
+
     pub fn progress(
         &mut self,
         runtime: &mut ReplacementRuntimeSession<Semantic>,
@@ -7008,6 +7087,9 @@ impl ReplacementDeviceCoordinator<()> {
         // completion stops every later retirement for the boot's life.
         let _ = self.retry_timeline_failures();
         let guest_uploads_resumed = self.resume_completed_guest_uploads();
+        // Before the suffixes are progressed, so a suffix repaired this tick
+        // is prepared this tick rather than one tick later.
+        let _ = self.repair_guest_upload_suffix_representations(host);
         let _ = self.progress_guest_upload_suffixes();
         // A refused suffix is terminal and nothing else claims it, so without
         // one release per tick a single unimplemented case holds the channel's
@@ -7438,6 +7520,58 @@ impl ReplacementDeviceCoordinator<()> {
             }
         }
         released
+    }
+
+    /// Build the execution representations retained upload suffixes are
+    /// waiting on, and return each repaired suffix to the preparing state.
+    ///
+    /// A suffix that stops on a missing execution representation is not
+    /// waiting for a producer and is not refused: nothing in its own route
+    /// builds what it named, so it stays retained forever and holds its
+    /// submission domain. The exec-dispatch route repairs the same fact
+    /// already --- `prepare_backing_representation` is that repair, and it
+    /// recovers the storage class from the storage node so it serves every
+    /// class rather than only task-address allocations.
+    ///
+    /// A repair that itself refuses is named on the failure channel and the
+    /// suffix is left retained. That is a real gap in the materializers and
+    /// says which class to go and close; silently dropping the suffix would
+    /// lose the guest's whole upload chain instead.
+    pub fn repair_guest_upload_suffix_representations(
+        &mut self,
+        host: &mut (impl HostMemory + crate::runtime::host::HostOps),
+    ) -> usize {
+        let page_shift = self.transport.page_shift();
+        let mut repaired = 0;
+        for (transaction, backing) in self.guest_upload_suffixes.missing_representation_suffixes() {
+            if let Err(reason) =
+                prepare_backing_representation(&mut self.runtime, host, page_shift, backing)
+            {
+                report_retained_failure_detail(
+                    "replacement_guest_upload_suffix_repair",
+                    transaction,
+                    &format!("backing:{}:{reason:?}", backing.get()),
+                );
+                continue;
+            }
+            let Some(failure) = self
+                .guest_upload_suffixes
+                .take_preparation_failed(transaction)
+            else {
+                continue;
+            };
+            match self.runtime.retry_guest_upload_suffix_after_repair(failure) {
+                Ok(continuing) => {
+                    self.guest_upload_suffixes
+                        .restore_continuing(transaction, continuing);
+                    repaired += 1;
+                }
+                Err(failure) => self
+                    .guest_upload_suffixes
+                    .restore_preparation_failed(transaction, failure),
+            }
+        }
+        repaired
     }
 
     pub fn progress_guest_upload_suffixes(&mut self) -> Vec<ReplacementGuestUploadSuffixProgress> {

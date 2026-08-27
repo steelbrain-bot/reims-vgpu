@@ -3907,6 +3907,20 @@ impl<Semantic> ReplacementGuestUploadSuffixPreparationFailure<Semantic> {
         })
     }
 
+    /// The backing this suffix stopped on because it has no execution
+    /// representation yet.
+    ///
+    /// Only the resource arm can carry one. A readiness refusal is about
+    /// content that has not been produced and an image refusal is about a
+    /// claim this transaction may not take yet; neither is repaired by
+    /// building anything.
+    pub fn missing_representation_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self {
+            Self::Resources { reason, .. } => reason.missing_representation_backing(),
+            Self::Readiness { .. } | Self::Images { .. } => None,
+        }
+    }
+
     /// Why this suffix could not be prepared.
     ///
     /// The coordinator retains the failure and reports only the step it
@@ -5626,26 +5640,58 @@ impl ReplacementDecodedExecAdmissionError {
 }
 
 impl ReplacementExecAutomaticPreparationError {
-    /// The backing a `StaleExecutionRepresentation` names, if that is what
-    /// refused this resource preparation.
+    /// The backing this refused on and what was wrong with it.
     ///
-    /// See [`reims_vgpu_core::ComputeDispatchPreparationError::stale_backing`].
+    /// See [`reims_vgpu_core::RenderDispatchPreparationError::backing_fault`].
     /// Only the two dispatch arms can carry one: a blit or an info query names
     /// its backing through a different failure entirely.
-    pub(crate) fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+    pub(crate) fn backing_fault(
+        &self,
+    ) -> Option<(
+        reims_vgpu_protocol::BackingId,
+        reims_vgpu_core::ManagedBackingError,
+    )> {
         match self {
             Self::Compute { failure, .. } => match failure.as_ref() {
                 reims_vgpu_core::ExecResourcePreparationStepFailure::Preparation((reason, _)) => {
-                    reason.stale_backing()
+                    reason.backing_fault()
                 }
                 _ => None,
             },
             Self::Render { failure, .. } => match failure.as_ref() {
                 reims_vgpu_core::ExecResourcePreparationStepFailure::Preparation((reason, _)) => {
-                    reason.stale_backing()
+                    reason.backing_fault()
                 }
                 _ => None,
             },
+            _ => None,
+        }
+    }
+
+    /// The backing a `StaleExecutionRepresentation` names, if that is what
+    /// refused this resource preparation.
+    pub(crate) fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self.backing_fault() {
+            Some((backing, reims_vgpu_core::ManagedBackingError::StaleExecutionRepresentation)) => {
+                Some(backing)
+            }
+            _ => None,
+        }
+    }
+
+    /// The backing with no execution representation yet, if that is what
+    /// refused this resource preparation.
+    ///
+    /// See
+    /// [`reims_vgpu_core::RenderDispatchPreparationError::missing_representation_backing`]:
+    /// this is the repairable one, and leaving it unrepaired holds a whole
+    /// submission domain rather than costing one command.
+    pub(crate) fn missing_representation_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self.backing_fault() {
+            Some((
+                backing,
+                reims_vgpu_core::ManagedBackingError::MissingExecutionRepresentation,
+            )) => Some(backing),
             _ => None,
         }
     }
@@ -18611,6 +18657,57 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             },
             outputs,
         ))
+    }
+
+    /// Turn a suffix that stopped on a missing execution representation back
+    /// into one that can be prepared again.
+    ///
+    /// The representation is built by the caller and this rebuilds the
+    /// continuation over it. The retained manifest is *not* carried across:
+    /// the resource arm stops after part of it has been consumed, and building
+    /// a representation changes what a manifest would say about that backing
+    /// anyway, so it is derived again from the admitted exec --- which is the
+    /// only thing it was ever derived from. A preflight that cannot answer yet
+    /// hands the failure straight back, and the suffix stays retained for the
+    /// next pass rather than becoming a half-prepared state nothing owns.
+    pub fn retry_guest_upload_suffix_after_repair(
+        &self,
+        failure: Box<ReplacementGuestUploadSuffixPreparationFailure<Semantic>>,
+    ) -> Result<
+        ReplacementContinuingGuestUpload<Semantic>,
+        Box<ReplacementGuestUploadSuffixPreparationFailure<Semantic>>,
+    > {
+        if failure.missing_representation_backing().is_none() {
+            return Err(failure);
+        }
+        let ReplacementGuestUploadSuffixPreparationFailure::Resources {
+            reason,
+            native,
+            prepared,
+            chain,
+            last_auxiliary,
+        } = *failure
+        else {
+            unreachable!("only the resource arm names a missing representation")
+        };
+        match self.preflight_prepared_guest_upload_suffix_resources(&prepared) {
+            Ok(manifest) => Ok(ReplacementContinuingGuestUpload {
+                native,
+                prepared,
+                manifest,
+                chain,
+                last_auxiliary,
+            }),
+            Err(_) => Err(Box::new(
+                ReplacementGuestUploadSuffixPreparationFailure::Resources {
+                    reason,
+                    native,
+                    prepared,
+                    chain,
+                    last_auxiliary,
+                },
+            )),
+        }
     }
 
     pub fn prepare_guest_upload_suffix(

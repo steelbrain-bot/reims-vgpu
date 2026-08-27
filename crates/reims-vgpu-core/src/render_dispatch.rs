@@ -548,6 +548,25 @@ pub enum RenderDispatchPreparationError {
 }
 
 impl RenderDispatchPreparationError {
+    /// The backing this refusal is about and what was wrong with it, if it is
+    /// about one at all.
+    ///
+    /// Everything that repairs a backing needs the same two facts and asks a
+    /// different question of them, so they are read out once here and the
+    /// questions are derived. A second hand-written match per question is how
+    /// one repair ends up serving one route: the missing-representation repair
+    /// reached the dispatch route and not the guest-upload one, and a suffix
+    /// that stopped on it held its submission domain for the life of the
+    /// device.
+    pub const fn backing_fault(&self) -> Option<(BackingId, ManagedBackingError)> {
+        match self {
+            Self::Backing {
+                backing, reason, ..
+            } => Some((*backing, *reason)),
+            _ => None,
+        }
+    }
+
     /// The backing a `StaleExecutionRepresentation` names, if that is what this
     /// is.
     ///
@@ -556,12 +575,22 @@ impl RenderDispatchPreparationError {
     /// backing, and this is what lets a diagnostic that has only the failure
     /// reach it.
     pub const fn stale_backing(&self) -> Option<BackingId> {
-        match self {
-            Self::Backing {
-                backing,
-                reason: ManagedBackingError::StaleExecutionRepresentation,
-                ..
-            } => Some(*backing),
+        match self.backing_fault() {
+            Some((backing, ManagedBackingError::StaleExecutionRepresentation)) => Some(backing),
+            _ => None,
+        }
+    }
+
+    /// The backing that has no execution representation yet, if that is why
+    /// this refused.
+    ///
+    /// Repairable, and the only refusal here that is: the representation is
+    /// built and the operation is prepared again. Left unrepaired it is not one
+    /// lost command --- it holds the whole recorded chain, and every later
+    /// transaction in the submission domain refuses behind it.
+    pub const fn missing_representation_backing(&self) -> Option<BackingId> {
+        match self.backing_fault() {
+            Some((backing, ManagedBackingError::MissingExecutionRepresentation)) => Some(backing),
             _ => None,
         }
     }
@@ -1724,5 +1753,46 @@ mod tests {
         assert!(prepared.writes().is_empty());
         assert!(prepared.completions().is_empty());
         cancel_prepared_render_dispatch(&mut owner, prepared).unwrap();
+    }
+
+    /// The two repairable-vs-not questions about a backing refusal are asked
+    /// by different routes and must never disagree.
+    ///
+    /// They used to be two hand-written matches, and only one of them was
+    /// wired to a repair. A suffix that stopped on a missing representation
+    /// therefore stayed retained forever and held its whole submission domain,
+    /// while the identical fact arriving through the exec-dispatch route was
+    /// repaired and retried. Both now derive from `backing_fault`, so a third
+    /// question cannot be added to one and forgotten in the other.
+    #[test]
+    fn a_backing_refusal_answers_stale_and_missing_from_one_reading() {
+        let backing = BackingId::new(7);
+        let refusal = |reason| RenderDispatchPreparationError::Backing {
+            backing,
+            resources: Box::new([]),
+            regions: Box::new([]),
+            reads: true,
+            writes: false,
+            reason,
+        };
+
+        let missing = refusal(ManagedBackingError::MissingExecutionRepresentation);
+        assert_eq!(
+            missing.backing_fault(),
+            Some((backing, ManagedBackingError::MissingExecutionRepresentation))
+        );
+        assert_eq!(missing.missing_representation_backing(), Some(backing));
+        assert_eq!(missing.stale_backing(), None);
+
+        let stale = refusal(ManagedBackingError::StaleExecutionRepresentation);
+        assert_eq!(stale.stale_backing(), Some(backing));
+        assert_eq!(stale.missing_representation_backing(), None);
+
+        // A refusal that is not about a backing answers neither, so a repair
+        // that asks cannot be handed an unrelated failure's identity.
+        let unrelated = RenderDispatchPreparationError::PipelineMismatch;
+        assert_eq!(unrelated.backing_fault(), None);
+        assert_eq!(unrelated.stale_backing(), None);
+        assert_eq!(unrelated.missing_representation_backing(), None);
     }
 }

@@ -300,11 +300,30 @@ impl ComputeDispatchPreparationError {
     /// backing, and this is what lets a diagnostic that has only the failure
     /// reach it.
     pub const fn stale_backing(&self) -> Option<BackingId> {
+        match self.backing_fault() {
+            Some((backing, ManagedBackingError::StaleExecutionRepresentation)) => Some(backing),
+            _ => None,
+        }
+    }
+
+    /// The backing this refusal is about and what was wrong with it.
+    ///
+    /// See [`RenderDispatchPreparationError::backing_fault`]; the two dispatch
+    /// classes answer the same questions and must answer them the same way.
+    pub const fn backing_fault(&self) -> Option<(BackingId, ManagedBackingError)> {
         match self {
-            Self::Backing {
-                backing,
-                reason: ManagedBackingError::StaleExecutionRepresentation,
-            } => Some(*backing),
+            Self::Backing { backing, reason } => Some((*backing, *reason)),
+            _ => None,
+        }
+    }
+
+    /// The backing that has no execution representation yet, if that is why
+    /// this refused.
+    ///
+    /// See [`RenderDispatchPreparationError::missing_representation_backing`].
+    pub const fn missing_representation_backing(&self) -> Option<BackingId> {
+        match self.backing_fault() {
+            Some((backing, ManagedBackingError::MissingExecutionRepresentation)) => Some(backing),
             _ => None,
         }
     }
