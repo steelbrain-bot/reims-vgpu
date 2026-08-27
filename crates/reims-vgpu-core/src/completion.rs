@@ -66,8 +66,18 @@ pub enum CompletionOwnerError {
     /// upload at 85 -- which was the upload that would have made a backing's
     /// execution representation current, so a render behind it then refused
     /// `StaleExecutionRepresentation` for the life of the device.
+    ///
+    /// Nor is it a check that the point is still ahead of the GPU. A point at
+    /// or below `last_completed` is work the GPU has already finished, and
+    /// refusing it loses a completion for a submission that succeeded: the
+    /// driver accepted it, the queue signalled it, and the retirement poll
+    /// simply observed the signal before the acceptance path recorded the
+    /// fact. Nothing orders those two. The registration is kept and the next
+    /// poll's `advance` -- which may repeat a value it has already reported --
+    /// publishes it, one tick late and correct. A driven x86/macos-13 boot
+    /// lost the upload at queue 1 point 79 this way, which parked its domain's
+    /// head at sequence 39 and starved every transaction behind it.
     DuplicateSubmittedPoint,
-    TimelineAlreadyCompleted,
     TimelineRegressed,
     TransactionStillPending,
 }
@@ -139,12 +149,6 @@ impl<T> TimelineCompletionOwner<T> {
             return Err(CompletionOwnerError::DuplicateTransaction);
         }
         let queue = self.queues.entry(point.queue).or_default();
-        if queue
-            .last_completed
-            .is_some_and(|completed| point.value <= completed)
-        {
-            return Err(CompletionOwnerError::TimelineAlreadyCompleted);
-        }
         if queue.pending.contains_key(&point.value) {
             return Err(CompletionOwnerError::DuplicateSubmittedPoint);
         }
@@ -424,20 +428,40 @@ mod tests {
         assert_eq!(owner.last_submitted(QueueOwnerId::new(9)), None);
     }
 
+    /// A registration behind an observed completion is late, not wrong.
+    ///
+    /// The driver accepted the submission and the queue signalled it; the
+    /// retirement poll simply saw the signal before the acceptance path
+    /// recorded the fact, and nothing orders those two. Refusing here loses the
+    /// completion of a submission that succeeded, which parks the domain head
+    /// that submission was holding. The next `advance` -- repeating a value it
+    /// has already reported -- is what publishes it.
     #[test]
-    fn work_cannot_be_registered_behind_observed_completion() {
+    fn work_registered_behind_observed_completion_still_completes() {
         let mut owner = TimelineCompletionOwner::new(VulkanDeviceEpochId::new(2));
-        owner
+        assert!(owner
             .advance(QueueOwnerId::new(4), QueueTimelineValue::new(10))
-            .unwrap();
-        assert_eq!(
-            owner.register(
+            .unwrap()
+            .is_empty());
+        owner
+            .register(
                 TransactionId::new(1),
                 SessionGenerationId::new(1),
                 point(2, 4, 9),
                 (),
-            ),
-            Err(CompletionOwnerError::TimelineAlreadyCompleted)
+            )
+            .unwrap();
+
+        let facts = owner
+            .advance(QueueOwnerId::new(4), QueueTimelineValue::new(10))
+            .unwrap();
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact.transaction)
+                .collect::<Vec<_>>(),
+            [TransactionId::new(1)],
+            "repeating an already-reported completion is what publishes a late registration"
         );
     }
 }
