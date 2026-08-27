@@ -83,7 +83,6 @@ pub struct ResolvedTextureBindingView {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TextureViewResolveError {
-    BackingAbsent(BackingId),
     ResourceAbsent(AnyResourceId),
     NotTextureView(AnyResourceId),
     DescriptorAbsent(AnyResourceId),
@@ -1339,34 +1338,6 @@ impl ResourceGraph {
         views.sort_by_key(|view| view.resource);
         Ok(views.into_boxed_slice())
     }
-
-    /// Resolve every live shader-visible view whose base resolves to one
-    /// canonical backing. A native image representation is backing-owned, so
-    /// rebuilding it must include views below every aliased base resource,
-    /// not only the base which happened to trigger materialization.
-    pub fn texture_binding_views_for_backing(
-        &self,
-        backing: BackingId,
-    ) -> Result<Box<[ResolvedTextureBindingView]>, TextureViewResolveError> {
-        if !self.storage.contains_key(&backing) {
-            return Err(TextureViewResolveError::BackingAbsent(backing));
-        }
-        let mut views = self
-            .resources
-            .values()
-            .filter(|node| {
-                matches!(
-                    node.kind,
-                    ObjectKind::TextureView | ObjectKind::IOSurfacePlaneView
-                ) && node.lifecycle != LifecycleState::Released
-                    && self.resolved_backing(node.id) == Some(backing)
-            })
-            .map(|node| self.resolve_texture_binding_view(node.id))
-            .collect::<Result<Vec<_>, _>>()?;
-        views.sort_by_key(|view| view.resource);
-        Ok(views.into_boxed_slice())
-    }
-
     pub fn resources_for_task(&self, task: TaskId) -> Box<[AnyResourceId]> {
         self.resources
             .values()
@@ -3233,14 +3204,22 @@ mod tests {
                 [aliased_base],
             )
             .unwrap();
+        // The alias shares the backing and owns its own view. Views belong to
+        // the texture they view and never to the range it happens to sit on:
+        // a materialization gathers by base for exactly this reason, because
+        // the alias's view carries the alias's format and no image serving
+        // this base could express it.
         assert_eq!(
-            graph.texture_binding_views_for_backing(backing).unwrap(),
+            graph.texture_binding_views_for_base(base).unwrap(),
             vec![
                 graph.resolve_texture_binding_view(inner).unwrap(),
                 graph.resolve_texture_binding_view(outer).unwrap(),
-                graph.resolve_texture_binding_view(aliased_view).unwrap(),
             ]
             .into_boxed_slice()
+        );
+        assert_eq!(
+            graph.texture_binding_views_for_base(aliased_base).unwrap(),
+            vec![graph.resolve_texture_binding_view(aliased_view).unwrap()].into_boxed_slice()
         );
     }
 

@@ -2889,11 +2889,16 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             return Err(ReplacementRepresentationConstructionError::TransferEndpointAbsent(route));
         }
         let memory = Self::owned_working_memory(route)?;
+        // This texture's views, not the backing's. Another texture declared
+        // over the same guest range is a different texture with a different
+        // format, and its views belong to its own image -- installing them
+        // here is the same substitution the per-texture image key exists to
+        // prevent, one layer down.
         let shader_views = self
             .epoch
             .resources
             .graph()
-            .texture_binding_views_for_backing(backing)
+            .texture_binding_views_for_base(resource)
             .map_err(ReplacementRepresentationConstructionError::TextureView)?;
         let native = device
             .create_owned_texture(declaration, Box::new([]), shader_views, memory)
@@ -33585,7 +33590,7 @@ mod tests {
     }
 
     #[test]
-    fn texture_views_survive_backing_wide_physical_rematerialization_across_aliased_bases() {
+    fn a_rebuilt_texture_carries_its_own_views_and_not_an_aliased_bases_views() {
         let Some(session) = session() else {
             return;
         };
@@ -33775,12 +33780,16 @@ mod tests {
         ));
         let replacement = owners.materialize_resource(session.vulkan(), base).unwrap();
         assert_ne!(replacement, representation);
-        assert!(owners
-            .resources()
-            .representation(backing, replacement)
-            .unwrap()
-            .shader_view(aliased_semantic)
-            .is_ok());
+        let resources = owners.resources();
+        let rebuilt = resources.representation(backing, replacement).unwrap();
+        // The base's own view comes back with its new image, which is what
+        // surviving a physical replacement means.
+        assert!(rebuilt.shader_view(semantic).is_ok());
+        // The alias's view does not, and must not. It views a different
+        // texture that happens to share these bytes, and that texture owns its
+        // own image; serving its view from this one is the substitution that
+        // let two declared formats collide.
+        assert!(rebuilt.shader_view(aliased_semantic).is_err());
     }
 
     #[test]
