@@ -757,7 +757,48 @@ pub enum ResourceDescriptor {
     RasterizationRateMap(RasterizationRateMapDescriptor),
 }
 
+/// The class of native representation a decoded descriptor materializes into.
+///
+/// Two independent questions have to agree about this and only one of them is
+/// on the construction path: materialization dispatches on it to choose what
+/// to build, and every later reader asks it again to decide whether the thing
+/// was already built. When the two were written by hand they disagreed --- a
+/// descriptor that materializes an image but was absent from the second list
+/// answers "no representation" forever, so nothing that waits on the image
+/// ever proceeds and the channel it belongs to parks. Both now read this.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum NativeRepresentationClass {
+    /// An untyped byte range: a buffer.
+    Bytes,
+    /// An image, keyed by the resource that owns the storage it covers.
+    Image,
+}
+
 impl ResourceDescriptor {
+    /// The native representation class this descriptor materializes into, or
+    /// `None` for a descriptor with no native representation of its own ---
+    /// samplers, pipelines, and the binding views that are installed onto
+    /// another resource's image rather than carrying one.
+    pub const fn native_representation_class(&self) -> Option<NativeRepresentationClass> {
+        match self {
+            Self::Buffer(_) => Some(NativeRepresentationClass::Bytes),
+            Self::Texture(_)
+            | Self::HeapTexture(_)
+            | Self::MapperIOSurfaceTextureView(_)
+            | Self::IOSurfacePlaneView(_) => Some(NativeRepresentationClass::Image),
+            Self::SurfaceBacking(_)
+            | Self::Sampler(_)
+            | Self::Function(_)
+            | Self::RenderPipeline(_)
+            | Self::ComputePipeline(_)
+            | Self::DepthStencil(_)
+            | Self::TextureView(_)
+            | Self::BufferTexture(_)
+            | Self::IndirectCommandBuffer(_)
+            | Self::RasterizationRateMap(_) => None,
+        }
+    }
+
     /// Object-list identities whose construction must precede this descriptor.
     ///
     /// This is only the object-list relation. Heap and mapper-service

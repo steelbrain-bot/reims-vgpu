@@ -2740,20 +2740,27 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         let node = self.epoch.resources.graph().resource(resource).ok_or(
             ReplacementRepresentationConstructionError::ResourceAbsent(resource),
         )?;
+        // The class, not the descriptor: what this builds and what every
+        // later reader asks about must be one statement, or a descriptor
+        // reachable here and absent there materializes an image nothing can
+        // find. A plane view's declaration comes from its surface rather than
+        // from itself, so it is an image this entry point cannot construct ---
+        // a typed refusal, and not a hole in the class.
         match node
             .descriptor
             .as_deref()
             .ok_or(ReplacementRepresentationConstructionError::DescriptorAbsent(resource))?
+            .native_representation_class()
         {
-            reims_vgpu_protocol::ResourceDescriptor::Buffer(_) => {
+            Some(reims_vgpu_protocol::NativeRepresentationClass::Bytes) => {
                 self.materialize_buffer(device, resource, route)
             }
-            reims_vgpu_protocol::ResourceDescriptor::Texture(_)
-            | reims_vgpu_protocol::ResourceDescriptor::HeapTexture(_)
-            | reims_vgpu_protocol::ResourceDescriptor::MapperIOSurfaceTextureView(_) => {
+            Some(reims_vgpu_protocol::NativeRepresentationClass::Image) => {
                 self.materialize_texture(device, resource, route)
             }
-            _ => Err(ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind)),
+            None => {
+                Err(ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind))
+            }
         }
     }
 
@@ -15277,14 +15284,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
     ) -> Option<reims_vgpu_core::BackingView> {
         let node = self.execution.resources().graph().resource(resource)?;
-        match node.descriptor.as_deref()? {
-            reims_vgpu_protocol::ResourceDescriptor::Buffer(_) => {
+        match node.descriptor.as_deref()?.native_representation_class()? {
+            reims_vgpu_protocol::NativeRepresentationClass::Bytes => {
                 Some(reims_vgpu_core::BackingView::Bytes)
             }
-            reims_vgpu_protocol::ResourceDescriptor::Texture(_) => Some(
+            reims_vgpu_protocol::NativeRepresentationClass::Image => Some(
                 reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::owning(resource)),
             ),
-            _ => None,
         }
     }
 
@@ -26156,6 +26162,17 @@ mod tests {
         assert_eq!(attachment.extent, [640, 480, 1]);
         assert_eq!(attachment.pixel_format, 80);
         assert_eq!(attachment.sample_count, 1);
+        // A plane view materializes an image of its own, so every reader that
+        // asks whether that image exists yet has to be able to name it. A
+        // reader that answers `None` for this descriptor says "no image, ever"
+        // --- the view is never installed, and every draw that binds it parks
+        // its channel on a refusal nothing can clear.
+        assert_eq!(
+            runtime.resource_backing_view(view.resource),
+            Some(reims_vgpu_core::BackingView::Image(
+                reims_vgpu_core::ImageOwner::owning(view.resource)
+            ))
+        );
 
         let parent_task = reims_vgpu_protocol::TaskId::new(0);
         let cross_task_surface_object = 20;
