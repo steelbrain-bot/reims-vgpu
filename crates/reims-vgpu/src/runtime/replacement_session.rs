@@ -2905,7 +2905,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .epoch
             .resources
             .graph()
-            .texture_binding_views_for_base(resource)
+            .texture_binding_views_for_image_owner(resource)
             .map_err(ReplacementRepresentationConstructionError::TextureView)?;
         let native = device
             .create_owned_texture(declaration, Box::new([]), shader_views, memory)
@@ -26160,6 +26160,47 @@ mod tests {
         assert_eq!(attachment.extent, [640, 480, 1]);
         assert_eq!(attachment.pixel_format, 80);
         assert_eq!(attachment.sample_count, 1);
+        // A texture view over the plane view. Its chain terminates at the
+        // surface, which owns the allocation and no image, while the image it
+        // has to be installed onto belongs to the plane. Gathering a
+        // materializing owner's views by chain terminus drops it: the plane
+        // builds its image carrying none of its views, nothing revisits a
+        // declared view once the image exists, and every draw that binds this
+        // one refuses for the life of the device.
+        let nested_object = 30;
+        let nested = crate::runtime::replacement_object_lifecycle::apply_replacement_texture_view(
+            &mut runtime,
+            task,
+            nested_object,
+            reims_vgpu_protocol::ResourceDescriptor::TextureView(
+                reims_vgpu_protocol::TextureViewDescriptor {
+                    view_texture_ref: nested_object,
+                    base_texture_ref: view_object,
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap();
+        assert!(nested.newly_declared);
+        let graph = runtime.execution().resources().graph();
+        let resolved = graph.resolve_texture_binding_view(nested.resource).unwrap();
+        assert_eq!(resolved.base, declared.resource);
+        assert_eq!(resolved.image_owner, view.resource);
+        assert_eq!(
+            graph
+                .texture_binding_views_for_image_owner(view.resource)
+                .unwrap()
+                .iter()
+                .map(|gathered| gathered.resource)
+                .collect::<Vec<_>>(),
+            [nested.resource]
+        );
+        // The surface owns no image, so nothing is gathered onto it.
+        assert!(graph
+            .texture_binding_views_for_image_owner(declared.resource)
+            .unwrap()
+            .is_empty());
+
         // A plane view materializes an image of its own, so every reader that
         // asks whether that image exists yet has to be able to name it. A
         // reader that answers `None` for this descriptor says "no image, ever"
@@ -26289,7 +26330,10 @@ mod tests {
                 resources,
                 retired,
             } if *root == declared.resource
-                && resources.as_ref() == [view.resource, declared.resource]
+                // Child-first, and the nested view declared above is now part
+                // of the tree: it shares the plane's backing, so the surface
+                // still retires exactly one storage.
+                && resources.as_ref() == [nested.resource, view.resource, declared.resource]
                 && retired.len() == 1
                 && retired[0].storage.id == view.backing
         ));

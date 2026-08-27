@@ -1338,20 +1338,31 @@ impl ResourceGraph {
         })
     }
 
-    /// Resolve every live shader-visible view whose generational parent chain
-    /// terminates at `base`. The returned identities are stable even when a
-    /// task-local object slot is subsequently reused.
-    pub fn texture_binding_views_for_base(
+    /// Resolve every live shader-visible view that belongs on the image
+    /// `owner` owns. The returned identities are stable even when a task-local
+    /// object slot is subsequently reused.
+    ///
+    /// Ownership, not the view chain. A view resolves its `base` by walking
+    /// parents to the end of the chain, and that terminus is not always the
+    /// resource holding the image: a view of an IOSurface plane resolves its
+    /// base to the *surface*, which owns the allocation and no image at all,
+    /// while the plane owns both the storage and the image the view has to be
+    /// installed onto. Selecting by base drops exactly those views --- the
+    /// plane materializes carrying none of them, no later pass installs them
+    /// because the image now exists and nothing revisits declared views, and
+    /// every draw that binds one refuses with no view present and parks its
+    /// channel for the life of the device.
+    pub fn texture_binding_views_for_image_owner(
         &self,
-        base: AnyResourceId,
+        owner: AnyResourceId,
     ) -> Result<Box<[ResolvedTextureBindingView]>, TextureViewResolveError> {
         self.resources
-            .get(&base)
-            .ok_or(TextureViewResolveError::ResourceAbsent(base))?;
+            .get(&owner)
+            .ok_or(TextureViewResolveError::ResourceAbsent(owner))?;
         let mut pending = self
             .resources
-            .get(&base)
-            .expect("base presence was validated")
+            .get(&owner)
+            .expect("owner presence was validated")
             .children
             .iter()
             .copied()
@@ -1375,7 +1386,7 @@ impl ResourceGraph {
                 continue;
             }
             let view = self.resolve_texture_binding_view(resource)?;
-            if view.base == base {
+            if view.image_owner == owner {
                 views.push(view);
             }
         }
@@ -3227,7 +3238,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            graph.texture_binding_views_for_base(base).unwrap(),
+            graph.texture_binding_views_for_image_owner(base).unwrap(),
             vec![
                 graph.resolve_texture_binding_view(inner).unwrap(),
                 graph.resolve_texture_binding_view(outer).unwrap(),
@@ -3259,12 +3270,11 @@ mod tests {
             )
             .unwrap();
         // The alias shares the backing and owns its own view. Views belong to
-        // the texture they view and never to the range it happens to sit on:
-        // a materialization gathers by base for exactly this reason, because
-        // the alias's view carries the alias's format and no image serving
-        // this base could express it.
+        // the texture whose image they name and never to the range it happens
+        // to sit on: the alias's view carries the alias's format, and no image
+        // serving this base could express it.
         assert_eq!(
-            graph.texture_binding_views_for_base(base).unwrap(),
+            graph.texture_binding_views_for_image_owner(base).unwrap(),
             vec![
                 graph.resolve_texture_binding_view(inner).unwrap(),
                 graph.resolve_texture_binding_view(outer).unwrap(),
@@ -3272,7 +3282,9 @@ mod tests {
             .into_boxed_slice()
         );
         assert_eq!(
-            graph.texture_binding_views_for_base(aliased_base).unwrap(),
+            graph
+                .texture_binding_views_for_image_owner(aliased_base)
+                .unwrap(),
             vec![graph.resolve_texture_binding_view(aliased_view).unwrap()].into_boxed_slice()
         );
     }
