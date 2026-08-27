@@ -4320,25 +4320,8 @@ pub(crate) enum ReplacementResourceReadyExecFailure<Completion> {
 
 #[derive(Debug)]
 pub(crate) struct ReplacementExecImagePreparationFailure {
-    pub reason: ReplacementExecImagePreparationRefusal,
+    pub reason: reims_vgpu_vulkan::replacement_exec_image::ExecImageStateError,
     pub resources: PreparedReplacementExecResources,
-}
-
-/// Why one exec could not take its image claims.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReplacementExecImagePreparationRefusal {
-    /// The backend's own image-state rule declined the plan.
-    Images(reims_vgpu_vulkan::replacement_exec_image::ExecImageStateError),
-    /// An earlier transaction in this one's own submission domain has not
-    /// submitted yet, so this one may not claim an image ahead of it.
-    ///
-    /// An image representation carries one prepared transition at a time and a
-    /// domain submits in sequence order. Letting a later transaction take the
-    /// claim first inverts those two orders against each other, and the result
-    /// is a cycle rather than a delay: the earlier transaction cannot prepare
-    /// because the later one holds the claim, and the later one cannot submit
-    /// or cancel because the earlier one holds the domain head.
-    EarlierInDomainUnsubmitted { predecessor: TransactionId },
 }
 
 type ReplacementExecResourceCancellation = reims_vgpu_core::ExecResourceCancellationResult<
@@ -11472,7 +11455,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 Ok(has_images) => has_images,
                 Err(reason) => {
                     return Err(Box::new(ReplacementExecImagePreparationFailure {
-                        reason: ReplacementExecImagePreparationRefusal::Images(reason),
+                        reason,
                         resources,
                     }));
                 }
@@ -11482,26 +11465,6 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 resources,
                 image_states: None,
             });
-        }
-        // Ordering the claim, not the work: everything above this point --
-        // readiness, resource preparation, the has-images classification --
-        // still runs as soon as the transaction arrives, and a transaction
-        // with no image uses has already returned. Only the exclusive claim
-        // waits, and only behind this transaction's own domain.
-        // An untracked transaction sits in no domain, so nothing can be ahead
-        // of it -- the order is assigned once, at admission, and never later.
-        // That is an answer rather than a swallowed error.
-        if let Ok(Some(predecessor)) = self
-            .execution
-            .runtime()
-            .unsubmitted_submission_predecessor(resources.transaction())
-        {
-            return Err(Box::new(ReplacementExecImagePreparationFailure {
-                reason: ReplacementExecImagePreparationRefusal::EarlierInDomainUnsubmitted {
-                    predecessor,
-                },
-                resources,
-            }));
         }
         let queue_family = self.session.vulkan().work_queue_family();
         let final_layouts =
@@ -11518,7 +11481,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 image_states: Some(image_states),
             }),
             Err(reason) => Err(Box::new(ReplacementExecImagePreparationFailure {
-                reason: ReplacementExecImagePreparationRefusal::Images(reason),
+                reason,
                 resources,
             })),
         }
