@@ -1248,7 +1248,14 @@ impl ReplacementNativeRepresentation {
         let Self::Image(image) = self else {
             return Err(TextureBindingViewDecline::NotImage);
         };
-        if semantic.resource == semantic.base {
+        // The image's own texture, not the end of the view chain. A binding
+        // that names the resource owning this image is that image, whole, and
+        // there is no installed view to find --- but a plane view *is* the
+        // owner of its plane's image while its chain terminates at the parent
+        // surface, so comparing against the base sends it down the lookup path
+        // for a view it can never have, and it refuses with the view absent
+        // for as long as the guest keeps binding it.
+        if semantic.resource == semantic.image_owner {
             let bound = |value: u64| {
                 u32::try_from(value).map_err(|_| TextureBindingViewDecline::SubresourceRange)
             };
@@ -2783,8 +2790,21 @@ mod tests {
             TextureBindingViewDecline::PartialSubresourceRange
         );
 
-        let mut aliased = whole;
-        aliased.base = ResourceId::new(6, 1);
+        // A binding that is not the image's own texture. Ownership is what
+        // decides that, not the view chain: naming a different base while
+        // still owning this image is a plane view, which resolves to the image
+        // whole and has no installed view to look up.
+        let mut chained = whole;
+        chained.base = ResourceId::new(6, 1);
+        assert_eq!(
+            native
+                .shader_view(chained)
+                .expect("the owner is this image")
+                .view,
+            vk::ImageView::from_raw(22)
+        );
+        let mut aliased = chained;
+        aliased.image_owner = ResourceId::new(6, 1);
         assert_eq!(
             native.shader_view(aliased).unwrap_err(),
             TextureBindingViewDecline::ShaderViewAbsent
