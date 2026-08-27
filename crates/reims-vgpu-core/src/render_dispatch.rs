@@ -535,6 +535,26 @@ pub enum RenderDispatchPreparationError {
     Uses(ResourceUseBatchError),
 }
 
+impl RenderDispatchPreparationError {
+    /// The backing a `StaleExecutionRepresentation` names, if that is what this
+    /// is.
+    ///
+    /// The refusal says only that the execution representation does not hold
+    /// the content the operation needs. What it holds instead is a query on the
+    /// backing, and this is what lets a diagnostic that has only the failure
+    /// reach it.
+    pub const fn stale_backing(&self) -> Option<BackingId> {
+        match self {
+            Self::Backing {
+                backing,
+                reason: ManagedBackingError::StaleExecutionRepresentation,
+                ..
+            } => Some(*backing),
+            _ => None,
+        }
+    }
+}
+
 pub fn prepare_render_dispatch<T, NativePipeline>(
     owner: &mut ResourceLifecycleOwner<T>,
     transaction: TransactionId,

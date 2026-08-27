@@ -629,6 +629,25 @@ impl<T> ManagedBackingOwner<T> {
             .and_then(|record| record.native.as_mut())
     }
 
+    /// What one backing's execution representation currently holds, for a
+    /// diagnostic that has only the backing to go on.
+    ///
+    /// `StaleExecutionRepresentation` names the backing and nothing else, and
+    /// the operation's own required snapshot is not in reach from where that
+    /// refusal is reported. This is the other half: pair it with the regions
+    /// the blocked operation names and the disagreement is readable.
+    pub fn execution_representation_coverage(
+        &self,
+        backing: BackingId,
+    ) -> Option<(RepresentationId, Vec<RegionVersion>)> {
+        let record = self.backings.get(&backing)?;
+        let representation = record.execution_representation?;
+        Some((
+            representation,
+            record.authority.representation_coverage(representation),
+        ))
+    }
+
     pub fn execution_representation_id(
         &self,
         backing: BackingId,
@@ -2632,5 +2651,48 @@ mod tests {
             .plan_transfers(backing, GUEST_REPRESENTATION, working, &newer)
             .unwrap()
             .is_empty());
+    }
+
+    /// The refusal names the backing; this is what the backing holds instead.
+    ///
+    /// A `StaleExecutionRepresentation` is reported from a place that has the
+    /// failure and not the operation's required snapshot, so without this the
+    /// only reading available is "some content is not current" -- which is what
+    /// the refusal already said. A boot spent twenty-eight thousand retries on
+    /// one of these.
+    #[test]
+    fn a_backing_can_say_what_its_execution_representation_holds() {
+        let (mut owner, backing) = owner();
+        assert_eq!(
+            owner.execution_representation_coverage(backing),
+            None,
+            "a backing with no execution representation holds nothing to report"
+        );
+
+        let execution = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                "execution",
+            )
+            .unwrap();
+        let (reported, coverage) = owner.execution_representation_coverage(backing).unwrap();
+        assert_eq!(reported, execution);
+        assert_eq!(
+            coverage,
+            owner
+                .live_backing(backing)
+                .unwrap()
+                .authority
+                .representation_coverage(execution),
+            "the reported coverage is the authority's own account and not a second one"
+        );
+
+        assert_eq!(
+            owner.execution_representation_coverage(BackingId::new(99)),
+            None,
+            "a backing this owner does not hold has no coverage to report"
+        );
     }
 }

@@ -5590,6 +5590,32 @@ impl ReplacementDecodedExecAdmissionError {
     }
 }
 
+impl ReplacementExecAutomaticPreparationError {
+    /// The backing a `StaleExecutionRepresentation` names, if that is what
+    /// refused this resource preparation.
+    ///
+    /// See [`reims_vgpu_core::ComputeDispatchPreparationError::stale_backing`].
+    /// Only the two dispatch arms can carry one: a blit or an info query names
+    /// its backing through a different failure entirely.
+    pub(crate) fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self {
+            Self::Compute { failure, .. } => match failure.as_ref() {
+                reims_vgpu_core::ExecResourcePreparationStepFailure::Preparation((reason, _)) => {
+                    reason.stale_backing()
+                }
+                _ => None,
+            },
+            Self::Render { failure, .. } => match failure.as_ref() {
+                reims_vgpu_core::ExecResourcePreparationStepFailure::Preparation((reason, _)) => {
+                    reason.stale_backing()
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 impl<Completion> ReplacementExecIngressPreparationError<Completion> {
     /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
     pub(crate) const fn is_terminal_refusal(&self) -> bool {
@@ -5601,6 +5627,17 @@ impl<Completion> ReplacementExecIngressPreparationError<Completion> {
 }
 
 impl<Completion> ReplacementExecIngressDispatchFailure<Completion> {
+    /// See [`ReplacementExecAutomaticPreparationError::stale_backing`].
+    pub(crate) fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self {
+            Self::DirectResources(ReplacementResourceReadyExecFailure::Resources {
+                reason,
+                ..
+            }) => reason.stale_backing(),
+            _ => None,
+        }
+    }
+
     /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
     pub(crate) const fn is_terminal_refusal(&self) -> bool {
         match self {
@@ -7087,6 +7124,29 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             guest_uploads: self.execution.epoch.recorded_guest_uploads.len(),
             indirect_ranges: self.execution.epoch.recorded_indirect_ranges.len(),
         }
+    }
+
+    /// What a backing's execution representation currently holds, rendered for
+    /// a diagnostic beside a `StaleExecutionRepresentation` refusal.
+    ///
+    /// See
+    /// [`reims_vgpu_core::ManagedBackingOwner::execution_representation_coverage`].
+    pub fn execution_representation_coverage(
+        &self,
+        backing: reims_vgpu_protocol::BackingId,
+    ) -> Option<(reims_vgpu_protocol::RepresentationId, String)> {
+        let (representation, coverage) = self
+            .execution
+            .resources()
+            .execution_representation_coverage(backing)?;
+        Some((
+            representation,
+            coverage
+                .iter()
+                .map(|held| format!("{:?}@{}", held.region, held.version.get()))
+                .collect::<Vec<_>>()
+                .join(","),
+        ))
     }
 
     /// Every transaction a parked recording map still holds.

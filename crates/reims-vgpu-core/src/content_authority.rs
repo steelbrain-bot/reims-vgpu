@@ -559,6 +559,21 @@ impl RegionContentState {
             })
     }
 
+    /// Every region one representation currently holds, with the version it
+    /// holds it at.
+    ///
+    /// `representation_matches` answers yes or no, which is the right shape for
+    /// a decision and the wrong one for a diagnostic: a refusal that says only
+    /// "stale" leaves the next question -- what does it hold instead -- with
+    /// nowhere to start, and a boot spent twenty-eight thousand retries on one
+    /// of these saying nothing more than the name.
+    pub fn representation_coverage(&self, representation: RepresentationId) -> Vec<RegionVersion> {
+        self.representations
+            .get(&representation)
+            .map(|coverage| coverage.entries.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn current_regions_in_representation(
         &self,
         representation: RepresentationId,
@@ -1145,6 +1160,14 @@ impl ContentAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .representation_matches(representation, snapshot)
+    }
+
+    /// See [`RegionContentState::representation_coverage`].
+    pub fn representation_coverage(&self, representation: RepresentationId) -> Vec<RegionVersion> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .representation_coverage(representation)
     }
 
     pub(crate) fn current_regions_in_representation(

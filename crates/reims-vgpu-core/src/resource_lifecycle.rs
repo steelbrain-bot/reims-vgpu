@@ -1284,6 +1284,14 @@ impl<T> ResourceLifecycleOwner<T> {
         self.native.execution_representation_id(backing)
     }
 
+    /// See [`crate::ManagedBackingOwner::execution_representation_coverage`].
+    pub fn execution_representation_coverage(
+        &self,
+        backing: BackingId,
+    ) -> Option<(RepresentationId, Vec<crate::RegionVersion>)> {
+        self.native.execution_representation_coverage(backing)
+    }
+
     pub fn execution_representation(&self, backing: BackingId) -> Option<(RepresentationId, &T)> {
         self.native.execution_representation(backing)
     }

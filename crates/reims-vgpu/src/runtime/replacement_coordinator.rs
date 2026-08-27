@@ -128,6 +128,14 @@ impl ReplacementObjectRepresentationPreparationError {
 }
 
 impl<Semantic> ReplacementHostExecDispatchFailure<Semantic> {
+    /// See [`crate::runtime::replacement_session::ReplacementExecAutomaticPreparationError::stale_backing`].
+    fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self {
+            Self::Dispatch { reason, .. } => reason.stale_backing(),
+            _ => None,
+        }
+    }
+
     /// See [`crate::runtime::replacement_session::ReplacementRepresentationConstructionError::is_unimplemented_case`].
     const fn is_unimplemented_case(&self) -> bool {
         match self {
@@ -6903,6 +6911,35 @@ impl ReplacementDeviceCoordinator<()> {
         );
         let orphaned =
             unowned_submission_positions(&self.runtime.submission_order_census(), &owned);
+        // A stale execution representation names the backing and stops. What
+        // that backing holds instead is the other half of the disagreement,
+        // and without it the reading is "some content is not current" -- which
+        // is what the refusal already said. One line per distinct backing,
+        // deduped, because a head in this state repeats once a second.
+        for backing in self
+            .blocked_drains
+            .iter()
+            .filter_map(|blocked| match blocked.as_ref() {
+                ReplacementBlockedDrain::DeferredChild(failure) => match failure.as_ref() {
+                    ReplacementDeferredChildDispatchFailure::Exec { failure, .. } => {
+                        failure.stale_backing()
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+        {
+            let Some((representation, holds)) =
+                self.runtime.execution_representation_coverage(backing)
+            else {
+                continue;
+            };
+            crate::observe::off(format!(
+                "replacement_stale_representation backing={} representation={} holds=[{holds}]",
+                backing.get(),
+                representation.get()
+            ));
+        }
         let unowned = orphaned
             .iter()
             .map(|(transaction, _)| *transaction)
