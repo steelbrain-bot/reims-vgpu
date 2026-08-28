@@ -1636,6 +1636,16 @@ impl<T> ResourceLifecycleOwner<T> {
             .current_regions_in_representation(backing, representation, required)
     }
 
+    pub fn transferable_regions_in_representation(
+        &self,
+        backing: BackingId,
+        representation: reims_vgpu_protocol::RepresentationId,
+        required: crate::RegionVersion,
+    ) -> Result<Box<[crate::BackingRegion]>, ManagedBackingError> {
+        self.native
+            .transferable_regions_in_representation(backing, representation, required)
+    }
+
     pub fn pending_gpu_writes_overlapping(
         &self,
         backing: BackingId,

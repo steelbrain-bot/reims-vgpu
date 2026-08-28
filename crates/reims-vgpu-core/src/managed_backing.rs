@@ -662,9 +662,11 @@ impl<T> ManagedBackingOwner<T> {
                 !excluded.contains(representation) && native.native.is_some()
             })
             .filter_map(|(&representation, _)| {
+                // Every consumer of this plans a transfer from the
+                // representation it names.
                 let regions = record
                     .authority
-                    .current_regions_in_representation(representation, required);
+                    .transferable_regions_in_representation(representation, required);
                 (!regions.is_empty()).then_some((representation, regions))
             })
             .collect())
@@ -681,6 +683,19 @@ impl<T> ManagedBackingOwner<T> {
         Ok(record
             .authority
             .current_regions_in_representation(representation, required))
+    }
+
+    pub fn transferable_regions_in_representation(
+        &self,
+        backing: BackingId,
+        representation: RepresentationId,
+        required: RegionVersion,
+    ) -> Result<Box<[BackingRegion]>, ManagedBackingError> {
+        let record = self.live_backing(backing)?;
+        known_representation(record, representation)?;
+        Ok(record
+            .authority
+            .transferable_regions_in_representation(representation, required))
     }
 
     /// Mutable access to one exact backing-owned representation. Construction

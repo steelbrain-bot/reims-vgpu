@@ -592,6 +592,11 @@ impl RegionContentState {
             .unwrap_or_default()
     }
 
+    /// The parts of `required` one representation already holds, named in the
+    /// asker's coordinates.
+    ///
+    /// This is the *read*: what a consumer wants to know is which of the bytes
+    /// it named are current, in the terms it named them.
     pub(crate) fn current_regions_in_representation(
         &self,
         representation: RepresentationId,
@@ -603,6 +608,30 @@ impl RegionContentState {
             .flat_map(|coverage| coverage.entries.iter())
             .filter(|current| current.version == required.version)
             .filter_map(|current| intersection(current.region, required.region))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    /// The parts of `required` one representation can be asked to *transfer*,
+    /// named in coordinates that representation can issue against.
+    ///
+    /// The sibling of the read above, and the distinction is the same one
+    /// [`transferable_from`] draws: a source whose coverage is the complete
+    /// backing has no finer coordinates to copy from, so narrowing to the
+    /// consumer's region here produces a copy nothing downstream can express.
+    /// Every caller that goes on to plan a transfer or an ingress asks this
+    /// one, so the two questions cannot be confused at a call site.
+    pub(crate) fn transferable_regions_in_representation(
+        &self,
+        representation: RepresentationId,
+        required: RegionVersion,
+    ) -> Box<[BackingRegion]> {
+        self.representations
+            .get(&representation)
+            .into_iter()
+            .flat_map(|coverage| coverage.entries.iter())
+            .filter(|current| current.version == required.version)
+            .filter_map(|current| transferable_from(required.region, current.region))
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
@@ -1206,6 +1235,18 @@ impl ContentAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .current_regions_in_representation(representation, required)
+    }
+
+    /// See [`RegionContentState::transferable_regions_in_representation`].
+    pub(crate) fn transferable_regions_in_representation(
+        &self,
+        representation: RepresentationId,
+        required: RegionVersion,
+    ) -> Box<[BackingRegion]> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .transferable_regions_in_representation(representation, required)
     }
 
     pub(crate) fn pending_gpu_writes_overlapping(
@@ -1926,6 +1967,57 @@ mod tests {
             .snapshot(&[BackingRegion::Whole, image([0, 0, 0], [16, 16, 1])])
             .iter()
             .all(|entry| entry.version == new));
+    }
+
+    /// The read and the transfer disagree about a whole-covered source, and
+    /// each accessor answers only its own question.
+    ///
+    /// A consumer asking which of its bytes are current wants them back in the
+    /// terms it named. A planner asking what a source can copy wants them in
+    /// terms that source can issue, and a whole-backing source can only issue
+    /// the whole backing. One accessor answering both narrowed every transfer
+    /// to the consumer's coordinates, and a host ingress -- a byte copy --
+    /// then arrived asking for a texel box.
+    #[test]
+    fn a_transfer_source_reports_regions_it_can_actually_issue() {
+        let mut whole = state(BackingRegion::Whole);
+        let write = whole
+            .plan_gpu_write(SubmissionId::new(1), GPU, [BackingRegion::Whole])
+            .unwrap()[0];
+        let required = RegionVersion {
+            region: image([0, 0, 0], [1280, 1024, 1]),
+            version: write.version,
+        };
+        whole.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+
+        assert_eq!(
+            whole
+                .current_regions_in_representation(GPU, required)
+                .as_ref(),
+            [required.region]
+        );
+        assert_eq!(
+            whole
+                .transferable_regions_in_representation(GPU, required)
+                .as_ref(),
+            [BackingRegion::Whole]
+        );
+
+        // A source that can address the requirement answers the same either
+        // way, so the two only ever differ where it matters.
+        let mut bytes = state(linear(0, 128));
+        let byte_write = bytes
+            .plan_gpu_write(SubmissionId::new(1), GPU, [linear(0, 128)])
+            .unwrap()[0];
+        bytes.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+        let byte_required = RegionVersion {
+            region: linear(0, 64),
+            version: byte_write.version,
+        };
+        assert_eq!(
+            bytes.current_regions_in_representation(GPU, byte_required),
+            bytes.transferable_regions_in_representation(GPU, byte_required)
+        );
     }
 
     /// A backing's coordinate vocabulary is what it was declared with, and

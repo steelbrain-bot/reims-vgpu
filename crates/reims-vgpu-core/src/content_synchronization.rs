@@ -324,7 +324,7 @@ pub fn prepare_content_synchronization<T>(
                     }
 
                     let endpoint_regions = resources
-                        .current_regions_in_representation(backing, endpoint, required)
+                        .transferable_regions_in_representation(backing, endpoint, required)
                         .map_err(|reason| ContentSynchronizationError::Backing {
                             backing,
                             reason,
@@ -385,7 +385,7 @@ pub fn prepare_content_synchronization<T>(
 
                     if endpoint == HOST_REPRESENTATION && !remaining.is_empty() {
                         let guest_regions = resources
-                            .current_regions_in_representation(
+                            .transferable_regions_in_representation(
                                 backing,
                                 GUEST_REPRESENTATION,
                                 required,
