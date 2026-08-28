@@ -7936,6 +7936,35 @@ pub(crate) enum ReplacementTextureResolutionError {
     StorageUnavailable,
 }
 
+/// One subresource's extent and sample count, however its base declared them.
+///
+/// The texture family declares a layout per level and the other texture-bearing
+/// descriptors declare only the base extent, so this is where the two forms
+/// meet. Reading the declaration is not a second source of truth for the
+/// texture family -- that arm still reads its own level layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReplacementAttachmentGeometry {
+    width: u32,
+    height: u32,
+    planes: u32,
+    sample_count: u32,
+}
+
+impl ReplacementAttachmentGeometry {
+    fn declared(declaration: &reims_vgpu_protocol::TextureDeclaration, mip: u32) -> Self {
+        Self {
+            width: reims_vgpu_protocol::mip_extent(declaration.width, mip),
+            height: reims_vgpu_protocol::mip_extent(declaration.height, mip),
+            planes: if declaration.texture_type == reims_vgpu_protocol::TextureType::D3 {
+                reims_vgpu_protocol::mip_extent(declaration.depth, mip)
+            } else {
+                1
+            },
+            sample_count: u32::from(declaration.sample_count).max(1),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementRenderAttachmentResolutionError {
     ResourceUnavailable,
@@ -17498,12 +17527,44 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 }),
             });
         }
-        let reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor) = base_descriptor else {
-            return Err(Error::BaseNotTexture(base.kind));
+        // Every descriptor that declares a texture can be rendered into, not
+        // only the one registered under the texture family. A texture placed in
+        // a heap, one placed over a buffer's storage and one over a mapper
+        // surface each carry a complete `TextureDeclaration`, and a colour
+        // attachment naming any of them refused `BaseNotTexture` -- which on a
+        // driven macos-13 boot was two of the five channel-1 packets this
+        // device gave up.
+        //
+        // Only the texture family declares its levels explicitly, so it is the
+        // only one whose level layout is read; the others derive the level
+        // extent from the declaration by the standard rule, which is what
+        // `mip_extent` states.
+        let geometry = match base_descriptor {
+            reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor) => {
+                let layout = descriptor.level(mip).ok_or(Error::SubresourceOutOfBounds)?;
+                ReplacementAttachmentGeometry {
+                    width: layout.width,
+                    height: layout.height,
+                    planes: layout.planes(),
+                    sample_count: descriptor
+                        .declaration
+                        .as_ref()
+                        .map_or(1, |declaration| u32::from(declaration.sample_count).max(1)),
+                }
+            }
+            reims_vgpu_protocol::ResourceDescriptor::HeapTexture(descriptor) => {
+                ReplacementAttachmentGeometry::declared(&descriptor.declaration, mip)
+            }
+            reims_vgpu_protocol::ResourceDescriptor::BufferTexture(descriptor) => {
+                ReplacementAttachmentGeometry::declared(&descriptor.desc, mip)
+            }
+            reims_vgpu_protocol::ResourceDescriptor::MapperIOSurfaceTextureView(descriptor) => {
+                ReplacementAttachmentGeometry::declared(&descriptor.declaration, mip)
+            }
+            _ => return Err(Error::BaseNotTexture(base.kind)),
         };
-        let layout = descriptor.level(mip).ok_or(Error::SubresourceOutOfBounds)?;
         let (layer, z) = if view.texture_type == reims_vgpu_protocol::TextureType::D3 {
-            if slice != 0 || depth_plane >= layout.planes() {
+            if slice != 0 || depth_plane >= geometry.planes {
                 return Err(Error::SubresourceOutOfBounds);
             }
             (0, depth_plane)
@@ -17519,12 +17580,9 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 .ok_or(Error::SubresourceOutOfBounds)?;
             (layer, 0)
         };
-        let extent = [layout.width, layout.height, 1];
+        let extent = [geometry.width, geometry.height, 1];
         let texels = reims_vgpu_core::TexelBox::new([0, 0, z], extent).ok_or(Error::EmptyExtent)?;
-        let sample_count = descriptor
-            .declaration
-            .as_ref()
-            .map_or(1, |declaration| u32::from(declaration.sample_count).max(1));
+        let sample_count = geometry.sample_count;
         Ok(ReplacementRenderAttachmentResource {
             resource,
             image_owner: view.image_owner,
@@ -23945,6 +24003,56 @@ mod tests {
             runtime
                 .resolve_resource(task, reims_vgpu_protocol::ObjectTableRef::new(plane_object))
                 .expect("the plane view is live")
+        );
+    }
+
+    /// A heap or buffer texture can be rendered into, at the level the draw
+    /// names.
+    ///
+    /// Only the texture family declares a layout per level; a texture placed in
+    /// a heap, over a buffer's storage or over a mapper surface declares its
+    /// base extent and the level follows by the standard halving rule. Refusing
+    /// those as `BaseNotTexture` cost a driven macos-13 boot two of the five
+    /// channel-1 packets it gave up, both colour attachments.
+    #[test]
+    fn an_attachment_over_a_declared_texture_takes_its_level_extent() {
+        let declaration = |texture_type, depth| reims_vgpu_protocol::TextureDeclaration {
+            texture_type,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
+            allow_gpu_optimized_contents: false,
+            usage: reims_vgpu_protocol::TEXTURE_USAGE_RENDER_TARGET,
+            pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_BGRA8_UNORM,
+            width: 1920,
+            height: 1080,
+            depth,
+            mipmap_level_count: 4,
+            sample_count: 4,
+            array_length: 1,
+            resource_options: 0,
+            protection_options: 0,
+            swizzle: None,
+        };
+
+        let flat = declaration(reims_vgpu_protocol::TextureType::D2, 1);
+        let base = ReplacementAttachmentGeometry::declared(&flat, 0);
+        assert_eq!((base.width, base.height, base.planes), (1920, 1080, 1));
+        assert_eq!(base.sample_count, 4);
+
+        // The halving rule, including the floor of one that keeps a level from
+        // becoming an empty extent.
+        let second = ReplacementAttachmentGeometry::declared(&flat, 2);
+        assert_eq!((second.width, second.height), (480, 270));
+        let deep = ReplacementAttachmentGeometry::declared(&flat, 11);
+        assert_eq!((deep.width, deep.height), (1, 1));
+
+        // Only a 3D texture has planes to index; an array's slices are layers
+        // and are bounded by the view's own range instead.
+        let volume = declaration(reims_vgpu_protocol::TextureType::D3, 64);
+        assert_eq!(
+            ReplacementAttachmentGeometry::declared(&volume, 2).planes,
+            16
         );
     }
 
