@@ -3539,6 +3539,97 @@ impl ReplacementExecResourcePreflightMode {
     }
 }
 
+/// Name the requirement one guest-upload refresh was planned to repair.
+///
+/// A refresh is ordinary control flow -- a retained manifest whose world moved
+/// under it is repaired rather than refused -- so this is on the `OFF`
+/// channel. What it exists for is the case where the repair does not converge:
+/// `replacement_pipeline_census`' `upload_resumptions` says how many times a
+/// suffix went round, and this says what it went round *for*. Neither reading
+/// answers alone, and the pair is the only way to tell an upload that is busy
+/// from one that is asking for something no refresh can give it.
+///
+/// Deduped per distinct requirement, so a suffix that loops a hundred times a
+/// second contributes one line rather than drowning the log in the volume that
+/// is itself the symptom.
+fn report_guest_upload_refresh(
+    transaction: TransactionId,
+    staleness: Option<ReplacementUploadManifestStaleness>,
+) {
+    let Some(staleness) = staleness else {
+        return;
+    };
+    let (reason, backing, detail) = match staleness {
+        ReplacementUploadManifestStaleness::Representation {
+            backing,
+            representation,
+        } => (
+            "representation_retired",
+            backing,
+            format!("representation={}", representation.get()),
+        ),
+        ReplacementUploadManifestStaleness::Undesignated { backing } => {
+            ("backing_designates_nothing", backing, String::new())
+        }
+        ReplacementUploadManifestStaleness::Unreadable { backing } => {
+            ("backing_unreadable", backing, String::new())
+        }
+        ReplacementUploadManifestStaleness::Content {
+            backing,
+            view,
+            representation,
+        } => (
+            "view_content_stale",
+            backing,
+            format!("view={view:?} representation={}", representation.get()),
+        ),
+    };
+    let key = (transaction.get() << 32) | backing.get();
+    if crate::observe::first_sight(reason, key) {
+        crate::observe::off(format!(
+            "replacement_guest_upload_refresh transaction={} backing={} reason={reason} {detail}",
+            transaction.get(),
+            backing.get(),
+        ));
+    }
+}
+
+/// Why a retained upload manifest may no longer be read by its suffix.
+///
+/// The suffix answers "has anything moved under me" and plans a refresh when
+/// something has. A refresh that runs and leaves the same answer unchanged is
+/// a repair that did not repair, and the suffix then asks again -- so without
+/// a name for what is unsatisfied, an unconverging repair and a busy one are
+/// the same reading on the census: one live upload. Naming it is what makes
+/// the difference reportable on the failure channel, where an unconverging
+/// repair belongs, because it costs the guest the whole channel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementUploadManifestStaleness {
+    /// A representation this manifest recorded is no longer designated for its
+    /// backing: physical replacement retired the object it would have read.
+    Representation {
+        backing: reims_vgpu_protocol::BackingId,
+        representation: reims_vgpu_protocol::RepresentationId,
+    },
+    /// The backing designates no view at all, so it holds this content
+    /// nowhere and no accessor over the views that exist can say so.
+    Undesignated {
+        backing: reims_vgpu_protocol::BackingId,
+    },
+    /// The backing or its regional content could not be read.
+    Unreadable {
+        backing: reims_vgpu_protocol::BackingId,
+    },
+    /// One view over these bytes does not hold the content the manifest
+    /// requires. Every image declared over a backing keeps its own copy, so
+    /// the answer is per view and this names which one.
+    Content {
+        backing: reims_vgpu_protocol::BackingId,
+        view: reims_vgpu_core::BackingView,
+        representation: reims_vgpu_protocol::RepresentationId,
+    },
+}
+
 impl ReplacementExecResourceManifest {
     fn requires_guest_upload(&self) -> bool {
         !self.content_synchronization.is_empty()
@@ -3552,41 +3643,81 @@ impl ReplacementExecResourceManifest {
         &self,
         resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
     ) -> bool {
-        // Membership, not identity of a single designation: a backing carries
-        // one image per texture declared over it, and replacement retires them
-        // together, so a recorded identity is current exactly while it is
-        // still one of them.
+        self.stale_upload_representation(resources).is_none()
+    }
+
+    /// The first recorded representation replacement has retired, if any.
+    ///
+    /// Membership, not identity of a single designation: a backing carries one
+    /// image per texture declared over it, and replacement retires them
+    /// together, so a recorded identity is current exactly while it is still
+    /// one of them.
+    fn stale_upload_representation(
+        &self,
+        resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
+    ) -> Option<ReplacementUploadManifestStaleness> {
         self.upload_representations
             .iter()
-            .all(|(&backing, &representation)| resources.is_designated(backing, representation))
+            .find(|&(&backing, &representation)| !resources.is_designated(backing, representation))
+            .map(
+                |(&backing, &representation)| ReplacementUploadManifestStaleness::Representation {
+                    backing,
+                    representation,
+                },
+            )
     }
 
     fn upload_content_matches(
         &self,
         resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
     ) -> bool {
-        self.content_requirements.iter().all(|request| {
+        self.stale_upload_content(resources).is_none()
+    }
+
+    /// The first content requirement a view of its backing does not hold.
+    fn stale_upload_content(
+        &self,
+        resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
+    ) -> Option<ReplacementUploadManifestStaleness> {
+        self.content_requirements.iter().find_map(|request| {
+            let backing = request.backing;
             // A backing that designates nothing holds this content nowhere, and
             // `stale_designated_representations` cannot say so -- it answers
             // about the views that exist, and there are none.
-            let Ok(designated) = resources.designated_views(request.backing) else {
-                return false;
+            let Ok(designated) = resources.designated_views(backing) else {
+                return Some(ReplacementUploadManifestStaleness::Unreadable { backing });
             };
             if designated.is_empty() {
-                return false;
+                return Some(ReplacementUploadManifestStaleness::Undesignated { backing });
             }
-            let Ok(snapshot) = resources.snapshot_content(request.backing, &request.regions) else {
-                return false;
+            let Ok(snapshot) = resources.snapshot_content(backing, &request.regions) else {
+                return Some(ReplacementUploadManifestStaleness::Unreadable { backing });
             };
             // Every image over these bytes holds its own copy, so the upload's
             // content requirement is met only when all of them hold it. Asked
             // of the type that owns the designations, so this cannot drift
             // from the preflight that decides whether to request the
             // synchronization in the first place.
-            resources
-                .stale_designated_representations(request.backing, &snapshot)
-                .is_ok_and(|stale| stale.is_empty())
+            let stale = resources
+                .stale_designated_representations(backing, &snapshot)
+                .ok()?;
+            stale.first().map(|&(view, representation)| {
+                ReplacementUploadManifestStaleness::Content {
+                    backing,
+                    view,
+                    representation,
+                }
+            })
         })
+    }
+
+    /// Why this manifest may not be read as it stands, or `None` if it may.
+    fn upload_staleness(
+        &self,
+        resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
+    ) -> Option<ReplacementUploadManifestStaleness> {
+        self.stale_upload_representation(resources)
+            .or_else(|| self.stale_upload_content(resources))
     }
 }
 
@@ -18792,9 +18923,8 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         // execution identities and exact regional content still match.
         // Physical replacement or a content-version transition requires a
         // fresh preflight before the suffix may read them.
-        let upload_state_changed = !retained
-            .upload_representations_match(&self.execution.epoch.resources)
-            || !retained.upload_content_matches(&self.execution.epoch.resources);
+        let staleness = retained.upload_staleness(&self.execution.epoch.resources);
+        let upload_state_changed = staleness.is_some();
         let mut manifest = if upload_state_changed {
             match self.preflight_prepared_guest_upload_suffix_resources(&prepared) {
                 Ok(manifest) => manifest,
@@ -18816,6 +18946,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         };
         if upload_state_changed && manifest.requires_guest_upload() {
             let transaction = chain.transaction();
+            report_guest_upload_refresh(transaction, staleness);
             let recording_exec = CanonicalReplacementExecTransaction {
                 identity: chain.suffix().identity,
                 prologue: reims_vgpu_core::ExecPrologue::default(),
