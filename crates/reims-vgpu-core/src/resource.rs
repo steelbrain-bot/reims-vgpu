@@ -2101,21 +2101,36 @@ impl ResourceGraph {
     /// Release the exact generational resource resolved at transaction
     /// admission. A stale generation cannot delete the replacement occupying
     /// the same task-local object slot.
+    /// Release one generation, idempotently.
+    ///
+    /// Releasing an object that is already released is the guest's statement
+    /// satisfied, not a failure. It is reachable whenever something else
+    /// emptied the name first -- a rebind, a tree release, a task teardown --
+    /// and the guest's own delete for that generation is still admitted and on
+    /// its way. Refusing it there costs far more than the delete: the packet
+    /// carrying it is refused at apply, its completion stamp is never
+    /// published, and the guest waits on that stamp for the life of the boot.
+    /// A driven macos-13 conformance boot died exactly that way, on
+    /// `ReleaseResource { resource: ResourceId { index: 18, generation: 2 } }`
+    /// against a name a rebind had emptied one millisecond earlier.
+    ///
+    /// Generations are what make this safe to wave through. The delete names
+    /// the generation it was admitted against, so it can never reach whatever
+    /// the name holds now.
     pub fn release_resource(&mut self, id: AnyResourceId) -> Result<AnyResourceId, GraphError> {
-        let node = self.resources.get(&id).ok_or(GraphError::ResourceAbsent)?;
+        let Some(node) = self.resources.get(&id) else {
+            return Ok(id);
+        };
         let key = (node.task, node.object);
-        let slot = self
-            .slots
-            .get_mut(&key)
-            .ok_or(GraphError::ReferenceUnbound)?;
-        if slot.current != Some(id) {
-            return Err(GraphError::ReferenceUnbound);
+        if let Some(slot) = self.slots.get_mut(&key) {
+            if slot.current == Some(id) {
+                slot.current = None;
+                slot.released = Some(id);
+            }
         }
-        slot.current = None;
-        slot.released = Some(id);
         self.resources
             .get_mut(&id)
-            .ok_or(GraphError::ResourceAbsent)?
+            .expect("the node was just found in the canonical graph")
             .lifecycle = LifecycleState::Released;
         self.collect_if_unowned(id);
         Ok(id)
@@ -2276,6 +2291,51 @@ mod tests {
         assert_eq!(
             graph.slot_state(TaskId::new(9), object(47)),
             ObjectSlotState::Undeclared
+        );
+    }
+
+    /// A delete the guest already sent for a generation something else has
+    /// already released must complete, not refuse.
+    ///
+    /// The two happen together whenever a name is rebound: the declaration that
+    /// rebinds releases the live generation, and the guest's own delete for
+    /// that generation is still admitted and on its way. Refusing it costs far
+    /// more than the delete -- the packet carrying it is refused at apply, its
+    /// completion stamp is never published, and the guest waits on that stamp
+    /// for the rest of the boot with nothing in any census to say why.
+    #[test]
+    fn releasing_a_generation_something_else_already_released_completes() {
+        let mut graph = ResourceGraph::default();
+        let first = graph
+            .create_resource(task(), object(43), ObjectKind::IOSurfacePlaneView, None, [])
+            .unwrap();
+
+        // The rebind: the live generation goes and the name takes a new one.
+        graph.release_resource(first).unwrap();
+        let second = graph
+            .create_resource(task(), object(43), ObjectKind::Buffer, None, [])
+            .unwrap();
+        assert_ne!(second, first);
+
+        // The guest's delete, admitted against the generation it resolved.
+        assert_eq!(graph.release_resource(first), Ok(first));
+        assert_eq!(
+            graph.slot_state(task(), object(43)),
+            ObjectSlotState::Bound(second),
+            "a delete names the generation it was admitted against and cannot \
+             reach whatever the name holds now"
+        );
+
+        // And releasing the live one still empties the name, once.
+        graph.release_resource(second).unwrap();
+        assert_eq!(
+            graph.slot_state(task(), object(43)),
+            ObjectSlotState::Released(Some(second))
+        );
+        assert_eq!(graph.release_resource(second), Ok(second));
+        assert_eq!(
+            graph.slot_state(task(), object(43)),
+            ObjectSlotState::Released(Some(second))
         );
     }
 
