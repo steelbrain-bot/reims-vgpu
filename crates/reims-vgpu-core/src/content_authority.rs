@@ -1657,6 +1657,32 @@ fn subtract(region: BackingRegion, cut: BackingRegion) -> Option<Vec<BackingRegi
     })
 }
 
+/// The part of `required` a source covering `available` can be asked to
+/// transfer, named in coordinates that source can address.
+///
+/// This is deliberately not [`intersection`]. A *read* asks whether bytes are
+/// current and is answered in the reader's own coordinates, so whole-backing
+/// coverage answers an image query about that image. A *transfer* has to be
+/// issued against the source, and a source whose coverage is the complete
+/// backing has no finer coordinates to issue against -- the only copy it can
+/// perform is the whole backing. Naming the requirement's own region there
+/// produces a copy request the source cannot express, and the refusal then
+/// lands at the executor, on a transfer the planner should never have chosen.
+///
+/// Widening to the whole backing copies more than was asked for and copies the
+/// right bytes. The alternative is a transfer that never runs.
+pub(crate) fn transferable_from(
+    required: BackingRegion,
+    available: BackingRegion,
+) -> Option<BackingRegion> {
+    let overlap = intersection(required, available)?;
+    Some(if available == BackingRegion::Whole {
+        available
+    } else {
+        overlap
+    })
+}
+
 /// The part of `region` that is provably still `region` and not `cut`.
 ///
 /// Where the remainder has no expression this is empty, so a caller recording
@@ -1873,6 +1899,42 @@ mod tests {
             .snapshot(&[BackingRegion::Whole, image([0, 0, 0], [16, 16, 1])])
             .iter()
             .all(|entry| entry.version == new));
+    }
+
+    /// A transfer is named in coordinates its source can issue against.
+    ///
+    /// A read of whole-backing coverage is answered about the image the reader
+    /// asked for, which is right for a read and wrong for a copy: the source
+    /// has no finer coordinates to copy from, so the only transfer it can
+    /// perform is the whole backing. Naming the reader's region instead
+    /// produces a request the executor refuses, on a transfer the planner
+    /// chose.
+    #[test]
+    fn a_transfer_from_whole_coverage_is_named_as_the_whole_backing() {
+        let region = image([0, 0, 0], [1280, 1024, 1]);
+
+        // The read and the transfer disagree, and each is right for its own
+        // question.
+        assert_eq!(intersection(region, BackingRegion::Whole), Some(region));
+        assert_eq!(
+            transferable_from(region, BackingRegion::Whole),
+            Some(BackingRegion::Whole)
+        );
+
+        // Coverage that can address the requirement names the requirement, and
+        // coverage that does not overlap it at all names nothing.
+        assert_eq!(
+            transferable_from(linear(0, 64), linear(0, 128)),
+            Some(linear(0, 64))
+        );
+        assert_eq!(transferable_from(linear(0, 64), linear(64, 64)), None);
+
+        // A whole-backing requirement against whole-backing coverage is the
+        // whole backing either way.
+        assert_eq!(
+            transferable_from(BackingRegion::Whole, BackingRegion::Whole),
+            Some(BackingRegion::Whole)
+        );
     }
 
     /// Subtraction errs in the direction its caller must err in.

@@ -14,6 +14,14 @@ use crate::{
 use reims_vgpu_protocol::{BackingId, TransactionId};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The regions of `remaining` some source covering `available` can be asked to
+/// transfer, removing each claimed region from `remaining`.
+///
+/// Every caller of this uses the result to plan a transfer, so the claim is
+/// [`crate::content_authority::transferable_from`] rather than a plain
+/// intersection: a source whose coverage is the complete backing can only copy
+/// the complete backing, and asking it for one image region produces a request
+/// it cannot express.
 fn take_available_regions(
     remaining: &mut Vec<BackingRegion>,
     available: &[BackingRegion],
@@ -21,8 +29,8 @@ fn take_available_regions(
     let mut claimed = Vec::new();
     for available in available.iter().copied() {
         for region in remaining.iter().copied() {
-            if let Some(overlap) = crate::content_authority::intersection(region, available) {
-                claimed.push(overlap);
+            if let Some(region) = crate::content_authority::transferable_from(region, available) {
+                claimed.push(region);
             }
         }
         *remaining = remaining
