@@ -48,6 +48,19 @@ pub struct ContentSynchronizationRequest {
     /// Pending writes owned by the ordered EXEC suffix for which this
     /// synchronization is the queue prefix.
     pub permitted_pending_writes: Box<[crate::GpuWriteId]>,
+    /// The views of the backing this operation reads.
+    ///
+    /// A backing designates one representation per texture declared over it,
+    /// and a read of its *bytes* is served by the transfer endpoint those
+    /// images share --- which is not a designated view. So the designated
+    /// sweep never brings it current, and an operation binding a buffer over a
+    /// backing an image wrote refuses `StaleExecutionRepresentation` with
+    /// nothing planned to repair it. Naming the view here puts whichever
+    /// representation serves it in the destination set.
+    ///
+    /// Empty asks for the designated views alone, which is what an operation
+    /// that reads a backing without binding a view of it means.
+    pub views: Box<[crate::BackingView]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,6 +216,7 @@ pub fn prepare_content_synchronization<T>(
 ) -> Result<PreparedContentSynchronizationBatch, ContentSynchronizationError> {
     let mut grouped = BTreeMap::<BackingId, BTreeSet<BackingRegion>>::new();
     let mut permitted_pending = BTreeMap::<BackingId, BTreeSet<crate::GpuWriteId>>::new();
+    let mut read_views = BTreeMap::<BackingId, BTreeSet<crate::BackingView>>::new();
     for request in requests {
         if request.regions.is_empty() {
             return Err(ContentSynchronizationError::EmptyRegions(request.backing));
@@ -215,6 +229,10 @@ pub fn prepare_content_synchronization<T>(
             .entry(request.backing)
             .or_default()
             .extend(request.permitted_pending_writes);
+        read_views
+            .entry(request.backing)
+            .or_default()
+            .extend(request.views);
     }
 
     let mut transfers = Vec::new();
@@ -229,6 +247,23 @@ pub fn prepare_content_synchronization<T>(
         let designated = resources
             .designated_views(backing)
             .map_err(|reason| ContentSynchronizationError::Backing { backing, reason })?;
+        // Every representation this operation may read: the views the backing
+        // designates, and whichever representation serves each view the
+        // operation actually binds. The second set is usually a subset of the
+        // first and adds nothing --- except for a byte view over a backing
+        // that designates only images, where it is the transfer endpoint and
+        // is the whole point.
+        let mut destinations = designated
+            .iter()
+            .map(|(_, representation)| *representation)
+            .collect::<BTreeSet<_>>();
+        for view in read_views.remove(&backing).unwrap_or_default() {
+            destinations.insert(
+                resources
+                    .view_representation(backing, view)
+                    .map_err(|reason| ContentSynchronizationError::Backing { backing, reason })?,
+            );
+        }
         // One entry per backing, accumulated across its designated views.
         // Every view over these bytes holds its own copy and each may need a
         // different set of representations moved, but a use batch is keyed by
@@ -236,7 +271,7 @@ pub fn prepare_content_synchronization<T>(
         // designated views produced `DuplicateBacking` and parked its channel.
         // `RepresentationUse` carries a set for exactly this reason.
         let mut backing_uses = BTreeSet::new();
-        for (_, destination) in designated {
+        for destination in destinations {
             let result = (|| {
                 let regions = regions.clone();
                 let snapshot = resources
@@ -291,23 +326,29 @@ pub fn prepare_content_synchronization<T>(
                             .map_or(0, std::collections::BTreeSet::len),
                     });
                 }
-                let route = resources
-                    .representation_route(backing, destination)
-                    .expect("the execution representation has an owned route");
-                if !matches!(
-                    route,
-                    RepresentationRoute::ImportedGuestTransfer { .. }
-                        | RepresentationRoute::HostStagingTransfer { .. }
-                ) {
-                    return Err(ContentSynchronizationError::RouteCannotSynchronize {
-                        backing,
-                        route,
-                    });
-                }
-                let endpoint = match route {
-                    RepresentationRoute::ImportedGuestTransfer { .. } => GUEST_REPRESENTATION,
-                    RepresentationRoute::HostStagingTransfer { .. } => HOST_REPRESENTATION,
-                    _ => unreachable!("the synchronizable routes were matched above"),
+                // Which endpoint serves these bytes. A designated view names it
+                // through its own transfer route; the endpoint itself is the
+                // answer to its own question, and asking its route instead
+                // reads `HostStagingEndpoint` --- the route that makes it the
+                // endpoint --- and refuses the destination for being one.
+                let endpoint = if destination == GUEST_REPRESENTATION
+                    || destination == HOST_REPRESENTATION
+                {
+                    destination
+                } else {
+                    let route = resources
+                        .representation_route(backing, destination)
+                        .expect("the execution representation has an owned route");
+                    match route {
+                        RepresentationRoute::ImportedGuestTransfer { .. } => GUEST_REPRESENTATION,
+                        RepresentationRoute::HostStagingTransfer { .. } => HOST_REPRESENTATION,
+                        _ => {
+                            return Err(ContentSynchronizationError::RouteCannotSynchronize {
+                                backing,
+                                route,
+                            })
+                        }
+                    }
                 };
                 let mut used_representations = BTreeSet::from([destination]);
                 for required in snapshot.iter().copied() {
@@ -323,12 +364,20 @@ pub fn prepare_content_synchronization<T>(
                         continue;
                     }
 
-                    let endpoint_regions = resources
-                        .transferable_regions_in_representation(backing, endpoint, required)
-                        .map_err(|reason| ContentSynchronizationError::Backing {
-                            backing,
-                            reason,
-                        })?;
+                    // The endpoint is the preferred source, except when it is
+                    // the destination: a representation cannot copy into
+                    // itself, and what it is missing is exactly what the
+                    // images over the same bytes hold.
+                    let endpoint_regions = if destination == endpoint {
+                        Box::default()
+                    } else {
+                        resources
+                            .transferable_regions_in_representation(backing, endpoint, required)
+                            .map_err(|reason| ContentSynchronizationError::Backing {
+                                backing,
+                                reason,
+                            })?
+                    };
                     let endpoint_claimed =
                         take_available_regions(&mut remaining, &endpoint_regions);
                     if !endpoint_claimed.is_empty() {
@@ -537,6 +586,7 @@ mod tests {
                 backing,
                 regions: Box::new([region]),
                 permitted_pending_writes: Box::new([]),
+                views: Box::new([]),
             }],
         )
         .unwrap();
@@ -565,6 +615,7 @@ mod tests {
                 backing,
                 regions: Box::new([region]),
                 permitted_pending_writes: Box::new([]),
+                views: Box::new([]),
             }],
         )
         .unwrap();
@@ -633,6 +684,7 @@ mod tests {
                 backing,
                 regions: Box::new([region]),
                 permitted_pending_writes: Box::new([]),
+                views: Box::new([]),
             }],
         )
         .expect("two designated views over one backing is one use, not a duplicate");
@@ -709,6 +761,90 @@ mod tests {
         );
     }
 
+    /// A read of a backing's bytes brings the byte endpoint current, even
+    /// though nothing designates it.
+    ///
+    /// A texture declared over a buffer is an image whose storage *is* those
+    /// bytes, so a guest that renders through the texture and then binds the
+    /// buffer to a shader is reading what the image wrote. The byte view is
+    /// served by the transfer endpoint the images share, which is not a
+    /// designated view --- so the designated sweep reports the backing current
+    /// and plans nothing, and the bind then refuses
+    /// `StaleExecutionRepresentation` on every retry for the life of the boot,
+    /// holding its channel's submission head. Naming the view in the request
+    /// is what puts the endpoint in the destination set.
+    #[test]
+    fn a_byte_read_of_a_backing_only_an_image_designates_synchronizes_the_endpoint() {
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let region = BackingRegion::Linear(LinearRange::new(0, 64).unwrap());
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([region]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        resources
+            .create_representation(backing, RepresentationRoute::HostStagingEndpoint, ())
+            .unwrap();
+        let image_view = BackingView::Image(crate::ImageOwner::owning(
+            reims_vgpu_protocol::ResourceId::new(9, 1),
+        ));
+        let image = resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostStagingTransfer {
+                    working: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                image_view,
+                (),
+            )
+            .unwrap();
+        // The texture's own writes: the image holds this version and the bytes
+        // behind it do not.
+        resources
+            .plan_gpu_write(backing, SubmissionId::new(1), image, [region])
+            .unwrap();
+        resources
+            .complete_gpu_write(backing, SubmissionId::new(1), image)
+            .unwrap();
+
+        let snapshot = resources.snapshot_content(backing, &[region]).unwrap();
+        // What the backing designates is current, so a request that names no
+        // view asks for nothing --- and the byte endpoint stays stale.
+        assert!(resources
+            .stale_designated_representations(backing, &snapshot)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            resources
+                .stale_read_representations(backing, &[BackingView::Bytes], &snapshot)
+                .unwrap(),
+            vec![(BackingView::Bytes, HOST_REPRESENTATION)]
+        );
+
+        let prepared = prepare_content_synchronization(
+            &mut resources,
+            TransactionId::new(7),
+            [ContentSynchronizationRequest {
+                backing,
+                regions: Box::new([region]),
+                permitted_pending_writes: Box::new([]),
+                views: Box::new([BackingView::Bytes]),
+            }],
+        )
+        .unwrap();
+        // The image is the only place these bytes exist, so it is the source
+        // and the endpoint is the destination.
+        assert_eq!(prepared.transfers().len(), 1);
+        assert_eq!(prepared.transfers()[0].source, image);
+        assert_eq!(prepared.transfers()[0].destination, HOST_REPRESENTATION);
+        assert!(prepared.host_ingresses().is_empty());
+        cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
+    }
+
     #[test]
     fn synchronization_waits_for_an_overlapping_execution_write_instead_of_overwriting_it() {
         let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
@@ -748,6 +884,7 @@ mod tests {
                     backing,
                     regions: Box::new([region]),
                     permitted_pending_writes: Box::new([]),
+                    views: Box::new([]),
                 }],
             ),
             Err(ContentSynchronizationError::PendingGpuWrite {
@@ -766,6 +903,7 @@ mod tests {
                 backing,
                 regions: Box::new([region]),
                 permitted_pending_writes: Box::new([submission.into()]),
+                views: Box::new([]),
             }],
         )
         .unwrap();
@@ -782,6 +920,7 @@ mod tests {
                 backing,
                 regions: Box::new([region]),
                 permitted_pending_writes: Box::new([]),
+                views: Box::new([]),
             }],
         )
         .unwrap();
@@ -834,6 +973,7 @@ mod tests {
                     BackingRegion::Linear(LinearRange::new(0, 64).unwrap()),
                 ]),
                 permitted_pending_writes: Box::new([]),
+                views: Box::new([]),
             }],
         )
         .unwrap();
@@ -900,6 +1040,7 @@ mod tests {
                 backing,
                 regions: Box::new([region]),
                 permitted_pending_writes: Box::new([]),
+                views: Box::new([]),
             }],
         )
         .unwrap();
@@ -915,6 +1056,7 @@ mod tests {
                     backing,
                     regions: Box::new([region]),
                     permitted_pending_writes: Box::new([]),
+                    views: Box::new([]),
                 }],
             ),
             Err(ContentSynchronizationError::PendingGpuWrite {
@@ -982,6 +1124,7 @@ mod tests {
                 backing,
                 regions: Box::new([first, second]),
                 permitted_pending_writes: Box::new([]),
+                views: Box::new([]),
             }],
         )
         .unwrap();

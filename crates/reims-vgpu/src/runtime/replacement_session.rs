@@ -12047,6 +12047,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             reims_vgpu_protocol::BackingId,
             std::collections::BTreeSet<reims_vgpu_core::BackingRegion>,
         >::new();
+        // The views each operation binds, kept beside the regions: a read of a
+        // backing's bytes is served by a representation nothing designates,
+        // and dropping the view here is what left it out of the plan.
+        let mut read_views = BTreeMap::<
+            reims_vgpu_protocol::BackingId,
+            std::collections::BTreeSet<reims_vgpu_core::BackingView>,
+        >::new();
         for (origin, operation) in origins.iter().zip(exec.operations()) {
             let requests = match operation {
                 reims_vgpu_core::ResolvedOperation::Blit(blit) => {
@@ -12070,6 +12077,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     .entry(request.backing)
                     .or_default()
                     .extend(request.regions.iter().copied());
+                read_views
+                    .entry(request.backing)
+                    .or_default()
+                    .extend(request.views.iter().copied());
                 // One representative identity for readiness bookkeeping: the
                 // predicate below compares it against the validity record,
                 // which names the same representative. The per-image fan-out
@@ -12142,6 +12153,11 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                         backing,
                         permitted_pending_writes: Box::new([]),
                         regions: regions.into_boxed_slice(),
+                        views: read_views
+                            .get(&backing)
+                            .map(|views| views.iter().copied().collect::<Vec<_>>())
+                            .unwrap_or_default()
+                            .into_boxed_slice(),
                     },
                 )
                 .collect::<Vec<_>>()
@@ -12174,6 +12190,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     backing,
                     regions,
                     permitted_pending_writes,
+                    views,
                 } = request;
                 let validity_error =
                     |reason| ReplacementExecResourceReadinessError::ValidityRepresentation {
@@ -12184,7 +12201,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     Ok(snapshot) => snapshot,
                     Err(reason) => return Some(Err(validity_error(reason))),
                 };
-                let stale = match resources.stale_designated_representations(backing, &snapshot) {
+                let stale = match resources.stale_read_representations(backing, &views, &snapshot) {
                     Ok(stale) => stale,
                     Err(reason) => return Some(Err(validity_error(reason))),
                 };
@@ -12263,6 +12280,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     backing,
                     regions,
                     permitted_pending_writes: permitted.into_boxed_slice(),
+                    views,
                 }))
             })
             .collect::<Result<Vec<_>, _>>()?

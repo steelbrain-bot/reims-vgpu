@@ -44,6 +44,22 @@ pub struct ResolvedComputeResourceBinding {
     pub mode: AccessMode,
 }
 
+impl ResolvedComputeResourceBinding {
+    /// The view of the backing this binding addresses.
+    ///
+    /// The descriptor class carries it, and preparation and content
+    /// synchronization must not read it differently: one selects the
+    /// representation to bind and the other the representation to bring
+    /// current, and a disagreement between them is a bind of an object nothing
+    /// filled.
+    pub const fn backing_view(&self) -> BackingView {
+        match self.view {
+            ComputeBindingView::Buffer(_) => BackingView::Bytes,
+            ComputeBindingView::Image(view) => BackingView::Image(ImageOwner::of_view(view)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolvedComputeSamplerBinding {
     pub binding: u32,
@@ -114,31 +130,33 @@ impl ResolvedComputeDispatch {
     /// Exact canonical content consumed by this dispatch before any of its
     /// operation-local writes become visible.
     pub fn content_synchronization_requests(&self) -> Box<[crate::ContentSynchronizationRequest]> {
-        let mut grouped = BTreeMap::<BackingId, BTreeSet<BackingRegion>>::new();
+        let mut grouped =
+            BTreeMap::<BackingId, (BTreeSet<BackingRegion>, BTreeSet<BackingView>)>::new();
         for resource in &self.resources {
             if matches!(
                 resource.mode,
                 AccessMode::Read | AccessMode::ReadWrite | AccessMode::Unknown
             ) {
-                grouped
-                    .entry(resource.backing)
-                    .or_default()
-                    .extend(resource.regions.iter().copied());
+                let grouped = grouped.entry(resource.backing).or_default();
+                grouped.0.extend(resource.regions.iter().copied());
+                grouped.1.insert(resource.backing_view());
             }
         }
         if let ResolvedComputeLaunch::IndirectThreadgroups { arguments, .. } = self.launch {
-            grouped
-                .entry(arguments.storage)
-                .or_default()
-                .insert(BackingRegion::Linear(arguments.region));
+            let grouped = grouped.entry(arguments.storage).or_default();
+            grouped.0.insert(BackingRegion::Linear(arguments.region));
+            grouped.1.insert(BackingView::Bytes);
         }
         grouped
             .into_iter()
-            .map(|(backing, regions)| crate::ContentSynchronizationRequest {
-                backing,
-                regions: regions.into_iter().collect::<Vec<_>>().into_boxed_slice(),
-                permitted_pending_writes: Box::new([]),
-            })
+            .map(
+                |(backing, (regions, views))| crate::ContentSynchronizationRequest {
+                    backing,
+                    regions: regions.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                    permitted_pending_writes: Box::new([]),
+                    views: views.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                },
+            )
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
@@ -447,10 +465,7 @@ pub fn prepare_compute_dispatch<T, NativePipeline>(
         // The descriptor class says which view of the backing this binding
         // addresses, and the check above has already proved the class and the
         // view agree.
-        let view = match resource.view {
-            ComputeBindingView::Buffer(_) => BackingView::Bytes,
-            ComputeBindingView::Image(view) => BackingView::Image(ImageOwner::of_view(view)),
-        };
+        let view = resource.backing_view();
         let grouped = grouped.entry((resource.backing, view)).or_default();
         grouped.0.extend(resource.regions.iter().copied());
         grouped.1 |= matches!(

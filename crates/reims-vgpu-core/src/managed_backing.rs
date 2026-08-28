@@ -886,6 +886,46 @@ impl<T> ManagedBackingOwner<T> {
             .collect())
     }
 
+    /// Every representation an operation reading these views would find
+    /// stale, in view order.
+    ///
+    /// The designated views are always among them, because a backing owes its
+    /// own declared textures their content whatever this operation binds. The
+    /// views the operation names are the other half, and they are not always a
+    /// subset: a byte view over a backing that designates only images is
+    /// served by the transfer endpoint those images share, and nothing
+    /// designates it --- so a caller asking only what the backing designates
+    /// reads "nothing is stale" while the very representation the operation is
+    /// about to bind holds an older version.
+    ///
+    /// This lives here for the same reason
+    /// [`Self::stale_designated_representations`] does: the union is a
+    /// question about what a backing serves, and a caller that assembles it
+    /// from two lookups has written a second copy of a rule only this type can
+    /// keep true.
+    pub fn stale_read_representations(
+        &self,
+        backing: BackingId,
+        views: &[BackingView],
+        snapshot: &[RegionVersion],
+    ) -> Result<Vec<(BackingView, RepresentationId)>, ManagedBackingError> {
+        let mut stale = self.stale_designated_representations(backing, snapshot)?;
+        let record = self.live_backing(backing)?;
+        for view in views {
+            let representation = self.view_representation(backing, *view)?;
+            if stale.iter().any(|(_, found)| *found == representation) {
+                continue;
+            }
+            if !record
+                .authority
+                .representation_matches(representation, snapshot)
+            {
+                stale.push((*view, representation));
+            }
+        }
+        Ok(stale)
+    }
+
     pub fn execution_representation_id(
         &self,
         backing: BackingId,

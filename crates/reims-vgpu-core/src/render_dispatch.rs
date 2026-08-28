@@ -59,6 +59,21 @@ pub struct ResolvedRenderResourceBinding {
     pub mode: AccessMode,
 }
 
+impl ResolvedRenderResourceBinding {
+    /// The view of the backing this binding addresses.
+    ///
+    /// Preparation selects the representation to bind from this and content
+    /// synchronization the representation to bring current, so both read it
+    /// here: a disagreement between them is a bind of an object nothing
+    /// filled.
+    pub const fn backing_view(&self) -> BackingView {
+        match self.view {
+            RenderBindingView::Buffer(_) => BackingView::Bytes,
+            RenderBindingView::Image(view) => BackingView::Image(ImageOwner::of_view(view)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedRenderSamplerBinding {
     pub binding: u32,
@@ -298,35 +313,39 @@ impl ResolvedRenderDispatch {
     /// any of its writes.  Representation preparation uses the same decoded
     /// access modes and attachment load actions as render reservation.
     pub fn content_synchronization_requests(&self) -> Box<[crate::ContentSynchronizationRequest]> {
-        let mut grouped = BTreeMap::<BackingId, BTreeSet<BackingRegion>>::new();
+        let mut grouped =
+            BTreeMap::<BackingId, (BTreeSet<BackingRegion>, BTreeSet<BackingView>)>::new();
         for resource in &self.resources {
             if matches!(
                 resource.mode,
                 AccessMode::Read | AccessMode::ReadWrite | AccessMode::Unknown
             ) {
-                grouped
-                    .entry(resource.backing)
-                    .or_default()
-                    .extend(resource.regions.iter().copied());
+                let grouped = grouped.entry(resource.backing).or_default();
+                grouped.0.extend(resource.regions.iter().copied());
+                grouped.1.insert(resource.backing_view());
             }
         }
         if self.begins_encoder {
             for attachment in &self.attachments {
                 if attachment.load == LoadAction::Load {
-                    grouped
-                        .entry(attachment.backing)
-                        .or_default()
-                        .extend(attachment.regions.iter().copied());
+                    let grouped = grouped.entry(attachment.backing).or_default();
+                    grouped.0.extend(attachment.regions.iter().copied());
+                    grouped.1.insert(BackingView::Image(ImageOwner::owning(
+                        attachment.image_owner,
+                    )));
                 }
             }
         }
         grouped
             .into_iter()
-            .map(|(backing, regions)| crate::ContentSynchronizationRequest {
-                backing,
-                regions: regions.into_iter().collect::<Vec<_>>().into_boxed_slice(),
-                permitted_pending_writes: Box::new([]),
-            })
+            .map(
+                |(backing, (regions, views))| crate::ContentSynchronizationRequest {
+                    backing,
+                    regions: regions.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                    permitted_pending_writes: Box::new([]),
+                    views: views.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                },
+            )
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
@@ -633,10 +652,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
     for resource in &operation.resources {
         // The descriptor class says which view of the backing the binding
         // addresses; `validate_shape` has already proved class and view agree.
-        let view = match resource.view {
-            RenderBindingView::Buffer(_) => BackingView::Bytes,
-            RenderBindingView::Image(view) => BackingView::Image(ImageOwner::of_view(view)),
-        };
+        let view = resource.backing_view();
         let group = grouped.entry((resource.backing, view)).or_default();
         group.0.extend(resource.regions.iter().copied());
         group.1 |= matches!(

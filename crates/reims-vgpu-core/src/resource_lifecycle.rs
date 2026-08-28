@@ -1339,6 +1339,16 @@ impl<T> ResourceLifecycleOwner<T> {
             .stale_designated_representations(backing, snapshot)
     }
 
+    pub fn stale_read_representations(
+        &self,
+        backing: BackingId,
+        views: &[BackingView],
+        snapshot: &[RegionVersion],
+    ) -> Result<Vec<(BackingView, RepresentationId)>, ManagedBackingError> {
+        self.native
+            .stale_read_representations(backing, views, snapshot)
+    }
+
     /// See
     /// [`crate::ManagedBackingOwner::host_write_reaches_every_designated_view`].
     pub fn host_write_reaches_every_designated_view(

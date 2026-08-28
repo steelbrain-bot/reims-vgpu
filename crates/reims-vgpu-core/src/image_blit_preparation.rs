@@ -12,7 +12,7 @@ use crate::{
 use reims_vgpu_protocol::{
     BackingId, HazardDomainId, RepresentationId, SubmissionId, TransactionId,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
 pub struct PreparedImageBlit {
@@ -384,30 +384,34 @@ fn fold_by_backing(
 pub fn blit_content_synchronization_requests(
     operation: &ResolvedBlit,
 ) -> Result<Box<[crate::ContentSynchronizationRequest]>, ImageBlitPreparationError> {
-    let mut reads = BTreeMap::<BackingId, Vec<BackingRegion>>::new();
+    let mut reads = BTreeMap::<BackingId, (Vec<BackingRegion>, BTreeSet<BackingView>)>::new();
     match operation {
         ResolvedBlit::Fill { .. } => return Ok(Box::new([])),
         ResolvedBlit::Copy { source, .. } => {
-            reads
-                .entry(source.storage)
-                .or_default()
-                .push(BackingRegion::Linear(source.region));
+            let entry = reads.entry(source.storage).or_default();
+            entry.0.push(BackingRegion::Linear(source.region));
+            entry.1.insert(BackingView::Bytes);
         }
         _ => {
             let mut keyed = BTreeMap::new();
             collect_regions(operation, &mut keyed, &mut BTreeMap::new())?;
-            reads = fold_by_backing(keyed);
+            for ((backing, view), regions) in keyed {
+                let entry = reads.entry(backing).or_default();
+                entry.0.extend(regions);
+                entry.1.insert(view);
+            }
         }
     }
     Ok(reads
         .into_iter()
-        .map(|(backing, mut regions)| {
+        .map(|(backing, (mut regions, views))| {
             regions.sort_unstable();
             regions.dedup();
             crate::ContentSynchronizationRequest {
                 backing,
                 regions: regions.into_boxed_slice(),
                 permitted_pending_writes: Box::new([]),
+                views: views.into_iter().collect::<Vec<_>>().into_boxed_slice(),
             }
         })
         .collect::<Vec<_>>()

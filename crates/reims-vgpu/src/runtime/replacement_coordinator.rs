@@ -10006,6 +10006,7 @@ mod tests {
             backing,
             regions: Box::new([reims_vgpu_core::BackingRegion::Whole]),
             permitted_pending_writes: Box::new([]),
+            views: Box::new([]),
         };
 
         // Make the representation current: a freshly created one holds
@@ -10074,6 +10075,7 @@ mod tests {
                     backing,
                     regions: Box::new([reims_vgpu_core::BackingRegion::Whole]),
                     permitted_pending_writes: Box::new([write.into()]),
+                    views: Box::new([]),
                 }],
             );
         assert_eq!(
