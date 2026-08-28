@@ -308,8 +308,20 @@ fn unowned_submission_positions(
     order
         .iter()
         .filter(|entry| {
+            // Not `&& !entry.submitted`. Submission is native queue
+            // acceptance, and it releases nothing: the order entry lives until
+            // `retire`, which is reached only through publication. A
+            // transaction genuinely in flight is held by `exec_submissions`
+            // and so is already `owned` -- so excluding submitted entries here
+            // bought nothing and blinded this to the worse half of the class.
+            //
+            // Worse, because an unsubmitted orphan at least refuses loudly
+            // behind its domain head. A submitted one is silent on both sides:
+            // it publishes no completion, so no stamp is written and no IRQ is
+            // raised, and the guest client waiting on that stamp never wakes
+            // -- while this device reports an idle, healthy pipeline with
+            // nothing blocked and every gauge at zero.
             (entry.recorded || entry.issued)
-                && !entry.submitted
                 && !entry.abandoned
                 && !owned.contains(&entry.transaction)
         })
@@ -11834,11 +11846,20 @@ mod tests {
             .is_some());
     }
 
-    /// A settled position owes nothing; an unsettled one somebody has to hold.
+    /// An unretired position somebody has to hold, submitted or not.
     ///
-    /// Reading this the other way is what makes a leak invisible: a transaction
-    /// whose owner was dropped looks exactly like one in flight, because both
-    /// are "not submitted yet" and no counter distinguishes them.
+    /// Reading this the other way is what makes a leak invisible: a
+    /// transaction whose owner was dropped looks exactly like one in flight,
+    /// and no counter distinguishes them.
+    ///
+    /// Submission is not a settlement. It is native queue acceptance; the
+    /// order entry lives until `retire`, which is reached only through
+    /// publication. A transaction actually in flight is held by
+    /// `exec_submissions` and is therefore owned, so submitted positions need
+    /// no exclusion of their own -- and excluding them hid the worse half of
+    /// the class, where the transaction publishes no completion, no stamp is
+    /// written, no IRQ is raised, and the guest waits forever while this device
+    /// reports an idle pipeline.
     #[test]
     fn only_an_unsettled_position_with_no_owner_is_reported_as_unowned() {
         let entry = |transaction: u64, sequence: u64, started, submitted, abandoned| {
@@ -11867,9 +11888,24 @@ mod tests {
                 .iter()
                 .map(|(_, position)| position.as_str())
                 .collect::<Vec<_>>(),
-            ["13@1.4"],
-            "submitted and abandoned both release the domain claim, 12 is held, and 14 has not \
-             been started by anybody yet so nobody owes it an owner"
+            ["10@1.1", "13@1.4"],
+            "abandonment releases the domain claim and submission does not, 12 is held, and 14 \
+             has not been started by anybody yet so nobody owes it an owner"
+        );
+
+        // The same submitted position, this time with the live native
+        // submission that makes it genuinely in flight. Ownership is what
+        // separates the two, and it is the only thing that should.
+        let in_flight = std::collections::BTreeSet::from([
+            reims_vgpu_protocol::TransactionId::new(10),
+            reims_vgpu_protocol::TransactionId::new(12),
+        ]);
+        assert_eq!(
+            unowned_submission_positions(&order, &in_flight)
+                .iter()
+                .map(|(_, position)| position.as_str())
+                .collect::<Vec<_>>(),
+            ["13@1.4"]
         );
     }
 }
