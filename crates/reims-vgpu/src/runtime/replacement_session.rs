@@ -2675,6 +2675,23 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                     resource,
                 ))?;
         let (topology, mut capabilities) = device.representation_environment();
+        // A host-pointer import accepts one contiguous host range, so a guest
+        // allocation that reaches this device as several physical runs has no
+        // import to take and falls to a staging route. That is a different
+        // object from an imported one -- it holds nothing until something plans
+        // its upload -- and which allocations land there is the first fact a
+        // stale-representation reading needs. It is silent otherwise: the route
+        // is chosen correctly and no refusal is emitted.
+        if capabilities.imported_transfer && guest.runs().len() != 1 {
+            crate::observe::off(format!(
+                "replacement_scattered_guest_allocation resource={} backing={}                  storage_mode={:?} runs={} bytes={}",
+                resource.index(),
+                backing.get(),
+                descriptor.storage_mode(),
+                guest.runs().len(),
+                descriptor.allocation_size
+            ));
+        }
         capabilities.imported_transfer &= guest.runs().len() == 1;
         let route = Self::guest_transfer_route(descriptor.storage_mode(), topology, capabilities)?;
         match route {
