@@ -948,6 +948,18 @@ impl<T> ManagedBackingOwner<T> {
     ) -> Result<ManagedBackingProgress<T>, ManagedBackingError> {
         self.validate_replace_execution_representation(backing)?;
         let record = self.live_backing_mut(backing)?;
+        // The content statement travels with the object statement, here rather
+        // than at either caller, because a replacement that retires the objects
+        // and leaves the canonical version naming what they held is a permanent
+        // stall and not a stale pixel. See
+        // [`crate::ContentAuthority::guest_replaced_physical`]. It runs before
+        // the designation set is taken so a backing carrying no native object
+        // yet -- which is every backing between declaration and its first
+        // materialization -- makes the statement too.
+        record
+            .authority
+            .guest_replaced_physical()
+            .map_err(ManagedBackingError::Content)?;
         let designated = std::mem::take(&mut record.execution_representations);
         if designated.is_empty() {
             return Ok(ManagedBackingProgress::Live);
@@ -2550,22 +2562,10 @@ mod tests {
                 .unwrap(),
             Some(execution)
         );
+        // The replacement restated the guest as canonical, so the old object
+        // holds nothing current and retires as soon as its last use drains.
         assert_eq!(
             owner.cancel_use(backing, transaction).unwrap(),
-            ManagedBackingProgress::Live
-        );
-        assert_eq!(owner.representation(backing, execution), Some(&"execution"));
-
-        let transfer = owner
-            .plan_transfers(backing, execution, replacement, &snapshot)
-            .unwrap();
-        owner.complete_transfer(transfer[0]).unwrap();
-        let replacement_use = TransactionId::new(12);
-        owner
-            .accept_use(backing, replacement_use, [replacement])
-            .unwrap();
-        assert_eq!(
-            owner.cancel_use(backing, replacement_use).unwrap(),
             ManagedBackingProgress::RepresentationsRetired {
                 ready: vec!["execution"],
                 deferred: 0,
@@ -2573,15 +2573,72 @@ mod tests {
         );
         assert_eq!(owner.representation(backing, execution), None);
 
-        owner
-            .guest_write(backing, None, BackingRegion::Whole)
-            .unwrap();
+        // And the fresh object is stale against the post-replacement content
+        // until a transfer out of the guest lands, which is a state a route
+        // does plan for -- unlike a canonical version only a retired object
+        // ever held.
         let newer = owner
             .snapshot_content(backing, &[BackingRegion::Whole])
             .unwrap();
+        assert_ne!(newer, snapshot);
         assert_eq!(
             owner.execution_representation_for_snapshot(backing, BackingView::Bytes, &newer),
             Err(ManagedBackingError::StaleExecutionRepresentation)
+        );
+        let transfer = owner
+            .plan_transfers(backing, GUEST_REPRESENTATION, replacement, &newer)
+            .unwrap();
+        owner.complete_transfer(transfer[0]).unwrap();
+        assert_eq!(
+            owner.execution_representation_for_snapshot(backing, BackingView::Bytes, &newer),
+            Ok((replacement, &"replacement"))
+        );
+    }
+
+    /// A physical replacement restates the guest as canonical.
+    ///
+    /// Without it the canonical version keeps naming content only the retired
+    /// objects held, and every later reader asking for a designated
+    /// representation that holds it refuses `StaleExecutionRepresentation`
+    /// with nothing able to repair it -- which on a driven macos-13
+    /// conformance boot stalled one channel for the rest of the boot.
+    #[test]
+    fn a_physical_replacement_makes_the_guest_canonical_again() {
+        let (mut owner, backing) = owner();
+        let execution = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                "execution",
+            )
+            .unwrap();
+        let write = SubmissionId::new(3);
+        owner
+            .plan_gpu_write(backing, write, execution, [BackingRegion::Whole])
+            .unwrap();
+        owner.complete_gpu_write(backing, write, execution).unwrap();
+        let written = owner
+            .snapshot_content(backing, &[BackingRegion::Whole])
+            .unwrap();
+        assert!(owner
+            .representation_matches(backing, execution, &written)
+            .unwrap());
+        assert!(!owner
+            .representation_matches(backing, GUEST_REPRESENTATION, &written)
+            .unwrap());
+
+        owner.replace_execution_representation(backing).unwrap();
+
+        let replaced = owner
+            .snapshot_content(backing, &[BackingRegion::Whole])
+            .unwrap();
+        assert_ne!(replaced, written);
+        assert!(
+            owner
+                .representation_matches(backing, GUEST_REPRESENTATION, &replaced)
+                .unwrap(),
+            "the guest's own pages are what this backing holds after a replacement"
         );
     }
 

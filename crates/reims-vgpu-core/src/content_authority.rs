@@ -476,6 +476,35 @@ impl RegionContentState {
         self.representations.entry(representation).or_default();
     }
 
+    /// Restate the guest as canonical over every declared region, because the
+    /// physical pages under this backing have been replaced.
+    ///
+    /// A physical replacement is the guest re-pointing a resource's pages. The
+    /// bytes behind the backing afterwards are the guest's, and nothing a
+    /// native object held before describes them --- which is why replacement
+    /// retires every designated representation. Content authority has to hear
+    /// the same fact, or the canonical version keeps naming content that only
+    /// the retired objects held.
+    ///
+    /// Leaving it unsaid is not a stale pixel, it is a permanent stall: the
+    /// readiness check for a guest-visibility request asks for a designated
+    /// representation holding the canonical version, finds none, and refuses
+    /// `StaleExecutionRepresentation` --- forever, because no route plans a
+    /// transfer out of an object that no longer exists. A driven macos-13
+    /// conformance boot spent the rest of its life re-offering one synchronize
+    /// at channel 4's head for exactly this reason, 25 s after the replacement
+    /// that caused it.
+    ///
+    /// It is a guest write with no operation identity, the same statement a
+    /// standalone invalidation packet makes, because that is precisely what
+    /// happened: the guest replaced these bytes.
+    pub fn guest_replaced_physical(&mut self) -> Result<(), ContentAuthorityError> {
+        for region in self.declared.clone().iter().copied() {
+            self.guest_write(None, GUEST_REPRESENTATION, region)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn remove_representation(&mut self, representation: RepresentationId) {
         self.representations.remove(&representation);
     }
@@ -1213,6 +1242,14 @@ impl ContentAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .validate_reservations(count)
+    }
+
+    /// See [`RegionContentState::guest_replaced_physical`].
+    pub fn guest_replaced_physical(&self) -> Result<(), ContentAuthorityError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .guest_replaced_physical()
     }
 
     pub fn validate_guest_write_region(
