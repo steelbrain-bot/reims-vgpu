@@ -7720,6 +7720,9 @@ pub(crate) enum ReplacementTextureEndpointResolutionError {
     NonIdentitySwizzle,
     BaseDescriptorUnavailable,
     NotLinearTexture(reims_vgpu_protocol::ObjectKind),
+    /// A registered surface's plane view whose geometry does not lie inside
+    /// the plane it names.
+    SurfacePlane(reims_vgpu_protocol::SurfacePlaneLayoutError),
     StorageUnavailable,
     NotTaskAddress,
     SubresourceOutOfBounds,
@@ -7773,6 +7776,7 @@ impl ReplacementTextureEndpointResolutionError {
             Self::View(reason) => reason.awaits_declaration(),
             Self::NonIdentitySwizzle
             | Self::NotLinearTexture(_)
+            | Self::SurfacePlane(_)
             | Self::NotTaskAddress
             | Self::SubresourceOutOfBounds
             | Self::InvalidPacking
@@ -17036,13 +17040,50 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         let base = graph
             .resource(view.base)
             .ok_or(Error::ResourceUnavailable)?;
-        if base.kind != reims_vgpu_protocol::ObjectKind::Texture {
-            return Err(Error::NotLinearTexture(base.kind));
-        }
-        let Some(reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor)) =
-            base.descriptor.as_deref()
-        else {
-            return Err(Error::BaseDescriptorUnavailable);
+        // A blit endpoint needs a first byte, a pitch, an extent and a format,
+        // and two constructions carry those four. A linear texture declares
+        // them directly. A registered surface's plane view declares them
+        // jointly with its parent: the view says how to read the texels and
+        // the plane says where they live, which is exactly what
+        // `plane_linear_texture` composes -- so the plane arm produces the
+        // same vocabulary and the rest of this resolver does not know which
+        // one it got.
+        //
+        // Without the second arm a copy into a surface-backed texture is
+        // unresolvable, and a blit that cannot resolve refuses at projection
+        // with every input already declared. That is the head-of-line refusal
+        // `ReplacementOperationProjectionError::awaits_declaration` had to
+        // learn to call terminal, and it is what this arm stops the guest
+        // paying at all.
+        let projected_plane;
+        let (descriptor, backing) = match base.descriptor.as_deref() {
+            Some(reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor)) => {
+                (descriptor, base.storage.ok_or(Error::StorageUnavailable)?)
+            }
+            Some(reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(surface)) => {
+                // The plane view, not the surface: the surface is an
+                // allocation and owns no image, while the view owns both the
+                // plane's backing and the image the copy lands in.
+                let plane_view = graph.resource(resource).ok_or(Error::ResourceUnavailable)?;
+                let Some(reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(
+                    plane_view_descriptor,
+                )) = plane_view.descriptor.as_deref()
+                else {
+                    return Err(Error::NotLinearTexture(plane_view.kind));
+                };
+                let geometry = plane_view_descriptor
+                    .view
+                    .ok_or(Error::BaseDescriptorUnavailable)?;
+                projected_plane = surface
+                    .plane_linear_texture(geometry)
+                    .map_err(Error::SurfacePlane)?;
+                (
+                    &projected_plane,
+                    plane_view.storage.ok_or(Error::StorageUnavailable)?,
+                )
+            }
+            Some(_) => return Err(Error::NotLinearTexture(base.kind)),
+            None => return Err(Error::BaseDescriptorUnavailable),
         };
         let layout = descriptor
             .level(level)
@@ -17066,18 +17107,24 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         if bpp != base_bpp {
             return Err(Error::UnsupportedPixelFormat(view.pixel_format));
         }
-        let backing = base.storage.ok_or(Error::StorageUnavailable)?;
         let storage = graph.storage(backing).ok_or(Error::StorageUnavailable)?;
-        let reims_vgpu_core::StorageBacking::TaskAddress {
-            task: backing_task,
-            address,
-            length,
-        } = storage.backing
-        else {
-            return Err(Error::NotTaskAddress);
-        };
-        if backing_task != task || length.get() < descriptor.allocation_size {
-            return Err(Error::InvalidPacking);
+        match storage.backing {
+            reims_vgpu_core::StorageBacking::TaskAddress {
+                task: backing_task,
+                length,
+                ..
+            } => {
+                if backing_task != task || length.get() < descriptor.allocation_size {
+                    return Err(Error::InvalidPacking);
+                }
+            }
+            // A plane's backing is its surface's whole allocation and the
+            // projection above already measured this view's last row against
+            // that length, so there is no second bound to take here. The
+            // surface's task is the one it was registered in, which is not
+            // required to be the task issuing the copy.
+            reims_vgpu_core::StorageBacking::IOSurfacePlane { .. } => {}
+            _ => return Err(Error::NotTaskAddress),
         }
         let level_offset = descriptor
             .base_offset
@@ -17099,7 +17146,6 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             slice,
             backing: reims_vgpu_core::ResolvedTextureBacking::Linear(
                 reims_vgpu_core::ResolvedLinearTextureLevel {
-                    base_gva: address.get(),
                     alloc_size: descriptor.allocation_size,
                     level_offset,
                     row_stride: layout.row_stride,
@@ -23556,6 +23602,105 @@ mod tests {
                 ),
             };
         assert!(ingress.is_terminal_refusal());
+    }
+
+    /// A copy into a registered surface's plane view resolves.
+    ///
+    /// The endpoint resolver served one construction --- a linear texture over
+    /// a task address --- and every other base kind fell out of it as
+    /// `NotLinearTexture`. A plane view's base is the surface, so every blit
+    /// naming one refused with all of its inputs already declared. On a driven
+    /// macos-13 conformance boot that refusal sat at a channel head and was
+    /// re-offered 278 795 times.
+    #[test]
+    fn a_copy_into_a_registered_surface_plane_resolves_its_endpoint() {
+        let Some(mut runtime) = runtime_session() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(12);
+        runtime.define_task(task, 0x40_0000, 2).unwrap();
+
+        let surface_object = 41;
+        let mut planes = [reims_vgpu_protocol::SurfaceBackingPlane::default();
+            reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP];
+        planes[0] = reims_vgpu_protocol::SurfaceBackingPlane {
+            offset: 0,
+            width: 4,
+            height: 4,
+            bytes_per_row: 16,
+            bytes_per_element: 4,
+        };
+        crate::runtime::replacement_object_lifecycle::apply_replacement_registered_surface(
+            &mut runtime,
+            task,
+            surface_object,
+            reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(
+                reims_vgpu_protocol::SurfaceBackingDescriptor {
+                    length: 1 << shift,
+                    backing_pfn: 0x200,
+                    pixel_format: u32::from_be_bytes(*b"BGRA"),
+                    plane_count: 1,
+                    planes,
+                    width: 4,
+                    height: 4,
+                    bytes_per_row: 16,
+                },
+            ),
+        )
+        .unwrap();
+        let plane_object = 42;
+        crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+            &mut runtime,
+            task,
+            plane_object,
+            reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(
+                reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor {
+                    surface: reims_vgpu_protocol::ObjectTableRef::new(surface_object),
+                    owner_task: task,
+                    operation_kind: Some(5),
+                    operation_length: Some(32),
+                    own_ref: Some(reims_vgpu_protocol::ObjectTableRef::new(plane_object)),
+                    record_kind: Some(reims_vgpu_protocol::IOSurfacePlaneViewRecordKind::Plane),
+                    unidentified_record_flags: 0,
+                    view: Some(reims_vgpu_protocol::IOSurfacePlaneViewDescriptor {
+                        pixel_format: 80,
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                        plane_index: Some(0),
+                    }),
+                    decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
+                },
+            ),
+        )
+        .unwrap();
+
+        let endpoint = runtime
+            .resolve_linear_texture_endpoint(
+                task,
+                reims_vgpu_protocol::ObjectTableRef::new(plane_object),
+                0,
+                0,
+            )
+            .expect("a plane view carries a first byte, a pitch, an extent and a format");
+        let reims_vgpu_core::ResolvedTextureBacking::Linear(level) = endpoint.backing else {
+            panic!("a plane view projects into the linear vocabulary");
+        };
+        // The plane's pitch, not the view's tight row: those are the two
+        // numbers this construction composes, and taking the view's would
+        // walk 16 bytes short of every row after the first.
+        assert_eq!(level.row_stride, 16);
+        assert_eq!((level.width, level.height, level.bpp), (4, 4, 4));
+        assert_eq!(level.level_offset, u64::from(planes[0].offset));
+        // The image the copy lands in belongs to the plane view, not to the
+        // surface, which owns the allocation and no image at all.
+        assert_eq!(
+            endpoint.image_owner,
+            runtime
+                .resolve_resource(task, reims_vgpu_protocol::ObjectTableRef::new(plane_object))
+                .expect("the plane view is live")
+        );
     }
 
     /// A projection refusal that no later packet can answer differently must
@@ -35032,7 +35177,6 @@ mod tests {
             slice: 0,
             backing: reims_vgpu_core::ResolvedTextureBacking::Linear(
                 reims_vgpu_core::ResolvedLinearTextureLevel {
-                    base_gva: 0,
                     alloc_size: 64,
                     level_offset: 0,
                     row_stride: 16,
@@ -36348,7 +36492,6 @@ mod tests {
             slice: 0,
             backing: reims_vgpu_core::ResolvedTextureBacking::Linear(
                 reims_vgpu_core::ResolvedLinearTextureLevel {
-                    base_gva: 0,
                     alloc_size: allocation.len() as u64,
                     level_offset: 0,
                     row_stride: 16,

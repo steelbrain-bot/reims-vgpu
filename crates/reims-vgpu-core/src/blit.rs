@@ -8,8 +8,6 @@ use reims_vgpu_protocol::{
 /// One resolved mip level in a task-address texture allocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedLinearTextureLevel {
-    /// Allocation base guest virtual address.
-    pub base_gva: u64,
     pub alloc_size: u64,
     pub level_offset: u64,
     pub row_stride: u64,
@@ -322,7 +320,6 @@ mod tests {
             level: 0,
             slice: 0,
             backing: ResolvedTextureBacking::Linear(ResolvedLinearTextureLevel {
-                base_gva: u64::from(index) << 12,
                 alloc_size: 0x1000,
                 level_offset: 0,
                 row_stride: 64,
@@ -350,7 +347,6 @@ mod tests {
     #[test]
     fn resolved_texture_storage_keeps_mapping_identity_and_level_geometry() {
         let linear = ResolvedLinearTextureLevel {
-            base_gva: 0x1000,
             alloc_size: 0x8000,
             level_offset: 0x200,
             row_stride: 64,
@@ -436,7 +432,6 @@ mod tests {
                 level: 0,
                 slice: 0,
                 backing: ResolvedTextureBacking::Linear(ResolvedLinearTextureLevel {
-                    base_gva: 0x1000,
                     alloc_size: 0x1000,
                     level_offset: 0,
                     row_stride: 64,

@@ -787,7 +787,6 @@ mod tests {
             level: 2,
             slice: 3,
             backing: ResolvedTextureBacking::Linear(ResolvedLinearTextureLevel {
-                base_gva: 0x2000,
                 alloc_size: 0x1000,
                 level_offset: 0,
                 row_stride: 64,
