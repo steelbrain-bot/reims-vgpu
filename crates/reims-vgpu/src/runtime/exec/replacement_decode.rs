@@ -2953,6 +2953,38 @@ fn resolve_render_pass_actions(
     Ok((load, store))
 }
 
+/// The census name for a colour attachment's load action.
+///
+/// Which of the three the guest's compositor asks for is the difference between
+/// "this pass owns the whole target" and "this pass adds to what is already
+/// there", and a target that comes out banded is a target where those two
+/// answers disagree with what the pass actually wrote. Counting them costs one
+/// increment per attachment and is the only way to read the guest's own
+/// statement without a decoder trace.
+const fn load_action_census_name(
+    load: reims_vgpu_protocol::pass_action::LoadAction,
+) -> &'static str {
+    use reims_vgpu_protocol::pass_action::LoadAction;
+    match load {
+        LoadAction::DontCare => "render_color_load_dont_care",
+        LoadAction::Load => "render_color_load_load",
+        LoadAction::Clear => "render_color_load_clear",
+    }
+}
+
+/// The census name for a colour attachment's store action.
+const fn store_action_census_name(
+    store: reims_vgpu_protocol::pass_action::StoreAction,
+) -> &'static str {
+    use reims_vgpu_protocol::pass_action::StoreAction;
+    match store {
+        StoreAction::DontCare => "render_color_store_dont_care",
+        StoreAction::Store => "render_color_store_store",
+        StoreAction::MultisampleResolve => "render_color_store_resolve",
+        StoreAction::StoreAndMultisampleResolve => "render_color_store_store_and_resolve",
+    }
+}
+
 pub(crate) fn resolve_render_pass_attachments<Semantic: Clone>(
     runtime: &ReplacementRuntimeSession<Semantic>,
     task: reims_vgpu_protocol::TaskId,
@@ -2986,6 +3018,8 @@ pub(crate) fn resolve_render_pass_attachments<Semantic: Clone>(
         }
         let (load, store) =
             resolve_render_pass_actions(role, attachment.load_action, attachment.store_action)?;
+        crate::runtime::contract_census::note(load_action_census_name(load));
+        crate::runtime::contract_census::note(store_action_census_name(store));
         let target = runtime
             .resolve_render_attachment(
                 task,
