@@ -1024,11 +1024,23 @@ mod tests {
             destination: reims_vgpu_protocol::RepresentationId::new(3),
         };
         // A shape this device does not implement cannot become recordable, so
-        // retrying it holds its submission head for the life of the boot.
-        assert!(ReplacementExecProgramError::ContentSynchronization(
-            ResourceStateTransferRecordError::ImageToImageUnsupported(key)
-        )
-        .is_terminal_refusal());
+        // retrying it holds its submission head for the life of the boot. Every
+        // cause of this refusal is such a shape, so each stays terminal.
+        for refusal in [
+            crate::replacement_resource_state::ImageToImageRefusal::SameImage,
+            crate::replacement_resource_state::ImageToImageRefusal::LinearRegion,
+            crate::replacement_resource_state::ImageToImageRefusal::NoCopyableAspect {
+                aspect_mask: ash::vk::ImageAspectFlags::empty(),
+            },
+        ] {
+            assert!(ReplacementExecProgramError::ContentSynchronization(
+                ResourceStateTransferRecordError::ImageToImageUnsupported {
+                    transfer: key,
+                    refusal,
+                }
+            )
+            .is_terminal_refusal());
+        }
         // A preparation a later pass supplies is a wait, not a decline.
         assert!(!ReplacementExecProgramError::ContentSynchronization(
             ResourceStateTransferRecordError::ImageTransferRequiresState(key)

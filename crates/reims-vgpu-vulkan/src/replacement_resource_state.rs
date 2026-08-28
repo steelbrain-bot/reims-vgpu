@@ -45,7 +45,10 @@ pub enum ResourceStateTransferRecordError {
     ImageStateMismatch(TransferKey),
     ImageTransition(crate::replacement_image_transition::ImageTransitionResolveError),
     ImageEndpointMissing(TransferKey),
-    ImageToImageUnsupported(TransferKey),
+    ImageToImageUnsupported {
+        transfer: TransferKey,
+        refusal: ImageToImageRefusal,
+    },
     ImageLayoutMissing(TransferKey),
     ImageLayoutUnsupported(TransferKey),
     ImageUsageMissing(TransferKey),
@@ -67,9 +70,149 @@ impl ResourceStateTransferRecordError {
     pub const fn is_terminal_refusal(&self) -> bool {
         matches!(
             self,
-            Self::ImageToImageUnsupported(_) | Self::ImageLayoutUnsupported(_)
+            Self::ImageToImageUnsupported { .. } | Self::ImageLayoutUnsupported(_)
         )
     }
+}
+
+/// One of the five terms `same_subresource_range` compares.
+///
+/// `vk::ImageSubresourceRange` implements neither `PartialEq` nor `Eq`, which
+/// is why that helper exists at all; these name the comparisons it makes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubresourceRangeTerm {
+    AspectMask,
+    BaseMipLevel,
+    LevelCount,
+    BaseArrayLayer,
+    LayerCount,
+}
+
+/// Which term of the agreement two image endpoints failed, and both values.
+///
+/// Two textures over one allocation are two native images this device believes
+/// carry identical content, so a copy between them is expressible only while
+/// all four of these agree. A format pair and an extent pair fail at the same
+/// call site and are different defects -- one is a planner that named siblings
+/// the guest never aliased, the other is a geometry this device derived
+/// wrongly -- so the term is what has to be recorded, not the fact of a
+/// disagreement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageEndpointDisagreement {
+    PixelFormat {
+        source: u16,
+        destination: u16,
+    },
+    Extent {
+        source: [u32; 3],
+        destination: [u32; 3],
+    },
+    Samples {
+        source: vk::SampleCountFlags,
+        destination: vk::SampleCountFlags,
+    },
+    /// The ranges disagree, on this term. Naming the term rather than the two
+    /// ranges is the same move this whole refusal makes one level up: a level
+    /// count and an aspect mask fail the same comparison and mean different
+    /// things.
+    SubresourceRange {
+        term: SubresourceRangeTerm,
+        source: u32,
+        destination: u32,
+    },
+}
+
+/// The one place that decides whether two image endpoints agree, and says
+/// which term did not.
+///
+/// Deciding and reporting are the same walk: a second spelling of the terms
+/// somewhere else is the next divergence.
+fn image_endpoints_disagree(
+    source: &crate::replacement_image_transition::NativeImageTarget,
+    destination: &crate::replacement_image_transition::NativeImageTarget,
+) -> Option<ImageEndpointDisagreement> {
+    if source.pixel_format != destination.pixel_format {
+        return Some(ImageEndpointDisagreement::PixelFormat {
+            source: source.pixel_format,
+            destination: destination.pixel_format,
+        });
+    }
+    let extent = |extent: vk::Extent3D| [extent.width, extent.height, extent.depth];
+    if source.extent != destination.extent {
+        return Some(ImageEndpointDisagreement::Extent {
+            source: extent(source.extent),
+            destination: extent(destination.extent),
+        });
+    }
+    if source.samples != destination.samples {
+        return Some(ImageEndpointDisagreement::Samples {
+            source: source.samples,
+            destination: destination.samples,
+        });
+    }
+    // The same five comparisons `same_subresource_range` makes, in its order,
+    // reported rather than reduced to a bool.
+    for (term, left, right) in [
+        (
+            SubresourceRangeTerm::AspectMask,
+            source.full_range.aspect_mask.as_raw(),
+            destination.full_range.aspect_mask.as_raw(),
+        ),
+        (
+            SubresourceRangeTerm::BaseMipLevel,
+            source.full_range.base_mip_level,
+            destination.full_range.base_mip_level,
+        ),
+        (
+            SubresourceRangeTerm::LevelCount,
+            source.full_range.level_count,
+            destination.full_range.level_count,
+        ),
+        (
+            SubresourceRangeTerm::BaseArrayLayer,
+            source.full_range.base_array_layer,
+            destination.full_range.base_array_layer,
+        ),
+        (
+            SubresourceRangeTerm::LayerCount,
+            source.full_range.layer_count,
+            destination.full_range.layer_count,
+        ),
+    ] {
+        if left != right {
+            return Some(ImageEndpointDisagreement::SubresourceRange {
+                term,
+                source: left,
+                destination: right,
+            });
+        }
+    }
+    None
+}
+
+/// Why an image-to-image transfer is not a copy this device can record.
+///
+/// Four conditions reach this refusal and they call for different repairs, so
+/// the family name alone cannot be acted on: a boot reporting it says only
+/// that a content repair between two siblings stopped, and the submission head
+/// it holds stays held whichever one fired.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageToImageRefusal {
+    /// The endpoints disagree on one of the terms a copy between them needs.
+    /// `vkCmdCopyImage` between mismatched formats or extents is not a
+    /// narrower copy, it is undefined.
+    EndpointsDisagree(ImageEndpointDisagreement),
+    /// Both representations resolved to one native image, so the copy would
+    /// read and write the same memory. The authority planned a transfer whose
+    /// endpoints are not two places.
+    SameImage,
+    /// A byte range names no image geometry of its own. That is the
+    /// buffer/image pair's shape, and it is recorded there.
+    LinearRegion,
+    /// The source declares no aspect `vkCmdCopyImage` can name, so the region
+    /// walk produced no command. An empty batch is not a completed transfer:
+    /// the destination would stay stale with nothing saying so.
+    NoCopyableAspect { aspect_mask: vk::ImageAspectFlags },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -829,17 +972,11 @@ fn resolve_image_image_transfer(
     destination_key: ReplacementImageKey,
     state: &PreparedImageState,
 ) -> Result<NativeResourceStateTransfer, ResourceStateTransferRecordError> {
-    if source.pixel_format != destination.pixel_format
-        || source.extent != destination.extent
-        || source.samples != destination.samples
-        || !crate::replacement_image_transition::same_subresource_range(
-            source.full_range,
-            destination.full_range,
-        )
-    {
-        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported(
+    if let Some(disagreement) = image_endpoints_disagree(&source, &destination) {
+        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
             transfer,
-        ));
+            refusal: ImageToImageRefusal::EndpointsDisagree(disagreement),
+        });
     }
     if !source.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
         || !destination
@@ -863,9 +1000,10 @@ fn resolve_image_image_transfer(
         transfer,
     )?;
     if source.image == destination.image {
-        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported(
+        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
             transfer,
-        ));
+            refusal: ImageToImageRefusal::SameImage,
+        });
     }
     let subresources: Vec<(u32, u32, [u32; 3], [i32; 3])> = match transfer.region {
         // The whole image is every subresource it declares, at that level's
@@ -917,12 +1055,11 @@ fn resolve_image_image_transfer(
             ];
             vec![(region.mip, region.layer, extent, origin)]
         }
-        // A byte range names no image geometry of its own. That is the
-        // buffer/image pair's shape, and it is recorded there.
         BackingRegion::Linear(_) => {
-            return Err(ResourceStateTransferRecordError::ImageToImageUnsupported(
+            return Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
                 transfer,
-            ));
+                refusal: ImageToImageRefusal::LinearRegion,
+            });
         }
     };
     let mut commands = Vec::with_capacity(subresources.len());
@@ -957,9 +1094,12 @@ fn resolve_image_image_transfer(
         }
     }
     if commands.is_empty() {
-        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported(
+        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
             transfer,
-        ));
+            refusal: ImageToImageRefusal::NoCopyableAspect {
+                aspect_mask: source.full_range.aspect_mask,
+            },
+        });
     }
     Ok(NativeResourceStateTransfer::Image(
         commands.into_boxed_slice(),
@@ -2078,5 +2218,148 @@ mod tests {
         assert_eq!(stores[0].bytes, [9, 10]);
         assert_eq!(stores[1].offset, 17);
         assert_eq!(stores[1].bytes, [17, 18]);
+    }
+
+    /// Each condition that refuses an image-to-image copy names itself.
+    ///
+    /// The four reach one refusal family and call for different repairs -- a
+    /// planner that paired siblings the guest never aliased, an authority that
+    /// planned a copy between one image and itself, a byte range that belongs
+    /// on the buffer/image path, and a source declaring no aspect to copy.
+    /// A boot that reports only the family says which of those it hit by luck,
+    /// and each holds its submission head until someone knows.
+    #[test]
+    fn every_unrecordable_image_pair_says_which_term_it_could_not_record() {
+        use crate::replacement_image_state::{
+            ReplacementImageSharing, ReplacementImageState, ReplacementImageStateOwner,
+            ReplacementImageUse,
+        };
+
+        let source_key = ReplacementImageKey {
+            backing: BackingId::new(1),
+            representation: RepresentationId::new(2),
+        };
+        let destination_key = ReplacementImageKey {
+            backing: BackingId::new(1),
+            representation: RepresentationId::new(3),
+        };
+        let mut owner = ReplacementImageStateOwner::new(VulkanDeviceEpochId::new(1));
+        for key in [source_key, destination_key] {
+            owner
+                .register(
+                    key,
+                    ReplacementImageState {
+                        layout: vk::ImageLayout::GENERAL,
+                        sharing: ReplacementImageSharing::Concurrent,
+                        last_use: None,
+                    },
+                )
+                .unwrap();
+        }
+        let state = owner
+            .prepare(
+                TransactionId::new(1),
+                0,
+                [
+                    ReplacementImageUse {
+                        image: source_key,
+                        required_usage: vk::ImageUsageFlags::TRANSFER_SRC,
+                        use_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        final_layout: vk::ImageLayout::GENERAL,
+                    },
+                    ReplacementImageUse {
+                        image: destination_key,
+                        required_usage: vk::ImageUsageFlags::TRANSFER_DST,
+                        use_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        final_layout: vk::ImageLayout::GENERAL,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let target = |image: u64, pixel_format: u16, aspect: vk::ImageAspectFlags| {
+            crate::replacement_image_transition::NativeImageTarget {
+                image: vk::Image::from_raw(image),
+                view: vk::ImageView::null(),
+                image_type: vk::ImageType::TYPE_2D,
+                full_range: vk::ImageSubresourceRange {
+                    aspect_mask: aspect,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+                pixel_format,
+                extent: vk::Extent3D {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                },
+                samples: vk::SampleCountFlags::TYPE_1,
+            }
+        };
+        let key = |region| TransferKey {
+            backing: BackingId::new(1),
+            region,
+            version: reims_vgpu_protocol::ContentVersion::new(1),
+            source: RepresentationId::new(2),
+            destination: RepresentationId::new(3),
+        };
+        let refusal =
+            |transfer: TransferKey, source, destination| match resolve_image_image_transfer(
+                transfer,
+                source,
+                source_key,
+                destination,
+                destination_key,
+                &state,
+            ) {
+                Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
+                    refusal, ..
+                }) => refusal,
+                other => panic!("expected an unrecordable pair, got {other:?}"),
+            };
+
+        let color = vk::ImageAspectFlags::COLOR;
+        // A format pair and an extent pair fail at the same line; only the
+        // recorded endpoints say which term the planner got wrong.
+        assert_eq!(
+            refusal(
+                key(BackingRegion::Whole),
+                target(1, 7, color),
+                target(2, 9, color),
+            ),
+            ImageToImageRefusal::EndpointsDisagree(ImageEndpointDisagreement::PixelFormat {
+                source: 7,
+                destination: 9,
+            })
+        );
+
+        assert_eq!(
+            refusal(
+                key(BackingRegion::Whole),
+                target(1, 7, color),
+                target(1, 7, color),
+            ),
+            ImageToImageRefusal::SameImage
+        );
+        assert_eq!(
+            refusal(
+                key(BackingRegion::Linear(LinearRange::new(0, 16).unwrap())),
+                target(1, 7, color),
+                target(2, 7, color),
+            ),
+            ImageToImageRefusal::LinearRegion
+        );
+        let empty = vk::ImageAspectFlags::empty();
+        assert_eq!(
+            refusal(
+                key(BackingRegion::Whole),
+                target(1, 7, empty),
+                target(2, 7, empty),
+            ),
+            ImageToImageRefusal::NoCopyableAspect { aspect_mask: empty }
+        );
     }
 }
