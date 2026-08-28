@@ -93,6 +93,11 @@ pub enum TextureViewResolveError {
     NotTextureView(AnyResourceId),
     DescriptorAbsent(AnyResourceId),
     DescriptorKindMismatch(AnyResourceId),
+    /// A registered-surface plane view whose nested record carried no view
+    /// geometry. The surface relation is known and the view is not, which is
+    /// a different fact from a descriptor of the wrong kind and waits on a
+    /// different thing.
+    PlaneGeometryAbsent(AnyResourceId),
     ParentCount(AnyResourceId),
     EmptyRange(AnyResourceId),
     UnknownTextureType(u16),
@@ -1100,7 +1105,7 @@ impl ResourceGraph {
                 };
                 let plane = descriptor
                     .view
-                    .ok_or(TextureViewResolveError::DescriptorKindMismatch(current))?;
+                    .ok_or(TextureViewResolveError::PlaneGeometryAbsent(current))?;
                 let plane_range = ResolvedTextureViewRange {
                     level_base: 0,
                     level_count: 1,
@@ -1146,8 +1151,23 @@ impl ResourceGraph {
                 .descriptor
                 .as_deref()
                 .ok_or(TextureViewResolveError::DescriptorAbsent(current))?;
+            // The wire registers several things under the texture-view family
+            // that are not view hops: a texture placed over a buffer's storage
+            // and one placed in a heap are base textures, declaring their own
+            // geometry and composing over no parent. What makes a node a hop
+            // is the view descriptor it retains, not the family it was
+            // registered under --- reading the family instead refuses a
+            // buffer-backed texture the guest bound directly, and the refusal
+            // sits on a submission head.
             let ResourceDescriptor::TextureView(descriptor) = descriptor else {
-                return Err(TextureViewResolveError::DescriptorKindMismatch(current));
+                return Ok(ResolvedTextureView {
+                    view,
+                    base: current,
+                    range,
+                    texture_type,
+                    pixel_format,
+                    swizzle,
+                });
             };
             let hop_range = match descriptor.form {
                 TextureViewForm::Simple => None,
@@ -2642,6 +2662,73 @@ mod tests {
         for (view, was) in views.into_iter().zip(before) {
             assert_ne!(graph.resource(view).unwrap().content.current(), was);
         }
+    }
+
+    /// A texture placed over a buffer's storage is a base texture, not a view
+    /// hop, and binding it directly resolves.
+    ///
+    /// The wire registers it under the texture-view family, and the chain
+    /// walker used to read that family as "this node is a view" and demand a
+    /// view descriptor of it. What it retains is its own declaration, so the
+    /// walk refused `DescriptorKindMismatch` --- on a compute binding, on a
+    /// submission head, for the life of the boot. What makes a node a hop is
+    /// the view descriptor it retains.
+    #[test]
+    fn a_texture_over_a_buffer_is_the_base_of_its_own_binding() {
+        let mut graph = ResourceGraph::default();
+        let storage = graph
+            .create_storage_with_regions(StorageBacking::Dedicated, [BackingRegion::Whole])
+            .unwrap();
+        let buffer = graph
+            .create_resource(task(), object(7), ObjectKind::Buffer, Some(storage), [])
+            .unwrap();
+        let declaration = reims_vgpu_protocol::TextureDeclaration {
+            texture_type: TextureType::D2,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
+            allow_gpu_optimized_contents: false,
+            usage: reims_vgpu_protocol::TEXTURE_USAGE_SHADER_READ,
+            pixel_format: 80,
+            width: 128,
+            height: 64,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            resource_options: 0,
+            protection_options: 0,
+            swizzle: None,
+        };
+        let texture = graph
+            .create_resource_with_descriptor(
+                task(),
+                object(8),
+                // The family the wire registers it under.
+                ObjectKind::TextureView,
+                Some(Arc::new(ResourceDescriptor::BufferTexture(
+                    reims_vgpu_protocol::BufferTextureDescriptor {
+                        new_texture_ref: 8,
+                        buffer_ref: 7,
+                        offset: 0,
+                        bytes_per_row: 512,
+                        desc: declaration,
+                    },
+                ))),
+                Some(storage),
+                [buffer],
+            )
+            .unwrap();
+
+        let resolved = graph.resolve_texture_binding_view(texture).unwrap();
+        assert_eq!(resolved.resource, texture);
+        // Its own declaration answers for it: the chain ends here rather than
+        // composing over the buffer it is placed on.
+        assert_eq!(resolved.base, texture);
+        assert_eq!(resolved.texture_type, TextureType::D2);
+        assert_eq!(resolved.pixel_format, 80);
+        assert_eq!(resolved.range.level_count, 1);
+        assert_eq!(resolved.range.slice_count, 1);
     }
 
     #[test]
