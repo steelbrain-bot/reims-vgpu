@@ -121,6 +121,10 @@ pub struct ReplacementDeviceEpoch {
         std::sync::Mutex<Option<crate::replacement_window_present::ReplacementWindowPresenter>>,
     #[cfg(feature = "host-window")]
     window_swapchain_generations: Arc<AtomicU64>,
+    /// Staging for scanout frames the host publishes itself, which is the only
+    /// source the window has before the guest's driver attaches.
+    #[cfg(feature = "host-window")]
+    host_scanout: std::sync::Mutex<Option<crate::replacement_host_scanout::ReplacementHostScanout>>,
 }
 
 impl ReplacementDeviceEpoch {
@@ -248,6 +252,8 @@ impl ReplacementDeviceEpoch {
             work_timelines: Box::new([timeline]),
             #[cfg(feature = "host-window")]
             window_presenter: std::sync::Mutex::new(None),
+            #[cfg(feature = "host-window")]
+            host_scanout: std::sync::Mutex::new(None),
             #[cfg(feature = "host-window")]
             window_swapchain_generations: Arc::new(AtomicU64::new(1)),
         })
@@ -581,6 +587,133 @@ impl ReplacementDeviceEpoch {
     }
 
     #[cfg(feature = "host-window")]
+    /// Stage one host-published scanout frame and acquire a swapchain image
+    /// that will be blitted from it.
+    ///
+    /// The firmware and early-boot display are CPU-written framebuffer bytes
+    /// with no guest Present behind them, so this is the only route the window
+    /// has until the guest's driver attaches.
+    ///
+    /// # Safety
+    ///
+    /// The returned dispatch names this exact live device epoch and must be
+    /// submitted or abandoned before another frame is staged.
+    unsafe fn prepare_host_scanout_present(
+        &self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<
+        crate::replacement_window_present::ReplacementWindowPresentDispatch,
+        crate::replacement_host_scanout::ReplacementHostScanoutPresentError,
+    > {
+        use crate::replacement_host_scanout::ReplacementHostScanoutPresentError;
+        let mut staging = self
+            .host_scanout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let scanout = match staging.as_mut() {
+            Some(scanout) => scanout,
+            None => staging.insert(
+                unsafe {
+                    crate::replacement_host_scanout::create_scanout(&self.context, width, height)
+                }
+                .map_err(ReplacementHostScanoutPresentError::Scanout)?,
+            ),
+        };
+        let (source, transitions) = unsafe { scanout.stage(&self.context, bgra, width, height) }
+            .map_err(ReplacementHostScanoutPresentError::Scanout)?;
+        let mut presenter = self
+            .window_presenter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(presenter) = presenter.as_mut() else {
+            return Err(ReplacementHostScanoutPresentError::NotAttached);
+        };
+        unsafe { presenter.prepare(&self.context, source, &transitions) }
+            .map_err(ReplacementHostScanoutPresentError::Window)
+    }
+
+    #[cfg(feature = "host-window")]
+    /// Blit one host-published scanout frame into the window and present it.
+    ///
+    /// `None` means the swapchain could not offer an image this tick, which is
+    /// ordinary back-pressure rather than a lost frame: the same bytes are
+    /// still published and the next tick tries again.
+    ///
+    /// # Safety
+    ///
+    /// A native window must be attached to this exact live device epoch.
+    pub unsafe fn present_host_scanout_frame(
+        &self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<
+        Option<crate::replacement_window_present::ReplacementWindowPresentOutcome>,
+        crate::replacement_host_scanout::ReplacementHostScanoutPresentError,
+    > {
+        use crate::{
+            replacement_host_scanout::ReplacementHostScanoutPresentError,
+            replacement_window_present::ReplacementWindowPresentDispatch,
+        };
+        let window = match unsafe { self.prepare_host_scanout_present(bgra, width, height) }? {
+            ReplacementWindowPresentDispatch::Busy => return Ok(None),
+            ReplacementWindowPresentDispatch::Prepared(window) => window,
+        };
+        let slot = window.recording.slot();
+        let fence = window.recording.fence;
+        let lane = self
+            .queues()
+            .lane(self.work_queue)
+            .expect("the replacement epoch always owns its work queue lane");
+        let presented = match lane
+            .submit
+            .submit_host_present(window.recording, window.present)
+        {
+            Ok(presented) => presented,
+            Err(reason) => {
+                self.release_host_scanout();
+                if let Err(reservation) = self.abandon_window_present(slot) {
+                    return Err(ReplacementHostScanoutPresentError::Reservation(reservation));
+                }
+                return Err(ReplacementHostScanoutPresentError::Queue(reason));
+            }
+        };
+        self.host_scanout_read_by(fence);
+        self.accept_window_present(slot, window.acquire_suboptimal, presented)
+            .map(Some)
+            .map_err(ReplacementHostScanoutPresentError::Reservation)
+    }
+
+    #[cfg(feature = "host-window")]
+    /// Record the present that now reads the staged bytes, so the next frame
+    /// waits for it before overwriting them.
+    pub fn host_scanout_read_by(&self, fence: vk::Fence) {
+        if let Some(scanout) = self
+            .host_scanout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            scanout.read_by(fence);
+        }
+    }
+
+    #[cfg(feature = "host-window")]
+    /// Release the staged bytes after a present that never reached the driver.
+    pub fn release_host_scanout(&self) {
+        if let Some(scanout) = self
+            .host_scanout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            scanout.released();
+        }
+    }
+
+    #[cfg(feature = "host-window")]
     /// Detach and destroy the native window presentation objects.
     ///
     /// # Safety
@@ -604,6 +737,14 @@ impl ReplacementDeviceEpoch {
             .wait_idle()
             .map_err(ReplacementWindowDetachError::Queue)?;
         unsafe { presenter.destroy_after_idle(&self.context) };
+        if let Some(scanout) = self
+            .host_scanout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            unsafe { scanout.destroy(&self.context) };
+        }
         Ok(())
     }
 
@@ -1332,6 +1473,14 @@ impl Drop for ReplacementDeviceEpoch {
                 ));
             }
             unsafe { presenter.destroy_after_idle(&self.context) };
+            if let Some(scanout) = self
+                .host_scanout
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                unsafe { scanout.destroy(&self.context) };
+            }
         }
         drop(self.queues.take());
         unsafe {

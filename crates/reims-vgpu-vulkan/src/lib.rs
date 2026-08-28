@@ -36,6 +36,8 @@ pub mod replacement_exec_queue;
 pub mod replacement_exec_recording;
 mod replacement_fill;
 mod replacement_fill_shader;
+#[cfg(feature = "host-window")]
+pub mod replacement_host_scanout;
 pub mod replacement_image_acceptance;
 pub mod replacement_image_blit;
 pub mod replacement_image_release;

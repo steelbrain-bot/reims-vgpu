@@ -668,6 +668,21 @@ impl PendingReplacementQueueSubmit {
 }
 
 enum Request {
+    /// A present the host originated, which takes no queue timeline point.
+    ///
+    /// Its only source is a host-staged scanout image and its only destination
+    /// is an acquired swapchain image, so no guest submission produces what it
+    /// reads or consumes what it writes: there is nothing on this timeline for
+    /// it to wait on and nothing that could wait on it. Reserving a point
+    /// would also put it in the queue's single signal-value sequence, where a
+    /// guest point already reserved but not yet submitted would make its
+    /// admission arrive out of order.
+    #[cfg(feature = "host-window")]
+    HostPresent {
+        recording: ReplacementPresentRecording,
+        present: ReplacementQueuePresent,
+        reply: mpsc::SyncSender<Result<Result<bool, vk::Result>, ReplacementQueueError>>,
+    },
     Submit {
         submission: Box<ReplacementQueueSubmission>,
         reply: mpsc::SyncSender<
@@ -919,6 +934,34 @@ impl ReplacementQueueOwner {
         Ok(prepared)
     }
 
+    #[cfg(feature = "host-window")]
+    /// Submit one host-originated present and wait for the driver's answer.
+    ///
+    /// Synchronous because the host window thread has nothing else to do with
+    /// the acquired image until the driver has taken it, and because the reply
+    /// carries the `vkQueuePresentKHR` result the swapchain owner must see to
+    /// release its reservation.
+    pub fn submit_host_present(
+        &self,
+        recording: ReplacementPresentRecording,
+        present: ReplacementQueuePresent,
+    ) -> Result<Result<bool, vk::Result>, ReplacementQueueError> {
+        if let Some(error) = self.failure.get() {
+            return Err(error);
+        }
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(Request::HostPresent {
+                recording,
+                present,
+                reply,
+            })
+            .map_err(|_| ReplacementQueueError::OwnerStopped)?;
+        receiver
+            .recv()
+            .map_err(|_| ReplacementQueueError::OwnerStopped)?
+    }
+
     /// Serialize a queue-idle boundary with all submissions owned by this
     /// lane. Swapchain replacement uses this before destroying images that
     /// earlier Present submissions may still reference.
@@ -983,6 +1026,23 @@ fn run(
                 };
                 let _ = reply.send(result);
             }
+            #[cfg(feature = "host-window")]
+            Request::HostPresent {
+                recording,
+                present,
+                reply,
+            } => {
+                let result = if let Some(error) = failure.get() {
+                    Err(error)
+                } else {
+                    submit_host_present(device, queue, &recording, &present)
+                        .map_err(ReplacementQueueError::Driver)
+                };
+                if let Err(error) = result {
+                    failure.set(error);
+                }
+                let _ = reply.send(result);
+            }
             Request::WaitIdle { reply } => {
                 let result = if let Some(error) = failure.get() {
                     Err(error)
@@ -997,6 +1057,41 @@ fn run(
             Request::Stop => break,
         }
     }
+}
+
+#[cfg(feature = "host-window")]
+fn submit_host_present(
+    device: &ash::Device,
+    queue: vk::Queue,
+    recording: &ReplacementPresentRecording,
+    present: &ReplacementQueuePresent,
+) -> Result<Result<bool, vk::Result>, vk::Result> {
+    let waits = [present.acquire_wait];
+    let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+    let signals = [present.render_finished];
+    let commands = [recording.command_buffer];
+    unsafe {
+        device.queue_submit(
+            queue,
+            &[vk::SubmitInfo::default()
+                .wait_semaphores(&waits)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&commands)
+                .signal_semaphores(&signals)],
+            recording.fence,
+        )
+    }?;
+    let swapchains = [present.swapchain];
+    let indices = [present.image_index];
+    Ok(unsafe {
+        present.loader.queue_present(
+            queue,
+            &vk::PresentInfoKHR::default()
+                .wait_semaphores(&signals)
+                .swapchains(&swapchains)
+                .image_indices(&indices),
+        )
+    })
 }
 
 fn submit(

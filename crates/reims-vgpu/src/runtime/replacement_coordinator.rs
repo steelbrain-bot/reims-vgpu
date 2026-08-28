@@ -6685,6 +6685,29 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
     }
 
     #[cfg(feature = "host-window")]
+    /// Present one scanout frame the host published itself.
+    ///
+    /// # Safety
+    ///
+    /// A native window must still be attached to this device.
+    pub unsafe fn present_host_scanout_frame(
+        &self,
+        bgra: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<
+        Option<reims_vgpu_vulkan::replacement_window_present::ReplacementWindowPresentOutcome>,
+        reims_vgpu_vulkan::replacement_host_scanout::ReplacementHostScanoutPresentError,
+    > {
+        unsafe {
+            self.runtime
+                .session()
+                .vulkan()
+                .present_host_scanout_frame(bgra, width, height)
+        }
+    }
+
+    #[cfg(feature = "host-window")]
     /// Retire the swapchain and surface before their native window disappears.
     ///
     /// # Safety

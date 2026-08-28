@@ -116,15 +116,63 @@ impl crate::runtime::replacement_services::WindowPresentationService for Replace
 
     fn present_window_frame(
         &self,
-        _frame: Option<crate::runtime::replacement_services::WindowPresentationFrame<'_>>,
+        frame: Option<crate::runtime::replacement_services::WindowPresentationFrame<'_>>,
     ) -> Result<
         crate::runtime::replacement_services::WindowPresentOutcome,
         crate::runtime::replacement_services::WindowPresentationError,
     > {
-        // Guest Present transactions submit directly through the replacement
-        // queue owner. The window loop owns native handles and resize/input,
-        // but never manufactures a second presentation transaction.
-        Ok(crate::runtime::replacement_services::WindowPresentOutcome::Busy)
+        use crate::runtime::replacement_services::{
+            WindowPresentOutcome, WindowPresentationError, WindowPresentationPayload,
+        };
+        // A resident frame belongs to a guest Present transaction, which
+        // submits itself through the replacement queue owner: the window loop
+        // owns native handles and resize/input, and never manufactures a second
+        // presentation transaction. A CPU frame has no such owner — it is the
+        // host's own scanout publication, and it is the only thing the window
+        // has to show before the guest's driver attaches.
+        let Some(frame) = frame else {
+            return Ok(WindowPresentOutcome::Busy);
+        };
+        let WindowPresentationPayload::CpuBgra(bgra) = frame.payload else {
+            return Ok(WindowPresentOutcome::Busy);
+        };
+        let slot = self.0.upgrade().ok_or_else(|| {
+            WindowPresentationError::replacement("present", "device was destroyed".to_string())
+        })?;
+        let inner = slot.inner.lock();
+        let outcome = unsafe {
+            inner
+                .device
+                .present_host_scanout_frame(bgra, frame.width, frame.height)
+        }
+        .map_err(|reason| WindowPresentationError::replacement("present", format!("{reason:?}")))?;
+        Ok(match outcome {
+            None => WindowPresentOutcome::Busy,
+            Some(
+                reims_vgpu_vulkan::replacement_window_present::ReplacementWindowPresentOutcome::Presented {
+                    width,
+                    height,
+                    swapchain_images,
+                    suboptimal,
+                },
+            ) => WindowPresentOutcome::Presented {
+                route: reims_vgpu_core::PresentationRoute::CpuBgra,
+                width,
+                height,
+                swapchain_images,
+                suboptimal,
+            },
+            Some(
+                reims_vgpu_vulkan::replacement_window_present::ReplacementWindowPresentOutcome::Refused(
+                    result,
+                ),
+            ) => {
+                return Err(WindowPresentationError::replacement(
+                    "present",
+                    format!("swapchain refused the frame: {result:?}"),
+                ))
+            }
+        })
     }
 
     fn detach_window_presenter(&self) {
