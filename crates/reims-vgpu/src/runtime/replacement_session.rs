@@ -12493,6 +12493,30 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     where
         Semantic: Clone,
     {
+        // A failure here is retained and re-driven from the manifest it
+        // carries, so this manifest may be many ticks old. Its permitted
+        // pending writes are a snapshot of the submission order taken when it
+        // was built, and a GPU write planned since is in no snapshot -- so
+        // content synchronization refuses `PendingGpuWrite` on a write the
+        // manifest will never come to permit, once a tick, for the life of the
+        // device.
+        //
+        // The suffix route asks the same question before reading its retained
+        // manifest. This is the same question on the route that runs first,
+        // and leaving it to the suffix is what let a boot hold channel 1 with
+        // `consumer` and the write's producer the *same* transaction and
+        // `permits=0`.
+        let refreshed = manifest
+            .upload_staleness(&self.execution.epoch.resources)
+            .and_then(|staleness| {
+                let transaction = prepared.admitted.transaction.id;
+                report_guest_upload_refresh(transaction, Some(staleness));
+                self.preflight_prepared_guest_upload_resources(&prepared)
+                    .ok()
+            });
+        if let Some(refreshed) = refreshed {
+            manifest = refreshed;
+        }
         if !manifest.requires_guest_upload() {
             return Err(Box::new(
                 ReplacementGuestUploadPhasePreparationFailure::NoUpload { prepared, manifest },
