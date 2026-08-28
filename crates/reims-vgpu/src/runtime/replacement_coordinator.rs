@@ -914,84 +914,21 @@ where
     let runs =
         crate::runtime::guest_ram_map::references_for_runs(host, &gpas, page_size, in_page, length)
             .map_err(ReplacementObjectRepresentationPreparationError::GuestMap)?;
-    // A window the guest laid out over several physical runs is still one
-    // allocation, and the import rail binds one host-virtual range: a
-    // multi-run window disqualifies itself from the host-pointer import and
-    // every resource over it falls to a staging copy. So ask the shim to
-    // reserve one range and map the pages into their resource offsets, which
-    // is the alias the import was designed around.
-    if runs.len() > 1 {
-        if let Some(packed) = packed_task_guest_window(host, &gpas, page_size, in_page, length) {
-            return reims_vgpu_memory::GuestWindow::new(vec![packed])
-                .map_err(ReplacementObjectRepresentationPreparationError::GuestWindow);
-        }
-    }
+    // A window the guest laid out over several physical runs stays several
+    // runs. The import rail binds one host-virtual range, so such a window
+    // disqualifies itself from the host-pointer import and every resource over
+    // it takes a staging copy. Packing the pages into one reserved range to
+    // recover the import is the obvious idea and it is not sound as written:
+    // the packed view fixes one instant's GVA->GPA->HVA mapping and is then
+    // held for the device's lifetime, so it goes on naming pages the guest has
+    // since taken back. A driven macos-13 x86 boot rendered the whole desktop
+    // layer as full-width rainbow banding at page granularity -- 2025 pages
+    // over ~500 physical runs, and a 4 KiB page is about half of a 1920 px
+    // row. Removing the packing rendered the same desktop cleanly. Anything
+    // that reinstates it has to invalidate the view when the guest remaps,
+    // which is a lifetime this device does not currently observe.
     reims_vgpu_memory::GuestWindow::new(runs)
         .map_err(ReplacementObjectRepresentationPreparationError::GuestWindow)
-}
-
-/// One packed host-virtual alias over a scattered guest window, or `None`.
-///
-/// The alias is what makes a scattered allocation importable: consecutive host
-/// pages naming arbitrary guest-physical pages in the task's virtual order, so
-/// the whole window is one run and `imported_transfer` stays available. Without
-/// it a guest allocation of ten physical runs binds through a host-visible
-/// working buffer, and a GPU write into `Shared` storage then reaches the guest
-/// only when something copies it back.
-///
-/// Gated on [`crate::runtime::host::HostPageViews::map_pages_stable`], the shim's own
-/// statement that the alias it returns may be retained and imported. A shim
-/// that answers false hands back a view whose lifetime the caller owns, and
-/// this window has nowhere to own one: the alias must outlive every submitted
-/// GPU access made through the import built over it, and the import is reached
-/// from the backend's own epoch registry rather than from here. Refusing there
-/// is a rail choice with a cost -- the staging route -- and not a loss.
-///
-/// Every step is an `Option` rather than a refusal because each one has a
-/// working answer behind it: the multi-run window the caller already holds.
-fn packed_task_guest_window(
-    host: &mut (impl HostMemory + crate::runtime::host::HostOps),
-    gpas: &[u64],
-    page_size: u64,
-    in_page: u64,
-    length: u64,
-) -> Option<reims_vgpu_memory::GuestWindowRun> {
-    if !host.map_pages_stable() {
-        return None;
-    }
-    // The alias base is the first page's base, so everything the window reaches
-    // is measured from there -- `in_page` included.
-    let reachable = in_page.checked_add(length)?;
-    let mapped = (gpas.len() as u64).checked_mul(page_size)?;
-    let align = reims_vgpu_memory::host_allocation_import_align(reachable).ok()?;
-    let alias_len = reims_vgpu_protocol::align_up_u64(reachable, align.max(page_size))?;
-    let host_base = if alias_len > mapped {
-        host.map_pages_with_padding(gpas, page_size as usize, usize::try_from(alias_len).ok()?)?
-    } else {
-        host.map_pages(gpas, page_size as usize)?
-    };
-    let import = std::sync::Arc::new(
-        reims_vgpu_memory::GuestRamImport::new_host_allocation(host_base, alias_len, align).ok()?,
-    );
-    let slice = import.slice(in_page, length).ok()?;
-    let guest = reims_vgpu_memory::GuestRef::new(std::sync::Arc::clone(&import), slice).ok()?;
-    // One line per distinct scatter shape, not one per alias: a driven boot
-    // packs thousands and the question this answers is which shapes reach the
-    // rail at all, which the first of each says and the rest repeat.
-    let runs = reims_vgpu_paging::runs::contig_run_count(gpas, page_size);
-    if crate::observe::first_sight(
-        "packed_guest_alias",
-        u64::try_from(runs).unwrap_or(u64::MAX),
-    ) {
-        let pages = gpas.len();
-        crate::observe::off(format!(
-            "replacement_packed_guest_alias pages={pages} runs={runs} bytes={length} alias_len={alias_len}"
-        ));
-    }
-    Some(reims_vgpu_memory::GuestWindowRun {
-        window_offset: 0,
-        guest,
-    })
 }
 
 fn replacement_object_preparation_failure_diagnostic(
@@ -9164,55 +9101,6 @@ pub(crate) fn publish_ordered_fact_to_host<Semantic>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A scattered guest window becomes one run, which is what the import
-    /// needs.
-    ///
-    /// `references_for_runs` returns one run per GPA-contiguous stretch, and a
-    /// window of more than one disqualifies itself from the host-pointer
-    /// import: every resource over it then binds through a host-visible
-    /// working buffer. The pages here are deliberately non-adjacent, so the
-    /// unpacked answer is three runs and the packed one is a single window
-    /// spanning all three.
-    #[test]
-    fn a_scattered_guest_window_packs_into_one_importable_run() {
-        const PAGE: u64 = 1 << reims_vgpu_paging::geometry::PAGE_SHIFT_X86;
-        // Packing exists only to make an import possible, so a host that
-        // published no import limits correctly declines to pack at all.
-        // Granularity 1 because the fixture's scattered view is a heap
-        // allocation rather than a page-aligned mapping; a real shim returns a
-        // page-aligned base and the import align it must satisfy is the
-        // backend's own published one.
-        reims_vgpu_memory::latch_import_limits(1, 1 << 30, 1 << 30);
-        let mut host = crate::runtime::host::FakeHost::new();
-        host.stable_map_pages = true;
-        let gpas = [0x40 * PAGE, 0x91 * PAGE, 0x13 * PAGE];
-        for &gpa in &gpas {
-            host.map_range(gpa, PAGE as usize, 0);
-        }
-        assert_eq!(
-            reims_vgpu_paging::runs::contig_run_count(&gpas, PAGE),
-            3,
-            "the fixture must be scattered or it proves nothing"
-        );
-
-        let length = 3 * PAGE;
-        let packed = packed_task_guest_window(&mut host, &gpas, PAGE, 0, length)
-            .expect("a stable shim packs a scattered window");
-        assert_eq!(packed.window_offset, 0);
-        assert_eq!(packed.guest.requested(), length);
-
-        // A shim whose alias the caller would have to release cannot be used
-        // here, because this window has nowhere to own one.
-        host.stable_map_pages = false;
-        assert!(packed_task_guest_window(&mut host, &gpas, PAGE, 0, length).is_none());
-
-        // A host with no published granularity cannot import, so there is
-        // nothing for a packed alias to be for.
-        host.stable_map_pages = true;
-        reims_vgpu_memory::forget_import_limits();
-        assert!(packed_task_guest_window(&mut host, &gpas, PAGE, 0, length).is_none());
-    }
 
     #[test]
     fn guest_upload_suffix_waiting_for_a_content_producer_is_retryable() {
