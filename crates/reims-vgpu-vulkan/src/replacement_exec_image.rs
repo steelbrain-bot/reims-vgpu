@@ -50,7 +50,7 @@ pub fn exec_has_image_uses_with_transfer_classifier<
     NativeRender,
 >(
     resources: &PreparedExecResources<Compute, NativeCompute, Render, NativeRender>,
-    mut linear_transfer_uses_image: impl FnMut(TransferKey) -> bool,
+    mut transfer_uses_images: impl FnMut(TransferKey) -> bool,
 ) -> Result<bool, ExecImageStateError> {
     if !resources.inputs().image_blits.is_empty() {
         return Ok(true);
@@ -63,7 +63,7 @@ pub fn exec_has_image_uses_with_transfer_classifier<
             states.states().iter().any(|state| {
                 state.transfers().iter().any(|transfer| {
                     matches!(transfer.region, BackingRegion::Image(_))
-                        || linear_transfer_uses_image(*transfer)
+                        || transfer_uses_images(*transfer)
                 })
             })
         })
@@ -77,7 +77,7 @@ pub fn exec_has_image_uses_with_transfer_classifier<
         .is_some_and(|batch| {
             batch.transfers().iter().any(|transfer| {
                 matches!(transfer.region, BackingRegion::Image(_))
-                    || linear_transfer_uses_image(*transfer)
+                    || transfer_uses_images(*transfer)
             })
         })
     {
@@ -112,7 +112,7 @@ pub fn prepare_exec_image_states<
     resources: &PreparedExecResources<Compute, NativeCompute, Render, NativeRender>,
     queue_family: u32,
     final_layouts: &impl ReplacementImageFinalLayout,
-    mut linear_transfer_uses_image: impl FnMut(TransferKey) -> bool,
+    mut transfer_uses_images: impl FnMut(TransferKey) -> bool,
 ) -> Result<PreparedImageStateBatch, ExecImageStateError> {
     let mut operations = Vec::new();
     for prepared in &resources.inputs().image_blits {
@@ -131,7 +131,7 @@ pub fn prepare_exec_image_states<
     if let Some(states) = resources.inputs().resource_states.as_ref() {
         for prepared in states.states() {
             let uses = derive_resource_state_image_uses(prepared, |transfer| {
-                linear_transfer_uses_image(transfer)
+                transfer_uses_images(transfer)
             })?;
             if !uses.is_empty() {
                 operations.push((prepared.index(), uses));
@@ -156,7 +156,7 @@ pub fn prepare_exec_image_states<
         .as_ref()
         .map(|batch| {
             derive_resource_state_transfer_image_uses(batch.transfers(), |transfer| {
-                linear_transfer_uses_image(transfer)
+                transfer_uses_images(transfer)
             })
         })
         .transpose()?
@@ -280,21 +280,23 @@ pub fn validate_exec_image_states<
 
 fn derive_resource_state_image_uses(
     prepared: &reims_vgpu_core::PreparedResourceState,
-    linear_transfer_uses_image: impl FnMut(TransferKey) -> bool,
+    transfer_uses_images: impl FnMut(TransferKey) -> bool,
 ) -> Result<Box<[crate::replacement_image_state::ReplacementImageUse]>, ExecImageStateError> {
-    derive_resource_state_transfer_image_uses(prepared.transfers(), linear_transfer_uses_image)
+    derive_resource_state_transfer_image_uses(prepared.transfers(), transfer_uses_images)
 }
 
 fn derive_resource_state_transfer_image_uses(
     transfers: &[TransferKey],
-    mut linear_transfer_uses_image: impl FnMut(TransferKey) -> bool,
+    mut transfer_uses_images: impl FnMut(TransferKey) -> bool,
 ) -> Result<Box<[crate::replacement_image_state::ReplacementImageUse]>, ExecImageStateError> {
     let mut roles =
         BTreeMap::<crate::replacement_image_state::ReplacementImageKey, (bool, bool)>::new();
     for &transfer in transfers {
-        if !matches!(transfer.region, BackingRegion::Image(_))
-            && !linear_transfer_uses_image(transfer)
-        {
+        // An image region says so by its own shape. Every other region --- a
+        // byte range staged through a linear layout, or a whole backing whose
+        // endpoints are two images over it --- is a question about what the
+        // endpoints resolved to, which only the classifier can answer.
+        if !matches!(transfer.region, BackingRegion::Image(_)) && !transfer_uses_images(transfer) {
             continue;
         }
         let source_endpoint = matches!(transfer.source, GUEST_REPRESENTATION | HOST_REPRESENTATION);

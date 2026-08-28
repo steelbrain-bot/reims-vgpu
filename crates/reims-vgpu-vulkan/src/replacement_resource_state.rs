@@ -12,7 +12,7 @@ use crate::replacement_buffer_blit::{
 };
 use crate::replacement_representation::ReplacementBufferAllocationError;
 use crate::{
-    replacement_image_blit::{NativeBufferImageCopy, NativeImageBlitCommand},
+    replacement_image_blit::{NativeBufferImageCopy, NativeImageBlitCommand, NativeImageCopy},
     replacement_image_state::{PreparedImageState, PreparedImageStateBatch, ReplacementImageKey},
     replacement_image_transition::{resolve_image_transitions, PreparedNativeImageState},
 };
@@ -793,13 +793,200 @@ fn resolve_transfer(
             state()?,
             resolver,
         ),
-        (None, Some(_), None, Some(_)) => Err(
-            ResourceStateTransferRecordError::ImageToImageUnsupported(transfer),
+        (None, Some(source), None, Some(destination)) => resolve_image_image_transfer(
+            transfer,
+            source,
+            source_key,
+            destination,
+            destination_key,
+            state()?,
         ),
         _ => Err(ResourceStateTransferRecordError::ImageEndpointMissing(
             transfer,
         )),
     }
+}
+
+/// Make one image over a backing current from another image over the same
+/// backing.
+///
+/// Two textures declared over one allocation are two native images holding one
+/// set of bytes, and the content authority designates both. When the guest's
+/// own content lands in one of them, the other is brought current from it --
+/// there is no third place those bytes exist, which is why the planner names a
+/// sibling representation as the source rather than a staging endpoint.
+///
+/// The copy is therefore between images this device believes carry identical
+/// content, so their subresource shape and pixel format must agree exactly. A
+/// pair that disagrees is not a copy this device can express and is refused by
+/// name: `vkCmdCopyImage` between mismatched formats or extents is not a
+/// narrower copy, it is undefined.
+fn resolve_image_image_transfer(
+    transfer: TransferKey,
+    source: crate::replacement_image_transition::NativeImageTarget,
+    source_key: ReplacementImageKey,
+    destination: crate::replacement_image_transition::NativeImageTarget,
+    destination_key: ReplacementImageKey,
+    state: &PreparedImageState,
+) -> Result<NativeResourceStateTransfer, ResourceStateTransferRecordError> {
+    if source.pixel_format != destination.pixel_format
+        || source.extent != destination.extent
+        || source.samples != destination.samples
+        || !crate::replacement_image_transition::same_subresource_range(
+            source.full_range,
+            destination.full_range,
+        )
+    {
+        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported(
+            transfer,
+        ));
+    }
+    if !source.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+        || !destination
+            .usage
+            .contains(vk::ImageUsageFlags::TRANSFER_DST)
+    {
+        return Err(ResourceStateTransferRecordError::ImageUsageMissing(
+            transfer,
+        ));
+    }
+    let source_layout = transfer_transition_layout(
+        state,
+        source_key,
+        vk::ImageUsageFlags::TRANSFER_SRC,
+        transfer,
+    )?;
+    let destination_layout = transfer_transition_layout(
+        state,
+        destination_key,
+        vk::ImageUsageFlags::TRANSFER_DST,
+        transfer,
+    )?;
+    if source.image == destination.image {
+        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported(
+            transfer,
+        ));
+    }
+    let subresources: Vec<(u32, u32, [u32; 3], [i32; 3])> = match transfer.region {
+        // The whole image is every subresource it declares, at that level's
+        // own extent. A content version names the bytes, not one mip.
+        BackingRegion::Whole => {
+            let mut levels = Vec::new();
+            for mip_offset in 0..source.full_range.level_count {
+                let mip = source
+                    .full_range
+                    .base_mip_level
+                    .checked_add(mip_offset)
+                    .ok_or(ResourceStateTransferRecordError::RangeAddressOverflow(
+                        transfer,
+                    ))?;
+                let extent = [
+                    (source.extent.width >> mip_offset).max(1),
+                    (source.extent.height >> mip_offset).max(1),
+                    (source.extent.depth >> mip_offset).max(1),
+                ];
+                for layer_offset in 0..source.full_range.layer_count {
+                    let layer = source
+                        .full_range
+                        .base_array_layer
+                        .checked_add(layer_offset)
+                        .ok_or(ResourceStateTransferRecordError::RangeAddressOverflow(
+                            transfer,
+                        ))?;
+                    levels.push((mip, layer, extent, [0, 0, 0]));
+                }
+            }
+            levels
+        }
+        BackingRegion::Image(region) => {
+            let extent = [
+                region.texels.end[0].saturating_sub(region.texels.origin[0]),
+                region.texels.end[1].saturating_sub(region.texels.origin[1]),
+                region.texels.end[2].saturating_sub(region.texels.origin[2]),
+            ];
+            let origin = [
+                i32::try_from(region.texels.origin[0]),
+                i32::try_from(region.texels.origin[1]),
+                i32::try_from(region.texels.origin[2]),
+            ];
+            let [x, y, z] = origin;
+            let origin = [
+                x.map_err(|_| ResourceStateTransferRecordError::RangeOutOfBounds(transfer))?,
+                y.map_err(|_| ResourceStateTransferRecordError::RangeOutOfBounds(transfer))?,
+                z.map_err(|_| ResourceStateTransferRecordError::RangeOutOfBounds(transfer))?,
+            ];
+            vec![(region.mip, region.layer, extent, origin)]
+        }
+        // A byte range names no image geometry of its own. That is the
+        // buffer/image pair's shape, and it is recorded there.
+        BackingRegion::Linear(_) => {
+            return Err(ResourceStateTransferRecordError::ImageToImageUnsupported(
+                transfer,
+            ));
+        }
+    };
+    let mut commands = Vec::with_capacity(subresources.len());
+    for (mip, layer, extent, offset) in subresources {
+        if extent.contains(&0) {
+            return Err(ResourceStateTransferRecordError::RangeOutOfBounds(transfer));
+        }
+        // One command per aspect: `vkCmdCopyImage` takes a single aspect per
+        // region, so a depth/stencil pair is two copies of the same box.
+        for aspect in [
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageAspectFlags::DEPTH,
+            vk::ImageAspectFlags::STENCIL,
+        ] {
+            if !source.full_range.aspect_mask.contains(aspect) {
+                continue;
+            }
+            commands.push(NativeImageBlitCommand::ImageToImage(NativeImageCopy {
+                source: source.image,
+                source_layout,
+                destination: destination.image,
+                destination_layout,
+                aspect,
+                source_mip: mip,
+                source_layer: layer,
+                destination_mip: mip,
+                destination_layer: layer,
+                source_offset: offset,
+                destination_offset: offset,
+                extent,
+            }));
+        }
+    }
+    if commands.is_empty() {
+        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported(
+            transfer,
+        ));
+    }
+    Ok(NativeResourceStateTransfer::Image(
+        commands.into_boxed_slice(),
+    ))
+}
+
+/// The layout a prepared transition puts one endpoint in, once it has proved
+/// the transition grants the usage this transfer needs.
+fn transfer_transition_layout(
+    state: &PreparedImageState,
+    image: ReplacementImageKey,
+    required_usage: vk::ImageUsageFlags,
+    transfer: TransferKey,
+) -> Result<vk::ImageLayout, ResourceStateTransferRecordError> {
+    let transition = state
+        .transitions()
+        .iter()
+        .find(|transition| transition.image == image)
+        .ok_or(ResourceStateTransferRecordError::ImageStateMismatch(
+            transfer,
+        ))?;
+    if !transition.required_usage.contains(required_usage) {
+        return Err(ResourceStateTransferRecordError::ImageStateMismatch(
+            transfer,
+        ));
+    }
+    Ok(transition.use_layout)
 }
 
 #[allow(
@@ -1452,16 +1639,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecordable_image_pair_names_its_shape_and_not_a_missing_state() {
+    fn an_unresolvable_endpoint_names_its_shape_and_not_a_missing_state() {
         use crate::replacement_image_transition::{NativeImageTarget, ReplacementImageResolver};
-        // A transfer whose endpoints are both images can never be recorded,
-        // whatever preparation runs. Naming it as a missing image state makes
-        // a permanent refusal look like a wait, and the channel retries it
-        // forever behind its own submission head.
-        struct BothImages {
+        // A transfer with one image endpoint and one endpoint that resolves to
+        // nothing at all can never be recorded, whatever preparation runs.
+        // Naming it as a missing image state makes a permanent refusal look
+        // like a wait, and the channel retries it forever behind its own
+        // submission head. The prepared state belongs to the arms that read
+        // it, which this is not.
+        struct OneImage {
             backing: BackingId,
+            image: RepresentationId,
         }
-        impl ReplacementBufferResolver for BothImages {
+        impl ReplacementBufferResolver for OneImage {
             fn resolve_buffer(
                 &self,
                 _backing: BackingId,
@@ -1470,39 +1660,166 @@ mod tests {
                 None
             }
         }
-        impl ReplacementImageResolver for BothImages {
+        impl ReplacementImageResolver for OneImage {
             fn resolve_image(&self, image: ReplacementImageKey) -> Option<NativeImageTarget> {
-                (image.backing == self.backing).then_some(NativeImageTarget {
-                    image: vk::Image::from_raw(33),
-                    view: vk::ImageView::from_raw(34),
-                    image_type: vk::ImageType::TYPE_2D,
-                    full_range: vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
+                (image.backing == self.backing && image.representation == self.image).then_some(
+                    NativeImageTarget {
+                        image: vk::Image::from_raw(33),
+                        view: vk::ImageView::from_raw(34),
+                        image_type: vk::ImageType::TYPE_2D,
+                        full_range: vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        usage: vk::ImageUsageFlags::TRANSFER_SRC,
+                        pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_R8_UNORM,
+                        extent: vk::Extent3D {
+                            width: 4,
+                            height: 4,
+                            depth: 1,
+                        },
+                        samples: vk::SampleCountFlags::TYPE_1,
                     },
-                    usage: vk::ImageUsageFlags::TRANSFER_SRC,
-                    pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_R8_UNORM,
-                    extent: vk::Extent3D {
-                        width: 4,
-                        height: 4,
-                        depth: 1,
-                    },
-                    samples: vk::SampleCountFlags::TYPE_1,
+                )
+            }
+        }
+        let (prepared, key, _) = prepared(BackingRegion::Whole);
+        let resolver = OneImage {
+            backing: key.backing,
+            image: key.source,
+        };
+        assert!(matches!(
+            ReplacementResourceStateProgram::resolve_with_image_state(&prepared, None, &resolver),
+            Err(ResourceStateTransferRecordError::ImageEndpointMissing(found))
+                if found == key
+        ));
+    }
+
+    #[test]
+    fn a_whole_transfer_between_two_images_over_one_backing_copies_every_subresource() {
+        use crate::replacement_image_transition::{NativeImageTarget, ReplacementImageResolver};
+        // Two textures declared over one allocation are two native images
+        // holding one set of bytes. When the guest's content lands in one, the
+        // other is brought current from it, and there is no third place those
+        // bytes exist -- so this is the copy, not a fallback for one.
+        struct TwoImages {
+            backing: BackingId,
+        }
+        fn target() -> NativeImageTarget {
+            NativeImageTarget {
+                image: vk::Image::from_raw(0),
+                view: vk::ImageView::from_raw(0),
+                image_type: vk::ImageType::TYPE_2D,
+                full_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 2,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+                pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_R8_UNORM,
+                extent: vk::Extent3D {
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                },
+                samples: vk::SampleCountFlags::TYPE_1,
+            }
+        }
+        impl ReplacementBufferResolver for TwoImages {
+            fn resolve_buffer(
+                &self,
+                _backing: BackingId,
+                _representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                None
+            }
+        }
+        impl ReplacementImageResolver for TwoImages {
+            fn resolve_image(&self, image: ReplacementImageKey) -> Option<NativeImageTarget> {
+                (image.backing == self.backing).then(|| {
+                    let mut target = target();
+                    target.image = vk::Image::from_raw(u64::from(image.representation.get()) + 1);
+                    target
                 })
             }
         }
         let (prepared, key, _) = prepared(BackingRegion::Whole);
-        let resolver = BothImages {
+        let resolver = TwoImages {
             backing: key.backing,
         };
-        assert!(matches!(
-            ReplacementResourceStateProgram::resolve_with_image_state(&prepared, None, &resolver),
-            Err(ResourceStateTransferRecordError::ImageToImageUnsupported(found))
-                if found == key
-        ));
+        let key_for = |representation| ReplacementImageKey {
+            backing: key.backing,
+            representation,
+        };
+        let mut images = crate::replacement_image_state::ReplacementImageStateOwner::new(
+            reims_vgpu_protocol::VulkanDeviceEpochId::new(1),
+        );
+        for representation in [key.source, key.destination] {
+            images
+                .register(
+                    key_for(representation),
+                    crate::replacement_image_state::ReplacementImageState {
+                        layout: vk::ImageLayout::GENERAL,
+                        sharing:
+                            crate::replacement_image_state::ReplacementImageSharing::Concurrent,
+                        last_use: None,
+                    },
+                )
+                .unwrap();
+        }
+        let state = images
+            .prepare_operation(
+                prepared.transaction(),
+                prepared.index(),
+                3,
+                [
+                    crate::replacement_image_state::ReplacementImageUse {
+                        image: key_for(key.source),
+                        required_usage: vk::ImageUsageFlags::TRANSFER_SRC,
+                        use_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        final_layout: vk::ImageLayout::GENERAL,
+                    },
+                    crate::replacement_image_state::ReplacementImageUse {
+                        image: key_for(key.destination),
+                        required_usage: vk::ImageUsageFlags::TRANSFER_DST,
+                        use_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        final_layout: vk::ImageLayout::GENERAL,
+                    },
+                ],
+            )
+            .unwrap();
+        let program = ReplacementResourceStateProgram::resolve_with_image_state(
+            &prepared,
+            Some(&state),
+            &resolver,
+        )
+        .expect("two images over one backing is a copy this device records");
+        let [NativeResourceStateTransfer::Image(commands)] = program.native_transfers() else {
+            panic!("a whole image-to-image transfer records image copies");
+        };
+        // Both declared mip levels, at their own extents, in one direction.
+        assert_eq!(commands.len(), 2);
+        let extents = commands
+            .iter()
+            .map(|command| {
+                let NativeImageBlitCommand::ImageToImage(copy) = command else {
+                    panic!("an image-to-image transfer records image copies")
+                };
+                assert_eq!(copy.source_layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                assert_eq!(
+                    copy.destination_layout,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                );
+                assert_ne!(copy.source, copy.destination);
+                (copy.source_mip, copy.extent)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(extents, vec![(0, [4, 4, 1]), (1, [2, 2, 1])]);
     }
 
     #[test]

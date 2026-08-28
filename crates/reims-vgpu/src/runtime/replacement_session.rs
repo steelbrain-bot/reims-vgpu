@@ -11867,7 +11867,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         &mut self,
         resources: PreparedReplacementExecResources,
     ) -> Result<ReplacementPreparedExecEnvelope, Box<ReplacementExecImagePreparationFailure>> {
-        let linear_image_transfers = resources
+        let image_transfers = resources
             .inputs()
             .resource_states
             .as_ref()
@@ -11883,26 +11883,37 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     .flat_map(|batch| batch.transfers().iter()),
             )
             .copied()
+            // Which transfers reach an image at all, for a region that does
+            // not say so itself. Two shapes qualify and they are different
+            // rails: a byte range staged between an image and a buffer that
+            // carries a linear texture layout, and a copy between two images
+            // over one backing --- which is what the content authority plans
+            // when a guest's own content lands in one texture over an
+            // allocation and a second texture over the same allocation has to
+            // be brought current from it.
             .filter(|transfer| {
                 let representations = self.execution.resources();
                 let source = representations.representation(transfer.backing, transfer.source);
                 let destination =
                     representations.representation(transfer.backing, transfer.destination);
-                matches!(
-                    (source, destination),
-                    (Some(source), Some(destination))
-                        if (source.image().is_some()
-                            && destination.buffer().is_some()
-                            && destination.linear_texture_layout().is_some())
-                            || (destination.image().is_some()
-                                && source.buffer().is_some()
-                                && source.linear_texture_layout().is_some())
-                )
+                let (Some(source), Some(destination)) = (source, destination) else {
+                    return false;
+                };
+                let staged =
+                    |image: &ReplacementNativeRepresentation,
+                     bytes: &ReplacementNativeRepresentation| {
+                        image.image().is_some()
+                            && bytes.buffer().is_some()
+                            && bytes.linear_texture_layout().is_some()
+                    };
+                (source.image().is_some() && destination.image().is_some())
+                    || staged(source, destination)
+                    || staged(destination, source)
             })
             .collect::<std::collections::BTreeSet<_>>();
         let has_images = match reims_vgpu_vulkan::replacement_exec_image::exec_has_image_uses_with_transfer_classifier(
                 &resources,
-                |transfer| linear_image_transfers.contains(&transfer),
+                |transfer| image_transfers.contains(&transfer),
             ) {
                 Ok(has_images) => has_images,
                 Err(reason) => {
@@ -12013,7 +12024,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             &resources,
             queue_family,
             &final_layouts,
-            |transfer| linear_image_transfers.contains(&transfer),
+            |transfer| image_transfers.contains(&transfer),
         ) {
             Ok(image_states) => Ok(ReplacementPreparedExecEnvelope {
                 resources,
