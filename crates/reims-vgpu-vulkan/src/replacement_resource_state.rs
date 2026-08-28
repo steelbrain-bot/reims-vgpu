@@ -120,10 +120,13 @@ pub enum ImageLayoutRefusal {
     /// The layout declares no pixel format, so nothing says how wide a texel
     /// is.
     PixelFormatUndeclared,
-    /// A depth or stencil format reached through a byte range. A linear range
-    /// names bytes and a copy needs an aspect, and this device does not pick
-    /// one for the guest.
-    DepthStencilFormat { pixel_format: u16 },
+    /// A byte range over a format whose guest cell interleaves two aspects.
+    ///
+    /// A range relates to texels through one element width and a copy names one
+    /// aspect, so a combined depth-stencil cell has neither. A format carrying
+    /// exactly one aspect walks as an ordinary strided image, whichever aspect
+    /// that is.
+    InterleavedAspects { pixel_format: u16 },
     /// The layout declares no physical slice count.
     SliceCountUndeclared,
     /// A zero row or image stride, which no byte offset divides by.
@@ -313,6 +316,10 @@ pub enum ImageToImageRefusal {
     /// walk produced no command. An empty batch is not a completed transfer:
     /// the destination would stay stale with nothing saying so.
     NoCopyableAspect { aspect_mask: vk::ImageAspectFlags },
+    /// The source declares no subresource, so the walk had nothing to visit
+    /// before any aspect was consulted. The same empty batch as
+    /// [`Self::NoCopyableAspect`] and a different repair.
+    NoSubresources { level_count: u32, layer_count: u32 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1363,7 +1370,8 @@ fn resolve_image_image_transfer(
                 .collect::<Result<Vec<_>, ResourceStateTransferRecordError>>()?
         }
     };
-    let mut commands = Vec::with_capacity(subresources.len());
+    let subresource_count = subresources.len();
+    let mut commands = Vec::with_capacity(subresource_count);
     for (mip, layer, extent, offset) in subresources {
         if extent.contains(&0) {
             return Err(ResourceStateTransferRecordError::RangeOutOfBounds(transfer));
@@ -1395,10 +1403,21 @@ fn resolve_image_image_transfer(
         }
     }
     if commands.is_empty() {
+        // Two different facts reach here and only one is about aspects. A
+        // source that declares no subresource at all produced nothing to copy
+        // before any aspect was consulted, and reporting that as an aspect
+        // refusal names a mask that is perfectly copyable.
         return Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
             transfer,
-            refusal: ImageToImageRefusal::NoCopyableAspect {
-                aspect_mask: source.full_range.aspect_mask,
+            refusal: if subresource_count == 0 {
+                ImageToImageRefusal::NoSubresources {
+                    level_count: source.full_range.level_count,
+                    layer_count: source.full_range.layer_count,
+                }
+            } else {
+                ImageToImageRefusal::NoCopyableAspect {
+                    aspect_mask: source.full_range.aspect_mask,
+                }
             },
         });
     }
@@ -1631,6 +1650,17 @@ fn resolve_buffer_image_transfer_region(
     let level = layout
         .level(region.mip)
         .ok_or_else(|| unsupported(ImageLayoutRefusal::LevelAbsent { mip: region.mip }))?;
+    // A buffer plane for one aspect of a combined depth-stencil format is
+    // packed at that aspect's own width, not at the cell's. The layout declares
+    // the cell, so every byte offset derived from it would name the wrong plane
+    // -- a wrong-pixels answer, which is worse than a named refusal.
+    if let Some(pixel_format) = layout.declared_pixel_format() {
+        if declared_image_aspects(pixel_format).len() > 1 {
+            return Err(unsupported(ImageLayoutRefusal::InterleavedAspects {
+                pixel_format,
+            }));
+        }
+    }
     let bytes_per_element = u64::from(layout.bytes_per_element);
     if layout.compressed_layout {
         return Err(unsupported(ImageLayoutRefusal::CompressedLayout));
@@ -1828,6 +1858,27 @@ fn image_region_byte_ranges(
     (!ranges.is_empty()).then_some(ranges)
 }
 
+/// The aspects one declared pixel format's texels carry, in copy order.
+///
+/// A copy names one aspect per region, so this is what says how many regions a
+/// subresource becomes: a colour format is one, and a combined depth-stencil
+/// format is two copies of the same texel box. That is the shape
+/// `vkCmdCopyImage` requires, and it is the same split the depth-from- and
+/// stencil-from-depth-stencil blit options describe on the guest's side.
+fn declared_image_aspects(pixel_format: u16) -> Vec<reims_vgpu_core::ImageAspect> {
+    let mut aspects = Vec::new();
+    if reims_vgpu_core::pixel_format::format_has_depth_aspect(pixel_format) {
+        aspects.push(reims_vgpu_core::ImageAspect::Depth);
+    }
+    if reims_vgpu_core::pixel_format::format_has_stencil_aspect(pixel_format) {
+        aspects.push(reims_vgpu_core::ImageAspect::Stencil);
+    }
+    if aspects.is_empty() {
+        aspects.push(reims_vgpu_core::ImageAspect::Color);
+    }
+    aspects
+}
+
 fn transfer_image_regions(
     layout: &reims_vgpu_protocol::LinearTextureDescriptor,
     transfer: TransferKey,
@@ -1841,13 +1892,7 @@ fn transfer_image_regions(
         let format = layout
             .declared_pixel_format()
             .ok_or_else(|| unsupported(ImageLayoutRefusal::PixelFormatUndeclared))?;
-        if reims_vgpu_core::pixel_format::format_has_depth_aspect(format)
-            || reims_vgpu_core::pixel_format::format_has_stencil_aspect(format)
-        {
-            return Err(unsupported(ImageLayoutRefusal::DepthStencilFormat {
-                pixel_format: format,
-            }));
-        }
+        let aspects = declared_image_aspects(format);
         let slices = layout
             .physical_slice_count()
             .ok_or_else(|| unsupported(ImageLayoutRefusal::SliceCountUndeclared))?;
@@ -1865,12 +1910,12 @@ fn transfer_image_regions(
                             extent,
                         })
                     })?;
-                regions.push(reims_vgpu_core::ImageRegion {
-                    aspect: reims_vgpu_core::ImageAspect::Color,
+                regions.extend(aspects.iter().map(|&aspect| reims_vgpu_core::ImageRegion {
+                    aspect,
                     mip,
                     layer,
                     texels,
-                });
+                }));
             }
         }
         return Ok(regions);
@@ -1941,13 +1986,17 @@ fn transfer_image_region(
     let pixel_format = layout
         .declared_pixel_format()
         .ok_or_else(|| unsupported(ImageLayoutRefusal::PixelFormatUndeclared))?;
-    if reims_vgpu_core::pixel_format::format_has_depth_aspect(pixel_format)
-        || reims_vgpu_core::pixel_format::format_has_stencil_aspect(pixel_format)
-    {
-        return Err(unsupported(ImageLayoutRefusal::DepthStencilFormat {
+    // A byte range relates to texels through one element width, so a format
+    // whose guest cell interleaves two aspects has no single width to walk it
+    // with: the depth field and the stencil field sit inside one cell, and a
+    // copy names one aspect. A format with exactly one aspect -- colour, depth
+    // or stencil alone -- is an ordinary strided image and walks unchanged.
+    let aspects = declared_image_aspects(pixel_format);
+    let [aspect] = aspects[..] else {
+        return Err(unsupported(ImageLayoutRefusal::InterleavedAspects {
             pixel_format,
         }));
-    }
+    };
     if layout.compressed_layout {
         return Err(unsupported(ImageLayoutRefusal::CompressedLayout));
     }
@@ -2091,7 +2140,7 @@ fn transfer_image_region(
                     return Err(ResourceStateTransferRecordError::RangeOutOfBounds(transfer));
                 }
                 regions.push(reims_vgpu_core::ImageRegion {
-                    aspect: reims_vgpu_core::ImageAspect::Color,
+                    aspect,
                     mip,
                     layer,
                     texels,
@@ -2605,6 +2654,112 @@ mod tests {
             ..transfer
         };
         assert_eq!(transfer_image_regions(&layout, whole).unwrap(), regions);
+    }
+
+    /// A depth attachment's whole-image transfer is a copy per aspect.
+    ///
+    /// `vkCmdCopyImage` names one aspect per region, so a subresource of a
+    /// combined depth-stencil format becomes two regions over the same texel
+    /// box. Refusing the whole format instead cost the guest every
+    /// whole-surface copy of a depth attachment, which is what a compositor
+    /// does with one.
+    ///
+    /// A byte range is the case that stays refused, and for a reason the two
+    /// halves of this test state together: a range relates to texels through
+    /// one element width, which a cell carrying two aspects does not have,
+    /// while a pure depth format has one and walks like any other image.
+    #[test]
+    fn a_depth_stencil_transfer_copies_each_aspect_it_declares() {
+        let layout = |pixel_format: u16, bytes_per_element: u8| {
+            reims_vgpu_protocol::LinearTextureDescriptor {
+                allocation_size: 64,
+                mipmap_level_count: 1,
+                bytes_per_slice: 64,
+                slice_count: 1,
+                bytes_per_element,
+                row_stride: 16,
+                width: 4,
+                height: 4,
+                depth: 1,
+                declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+                    texture_type: reims_vgpu_protocol::TextureType::D2,
+                    framebuffer_only: false,
+                    is_drawable: false,
+                    write_swizzle_enabled: None,
+                    allow_gpu_optimized_contents: false,
+                    usage: reims_vgpu_protocol::TEXTURE_USAGE_RENDER_TARGET,
+                    pixel_format,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    resource_options: 0,
+                    protection_options: 0,
+                    swizzle: None,
+                }),
+                levels: vec![reims_vgpu_protocol::TextureLevelLayout {
+                    offset: 0,
+                    size: 64,
+                    row_stride: 16,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                }],
+                ..Default::default()
+            }
+        };
+        let transfer = TransferKey {
+            backing: BackingId::new(1),
+            region: BackingRegion::Whole,
+            version: reims_vgpu_protocol::ContentVersion::new(1),
+            source: RepresentationId::new(3),
+            destination: RepresentationId::new(4),
+        };
+
+        let combined = layout(
+            reims_vgpu_core::pixel_format::MTL_FORMAT_DEPTH32_FLOAT_STENCIL8,
+            8,
+        );
+        let regions = transfer_image_regions(&combined, transfer).unwrap();
+        assert_eq!(
+            regions
+                .iter()
+                .map(|region| region.aspect)
+                .collect::<Vec<_>>(),
+            vec![
+                reims_vgpu_core::ImageAspect::Depth,
+                reims_vgpu_core::ImageAspect::Stencil,
+            ]
+        );
+
+        let depth = layout(reims_vgpu_core::pixel_format::MTL_FORMAT_DEPTH32_FLOAT, 4);
+        let regions = transfer_image_regions(&depth, transfer).unwrap();
+        assert_eq!(
+            regions
+                .iter()
+                .map(|region| region.aspect)
+                .collect::<Vec<_>>(),
+            vec![reims_vgpu_core::ImageAspect::Depth]
+        );
+
+        // The byte-range half. A pure depth range walks; a combined one names
+        // the reason it cannot.
+        let range = TransferKey {
+            region: BackingRegion::Linear(LinearRange::new(0, 64).unwrap()),
+            ..transfer
+        };
+        let regions = transfer_image_regions(&depth, range).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].aspect, reims_vgpu_core::ImageAspect::Depth);
+        assert!(matches!(
+            transfer_image_regions(&combined, range),
+            Err(ResourceStateTransferRecordError::ImageLayoutUnsupported {
+                refusal: ImageLayoutRefusal::InterleavedAspects { .. },
+                ..
+            })
+        ));
     }
 
     /// A layout refusal names the term that stopped it, not just the transfer.
