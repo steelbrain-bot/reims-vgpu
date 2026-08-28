@@ -494,8 +494,20 @@ impl RegionContentState {
         region: BackingRegion,
     ) -> Result<RegionVersion, ContentAuthorityError> {
         self.validate_guest_write(representation)?;
+        // Repeated only while the version it left is still exactly what the
+        // region holds. Anything that moved the region since -- a discard, a
+        // completed GPU write, a transfer landing -- makes this preparation a
+        // new statement about bytes that are no longer the ones it wrote, and
+        // reusing the version there would hand the caller a version nothing
+        // covers.
         if let Some((owner, version)) = self.guest_writes.get(&region) {
-            if Some(*owner) == write {
+            if Some(*owner) == write
+                && self.canonical.covers(region, *version)
+                && self
+                    .representations
+                    .get(&representation)
+                    .is_some_and(|coverage| coverage.covers(region, *version))
+            {
                 return Ok(RegionVersion {
                     region,
                     version: *version,
@@ -2265,6 +2277,14 @@ mod tests {
         // too: the region it wrote is no longer the one it left behind.
         let again = state.guest_write(Some(operation), GUEST, region).unwrap();
         assert!(again.version > second.version);
+
+        // Discarding the region takes its coverage away, so the repeat is no
+        // longer a repeat: handing back a version nothing covers would make
+        // every later read of it refuse as a stale source.
+        state.discard(region);
+        let after_discard = state.guest_write(Some(operation), GUEST, region).unwrap();
+        assert!(after_discard.version > again.version);
+        assert_eq!(state.snapshot(&[region]).as_ref(), [after_discard]);
     }
 
     #[test]
