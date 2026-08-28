@@ -5861,6 +5861,30 @@ impl<Semantic> ReplacementPublicationCoordinator<Semantic> {
     }
 }
 
+/// Cumulative counts of the pipeline transitions the live census can only show
+/// a standing total for.
+///
+/// A live count names *where* work is sitting and says nothing about whether it
+/// is sitting still. An owner readmitted, accepted and released once a second
+/// for a boot's life reports the same live count as one that arrived and
+/// stopped, and the two are opposite defects: the first is work going round a
+/// loop that never terminates, the second is work waiting for something that
+/// will not come. Only the first is repaired by finding what re-admits it, and
+/// a boot cannot be read for which one it has without these.
+///
+/// They are monotone for the device's life, so the difference between two
+/// census samples is the rate and a flat pair is a genuine park.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReplacementPipelineTransitions {
+    /// Guest-upload owners admitted into the upload coordinator.
+    upload_admissions: u64,
+    /// Accepted guest-upload owners resumed once a retirement covered their
+    /// queue point.
+    upload_resumptions: u64,
+    /// Retired native batches taken from the timeline owners.
+    batch_retirements: u64,
+}
+
 /// Aggregate replacement owner. Publication-producing coordinators are private
 /// children so their facts can reach the host only after joining this single
 /// FIFO sink.
@@ -5978,6 +6002,7 @@ pub(crate) struct ReplacementDeviceCoordinator<Semantic> {
     drain_failures: std::collections::VecDeque<Box<ReplacementDeviceDrainFailure<Semantic>>>,
     /// Cadence latch for [`Self::report_pipeline_census`].
     last_pipeline_census_ms: u64,
+    transitions: ReplacementPipelineTransitions,
     console_frames: std::collections::BTreeMap<
         (u32, u32),
         reims_vgpu_vulkan::replacement_console_present::ReplacementConsoleFrame,
@@ -6328,6 +6353,7 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
             suffix_repairs_deferred: 0,
             drain_failures: std::collections::VecDeque::new(),
             last_pipeline_census_ms: 0,
+            transitions: ReplacementPipelineTransitions::default(),
             console_frames: std::collections::BTreeMap::new(),
             next_console_frame: 0,
             console_frame_failure: None,
@@ -6531,6 +6557,7 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
         self.absorb_publications();
         while let Some(retired) = self.timelines.take_retired() {
             self.retired_batches.push_back(retired);
+            self.transitions.batch_retirements += 1;
         }
         progress
     }
@@ -6540,6 +6567,7 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
         self.absorb_publications();
         while let Some(retired) = self.timelines.take_retired() {
             self.retired_batches.push_back(retired);
+            self.transitions.batch_retirements += 1;
         }
         progress
     }
@@ -6844,11 +6872,10 @@ impl ReplacementDeviceCoordinator<()> {
             }
             crate::runtime::replacement_session::ReplacementQueueReadyRecording::GuestUpload(
                 ready,
-            ) => {
-                if let Err((ready, _semantic)) = self.guest_uploads.admit(ready, ()) {
-                    self.ready_guest_uploads.push_back(ready);
-                }
-            }
+            ) => match self.guest_uploads.admit(ready, ()) {
+                Ok(_) => self.transitions.upload_admissions += 1,
+                Err((ready, _semantic)) => self.ready_guest_uploads.push_back(ready),
+            },
             crate::runtime::replacement_session::ReplacementQueueReadyRecording::IndirectRange(
                 ready,
             ) => self.ready_indirect_ranges.push_back(ready),
@@ -6884,13 +6911,38 @@ impl ReplacementDeviceCoordinator<()> {
         }
     }
 
+    /// Re-offer every retained publication retirement to a fixed point.
+    ///
+    /// A retirement refused with `StillRequired` is waiting for its own
+    /// dependents to retire, and those dependents' facts are *behind it in this
+    /// queue*: a published fact is retained here in the order it was published,
+    /// and a producer is always published before the consumers that wait on it.
+    /// Retrying only the head therefore deadlocks the whole set -- the head
+    /// waits for a dependent that is never asked, and every later entry waits
+    /// behind the head. The wait graph is right to refuse; the queue was wrong
+    /// to ask one entry.
+    ///
+    /// So each pass offers every entry once and keeps the refusals in order,
+    /// and the passes repeat while one of them retired anything, because one
+    /// retirement removes a dependent and can make an entry refused earlier in
+    /// the same pass retirable now.
     fn retry_publication_retirement(&mut self) {
-        let Some(failure) = self.publication_retirement_failures.pop_front() else {
-            return;
-        };
-        match self.retire_published(failure.published) {
-            Ok(_) => {}
-            Err(failure) => self.publication_retirement_failures.push_front(failure),
+        loop {
+            let attempts = self.publication_retirement_failures.len();
+            let mut retired = 0;
+            for _ in 0..attempts {
+                let failure = self
+                    .publication_retirement_failures
+                    .pop_front()
+                    .expect("the attempt count came from this queue");
+                match self.retire_published(failure.published) {
+                    Ok(_) => retired += 1,
+                    Err(failure) => self.publication_retirement_failures.push_back(failure),
+                }
+            }
+            if retired == 0 {
+                break;
+            }
         }
     }
 
@@ -6961,7 +7013,7 @@ impl ReplacementDeviceCoordinator<()> {
             .collect::<Vec<_>>()
             .join(",");
         crate::observe::off(format!(
-            "replacement_pipeline_census recordings={} submissions={} uploads={} upload_stages=[{upload_stages}] retired_batches={} upload_suffixes={} suffix_stages=[{suffix_stages}] indirects={} ready_uploads={} ready_indirects={} parked_execs={} parked_uploads={} parked_indirects={} blocked_drains={} drain_failures={}",
+            "replacement_pipeline_census recordings={} submissions={} uploads={} upload_stages=[{upload_stages}] retired_batches={} upload_suffixes={} suffix_stages=[{suffix_stages}] indirects={} ready_uploads={} ready_indirects={} parked_execs={} parked_uploads={} parked_indirects={} blocked_drains={} drain_failures={} upload_admissions={} upload_resumptions={} batch_retirements={}",
             self.exec_recordings.live_recordings(),
             self.exec_submissions.live_submissions(),
             self.guest_uploads.live_uploads(),
@@ -6975,6 +7027,9 @@ impl ReplacementDeviceCoordinator<()> {
             parked.indirect_ranges,
             self.blocked_drains.len(),
             self.drain_failures.len(),
+            self.transitions.upload_admissions,
+            self.transitions.upload_resumptions,
+            self.transitions.batch_retirements,
         ));
         let (timeline_observations, timeline_semantics) = self.timelines.retained_failures();
         let cpu_failed = self
@@ -7245,10 +7300,13 @@ impl ReplacementDeviceCoordinator<()> {
                         self.publication_failure = None;
                         publications += 1;
                     }
-                    Err(failure) => {
-                        self.publication_retirement_failures.push_back(failure);
-                        break;
-                    }
+                    // Retirement is this device's own bookkeeping and the
+                    // host already has the fact: `publish_next` delivered it
+                    // before this call. A refusal therefore says nothing about
+                    // whether the *next* fact may be published, and breaking
+                    // here rationed the guest to one publication per tick for
+                    // as long as one retirement was legitimately refused.
+                    Err(failure) => self.publication_retirement_failures.push_back(failure),
                 },
                 Ok(None) => {
                     self.publication_failure = None;
@@ -7541,6 +7599,7 @@ impl ReplacementDeviceCoordinator<()> {
                 self.ready_guest_uploads.push_front(ready);
                 break;
             }
+            self.transitions.upload_admissions += 1;
         }
         let ids = self.guest_uploads.transaction_ids();
         let mut progress = Vec::with_capacity(ids.len());
@@ -7606,6 +7665,7 @@ impl ReplacementDeviceCoordinator<()> {
                         Err(failure) => self.guest_upload_continuation_failures.push_back(failure),
                     }
                     resumed += 1;
+                    self.transitions.upload_resumptions += 1;
                 }
                 Err(failure) => self.guest_upload_resume_failures.push_back(failure),
             }
@@ -10157,6 +10217,70 @@ mod tests {
         assert_eq!(device.pending_publications(), 0);
         assert_eq!(device.owned_phase_count(), 0);
         assert_eq!(host.get_u32(base), 33);
+        assert_eq!(device.live_transactions(), 0);
+    }
+
+    #[test]
+    fn a_retirement_refused_for_its_dependent_retires_once_that_dependent_does() {
+        let Some(runtime) = runtime() else {
+            return;
+        };
+        let mut device =
+            ReplacementDeviceCoordinator::new(runtime, crate::model::PAGE_SHIFT_X86).unwrap();
+        let producer_channel = reims_vgpu_protocol::ChannelId::new(1);
+        let waiter_channel = reims_vgpu_protocol::ChannelId::new(2);
+        let transactions = device.runtime.execution_mut().runtime_mut();
+        transactions.define_channel(producer_channel).unwrap();
+        transactions.define_channel(waiter_channel).unwrap();
+        let waiter = transactions
+            .admit_resolved(
+                waiter_channel,
+                [reims_vgpu_core::ResolvedTransactionPrerequisite {
+                    prerequisite: reims_vgpu_core::TransactionPrerequisite::Stamp {
+                        wait: reims_vgpu_protocol::StampWait {
+                            index: producer_channel.get(),
+                            value: 7,
+                        },
+                    },
+                    resolution: reims_vgpu_core::PrerequisiteResolution::Pending,
+                }],
+                None,
+                reims_vgpu_core::DeviceTransactionPayload::<(), (), (), (), ()>::Control(()),
+            )
+            .unwrap();
+        let producer = transactions
+            .admit_resolved(
+                producer_channel,
+                Box::<[reims_vgpu_core::ResolvedTransactionPrerequisite]>::default(),
+                Some(reims_vgpu_core::CompletionStamp::new(
+                    producer_channel.get(),
+                    7,
+                )),
+                reims_vgpu_core::DeviceTransactionPayload::<(), (), (), (), ()>::Control(()),
+            )
+            .unwrap();
+        let published = transactions.semantic_complete(producer.id, ()).unwrap();
+        assert_eq!(published.len(), 1);
+        let mut published = published;
+        published.extend(transactions.semantic_complete(waiter.id, ()).unwrap());
+        assert_eq!(published.len(), 2);
+        assert_eq!(published[0].transaction, producer.id);
+
+        // Retained in publication order, which is the order the device
+        // publishes them in: the producer first, the dependent that keeps it
+        // alive behind it.
+        for fact in published {
+            device.publication_retirement_failures.push_back(Box::new(
+                ReplacementPublishedFactRetirementFailure {
+                    reason: reims_vgpu_core::TransactionRuntimeError::UnknownTransaction,
+                    published: ReplacementHostPublishedFact(fact),
+                },
+            ));
+        }
+
+        device.retry_publication_retirement();
+
+        assert!(device.publication_retirement_failures.is_empty());
         assert_eq!(device.live_transactions(), 0);
     }
 
