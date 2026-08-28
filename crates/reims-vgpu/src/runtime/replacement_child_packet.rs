@@ -1246,6 +1246,27 @@ impl<Semantic> ReplacementDeferredSynchronizeDispatchFailure<Semantic> {
             Self::Admitted(failure) => failure.diagnostic(),
         }
     }
+
+    /// The reservations a terminal refusal must give up, or this failure back
+    /// if it is not one.
+    ///
+    /// A pre-admission refusal names a task or resource the guest has not
+    /// declared yet and holds no runtime place, so it is always re-offered.
+    /// Everything after admission answers through
+    /// [`crate::runtime::replacement_session::ReplacementSynchronizeDispatchFailure::into_terminal_reservations`].
+    pub(crate) fn into_terminal_reservations(
+        self,
+    ) -> Result<
+        crate::runtime::replacement_session::ReplacementRefusedExecReservations<Semantic>,
+        Box<Self>,
+    > {
+        match self {
+            Self::Admitted(failure) => failure
+                .into_terminal_reservations()
+                .map_err(|failure| Box::new(Self::Admitted(failure))),
+            failure => Err(Box::new(failure)),
+        }
+    }
 }
 
 pub(crate) fn dispatch_deferred_replacement_synchronize<Semantic>(

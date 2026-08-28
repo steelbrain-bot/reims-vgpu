@@ -85,6 +85,51 @@ pub enum ManagedBackingError {
     Retirement(NativeRetirementError),
 }
 
+impl ManagedBackingError {
+    /// Whether a later guest declaration can turn this refusal into a success.
+    ///
+    /// A caller that defers a refused operation and re-offers it at its
+    /// channel's head needs this to be answered honestly in both directions.
+    /// Deferring what nothing can answer holds every command behind it for the
+    /// life of the device; refusing what a later packet would have satisfied
+    /// costs the guest one command it should have kept.
+    ///
+    /// Only two arms are waits. A backing this owner does not know is one the
+    /// guest has not declared yet, and a backing with no execution
+    /// representation is one nothing has materialized an object over --- both
+    /// are answered by a packet that has not arrived.
+    ///
+    /// [`Self::StaleExecutionRepresentation`] is deliberately not among them,
+    /// and it is the one worth naming. It says the canonical content version
+    /// is held by no live representation, which happens when the object that
+    /// held it retired; no route plans a transfer out of an object that no
+    /// longer exists, so re-offering the operation asks a question whose
+    /// answer can only stay the same.
+    #[must_use]
+    pub const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::UnknownBacking | Self::MissingExecutionRepresentation => true,
+            Self::DuplicateBacking
+            | Self::AuthorityMismatch
+            | Self::BackingRetiring
+            | Self::AcceptedUseCountExhausted
+            | Self::UnknownAcceptedUse
+            | Self::EmptyRepresentationSet
+            | Self::UnknownRepresentation
+            | Self::RepresentationNativeReleased
+            | Self::DuplicateRepresentation
+            | Self::DuplicateExecutionRepresentation
+            | Self::ExecutionRepresentationAlreadyRetiring
+            | Self::StaleExecutionRepresentation
+            | Self::RepresentationIdentityExhausted
+            | Self::MixedEpochs
+            | Self::TimelineRegressed
+            | Self::Content(_)
+            | Self::Retirement(_) => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ManagedRepresentationFailure<T> {
     pub reason: ManagedBackingError,

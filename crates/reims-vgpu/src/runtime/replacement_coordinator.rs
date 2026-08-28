@@ -230,6 +230,17 @@ impl ReplacementDeferredChildDispatchFailure<()> {
                     Err(failure) => Err(Box::new(Self::Exec { failure, lease })),
                 }
             }
+            Self::Synchronize { failure, lease } => {
+                let detail = format!("route=deferred_synchronize {}", failure.diagnostic());
+                match (*failure).into_terminal_reservations() {
+                    Ok(reservations) => Ok(ReplacementRefusedChildPacket {
+                        lease,
+                        detail,
+                        reservations: Some(reservations),
+                    }),
+                    Err(failure) => Err(Box::new(Self::Synchronize { failure, lease })),
+                }
+            }
             failure => Err(Box::new(failure)),
         }
     }

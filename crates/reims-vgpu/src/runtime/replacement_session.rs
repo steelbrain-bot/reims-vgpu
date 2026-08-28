@@ -4897,6 +4897,45 @@ impl<Completion> ReplacementResourceReadyExecFailure<Completion> {
             Self::Readiness { .. } | Self::Images { .. } => None,
         }
     }
+
+    /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
+    ///
+    /// Only the readiness phase answers here, through
+    /// [`ReplacementExecResourceReadinessError::awaits_declaration`]. The other
+    /// two phases carry their own repair paths: a resource preparation naming a
+    /// backing with no representation is materialized where it refused, and an
+    /// image phase refusal is an ordering statement that the domain it names
+    /// resolves by submitting.
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::Readiness { reason, .. } => !reason.awaits_declaration(),
+            Self::Resources { .. } | Self::Images { .. } => false,
+        }
+    }
+
+    /// The reservations a terminal refusal must give up, or this failure back
+    /// if it is not one.
+    ///
+    /// The arms are exactly those [`Self::is_terminal_refusal`] admits, so the
+    /// two cannot disagree. A readiness refusal is decided after admission and
+    /// before an envelope is prepared, so the transaction's submission-order
+    /// position is the whole of what it holds -- and leaving that held is how a
+    /// channel advances past the packet while the domain stays blocked behind
+    /// a transaction nothing will ever submit.
+    pub(crate) fn into_terminal_reservations(
+        self,
+    ) -> Result<ReplacementRefusedExecReservations<Completion>, Self> {
+        match self {
+            Self::Readiness { reason, prepared } if !reason.awaits_declaration() => {
+                Ok(ReplacementRefusedExecReservations {
+                    transaction: Some(prepared.admitted.transaction.id),
+                    continuation: None,
+                    envelope: None,
+                })
+            }
+            failure => Err(failure),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -5353,6 +5392,48 @@ pub(crate) enum ReplacementExecResourceReadinessError {
         reason: reims_vgpu_core::ManagedBackingError,
     },
     Info(ReplacementPreparedInfoEvaluationFailure),
+}
+
+impl ReplacementExecResourceReadinessError {
+    /// Whether a later guest packet, compile or submission can make this
+    /// readiness question answer differently.
+    ///
+    /// Readiness is asked again every time its channel head is re-offered, so
+    /// an arm that can never change holds every command behind it for the life
+    /// of the device. Most arms here are genuine waits --- a pipeline still
+    /// compiling, a producer not yet ordered ahead of its reader, a
+    /// depth-stencil object not yet declared --- and re-offering is exactly
+    /// what they are for.
+    ///
+    /// Two kinds are not. A pipeline or variant that has already been *refused*
+    /// is a settled answer about a program this device has, and a validity
+    /// question about a backing answers for itself through
+    /// [`reims_vgpu_core::ManagedBackingError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::ValidityRepresentation { reason, .. } => reason.awaits_declaration(),
+            Self::RenderPipelineRefused { .. }
+            | Self::RenderVariantRefused { .. }
+            | Self::ComputePipelineRefused { .. }
+            | Self::ComputeVariantRefused { .. } => false,
+            Self::GuestUploadContinuationRequired(_)
+            | Self::ContentProducerPending { .. }
+            | Self::ContentProducerOrder { .. }
+            | Self::RenderAcquire { .. }
+            | Self::RenderPipelinePending(_)
+            | Self::RenderVariantPending(_)
+            | Self::RenderDepthStencilAbsent { .. }
+            | Self::RenderCompileScheduled { .. }
+            | Self::RenderCompileDispatch { .. }
+            | Self::ComputeAcquire { .. }
+            | Self::ComputePipelinePending(_)
+            | Self::ComputeVariantPending(_)
+            | Self::ComputeCompileScheduled { .. }
+            | Self::ComputeCompileDispatch { .. }
+            | Self::BlitContentRegions { .. }
+            | Self::Info(_) => true,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -6432,8 +6513,8 @@ impl<Completion> ReplacementExecIngressDispatchFailure<Completion> {
                 failure.reason.is_terminal_refusal()
             }
             Self::GuestUploadResolution(failure) => failure.reason.is_terminal_refusal(),
-            Self::DirectResources(_)
-            | Self::DirectDispatch(_)
+            Self::DirectResources(failure) => failure.is_terminal_refusal(),
+            Self::DirectDispatch(_)
             | Self::GuestUploadPhase(_)
             | Self::GuestUploadDispatch(_)
             | Self::IndirectRangeReadiness { .. }
@@ -6475,6 +6556,9 @@ impl<Completion> ReplacementExecIngressDispatchFailure<Completion> {
             Self::GuestUploadResolution(failure) if failure.reason.is_terminal_refusal() => {
                 Ok(failure.phase.into_abandoned_reservations())
             }
+            Self::DirectResources(failure) => failure
+                .into_terminal_reservations()
+                .map_err(Self::DirectResources),
             failure => Err(failure),
         }
     }
@@ -7492,6 +7576,29 @@ impl<Semantic> ReplacementSynchronizeDispatchFailure<Semantic> {
                 )
             }
             Self::Dispatch(_) => "dispatch".to_owned(),
+        }
+    }
+
+    /// The reservations a terminal refusal must give up, or this failure back
+    /// if it is not one.
+    ///
+    /// A synchronize reaches the same resource-readiness phase an EXEC does, so
+    /// it inherits the same classification rather than restating it. Every
+    /// other arm here is repairable by a later packet: an unresolved task or
+    /// resource is one the guest has not declared yet, and access compilation,
+    /// admission, preparation and dispatch are all asked again on the retry.
+    ///
+    /// Without this the route had no terminal answer at all, and one readiness
+    /// refusal nothing could satisfy held its channel for the rest of a driven
+    /// boot while every stall counter read healthy.
+    pub(crate) fn into_terminal_reservations(
+        self,
+    ) -> Result<ReplacementRefusedExecReservations<Semantic>, Self> {
+        match self {
+            Self::Resources(failure) => failure
+                .into_terminal_reservations()
+                .map_err(Self::Resources),
+            failure => Err(failure),
         }
     }
 }
@@ -23732,6 +23839,46 @@ mod tests {
             runtime
                 .resolve_resource(task, reims_vgpu_protocol::ObjectTableRef::new(plane_object))
                 .expect("the plane view is live")
+        );
+    }
+
+    /// A readiness refusal over content no live object holds is settled.
+    ///
+    /// `StaleExecutionRepresentation` says the canonical version of a
+    /// backing's bytes is held by no live representation, which is what a
+    /// retirement leaves behind. Nothing plans a transfer out of an object that
+    /// no longer exists, so re-offering the operation at its channel head asks
+    /// a question whose answer cannot change --- and a driven macos-13
+    /// conformance boot spent its whole life re-offering one synchronize for
+    /// exactly this reason, ~9 400 retries per 20 s window with every stall
+    /// counter reading healthy.
+    ///
+    /// The neighbouring case is the one that keeps the classification honest:
+    /// a backing with *no* execution representation yet is early, because a
+    /// materialization installs one.
+    #[test]
+    fn a_readiness_refusal_over_unheld_content_refuses_instead_of_holding_its_channel() {
+        let backing = reims_vgpu_protocol::BackingId::new(203);
+        let stale = ReplacementExecResourceReadinessError::ValidityRepresentation {
+            backing,
+            reason: reims_vgpu_core::ManagedBackingError::StaleExecutionRepresentation,
+        };
+        assert!(!stale.awaits_declaration());
+
+        let missing = ReplacementExecResourceReadinessError::ValidityRepresentation {
+            backing,
+            reason: reims_vgpu_core::ManagedBackingError::MissingExecutionRepresentation,
+        };
+        assert!(missing.awaits_declaration());
+
+        // A compile still running is the shape that must keep waiting, or the
+        // fix trades one lost channel for every pipeline the guest builds.
+        assert!(
+            ReplacementExecResourceReadinessError::ComputeCompileScheduled {
+                position: 5,
+                worker: RecordingWorkerId::new(0),
+            }
+            .awaits_declaration()
         );
     }
 
