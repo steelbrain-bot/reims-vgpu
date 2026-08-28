@@ -74,10 +74,10 @@ pub use pixel::{
 };
 pub use resource::{
     decode_object_list_entry, decode_surface_backing_descriptor, BufferDescriptor,
-    BufferTextureDescriptor, ColorWriteMask, ComputePipelineDescriptor, ComputePipelineObject,
-    ComputeStageInputAttribute, ComputeStageInputDescriptor, ComputeStageInputLayout,
-    DepthStencilDescriptor, DepthStencilFace, DepthStencilObject, EventObject, FenceObject,
-    FunctionDescriptor, FunctionObject, IOSurfacePlaneViewDecodeState,
+    BufferTextureDescriptor, BufferTextureLayoutError, ColorWriteMask, ComputePipelineDescriptor,
+    ComputePipelineObject, ComputeStageInputAttribute, ComputeStageInputDescriptor,
+    ComputeStageInputLayout, DepthStencilDescriptor, DepthStencilFace, DepthStencilObject,
+    EventObject, FenceObject, FunctionDescriptor, FunctionObject, IOSurfacePlaneViewDecodeState,
     IOSurfacePlaneViewDescriptor, IOSurfacePlaneViewRecordKind,
     IOSurfacePlaneViewResourceDescriptor, IcbCommandLayout, IcbCommandMemory, IcbUnappliedFlag,
     IndirectCommandBufferDescriptor, LinearTextureDescriptor, NativeRepresentationClass,

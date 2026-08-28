@@ -2005,6 +2005,9 @@ pub(crate) enum ReplacementExecutionRetirementError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementRepresentationConstructionError {
+    /// A texture placed over a buffer declares a geometry this construction
+    /// form cannot carry, or one whose rows do not fit the stride it named.
+    BufferTextureLayout(reims_vgpu_protocol::BufferTextureLayoutError),
     ResourceAbsent(ResourceId<reims_vgpu_protocol::ResourceObject>),
     DescriptorAbsent(ResourceId<reims_vgpu_protocol::ResourceObject>),
     TextureDeclarationAbsent(ResourceId<reims_vgpu_protocol::ResourceObject>),
@@ -2065,7 +2068,13 @@ impl ReplacementRepresentationConstructionError {
         match self {
             // A descriptor kind or a route this backend does not build. No
             // later packet turns one of these into a case it does build.
-            Self::UnsupportedDescriptor(_) | Self::RouteHasNoOwnedWorkingRepresentation(_) => true,
+            //
+            // A geometry this construction form cannot carry is the same
+            // kind of fact: the descriptor says what it says, and no later
+            // packet re-declares it.
+            Self::UnsupportedDescriptor(_)
+            | Self::RouteHasNoOwnedWorkingRepresentation(_)
+            | Self::BufferTextureLayout(_) => true,
             // A resource, descriptor, declaration or storage that has not
             // arrived yet, an allocation or import that can succeed on a later
             // attempt, and every refusal whose input this device does not own.
@@ -2821,13 +2830,29 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
     /// declaration retained by this exact resource generation. Render-target
     /// declarations eagerly create every contract-addressable mip/layer view,
     /// so immutable render projection never allocates a view while recording.
-    fn materialize_texture(
-        &mut self,
-        device: &ReplacementDeviceEpoch,
+    /// What a texture resource materializes from: its declaration, and how its
+    /// texels sit in the backing's bytes when it has an allocation-relative
+    /// layout at all.
+    ///
+    /// A heap placement and a mapper view have no such layout --- their bytes
+    /// are the allocator's business. An ordinary texture carries one on the
+    /// wire, and a texture placed over a buffer's storage derives one from the
+    /// stride the guest named, which is the whole content of that
+    /// construction form.
+    ///
+    /// One place, because materialization reads this to build the image and
+    /// the guest-window route reads it to size the window: two readings of one
+    /// descriptor that must not disagree about how long the texture is.
+    fn texture_layout_facts(
+        &self,
         resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
-        route: reims_vgpu_core::RepresentationRoute,
-    ) -> Result<reims_vgpu_protocol::RepresentationId, ReplacementRepresentationConstructionError>
-    {
+    ) -> Result<
+        (
+            reims_vgpu_protocol::TextureDeclaration,
+            Option<Arc<reims_vgpu_protocol::LinearTextureDescriptor>>,
+        ),
+        ReplacementRepresentationConstructionError,
+    > {
         let node = self.epoch.resources.graph().resource(resource).ok_or(
             ReplacementRepresentationConstructionError::ResourceAbsent(resource),
         )?;
@@ -2835,27 +2860,37 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .descriptor
             .as_deref()
             .ok_or(ReplacementRepresentationConstructionError::DescriptorAbsent(resource))?;
-        // A heap placement and a mapper view have no allocation-relative
-        // layout of their own, so only an ordinary texture carries one.
-        let (declaration, linear_texture) = match descriptor {
-            reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor) => (
+        match descriptor {
+            reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor) => Ok((
                 descriptor.declaration.ok_or(
                     ReplacementRepresentationConstructionError::TextureDeclarationAbsent(resource),
                 )?,
                 Some(Arc::new(descriptor.clone())),
-            ),
+            )),
+            reims_vgpu_protocol::ResourceDescriptor::BufferTexture(descriptor) => Ok((
+                descriptor.desc,
+                Some(Arc::new(descriptor.linear_layout().map_err(
+                    ReplacementRepresentationConstructionError::BufferTextureLayout,
+                )?)),
+            )),
             reims_vgpu_protocol::ResourceDescriptor::HeapTexture(descriptor) => {
-                (descriptor.declaration, None)
+                Ok((descriptor.declaration, None))
             }
             reims_vgpu_protocol::ResourceDescriptor::MapperIOSurfaceTextureView(descriptor) => {
-                (descriptor.declaration, None)
+                Ok((descriptor.declaration, None))
             }
-            _ => {
-                return Err(
-                    ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind),
-                );
-            }
-        };
+            _ => Err(ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind)),
+        }
+    }
+
+    fn materialize_texture(
+        &mut self,
+        device: &ReplacementDeviceEpoch,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+        route: reims_vgpu_core::RepresentationRoute,
+    ) -> Result<reims_vgpu_protocol::RepresentationId, ReplacementRepresentationConstructionError>
+    {
+        let (declaration, linear_texture) = self.texture_layout_facts(resource)?;
         self.materialize_texture_declaration(device, resource, declaration, linear_texture, route)
     }
 
@@ -3114,27 +3149,24 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         route: reims_vgpu_core::RepresentationRoute,
     ) -> Result<reims_vgpu_protocol::RepresentationId, ReplacementRepresentationConstructionError>
     {
+        let (_, texture_layout) = self.texture_layout_facts(resource)?;
         let node = self.epoch.resources.graph().resource(resource).ok_or(
             ReplacementRepresentationConstructionError::ResourceAbsent(resource),
         )?;
-        let descriptor = node
-            .descriptor
-            .as_deref()
-            .ok_or(ReplacementRepresentationConstructionError::DescriptorAbsent(resource))?;
-        let reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor) = descriptor else {
-            return Err(
-                ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind),
-            );
-        };
-        if guest.requested() != descriptor.allocation_size {
+        // A texture reached through a guest window is one whose bytes are the
+        // window's, so it has a layout over them; a heap placement and a
+        // mapper view do not come this way.
+        let texture_layout = texture_layout
+            .ok_or(ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind))?;
+        if guest.requested() != texture_layout.allocation_size {
             return Err(
                 ReplacementRepresentationConstructionError::GuestTextureLengthMismatch {
-                    expected: descriptor.allocation_size,
+                    expected: texture_layout.allocation_size,
                     actual: guest.requested(),
                 },
             );
         }
-        let texture_layout = Arc::new(descriptor.clone());
+        let allocation_size = texture_layout.allocation_size;
         let backing =
             node.storage
                 .ok_or(ReplacementRepresentationConstructionError::StorageAbsent(
@@ -3174,7 +3206,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                     .is_none()
                 {
                     let mut endpoint = device
-                        .create_host_staging_buffer_for_window(descriptor.allocation_size, guest)
+                        .create_host_staging_buffer_for_window(allocation_size, guest)
                         .map_err(ReplacementRepresentationConstructionError::BufferAllocation)?;
                     endpoint
                         .attach_linear_texture_layout(Arc::clone(&texture_layout))
@@ -3223,21 +3255,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         guest: reims_vgpu_memory::GuestWindow,
     ) -> Result<reims_vgpu_protocol::RepresentationId, ReplacementRepresentationConstructionError>
     {
-        let node = self.epoch.resources.graph().resource(resource).ok_or(
-            ReplacementRepresentationConstructionError::ResourceAbsent(resource),
-        )?;
-        let descriptor = node
-            .descriptor
-            .as_deref()
-            .ok_or(ReplacementRepresentationConstructionError::DescriptorAbsent(resource))?;
-        let reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor) = descriptor else {
-            return Err(
-                ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind),
-            );
-        };
-        let declaration = descriptor.declaration.ok_or(
-            ReplacementRepresentationConstructionError::TextureDeclarationAbsent(resource),
-        )?;
+        let (declaration, _) = self.texture_layout_facts(resource)?;
         let (topology, mut capabilities) = device.representation_environment();
         capabilities.imported_transfer &= guest.runs().len() == 1;
         let route = Self::guest_transfer_route(declaration.storage_mode(), topology, capabilities)?;
@@ -16129,9 +16147,119 @@ pub(crate) enum ReplacementTaskAddressMaterializationRefusal {
     StorageAbsent,
     UnservedStorageClass(reims_vgpu_core::StorageClass),
     NoDescribedOwner,
+    /// A texture placed over a buffer reaches past the guest allocation the
+    /// buffer names.
+    RangePastParent,
 }
 
 impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
+    /// What materializing one buffer-range backing needs to know.
+    ///
+    /// A texture placed over a buffer's storage owns the byte range it was
+    /// placed on, and that range is a window into the parent buffer's guest
+    /// allocation: the parent's task address advanced by the declared offset.
+    ///
+    /// The resources are every texture placed on that same range, because each
+    /// carries its own image over one set of bytes --- the same reason the
+    /// task-address materializer builds every texture declared over its
+    /// allocation. The window is as long as the longest of them: they begin
+    /// together and each declares its own height, so the range the backing
+    /// covers is the one that holds them all.
+    /// Which class of storage a backing is, for a caller choosing the
+    /// materializer that serves it.
+    pub(crate) fn backing_storage_class(
+        &self,
+        backing: reims_vgpu_protocol::BackingId,
+    ) -> Option<reims_vgpu_core::StorageClass> {
+        self.execution
+            .resources()
+            .graph()
+            .storage(backing)
+            .map(|storage| storage.backing.class())
+    }
+
+    pub(crate) fn buffer_range_backing_materialization_facts(
+        &self,
+        backing: reims_vgpu_protocol::BackingId,
+    ) -> Result<
+        ReplacementTaskAddressMaterializationFacts,
+        ReplacementTaskAddressMaterializationRefusal,
+    > {
+        let graph = self.execution.resources().graph();
+        let storage = graph
+            .storage(backing)
+            .ok_or(ReplacementTaskAddressMaterializationRefusal::StorageAbsent)?;
+        let reims_vgpu_core::StorageBacking::BufferRange { buffer, offset, .. } = storage.backing
+        else {
+            return Err(
+                ReplacementTaskAddressMaterializationRefusal::UnservedStorageClass(
+                    storage.backing.class(),
+                ),
+            );
+        };
+        let parent = graph
+            .resource(buffer)
+            .ok_or(ReplacementTaskAddressMaterializationRefusal::StorageAbsent)?;
+        let parent_storage = parent
+            .storage
+            .and_then(|backing| graph.storage(backing))
+            .ok_or(ReplacementTaskAddressMaterializationRefusal::StorageAbsent)?;
+        let reims_vgpu_core::StorageBacking::TaskAddress {
+            task,
+            address,
+            length: parent_length,
+        } = parent_storage.backing
+        else {
+            return Err(
+                ReplacementTaskAddressMaterializationRefusal::UnservedStorageClass(
+                    parent_storage.backing.class(),
+                ),
+            );
+        };
+        let mut resources = Vec::new();
+        let mut length = 0u64;
+        for resource in storage.owners.iter().copied() {
+            let Some(descriptor) = graph
+                .resource(resource)
+                .and_then(|node| node.descriptor.as_deref())
+            else {
+                continue;
+            };
+            let reims_vgpu_protocol::ResourceDescriptor::BufferTexture(descriptor) = descriptor
+            else {
+                continue;
+            };
+            let Ok(layout) = descriptor.linear_layout() else {
+                // The refusal belongs to materialization, which names the
+                // geometry it could not carry. Skipping it here leaves the
+                // backing with no owner and says so below.
+                continue;
+            };
+            length = length.max(layout.allocation_size);
+            resources.push(resource);
+        }
+        if resources.is_empty() {
+            return Err(ReplacementTaskAddressMaterializationRefusal::NoDescribedOwner);
+        }
+        let address = address
+            .get()
+            .checked_add(offset.get())
+            .ok_or(ReplacementTaskAddressMaterializationRefusal::NoDescribedOwner)?;
+        if offset
+            .get()
+            .checked_add(length)
+            .is_none_or(|end| end > parent_length.get())
+        {
+            return Err(ReplacementTaskAddressMaterializationRefusal::RangePastParent);
+        }
+        Ok(ReplacementTaskAddressMaterializationFacts {
+            resources: resources.into_boxed_slice(),
+            task,
+            address: reims_vgpu_protocol::GuestVirtualAddress::new(address),
+            length: reims_vgpu_protocol::ByteLength::new(length),
+        })
+    }
+
     pub(crate) fn task_address_backing_materialization_facts(
         &self,
         backing: reims_vgpu_protocol::BackingId,
@@ -17215,7 +17343,11 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             reims_vgpu_protocol::ResourceDescriptor::Buffer(_) => self
                 .execution
                 .materialize_buffer_with_guest_window(&self.session.vulkan, resource, guest),
-            reims_vgpu_protocol::ResourceDescriptor::Texture(_) => self
+            // A texture placed over a buffer's storage is materialized the same
+            // way an ordinary one is: its bytes are a guest window and its
+            // stride says how its texels sit in them.
+            reims_vgpu_protocol::ResourceDescriptor::Texture(_)
+            | reims_vgpu_protocol::ResourceDescriptor::BufferTexture(_) => self
                 .execution
                 .materialize_texture_with_guest_window(&self.session.vulkan, resource, guest),
             _ => Err(ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind)),

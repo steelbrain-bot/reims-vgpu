@@ -476,7 +476,59 @@ where
         }
         return Ok(());
     }
+    // Which materializer serves this backing is the storage class's question,
+    // and it is asked here rather than by each materializer refusing in turn.
+    if runtime.backing_storage_class(backing) == Some(reims_vgpu_core::StorageClass::BufferRange) {
+        return prepare_buffer_range_backing_representation(runtime, host, page_shift, backing);
+    }
     prepare_task_address_backing_representation(runtime, host, page_shift, backing)
+}
+
+/// Build the images declared over one byte range of a guest buffer.
+///
+/// A texture placed over a buffer's storage owns its own backing --- the range
+/// it was placed on --- and that range is a window into the parent buffer's
+/// allocation. So it materializes exactly as a texture over an allocation
+/// does, from a guest window that begins where the guest said the texture
+/// begins.
+fn prepare_buffer_range_backing_representation<Semantic>(
+    runtime: &mut ReplacementRuntimeSession<Semantic>,
+    host: &mut (impl HostMemory + crate::runtime::host::HostOps),
+    page_shift: u32,
+    backing: reims_vgpu_protocol::BackingId,
+) -> Result<(), ReplacementObjectRepresentationPreparationError>
+where
+    Semantic: Clone,
+{
+    let facts = runtime
+        .buffer_range_backing_materialization_facts(backing)
+        .map_err(
+            |reason| ReplacementObjectRepresentationPreparationError::BackingUnavailable {
+                backing,
+                reason,
+            },
+        )?;
+    // One window over the range's bytes and an image per texture placed on
+    // them, for the same reason the allocation's materializer loops: two
+    // textures over one range are two interpretations of one set of bytes and
+    // each needs its own native object.
+    for resource in facts.resources {
+        if runtime.resource_has_execution_representation(resource) {
+            continue;
+        }
+        let guest = resolve_task_guest_window(
+            runtime,
+            host,
+            page_shift,
+            facts.task,
+            facts.address.get(),
+            facts.length.get(),
+        )?;
+        runtime
+            .materialize_resource_with_guest_window(resource, guest)
+            .map_err(ReplacementObjectRepresentationPreparationError::Construction)?;
+    }
+    Ok(())
 }
 
 /// Build the image one declared plane of a registered surface is.
@@ -9230,6 +9282,104 @@ mod tests {
         // does anything.
         prepare_backing_representation(&mut runtime, &mut host, shift, view.backing, None).unwrap();
         assert!(runtime.resource_has_execution_representation(view.resource));
+    }
+
+    /// A texture placed over a buffer's storage is materialized from the
+    /// range it was placed on.
+    ///
+    /// Its backing is that range and nothing else serves that class, so the
+    /// repair refused `UnservedStorageClass(BufferRange)` --- on the head of a
+    /// channel, for the rest of the boot, against a guest binding a texture it
+    /// made over an `MTLBuffer`.
+    #[test]
+    fn a_texture_placed_over_a_buffer_is_materialized_from_its_range() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(11);
+        runtime.define_task(task, 0x40_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        // One guest page of buffer, with the texture placed part-way into it.
+        let backing_pfn = 0x200u64;
+        host.map_range(9u64 << shift, 1usize << shift, 0);
+        host.write_gpa(root + backing_pfn * 4, &9u32.to_le_bytes())
+            .unwrap();
+
+        let buffer =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+                &mut runtime,
+                shift,
+                task,
+                1,
+                reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                    reims_vgpu_protocol::BufferDescriptor {
+                        allocation_size: 1 << shift,
+                        handle: u32::try_from(backing_pfn).unwrap(),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+
+        let texture =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_buffer_texture(
+                &mut runtime,
+                task,
+                2,
+                reims_vgpu_protocol::ResourceDescriptor::BufferTexture(
+                    reims_vgpu_protocol::BufferTextureDescriptor {
+                        new_texture_ref: 2,
+                        buffer_ref: 1,
+                        // Part-way into the buffer: the range the texture owns
+                        // begins where the guest said it does.
+                        offset: 2048,
+                        bytes_per_row: 512,
+                        desc: reims_vgpu_protocol::TextureDeclaration {
+                            texture_type: reims_vgpu_protocol::TextureType::D2,
+                            framebuffer_only: false,
+                            is_drawable: false,
+                            write_swizzle_enabled: None,
+                            allow_gpu_optimized_contents: false,
+                            usage: reims_vgpu_protocol::TEXTURE_USAGE_SHADER_READ,
+                            pixel_format: 80,
+                            width: 100,
+                            height: 4,
+                            depth: 1,
+                            mipmap_level_count: 1,
+                            sample_count: 1,
+                            array_length: 1,
+                            resource_options: 0,
+                            protection_options: 0,
+                            swizzle: None,
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        assert_ne!(texture.backing, buffer.backing);
+        assert!(!runtime.resource_has_execution_representation(texture.resource));
+
+        prepare_backing_representation(&mut runtime, &mut host, shift, texture.backing, None)
+            .unwrap();
+        assert!(runtime.resource_has_execution_representation(texture.resource));
+
+        // The repair runs once per tick for as long as anything waits on the
+        // backing, so running it again builds nothing and refuses nothing.
+        prepare_backing_representation(&mut runtime, &mut host, shift, texture.backing, None)
+            .unwrap();
+        assert!(runtime.resource_has_execution_representation(texture.resource));
     }
 
     /// Two textures over one registered surface plane are two images, and the

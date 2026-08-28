@@ -785,7 +785,11 @@ impl ResourceDescriptor {
             Self::Texture(_)
             | Self::HeapTexture(_)
             | Self::MapperIOSurfaceTextureView(_)
-            | Self::IOSurfacePlaneView(_) => Some(NativeRepresentationClass::Image),
+            | Self::IOSurfacePlaneView(_)
+            // A texture placed over a buffer's storage is an image over those
+            // bytes, the same as one placed over an allocation: it is built as
+            // an image and every later reader has to find it as one.
+            | Self::BufferTexture(_) => Some(NativeRepresentationClass::Image),
             Self::SurfaceBacking(_)
             | Self::Sampler(_)
             | Self::Function(_)
@@ -793,7 +797,6 @@ impl ResourceDescriptor {
             | Self::ComputePipeline(_)
             | Self::DepthStencil(_)
             | Self::TextureView(_)
-            | Self::BufferTexture(_)
             | Self::IndirectCommandBuffer(_)
             | Self::RasterizationRateMap(_) => None,
         }
@@ -1130,6 +1133,116 @@ pub struct BufferTextureDescriptor {
     pub offset: u64,
     pub bytes_per_row: u64,
     pub desc: crate::TextureDeclaration,
+}
+
+/// Why a texture placed over a buffer's storage has no linear layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BufferTextureLayoutError {
+    /// The construction form carries one 2D image and nothing else: no mip
+    /// chain, no array, no cube, no multisampling, no depth.
+    UnsupportedGeometry(crate::TextureType),
+    MultipleLevelsOrSlices,
+    Multisampled,
+    EmptyGeometry,
+    /// This device does not know the texel width of the declared format, so it
+    /// cannot say where a row ends.
+    FormatUnknown(u16),
+    /// A row of texels does not fit in the stride the guest named.
+    RowExceedsStride {
+        texels: u64,
+        stride: u64,
+    },
+    SpanOverflow,
+}
+
+impl BufferTextureDescriptor {
+    /// How this texture's texels sit in the buffer's bytes.
+    ///
+    /// The construction form is one 2D image over a byte range: the first row
+    /// begins at the declared offset, each following row begins one stride
+    /// later, and the image occupies every byte from the first row's start to
+    /// the last row's end. There is no mip chain and no second slice, so the
+    /// level record is the whole layout.
+    ///
+    /// The span is the rows and not `stride * height`: the last row ends where
+    /// its texels end, and the padding a stride would add past it belongs to
+    /// the buffer rather than to the texture.
+    pub fn linear_layout(&self) -> Result<LinearTextureDescriptor, BufferTextureLayoutError> {
+        let declaration = self.desc;
+        if !matches!(
+            declaration.texture_type,
+            crate::TextureType::D2 | crate::TextureType::Buffer
+        ) {
+            return Err(BufferTextureLayoutError::UnsupportedGeometry(
+                declaration.texture_type,
+            ));
+        }
+        if declaration.mipmap_level_count != 1 || declaration.array_length != 1 {
+            return Err(BufferTextureLayoutError::MultipleLevelsOrSlices);
+        }
+        if declaration.sample_count != 1 {
+            return Err(BufferTextureLayoutError::Multisampled);
+        }
+        if declaration.width == 0
+            || declaration.height == 0
+            || declaration.depth != 1
+            || self.bytes_per_row == 0
+        {
+            return Err(BufferTextureLayoutError::EmptyGeometry);
+        }
+        let bytes_per_element = crate::iosurface::format_bytes_per_pixel(declaration.pixel_format)
+            .and_then(|bytes| u8::try_from(bytes).ok())
+            .filter(|bytes| *bytes != 0)
+            .ok_or(BufferTextureLayoutError::FormatUnknown(
+                declaration.pixel_format,
+            ))?;
+        let texels = u64::from(declaration.width)
+            .checked_mul(u64::from(bytes_per_element))
+            .ok_or(BufferTextureLayoutError::SpanOverflow)?;
+        if texels > self.bytes_per_row {
+            return Err(BufferTextureLayoutError::RowExceedsStride {
+                texels,
+                stride: self.bytes_per_row,
+            });
+        }
+        let occupied = u64::from(declaration.height - 1)
+            .checked_mul(self.bytes_per_row)
+            .and_then(|prefix| prefix.checked_add(texels))
+            .ok_or(BufferTextureLayoutError::SpanOverflow)?;
+        let row_stride = u32::try_from(self.bytes_per_row)
+            .map_err(|_| BufferTextureLayoutError::SpanOverflow)?;
+        let used_size =
+            u32::try_from(occupied).map_err(|_| BufferTextureLayoutError::SpanOverflow)?;
+        Ok(LinearTextureDescriptor {
+            // The allocation this layout addresses is the byte range the
+            // texture was placed on, which the device imports as its own
+            // window --- so the range begins at zero here and the buffer
+            // offset is where that window starts, not where this layout does.
+            allocation_size: occupied,
+            handle: 0,
+            mipmap_level_count: 1,
+            base_offset: 0,
+            bytes_per_slice: 0,
+            slice_count: 1,
+            cube_faces: false,
+            compressed_layout: false,
+            bytes_per_element,
+            used_size,
+            row_stride,
+            width: declaration.width,
+            height: declaration.height,
+            depth: 1,
+            declaration: Some(declaration),
+            levels: vec![TextureLevelLayout {
+                offset: 0,
+                size: occupied,
+                row_stride: self.bytes_per_row,
+                width: declaration.width,
+                height: declaration.height,
+                depth: 1,
+            }],
+        })
+    }
 }
 
 /// Typed refusal produced while decoding a resource construction descriptor.
@@ -1577,6 +1690,96 @@ mod tests {
             }
             .storage_mode(),
             crate::StorageMode::Private
+        );
+    }
+
+    /// A texture placed over a buffer occupies its rows and stops where the
+    /// last one ends.
+    ///
+    /// The stride is the guest's and may exceed a row of texels; the padding
+    /// between rows belongs to the texture's span and the padding after the
+    /// last row does not, because nothing of the texture is there.
+    #[test]
+    fn a_texture_over_a_buffer_spans_its_rows_and_not_the_padding_after_them() {
+        let declaration = crate::TextureDeclaration {
+            texture_type: crate::TextureType::D2,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
+            allow_gpu_optimized_contents: false,
+            usage: 0,
+            // Four bytes a texel.
+            pixel_format: 80,
+            width: 100,
+            height: 4,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            resource_options: 0,
+            protection_options: 0,
+            swizzle: None,
+        };
+        let descriptor = BufferTextureDescriptor {
+            new_texture_ref: 8,
+            buffer_ref: 7,
+            offset: 4096,
+            bytes_per_row: 512,
+            desc: declaration,
+        };
+        let layout = descriptor.linear_layout().unwrap();
+        assert_eq!(layout.bytes_per_element, 4);
+        assert_eq!(layout.row_stride, 512);
+        assert_eq!(layout.mipmap_level_count, 1);
+        assert_eq!(layout.slice_count, 1);
+        // Three whole strides and one row of texels.
+        assert_eq!(layout.allocation_size, 512 * 3 + 400);
+        assert_eq!(layout.levels.len(), 1);
+        assert_eq!(layout.levels[0].size, layout.allocation_size);
+        assert_eq!(layout.levels[0].row_stride, 512);
+        // The layout addresses the range the texture was placed on, so it
+        // begins at its own start: where that range sits in the buffer is the
+        // backing's question, not this one's.
+        assert_eq!(layout.base_offset, 0);
+
+        // A row of texels wider than the stride the guest named describes
+        // nothing, and says so rather than reading past each row.
+        assert_eq!(
+            BufferTextureDescriptor {
+                bytes_per_row: 256,
+                ..descriptor
+            }
+            .linear_layout(),
+            Err(BufferTextureLayoutError::RowExceedsStride {
+                texels: 400,
+                stride: 256
+            })
+        );
+        // The form carries one 2D image: a mip chain or a second slice is a
+        // geometry it cannot express, and is refused rather than truncated.
+        assert_eq!(
+            BufferTextureDescriptor {
+                desc: crate::TextureDeclaration {
+                    mipmap_level_count: 4,
+                    ..declaration
+                },
+                ..descriptor
+            }
+            .linear_layout(),
+            Err(BufferTextureLayoutError::MultipleLevelsOrSlices)
+        );
+        assert_eq!(
+            BufferTextureDescriptor {
+                desc: crate::TextureDeclaration {
+                    texture_type: crate::TextureType::D3,
+                    ..declaration
+                },
+                ..descriptor
+            }
+            .linear_layout(),
+            Err(BufferTextureLayoutError::UnsupportedGeometry(
+                crate::TextureType::D3
+            ))
         );
     }
 
