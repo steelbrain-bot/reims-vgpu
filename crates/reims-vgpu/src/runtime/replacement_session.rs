@@ -12038,13 +12038,14 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                             Some(reims_vgpu_core::HOST_REPRESENTATION),
                             Some(representation),
                         ),
-                        // Already held, or storage the guest cannot write.
-                        // Nothing to plan either way; a bind that then refuses
-                        // names the route on the stale-representation line.
+                        // Already held, or a route this device plans no upload
+                        // for. Nothing to plan either way; a bind that then
+                        // refuses names the route on the stale-representation
+                        // line, which is the whole difference between the two.
                         Some((
                             _,
                             reims_vgpu_core::GuestWriteStaging::AlreadyHeld
-                            | reims_vgpu_core::GuestWriteStaging::Unwritable,
+                            | reims_vgpu_core::GuestWriteStaging::NoUploadRoute,
                         )) => (None, None),
                         // No designated representation yet, or one with no
                         // native object. The bytes are recorded against the

@@ -944,15 +944,26 @@ impl<T> ResourceLifecycleOwner<T> {
                     let destination_route = self
                         .native
                         .representation_route(target.backing, destination);
-                    let route_is_valid = match destination_route {
-                        Some(RepresentationRoute::ImportedGuestTransfer { .. }) => {
+                    // The same question the transition asked when it chose
+                    // this destination, asked of the same function, so the
+                    // two cannot disagree about which routes carry an upload.
+                    // They were two hand-written matches over one enum, each
+                    // with its own catch-all.
+                    let route_is_valid = match destination_route
+                        .map(crate::managed_resource::RepresentationRoute::guest_write_staging)
+                    {
+                        Some(crate::GuestWriteStaging::Transfer) => {
                             target.host_ingress_destination.is_none()
                                 && guest_route == Some(RepresentationRoute::DirectGuestAlias)
                         }
-                        Some(RepresentationRoute::HostStagingTransfer { .. }) => {
+                        Some(crate::GuestWriteStaging::StageThenTransfer) => {
                             target.host_ingress_destination == Some(HOST_REPRESENTATION)
                         }
-                        _ => false,
+                        Some(
+                            crate::GuestWriteStaging::AlreadyHeld
+                            | crate::GuestWriteStaging::NoUploadRoute,
+                        )
+                        | None => false,
                     };
                     if !route_is_valid {
                         return Err(ValidityTransitionError::InvalidGuestUploadRoute {

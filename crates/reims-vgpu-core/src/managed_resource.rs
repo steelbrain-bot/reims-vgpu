@@ -49,25 +49,35 @@ pub enum RepresentationRoute {
 /// The routes differ in where the guest's bytes live relative to the object
 /// that executes over them, and that difference is the whole content of the
 /// question "what has to happen before this object holds what the guest just
-/// wrote". Answering it anywhere but here means answering it per caller, and
-/// a caller that fell through to "nothing has to happen" planned no upload at
-/// all --- so the object stayed empty and every later bind of it refused
-/// `StaleExecutionRepresentation` with nothing that could ever repair it.
+/// wrote". It was answered in two places from the same enum --- once where a
+/// validity transition picks its upload destination and once where the
+/// lifecycle owner validates the pair --- and each carried a catch-all, so
+/// neither said what it meant and nothing made them agree. Both now ask here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestWriteStaging {
     /// The object *is* the guest's allocation, imported. The store the guest
     /// made is already in it and there is nothing to plan.
     AlreadyHeld,
-    /// One allocation the host can write and the GPU can read. The upload is a
-    /// transfer from the guest representation straight into it.
+    /// Guest memory is imported and readable by the GPU, so nothing stages and
+    /// a transfer carries the bytes from the import into working memory. The
+    /// backing must carry the alias for this to be reachable, which is what
+    /// the lifecycle owner checks against `GUEST_REPRESENTATION`.
     Transfer,
-    /// Working memory the host cannot reach. The guest's bytes land in a
+    /// The host cannot reach working memory. The guest's bytes land in a
     /// staging buffer first and a GPU transfer moves them on.
     StageThenTransfer,
-    /// Storage the guest cannot CPU write at all --- private working memory
-    /// and render-pass memoryless attachments. A host-valid clear naming one
-    /// is a statement this device has no contract for.
-    Unwritable,
+    /// This device plans no upload for the route.
+    ///
+    /// Two different reasons share the arm and neither is a defect here.
+    /// Private working memory and memoryless attachments are storage the guest
+    /// cannot CPU write at all. `HostVisibleWorking` and `HostStagingEndpoint`
+    /// are storage it can, and the device has no upload built for them --- a
+    /// guest write against one leaves the object holding nothing, which the
+    /// bind reports as `StaleExecutionRepresentation` with `route=` naming
+    /// which of them it was. That is the honest reading: a route this device
+    /// does not serve, said out loud, rather than a catch-all that read as
+    /// "nothing needed".
+    NoUploadRoute,
 }
 
 impl RepresentationRoute {
@@ -76,14 +86,12 @@ impl RepresentationRoute {
     pub const fn guest_write_staging(self) -> GuestWriteStaging {
         match self {
             Self::DirectGuestAlias => GuestWriteStaging::AlreadyHeld,
-            Self::HostVisibleWorking | Self::HostStagingEndpoint => GuestWriteStaging::Transfer,
-            // The import is the guest's bytes, so nothing stages; the transfer
-            // carries them from the import into working memory.
             Self::ImportedGuestTransfer { .. } => GuestWriteStaging::Transfer,
             Self::HostStagingTransfer { .. } => GuestWriteStaging::StageThenTransfer,
-            Self::NativeWorking { .. } | Self::RenderPassMemoryless => {
-                GuestWriteStaging::Unwritable
-            }
+            Self::HostVisibleWorking
+            | Self::HostStagingEndpoint
+            | Self::NativeWorking { .. }
+            | Self::RenderPassMemoryless => GuestWriteStaging::NoUploadRoute,
         }
     }
 }
@@ -261,11 +269,11 @@ mod tests {
             ),
             (
                 RepresentationRoute::HostVisibleWorking,
-                GuestWriteStaging::Transfer,
+                GuestWriteStaging::NoUploadRoute,
             ),
             (
                 RepresentationRoute::HostStagingEndpoint,
-                GuestWriteStaging::Transfer,
+                GuestWriteStaging::NoUploadRoute,
             ),
             (
                 RepresentationRoute::ImportedGuestTransfer { working },
@@ -277,11 +285,11 @@ mod tests {
             ),
             (
                 RepresentationRoute::NativeWorking { memory: working },
-                GuestWriteStaging::Unwritable,
+                GuestWriteStaging::NoUploadRoute,
             ),
             (
                 RepresentationRoute::RenderPassMemoryless,
-                GuestWriteStaging::Unwritable,
+                GuestWriteStaging::NoUploadRoute,
             ),
         ] {
             assert_eq!(
