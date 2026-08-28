@@ -1373,6 +1373,15 @@ impl<T> ResourceLifecycleOwner<T> {
         self.native.designated_views(backing)
     }
 
+    /// See
+    /// [`crate::ManagedBackingOwner::reserved_representation_coverage`].
+    pub fn reserved_representation_coverage(
+        &self,
+        backing: BackingId,
+    ) -> Option<(Vec<RegionVersion>, Vec<RegionVersion>, Vec<RegionVersion>)> {
+        self.native.reserved_representation_coverage(backing)
+    }
+
     pub fn execution_representation_id(
         &self,
         backing: BackingId,

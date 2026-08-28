@@ -7652,6 +7652,19 @@ impl ReplacementDeviceCoordinator<()> {
             )
             .collect::<std::collections::BTreeSet<_>>();
         for backing in stale_backings {
+            // The designated objects are half the reading. A canonical version
+            // held by the guest's own bytes or by the host staging endpoint is
+            // a transfer nobody planned; one held by nothing at all is content
+            // that retired with the object that had it. The two need different
+            // repairs and neither line alone tells them apart.
+            if let Some((canonical, guest, host)) =
+                self.runtime.reserved_representation_coverage(backing)
+            {
+                let id = backing.get();
+                crate::observe::off(format!(
+                    "replacement_canonical_content backing={id} canonical=[{canonical}] guest=[{guest}] host=[{host}]"
+                ));
+            }
             for (view, representation, route, holds) in
                 self.runtime.execution_representation_coverage(backing)
             {
@@ -8500,6 +8513,14 @@ impl ReplacementDeviceCoordinator<()> {
                     channel.get()
                 ));
                 if let Some(backing) = stale_backing {
+                    if let Some((canonical, guest, host)) =
+                        self.runtime.reserved_representation_coverage(backing)
+                    {
+                        let id = backing.get();
+                        crate::observe::fail(format!(
+                            "replacement_refused_canonical_content backing={id} canonical=[{canonical}] guest=[{guest}] host=[{host}]"
+                        ));
+                    }
                     for (view, representation, route, holds) in
                         self.runtime.execution_representation_coverage(backing)
                     {

@@ -778,6 +778,34 @@ impl<T> ManagedBackingOwner<T> {
         ))
     }
 
+    /// What a backing's canonical content is, and what the two reserved
+    /// representations hold against it.
+    ///
+    /// [`Self::execution_representation_coverage`] answers for the objects a
+    /// bind resolves to, which is the wrong half of the question when the
+    /// refusal is `StaleExecutionRepresentation`: that says the canonical
+    /// version is held by no *designated* representation, and the two
+    /// representations that are never designated -- the guest's own bytes and
+    /// the host staging endpoint -- are exactly the ones a reading cannot see.
+    /// A canonical version sitting on one of them is a different defect from a
+    /// canonical version sitting nowhere, and they are indistinguishable
+    /// without this.
+    pub fn reserved_representation_coverage(
+        &self,
+        backing: BackingId,
+    ) -> Option<(Vec<RegionVersion>, Vec<RegionVersion>, Vec<RegionVersion>)> {
+        let record = self.backings.get(&backing)?;
+        Some((
+            record.authority.snapshot_all().into_vec(),
+            record
+                .authority
+                .representation_coverage(GUEST_REPRESENTATION),
+            record
+                .authority
+                .representation_coverage(HOST_REPRESENTATION),
+        ))
+    }
+
     /// Any one of a backing's designated representations.
     ///
     /// For questions about the backing's *storage* rather than about a

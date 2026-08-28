@@ -8345,6 +8345,28 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .collect()
     }
 
+    /// A backing's canonical content and what the guest and host
+    /// representations hold against it, rendered for a diagnostic.
+    ///
+    /// See
+    /// [`reims_vgpu_core::ManagedBackingOwner::reserved_representation_coverage`].
+    pub fn reserved_representation_coverage(
+        &self,
+        backing: reims_vgpu_protocol::BackingId,
+    ) -> Option<(String, String, String)> {
+        let render = |coverage: Vec<reims_vgpu_core::RegionVersion>| {
+            coverage
+                .iter()
+                .map(|held| format!("{:?}@{}", held.region, held.version.get()))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        self.execution
+            .resources()
+            .reserved_representation_coverage(backing)
+            .map(|(canonical, guest, host)| (render(canonical), render(guest), render(host)))
+    }
+
     /// Every transaction a parked recording map still holds.
     ///
     /// Read beside the coordinator's own owner sets: a transaction the
