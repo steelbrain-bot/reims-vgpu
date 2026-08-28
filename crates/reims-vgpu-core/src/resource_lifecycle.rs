@@ -1616,6 +1616,15 @@ impl<T> ResourceLifecycleOwner<T> {
         self.native.snapshot_content(backing, regions)
     }
 
+    /// See [`crate::content_authority::RegionContentState::unanswerable_regions`].
+    pub fn unanswerable_content_regions(
+        &self,
+        backing: BackingId,
+        regions: &[BackingRegion],
+    ) -> Result<Box<[BackingRegion]>, ManagedBackingError> {
+        self.native.unanswerable_content_regions(backing, regions)
+    }
+
     pub fn current_native_regions_for_version(
         &self,
         backing: BackingId,

@@ -227,6 +227,31 @@ impl CoverageMap {
             .collect()
     }
 
+    /// Whether this map holds content as [`BackingRegion::Whole`] while the
+    /// query asks about part of the backing.
+    ///
+    /// `Whole` is documented as the complete backing *when the contract
+    /// establishes no sound translation into finer coordinates*, and
+    /// [`intersection`] honours that by relating it to nothing narrower. So a
+    /// `Linear` or `Image` query against `Whole` coverage comes back empty --
+    /// the same empty answer a backing holding no content gives -- and the two
+    /// are opposite facts. The second says there is nothing to synchronize;
+    /// the first says this authority cannot tell, and every consumer reads it
+    /// as the second.
+    ///
+    /// The reverse direction is not this: a `Whole` query is answerable
+    /// against any coverage, because everything the map holds lies inside the
+    /// backing. Nor is a same-space query that simply found nothing -- a
+    /// linear map asked about bytes it has not written, or an image map asked
+    /// about another mip, has genuinely answered.
+    fn unanswerable(&self, region: BackingRegion) -> bool {
+        region != BackingRegion::Whole
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.region == BackingRegion::Whole)
+    }
+
     fn missing(&self, region: BackingRegion, version: ContentVersion) -> Vec<BackingRegion> {
         let mut missing = vec![region];
         for current in self.entries.iter().filter(|entry| entry.version == version) {
@@ -543,6 +568,23 @@ impl RegionContentState {
         snapshot.sort();
         snapshot.dedup();
         snapshot.into_boxed_slice()
+    }
+
+    /// The queried regions this backing's canonical coverage cannot narrow to,
+    /// in the order they were asked.
+    ///
+    /// [`Self::snapshot`] returns nothing for these, and every consumer of an
+    /// empty snapshot reads it as "already current" -- `representation_matches`
+    /// is an `all` over the snapshot and is vacuously true on nothing, so no
+    /// view is ever stale for a region the authority cannot answer about, and
+    /// the synchronization that would have filled it is dropped as satisfied.
+    /// Ask this beside the snapshot and refuse by name instead.
+    pub fn unanswerable_regions(&self, regions: &[BackingRegion]) -> Box<[BackingRegion]> {
+        regions
+            .iter()
+            .copied()
+            .filter(|region| self.canonical.unanswerable(*region))
+            .collect()
     }
 
     pub fn representation_matches(
@@ -1149,6 +1191,14 @@ impl ContentAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot(regions)
+    }
+
+    /// See [`RegionContentState::unanswerable_regions`].
+    pub fn unanswerable_regions(&self, regions: &[BackingRegion]) -> Box<[BackingRegion]> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unanswerable_regions(regions)
     }
 
     pub fn representation_matches(
@@ -1762,6 +1812,73 @@ mod tests {
         let mut state = RegionContentState::new(BackingId::new(7), GUEST, [region]).unwrap();
         state.ensure_representation(GPU);
         state
+    }
+
+    /// An empty snapshot means two opposite things and the authority says which.
+    ///
+    /// Every consumer of a snapshot reads an empty one as "already current" --
+    /// `representation_matches` is an `all` and is vacuously true on nothing --
+    /// so a query this authority cannot narrow to drops the synchronization
+    /// that would have filled the view, silently, as content.
+    #[test]
+    fn a_finer_query_against_whole_coverage_is_unanswerable_not_satisfied() {
+        let mut state = state(BackingRegion::Whole);
+        state
+            .plan_gpu_write(SubmissionId::new(1), GPU, [BackingRegion::Whole])
+            .unwrap();
+        state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+
+        // `Whole` narrows to no image or linear coordinate, so both answer
+        // empty and neither of those empties means satisfied.
+        let finer = [image([0, 0, 0], [16, 16, 1]), linear(0, 64)];
+        assert!(state.snapshot(&finer).is_empty());
+        assert_eq!(state.unanswerable_regions(&finer).as_ref(), finer);
+
+        // The complete backing is answerable, and a mixed query names only the
+        // half that is not.
+        assert!(state
+            .unanswerable_regions(&[BackingRegion::Whole])
+            .is_empty());
+        assert_eq!(
+            state
+                .unanswerable_regions(&[BackingRegion::Whole, linear(0, 64)])
+                .as_ref(),
+            [linear(0, 64)]
+        );
+    }
+
+    /// Coverage that is not `Whole` can answer any query, including an empty
+    /// one.
+    ///
+    /// The rule is one-directional. A map that holds byte ranges has a sound
+    /// translation into byte coordinates and reports honestly about ranges it
+    /// has not written; only `Whole` carries the declaration that no such
+    /// translation exists. Asking anything of a `Whole` *query* is answerable
+    /// too, because the complete backing contains whatever the map holds.
+    #[test]
+    fn coverage_finer_than_whole_answers_every_query_it_is_asked() {
+        let mut state = state(linear(0, 128));
+        assert!(state.unanswerable_regions(&[linear(0, 64)]).is_empty());
+        assert!(state
+            .unanswerable_regions(&[BackingRegion::Whole])
+            .is_empty());
+
+        state
+            .plan_gpu_write(SubmissionId::new(1), GPU, [linear(0, 32)])
+            .unwrap();
+        state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+
+        // Past the declared coverage the map answers with nothing, and that
+        // nothing is an answer: the query is in the space the map speaks.
+        assert!(state.snapshot(&[linear(128, 64)]).is_empty());
+        assert!(state.unanswerable_regions(&[linear(128, 64)]).is_empty());
+
+        // An image query against a linear map crosses coordinate spaces and
+        // is a producer that asked in the wrong terms, not an authority that
+        // cannot narrow: this rule does not claim that one.
+        assert!(state
+            .unanswerable_regions(&[image([0, 0, 0], [8, 8, 1])])
+            .is_empty());
     }
 
     #[test]
