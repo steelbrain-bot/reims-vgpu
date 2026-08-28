@@ -3430,12 +3430,42 @@ pub(crate) enum ReplacementComputeTranslationAvailability {
     Lifecycle(PipelineLifecycleError),
 }
 
+impl ReplacementComputeTranslationAvailability {
+    /// See [`reims_vgpu_core::TextureViewResolveError::awaits_declaration`].
+    ///
+    /// An unknown pipeline is one whose declaration has not arrived and a
+    /// pending one is still compiling, so both answer differently later. A
+    /// refusal and a lifecycle error are settled: the pipeline exists and this
+    /// device will not run it.
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::UnknownPipeline | Self::Pending => true,
+            Self::Refused(_) | Self::Lifecycle(_) => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementRenderSemanticAvailability {
     UnknownPipeline,
     Pending,
     Refused(ReplacementPipelineRefusal),
     Lifecycle(PipelineLifecycleError),
+}
+
+impl ReplacementRenderSemanticAvailability {
+    /// See [`reims_vgpu_core::TextureViewResolveError::awaits_declaration`].
+    ///
+    /// An unknown pipeline is one whose declaration has not arrived and a
+    /// pending one is still compiling, so both answer differently later. A
+    /// refusal and a lifecycle error are settled: the pipeline exists and this
+    /// device will not run it.
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::UnknownPipeline | Self::Pending => true,
+            Self::Refused(_) | Self::Lifecycle(_) => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6208,15 +6238,35 @@ impl ReplacementExecResourceTableError {
     }
 }
 
+impl ReplacementCanonicalExecDecodeError {
+    /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
+    ///
+    /// A decode refusal is about bytes this packet already carries, so no
+    /// later packet reads them differently. A projection refusal is the one
+    /// that can go either way, and
+    /// [`crate::runtime::replacement_exec_decode::ReplacementOperationProjectionError::awaits_declaration`]
+    /// is what says which.
+    pub(crate) fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::Decode(_) => true,
+            Self::Projection(failure) => !failure.reason.awaits_declaration(),
+        }
+    }
+}
+
 impl ReplacementDecodedExecAdmissionError {
-    /// See [`ReplacementExecResourceTableError::is_terminal_refusal`]. Only the
-    /// resource table can refuse in a way a later packet cannot repair;
-    /// decode, access compilation and runtime admission are all repairable or
-    /// are decode-level shapes.
-    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+    /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
+    ///
+    /// Access compilation and runtime admission are repairable by a later
+    /// packet. The resource table and the canonical decode each answer for
+    /// themselves --- both can refuse in a way nothing later repairs, and
+    /// re-offering such a refusal at a channel head costs every command
+    /// behind it rather than the one that refused.
+    pub(crate) fn is_terminal_refusal(&self) -> bool {
         match self {
             Self::ResourceTable(reason) => reason.is_terminal_refusal(),
-            Self::Canonical(_) | Self::Accesses(_) | Self::Admission(_) => false,
+            Self::Canonical(reason) => reason.is_terminal_refusal(),
+            Self::Accesses(_) | Self::Admission(_) => false,
         }
     }
 }
@@ -6287,7 +6337,7 @@ impl ReplacementExecAutomaticPreparationError {
 
 impl<Completion> ReplacementExecIngressPreparationError<Completion> {
     /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
-    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+    pub(crate) fn is_terminal_refusal(&self) -> bool {
         match self {
             Self::Admission(reason) => reason.is_terminal_refusal(),
             Self::Direct(_) | Self::IndirectRange(_) => false,
@@ -6347,7 +6397,7 @@ impl<Completion> ReplacementExecIngressDispatchFailure<Completion> {
     }
 
     /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
-    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+    pub(crate) fn is_terminal_refusal(&self) -> bool {
         match self {
             Self::Ingress(reason) => reason.is_terminal_refusal(),
             Self::DirectDispatch(ReplacementResourceReadyDispatchFailure::Resolution(failure)) => {
@@ -7692,6 +7742,66 @@ pub(crate) enum ReplacementRenderAttachmentResolutionError {
     BaseDescriptorUnavailable,
     SubresourceOutOfBounds,
     EmptyExtent,
+}
+
+impl ReplacementBufferRangeResolutionError {
+    /// See [`reims_vgpu_core::TextureViewResolveError::awaits_declaration`].
+    ///
+    /// The three `*Unavailable` arms name a lifecycle packet that has not
+    /// arrived; the rest describe a buffer that is fully declared and does not
+    /// hold the range asked for.
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::ResourceUnavailable | Self::DescriptorUnavailable | Self::StorageUnavailable => {
+                true
+            }
+            Self::NotBuffer(_)
+            | Self::NotTaskAddress
+            | Self::RangeOutOfBounds
+            | Self::AddressOverflow => false,
+        }
+    }
+}
+
+impl ReplacementTextureEndpointResolutionError {
+    /// See [`reims_vgpu_core::TextureViewResolveError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::ResourceUnavailable
+            | Self::BaseDescriptorUnavailable
+            | Self::StorageUnavailable => true,
+            Self::View(reason) => reason.awaits_declaration(),
+            Self::NonIdentitySwizzle
+            | Self::NotLinearTexture(_)
+            | Self::NotTaskAddress
+            | Self::SubresourceOutOfBounds
+            | Self::InvalidPacking
+            | Self::UnsupportedPixelFormat(_) => false,
+        }
+    }
+}
+
+impl ReplacementTextureResolutionError {
+    /// See [`reims_vgpu_core::TextureViewResolveError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::ResourceUnavailable | Self::StorageUnavailable => true,
+            Self::View(reason) => reason.awaits_declaration(),
+        }
+    }
+}
+
+impl ReplacementRenderAttachmentResolutionError {
+    /// See [`reims_vgpu_core::TextureViewResolveError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::ResourceUnavailable
+            | Self::StorageUnavailable
+            | Self::BaseDescriptorUnavailable => true,
+            Self::View(reason) => reason.awaits_declaration(),
+            Self::SubresourceOutOfBounds | Self::EmptyExtent => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23446,6 +23556,72 @@ mod tests {
                 ),
             };
         assert!(ingress.is_terminal_refusal());
+    }
+
+    /// A projection refusal that no later packet can answer differently must
+    /// refuse rather than be re-offered.
+    ///
+    /// A conformance boot met one blit whose destination texture was surface
+    /// backed, refused it at projection, and re-offered the same bytes 278 795
+    /// times over ten minutes. The channel's head never advanced, so the whole
+    /// battery ran against a dead channel while every census read healthy.
+    #[test]
+    fn a_projection_refusal_naming_a_declared_shape_refuses_instead_of_holding_its_channel() {
+        use crate::runtime::replacement_exec_decode::{
+            ReplacementImageBlitEndpoint, ReplacementImageBlitResolutionError,
+            ReplacementOperationProjectionError,
+        };
+
+        let surface_destination = ReplacementOperationProjectionError::ImageBlit(
+            ReplacementImageBlitResolutionError::Texture {
+                endpoint: ReplacementImageBlitEndpoint::Destination,
+                reference: 558,
+                reason: ReplacementTextureEndpointResolutionError::NotLinearTexture(
+                    reims_vgpu_protocol::ObjectKind::SurfaceBacking,
+                ),
+            },
+        );
+        assert!(!surface_destination.awaits_declaration());
+
+        // And the two wrappers the channel actually consults, because a
+        // refusal the head does not see is a refusal that never happens.
+        let canonical = ReplacementCanonicalExecDecodeError::Projection(
+            crate::runtime::replacement_exec_decode::ReplacementExecProjectionFailure {
+                reason: surface_destination,
+                streams: Box::new([]),
+            },
+        );
+        assert!(canonical.is_terminal_refusal());
+        assert!(ReplacementDecodedExecAdmissionError::Canonical(canonical).is_terminal_refusal());
+    }
+
+    /// The opposite case, on the same command: a blit whose source buffer has
+    /// not been declared yet is early, not refused, and the packet that
+    /// declares it may be the next one on another channel.
+    #[test]
+    fn a_projection_refusal_naming_an_undeclared_resource_still_waits() {
+        use crate::runtime::replacement_exec_decode::{
+            ReplacementImageBlitEndpoint, ReplacementImageBlitResolutionError,
+            ReplacementOperationProjectionError,
+        };
+
+        let pending_source = ReplacementOperationProjectionError::ImageBlit(
+            ReplacementImageBlitResolutionError::Buffer {
+                endpoint: ReplacementImageBlitEndpoint::Source,
+                reference: 12,
+                reason: ReplacementBufferRangeResolutionError::ResourceUnavailable,
+            },
+        );
+        assert!(pending_source.awaits_declaration());
+        assert!(!ReplacementDecodedExecAdmissionError::Canonical(
+            ReplacementCanonicalExecDecodeError::Projection(
+                crate::runtime::replacement_exec_decode::ReplacementExecProjectionFailure {
+                    reason: pending_source,
+                    streams: Box::new([]),
+                },
+            )
+        )
+        .is_terminal_refusal());
     }
 
     /// The transaction runtime declining the ordering is the opposite case: it

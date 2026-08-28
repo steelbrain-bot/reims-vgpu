@@ -1605,6 +1605,289 @@ pub(crate) enum ReplacementOperationProjectionError {
     Info(reims_vgpu_core::InfoResolutionError),
 }
 
+impl ReplacementOperationProjectionError {
+    /// Whether re-projecting this operation against a later packet could
+    /// answer differently.
+    ///
+    /// A projection refusal falls into exactly two classes and they need
+    /// opposite handling at a channel head. One names something that has not
+    /// arrived --- a resource, a heap, a pipeline still compiling --- and the
+    /// packet that supplies it may be the next one on another channel, so the
+    /// refusal is a wait and the head is right to keep offering. The other is
+    /// a statement about a command whose every input *is* declared: an opcode
+    /// this device does not implement, a shape the contract does not admit, a
+    /// range past its resource. Nothing that arrives later changes it.
+    ///
+    /// Retrying the second class is the failure this exists to stop. A
+    /// conformance boot met one blit whose destination texture was surface
+    /// backed, refused it at projection, and re-offered the same bytes 278 795
+    /// times over ten minutes --- the channel's head never advanced, so every
+    /// command the guest issued behind it was lost and the battery ran against
+    /// a dead channel while every counter in the device read healthy. One
+    /// unimplemented command must cost one command.
+    ///
+    /// The arms that answer `false` outright hold no name a later packet
+    /// supplies: they describe this packet's own encoder state, its opcodes,
+    /// or geometry it carries inline. The ones that delegate carry a
+    /// resolution refusal that mixes both classes, and each of those types
+    /// answers for itself.
+    pub(crate) fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::Event(_)
+            | Self::Fence(_)
+            | Self::TextureBlit(_)
+            | Self::ComputeState(_)
+            | Self::RenderState(_)
+            | Self::RenderTessellation(_)
+            | Self::RenderTile(_)
+            | Self::RenderUnresolved { .. }
+            | Self::ComputeUnresolved { .. }
+            | Self::BlitUnresolved { .. } => false,
+            Self::Participation(reason) => reason.awaits_declaration(),
+            Self::Barrier(reason) => reason.awaits_declaration(),
+            Self::BufferBlit(reason) => reason.awaits_declaration(),
+            Self::ImageBlit(reason) => reason.awaits_declaration(),
+            Self::IndirectCommand(reason) => reason.awaits_declaration(),
+            Self::RenderDraw(reason) => reason.awaits_declaration(),
+            Self::ComputeDispatch(reason) => reason.awaits_declaration(),
+            Self::ComputeControlFlow(reason) => reason.awaits_declaration(),
+            Self::ComputeIcb(reason) => reason.awaits_declaration(),
+            Self::RenderIcb(reason) => reason.awaits_declaration(),
+            Self::Info(reason) => reason.awaits_declaration(),
+        }
+    }
+}
+
+impl ReplacementParticipationResolutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::ResourceUnavailable { .. } | Self::HeapUnavailable { .. } => true,
+            Self::NotParticipationRecord | Self::MissingResourceUsage => false,
+        }
+    }
+}
+
+impl ReplacementBarrierResolutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::ResourceUnavailable { .. } => true,
+            Self::NotBarrierRecord
+            | Self::TextureBarrierContractUnresolved
+            | Self::UnsupportedProducerStages(_)
+            | Self::UnsupportedConsumerStages(_)
+            | Self::UnsupportedScope(_)
+            | Self::UnidentifiedRenderField(_) => false,
+        }
+    }
+}
+
+impl ReplacementBufferBlitResolutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::Range { reason, .. } => reason.awaits_declaration(),
+            Self::NotBufferBlit | Self::UnalignedWordPattern(_) | Self::OverlappingCopy => false,
+        }
+    }
+}
+
+impl ReplacementImageBlitResolutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::Buffer { reason, .. } => reason.awaits_declaration(),
+            Self::Texture { reason, .. } => reason.awaits_declaration(),
+            Self::NotImageCopy
+            | Self::Options(_)
+            | Self::AspectUnsupported { .. }
+            | Self::TexelWidthMismatch { .. }
+            | Self::OverlappingImageCopy
+            | Self::LevelOverflow(_)
+            | Self::SliceOverflow(_)
+            | Self::VolumeSliceConstraint
+            | Self::SubresourceGeometryMismatch => false,
+        }
+    }
+}
+
+impl ReplacementIndirectCommandResolutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::Resolve(reason) => reason.awaits_declaration(),
+            Self::NotIndirectCommand | Self::UnknownRangeOpcode(_) => false,
+        }
+    }
+}
+
+impl ReplacementRenderPassResolutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::Attachment { reason, .. } => reason.awaits_declaration(),
+            Self::OutsideEncoder
+            | Self::PassAction { .. }
+            | Self::StoreActionOptionsUnsupported { .. }
+            | Self::ResolveFilterUnsupported { .. }
+            | Self::ResolveMismatch(_)
+            | Self::DepthStencilAttachmentMismatch => false,
+        }
+    }
+}
+
+impl ReplacementRenderDrawResolutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    ///
+    /// A `*Missing` arm is not a wait: it says the guest's own encoder state
+    /// bound nothing at that index, which this packet already fixes or never
+    /// will. Only a binding that resolved to a named object and could not
+    /// find it defers.
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::Pipeline(reason) => reason.awaits_declaration(),
+            Self::Texture { reason, .. } => reason.awaits_declaration(),
+            Self::Buffer { reason, .. }
+            | Self::VertexBuffer { reason, .. }
+            | Self::IndexBuffer(reason)
+            | Self::IndirectBuffer(reason)
+            | Self::VisibilityBuffer(reason) => reason.awaits_declaration(),
+            Self::Attachment(reason) => reason.awaits_declaration(),
+            Self::NotDraw
+            | Self::OutsideEncoder
+            | Self::PipelineUnbound
+            | Self::PrimitiveTopology(_)
+            | Self::RenderExtentOutOfRange
+            | Self::RenderExtentPastAttachment { .. }
+            | Self::RenderTargetArrayLengthUnsupported { .. }
+            | Self::DepthStencilStateMissing
+            | Self::ReflectedResourceUnrepresented { .. }
+            | Self::ReflectedInterfaceUnrepresented { .. }
+            | Self::SamplerMissing { .. }
+            | Self::SamplerState(_)
+            | Self::SamplerBindingCollision(_)
+            | Self::TextureShape { .. }
+            | Self::TextureShapeMismatch { .. }
+            | Self::TextureAccessUnknown { .. }
+            | Self::StorageImageAccessMissing(_)
+            | Self::StorageImageAccessAmbiguous(_)
+            | Self::TextureBindingCollision { .. }
+            | Self::BufferMissing { .. }
+            | Self::BufferExtentPastBinding { .. }
+            | Self::BufferBindingCollision(_)
+            | Self::VertexAttributeFormat { .. }
+            | Self::VertexStepFunction { .. }
+            | Self::VertexStepRate { .. }
+            | Self::VertexBufferMissing(_)
+            | Self::DynamicVertexStrideOutOfRange { .. }
+            | Self::VertexBindingCollision(_)
+            | Self::IndexType(_)
+            | Self::IndexVertexOffsetOutOfRange
+            | Self::IndexRangeOverflow
+            | Self::IndexedBufferMissing
+            | Self::VisibilityBufferMissing => false,
+        }
+    }
+}
+
+impl ReplacementComputeDispatchResolutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::IndirectBuffer(reason) => reason.awaits_declaration(),
+            Self::Pipeline(reason) => reason.awaits_declaration(),
+            Self::Texture(reason) => reason.awaits_declaration(),
+            Self::NotDirectDispatch
+            | Self::IndirectThreadsRequireGpuWorkgroupConversion { .. }
+            | Self::GridDimensionOutOfRange
+            | Self::GridInvalid
+            | Self::StageInputUnsupported(_)
+            | Self::ImageblockUnsupported(_)
+            | Self::Construction(_) => false,
+        }
+    }
+}
+
+impl ReplacementComputeControlFlowResolutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::PredicateBuffer { reason, .. } => reason.awaits_declaration(),
+            Self::OutsideEncoder { .. } | Self::Unsupported { .. } => false,
+        }
+    }
+}
+
+impl ReplacementComputeIcbPopulationError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::Dispatch { reason, .. } => reason.awaits_declaration(),
+            Self::OutsideEncoder
+            | Self::DecodedRangeMismatch
+            | Self::RenderCommandInComputeEncoder { .. }
+            | Self::Population(_) => false,
+        }
+    }
+}
+
+impl ReplacementComputeIcbExecutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::Population(reason) => reason.awaits_declaration(),
+            Self::ReadPlan(_)
+            | Self::Transport(_)
+            | Self::Decode(_)
+            | Self::IndirectRangeRequiresAsynchronousReadback => false,
+        }
+    }
+}
+
+impl ReplacementRenderIcbDrawError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::Draw(reason) => reason.awaits_declaration(),
+            Self::InheritedPipelineOverride
+            | Self::PipelineMissing
+            | Self::InheritedBuffersOverride
+            | Self::BufferIndexOverflow(_)
+            | Self::ObjectOrMeshBuffer
+            | Self::ObjectThreadgroupMemory
+            | Self::GeometryOutOfRange
+            | Self::UnsupportedDraw => false,
+        }
+    }
+}
+
+impl ReplacementRenderIcbPopulationError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::Draw { reason, .. } => reason.awaits_declaration(),
+            Self::OutsideEncoder
+            | Self::DecodedRangeMismatch
+            | Self::ComputeCommandInRenderEncoder { .. }
+            | Self::Population(_) => false,
+        }
+    }
+}
+
+impl ReplacementRenderIcbExecutionError {
+    /// See [`ReplacementOperationProjectionError::awaits_declaration`].
+    pub(crate) const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::Population(reason) => reason.awaits_declaration(),
+            Self::ReadPlan(_)
+            | Self::Transport(_)
+            | Self::Decode(_)
+            | Self::IndirectRangeRequiresAsynchronousReadback => false,
+        }
+    }
+}
+
 pub(crate) type ProjectedReplacementOperation<Completion> = reims_vgpu_core::ResolvedOperation<
     reims_vgpu_core::ResolvedRenderDispatch,
     reims_vgpu_core::ResolvedComputeDispatch,

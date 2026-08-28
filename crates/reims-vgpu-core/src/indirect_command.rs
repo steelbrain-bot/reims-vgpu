@@ -1659,6 +1659,22 @@ pub enum IndirectCommandResolutionError {
     ArgumentsRangePastResource,
 }
 
+impl IndirectCommandResolutionError {
+    /// See [`crate::TextureViewResolveError::awaits_declaration`].
+    #[must_use]
+    pub const fn awaits_declaration(self) -> bool {
+        match self {
+            Self::SourceAbsent | Self::DestinationAbsent | Self::ArgumentsAbsent => true,
+            Self::SourceRangeOverflow
+            | Self::SourceRangePastCapacity
+            | Self::DestinationRangeOverflow
+            | Self::DestinationRangePastCapacity
+            | Self::ArgumentsRangeOverflow
+            | Self::ArgumentsRangePastResource => false,
+        }
+    }
+}
+
 fn resolve_range(
     range: IndirectCommandRange,
     capacity: u32,

@@ -115,6 +115,47 @@ pub enum TextureViewResolveError {
     ViewRangeOutsideBase(AnyResourceId),
 }
 
+impl TextureViewResolveError {
+    /// Whether re-resolving this view against a later packet could answer
+    /// differently.
+    ///
+    /// A refusal that names something not yet declared -- a resource, a
+    /// descriptor, a base declaration, a plane's geometry -- is a wait: the
+    /// packet that supplies it may still arrive. Every other arm is a
+    /// statement about a chain that *is* fully declared, and asking again
+    /// returns the same answer forever.
+    ///
+    /// The distinction is not cosmetic. A consumer that retries a refusal of
+    /// the second kind at the head of its channel never advances, so one
+    /// unsupported view costs every command behind it rather than costing
+    /// itself.
+    #[must_use]
+    pub const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::ResourceAbsent(_)
+            | Self::DescriptorAbsent(_)
+            | Self::PlaneGeometryAbsent(_)
+            | Self::BaseDescriptorAbsent(_)
+            | Self::BaseDeclarationAbsent(_) => true,
+            Self::NotTextureView(_)
+            | Self::DescriptorKindMismatch(_)
+            | Self::ParentCount(_)
+            | Self::EmptyRange(_)
+            | Self::UnknownTextureType(_)
+            | Self::UnsupportedTextureType(_)
+            | Self::InvalidSwizzle(_)
+            | Self::LevelOverflow
+            | Self::LevelOutOfRange
+            | Self::SliceOverflow
+            | Self::SliceOutOfRange
+            | Self::ChainOverflow(_)
+            | Self::UnsupportedBaseDescriptor(_)
+            | Self::EmptyBaseGeometry(_)
+            | Self::ViewRangeOutsideBase(_) => false,
+        }
+    }
+}
+
 fn texture_declaration_view_facts(
     declaration: reims_vgpu_protocol::TextureDeclaration,
     base: AnyResourceId,

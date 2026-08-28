@@ -496,6 +496,26 @@ pub enum InfoResolutionError {
     RateParameterDestination(InfoReplyResolutionError),
 }
 
+impl InfoResolutionError {
+    /// See [`crate::TextureViewResolveError::awaits_declaration`].
+    ///
+    /// Every `*Absent` arm names an object whose declaration may still arrive.
+    /// A reply-target refusal is about a range the guest named in this packet
+    /// and does not change.
+    #[must_use]
+    pub const fn awaits_declaration(&self) -> bool {
+        match self {
+            Self::ResourceAbsent(_)
+            | Self::HeapAbsent
+            | Self::SamplerAbsent
+            | Self::RenderPipelineAbsent
+            | Self::ComputePipelineAbsent
+            | Self::RateMapAbsent => true,
+            Self::Reply(_) | Self::RateParameterDestination(_) => false,
+        }
+    }
+}
+
 /// Namespace and storage owner used by info resolution.
 ///
 /// Implementations resolve only live generations. `resolve_reply` additionally
