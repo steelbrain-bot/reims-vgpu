@@ -3796,15 +3796,20 @@ impl ReplacementExecResourceManifest {
                 .filter(|planned| planned.backing == backing)
                 .flat_map(|planned| planned.permitted_pending_writes.iter().copied())
                 .collect::<std::collections::BTreeSet<_>>();
-            unpermitted_pending_write_over(resources, backing, &request.regions, &permitted).map(
-                |(representation, write)| {
-                    ReplacementUploadManifestStaleness::UnpermittedPendingWrite {
-                        backing,
-                        representation,
-                        write,
-                    }
-                },
+            unpermitted_pending_write_over(
+                resources,
+                self.transaction,
+                backing,
+                &request.regions,
+                &permitted,
             )
+            .map(|(representation, write)| {
+                ReplacementUploadManifestStaleness::UnpermittedPendingWrite {
+                    backing,
+                    representation,
+                    write,
+                }
+            })
         })
     }
 }
@@ -4997,8 +5002,18 @@ fn report_content_synchronization_satisfied(
 /// Asked of every designated view rather than of the backing, because a write
 /// is outstanding against a representation and a backing carries one per
 /// texture declared over its range.
+///
+/// `consumer` is the transaction that would read past the write, and a write it
+/// produces itself is not one of these: the synchronization is the queue prefix
+/// for that transaction's own operations and runs ahead of them, so its own
+/// later write is not something it can be waiting for. This is the same
+/// statement `reims_vgpu_core::prepare_content_synchronization` makes when it
+/// decides whether to refuse, and the two must agree --- a manifest judged
+/// stale for a write the refusal does not raise would re-preflight once a tick
+/// forever.
 pub(crate) fn unpermitted_pending_write_over(
     resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
+    consumer: TransactionId,
     backing: reims_vgpu_protocol::BackingId,
     regions: &[reims_vgpu_core::BackingRegion],
     permitted: &std::collections::BTreeSet<reims_vgpu_core::GpuWriteId>,
@@ -5016,7 +5031,7 @@ pub(crate) fn unpermitted_pending_write_over(
                 .ok()?
                 .iter()
                 .copied()
-                .find(|write| !permitted.contains(write))
+                .find(|write| write.transaction() != Some(consumer) && !permitted.contains(write))
                 .map(|write| (representation, write))
         })
 }

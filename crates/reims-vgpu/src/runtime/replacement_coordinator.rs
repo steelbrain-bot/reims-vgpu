@@ -9727,11 +9727,13 @@ mod tests {
             .unwrap();
         let regions = [reims_vgpu_core::BackingRegion::Whole];
         let empty = std::collections::BTreeSet::new();
+        let consumer = reims_vgpu_protocol::TransactionId::new(5);
 
         // Before anything is planned there is nothing to permit.
         assert_eq!(
             crate::runtime::replacement_session::unpermitted_pending_write_over(
                 runtime.execution().resources(),
+                consumer,
                 backing,
                 &regions,
                 &empty,
@@ -9751,6 +9753,7 @@ mod tests {
         assert_eq!(
             crate::runtime::replacement_session::unpermitted_pending_write_over(
                 runtime.execution().resources(),
+                consumer,
                 backing,
                 &regions,
                 &empty,
@@ -9762,11 +9765,63 @@ mod tests {
         assert_eq!(
             crate::runtime::replacement_session::unpermitted_pending_write_over(
                 runtime.execution().resources(),
+                consumer,
                 backing,
                 &regions,
                 &std::iter::once(reims_vgpu_core::GpuWriteId::from(write)).collect(),
             ),
             None
+        );
+
+        // A write the consumer produces itself is in no permitted set either,
+        // and it is not a wait: the synchronization is that transaction's own
+        // queue prefix and runs ahead of the operation that will land it.
+        runtime
+            .execution_mut()
+            .resources_mut()
+            .complete_gpu_write(backing, write, representation)
+            .unwrap();
+        let own = reims_vgpu_core::GpuWriteId::operation(
+            consumer,
+            reims_vgpu_protocol::SubmissionId::new(10),
+            1,
+        );
+        runtime
+            .execution_mut()
+            .resources_mut()
+            .plan_gpu_write(backing, own, representation, regions)
+            .unwrap();
+        assert_eq!(
+            crate::runtime::replacement_session::unpermitted_pending_write_over(
+                runtime.execution().resources(),
+                consumer,
+                backing,
+                &regions,
+                &empty,
+            ),
+            None
+        );
+
+        // Another transaction's write over the same view still is one.
+        let other = reims_vgpu_core::GpuWriteId::operation(
+            reims_vgpu_protocol::TransactionId::new(6),
+            reims_vgpu_protocol::SubmissionId::new(12),
+            0,
+        );
+        runtime
+            .execution_mut()
+            .resources_mut()
+            .plan_gpu_write(backing, other, representation, regions)
+            .unwrap();
+        assert_eq!(
+            crate::runtime::replacement_session::unpermitted_pending_write_over(
+                runtime.execution().resources(),
+                consumer,
+                backing,
+                &regions,
+                &empty,
+            ),
+            Some((representation, other))
         );
     }
 

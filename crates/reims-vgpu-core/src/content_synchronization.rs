@@ -246,9 +246,30 @@ pub fn prepare_content_synchronization<T>(
                 if let Some(write) = pending
                     .iter()
                     .find(|write| {
-                        permitted_pending
-                            .get(&backing)
-                            .is_none_or(|permitted| !permitted.contains(write))
+                        // A write this very transaction produces is not
+                        // something it can wait for. The synchronization being
+                        // planned is the *queue prefix* for this transaction's
+                        // own operations, so it runs ahead of them by
+                        // construction and nothing about it depends on a write
+                        // those operations have not issued yet. Waiting is
+                        // unsatisfiable rather than slow: the write lands only
+                        // once this transaction submits, and it cannot submit
+                        // while its own preparation is refused for it.
+                        //
+                        // The window is real and does not need a stale
+                        // manifest to open it. Resource-state preparation runs
+                        // before this and plans an operation write for every
+                        // `set_host_valid` target, so a caller that computed
+                        // its permitted set from the pending writes it could
+                        // see -- correctly, and on this same tick -- hands over
+                        // a set that cannot name a write that did not exist
+                        // when it was taken. A driven boot held a channel on
+                        // exactly this shape, with `consumer` and the write's
+                        // own producer the same transaction and `permits` zero.
+                        write.transaction() != Some(transaction)
+                            && permitted_pending
+                                .get(&backing)
+                                .is_none_or(|permitted| !permitted.contains(write))
                     })
                     .copied()
                 {
@@ -731,6 +752,91 @@ mod tests {
         assert!(prepared.transfers().is_empty());
         assert!(prepared.host_ingresses().is_empty());
         cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
+    }
+
+    /// A transaction does not wait for a GPU write it produces itself.
+    ///
+    /// The synchronization is that transaction's own queue prefix and runs
+    /// ahead of the operations that will land the write, so the write is not
+    /// something the prefix can be waiting for --- and waiting is
+    /// unsatisfiable rather than slow, because the write lands only once the
+    /// transaction submits and it cannot submit while its own preparation is
+    /// refused for it.
+    ///
+    /// The window needs no stale caller to open it. Resource-state preparation
+    /// runs before this and plans an operation write for every
+    /// `set_host_valid` target, so a caller that computed its permitted set
+    /// from the writes it could see --- correctly, on this same tick --- hands
+    /// over a set that cannot name a write that did not exist when it was
+    /// taken.
+    #[test]
+    fn a_transaction_does_not_wait_for_a_gpu_write_of_its_own() {
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let region = BackingRegion::Linear(LinearRange::new(0, 64).unwrap());
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([region]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        resources
+            .create_representation(backing, RepresentationRoute::HostStagingEndpoint, ())
+            .unwrap();
+        let destination = resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostStagingTransfer {
+                    working: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                BackingView::Bytes,
+                (),
+            )
+            .unwrap();
+
+        let consumer = TransactionId::new(11);
+        let submission = SubmissionId::new(23);
+        let own = crate::GpuWriteId::operation(consumer, submission, 1);
+        resources
+            .plan_gpu_write(backing, own, destination, [region])
+            .unwrap();
+
+        // The consumer's own write is outstanding and no permitted set names
+        // it, and the synchronization is prepared regardless.
+        let prepared = prepare_content_synchronization(
+            &mut resources,
+            consumer,
+            [ContentSynchronizationRequest {
+                backing,
+                regions: Box::new([region]),
+                permitted_pending_writes: Box::new([]),
+            }],
+        )
+        .unwrap();
+        assert_eq!(prepared.host_ingresses().len(), 1);
+        cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
+
+        // Another transaction reading the same region still waits for it.
+        assert_eq!(
+            prepare_content_synchronization(
+                &mut resources,
+                TransactionId::new(12),
+                [ContentSynchronizationRequest {
+                    backing,
+                    regions: Box::new([region]),
+                    permitted_pending_writes: Box::new([]),
+                }],
+            ),
+            Err(ContentSynchronizationError::PendingGpuWrite {
+                backing,
+                representation: destination,
+                write: own,
+                consumer: TransactionId::new(12),
+                permits: 0,
+            })
+        );
     }
 
     #[test]
