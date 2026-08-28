@@ -108,19 +108,20 @@ pub(crate) enum ReplacementObjectRepresentationPreparationError {
 impl ReplacementObjectRepresentationPreparationError {
     /// See [`crate::runtime::replacement_session::ReplacementRepresentationConstructionError::is_unimplemented_case`].
     ///
-    /// Only construction carries a declared refusal. Everything else here is a
-    /// task, page, mapping or backing this device is waiting to learn about,
-    /// and a later packet on another channel is exactly what delivers it.
+    /// Construction carries a declared refusal and a backing refusal says
+    /// whether what it needs was destroyed. Everything else here is a task,
+    /// page or mapping this device is waiting to learn about, and a later
+    /// packet on another channel is exactly what delivers it.
     const fn is_unimplemented_case(&self) -> bool {
         match self {
             Self::Construction(reason) => reason.is_unimplemented_case(),
+            Self::BackingUnavailable { reason, .. } => reason.is_terminal(),
             Self::SurfaceDescriptorUnavailable(_)
             | Self::TaskUnavailable(_)
             | Self::UnsupportedPageShift(_)
             | Self::PageCountOverflow(_)
             | Self::PageAddressOverflow { .. }
             | Self::PageUnmapped { .. }
-            | Self::BackingUnavailable { .. }
             | Self::GuestMap(_)
             | Self::GuestWindow(_) => false,
         }
@@ -9412,6 +9413,120 @@ mod tests {
         prepare_backing_representation(&mut runtime, &mut host, shift, texture.backing, None)
             .unwrap();
         assert!(runtime.resource_has_execution_representation(texture.resource));
+    }
+
+    /// A backing the guest has retired is refused, not retried.
+    ///
+    /// A `BackingId` is minted with its storage node, so a repair that cannot
+    /// find one is looking at a backing that was destroyed, not one that has
+    /// yet to arrive. The same holds for the resource identity a placed range
+    /// resolves its guest address through, which is generational. None of the
+    /// three comes back -- but the whole backing-unavailable family was
+    /// classified as a wait. One such refusal held a deferred EXEC at the head
+    /// of its channel for 122 000 retries on a driven macos-13 boot, with
+    /// every other pipeline owner reading zero and the census otherwise
+    /// healthy.
+    #[test]
+    fn a_repair_named_on_a_retired_backing_is_refused_rather_than_retried() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(11);
+        runtime.define_task(task, 0x40_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        // One guest page of buffer, with the texture placed part-way into it.
+        let backing_pfn = 0x200u64;
+        host.map_range(9u64 << shift, 1usize << shift, 0);
+        host.write_gpa(root + backing_pfn * 4, &9u32.to_le_bytes())
+            .unwrap();
+
+        let buffer =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+                &mut runtime,
+                shift,
+                task,
+                1,
+                reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                    reims_vgpu_protocol::BufferDescriptor {
+                        allocation_size: 1 << shift,
+                        handle: u32::try_from(backing_pfn).unwrap(),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+
+        let texture =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_buffer_texture(
+                &mut runtime,
+                task,
+                2,
+                reims_vgpu_protocol::ResourceDescriptor::BufferTexture(
+                    reims_vgpu_protocol::BufferTextureDescriptor {
+                        new_texture_ref: 2,
+                        buffer_ref: 1,
+                        // Part-way into the buffer: the range the texture owns
+                        // begins where the guest said it does.
+                        offset: 2048,
+                        bytes_per_row: 512,
+                        desc: reims_vgpu_protocol::TextureDeclaration {
+                            texture_type: reims_vgpu_protocol::TextureType::D2,
+                            framebuffer_only: false,
+                            is_drawable: false,
+                            write_swizzle_enabled: None,
+                            allow_gpu_optimized_contents: false,
+                            usage: reims_vgpu_protocol::TEXTURE_USAGE_SHADER_READ,
+                            pixel_format: 80,
+                            width: 100,
+                            height: 4,
+                            depth: 1,
+                            mipmap_level_count: 1,
+                            sample_count: 1,
+                            array_length: 1,
+                            resource_options: 0,
+                            protection_options: 0,
+                            swizzle: None,
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+        assert_ne!(texture.backing, buffer.backing);
+
+        // The guest deletes the texture and the range backing it owned alone
+        // is retired. A deferred EXEC admitted before the delete still names
+        // that backing, so the repair is still asked for it.
+        runtime
+            .apply_resource_lifecycle(
+                reims_vgpu_core::ResolvedResourceLifecycle::ReleaseResource {
+                    resource: texture.resource,
+                },
+            )
+            .unwrap();
+        runtime
+            .apply_resource_lifecycle(reims_vgpu_core::ResolvedResourceLifecycle::RetireBacking {
+                backing: texture.backing,
+            })
+            .unwrap();
+        let reason =
+            prepare_backing_representation(&mut runtime, &mut host, shift, texture.backing, None)
+                .expect_err("the range's parent is gone, so there is no address to materialize");
+        assert!(
+            reason.is_unimplemented_case(),
+            "a retired backing is refused, not re-offered: {reason:?}"
+        );
     }
 
     /// Two textures over one registered surface plane are two images, and the

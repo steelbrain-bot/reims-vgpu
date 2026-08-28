@@ -16230,12 +16230,43 @@ pub(crate) struct ReplacementTaskAddressMaterializationFacts {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementTaskAddressMaterializationRefusal {
+    /// The backing itself is gone. A `BackingId` is minted with its storage
+    /// node and outlives every owner, so this says the backing was retired --
+    /// nothing brings it back under the same identity.
     StorageAbsent,
+    /// A buffer-range backing outlived the buffer resource it was placed on.
+    /// Resource identities are generational and never reused, so this one is
+    /// gone for good.
+    ParentAbsent,
+    /// The parent buffer is still declared but its own storage was retired.
+    ParentStorageAbsent,
     UnservedStorageClass(reims_vgpu_core::StorageClass),
     NoDescribedOwner,
     /// A texture placed over a buffer reaches past the guest allocation the
     /// buffer names.
     RangePastParent,
+}
+
+impl ReplacementTaskAddressMaterializationRefusal {
+    /// Whether asking again could ever answer differently.
+    ///
+    /// The three absent arms name something that existed and was destroyed:
+    /// a retired backing, a released resource, a retired parent storage. None
+    /// of the three is recreated under the identity that named it, so the
+    /// preparation this refuses can only ever refuse again. Re-offering it
+    /// held one deferred EXEC at the head of its channel for 122 000 retries
+    /// on a driven macos-13 boot, with every other pipeline owner reading
+    /// zero.
+    ///
+    /// The rest keep the retry. `NoDescribedOwner` in particular is a wait: a
+    /// texture declared over the range on a later packet joins the backing's
+    /// owners and the next attempt lands.
+    pub(crate) const fn is_terminal(&self) -> bool {
+        match self {
+            Self::StorageAbsent | Self::ParentAbsent | Self::ParentStorageAbsent => true,
+            Self::UnservedStorageClass(_) | Self::NoDescribedOwner | Self::RangePastParent => false,
+        }
+    }
 }
 
 impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
@@ -16285,11 +16316,11 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         };
         let parent = graph
             .resource(buffer)
-            .ok_or(ReplacementTaskAddressMaterializationRefusal::StorageAbsent)?;
+            .ok_or(ReplacementTaskAddressMaterializationRefusal::ParentAbsent)?;
         let parent_storage = parent
             .storage
             .and_then(|backing| graph.storage(backing))
-            .ok_or(ReplacementTaskAddressMaterializationRefusal::StorageAbsent)?;
+            .ok_or(ReplacementTaskAddressMaterializationRefusal::ParentStorageAbsent)?;
         let reims_vgpu_core::StorageBacking::TaskAddress {
             task,
             address,
