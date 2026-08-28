@@ -3809,6 +3809,40 @@ impl ReplacementExecResourceManifest {
     }
 }
 
+#[cfg(test)]
+impl ReplacementExecResourceManifest {
+    /// A manifest carrying only the content questions, for tests that ask what
+    /// its staleness answers.
+    ///
+    /// Both guest-upload routes ask [`Self::upload_staleness`] before they read
+    /// a manifest, and the answer is a function of the requirements, the
+    /// permits and the live resources alone -- the pipelines, info queries and
+    /// validity a real preflight also fills in reach none of it.
+    pub(crate) fn for_content_questions(
+        requirements: Vec<reims_vgpu_core::ContentSynchronizationRequest>,
+        planned: Vec<reims_vgpu_core::ContentSynchronizationRequest>,
+    ) -> Self {
+        Self {
+            transaction: TransactionId::new(1),
+            submission: SubmissionId::new(1),
+            compute: BTreeMap::new(),
+            render: BTreeMap::new(),
+            info: BTreeMap::new(),
+            validity: BTreeMap::new(),
+            content_requirements: requirements.into_boxed_slice(),
+            content_synchronization: planned.into_boxed_slice(),
+            upload_representations: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn staleness_for_test(
+        &self,
+        resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
+    ) -> Option<ReplacementUploadManifestStaleness> {
+        self.upload_staleness(resources)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ReplacementPreparedExecEnvelope {
     pub resources: PreparedReplacementExecResources,

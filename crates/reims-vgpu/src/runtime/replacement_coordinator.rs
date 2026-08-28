@@ -9770,6 +9770,122 @@ mod tests {
         );
     }
 
+    /// A manifest's own staleness verdict names the unpermitted write, so
+    /// every route that asks it before reading a manifest is told.
+    ///
+    /// The two guest-upload routes -- the initial one and the retained suffix
+    /// -- both ask this one question, and it is the question rather than the
+    /// route that has to carry the write: leaving it to the suffix is what let
+    /// a boot hold a channel with the synchronization's `consumer` and the
+    /// write's own producer the *same* transaction and no permitted set
+    /// computed at all.
+    #[test]
+    fn a_manifest_is_stale_for_a_write_its_permits_do_not_name() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(43);
+        runtime.define_task(task, 0x10_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        host.map_range(9u64 << shift, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        host.write_gpa(root + 0x10 * 4, &9u32.to_le_bytes())
+            .unwrap();
+        let declaration =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+                &mut runtime,
+                shift,
+                task,
+                77,
+                reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                    reims_vgpu_protocol::BufferDescriptor {
+                        allocation_size: 64,
+                        handle: 0x10,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing, None)
+            .unwrap();
+
+        let backing = declaration.backing;
+        let representation = runtime
+            .execution()
+            .resources()
+            .any_designated_representation(backing)
+            .unwrap();
+        let requirement = || reims_vgpu_core::ContentSynchronizationRequest {
+            backing,
+            regions: Box::new([reims_vgpu_core::BackingRegion::Whole]),
+            permitted_pending_writes: Box::new([]),
+        };
+
+        // Nothing is outstanding, so a manifest built over this backing is
+        // readable as it stands.
+        let manifest =
+            crate::runtime::replacement_session::ReplacementExecResourceManifest::for_content_questions(
+                vec![requirement()],
+                vec![requirement()],
+            );
+        assert_eq!(
+            manifest.staleness_for_test(runtime.execution().resources()),
+            None
+        );
+
+        let write = reims_vgpu_protocol::SubmissionId::new(11);
+        runtime
+            .execution_mut()
+            .resources_mut()
+            .plan_gpu_write(
+                backing,
+                write,
+                representation,
+                [reims_vgpu_core::BackingRegion::Whole],
+            )
+            .unwrap();
+
+        // The same manifest, unchanged, is now stale: its permits were taken
+        // before the write was planned and cannot grow to name it.
+        assert_eq!(
+            manifest.staleness_for_test(runtime.execution().resources()),
+            Some(
+                crate::runtime::replacement_session::ReplacementUploadManifestStaleness::UnpermittedPendingWrite {
+                    backing,
+                    representation,
+                    write: write.into(),
+                }
+            )
+        );
+
+        // A manifest whose permits do name it is readable again, which is what
+        // the re-preflight both routes run produces.
+        let refreshed =
+            crate::runtime::replacement_session::ReplacementExecResourceManifest::for_content_questions(
+                vec![requirement()],
+                vec![reims_vgpu_core::ContentSynchronizationRequest {
+                    backing,
+                    regions: Box::new([reims_vgpu_core::BackingRegion::Whole]),
+                    permitted_pending_writes: Box::new([write.into()]),
+                }],
+            );
+        assert_eq!(
+            refreshed.staleness_for_test(runtime.execution().resources()),
+            None
+        );
+    }
+
     #[test]
     fn a_physical_replacement_reinstalls_the_backing_execution_representation() {
         use crate::runtime::host::HostMemory;
