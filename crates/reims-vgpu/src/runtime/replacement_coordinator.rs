@@ -8181,8 +8181,19 @@ impl ReplacementDeviceCoordinator<()> {
                 // still owns the ring head would be re-offered from that head
                 // and admitted a second time.
                 if let Some(reservations) = reservations {
+                    let transaction = reservations.transaction();
                     match self.runtime.abandon_refused_exec(reservations, ()) {
-                        Ok(facts) => self.publications.enqueue(facts),
+                        Ok(facts) => {
+                            if let Some(transaction) = transaction {
+                                self.publications.enqueue(facts);
+                                self.abandoned_transactions += 1;
+                                crate::observe::fail(format!(
+                                    "replacement_refused_exec_abandoned channel={} opcode={opcode:#x} transaction={}",
+                                    channel.get(),
+                                    transaction.get()
+                                ));
+                            }
+                        }
                         Err(reason) => crate::observe::fail(format!(
                             "replacement_refused_exec_abandon_refused channel={} opcode={opcode:#x} reason={reason:?}",
                             channel.get()
