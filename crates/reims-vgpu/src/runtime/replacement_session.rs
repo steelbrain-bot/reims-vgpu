@@ -7730,6 +7730,36 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         &mut self.execution
     }
 
+    /// Every live transaction the runtime calls semantically ready that no
+    /// coordinator has submitted, newest last.
+    ///
+    /// A transaction in this set is the one that says why a whole domain
+    /// stopped. Its prerequisites are met, nothing has refused it -- so it
+    /// appears in no failure queue and on no blocked-drain head -- and it holds
+    /// its position in the submission order, which every later transaction on
+    /// that domain then refuses behind with `NotSubmissionHead`, and which the
+    /// whole published-fact retirement chain then waits on.
+    ///
+    /// The per-transaction record that carries the same fact is emitted on
+    /// first sight of each distinct state, so it stops the moment a transaction
+    /// stops changing --- which is exactly when this question starts being
+    /// asked. This is the live form.
+    pub fn ready_unsubmitted_transactions(
+        &self,
+    ) -> Vec<(
+        reims_vgpu_protocol::TransactionId,
+        reims_vgpu_protocol::ChannelId,
+    )> {
+        self.execution
+            .runtime()
+            .diagnostics()
+            .into_vec()
+            .into_iter()
+            .filter(|diagnostic| diagnostic.semantic_ready && !diagnostic.submitted)
+            .map(|diagnostic| (diagnostic.transaction, diagnostic.channel))
+            .collect()
+    }
+
     pub fn transaction_state_diagnostics(&self) -> Vec<(u64, String)> {
         self.execution
             .runtime()

@@ -6813,6 +6813,15 @@ impl ReplacementDeviceCoordinator<()> {
         self.runtime.transaction_state_diagnostics()
     }
 
+    /// See [`ReplacementRuntimeSession::ready_unsubmitted_transactions`].
+    pub fn ready_unsubmitted_diagnostics(&self) -> Vec<String> {
+        self.runtime
+            .ready_unsubmitted_transactions()
+            .into_iter()
+            .map(|(transaction, channel)| format!("{}@{}", transaction.get(), channel.get()))
+            .collect()
+    }
+
     pub fn blocked_drain_diagnostics(&self) -> Vec<String> {
         self.blocked_drains
             .iter()
@@ -7099,24 +7108,45 @@ impl ReplacementDeviceCoordinator<()> {
             .publication_failure
             .map(|reason| format!("{reason:?}"))
             .unwrap_or_default();
-        let publish_retire_head = self
+        // Every retained retirement, not the head. `retry_publication_retirement`
+        // offers the whole queue each pass and repeats while anything moved, so
+        // a queue that stops draining is stuck at *all* of its entries at once
+        // and the head's reason is the least informative of them: the head is
+        // by construction the earliest-published fact, which is the one with
+        // the most dependents. A boot spent its whole life on
+        // `401:Coordination(Retire(StillRequired))` while seventeen later
+        // entries -- including whichever one has no dependents and is therefore
+        // the actual tail of the chain -- went unreported.
+        let publish_retire = self
             .publication_retirement_failures
-            .front()
+            .iter()
             .map(|failure| {
-                format!(
-                    "{}:{:?}",
-                    failure.published.0.transaction.get(),
-                    failure.reason
-                )
+                let transaction = failure.published.0.transaction;
+                // Who is holding it, not just that somebody is. A chain of
+                // published facts refuses at every entry at once, and the
+                // identities are what point at the one transaction at the tail
+                // that never completed.
+                let dependents = self
+                    .runtime
+                    .execution()
+                    .runtime()
+                    .dependents(transaction)
+                    .iter()
+                    .map(|dependent| dependent.get().to_string())
+                    .collect::<Vec<_>>()
+                    .join("+");
+                format!("{}:{:?}({dependents})", transaction.get(), failure.reason)
             })
-            .unwrap_or_default();
+            .collect::<Vec<_>>()
+            .join(",");
+        let ready_unsubmitted = self.ready_unsubmitted_diagnostics().join(",");
         let blocked_head = self
             .blocked_drain_diagnostics()
             .first()
             .cloned()
             .unwrap_or_default();
         crate::observe::off(format!(
-            "replacement_pipeline_stalls cpu_live={} cpu_failed=[{cpu_failed}] cpu_publications={} timeline_observations={timeline_observations} timeline_semantics={timeline_semantics} abandoned={} refused_packets={} blocked_retries={} blocked_head=[{blocked_head}] upload_resume={} upload_continuation={} indirect_resume={} accepted_routing={} publication_retire={} publish_fail=[{publish_fail}] publish_retire_head=[{publish_retire_head}] cleanup_dispatch={} cleanup_completion={} mmio={} continuing_uploads={} continuing_indirects={} suffix_repairs={}/{}/{}/{}",
+            "replacement_pipeline_stalls cpu_live={} cpu_failed=[{cpu_failed}] cpu_publications={} timeline_observations={timeline_observations} timeline_semantics={timeline_semantics} abandoned={} refused_packets={} blocked_retries={} blocked_head=[{blocked_head}] upload_resume={} upload_continuation={} indirect_resume={} accepted_routing={} publication_retire={} publish_fail=[{publish_fail}] publish_retire=[{publish_retire}] ready_unsubmitted=[{ready_unsubmitted}] cleanup_dispatch={} cleanup_completion={} mmio={} continuing_uploads={} continuing_indirects={} suffix_repairs={}/{}/{}/{}",
             self.cpu.live_packets(),
             self.cpu.pending_publications(),
             self.abandoned_transactions,

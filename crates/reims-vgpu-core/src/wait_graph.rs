@@ -60,6 +60,8 @@ pub enum WaitGraphError {
 pub enum WaitGraphRetireError {
     UnknownTransaction,
     NotCompleted,
+    /// Some transaction still names this one as a prerequisite and must retire
+    /// before it can. Ask [`WaitGraph::dependents`] which.
     StillRequired,
 }
 
@@ -280,6 +282,23 @@ impl WaitGraph {
             .unwrap_or_default()
     }
 
+    /// The transactions that name this one as a prerequisite and so hold its
+    /// retirement.
+    ///
+    /// [`WaitGraphRetireError::StillRequired`] answers yes or no, which is the
+    /// right shape for a decision and the wrong one for a diagnostic. A
+    /// retirement queue that stops draining refuses at every entry at once, and
+    /// "somebody still requires this" repeated eighteen times says only that
+    /// the set is stuck; the identities are what say whether it is a chain
+    /// waiting on one uncompleted tail or something the graph should never have
+    /// admitted.
+    pub fn dependents(&self, transaction: TransactionId) -> Box<[TransactionId]> {
+        self.nodes
+            .get(&transaction)
+            .map(|node| node.dependents.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     pub fn prerequisites(&self, transaction: TransactionId) -> Box<[ResolvedWaitDependency]> {
         self.nodes
             .get(&transaction)
@@ -480,6 +499,10 @@ mod tests {
         assert_eq!(
             graph.retire(TransactionId::new(1)),
             Err(WaitGraphRetireError::StillRequired)
+        );
+        assert_eq!(
+            graph.dependents(TransactionId::new(1)),
+            vec![TransactionId::new(2)].into_boxed_slice()
         );
         graph.complete(TransactionId::new(2));
         graph.retire(TransactionId::new(2)).unwrap();

@@ -159,6 +159,11 @@ impl DependencyCoordinator {
         self.waits.prerequisites(transaction)
     }
 
+    /// See [`WaitGraph::dependents`].
+    pub fn dependents(&self, transaction: TransactionId) -> Box<[TransactionId]> {
+        self.waits.dependents(transaction)
+    }
+
     /// Semantic completion satisfies dependents and retires this transaction's
     /// live hazard records. Native lifetime retirement remains separate.
     pub fn semantic_complete(

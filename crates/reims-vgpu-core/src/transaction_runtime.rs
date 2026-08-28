@@ -1201,6 +1201,11 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
         self.transactions.len()
     }
 
+    /// See [`crate::WaitGraph::dependents`].
+    pub fn dependents(&self, transaction: TransactionId) -> Box<[TransactionId]> {
+        self.dependencies.dependents(transaction)
+    }
+
     pub fn diagnostics(&self) -> Box<[TransactionRuntimeDiagnostic]> {
         let ready = self
             .semantic_ready()
@@ -1926,6 +1931,10 @@ mod tests {
             )]
         );
         assert_eq!(runtime.semantic_ready()[0].id(), producer.id);
+        // The producer names who is holding it, which is what a retirement
+        // that refuses `StillRequired` needs and cannot say for itself.
+        assert_eq!(runtime.dependents(producer.id), Box::from([waiter.id]));
+        assert!(runtime.dependents(waiter.id).is_empty());
         runtime.semantic_complete(producer.id, "producer").unwrap();
         assert_eq!(runtime.semantic_ready()[0].id(), waiter.id);
     }
