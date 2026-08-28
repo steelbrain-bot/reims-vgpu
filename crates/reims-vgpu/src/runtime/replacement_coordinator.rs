@@ -2920,6 +2920,43 @@ impl<Semantic> ReplacementCoordinatedPresentPreparation<Semantic> {
             },
         }
     }
+
+    /// Which stage of the trip to the swapchain this present is holding.
+    ///
+    /// A present that never reaches the screen and a present that reaches it
+    /// carrying black are indistinguishable from outside, and the step counters
+    /// cannot separate them either: a stage nothing advances is polled every
+    /// tick and answers `present_wrong_stage` each time, which reads as noise
+    /// rather than as one present stuck since the second it arrived. Reported
+    /// per live present beside the pipeline census, the way a retained upload
+    /// owner's stage already is.
+    pub(crate) const fn stage(&self) -> &'static str {
+        match self {
+            Self::Admitted(_) => "admitted",
+            Self::Ready(_) => "ready",
+            Self::Prepared(_) => "prepared",
+            Self::Allocated(_) => "allocated",
+            Self::NativePreparationFailed(_) => "native_preparation_failed",
+            Self::AllocationFailed(_) => "allocation_failed",
+            Self::PreparedQueue(_) => "prepared_queue",
+            Self::PendingQueue(_) => "pending_queue",
+            Self::QueuePreparationFailed(_) => "queue_preparation_failed",
+            Self::ConsoleQueuePreparationFailed(_) => "console_queue_preparation_failed",
+            #[cfg(feature = "host-window")]
+            Self::WindowQueuePreparationFailed(_) => "window_queue_preparation_failed",
+            Self::QueueEnqueueFailed(_) => "queue_enqueue_failed",
+            Self::DriverRefused { .. } => "driver_refused",
+            Self::AcceptanceFailed(_) => "acceptance_failed",
+            Self::Queued(_) => "queued",
+            Self::TimelineFailed(_) => "timeline_failed",
+            Self::Completed(_) => "completed",
+            Self::NotificationPreparationFailed(_) => "notification_preparation_failed",
+            Self::PreparedNotification(_) => "prepared_notification",
+            Self::NotificationApplyFailed(_) => "notification_apply_failed",
+            Self::Notified(_) => "notified",
+            Self::CompletionFailed(_) => "completion_failed",
+        }
+    }
 }
 
 pub(crate) struct ReplacementCoordinatedPresentPreparationEntry<Semantic> {
@@ -3026,6 +3063,18 @@ impl<Semantic> Default for ReplacementPresentCoordinator<Semantic> {
 pub(crate) struct ReplacementPresentCoordinatorAdmissionFailure<Semantic> {
     pub present: crate::runtime::replacement_session::ReplacementAdmittedPresent<Semantic>,
     pub semantic: Semantic,
+}
+
+impl<Semantic> ReplacementPresentCoordinator<Semantic> {
+    /// Every live present and the stage it is holding.
+    ///
+    /// See [`ReplacementCoordinatedPresentPreparation::stage`].
+    pub(crate) fn stages(&self) -> Vec<(reims_vgpu_protocol::TransactionId, &'static str)> {
+        self.preparations
+            .iter()
+            .map(|(&transaction, entry)| (transaction, entry.state.stage()))
+            .collect()
+    }
 }
 
 impl<Semantic: Clone> ReplacementPresentCoordinator<Semantic> {
@@ -7320,8 +7369,15 @@ impl ReplacementDeviceCoordinator<()> {
             .map(|(transaction, stage)| format!("{}:{stage}", transaction.get()))
             .collect::<Vec<_>>()
             .join(",");
+        let present_stages = self
+            .present
+            .stages()
+            .into_iter()
+            .map(|(transaction, stage)| format!("{}:{stage}", transaction.get()))
+            .collect::<Vec<_>>()
+            .join(",");
         crate::observe::off(format!(
-            "replacement_pipeline_census recordings={} submissions={} uploads={} upload_stages=[{upload_stages}] retired_batches={} upload_suffixes={} suffix_stages=[{suffix_stages}] indirects={} ready_uploads={} ready_indirects={} parked_execs={} parked_uploads={} parked_indirects={} blocked_drains={} drain_failures={} upload_admissions={} upload_resumptions={} batch_retirements={}",
+            "replacement_pipeline_census present_stages=[{present_stages}] recordings={} submissions={} uploads={} upload_stages=[{upload_stages}] retired_batches={} upload_suffixes={} suffix_stages=[{suffix_stages}] indirects={} ready_uploads={} ready_indirects={} parked_execs={} parked_uploads={} parked_indirects={} blocked_drains={} drain_failures={} upload_admissions={} upload_resumptions={} batch_retirements={}",
             self.exec_recordings.live_recordings(),
             self.exec_submissions.live_submissions(),
             self.guest_uploads.live_uploads(),
