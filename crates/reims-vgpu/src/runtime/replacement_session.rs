@@ -2136,7 +2136,10 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                 Some(reims_vgpu_core::WorkingMemoryClass::HostVisible)
             }
             reims_vgpu_core::RepresentationRoute::ImportedGuestTransfer { .. }
-            | reims_vgpu_core::RepresentationRoute::HostStagingTransfer { .. } => None,
+            | reims_vgpu_core::RepresentationRoute::HostStagingTransfer { .. }
+            // A direct alias owns no working memory: the guest's own pages are
+            // the execution object, which is the whole point of the route.
+            | reims_vgpu_core::RepresentationRoute::DirectGuestAlias => None,
             _ => {
                 return Err(
                     ReplacementRepresentationConstructionError::RouteHasNoOwnedWorkingRepresentation(
@@ -2649,6 +2652,51 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         guest: reims_vgpu_memory::GuestWindow,
     ) -> Result<reims_vgpu_protocol::RepresentationId, ReplacementRepresentationConstructionError>
     {
+        let route = self.buffer_guest_window_route(device, resource, &guest)?;
+        self.materialize_buffer_with_guest_window_route(device, resource, guest, route)
+    }
+
+    /// Which route a buffer's guest window takes on this device, separately
+    /// from taking it, so a test can name the cell it means to exercise
+    /// instead of inheriting whichever one the developer's GPU happens to be.
+    pub fn buffer_guest_window_route(
+        &self,
+        device: &ReplacementDeviceEpoch,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+        guest: &reims_vgpu_memory::GuestWindow,
+    ) -> Result<reims_vgpu_core::RepresentationRoute, ReplacementRepresentationConstructionError>
+    {
+        let node = self.epoch.resources.graph().resource(resource).ok_or(
+            ReplacementRepresentationConstructionError::ResourceAbsent(resource),
+        )?;
+        let descriptor = node
+            .descriptor
+            .as_deref()
+            .ok_or(ReplacementRepresentationConstructionError::DescriptorAbsent(resource))?;
+        let reims_vgpu_protocol::ResourceDescriptor::Buffer(descriptor) = descriptor else {
+            return Err(
+                ReplacementRepresentationConstructionError::UnsupportedDescriptor(node.kind),
+            );
+        };
+        let (topology, mut capabilities) = device.representation_environment();
+        let runs = guest.runs().len();
+        // A host-pointer import accepts one contiguous host range, so a guest
+        // allocation that reaches this device as several physical runs has no
+        // import to take and falls to a staging route. A direct alias is that
+        // same import used as the execution object, so it needs the same run.
+        capabilities.imported_transfer &= runs == 1;
+        capabilities.direct_guest_backing &= runs == 1;
+        Self::guest_transfer_route(descriptor.storage_mode(), topology, capabilities)
+    }
+
+    pub fn materialize_buffer_with_guest_window_route(
+        &mut self,
+        device: &ReplacementDeviceEpoch,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+        guest: reims_vgpu_memory::GuestWindow,
+        route: reims_vgpu_core::RepresentationRoute,
+    ) -> Result<reims_vgpu_protocol::RepresentationId, ReplacementRepresentationConstructionError>
+    {
         let node = self.epoch.resources.graph().resource(resource).ok_or(
             ReplacementRepresentationConstructionError::ResourceAbsent(resource),
         )?;
@@ -2674,13 +2722,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                 .ok_or(ReplacementRepresentationConstructionError::StorageAbsent(
                     resource,
                 ))?;
-        let (topology, mut capabilities) = device.representation_environment();
         let runs = guest.runs().len();
-        // A host-pointer import accepts one contiguous host range, so a guest
-        // allocation that reaches this device as several physical runs has no
-        // import to take and falls to a staging route.
-        capabilities.imported_transfer &= runs == 1;
-        let route = Self::guest_transfer_route(descriptor.storage_mode(), topology, capabilities)?;
         // A staging object is not an imported one: it aliases nothing and holds
         // nothing until something plans its upload. Which allocations land
         // there, what storage mode they declare and whether the import was
@@ -2698,6 +2740,27 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             ));
         }
         match route {
+            // The execution object *is* the guest's pages. There is no working
+            // copy to keep in step and therefore no transfer to plan: a GPU
+            // write through this object is a write the guest can already read,
+            // which is what a `Shared` allocation on a unified host means and
+            // is why Metal never asks this device to synchronize one.
+            reims_vgpu_core::RepresentationRoute::DirectGuestAlias => {
+                let imported = device
+                    .create_imported_guest_buffer(&guest.runs()[0].guest)
+                    .map_err(ReplacementRepresentationConstructionError::GuestBufferImport)?;
+                self.epoch
+                    .resources
+                    .create_execution_representation(
+                        backing,
+                        route,
+                        reims_vgpu_core::BackingView::Bytes,
+                        imported,
+                    )
+                    .map_err(|failure| {
+                        ReplacementRepresentationConstructionError::Lifecycle(failure.reason)
+                    })
+            }
             reims_vgpu_core::RepresentationRoute::ImportedGuestTransfer { working } => {
                 if self
                     .epoch
@@ -2841,6 +2904,11 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .resources
             .representation(backing, reims_vgpu_core::GUEST_REPRESENTATION)
             .is_some();
+        // This form carries no guest reference, and an alias is a native
+        // object bound over the guest's own pages: with nothing to bind there
+        // is no alias to build. A resource whose backing does carry one is
+        // materialized through the window form that made it.
+        capabilities.direct_guest_backing = false;
         let route = reims_vgpu_core::plan_representation(storage_mode, topology, capabilities)
             .map_err(ReplacementRepresentationConstructionError::RepresentationPlan)?;
         self.materialize_resource_with_route(device, resource, route)
@@ -3112,6 +3180,7 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .expect("a validated surface-plane layout carries its native declaration");
         let (topology, mut capabilities) = device.representation_environment();
         capabilities.imported_transfer = false;
+        capabilities.direct_guest_backing = false;
         let route = Self::guest_transfer_route(
             reims_vgpu_protocol::StorageMode::Shared,
             topology,
@@ -3278,6 +3347,11 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
         let (declaration, _) = self.texture_layout_facts(resource)?;
         let (topology, mut capabilities) = device.representation_environment();
         capabilities.imported_transfer &= guest.runs().len() == 1;
+        // A direct alias is a byte object over the guest's pages. An image has
+        // a native tiling this device does not choose and the guest does not
+        // know, so its texels are never the guest's bytes whatever the host
+        // topology is.
+        capabilities.direct_guest_backing = false;
         let route = Self::guest_transfer_route(declaration.storage_mode(), topology, capabilities)?;
         self.materialize_texture_with_guest_endpoint_route(device, resource, guest, route)
     }
@@ -35157,9 +35231,19 @@ mod tests {
             reims_vgpu_core::ResourceLifecycleEffect::ResourceCreated(resource) => resource,
             _ => unreachable!(),
         };
+        // The cell is named rather than inherited: on a unified host with the
+        // import this allocation takes a direct alias and there is no second
+        // object, which is a different shape and a different test.
         let working = runtime
             .execution
-            .materialize_buffer_with_guest_endpoint(&runtime.session.vulkan, resource, &guest)
+            .materialize_buffer_with_guest_window_route(
+                &runtime.session.vulkan,
+                resource,
+                reims_vgpu_memory::GuestWindow::contiguous(guest.clone()),
+                reims_vgpu_core::RepresentationRoute::ImportedGuestTransfer {
+                    working: reims_vgpu_core::WorkingMemoryClass::HostVisible,
+                },
+            )
             .unwrap();
         assert_ne!(working, reims_vgpu_core::GUEST_REPRESENTATION);
         let guest_target = runtime

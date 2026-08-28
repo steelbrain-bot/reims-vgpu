@@ -11,6 +11,7 @@ use reims_vgpu_protocol::{
     BackingId, ContentVersion, RepresentationId, SubmissionId, TransactionId,
 };
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 /// Reserved representation identities used by the canonical compatibility
@@ -322,6 +323,25 @@ pub struct RegionContentState {
     next_version: u64,
     canonical: CoverageMap,
     representations: BTreeMap<RepresentationId, CoverageMap>,
+    /// Representations whose bytes *are* the guest's bytes.
+    ///
+    /// A direct guest alias is a native object bound over the guest's own
+    /// pages: there is no second copy, so a write through it is a write the
+    /// guest can already see, and a guest store is a store the object can
+    /// already read. Coverage for such an object is therefore not a separate
+    /// statement from the guest's -- it is the same statement addressed twice,
+    /// and every assignment to one member of this class is made to all of them
+    /// and to [`GUEST_REPRESENTATION`].
+    ///
+    /// The alias needs its own identity even though it shares the guest's
+    /// content, because identity is what object lifetime is keyed on: the
+    /// guest representation is permanent and a native object is not, so
+    /// pinning the alias to [`GUEST_REPRESENTATION`] makes a physical
+    /// replacement either unable to retire the object or able to erase the
+    /// guest's canonical coverage with it. The set is what keeps the two facts
+    /// apart -- one identity per object lifetime, one content statement across
+    /// all of them.
+    guest_aliases: BTreeSet<RepresentationId>,
     pending_gpu_writes: BTreeMap<GpuWriteId, PendingGpuWrite>,
     pending_transfers: BTreeMap<TransferKey, usize>,
     pending_host_landings: BTreeMap<HostLandingKey, usize>,
@@ -442,6 +462,7 @@ impl RegionContentState {
             next_version: 2,
             canonical,
             representations,
+            guest_aliases: BTreeSet::new(),
             pending_gpu_writes: BTreeMap::new(),
             pending_transfers: BTreeMap::new(),
             pending_host_landings: BTreeMap::new(),
@@ -465,6 +486,7 @@ impl RegionContentState {
             next_version: 2,
             canonical,
             representations,
+            guest_aliases: BTreeSet::new(),
             pending_gpu_writes: BTreeMap::new(),
             pending_transfers: BTreeMap::new(),
             pending_host_landings: BTreeMap::new(),
@@ -485,6 +507,57 @@ impl RegionContentState {
 
     pub fn ensure_representation(&mut self, representation: RepresentationId) {
         self.representations.entry(representation).or_default();
+    }
+
+    /// Declare that `representation` addresses the guest's own pages, so it
+    /// and [`GUEST_REPRESENTATION`] hold one content statement between them.
+    ///
+    /// It starts out holding exactly what the guest holds, because binding an
+    /// object over pages copies nothing: the bytes it can read are the bytes
+    /// already there. See [`RegionContentState::guest_aliases`].
+    pub fn alias_guest_representation(&mut self, representation: RepresentationId) {
+        self.representations.entry(representation).or_default();
+        if representation == GUEST_REPRESENTATION {
+            return;
+        }
+        let guest = self
+            .representations
+            .get(&GUEST_REPRESENTATION)
+            .cloned()
+            .unwrap_or_default();
+        self.representations.insert(representation, guest);
+        self.guest_aliases.insert(representation);
+    }
+
+    /// Assign coverage to one representation and to everything that shares its
+    /// content statement. See [`RegionContentState::guest_aliases`].
+    fn assign_coverage(
+        &mut self,
+        representation: RepresentationId,
+        region: BackingRegion,
+        version: ContentVersion,
+        if_newer: bool,
+    ) {
+        let mut targets = vec![representation];
+        if representation == GUEST_REPRESENTATION || self.guest_aliases.contains(&representation) {
+            targets.extend(
+                self.guest_aliases
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(GUEST_REPRESENTATION))
+                    .filter(|target| *target != representation),
+            );
+        }
+        for target in targets {
+            let Some(coverage) = self.representations.get_mut(&target) else {
+                continue;
+            };
+            if if_newer {
+                coverage.assign_if_newer(region, version);
+            } else {
+                coverage.assign(region, version);
+            }
+        }
     }
 
     /// Restate the guest as canonical over every declared region, because the
@@ -518,6 +591,7 @@ impl RegionContentState {
 
     pub(crate) fn remove_representation(&mut self, representation: RepresentationId) {
         self.representations.remove(&representation);
+        self.guest_aliases.remove(&representation);
     }
 
     /// Record that the guest wrote one region, under the operation that says so.
@@ -561,10 +635,7 @@ impl RegionContentState {
             self.guest_writes.remove(&region);
         }
         self.canonical.assign(region, version);
-        self.representations
-            .get_mut(&representation)
-            .unwrap()
-            .assign(region, version);
+        self.assign_coverage(representation, region, version, false);
         self.discarded = self
             .discarded
             .drain(..)
@@ -611,12 +682,8 @@ impl RegionContentState {
             .pending_gpu_writes
             .remove(&write)
             .expect("GPU-write completion was prevalidated");
-        let native = self
-            .representations
-            .get_mut(&representation)
-            .expect("GPU-write representation was prevalidated");
         for write in planned.regions.iter().copied() {
-            native.assign_if_newer(write.region, write.version);
+            self.assign_coverage(representation, write.region, write.version, true);
             self.canonical.assign_if_newer(write.region, write.version);
         }
         Ok(planned.regions)
@@ -977,10 +1044,7 @@ impl RegionContentState {
         if *count == 0 {
             self.pending_host_landings.remove(&landing);
         }
-        self.representations
-            .get_mut(&GUEST_REPRESENTATION)
-            .expect("host landing destination was prevalidated")
-            .assign(landing.region, landing.version);
+        self.assign_coverage(GUEST_REPRESENTATION, landing.region, landing.version, false);
         Ok(())
     }
 
@@ -1158,10 +1222,7 @@ impl RegionContentState {
     pub fn complete_transfer(&mut self, key: TransferKey) -> Result<(), ContentAuthorityError> {
         self.validate_complete_transfer(key)?;
         self.pending_transfers.remove(&key);
-        self.representations
-            .get_mut(&key.destination)
-            .expect("transfer destination was prevalidated")
-            .assign(key.region, key.version);
+        self.assign_coverage(key.destination, key.region, key.version, false);
         Ok(())
     }
 
@@ -1230,10 +1291,8 @@ impl RegionContentState {
         if !self.canonical.covers(required.region, required.version) {
             return Err(ContentAuthorityError::StaleSource);
         }
-        self.representations
-            .entry(representation)
-            .or_default()
-            .assign(required.region, required.version);
+        self.representations.entry(representation).or_default();
+        self.assign_coverage(representation, required.region, required.version, false);
         Ok(())
     }
 
@@ -1446,6 +1505,14 @@ impl ContentAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .ensure_representation(representation);
+    }
+
+    /// See [`RegionContentState::alias_guest_representation`].
+    pub fn alias_guest_representation(&self, representation: RepresentationId) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .alias_guest_representation(representation);
     }
 
     pub fn guest_write_region(
@@ -2100,6 +2167,37 @@ mod tests {
         );
         assert!(state.representation_matches(GPU, &state.snapshot(&[region])));
         assert!(state.representation_matches(GPU, &state.snapshot(&[linear(0, 64)])));
+    }
+
+    /// An alias and the guest hold one content statement in both directions.
+    ///
+    /// The alias is a native object bound over the guest's own pages, so a GPU
+    /// write through it is a write the guest can already read and a guest
+    /// store is a store the object can already read. Without that, a `Shared`
+    /// allocation on a unified host would owe a transfer back to the guest
+    /// that Metal never asks for, and every readback of GPU-written bytes
+    /// would return what the guest wrote last.
+    #[test]
+    fn a_guest_alias_and_the_guest_hold_one_content_statement() {
+        let page = linear(0, 4096);
+        let mut state = state(page);
+        state.alias_guest_representation(GPU);
+        assert!(state.representation_matches(GPU, &state.snapshot(&[page])));
+
+        let head = linear(0, 4);
+        state
+            .plan_gpu_write(SubmissionId::new(1), GPU, [head])
+            .unwrap();
+        state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+        let snapshot = state.snapshot(&[page]);
+        assert!(state.representation_matches(GUEST, &snapshot));
+        assert!(state.outstanding_snapshot(GUEST, &snapshot).is_empty());
+
+        let tail = linear(4, 4092);
+        state.guest_write(None, GUEST, tail).unwrap();
+        let snapshot = state.snapshot(&[page]);
+        assert!(state.representation_matches(GPU, &snapshot));
+        assert!(state.outstanding_snapshot(GPU, &snapshot).is_empty());
     }
 
     /// A source covers what will be copied, not what the consumer named.

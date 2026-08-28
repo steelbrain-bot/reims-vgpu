@@ -316,15 +316,15 @@ impl ReplacementDeviceEpoch {
         (
             topology,
             reims_vgpu_core::RepresentationCapabilities {
-                // Always false: a direct alias is pinned to the fixed
-                // `GUEST_REPRESENTATION` identity, and a physical replacement
-                // retires the execution representation without freeing that
-                // identity, so an aliased backing cannot be reinstalled after
-                // one. Making the alias reachable needs a distinct execution
-                // identity whose coverage the authority mirrors onto the guest
-                // representation, which is a lifetime change and not a
-                // capability change. See `kb/`.
-                direct_guest_backing: false,
+                // A byte object bound over the guest's own pages, with no
+                // second copy anywhere. That needs both halves: the import,
+                // which is what binds those pages, and unified memory, which
+                // is what makes them the memory the GPU actually reads. On a
+                // discrete device the working memory is VRAM and the import is
+                // its backing store, so the copy between them is the route and
+                // not a fallback.
+                direct_guest_backing: self.context.caps.host_pointer.rung.is_available()
+                    && topology == reims_vgpu_core::HostMemoryTopology::Unified,
                 imported_transfer: self.context.caps.host_pointer.rung.is_available(),
                 host_visible_working,
                 device_local_working,

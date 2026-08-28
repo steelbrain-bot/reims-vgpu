@@ -490,6 +490,30 @@ impl<T> ManagedBackingOwner<T> {
         route: RepresentationRoute,
         native: T,
     ) -> Result<RepresentationId, ManagedRepresentationFailure<T>> {
+        self.create_representation_with_identity(backing, route, native, true)
+    }
+
+    /// `reserved_identity` says whether a route with a reserved identity may
+    /// claim it. It is false for exactly one caller and one route: an
+    /// execution-designated [`RepresentationRoute::DirectGuestAlias`].
+    ///
+    /// Both roles of the alias are one native object over the guest's own
+    /// pages, and both hold the guest's content statement -- but only one of
+    /// them is retired when the guest replaces the physical pages under the
+    /// backing. `GUEST_REPRESENTATION` is permanent: it is where the guest's
+    /// canonical coverage lives whether or not any object exists, so retiring
+    /// it would erase that coverage and refusing to retire it would leave the
+    /// stale import bound over pages the guest has taken back. An execution
+    /// alias therefore takes an ordinary identity, which the content authority
+    /// then declares to be the guest's own bytes -- one identity per object
+    /// lifetime, one content statement across both.
+    fn create_representation_with_identity(
+        &mut self,
+        backing: BackingId,
+        route: RepresentationRoute,
+        native: T,
+        reserved_identity: bool,
+    ) -> Result<RepresentationId, ManagedRepresentationFailure<T>> {
         let Some(record) = self.backings.get_mut(&backing) else {
             return Err(ManagedRepresentationFailure {
                 reason: ManagedBackingError::UnknownBacking,
@@ -502,10 +526,17 @@ impl<T> ManagedBackingOwner<T> {
                 native,
             });
         }
-        let representation = if route == RepresentationRoute::DirectGuestAlias {
-            GUEST_REPRESENTATION
-        } else if route == RepresentationRoute::HostStagingEndpoint {
-            HOST_REPRESENTATION
+        let reserved = match route {
+            RepresentationRoute::DirectGuestAlias if reserved_identity => {
+                Some(GUEST_REPRESENTATION)
+            }
+            RepresentationRoute::HostStagingEndpoint if reserved_identity => {
+                Some(HOST_REPRESENTATION)
+            }
+            _ => None,
+        };
+        let representation = if let Some(reserved) = reserved {
+            reserved
         } else {
             let representation = RepresentationId::new(self.next_representation);
             let Some(next_representation) = self.next_representation.checked_add(1) else {
@@ -523,7 +554,11 @@ impl<T> ManagedBackingOwner<T> {
                 native,
             });
         }
-        record.authority.ensure_representation(representation);
+        if route == RepresentationRoute::DirectGuestAlias {
+            record.authority.alias_guest_representation(representation);
+        } else {
+            record.authority.ensure_representation(representation);
+        }
         record.representations.insert(
             representation,
             NativeRepresentation {
@@ -565,7 +600,12 @@ impl<T> ManagedBackingOwner<T> {
                 native,
             });
         }
-        let representation = self.create_representation(backing, route, native)?;
+        let representation = self.create_representation_with_identity(
+            backing,
+            route,
+            native,
+            route != RepresentationRoute::DirectGuestAlias,
+        )?;
         let record = self
             .backings
             .get_mut(&backing)
@@ -612,21 +652,25 @@ impl<T> ManagedBackingOwner<T> {
         // The byte endpoint the images transfer through. The route names it:
         // an imported or directly aliased backing keeps the guest's own pages,
         // and a staged one keeps the host copy.
-        let route = record
+        let designated = record
             .execution_representations
             .values()
             .find_map(|representation| {
                 record
                     .representations
                     .get(representation)
-                    .map(|held| held.route)
+                    .map(|held| (*representation, held.route))
             });
-        let endpoint = match route {
-            Some(
-                RepresentationRoute::ImportedGuestTransfer { .. }
-                | RepresentationRoute::DirectGuestAlias,
-            ) => crate::GUEST_REPRESENTATION,
-            Some(RepresentationRoute::HostStagingTransfer { .. }) => crate::HOST_REPRESENTATION,
+        let endpoint = match designated {
+            // A direct alias is already the guest's own pages, so it is its
+            // own byte endpoint and there is no second object to name.
+            Some((representation, RepresentationRoute::DirectGuestAlias)) => representation,
+            Some((_, RepresentationRoute::ImportedGuestTransfer { .. })) => {
+                crate::GUEST_REPRESENTATION
+            }
+            Some((_, RepresentationRoute::HostStagingTransfer { .. })) => {
+                crate::HOST_REPRESENTATION
+            }
             _ => return Err(ManagedBackingError::MissingExecutionRepresentation),
         };
         if record.representations.contains_key(&endpoint) {
@@ -2474,6 +2518,50 @@ mod tests {
         let mut owner = ManagedBackingOwner::new(VulkanDeviceEpochId::new(7));
         owner.register_backing(backing, authority).unwrap();
         (owner, backing)
+    }
+
+    /// An execution alias is retired and rebuilt by a physical replacement.
+    ///
+    /// It has to take an ordinary identity for that to be possible. Pinned to
+    /// `GUEST_REPRESENTATION` it would either survive the replacement -- still
+    /// imported over pages the guest has taken back -- or take the guest's
+    /// permanent canonical coverage down with it.
+    #[test]
+    fn an_execution_guest_alias_takes_its_own_identity_and_is_replaceable() {
+        let (mut owner, backing) = owner();
+        let alias = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::DirectGuestAlias,
+                BackingView::Bytes,
+                "import",
+            )
+            .unwrap();
+        assert_ne!(alias, crate::GUEST_REPRESENTATION);
+        assert_eq!(
+            owner.view_representation(backing, BackingView::Bytes),
+            Ok(alias)
+        );
+        assert_eq!(
+            owner.replace_execution_representation(backing),
+            Ok(ManagedBackingProgress::RepresentationsRetired {
+                ready: vec!["import"],
+                deferred: 0,
+            })
+        );
+        let rebuilt = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::DirectGuestAlias,
+                BackingView::Bytes,
+                "reimport",
+            )
+            .unwrap();
+        assert_ne!(rebuilt, alias);
+        assert_eq!(
+            owner.execution_representation_id(backing, BackingView::Bytes),
+            Ok(rebuilt)
+        );
     }
 
     #[test]
