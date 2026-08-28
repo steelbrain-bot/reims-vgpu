@@ -77,11 +77,31 @@ pub(crate) enum ReplacementObjectDeleteEffect {
     IndirectCommandBuffer(
         crate::runtime::replacement_session::ReplacementRetiredIndirectCommandBuffer,
     ),
+    /// A delete naming an object this device holds no record of.
+    ///
+    /// There is nothing to free: no native object was created, no descriptor
+    /// retained, no transaction is waiting on it. The guest has already
+    /// stopped tracking that name, so the delete's *effect* --- that the name
+    /// is gone --- is already true, and this is a contract no-op in the same
+    /// sense as `ReplacementControlEffect::AbsentResourceDelete`.
+    ///
+    /// Refusing instead cost the guest the whole CPU transaction the delete
+    /// arrived in, which carried other work. It is reported by name on the
+    /// failure channel, because the other reading --- an object this device
+    /// *should* have registered and did not --- is a real defect and looks
+    /// identical from here.
+    AbsentObject(ReplacementDeletedObjectKind),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementObjectDeleteRefusal {
     ResourceLifecycleUnresolved(ReplacementDeletedObjectKind),
+    /// The namespace resolved the object and then declined to release it.
+    ///
+    /// Not "this device never had it" --- that is
+    /// [`ReplacementObjectDeleteEffect::AbsentObject`] and is a no-op. This is
+    /// the two halves of one namespace disagreeing about a name inside one
+    /// call, which is a device-state defect rather than a wait.
     UnknownObject(ReplacementDeletedObjectKind),
     Object(crate::runtime::replacement_session::ReplacementObjectRetirementError),
     Pipeline(reims_vgpu_core::PipelineLifecycleError),
@@ -90,12 +110,12 @@ pub(crate) enum ReplacementObjectDeleteRefusal {
 impl ReplacementObjectDeleteRefusal {
     /// Whether no later guest packet can make this delete succeed.
     ///
-    /// A delete naming an object this device never registered is the one such
-    /// arm: the guest has already stopped tracking that name, so nothing will
-    /// ever create it, and every retry asks the same resolved question again.
-    /// The other three are genuinely pending -- an unresolved resource
-    /// lifecycle, an object still held by live work, a pipeline mid-flight --
-    /// and a later packet is exactly what clears them.
+    /// A namespace that resolved a name and then refused to release it is the
+    /// one such arm: both answers came from the same state in the same call,
+    /// so no later packet changes either of them. The other three are
+    /// genuinely pending -- an unresolved resource lifecycle, an object still
+    /// held by live work, a pipeline mid-flight -- and a later packet is
+    /// exactly what clears them.
     pub(crate) const fn is_terminal_refusal(&self) -> bool {
         match self {
             Self::UnknownObject(_) => true,
@@ -934,6 +954,31 @@ pub(crate) fn decode_replacement_object_delete(
     })
 }
 
+/// One stable key per (task, kind, reference), so a guest that recycles a small
+/// pool of names reports each distinct absent delete once rather than on every
+/// create/delete round.
+fn absent_object_key(command: DecodedReplacementObjectDelete) -> u64 {
+    (u64::from(command.task.get()) << 40)
+        | (u64::from(command.kind as u8) << 32)
+        | u64::from(command.reference)
+}
+
+fn report_absent_object(command: DecodedReplacementObjectDelete) -> ReplacementObjectDeleteEffect {
+    if crate::observe::first_sight(
+        "replacement_object_delete_absent",
+        absent_object_key(command),
+    ) {
+        crate::observe::fail(format!(
+            "replacement_object_delete_absent task={} kind={:?} reference={} \
+             reason=no_registered_object",
+            command.task.get(),
+            command.kind,
+            command.reference
+        ));
+    }
+    ReplacementObjectDeleteEffect::AbsentObject(command.kind)
+}
+
 pub(crate) fn apply_replacement_object_delete<Semantic: Clone>(
     runtime: &mut crate::runtime::replacement_session::ReplacementRuntimeSession<Semantic>,
     command: DecodedReplacementObjectDelete,
@@ -948,10 +993,12 @@ pub(crate) fn apply_replacement_object_delete<Semantic: Clone>(
         }
         ReplacementDeletedObjectKind::RasterizationRateMap => {
             let serializer = SerializerRef::new(reference);
-            let identity = runtime
+            let Some(identity) = runtime
                 .resolve_rasterization_rate_map(command.task, serializer)
                 .map(|(identity, _)| identity)
-                .ok_or_else(|| fail(ReplacementObjectDeleteRefusal::UnknownObject(command.kind)))?;
+            else {
+                return Ok(report_absent_object(command));
+            };
             let descriptor = runtime
                 .retire_rasterization_rate_map(command.task, serializer)
                 .map_err(|reason| fail(ReplacementObjectDeleteRefusal::Object(reason)))?;
@@ -962,10 +1009,12 @@ pub(crate) fn apply_replacement_object_delete<Semantic: Clone>(
         }
         ReplacementDeletedObjectKind::Sampler => {
             let serializer = SerializerRef::new(reference);
-            let identity = runtime
+            let Some(identity) = runtime
                 .resolve_sampler(command.task, serializer)
                 .map(|(identity, _)| identity)
-                .ok_or_else(|| fail(ReplacementObjectDeleteRefusal::UnknownObject(command.kind)))?;
+            else {
+                return Ok(report_absent_object(command));
+            };
             let descriptor = runtime
                 .retire_sampler(command.task, serializer)
                 .map_err(|reason| fail(ReplacementObjectDeleteRefusal::Object(reason)))?;
@@ -976,10 +1025,12 @@ pub(crate) fn apply_replacement_object_delete<Semantic: Clone>(
         }
         ReplacementDeletedObjectKind::DepthStencil => {
             let serializer = SerializerRef::new(reference);
-            let identity = runtime
+            let Some(identity) = runtime
                 .resolve_depth_stencil(command.task, serializer)
                 .map(|(identity, _)| identity)
-                .ok_or_else(|| fail(ReplacementObjectDeleteRefusal::UnknownObject(command.kind)))?;
+            else {
+                return Ok(report_absent_object(command));
+            };
             let descriptor = runtime
                 .retire_depth_stencil(command.task, serializer)
                 .map_err(|reason| fail(ReplacementObjectDeleteRefusal::Object(reason)))?;
@@ -990,10 +1041,12 @@ pub(crate) fn apply_replacement_object_delete<Semantic: Clone>(
         }
         ReplacementDeletedObjectKind::Function => {
             let serializer = SerializerRef::new(reference);
-            let identity = runtime
+            let Some(identity) = runtime
                 .resolve_function(command.task, serializer)
                 .map(|(identity, _)| identity)
-                .ok_or_else(|| fail(ReplacementObjectDeleteRefusal::UnknownObject(command.kind)))?;
+            else {
+                return Ok(report_absent_object(command));
+            };
             let function = runtime
                 .retire_function(command.task, serializer)
                 .map_err(|reason| fail(ReplacementObjectDeleteRefusal::Object(reason)))?;
@@ -1001,9 +1054,9 @@ pub(crate) fn apply_replacement_object_delete<Semantic: Clone>(
         }
         ReplacementDeletedObjectKind::RenderPipeline => {
             let serializer = SerializerRef::new(reference);
-            let identity = runtime
-                .resolve_render_pipeline(command.task, serializer)
-                .ok_or_else(|| fail(ReplacementObjectDeleteRefusal::UnknownObject(command.kind)))?;
+            let Some(identity) = runtime.resolve_render_pipeline(command.task, serializer) else {
+                return Ok(report_absent_object(command));
+            };
             let waiters = runtime
                 .retire_render_pipeline(command.task, serializer)
                 .map_err(|reason| fail(ReplacementObjectDeleteRefusal::Pipeline(reason)))?;
@@ -1011,9 +1064,9 @@ pub(crate) fn apply_replacement_object_delete<Semantic: Clone>(
         }
         ReplacementDeletedObjectKind::ComputePipeline => {
             let serializer = SerializerRef::new(reference);
-            let identity = runtime
-                .resolve_compute_pipeline(command.task, serializer)
-                .ok_or_else(|| fail(ReplacementObjectDeleteRefusal::UnknownObject(command.kind)))?;
+            let Some(identity) = runtime.resolve_compute_pipeline(command.task, serializer) else {
+                return Ok(report_absent_object(command));
+            };
             let waiters = runtime
                 .retire_compute_pipeline(command.task, serializer)
                 .map_err(|reason| fail(ReplacementObjectDeleteRefusal::Pipeline(reason)))?;
@@ -1021,9 +1074,9 @@ pub(crate) fn apply_replacement_object_delete<Semantic: Clone>(
         }
         ReplacementDeletedObjectKind::Fence => {
             let serializer = SerializerRef::new(reference);
-            let identity = runtime
-                .resolve_fence(command.task, serializer)
-                .ok_or_else(|| fail(ReplacementObjectDeleteRefusal::UnknownObject(command.kind)))?;
+            let Some(identity) = runtime.resolve_fence(command.task, serializer) else {
+                return Ok(report_absent_object(command));
+            };
             if !runtime.release_fence(command.task, serializer) {
                 return Err(fail(ReplacementObjectDeleteRefusal::UnknownObject(
                     command.kind,

@@ -30554,19 +30554,19 @@ mod tests {
             } if retired == identity
         ));
         assert_eq!(runtime.resolve_sampler(task, reference), None);
-        assert_eq!(
+        // Deleting it again frees nothing: no native object, no descriptor, no
+        // waiter. The delete's effect is already true, so it is a contract
+        // no-op and the CPU transaction carrying it keeps its other work.
+        assert!(matches!(
             crate::runtime::replacement_object_lifecycle::apply_replacement_object_delete(
                 &mut runtime,
                 command
             )
-            .unwrap_err(),
-            crate::runtime::replacement_object_lifecycle::ReplacementObjectDeleteFailure {
-                reason: crate::runtime::replacement_object_lifecycle::ReplacementObjectDeleteRefusal::UnknownObject(
-                    crate::runtime::replacement_object_lifecycle::ReplacementDeletedObjectKind::Sampler
-                ),
-                command,
-            }
-        );
+            .unwrap(),
+            crate::runtime::replacement_object_lifecycle::ReplacementObjectDeleteEffect::AbsentObject(
+                crate::runtime::replacement_object_lifecycle::ReplacementDeletedObjectKind::Sampler
+            )
+        ));
 
         let resource_delete = crate::runtime::replacement_object_lifecycle::DecodedReplacementObjectDelete {
             task,
