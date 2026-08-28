@@ -282,9 +282,12 @@ pub enum ValidityTransitionError {
     /// independent facts and the refusal is legible only with all three. A
     /// `destination` of `None` beside a host ingress is "nothing designated";
     /// a `HostStagingTransfer` destination means the host ingress did not
-    /// pair with it; an `ImportedGuestTransfer` destination means the guest
-    /// representation is not the direct alias that route requires, and
-    /// `guest_route` then says what it is instead.
+    /// pair with it; an `ImportedGuestTransfer` destination means the backing
+    /// carries no direct guest alias, which is what that route reads through.
+    /// `GUEST_REPRESENTATION` is reserved to `DirectGuestAlias` at creation,
+    /// so `guest_route` reads `None` when the alias is absent and never some
+    /// third route --- it is there because "absent" is the answer, not a
+    /// missing one.
     InvalidGuestUploadRoute {
         backing: BackingId,
         destination: Option<RepresentationId>,
