@@ -1302,6 +1302,17 @@ impl<T> ResourceLifecycleOwner<T> {
         self.native.is_designated(backing, representation)
     }
 
+    /// See
+    /// [`crate::ManagedBackingOwner::stale_designated_representations`].
+    pub fn stale_designated_representations(
+        &self,
+        backing: BackingId,
+        snapshot: &[RegionVersion],
+    ) -> Result<Vec<(BackingView, RepresentationId)>, ManagedBackingError> {
+        self.native
+            .stale_designated_representations(backing, snapshot)
+    }
+
     /// See [`crate::ManagedBackingOwner::designated_views`].
     pub fn designated_views(
         &self,

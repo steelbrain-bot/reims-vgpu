@@ -580,6 +580,62 @@ mod tests {
     }
 
     #[test]
+    fn one_current_view_does_not_answer_for_a_backing_whose_other_view_is_empty() {
+        // The question "is this backing already current?" has one answer per
+        // designated view. A caller that asks one representation and
+        // generalises reads "current" off the view that happens to hold the
+        // content and drops the synchronization the empty one owes --- which
+        // leaves a render bind addressing an image with nothing in it.
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let region = BackingRegion::Linear(LinearRange::new(0, 64).unwrap());
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([region]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        resources
+            .create_representation(backing, RepresentationRoute::HostStagingEndpoint, ())
+            .unwrap();
+        let route = RepresentationRoute::HostStagingTransfer {
+            working: crate::WorkingMemoryClass::DeviceLocal,
+        };
+        let bytes = resources
+            .create_execution_representation(backing, route, BackingView::Bytes, ())
+            .unwrap();
+        let image_view = BackingView::Image(crate::ImageOwner::owning(
+            reims_vgpu_protocol::ResourceId::new(9, 1),
+        ));
+        let image = resources
+            .create_execution_representation(backing, route, image_view, ())
+            .unwrap();
+
+        // Only the bytes view is brought current.
+        resources
+            .plan_gpu_write(backing, SubmissionId::new(1), bytes, [region])
+            .unwrap();
+        resources
+            .complete_gpu_write(backing, SubmissionId::new(1), bytes)
+            .unwrap();
+
+        let snapshot = resources.snapshot_content(backing, &[region]).unwrap();
+        // Asking the current one alone says the backing needs nothing.
+        assert!(resources
+            .representation_matches(backing, bytes, &snapshot)
+            .unwrap());
+        // Asking the owner of the designations names the one that does.
+        assert_eq!(
+            resources
+                .stale_designated_representations(backing, &snapshot)
+                .unwrap(),
+            vec![(image_view, image)]
+        );
+    }
+
+    #[test]
     fn synchronization_waits_for_an_overlapping_execution_write_instead_of_overwriting_it() {
         let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
         let region = BackingRegion::Linear(LinearRange::new(0, 64).unwrap());

@@ -11405,6 +11405,23 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         };
         let content_requirements = requests_for(&required_content_regions);
         let synchronization_requests = requests_for(&synchronization_regions);
+        // Every designated view of a backing holds its own copy of these
+        // bytes, so the question "is this backing already current?" has one
+        // answer per view and no single answer for the backing. Asking one
+        // arbitrary designated representation and dropping the whole request
+        // when *it* matched is what left a second view empty: on a driven
+        // boot `BackingId(36)` carried a representation holding its content
+        // and a second holding nothing at all, the render bind addressed the
+        // empty one, and the synchronization that would have filled it was
+        // filtered out here before the planner ever saw the backing.
+        //
+        // So the request survives unless *every* designated view already
+        // matches --- which is what
+        // `ResourceLifecycleOwner::stale_designated_representations` answers,
+        // on the type that owns the designations, so the one-view question
+        // cannot be asked here again by accident. The pending-write scan then
+        // runs per stale view: a producer outstanding against one view does
+        // not license reading another.
         let content_synchronization = synchronization_requests
             .iter()
             .cloned()
@@ -11414,125 +11431,114 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     regions,
                     permitted_pending_writes,
                 } = request;
-                let destination = match resources.any_designated_representation(backing) {
-                    Ok(destination) => destination,
-                    Err(reason) => {
-                        return Some(Err(
-                            ReplacementExecResourceReadinessError::ValidityRepresentation {
-                                backing,
-                                reason,
-                            },
-                        ))
-                    }
-                };
+                let validity_error =
+                    |reason| ReplacementExecResourceReadinessError::ValidityRepresentation {
+                        backing,
+                        reason,
+                    };
                 let snapshot = match resources.snapshot_content(backing, &regions) {
                     Ok(snapshot) => snapshot,
-                    Err(reason) => {
-                        return Some(Err(
-                            ReplacementExecResourceReadinessError::ValidityRepresentation {
-                                backing,
-                                reason,
-                            },
-                        ))
-                    }
+                    Err(reason) => return Some(Err(validity_error(reason))),
                 };
-                match resources.representation_matches(backing, destination, &snapshot) {
-                    Ok(true) => None,
-                    Ok(false) => match resources.pending_gpu_writes_overlapping(
+                let stale = match resources.stale_designated_representations(backing, &snapshot) {
+                    Ok(stale) => stale,
+                    Err(reason) => return Some(Err(validity_error(reason))),
+                };
+                if stale.is_empty() {
+                    return None;
+                }
+                let mut permitted = permitted_pending_writes.into_vec();
+                // The first pending write no ordering permits, with the view it
+                // was found against, because that view is what the guest is
+                // waiting to read.
+                let mut blocked: Option<(
+                    reims_vgpu_protocol::RepresentationId,
+                    reims_vgpu_core::GpuWriteId,
+                    Option<reims_vgpu_core::SubmissionOrderRelation>,
+                )> = None;
+                for (_, destination) in stale {
+                    let pending = match resources.pending_gpu_writes_overlapping(
                         backing,
                         destination,
                         &regions,
                     ) {
-                        Ok(pending) => {
-                            let mut permitted = permitted_pending_writes.into_vec();
-                            let mut denied_by = std::collections::BTreeMap::new();
-                            for write in pending.iter().copied() {
-                                if permitted.contains(&write) {
-                                    continue;
-                                }
-                                let Some(producer) = write.transaction() else {
-                                    continue;
-                                };
-                                match self
-                                    .execution
-                                    .runtime()
-                                    .submission_order_relation(transaction, producer)
-                                {
-                                    // The producer is ordered behind this
-                                    // reader, so its write lands after the read
-                                    // and does not concern it.
-                                    Ok(reims_vgpu_core::SubmissionOrderRelation::Before)
-                                    // Or the two are on queues with no order
-                                    // between them at all. A queue that is
-                                    // blocked does not impose its own
-                                    // completion-publication order on an
-                                    // independent queue: with no ordering
-                                    // declared, either order is a valid
-                                    // execution, so serializing the reader
-                                    // ahead of the writer is one of them. The
-                                    // guest orders across queues by committing
-                                    // an explicit shared-event wait, and that
-                                    // arrives as a prerequisite rather than as
-                                    // a pending write discovered here -- so
-                                    // waiting on this one invents an order the
-                                    // guest never asked for, and deadlocks
-                                    // whenever the producer's own progress runs
-                                    // through the queue now parked on it.
-                                    | Ok(reims_vgpu_core::SubmissionOrderRelation::Independent) => {
-                                        permitted.push(write);
-                                    }
-                                    Ok(
-                                        relation @ (reims_vgpu_core::SubmissionOrderRelation::Same
-                                        | reims_vgpu_core::SubmissionOrderRelation::After),
-                                    ) => {
-                                        denied_by.insert(write, relation);
-                                    }
-                                    Err(reason) => {
-                                        return Some(Err(
-                                            ReplacementExecResourceReadinessError::ContentProducerOrder {
-                                                consumer: transaction,
-                                                producer,
-                                                reason,
-                                            },
-                                        ));
-                                    }
-                                }
+                        Ok(pending) => pending,
+                        Err(reason) => return Some(Err(validity_error(reason))),
+                    };
+                    let mut denied_by = std::collections::BTreeMap::new();
+                    for write in pending.iter().copied() {
+                        if permitted.contains(&write) {
+                            continue;
+                        }
+                        let Some(producer) = write.transaction() else {
+                            continue;
+                        };
+                        match self
+                            .execution
+                            .runtime()
+                            .submission_order_relation(transaction, producer)
+                        {
+                            // The producer is ordered behind this reader, so
+                            // its write lands after the read and does not
+                            // concern it.
+                            Ok(reims_vgpu_core::SubmissionOrderRelation::Before)
+                            // Or the two are on queues with no order between
+                            // them at all. A queue that is blocked does not
+                            // impose its own completion-publication order on an
+                            // independent queue: with no ordering declared,
+                            // either order is a valid execution, so serializing
+                            // the reader ahead of the writer is one of them.
+                            // The guest orders across queues by committing an
+                            // explicit shared-event wait, and that arrives as a
+                            // prerequisite rather than as a pending write
+                            // discovered here -- so waiting on this one invents
+                            // an order the guest never asked for, and deadlocks
+                            // whenever the producer's own progress runs through
+                            // the queue now parked on it.
+                            | Ok(reims_vgpu_core::SubmissionOrderRelation::Independent) => {
+                                permitted.push(write);
                             }
-                            match pending
-                                .iter()
-                                .find(|write| !permitted.contains(write))
-                                .copied()
-                            {
-                                Some(write) => Some(Err(
-                                    ReplacementExecResourceReadinessError::ContentProducerPending {
-                                        backing,
-                                        representation: destination,
-                                        consumer: submission,
-                                        write,
-                                        relation: denied_by.get(&write).copied(),
+                            Ok(
+                                relation @ (reims_vgpu_core::SubmissionOrderRelation::Same
+                                | reims_vgpu_core::SubmissionOrderRelation::After),
+                            ) => {
+                                denied_by.insert(write, relation);
+                            }
+                            Err(reason) => {
+                                return Some(Err(
+                                    ReplacementExecResourceReadinessError::ContentProducerOrder {
+                                        consumer: transaction,
+                                        producer,
+                                        reason,
                                     },
-                                )),
-                                None => Some(Ok(reims_vgpu_core::ContentSynchronizationRequest {
-                                    backing,
-                                    regions,
-                                    permitted_pending_writes: permitted.into_boxed_slice(),
-                                })),
+                                ));
                             }
                         }
-                        Err(reason) => Some(Err(
-                            ReplacementExecResourceReadinessError::ValidityRepresentation {
-                                backing,
-                                reason,
-                            },
-                        )),
-                    },
-                    Err(reason) => Some(Err(
-                        ReplacementExecResourceReadinessError::ValidityRepresentation {
-                            backing,
-                            reason,
-                        },
-                    )),
+                    }
+                    if blocked.is_none() {
+                        blocked = pending
+                            .iter()
+                            .find(|write| !permitted.contains(write))
+                            .copied()
+                            .map(|write| (destination, write, denied_by.get(&write).copied()));
+                    }
                 }
+                if let Some((representation, write, relation)) = blocked {
+                    return Some(Err(
+                        ReplacementExecResourceReadinessError::ContentProducerPending {
+                            backing,
+                            representation,
+                            consumer: submission,
+                            write,
+                            relation,
+                        },
+                    ));
+                }
+                Some(Ok(reims_vgpu_core::ContentSynchronizationRequest {
+                    backing,
+                    regions,
+                    permitted_pending_writes: permitted.into_boxed_slice(),
+                }))
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();

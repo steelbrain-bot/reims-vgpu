@@ -813,6 +813,38 @@ impl<T> ManagedBackingOwner<T> {
             .collect())
     }
 
+    /// Every designated view whose representation does not already hold the
+    /// required content, in view order.
+    ///
+    /// The answer to "is this backing current?" is per view and there is no
+    /// single answer for the backing. Each designated view carries its own
+    /// native object over the same bytes and its own content record, so one
+    /// may be current while another holds nothing at all --- and a caller that
+    /// asks one representation and generalises drops the work the others owe.
+    /// An empty result is the only reading that means the backing needs
+    /// nothing.
+    ///
+    /// This exists so that question cannot be asked one view at a time by
+    /// accident. Callers that must synchronize, or must decide whether a
+    /// synchronization request is necessary, ask here.
+    pub fn stale_designated_representations(
+        &self,
+        backing: BackingId,
+        snapshot: &[RegionVersion],
+    ) -> Result<Vec<(BackingView, RepresentationId)>, ManagedBackingError> {
+        let record = self.live_backing(backing)?;
+        Ok(record
+            .execution_representations
+            .iter()
+            .filter(|(_, representation)| {
+                !record
+                    .authority
+                    .representation_matches(**representation, snapshot)
+            })
+            .map(|(view, representation)| (*view, *representation))
+            .collect())
+    }
+
     pub fn execution_representation_id(
         &self,
         backing: BackingId,
