@@ -294,38 +294,27 @@ pub(crate) enum ReplacementIOSurfacePlaneViewRefusal {
         view: (u32, u32, u32),
         count: u8,
     },
-    /// The view's own geometry is not the geometry the parent declared for
-    /// the plane it selects.
+    /// This view is not a texture this device can lay out over the plane it
+    /// selects.
     ///
-    /// Both geometries, the plane, and the record variant, because none of
-    /// them is inferable from the others and the repair differs by which
-    /// term is wrong: a factor of two on one axis is chroma subsampling
-    /// counted in the wrong units, a small excess is an alignment the parent
-    /// declaration rounds and the view does not, and a `ColorView` that
-    /// mismatches where a `Plane` would not means the two record variants do
-    /// not in fact share a geometry contract. A boot has already been spent
-    /// on this refusal reporting only its own name.
-    PlaneGeometryMismatch {
+    /// `layout` is the one rule's own answer; everything beside it is the
+    /// input that produced it, because none of those terms is inferable from
+    /// the others and the repair differs by which is wrong. Both formats are
+    /// here because a geometry disagreement and a format reinterpretation are
+    /// the same numbers seen from two sides: a view half the plane's width and
+    /// half its height, over an element four times as wide, addresses exactly
+    /// the plane's bytes. The parent's plane count and pixel-format word say
+    /// whether the selected plane is one of several -- a subsampled surface's
+    /// planes differ in extent by construction -- or the only one there is.
+    PlaneNotExpressible {
         record: Option<reims_vgpu_protocol::IOSurfacePlaneViewRecordKind>,
+        layout: reims_vgpu_protocol::SurfacePlaneLayoutError,
         plane: u32,
-        /// The view's own `MTLPixelFormat` ordinal and geometry.
-        ///
-        /// The format is here because a geometry disagreement and a format
-        /// reinterpretation are the same numbers seen from two sides: a view
-        /// half the plane's width and half its height over an element four
-        /// times as wide addresses exactly the plane's bytes, and reading that
-        /// as a wrong extent names the wrong defect. Only the two formats
-        /// beside the two extents distinguish them.
         view_format: u16,
         view: (u32, u32, u32),
-        /// The plane's declared extent, and the element width it declares
-        /// those texels in.
         declared: (u32, u32),
         declared_bytes_per_element: u8,
-        /// The parent's plane count and IOSurface pixel-format word, which say
-        /// whether the selected plane is one of several -- a subsampled
-        /// surface's planes differ in extent by construction -- or the only
-        /// one the surface has.
+        declared_bytes_per_row: u32,
         count: u8,
         surface_format: u32,
     },
@@ -571,22 +560,23 @@ pub(crate) fn apply_replacement_iosurface_plane_view<Semantic: Clone>(
         });
     };
     let declared_plane = parent.planes[plane];
-    // `depth` is not re-checked here: the decoder admits a view only when it
-    // decodes as 1, so a second test of it could never fail and would read as
-    // cover this refusal does not have.
-    if view.width != declared_plane.width || view.height != declared_plane.height {
-        return Err(
-            ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch {
-                record: view_resource.record_kind,
-                plane: plane_index,
-                view_format: view.pixel_format,
-                view: (view.width, view.height, view.depth),
-                declared: (declared_plane.width, declared_plane.height),
-                declared_bytes_per_element: declared_plane.bytes_per_element,
-                count: parent.plane_count,
-                surface_format: parent.pixel_format,
-            },
-        );
+    // Whether this view is expressible over this plane is one question with
+    // one answer, and `plane_linear_texture` is where it lives -- it owns the
+    // plane table and it is what materialization asks later. Re-deriving the
+    // rule here would be a second spelling of it, and the two would drift.
+    if let Err(layout) = parent.plane_linear_texture(view) {
+        return Err(ReplacementIOSurfacePlaneViewRefusal::PlaneNotExpressible {
+            record: view_resource.record_kind,
+            layout,
+            plane: plane_index,
+            view_format: view.pixel_format,
+            view: (view.width, view.height, view.depth),
+            declared: (declared_plane.width, declared_plane.height),
+            declared_bytes_per_element: declared_plane.bytes_per_element,
+            declared_bytes_per_row: declared_plane.bytes_per_row,
+            count: parent.plane_count,
+            surface_format: parent.pixel_format,
+        });
     }
     runtime
         .declare_io_surface_plane_view(

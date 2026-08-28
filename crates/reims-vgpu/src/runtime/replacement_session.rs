@@ -26708,11 +26708,13 @@ mod tests {
                 invalid_view_object,
                 reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(invalid_view),
             ),
-            // Every term the refusal carries, so a reading of it off a boot
-            // can be trusted to name the axis that is wrong: only the width
-            // was perturbed and only the width may differ here.
-            Err(crate::runtime::replacement_object_lifecycle::ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch {
+            // A wider view is not refused for disagreeing with the plane's
+            // extent -- it may -- but for a row that no longer fits the
+            // plane's pitch. Every term the refusal carries is asserted, so a
+            // reading of it off a boot can be trusted to name what is wrong.
+            Err(crate::runtime::replacement_object_lifecycle::ReplacementIOSurfacePlaneViewRefusal::PlaneNotExpressible {
                 record: plane_view.record_kind,
+                layout: reims_vgpu_protocol::SurfacePlaneLayoutError::ViewRowExceedsPlanePitch,
                 plane: plane_view.view.unwrap().plane_index.unwrap(),
                 view_format: plane_view.view.unwrap().pixel_format,
                 view: (641, plane_view.view.unwrap().height, plane_view.view.unwrap().depth),
@@ -26724,6 +26726,9 @@ mod tests {
                 declared_bytes_per_element: descriptor.planes
                     [plane_view.view.unwrap().plane_index.unwrap() as usize]
                     .bytes_per_element,
+                declared_bytes_per_row: descriptor.planes
+                    [plane_view.view.unwrap().plane_index.unwrap() as usize]
+                    .bytes_per_row,
                 count: descriptor.plane_count,
                 surface_format: descriptor.pixel_format,
             })

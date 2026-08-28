@@ -885,7 +885,14 @@ pub enum SurfacePlaneLayoutError {
     /// selects is not something this descriptor can be asked.
     PlaneIndexAbsent,
     PlaneOutOfBounds,
+    /// The view declares a depth other than one. A plane is a 2D surface.
     GeometryMismatch,
+    /// The view's `MTLPixelFormat` is not one this device knows an element
+    /// width for, so its rows cannot be measured against the plane's pitch.
+    ViewFormatUnknown,
+    /// One row of the view is wider than the plane's declared pitch, so the
+    /// view's texels do not lie inside the plane's rows however they align.
+    ViewRowExceedsPlanePitch,
     EmptyLayout,
     SpanOverflow,
     SpanTooLarge,
@@ -893,8 +900,24 @@ pub enum SurfacePlaneLayoutError {
 }
 
 impl SurfaceBackingDescriptor {
-    /// Project one declared IOSurface plane into the ordinary linear-texture
+    /// Project one registered plane view into the ordinary linear-texture
     /// vocabulary used by transfer and native-image construction.
+    ///
+    /// The view's extent and format are the *texture's*, and they are not
+    /// required to be the plane's. A plane-view record carries the
+    /// `MTLTextureDescriptor` the guest passed to
+    /// `newTextureWithDescriptor:iosurface:plane:` verbatim -- its extent,
+    /// format, mip and sample counts are all descriptor fields and none of
+    /// them is derived from the surface. What the plane contributes is where
+    /// its bytes start and how far apart its rows are, so the two compose:
+    /// the view says how to read the texels, the plane says where they live.
+    ///
+    /// This device therefore does not test the two extents for equality. That
+    /// rule was never in the contract, and it refuses the ordinary case of a
+    /// view whose element is wider than the plane's -- half the width over
+    /// four times the element addresses exactly the same bytes. What can still
+    /// fail is a *fit*: a row wider than the plane's pitch, or a last row past
+    /// the allocation, and each of those is refused by its own name.
     pub fn plane_linear_texture(
         &self,
         view: IOSurfacePlaneViewDescriptor,
@@ -907,25 +930,31 @@ impl SurfaceBackingDescriptor {
             .filter(|index| *index < usize::from(self.plane_count))
             .ok_or(SurfacePlaneLayoutError::PlaneOutOfBounds)?;
         let plane = self.planes[plane_index];
-        if view.width != plane.width || view.height != plane.height || view.depth != 1 {
+        // Depth is the one extent term the view may not choose: a plane is a
+        // 2D surface and this construction form declares a 2D texture.
+        if view.depth != 1 {
             return Err(SurfacePlaneLayoutError::GeometryMismatch);
         }
-        if view.pixel_format == 0
-            || plane.width == 0
-            || plane.height == 0
-            || plane.bytes_per_row == 0
-            || plane.bytes_per_element == 0
+        if view.pixel_format == 0 || view.width == 0 || view.height == 0 || plane.bytes_per_row == 0
         {
             return Err(SurfacePlaneLayoutError::EmptyLayout);
         }
-        let tight_row = plane
+        // The element width is the view's, because the view's format is what
+        // the texels are read as. The plane's declared element width describes
+        // the surface's own format and is not the same question whenever the
+        // two formats differ.
+        let bytes_per_element = crate::iosurface::format_bytes_per_pixel(view.pixel_format)
+            .and_then(|bytes| u8::try_from(bytes).ok())
+            .filter(|bytes| *bytes != 0)
+            .ok_or(SurfacePlaneLayoutError::ViewFormatUnknown)?;
+        let tight_row = view
             .width
-            .checked_mul(u32::from(plane.bytes_per_element))
+            .checked_mul(u32::from(bytes_per_element))
             .ok_or(SurfacePlaneLayoutError::SpanOverflow)?;
         if tight_row > plane.bytes_per_row {
-            return Err(SurfacePlaneLayoutError::SpanPastAllocation);
+            return Err(SurfacePlaneLayoutError::ViewRowExceedsPlanePitch);
         }
-        let occupied = u64::from(plane.height - 1)
+        let occupied = u64::from(view.height - 1)
             .checked_mul(u64::from(plane.bytes_per_row))
             .and_then(|prefix| prefix.checked_add(u64::from(tight_row)))
             .ok_or(SurfacePlaneLayoutError::SpanOverflow)?;
@@ -966,19 +995,19 @@ impl SurfaceBackingDescriptor {
             slice_count: 1,
             cube_faces: false,
             compressed_layout: false,
-            bytes_per_element: plane.bytes_per_element,
+            bytes_per_element,
             used_size,
             row_stride: plane.bytes_per_row,
-            width: plane.width,
-            height: plane.height,
+            width: view.width,
+            height: view.height,
             depth: 1,
             declaration: Some(declaration),
             levels: vec![TextureLevelLayout {
                 offset: 0,
                 size: occupied,
                 row_stride: u64::from(plane.bytes_per_row),
-                width: plane.width,
-                height: plane.height,
+                width: view.width,
+                height: view.height,
                 depth: 1,
             }],
         })
@@ -1743,12 +1772,58 @@ mod tests {
         assert_eq!(layout.levels[0].size, 31 * 0x140 + 64 * 4);
         assert_eq!(layout.declaration.unwrap().usage, 0);
 
-        assert_eq!(
-            surface.plane_linear_texture(IOSurfacePlaneViewDescriptor {
+        // A narrower view is a texture over the same rows, not a refusal.
+        // The plane says where the bytes are and how far apart the rows are;
+        // the view says how many texels to read out of each.
+        let narrower = surface
+            .plane_linear_texture(IOSurfacePlaneViewDescriptor {
                 pixel_format: 80,
                 width: 63,
                 height: 32,
                 depth: 1,
+                plane_index: Some(0),
+            })
+            .expect("a narrower view lies inside the plane's rows");
+        assert_eq!(narrower.width, 63);
+        assert_eq!(narrower.row_stride, 0x140, "the pitch is the plane's");
+        assert_eq!(narrower.levels[0].size, 31 * 0x140 + 63 * 4);
+
+        // A view whose element is wider than the plane's, over proportionally
+        // fewer texels, addresses exactly the same bytes. This is the shape a
+        // guest sends when it reinterprets a surface, and an extent-equality
+        // rule refuses it -- which is what blocked device open.
+        let reinterpreted = surface
+            .plane_linear_texture(IOSurfacePlaneViewDescriptor {
+                pixel_format: crate::metal_pixel::MTL_FORMAT_RGBA32_FLOAT,
+                width: 16,
+                height: 32,
+                depth: 1,
+                plane_index: Some(0),
+            })
+            .expect("a wider element over fewer texels fits the same rows");
+        assert_eq!(reinterpreted.bytes_per_element, 16);
+        assert_eq!(reinterpreted.width, 16);
+        assert_eq!(reinterpreted.levels[0].size, 31 * 0x140 + 16 * 16);
+
+        // A row wider than the plane's pitch does not fit however it aligns.
+        assert_eq!(
+            surface.plane_linear_texture(IOSurfacePlaneViewDescriptor {
+                pixel_format: 80,
+                width: 0x141,
+                height: 32,
+                depth: 1,
+                plane_index: Some(0),
+            }),
+            Err(SurfacePlaneLayoutError::ViewRowExceedsPlanePitch)
+        );
+
+        // Depth is the one extent term a plane view may not choose.
+        assert_eq!(
+            surface.plane_linear_texture(IOSurfacePlaneViewDescriptor {
+                pixel_format: 80,
+                width: 64,
+                height: 32,
+                depth: 2,
                 plane_index: Some(0),
             }),
             Err(SurfacePlaneLayoutError::GeometryMismatch)
