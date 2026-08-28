@@ -3549,9 +3549,14 @@ impl ReplacementExecResourcePreflightMode {
 /// answers alone, and the pair is the only way to tell an upload that is busy
 /// from one that is asking for something no refresh can give it.
 ///
-/// Deduped per distinct requirement, so a suffix that loops a hundred times a
-/// second contributes one line rather than drowning the log in the volume that
-/// is itself the symptom.
+/// Deduped per distinct *state*, not per transaction: a suffix that loops a
+/// hundred times a second must not drown the log in the volume that is itself
+/// the symptom, and keying on the transaction alone would report only the
+/// first round, where a view legitimately holds nothing yet. Keying on what
+/// the round found means every round that changed something prints and every
+/// round that changed nothing is silent -- so one line beside a large
+/// `upload_resumptions` is the non-convergence, stated by the state it is
+/// stuck in.
 fn report_guest_upload_refresh(
     transaction: TransactionId,
     staleness: Option<ReplacementUploadManifestStaleness>,
@@ -3589,13 +3594,15 @@ fn report_guest_upload_refresh(
             ),
         ),
     };
-    let key = (transaction.get() << 32) | backing.get();
-    if crate::observe::first_sight(reason, key) {
-        crate::observe::off(format!(
-            "replacement_guest_upload_refresh transaction={} backing={} reason={reason} {detail}",
-            transaction.get(),
-            backing.get(),
-        ));
+    let line = format!(
+        "replacement_guest_upload_refresh transaction={} backing={} reason={reason} {detail}",
+        transaction.get(),
+        backing.get(),
+    );
+    let mut key = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&line, &mut key);
+    if crate::observe::first_sight(reason, std::hash::Hasher::finish(&key)) {
+        crate::observe::off(line);
     }
 }
 
