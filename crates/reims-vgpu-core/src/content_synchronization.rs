@@ -27,7 +27,7 @@ fn take_available_regions(
         }
         *remaining = remaining
             .drain(..)
-            .flat_map(|region| crate::content_authority::subtract(region, available))
+            .flat_map(|region| crate::content_authority::not_covered_by(region, available))
             .collect();
     }
     claimed

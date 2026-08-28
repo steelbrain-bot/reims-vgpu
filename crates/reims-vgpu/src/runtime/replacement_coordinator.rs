@@ -10008,6 +10008,26 @@ mod tests {
             permitted_pending_writes: Box::new([]),
         };
 
+        // Make the representation current: a freshly created one holds
+        // nothing, and a manifest over a backing whose views hold nothing is
+        // stale by the only honest reading of it.
+        let landed = reims_vgpu_protocol::SubmissionId::new(10);
+        runtime
+            .execution_mut()
+            .resources_mut()
+            .plan_gpu_write(
+                backing,
+                landed,
+                representation,
+                [reims_vgpu_core::BackingRegion::Whole],
+            )
+            .unwrap();
+        runtime
+            .execution_mut()
+            .resources_mut()
+            .complete_gpu_write(backing, landed, representation)
+            .unwrap();
+
         // Nothing is outstanding, so a manifest built over this backing is
         // readable as it stands.
         let manifest =
@@ -10058,53 +10078,6 @@ mod tests {
             );
         assert_eq!(
             refreshed.staleness_for_test(runtime.execution().resources()),
-            None
-        );
-
-        // Complete that write over the whole backing, and the canonical
-        // coverage now carries a `Whole` entry beside the byte ranges declared
-        // at creation --- the two do not intersect, so neither subtracts the
-        // other. A requirement naming part of the backing can no longer be
-        // answered against that: it is compared only against the stale byte
-        // range, and the newer content, which covers those same bytes, is
-        // invisible to it. Without the refusal that reads as a view needing a
-        // repair it can never receive; with a backing whose coverage is only
-        // `Whole` it reads as already current. Both are the authority saying
-        // it cannot narrow, and it must say so.
-        runtime
-            .execution_mut()
-            .resources_mut()
-            .complete_gpu_write(backing, write, representation)
-            .unwrap();
-        let part = reims_vgpu_core::BackingRegion::Linear(
-            reims_vgpu_core::LinearRange::new(0, 32).unwrap(),
-        );
-        let partial = || reims_vgpu_core::ContentSynchronizationRequest {
-            backing,
-            regions: Box::new([part]),
-            permitted_pending_writes: Box::new([]),
-        };
-        assert_eq!(
-            crate::runtime::replacement_session::ReplacementExecResourceManifest::for_content_questions(
-                vec![partial()],
-                vec![partial()],
-            )
-            .staleness_for_test(runtime.execution().resources()),
-            Some(
-                crate::runtime::replacement_session::ReplacementUploadManifestStaleness::Unanswerable {
-                    backing,
-                    regions: Box::new([part]),
-                }
-            )
-        );
-
-        // The complete backing remains answerable against the same coverage.
-        assert_eq!(
-            crate::runtime::replacement_session::ReplacementExecResourceManifest::for_content_questions(
-                vec![requirement()],
-                vec![requirement()],
-            )
-            .staleness_for_test(runtime.execution().resources()),
             None
         );
     }

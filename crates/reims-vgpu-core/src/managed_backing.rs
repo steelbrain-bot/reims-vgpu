@@ -1003,19 +1003,6 @@ impl<T> ManagedBackingOwner<T> {
         Ok(record.authority.snapshot_regions(regions))
     }
 
-    /// See [`crate::content_authority::RegionContentState::unanswerable_regions`].
-    pub fn unanswerable_content_regions(
-        &self,
-        backing: BackingId,
-        regions: &[BackingRegion],
-    ) -> Result<Box<[BackingRegion]>, ManagedBackingError> {
-        let record = self
-            .backings
-            .get(&backing)
-            .ok_or(ManagedBackingError::UnknownBacking)?;
-        Ok(record.authority.unanswerable_regions(regions))
-    }
-
     pub fn representation_matches(
         &self,
         backing: BackingId,

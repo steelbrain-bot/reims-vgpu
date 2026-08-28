@@ -171,7 +171,7 @@ impl CoverageMap {
     fn assign(&mut self, region: BackingRegion, version: ContentVersion) {
         let mut next = Vec::with_capacity(self.entries.len() + 1);
         for existing in self.entries.drain(..) {
-            for remainder in subtract(existing.region, region) {
+            for remainder in remaining_after(existing.region, region) {
                 next.push(RegionVersion {
                     region: remainder,
                     version: existing.version,
@@ -188,7 +188,7 @@ impl CoverageMap {
         for protected in self.entries.iter().filter(|entry| entry.version >= version) {
             writable = writable
                 .into_iter()
-                .flat_map(|candidate| subtract(candidate, protected.region))
+                .flat_map(|candidate| remaining_after(candidate, protected.region))
                 .collect();
             if writable.is_empty() {
                 return;
@@ -204,7 +204,7 @@ impl CoverageMap {
             .entries
             .drain(..)
             .flat_map(|existing| {
-                subtract(existing.region, region)
+                remaining_after(existing.region, region)
                     .into_iter()
                     .map(move |remainder| RegionVersion {
                         region: remainder,
@@ -227,37 +227,12 @@ impl CoverageMap {
             .collect()
     }
 
-    /// Whether this map holds content as [`BackingRegion::Whole`] while the
-    /// query asks about part of the backing.
-    ///
-    /// `Whole` is documented as the complete backing *when the contract
-    /// establishes no sound translation into finer coordinates*, and
-    /// [`intersection`] honours that by relating it to nothing narrower. So a
-    /// `Linear` or `Image` query against `Whole` coverage comes back empty --
-    /// the same empty answer a backing holding no content gives -- and the two
-    /// are opposite facts. The second says there is nothing to synchronize;
-    /// the first says this authority cannot tell, and every consumer reads it
-    /// as the second.
-    ///
-    /// The reverse direction is not this: a `Whole` query is answerable
-    /// against any coverage, because everything the map holds lies inside the
-    /// backing. Nor is a same-space query that simply found nothing -- a
-    /// linear map asked about bytes it has not written, or an image map asked
-    /// about another mip, has genuinely answered.
-    fn unanswerable(&self, region: BackingRegion) -> bool {
-        region != BackingRegion::Whole
-            && self
-                .entries
-                .iter()
-                .any(|entry| entry.region == BackingRegion::Whole)
-    }
-
     fn missing(&self, region: BackingRegion, version: ContentVersion) -> Vec<BackingRegion> {
         let mut missing = vec![region];
         for current in self.entries.iter().filter(|entry| entry.version == version) {
             missing = missing
                 .into_iter()
-                .flat_map(|candidate| subtract(candidate, current.region))
+                .flat_map(|candidate| not_covered_by(candidate, current.region))
                 .collect();
             if missing.is_empty() {
                 break;
@@ -459,7 +434,7 @@ impl RegionContentState {
         self.discarded = self
             .discarded
             .drain(..)
-            .flat_map(|discarded| subtract(discarded, region))
+            .flat_map(|discarded| remaining_after(discarded, region))
             .collect();
         Ok(RegionVersion { region, version })
     }
@@ -570,23 +545,6 @@ impl RegionContentState {
         snapshot.into_boxed_slice()
     }
 
-    /// The queried regions this backing's canonical coverage cannot narrow to,
-    /// in the order they were asked.
-    ///
-    /// [`Self::snapshot`] returns nothing for these, and every consumer of an
-    /// empty snapshot reads it as "already current" -- `representation_matches`
-    /// is an `all` over the snapshot and is vacuously true on nothing, so no
-    /// view is ever stale for a region the authority cannot answer about, and
-    /// the synchronization that would have filled it is dropped as satisfied.
-    /// Ask this beside the snapshot and refuse by name instead.
-    pub fn unanswerable_regions(&self, regions: &[BackingRegion]) -> Box<[BackingRegion]> {
-        regions
-            .iter()
-            .copied()
-            .filter(|region| self.canonical.unanswerable(*region))
-            .collect()
-    }
-
     pub fn representation_matches(
         &self,
         representation: RepresentationId,
@@ -664,7 +622,7 @@ impl RegionContentState {
                 {
                     missing = missing
                         .into_iter()
-                        .flat_map(|region| subtract(region, current.region))
+                        .flat_map(|region| not_covered_by(region, current.region))
                         .collect();
                     if missing.is_empty() {
                         return true;
@@ -1193,14 +1151,6 @@ impl ContentAuthority {
             .snapshot(regions)
     }
 
-    /// See [`RegionContentState::unanswerable_regions`].
-    pub fn unanswerable_regions(&self, regions: &[BackingRegion]) -> Box<[BackingRegion]> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .unanswerable_regions(regions)
-    }
-
     pub fn representation_matches(
         &self,
         representation: RepresentationId,
@@ -1619,9 +1569,18 @@ impl PartialEq for ContentAuthority {
 
 impl Eq for ContentAuthority {}
 
+/// The part of the backing both regions name, or `None` if they share none.
+///
+/// [`BackingRegion::Whole`] is the complete backing, so it contains every
+/// other region and intersecting with it yields the other region unchanged.
+/// That is not a translation into finer coordinates and does not need one: it
+/// is the statement that all the bytes include these bytes, which holds
+/// whatever the finer coordinates mean. The direction that *does* need a
+/// translation is subtraction, and [`subtract`] refuses it.
 pub(crate) fn intersection(left: BackingRegion, right: BackingRegion) -> Option<BackingRegion> {
     match (left, right) {
         (BackingRegion::Whole, BackingRegion::Whole) => Some(BackingRegion::Whole),
+        (BackingRegion::Whole, region) | (region, BackingRegion::Whole) => Some(region),
         (BackingRegion::Linear(left), BackingRegion::Linear(right)) => {
             let start = left.start().max(right.start());
             let end = left.end().min(right.end());
@@ -1656,11 +1615,23 @@ pub(crate) fn intersection(left: BackingRegion, right: BackingRegion) -> Option<
     }
 }
 
-pub(crate) fn subtract(region: BackingRegion, cut: BackingRegion) -> Vec<BackingRegion> {
+/// The part of `region` outside `cut`, or `None` where the algebra cannot
+/// express it.
+///
+/// The only inexpressible case is the complete backing minus part of it.
+/// [`BackingRegion::Whole`] exists precisely for a backing whose contract
+/// establishes no sound translation into finer coordinates, so "everything
+/// except this box" has no name, and there is no honest region set to return.
+/// Callers must decide which way to err; [`remaining_after`] and
+/// [`not_covered_by`] are the two answers and every caller uses one of them.
+fn subtract(region: BackingRegion, cut: BackingRegion) -> Option<Vec<BackingRegion>> {
     let Some(overlap) = intersection(region, cut) else {
-        return vec![region];
+        return Some(vec![region]);
     };
-    match (region, overlap) {
+    if region == BackingRegion::Whole && overlap != BackingRegion::Whole {
+        return None;
+    }
+    Some(match (region, overlap) {
         (BackingRegion::Whole, BackingRegion::Whole) => Vec::new(),
         (BackingRegion::Linear(region), BackingRegion::Linear(overlap)) => {
             let mut out = Vec::with_capacity(2);
@@ -1682,8 +1653,31 @@ pub(crate) fn subtract(region: BackingRegion, cut: BackingRegion) -> Vec<Backing
                 .map(BackingRegion::Image)
                 .collect()
         }
-        _ => unreachable!("intersection preserves region kind"),
-    }
+        _ => unreachable!("an inexpressible remainder returned above"),
+    })
+}
+
+/// The part of `region` that is provably still `region` and not `cut`.
+///
+/// Where the remainder has no expression this is empty, so a caller recording
+/// what content it *holds* gives up a claim rather than keeping a stale one.
+/// The complete backing minus a freshly written box is exactly that case:
+/// keeping `Whole` at the old version would go on asserting the old content
+/// over the bytes just overwritten, and a later read of those bytes would be
+/// answered from it. Giving the claim up costs a synchronization that was not
+/// needed; keeping it costs the wrong pixels, silently.
+pub(crate) fn remaining_after(region: BackingRegion, cut: BackingRegion) -> Vec<BackingRegion> {
+    subtract(region, cut).unwrap_or_default()
+}
+
+/// The part of `region` that `cut` has not been shown to cover.
+///
+/// The dual of [`remaining_after`], for a caller asking what still needs
+/// filling. Where the remainder has no expression this is the whole region, so
+/// the answer over-reports what is missing and plans a transfer that was not
+/// needed rather than skipping one that was.
+pub(crate) fn not_covered_by(region: BackingRegion, cut: BackingRegion) -> Vec<BackingRegion> {
+    subtract(region, cut).unwrap_or_else(|| vec![region])
 }
 
 fn subtract_image(region: ImageRegion, overlap: ImageRegion) -> Vec<ImageRegion> {
@@ -1814,71 +1808,100 @@ mod tests {
         state
     }
 
-    /// An empty snapshot means two opposite things and the authority says which.
+    /// The complete backing contains every finer region, for reading.
     ///
-    /// Every consumer of a snapshot reads an empty one as "already current" --
-    /// `representation_matches` is an `all` and is vacuously true on nothing --
-    /// so a query this authority cannot narrow to drops the synchronization
-    /// that would have filled the view, silently, as content.
+    /// `Whole` covers content whose contract establishes no translation into
+    /// finer coordinates. That blocks *subdividing* it, and it does not block
+    /// the containment: all the bytes include these bytes, whatever the finer
+    /// coordinates mean. Before this held, an image query against `Whole`
+    /// coverage returned nothing, `representation_matches` was an `all` over
+    /// nothing and therefore vacuously true, and the synchronization that
+    /// would have filled the view was dropped as already satisfied.
     #[test]
-    fn a_finer_query_against_whole_coverage_is_unanswerable_not_satisfied() {
+    fn whole_coverage_answers_a_finer_read_rather_than_nothing() {
+        let mut state = state(BackingRegion::Whole);
+        let write = state
+            .plan_gpu_write(SubmissionId::new(1), GPU, [BackingRegion::Whole])
+            .unwrap()[0];
+        state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+
+        let region = image([0, 0, 0], [16, 16, 1]);
+        assert_eq!(
+            state.snapshot(&[region]).as_ref(),
+            [RegionVersion {
+                region,
+                version: write.version,
+            }]
+        );
+        assert!(state.representation_matches(GPU, &state.snapshot(&[region])));
+        assert!(state.representation_matches(GPU, &state.snapshot(&[linear(0, 64)])));
+    }
+
+    /// Writing part of a whole-covered backing gives up the whole claim.
+    ///
+    /// "Everything except this box" has no expression, so the choice is
+    /// between keeping `Whole` at the old version -- which goes on asserting
+    /// the old content over the bytes just overwritten, and answers a later
+    /// read of them from it -- and giving the claim up. Giving it up costs a
+    /// synchronization that was not needed. Keeping it costs the wrong pixels,
+    /// silently.
+    #[test]
+    fn a_partial_write_over_whole_coverage_gives_up_the_claim_it_cannot_narrow() {
         let mut state = state(BackingRegion::Whole);
         state
             .plan_gpu_write(SubmissionId::new(1), GPU, [BackingRegion::Whole])
             .unwrap();
-        state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+        let old = state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap()[0].version;
 
-        // `Whole` narrows to no image or linear coordinate, so both answer
-        // empty and neither of those empties means satisfied.
-        let finer = [image([0, 0, 0], [16, 16, 1]), linear(0, 64)];
-        assert!(state.snapshot(&finer).is_empty());
-        assert_eq!(state.unanswerable_regions(&finer).as_ref(), finer);
+        let part = image([0, 0, 0], [8, 8, 1]);
+        state
+            .plan_gpu_write(SubmissionId::new(2), GPU, [part])
+            .unwrap();
+        let new = state.complete_gpu_write(SubmissionId::new(2), GPU).unwrap()[0].version;
+        assert!(new > old);
 
-        // The complete backing is answerable, and a mixed query names only the
-        // half that is not.
-        assert!(state
-            .unanswerable_regions(&[BackingRegion::Whole])
-            .is_empty());
+        // The written box reads at the new version, and nothing anywhere still
+        // reads at the old one.
         assert_eq!(
-            state
-                .unanswerable_regions(&[BackingRegion::Whole, linear(0, 64)])
-                .as_ref(),
-            [linear(0, 64)]
+            state.snapshot(&[part]).as_ref(),
+            [RegionVersion {
+                region: part,
+                version: new,
+            }]
         );
+        assert!(state
+            .snapshot(&[BackingRegion::Whole, image([0, 0, 0], [16, 16, 1])])
+            .iter()
+            .all(|entry| entry.version == new));
     }
 
-    /// Coverage that is not `Whole` can answer any query, including an empty
-    /// one.
+    /// Subtraction errs in the direction its caller must err in.
     ///
-    /// The rule is one-directional. A map that holds byte ranges has a sound
-    /// translation into byte coordinates and reports honestly about ranges it
-    /// has not written; only `Whole` carries the declaration that no such
-    /// translation exists. Asking anything of a `Whole` *query* is answerable
-    /// too, because the complete backing contains whatever the map holds.
+    /// The complete backing minus a box has no expression. A caller recording
+    /// what it *holds* must give the claim up; a caller asking what is still
+    /// *missing* must report all of it. One answer would be wrong for one of
+    /// them, and both wrongs are silent.
     #[test]
-    fn coverage_finer_than_whole_answers_every_query_it_is_asked() {
-        let mut state = state(linear(0, 128));
-        assert!(state.unanswerable_regions(&[linear(0, 64)]).is_empty());
-        assert!(state
-            .unanswerable_regions(&[BackingRegion::Whole])
-            .is_empty());
+    fn the_two_subtractions_disagree_only_where_the_remainder_has_no_name() {
+        let part = image([2, 2, 0], [4, 4, 1]);
+        assert!(remaining_after(BackingRegion::Whole, part).is_empty());
+        assert_eq!(
+            not_covered_by(BackingRegion::Whole, part),
+            [BackingRegion::Whole]
+        );
 
-        state
-            .plan_gpu_write(SubmissionId::new(1), GPU, [linear(0, 32)])
-            .unwrap();
-        state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
-
-        // Past the declared coverage the map answers with nothing, and that
-        // nothing is an answer: the query is in the space the map speaks.
-        assert!(state.snapshot(&[linear(128, 64)]).is_empty());
-        assert!(state.unanswerable_regions(&[linear(128, 64)]).is_empty());
-
-        // An image query against a linear map crosses coordinate spaces and
-        // is a producer that asked in the wrong terms, not an authority that
-        // cannot narrow: this rule does not claim that one.
-        assert!(state
-            .unanswerable_regions(&[image([0, 0, 0], [8, 8, 1])])
-            .is_empty());
+        // Everywhere the remainder does have a name they agree, including the
+        // other direction: removing all the bytes removes any subset of them.
+        assert!(remaining_after(part, BackingRegion::Whole).is_empty());
+        assert!(not_covered_by(part, BackingRegion::Whole).is_empty());
+        assert_eq!(
+            remaining_after(linear(0, 128), linear(0, 64)),
+            not_covered_by(linear(0, 128), linear(0, 64))
+        );
+        assert_eq!(
+            remaining_after(BackingRegion::Whole, BackingRegion::Whole),
+            not_covered_by(BackingRegion::Whole, BackingRegion::Whole)
+        );
     }
 
     #[test]
@@ -2112,7 +2135,7 @@ mod tests {
     fn image_box_subtraction_preserves_every_texel_outside_the_write() {
         let whole = image([0, 0, 0], [8, 8, 1]);
         let center = image([2, 2, 0], [4, 4, 1]);
-        let remainder = subtract(whole, center);
+        let remainder = remaining_after(whole, center);
         assert_eq!(remainder.len(), 4);
         let volume: u32 = remainder
             .iter()

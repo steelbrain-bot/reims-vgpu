@@ -73,7 +73,9 @@ impl AdmittedResourceStates {
                 for written in target.regions.iter().copied() {
                     missing = missing
                         .into_iter()
-                        .flat_map(|required| crate::content_authority::subtract(required, written))
+                        .flat_map(|required| {
+                            crate::content_authority::not_covered_by(required, written)
+                        })
                         .collect();
                     if missing.is_empty() {
                         return missing;

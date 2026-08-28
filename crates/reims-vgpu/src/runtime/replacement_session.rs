@@ -3579,11 +3579,6 @@ fn report_guest_upload_refresh(
         ReplacementUploadManifestStaleness::Unreadable { backing } => {
             ("backing_unreadable", backing, String::new())
         }
-        ReplacementUploadManifestStaleness::Unanswerable { backing, regions } => (
-            "content_regions_unanswerable",
-            backing,
-            format!("regions={regions:?}"),
-        ),
         ReplacementUploadManifestStaleness::UnpermittedPendingWrite {
             backing,
             representation,
@@ -3645,18 +3640,6 @@ pub(crate) enum ReplacementUploadManifestStaleness {
     /// The backing or its regional content could not be read.
     Unreadable {
         backing: reims_vgpu_protocol::BackingId,
-    },
-    /// The backing's content authority holds no coverage in the coordinate
-    /// space these regions are expressed in, so it cannot say whether any view
-    /// is stale.
-    ///
-    /// It answers such a query with nothing, which is the same nothing a
-    /// backing holding no content answers, and the comparison below is an
-    /// `all` over that snapshot -- vacuously true, so every view reads as
-    /// current and the upload proceeds against bytes nobody vouched for.
-    Unanswerable {
-        backing: reims_vgpu_protocol::BackingId,
-        regions: Box<[reims_vgpu_core::BackingRegion]>,
     },
     /// One view over these bytes does not hold the content the manifest
     /// requires. Every image declared over a backing keeps its own copy, so
@@ -3757,21 +3740,6 @@ impl ReplacementExecResourceManifest {
             };
             if designated.is_empty() {
                 return Some(ReplacementUploadManifestStaleness::Undesignated { backing });
-            }
-            // An empty snapshot is two opposite facts -- this backing holds
-            // nothing here, or it holds content these coordinates cannot
-            // reach -- and the comparison below reads both as current. Ask
-            // which before believing it.
-            let Ok(unanswerable) =
-                resources.unanswerable_content_regions(backing, &request.regions)
-            else {
-                return Some(ReplacementUploadManifestStaleness::Unreadable { backing });
-            };
-            if !unanswerable.is_empty() {
-                return Some(ReplacementUploadManifestStaleness::Unanswerable {
-                    backing,
-                    regions: unanswerable,
-                });
             }
             let Ok(snapshot) = resources.snapshot_content(backing, &request.regions) else {
                 return Some(ReplacementUploadManifestStaleness::Unreadable { backing });
@@ -5229,21 +5197,6 @@ pub(crate) enum ReplacementExecResourceReadinessError {
     ValidityRepresentation {
         backing: reims_vgpu_protocol::BackingId,
         reason: reims_vgpu_core::ManagedBackingError,
-    },
-    /// The backing's content authority holds no coverage in the coordinate
-    /// space this read is expressed in, so it cannot say whether the bytes are
-    /// current.
-    ///
-    /// The empty snapshot such a query returns is the same empty snapshot a
-    /// backing holding nothing returns, and every consumer downstream reads
-    /// that as "already current": `representation_matches` is an `all` over the
-    /// snapshot and is vacuously true, so no view is stale and the whole
-    /// request is dropped as satisfied. That is a guess where the contract
-    /// asked for a refusal, and it fails as *content*, which no counter here
-    /// reports.
-    ContentRegionUnanswerable {
-        backing: reims_vgpu_protocol::BackingId,
-        regions: Box<[reims_vgpu_core::BackingRegion]>,
     },
     Info(ReplacementPreparedInfoEvaluationFailure),
 }
@@ -12174,24 +12127,6 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     Ok(snapshot) => snapshot,
                     Err(reason) => return Some(Err(validity_error(reason))),
                 };
-                // An empty snapshot has two meanings and the difference is
-                // the whole question: this backing holds nothing here, or this
-                // backing holds content it cannot express in these
-                // coordinates. Only the first means there is nothing to
-                // synchronize, and the code below cannot tell them apart --
-                // `stale` is empty either way. Ask before reading it.
-                match resources.unanswerable_content_regions(backing, &regions) {
-                    Ok(unanswerable) if unanswerable.is_empty() => {}
-                    Ok(unanswerable) => {
-                        return Some(Err(
-                            ReplacementExecResourceReadinessError::ContentRegionUnanswerable {
-                                backing,
-                                regions: unanswerable,
-                            },
-                        ));
-                    }
-                    Err(reason) => return Some(Err(validity_error(reason))),
-                }
                 let stale = match resources.stale_designated_representations(backing, &snapshot) {
                     Ok(stale) => stale,
                     Err(reason) => return Some(Err(validity_error(reason))),
