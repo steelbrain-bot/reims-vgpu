@@ -4900,16 +4900,23 @@ impl<Completion> ReplacementResourceReadyExecFailure<Completion> {
 
     /// See [`ReplacementExecResourceTableError::is_terminal_refusal`].
     ///
-    /// Only the readiness phase answers here, through
-    /// [`ReplacementExecResourceReadinessError::awaits_declaration`]. The other
-    /// two phases carry their own repair paths: a resource preparation naming a
-    /// backing with no representation is materialized where it refused, and an
-    /// image phase refusal is an ordering statement that the domain it names
-    /// resolves by submitting.
-    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+    /// Two phases answer here. Readiness answers through
+    /// [`ReplacementExecResourceReadinessError::awaits_declaration`]. Resource
+    /// preparation answers only for a *stale* representation, which is the same
+    /// statement asked of a bind rather than of a validity move: the canonical
+    /// content is held by no live object and nothing plans a transfer out of
+    /// one that does not exist. The neighbouring fault at that phase, a backing
+    /// with no representation at all, keeps waiting -- it is materialized where
+    /// it refused, and that repair is the reason the two must not share an
+    /// answer. An image phase refusal is an ordering statement the domain it
+    /// names resolves by submitting.
+    pub(crate) fn is_terminal_refusal(&self) -> bool {
         match self {
             Self::Readiness { reason, .. } => !reason.awaits_declaration(),
-            Self::Resources { .. } | Self::Images { .. } => false,
+            Self::Resources { reason, .. } => reason
+                .backing_fault()
+                .is_some_and(|(_, _, fault)| !fault.awaits_declaration()),
+            Self::Images { .. } => false,
         }
     }
 
@@ -4927,6 +4934,17 @@ impl<Completion> ReplacementResourceReadyExecFailure<Completion> {
     ) -> Result<ReplacementRefusedExecReservations<Completion>, Self> {
         match self {
             Self::Readiness { reason, prepared } if !reason.awaits_declaration() => {
+                Ok(ReplacementRefusedExecReservations {
+                    transaction: Some(prepared.admitted.transaction.id),
+                    continuation: None,
+                    envelope: None,
+                })
+            }
+            Self::Resources { reason, prepared }
+                if reason
+                    .backing_fault()
+                    .is_some_and(|(_, _, fault)| !fault.awaits_declaration()) =>
+            {
                 Ok(ReplacementRefusedExecReservations {
                     transaction: Some(prepared.admitted.transaction.id),
                     continuation: None,
