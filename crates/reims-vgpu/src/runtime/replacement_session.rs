@@ -3566,6 +3566,9 @@ impl ReplacementExecResourceManifest {
         resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
     ) -> bool {
         self.content_requirements.iter().all(|request| {
+            // A backing that designates nothing holds this content nowhere, and
+            // `stale_designated_representations` cannot say so -- it answers
+            // about the views that exist, and there are none.
             let Ok(designated) = resources.designated_views(request.backing) else {
                 return false;
             };
@@ -3576,12 +3579,13 @@ impl ReplacementExecResourceManifest {
                 return false;
             };
             // Every image over these bytes holds its own copy, so the upload's
-            // content requirement is met only when all of them hold it.
-            designated.into_iter().all(|(_, representation)| {
-                resources
-                    .representation_matches(request.backing, representation, &snapshot)
-                    .unwrap_or(false)
-            })
+            // content requirement is met only when all of them hold it. Asked
+            // of the type that owns the designations, so this cannot drift
+            // from the preflight that decides whether to request the
+            // synchronization in the first place.
+            resources
+                .stale_designated_representations(request.backing, &snapshot)
+                .is_ok_and(|stale| stale.is_empty())
         })
     }
 }
