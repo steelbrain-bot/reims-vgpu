@@ -392,23 +392,25 @@ fn unowned_submission_positions(
         .collect()
 }
 
+/// The backing an exec dispatch stopped on for want of an execution
+/// representation, and the view that named it, if that is the fault it carries.
+///
+/// Which arms carry a backing fault at all is
+/// [`crate::runtime::replacement_session::ReplacementExecIngressDispatchFailure::backing_fault`]'s
+/// question and not this one's; this only says which fault is the repairable
+/// one.
 fn missing_execution_representation<Semantic>(
     failure: &crate::runtime::replacement_session::ReplacementExecIngressDispatchFailure<Semantic>,
-) -> Option<reims_vgpu_protocol::BackingId> {
-    use crate::runtime::replacement_session::{
-        ReplacementExecIngressDispatchFailure as Dispatch,
-        ReplacementExecResourceReadinessError as Readiness,
-        ReplacementResourceReadyExecFailure as Resources,
-    };
-    match failure {
-        Dispatch::DirectResources(Resources::Readiness {
-            reason:
-                Readiness::ValidityRepresentation {
-                    backing,
-                    reason: reims_vgpu_core::ManagedBackingError::MissingExecutionRepresentation,
-                },
-            ..
-        }) => Some(*backing),
+) -> Option<(
+    reims_vgpu_protocol::BackingId,
+    Option<reims_vgpu_core::BackingView>,
+)> {
+    match failure.backing_fault() {
+        Some((
+            backing,
+            view,
+            reims_vgpu_core::ManagedBackingError::MissingExecutionRepresentation,
+        )) => Some((backing, view)),
         _ => None,
     }
 }
@@ -1220,9 +1222,9 @@ where
                     )
                 )
             );
-            if let Some(backing) = missing_execution_representation(&reason) {
+            if let Some((backing, view)) = missing_execution_representation(&reason) {
                 if let Err(preparation) =
-                    prepare_backing_representation(runtime, host, page_shift, backing, None)
+                    prepare_backing_representation(runtime, host, page_shift, backing, view)
                 {
                     return Err(Box::new(
                         ReplacementHostExecDispatchFailure::BackingRepresentation {
@@ -1259,8 +1261,12 @@ where
             ready,
             ..
         } => {
+            // Derived from the retained dispatch rather than carried beside
+            // it, so the retry cannot ask for a different view than the one
+            // that refused.
+            let view = missing_execution_representation(&dispatch).and_then(|(_, view)| view);
             if let Err(reason) =
-                prepare_backing_representation(runtime, host, page_shift, backing, None)
+                prepare_backing_representation(runtime, host, page_shift, backing, view)
             {
                 return Err(Box::new(
                     ReplacementHostExecDispatchFailure::BackingRepresentation {

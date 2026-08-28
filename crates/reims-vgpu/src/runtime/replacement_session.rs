@@ -6283,13 +6283,52 @@ impl<Completion> ReplacementExecIngressPreparationError<Completion> {
 }
 
 impl<Completion> ReplacementExecIngressDispatchFailure<Completion> {
-    /// See [`ReplacementExecAutomaticPreparationError::stale_backing`].
-    pub(crate) fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+    /// The backing fault this dispatch carries, whichever phase reported it.
+    ///
+    /// Two phases of one dispatch report a backing fault and they name
+    /// different amounts of it. Readiness asks whether a backing has *any*
+    /// designated representation, so it names a backing and no view. Resource
+    /// preparation asks for the representation one binding resolves to, so it
+    /// names the view as well, and the view is what says which of a backing's
+    /// images the fault is about.
+    ///
+    /// They are one fact and this is the one place that reads them, because
+    /// every reader that told them apart by hand has ended up reading only one.
+    /// The repair for a missing execution representation took the view and read
+    /// only the readiness arm, so a head that refused through resource
+    /// preparation -- which is the arm a compute binding takes -- parked
+    /// forever on a repair that was already reachable.
+    pub(crate) fn backing_fault(
+        &self,
+    ) -> Option<(
+        reims_vgpu_protocol::BackingId,
+        Option<reims_vgpu_core::BackingView>,
+        reims_vgpu_core::ManagedBackingError,
+    )> {
         match self {
+            Self::DirectResources(ReplacementResourceReadyExecFailure::Readiness {
+                reason:
+                    ReplacementExecResourceReadinessError::ValidityRepresentation { backing, reason },
+                ..
+            }) => Some((*backing, None, *reason)),
             Self::DirectResources(ReplacementResourceReadyExecFailure::Resources {
                 reason,
                 ..
-            }) => reason.stale_backing(),
+            }) => reason
+                .backing_fault()
+                .map(|(backing, view, reason)| (backing, Some(view), reason)),
+            _ => None,
+        }
+    }
+
+    /// See [`ReplacementExecAutomaticPreparationError::stale_backing`].
+    pub(crate) fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self.backing_fault() {
+            Some((
+                backing,
+                _,
+                reims_vgpu_core::ManagedBackingError::StaleExecutionRepresentation,
+            )) => Some(backing),
             _ => None,
         }
     }
