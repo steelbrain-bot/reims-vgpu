@@ -2540,7 +2540,8 @@ pub fn translate_cached_reflected(
                 // cumulative counter — logging it always-on flooded /tmp/reims-vgpu-fail.log
                 // (~1.1M lines / boot, drowning real failures) and paid a file write
                 // per draw on the render path. Verbose-gated only; the miss/`ok` line
-                // below stays always-on so cache lifecycle is still visible.
+                // below stays always-on, on the OFF channel, so cache lifecycle
+                // is still visible.
                 if reims_vgpu_observe::draw_log_enabled() {
                     reims_vgpu_observe::line(format!(
                         "linux_m2v_translate_hit pipe={pipeline_ref} stage={stage:?} spv={} hits={hits} misses={misses}",
@@ -2571,7 +2572,13 @@ pub fn translate_cached_reflected(
         let hits = c.hits;
         let misses = c.misses;
         drop(c);
-        reims_vgpu_observe::fail(format!(
+        // A translation that succeeded is not a loss, so it belongs on the
+        // always-on OFF channel rather than the failure one: a reader ranking
+        // `reason=` on the fail channel otherwise has to filter these out
+        // first, and one that does not read them as a shader rail failing
+        // dozens of times a boot. Still always-on, so cache lifecycle stays
+        // visible.
+        reims_vgpu_observe::off(format!(
             "linux_m2v_translate ok pipe={pipeline_ref} stage={stage:?} v_spv_or_f={} hits={hits} misses={misses}",
             shader.spirv.len()
         ));
@@ -2642,7 +2649,8 @@ pub fn translate_cached_kernel_reflected(
         let hits = c.hits;
         let misses = c.misses;
         drop(c);
-        reims_vgpu_observe::fail(format!(
+        // Off-channel for the reason the render arm above states.
+        reims_vgpu_observe::off(format!(
             "linux_m2v_translate ok pipe={pipeline_ref} stage=Kernel tg=[{},{},{}] spv={} hits={hits} misses={misses}",
             local_size[0], local_size[1], local_size[2], shader.spirv.len()
         ));

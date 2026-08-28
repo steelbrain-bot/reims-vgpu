@@ -592,28 +592,59 @@ pub(super) fn copy_console_frame(
     result
 }
 
-pub(super) fn copy_efi_console(
-    id: u64,
+/// Fill `destination` from the console framebuffer the guest programmed, if
+/// that is where the console currently lives.
+///
+/// MMIO `efi_fb_start` carries the console's guest-physical base and
+/// `efi_fb_stride` its row pitch. The geometry is the single mode this device
+/// advertises -- [`crate::model::EFI_BOOT_WIDTH`] by
+/// [`crate::model::EFI_BOOT_HEIGHT`] -- so a request for any other geometry is
+/// not this framebuffer; the stride is the only part of the layout the guest
+/// sets, and reading rows at `width * 4` instead shears the image by the
+/// padding on every row.
+///
+/// This is what keeps the boot screen moving. macOS relocates its kernel video
+/// console off the BAR1 GOP aperture into system RAM part-way through boot --
+/// the guest serial says `console relocated to <gpa>` -- and BAR1 stops
+/// changing from that moment. A console that follows only BAR1 therefore
+/// freezes on whatever text was last written there and shows it for the rest of
+/// the boot.
+///
+/// `false` means this framebuffer is not the source right now, and every way
+/// that happens is ordinary rather than a fault: unprogrammed, a geometry that
+/// is not the advertised mode, a stride narrower than one row, or a base that
+/// is not guest RAM. For most of early boot the base *is* the BAR1 aperture,
+/// which is device memory and reads closed by design. The caller holds BAR1 for
+/// exactly this case.
+///
+/// A closed door costs exactly one refused read: the loop below starts at row
+/// zero and returns on the first failure. That matters because each refused
+/// read is reported on the failure channel, and this door is shut for most of
+/// early boot -- reading the whole frame before giving up would turn one
+/// expected decline into one per row, on the console's own repeat cadence.
+fn copy_guest_efi_console(
+    host: &impl HostMemory,
+    start: u64,
+    stride: u32,
     destination: &mut [u8],
     destination_stride: u32,
     width: u32,
     height: u32,
 ) -> bool {
-    let Some(slot) = slot(id) else {
-        return false;
-    };
-    let inner = slot.inner.lock();
-    let start = inner.device.transport_registers().gfx.efi_fb_start;
-    let Some(ops) = slot.ops else {
-        return false;
-    };
-    if start == 0 {
+    if start == 0
+        || width != crate::model::EFI_BOOT_WIDTH
+        || height != crate::model::EFI_BOOT_HEIGHT
+    {
         return false;
     }
     let row_len = match width.checked_mul(4) {
         Some(row_len) if destination_stride >= row_len => row_len,
         _ => return false,
     };
+    let stride = if stride == 0 { row_len } else { stride };
+    if stride < row_len {
+        return false;
+    }
     let required = match height.checked_sub(1).and_then(|rows| {
         u64::from(rows)
             .checked_mul(u64::from(destination_stride))
@@ -629,11 +660,9 @@ pub(super) fn copy_efi_console(
     if destination.len() < required {
         return false;
     }
-    let mut scratch = VecDeque::new();
-    let host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
     for row in 0..height {
         let source = match u64::from(row)
-            .checked_mul(u64::from(row_len))
+            .checked_mul(u64::from(stride))
             .and_then(|offset| start.checked_add(offset))
         {
             Some(source) => source,
@@ -650,6 +679,35 @@ pub(super) fn copy_efi_console(
         }
     }
     true
+}
+
+pub(super) fn copy_efi_console(
+    id: u64,
+    destination: &mut [u8],
+    destination_stride: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Some(slot) = slot(id) else {
+        return false;
+    };
+    let inner = slot.inner.lock();
+    let gfx = &inner.device.transport_registers().gfx;
+    let (start, stride) = (gfx.efi_fb_start, gfx.efi_fb_stride);
+    let Some(ops) = slot.ops else {
+        return false;
+    };
+    let mut scratch = VecDeque::new();
+    let host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
+    copy_guest_efi_console(
+        &host,
+        start,
+        stride,
+        destination,
+        destination_stride,
+        width,
+        height,
+    )
 }
 
 pub(super) fn cursor_glyph(id: u64) -> Option<(u16, u16, u16, u16, Vec<u32>)> {
@@ -706,19 +764,48 @@ fn publish_early_window_frame(slot: &BoundReplacementDevice, product_presented: 
     let Some(window) = window.as_mut() else {
         return;
     };
+    // Republish only when the firmware framebuffer's bytes actually differ from
+    // what the window is already showing.
+    //
+    // `Frame::seq` is the whole "is this a new picture" test the window loop
+    // applies, so a fresh seq over identical bytes buys a full-screen present
+    // that puts the same picture back up. This publisher runs once per device
+    // poll rather than once per guest update -- about 205 times a second across
+    // an x86 boot -- and the guest is drawing into this framebuffer while we
+    // read it with no synchronization available on either side. Publishing
+    // unconditionally therefore spent a full-screen copy and a present on every
+    // one of those polls, and showed the boot console tearing at the poll rate
+    // instead of at the rate the console actually changes.
+    //
+    // The comparison needs no state of its own: the frame slot already retains
+    // the last frame published, which is exactly the picture on screen. The
+    // slot handle is cloned rather than borrowed so the `seq` bump below can
+    // still take `window` mutably.
+    let frames = window.frames.clone();
+    let Ok(mut current) = frames.lock() else {
+        return;
+    };
+    if let Some(crate::host_window::present::FramePayload::CpuBgra {
+        bgra: published,
+        width,
+        height,
+    }) = current.as_deref().map(|frame| &frame.payload)
+    {
+        if *width == framebuffer.width && *height == framebuffer.height && published[..] == bgra[..]
+        {
+            return;
+        }
+    }
     window.seq = window.seq.wrapping_add(1);
-    let frame = Arc::new(crate::host_window::present::Frame {
+    *current = Some(Arc::new(crate::host_window::present::Frame {
         seq: window.seq,
         payload: crate::host_window::present::FramePayload::CpuBgra {
             bgra,
             width: framebuffer.width,
             height: framebuffer.height,
         },
-    });
-    if let Ok(mut current) = window.frames.lock() {
-        *current = Some(frame);
-        window.wake.wake();
-    };
+    }));
+    window.wake.wake();
 }
 
 #[cfg(feature = "host-window")]
@@ -903,5 +990,137 @@ mod tests {
 
         assert!(super::poll(handle));
         assert!(super::destroy(handle));
+    }
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::copy_guest_efi_console;
+    use crate::model::{EFI_BOOT_HEIGHT, EFI_BOOT_WIDTH};
+    use crate::runtime::host::{FakeHost, HostMemory};
+
+    const BASE: u64 = 0x8000_0000;
+    const ROW_BYTES: u32 = EFI_BOOT_WIDTH * 4;
+
+    /// A guest that pads its rows is read at the pitch it published.
+    ///
+    /// The failure this gates is a shear rather than a refusal: reading at
+    /// `width * 4` when the guest published a wider stride walks the source
+    /// short by the padding on every row, so row N arrives holding bytes from
+    /// part-way through row N-1 and the console slides diagonally down the
+    /// screen. Marking one byte per row and checking where it lands says which
+    /// pitch the copy used.
+    #[test]
+    fn the_guest_console_is_read_at_the_stride_the_guest_published() {
+        let padded = ROW_BYTES + 256;
+        let mut host = FakeHost::new();
+        let rows = [0u32, 1, 2, 17, EFI_BOOT_HEIGHT - 1];
+        for (marker, row) in rows.iter().enumerate() {
+            let byte = [marker as u8 + 1];
+            host.write_gpa(BASE + u64::from(*row) * u64::from(padded), &byte)
+                .unwrap();
+        }
+        let mut destination = vec![0u8; (ROW_BYTES as usize) * (EFI_BOOT_HEIGHT as usize)];
+        assert!(copy_guest_efi_console(
+            &host,
+            BASE,
+            padded,
+            &mut destination,
+            ROW_BYTES,
+            EFI_BOOT_WIDTH,
+            EFI_BOOT_HEIGHT,
+        ));
+        for (marker, row) in rows.iter().enumerate() {
+            assert_eq!(
+                destination[(*row as usize) * (ROW_BYTES as usize)],
+                marker as u8 + 1,
+                "row {row} did not come from the published stride"
+            );
+        }
+    }
+
+    /// A zero stride means the guest published none, so rows are contiguous.
+    #[test]
+    fn an_unpublished_stride_reads_contiguous_rows() {
+        let mut host = FakeHost::new();
+        host.write_gpa(BASE + u64::from(ROW_BYTES), &[9]).unwrap();
+        let mut destination = vec![0u8; (ROW_BYTES as usize) * (EFI_BOOT_HEIGHT as usize)];
+        assert!(copy_guest_efi_console(
+            &host,
+            BASE,
+            0,
+            &mut destination,
+            ROW_BYTES,
+            EFI_BOOT_WIDTH,
+            EFI_BOOT_HEIGHT,
+        ));
+        assert_eq!(destination[ROW_BYTES as usize], 9);
+    }
+
+    /// The console is the one mode this device advertises. Any other geometry
+    /// names a different framebuffer, and the caller has BAR1 for it.
+    #[test]
+    fn a_geometry_that_is_not_the_advertised_mode_is_refused() {
+        let host = FakeHost::new();
+        let mut destination = vec![0u8; 1280 * 720 * 4];
+        assert!(!copy_guest_efi_console(
+            &host,
+            BASE,
+            0,
+            &mut destination,
+            1280 * 4,
+            1280,
+            720,
+        ));
+    }
+
+    /// A stride narrower than one row cannot describe this framebuffer.
+    #[test]
+    fn a_stride_narrower_than_a_row_is_refused() {
+        let host = FakeHost::new();
+        let mut destination = vec![0u8; (ROW_BYTES as usize) * (EFI_BOOT_HEIGHT as usize)];
+        assert!(!copy_guest_efi_console(
+            &host,
+            BASE,
+            ROW_BYTES - 4,
+            &mut destination,
+            ROW_BYTES,
+            EFI_BOOT_WIDTH,
+            EFI_BOOT_HEIGHT,
+        ));
+    }
+
+    /// An unprogrammed base is the ordinary early-boot answer, not a fault.
+    #[test]
+    fn an_unprogrammed_console_base_is_refused() {
+        let host = FakeHost::new();
+        let mut destination = vec![0u8; (ROW_BYTES as usize) * (EFI_BOOT_HEIGHT as usize)];
+        assert!(!copy_guest_efi_console(
+            &host,
+            0,
+            0,
+            &mut destination,
+            ROW_BYTES,
+            EFI_BOOT_WIDTH,
+            EFI_BOOT_HEIGHT,
+        ));
+    }
+
+    /// The base is the BAR1 aperture for most of early boot -- device memory,
+    /// which reads closed -- and one refused read is the whole cost.
+    #[test]
+    fn a_console_base_that_is_not_guest_ram_is_refused() {
+        let mut host = FakeHost::new();
+        host.mark_non_ram(BASE, u64::from(ROW_BYTES) * u64::from(EFI_BOOT_HEIGHT));
+        let mut destination = vec![0u8; (ROW_BYTES as usize) * (EFI_BOOT_HEIGHT as usize)];
+        assert!(!copy_guest_efi_console(
+            &host,
+            BASE,
+            0,
+            &mut destination,
+            ROW_BYTES,
+            EFI_BOOT_WIDTH,
+            EFI_BOOT_HEIGHT,
+        ));
     }
 }
