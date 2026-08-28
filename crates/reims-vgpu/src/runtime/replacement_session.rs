@@ -4604,7 +4604,16 @@ pub(crate) enum ReplacementResourceReadyExecFailure<Completion> {
 #[derive(Debug)]
 pub(crate) struct ReplacementExecImagePreparationFailure {
     pub reason: ReplacementExecImagePreparationRefusal,
-    pub resources: PreparedReplacementExecResources,
+    /// The prepared resources, when the refusal left this transaction's claims
+    /// intact and re-asking is all a retry needs.
+    ///
+    /// `None` when the refusal was an ordering one, because those claims had
+    /// to go. See
+    /// [`ReplacementExecImagePreparationRefusal::releases_prepared_resources`]:
+    /// a transaction behind an unsubmitted predecessor may hold no exclusive
+    /// claim at all, and a resource preparation takes several before the image
+    /// stage is ever reached.
+    pub resources: Option<PreparedReplacementExecResources>,
 }
 
 /// Why one exec could not take its image claims.
@@ -4640,6 +4649,32 @@ pub(crate) enum ReplacementExecImagePreparationRefusal {
     /// of, and silently allowing it is how an ordering rule stops covering the
     /// population it was written for.
     SubmissionOrderUntracked,
+}
+
+impl ReplacementExecImagePreparationRefusal {
+    /// Whether this refusal requires the transaction's prepared resources to be
+    /// given back rather than retained for the retry.
+    ///
+    /// The image claim is not the only exclusive claim an exec takes, and it is
+    /// the last one. Resource preparation runs on arrival and takes the others
+    /// -- among them a *pending content transfer*, which the content authority
+    /// grants once per region and which the head of the domain may need for
+    /// itself. Retaining those across an ordering refusal reproduces, one stage
+    /// earlier, exactly the deadlock
+    /// [`Self::BehindUnsubmittedPredecessor`] was written to end: a later
+    /// transaction holds what the head needs, the head's own repair plans
+    /// nothing because the claim is already taken, and neither can move while
+    /// every stall counter reads healthy.
+    ///
+    /// A backend refusal is different and must retain: nothing about ordering
+    /// is wrong, no predecessor is waiting on what this transaction holds, and
+    /// re-preparing would abandon claims it legitimately owns.
+    pub const fn releases_prepared_resources(self) -> bool {
+        match self {
+            Self::Images(_) => false,
+            Self::BehindUnsubmittedPredecessor(_) | Self::SubmissionOrderUntracked => true,
+        }
+    }
 }
 
 type ReplacementExecResourceCancellation = reims_vgpu_core::ExecResourceCancellationResult<
@@ -9126,7 +9161,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     self.dispatch_prepared_direct_ingress(prepared)
                 }
                 ReplacementResourceReadyExecFailure::Images { reason, prepared } => {
-                    let envelope = match self.prepare_exec_image_states(reason.resources) {
+                    // An ordering refusal gave the claims back, so there is
+                    // nothing left to re-ask and the whole exec is prepared
+                    // again -- the same route the two arms above take.
+                    let Some(resources) = reason.resources else {
+                        return self.dispatch_prepared_direct_ingress(prepared);
+                    };
+                    let envelope = match self.prepare_exec_image_states(resources) {
                         Ok(envelope) => envelope,
                         Err(reason) => {
                             return Err(ReplacementExecIngressDispatchFailure::DirectResources(
@@ -9192,7 +9233,17 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     manifest,
                     chain,
                 } => {
-                    let envelope = match self.prepare_exec_image_states(reason.resources) {
+                    // An ordering refusal gave the claims back, so the phase is
+                    // built again from the exec and the manifest it arrived
+                    // with -- the same route the two arms above take.
+                    let Some(resources) = reason.resources else {
+                        drop(chain);
+                        let phase = self
+                            .prepare_guest_upload_phase(prepared, manifest)
+                            .map_err(ReplacementExecIngressDispatchFailure::GuestUploadPhase)?;
+                        return self.drive_guest_upload_phase(phase);
+                    };
+                    let envelope = match self.prepare_exec_image_states(resources) {
                         Ok(envelope) => envelope,
                         Err(reason) => {
                             return Err(ReplacementExecIngressDispatchFailure::GuestUploadPhase(
@@ -9237,7 +9288,12 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 self.prepare_direct_ingress_exec(prepared)
             }
             ReplacementResourceReadyExecFailure::Images { reason, prepared } => {
-                let envelope = match self.prepare_exec_image_states(reason.resources) {
+                // An ordering refusal gave the claims back; re-prepare the
+                // whole exec as the two arms above do.
+                let Some(resources) = reason.resources else {
+                    return self.prepare_direct_ingress_exec(prepared);
+                };
+                let envelope = match self.prepare_exec_image_states(resources) {
                     Ok(envelope) => envelope,
                     Err(reason) => {
                         return Err(ReplacementResourceReadyExecFailure::Images {
@@ -9319,19 +9375,25 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                         prepared,
                         ..
                     } => self.prepare_indirect_range_phase_resources(prepared),
+                    // An ordering refusal gave the claims back; re-prepare the
+                    // whole phase as the two arms above do.
                     ReplacementResourceReadyIndirectRangePhaseFailure::Images {
                         reason,
                         prepared,
-                    } => match self.prepare_exec_image_states(reason.resources) {
-                        Ok(envelope) => {
-                            Ok(ReplacementResourceReadyIndirectRangePhase { prepared, envelope })
-                        }
-                        Err(reason) => Err(Box::new(
-                            ReplacementResourceReadyIndirectRangePhaseFailure::Images {
-                                reason,
+                    } => match reason.resources {
+                        None => self.prepare_indirect_range_phase_resources(prepared),
+                        Some(resources) => match self.prepare_exec_image_states(resources) {
+                            Ok(envelope) => Ok(ReplacementResourceReadyIndirectRangePhase {
                                 prepared,
-                            },
-                        )),
+                                envelope,
+                            }),
+                            Err(reason) => Err(Box::new(
+                                ReplacementResourceReadyIndirectRangePhaseFailure::Images {
+                                    reason,
+                                    prepared,
+                                },
+                            )),
+                        },
                     },
                 }
                 .map_err(ReplacementInitialIndirectRangePhaseDispatchFailure::Resources)?;
@@ -12076,7 +12138,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 Err(reason) => {
                     return Err(Box::new(ReplacementExecImagePreparationFailure {
                         reason: ReplacementExecImagePreparationRefusal::Images(reason),
-                        resources,
+                        resources: Some(resources),
                     }));
                 }
             };
@@ -12168,6 +12230,27 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             None => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
         };
         if let Some(reason) = refusal {
+            // Give the claims back before the refusal is retained. Everything
+            // this preparation took -- resource uses, planned GPU writes, and
+            // the pending content transfers the head of this domain may itself
+            // be waiting on -- is exclusive, and a transaction that may not
+            // take the *image* claim may not sit on those either. See
+            // [`ReplacementExecImagePreparationRefusal::releases_prepared_resources`].
+            let resources = if reason.releases_prepared_resources() {
+                reims_vgpu_core::cancel_prepared_exec_resources(
+                    &mut self.execution.epoch.resources,
+                    resources,
+                )
+                .unwrap_or_else(|failure| {
+                    unreachable!(
+                        "an order-refused transaction's resources were prepared and never accepted: {:?}",
+                        failure.reason
+                    )
+                });
+                None
+            } else {
+                Some(resources)
+            };
             return Err(Box::new(ReplacementExecImagePreparationFailure {
                 reason,
                 resources,
@@ -12189,7 +12272,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             }),
             Err(reason) => Err(Box::new(ReplacementExecImagePreparationFailure {
                 reason: ReplacementExecImagePreparationRefusal::Images(reason),
-                resources,
+                resources: Some(resources),
             })),
         }
     }
@@ -32952,6 +33035,279 @@ mod tests {
             admitted_ingress_exec,
             producer,
         })
+    }
+
+    /// An exec refused for *ordering* gives back every claim its resource
+    /// preparation took, so the head of its domain can still take them.
+    ///
+    /// The image claim is the last one an exec takes and it is not the only
+    /// one. Resource preparation runs on arrival, and by the time the ordering
+    /// question is asked this transaction already holds write reservations,
+    /// representation uses and pending content transfers. Keeping those across
+    /// an ordering refusal starves the head silently, because the refusal is
+    /// lifted only *by* the head submitting: a pending transfer is granted
+    /// once per region, so the head's own repair is handed an empty plan
+    /// rather than a refusal, plans nothing, never becomes current and never
+    /// submits, while the later transaction goes on refusing behind it. Both
+    /// retry for the life of the device with every stall counter reading
+    /// healthy, which is the deadlock `BehindUnsubmittedPredecessor` was
+    /// written to end, one stage earlier.
+    ///
+    /// The claim this asserts on is the write reservation, because it is the
+    /// one an EXEC of this shape takes; the release is a single act over
+    /// writes, transfers and uses, so it is the same act that frees the
+    /// transfer a driven boot wedged on.
+    #[test]
+    fn an_order_refused_exec_gives_back_the_content_claims_its_head_needs() {
+        let Some(mut scaffold) = guest_upload_scaffold() else {
+            return;
+        };
+        let declaration = reims_vgpu_protocol::TextureDeclaration {
+            texture_type: reims_vgpu_protocol::TextureType::D2,
+            framebuffer_only: false,
+            is_drawable: false,
+            write_swizzle_enabled: None,
+            allow_gpu_optimized_contents: false,
+            usage: 1,
+            pixel_format: 70,
+            width: 4,
+            height: 4,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            resource_options: 0,
+            protection_options: 0,
+            swizzle: None,
+        };
+        // Two textures over one allocation, so the EXEC below copies between
+        // two distinct images and reaches the image stage at all: an EXEC with
+        // no image use returns before the ordering question is asked.
+        let texture = |scaffold: &mut GuestUploadScaffold, object: u32| {
+            let resource = match scaffold
+                .runtime
+                .apply_resource_lifecycle(
+                    reims_vgpu_core::ResolvedResourceLifecycle::CreateResource {
+                        task: reims_vgpu_protocol::TaskId::new(1),
+                        object: reims_vgpu_protocol::ObjectTableRef::new(object),
+                        kind: reims_vgpu_protocol::ObjectKind::Texture,
+                        descriptor: Arc::new(reims_vgpu_protocol::ResourceDescriptor::Texture(
+                            reims_vgpu_protocol::LinearTextureDescriptor {
+                                allocation_size: 64,
+                                handle: 0x10,
+                                mipmap_level_count: 1,
+                                bytes_per_element: 4,
+                                used_size: 64,
+                                row_stride: 16,
+                                width: 4,
+                                height: 4,
+                                depth: 1,
+                                declaration: Some(declaration),
+                                ..Default::default()
+                            },
+                        )),
+                        storage: Some(scaffold.backing),
+                        parents: Box::new([]),
+                    },
+                )
+                .unwrap()
+            {
+                reims_vgpu_core::ResourceLifecycleEffect::ResourceCreated(resource) => resource,
+                effect => unreachable!("{effect:?}"),
+            };
+            let representation = scaffold
+                .runtime
+                .execution
+                .materialize_resource_with_route(
+                    &scaffold.runtime.session.vulkan,
+                    resource,
+                    scaffold.route,
+                )
+                .unwrap_or_else(|reason| panic!("the texture must materialize: {reason:?}"));
+            (resource, representation)
+        };
+        let (current_resource, current) = texture(&mut scaffold, 31);
+        let (stale_resource, stale) = texture(&mut scaffold, 32);
+        assert_ne!(current, stale);
+        let backing = scaffold.backing;
+        let endpoint = |resource| reims_vgpu_core::ResolvedTextureEndpoint {
+            resource,
+            image_owner: resource,
+            storage: backing,
+            level: 0,
+            slice: 0,
+            backing: reims_vgpu_core::ResolvedTextureBacking::Linear(
+                reims_vgpu_core::ResolvedLinearTextureLevel {
+                    base_gva: 0,
+                    alloc_size: 64,
+                    level_offset: 0,
+                    row_stride: 16,
+                    slice_stride: 0,
+                    slice_index: 0,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    bpp: 4,
+                    pixel_format: 70,
+                },
+            ),
+        };
+
+        // One image holds the backing's content; the other holds none, so an
+        // exec naming the second owes an image-to-image transfer.
+        // The rows the blit reads, in the granularity a linear texture's
+        // content is tracked at: a `Whole` version does not answer a `Linear`
+        // question, so writing the backing as a whole would leave every view
+        // stale for exactly these regions.
+        let rows = (0..4)
+            .map(|row| {
+                reims_vgpu_core::BackingRegion::Linear(
+                    reims_vgpu_core::LinearRange::new(row * 16, 16).unwrap(),
+                )
+            })
+            .collect::<Box<[_]>>();
+        let write = SubmissionId::new(90);
+        scaffold
+            .runtime
+            .execution
+            .resources_mut()
+            .plan_gpu_write(scaffold.backing, write, current, rows.clone())
+            .unwrap();
+        scaffold
+            .runtime
+            .execution
+            .resources_mut()
+            .complete_gpu_write(scaffold.backing, write, current)
+            .unwrap();
+        // Every designated view current at that one version, so nothing this
+        // EXEC does is a repair: the claim it takes and must give back is its
+        // own, not one the content authority handed it.
+        let snapshot = scaffold
+            .runtime
+            .execution
+            .resources()
+            .snapshot_content(scaffold.backing, &rows)
+            .unwrap();
+        for destination in [scaffold.execution, stale] {
+            for key in scaffold
+                .runtime
+                .execution
+                .resources_mut()
+                .plan_transfers(scaffold.backing, current, destination, &snapshot)
+                .unwrap()
+            {
+                scaffold
+                    .runtime
+                    .execution
+                    .resources_mut()
+                    .complete_transfer(key)
+                    .unwrap();
+            }
+        }
+
+        // Admitted behind the scaffold's own ingress EXEC on that EXEC's
+        // channel, so it is not the head of its domain.
+        let channel = reims_vgpu_protocol::ChannelId::new(26);
+        let follower = scaffold
+            .runtime
+            .execution
+            .runtime_mut()
+            .admit_exec_operations(
+                channel,
+                Box::<[reims_vgpu_core::ResolvedTransactionPrerequisite]>::default(),
+                Some(reims_vgpu_core::CompletionStamp::new(channel.get(), 2)),
+                CanonicalReplacementExecTransaction::<()> {
+                    identity: reims_vgpu_protocol::SubmissionIdentity {
+                        id: SubmissionId::new(72),
+                        task: reims_vgpu_protocol::TaskId::new(1),
+                    },
+                    prologue: reims_vgpu_core::ExecPrologue::default(),
+                    streams: Box::new([reims_vgpu_core::ResolvedExecStream {
+                        stream_index: 0,
+                        segments: Box::new([reims_vgpu_core::ResolvedExecSegment {
+                            boundary: reims_vgpu_protocol::SegmentBoundary {
+                                stream_index: 0,
+                                index: 0,
+                                kind: reims_vgpu_protocol::SegmentKind::Blit,
+                                continues_previous: false,
+                                continues_next: false,
+                            },
+                            operations: Box::new([reims_vgpu_core::ResolvedOperation::Blit(
+                                Box::new(reims_vgpu_core::ResolvedBlit::TextureToTexture(
+                                    reims_vgpu_core::ResolvedTextureToTextureBlit {
+                                        source: endpoint(stale_resource),
+                                        source_origin: reims_vgpu_core::TextureOrigin {
+                                            x: 0,
+                                            y: 0,
+                                            z: 0,
+                                        },
+                                        destination: endpoint(current_resource),
+                                        destination_origin: reims_vgpu_core::TextureOrigin {
+                                            x: 0,
+                                            y: 0,
+                                            z: 0,
+                                        },
+                                        extent: reims_vgpu_core::TextureExtent {
+                                            width: 4,
+                                            height: 4,
+                                            depth: 1,
+                                        },
+                                        aspect: reims_vgpu_core::pixel_format::BlitAspect::Full,
+                                    },
+                                )),
+                            )]),
+                        }]),
+                    }]),
+                    accesses: Box::new([]),
+                },
+            )
+            .unwrap();
+        let prepared = scaffold
+            .runtime
+            .prepare_admitted_exec(follower)
+            .unwrap_or_else(|failure| panic!("the follower must prepare: {:?}", failure.reason));
+        let manifest = scaffold
+            .runtime
+            .preflight_prepared_guest_upload_resources(&prepared)
+            .unwrap_or_else(|reason| panic!("the follower must preflight: {reason:?}"));
+        assert!(!manifest.requires_guest_upload());
+        let resources = scaffold
+            .runtime
+            .prepare_preflighted_exec_resources(&prepared, manifest)
+            .unwrap_or_else(|_| panic!("the follower's resource preparation must succeed"));
+        let reason = *scaffold
+            .runtime
+            .prepare_exec_image_states(resources)
+            .err()
+            .unwrap_or_else(|| {
+                panic!("a follower behind an unsubmitted head must not take the image claim")
+            });
+        assert!(
+            matches!(
+                reason.reason,
+                ReplacementExecImagePreparationRefusal::BehindUnsubmittedPredecessor(_)
+            ),
+            "{:?}",
+            reason.reason
+        );
+        // The claim itself, asked of the authority that grants it. A write
+        // reservation still standing here is one the head's own preparation
+        // must queue behind, for as long as the refused transaction retries
+        // --- which is forever, because it is refused until the head submits.
+        assert!(
+            scaffold
+                .runtime
+                .execution
+                .resources()
+                .pending_gpu_writes_overlapping(scaffold.backing, current, &rows)
+                .unwrap()
+                .is_empty(),
+            "an ordering refusal leaves the authority holding nothing"
+        );
+        assert!(
+            reason.resources.is_none(),
+            "an ordering refusal keeps nothing"
+        );
     }
 
     /// A guest-upload phase that refused before it claimed anything is
