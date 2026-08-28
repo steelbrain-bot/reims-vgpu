@@ -342,6 +342,16 @@ pub fn prepare_content_synchronization<T>(
                     match route {
                         RepresentationRoute::ImportedGuestTransfer { .. } => GUEST_REPRESENTATION,
                         RepresentationRoute::HostStagingTransfer { .. } => HOST_REPRESENTATION,
+                        RepresentationRoute::DirectGuestAlias => destination,
+                        // A direct alias is bound over the guest's own pages,
+                        // so it is its own endpoint for the same reason the two
+                        // reserved identities above are: there is no second
+                        // object holding these bytes and nothing to copy
+                        // between. Refusing it instead spun a driven macos-13
+                        // boot's channel 1 head on one backing for 100 580
+                        // retries -- the refusal is retryable, and the answer
+                        // it waits for is one no route will ever produce
+                        // because none is needed.
                         _ => {
                             return Err(ContentSynchronizationError::RouteCannotSynchronize {
                                 backing,
@@ -627,6 +637,86 @@ mod tests {
                     && transfer.destination == destination
                     && transfer.region == region
         ));
+        cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
+    }
+
+    /// A direct guest alias needs no synchronization and must not refuse one.
+    ///
+    /// The alias is bound over the guest's own pages, so a request to make the
+    /// guest see this backing is already satisfied the moment it is asked --
+    /// there is no second object and nothing to copy. Refusing it named a
+    /// route rather than a fault, and because that refusal is retryable it
+    /// held a driven macos-13 boot's channel 1 head on one backing for 100 580
+    /// retries, waiting on a transfer no route would ever plan.
+    #[test]
+    fn a_direct_guest_alias_synchronizes_without_planning_a_copy() {
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let region = BackingRegion::Linear(LinearRange::new(0, 64).unwrap());
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([region]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let alias = resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::DirectGuestAlias,
+                BackingView::Bytes,
+                (),
+            )
+            .unwrap();
+        // An image over the same bytes, whose GPU write advances canonical and
+        // leaves the byte alias behind. Without a second view the alias always
+        // matches and the request is answered before any endpoint is chosen,
+        // which is why an alias alone never reached this refusal.
+        let image_view = BackingView::Image(crate::ImageOwner::owning(
+            reims_vgpu_protocol::ResourceId::new(9, 1),
+        ));
+        let image = resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::NativeWorking {
+                    memory: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                image_view,
+                (),
+            )
+            .unwrap();
+        resources
+            .plan_gpu_write(backing, SubmissionId::new(4), image, [region])
+            .unwrap();
+        resources
+            .complete_gpu_write(backing, SubmissionId::new(4), image)
+            .unwrap();
+        assert!(!resources
+            .representation_matches(
+                backing,
+                alias,
+                &resources.snapshot_content(backing, &[region]).unwrap()
+            )
+            .unwrap());
+
+        let prepared = prepare_content_synchronization(
+            &mut resources,
+            TransactionId::new(7),
+            [ContentSynchronizationRequest {
+                backing,
+                regions: Box::new([region]),
+                permitted_pending_writes: Box::new([]),
+                views: Box::new([]),
+            }],
+        )
+        .expect("the alias is the endpoint the image copies into");
+        assert!(prepared.host_ingresses().is_empty());
+        assert!(
+            matches!(prepared.transfers(), [transfer] if transfer.destination == alias),
+            "{:?}",
+            prepared.transfers()
+        );
         cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
     }
 
