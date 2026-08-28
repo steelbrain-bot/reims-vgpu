@@ -1282,7 +1282,7 @@ fn resolve_alias_bytes_round_trip(
         .ok_or_else(|| refuse(AliasRoundTripTerm::SourceLayout))?;
     let destination_layout = resolver
         .resolve_linear_texture_layout(transfer.backing, transfer.destination)
-        .ok_or_else(|| refuse(AliasRoundTripTerm::TransferBytes))?;
+        .ok_or_else(|| refuse(AliasRoundTripTerm::DestinationLayout))?;
     let bytes = resolver
         .resolve_alias_transfer_bytes(transfer.backing, transfer.destination)
         .ok_or_else(|| refuse(AliasRoundTripTerm::TransferBytes))?;
