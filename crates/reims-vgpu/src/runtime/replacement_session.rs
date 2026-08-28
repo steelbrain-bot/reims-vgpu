@@ -9227,6 +9227,18 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 // boot parked exactly there, refusing `InvalidGuestUploadRoute`
                 // against a designated destination whose route had gone.
                 //
+                // What moved it is `ReplacePhysical`: the guest replaced a
+                // resource's physical incarnation, and
+                // `ManagedBackingOwner::replace_execution_representation`
+                // revokes the construction-designated object for exactly that
+                // reason -- existing accepted and submitted uses keep it
+                // alive, no later preparation may select it, and a fresh
+                // materialization installs a new identity. So re-reading is
+                // not a workaround for a retirement that should not have
+                // happened; it is the recovery that revocation contract
+                // specifies, and a preparation still holding the old
+                // designation is precisely the "later preparation" it forbids.
+                //
                 // Discarding it costs a preflight, which is the pipeline and
                 // content lookups the first attempt made; a `ReadyPipelineLease`
                 // is a refcounted handle and drops to nothing.
