@@ -416,25 +416,6 @@ fn missing_execution_representation<Semantic>(
     }
 }
 
-/// Build the execution representation a backing is missing, whatever class of
-/// storage it is.
-///
-/// This is the late repair: a dispatch that met a backing with no execution
-/// representation names it, and this builds it and the dispatch is retried. The
-/// object-ready route ahead of it materializes from the *resources* a packet
-/// declares, and it is the only route that knows a plane view from a linear
-/// allocation. A backing that reaches here did not come through that route --
-/// it was declared by an earlier packet, or replaced -- so the class has to be
-/// recovered from the storage node.
-///
-/// Dispatching on the class is what keeps the two routes from disagreeing. A
-/// repair that served only task-address storage refused every plane of a
-/// registered surface by name, and because a missing execution representation
-/// holds the whole recorded chain, that refusal parked its channel's submission
-/// head rather than costing one command. The classes with no materializer here
-/// still refuse -- but they refuse saying which class, which is the difference
-/// between a gap someone can go and close and a backing that is simply
-/// "unavailable".
 /// Report a repair that returned `Ok` and built nothing.
 ///
 /// A repair's return value cannot tell the two apart, and the difference is a
@@ -473,6 +454,25 @@ fn report_inert_backing_repair<Semantic: Clone>(
     }
 }
 
+/// Build the execution representation a backing is missing, whatever class of
+/// storage it is.
+///
+/// This is the late repair: a dispatch that met a backing with no execution
+/// representation names it, and this builds it and the dispatch is retried. The
+/// object-ready route ahead of it materializes from the *resources* a packet
+/// declares, and it is the only route that knows a plane view from a linear
+/// allocation. A backing that reaches here did not come through that route --
+/// it was declared by an earlier packet, or replaced -- so the class has to be
+/// recovered from the storage node.
+///
+/// Dispatching on the class is what keeps the two routes from disagreeing. A
+/// repair that served only task-address storage refused every plane of a
+/// registered surface by name, and because a missing execution representation
+/// holds the whole recorded chain, that refusal parked its channel's submission
+/// head rather than costing one command. The classes with no materializer here
+/// still refuse -- but they refuse saying which class, which is the difference
+/// between a gap someone can go and close and a backing that is simply
+/// "unavailable".
 fn prepare_backing_representation<Semantic>(
     runtime: &mut ReplacementRuntimeSession<Semantic>,
     host: &mut (impl HostMemory + crate::runtime::host::HostOps),
