@@ -1206,6 +1206,11 @@ impl<Completion: Clone> TransactionRuntime<Completion> {
         self.dependencies.dependents(transaction)
     }
 
+    /// See [`SynchronizationConditionOwner::published_signal`].
+    pub fn published_signal(&self, cause: ExplicitWaitCause) -> Option<ConditionSignal> {
+        self.conditions.published_signal(cause)
+    }
+
     pub fn diagnostics(&self) -> Box<[TransactionRuntimeDiagnostic]> {
         let ready = self
             .semantic_ready()

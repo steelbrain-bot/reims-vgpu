@@ -282,6 +282,21 @@ impl SynchronizationConditionOwner {
             })
     }
 
+    /// The signal this condition has actually published, if any.
+    ///
+    /// [`Self::classify_wait`] answers satisfied, bound or pending, which is
+    /// the right shape for a decision and the wrong one for a diagnostic: a
+    /// wait reported as `Pending` says that nothing has satisfied it and not
+    /// how far behind the condition is. A stamp wait for value 109 against a
+    /// channel that has published 108 and one against a channel that has
+    /// published nothing at all read identically, and they are different bugs.
+    ///
+    /// Keyed through the same `condition_key` the classifier uses, so the two
+    /// cannot come to disagree about which condition a cause names.
+    pub fn published_signal(&self, cause: ExplicitWaitCause) -> Option<ConditionSignal> {
+        self.published.get(&condition_key(cause)).copied()
+    }
+
     pub fn classify_wait(&self, cause: ExplicitWaitCause) -> ConditionWaitResolution {
         let key = condition_key(cause);
         if self
@@ -937,6 +952,59 @@ mod tests {
                 value: 9,
             }),
             ConditionWaitResolution::Satisfied
+        );
+    }
+
+    /// A pending wait is reported beside how far its condition actually got.
+    ///
+    /// `classify_wait` collapses "nothing has signalled this channel at all"
+    /// and "this channel has signalled, one short" into the same `Pending`, and
+    /// a device that has stopped needs those told apart.
+    #[test]
+    fn a_pending_stamp_wait_reports_what_its_channel_has_published() {
+        let mut owner = SynchronizationConditionOwner::default();
+        let channel = ChannelId::new(3);
+        let wait = |value| ExplicitWaitCause::Stamp {
+            source_channel: channel,
+            value,
+        };
+
+        // Nothing signalled: pending, with nothing published to compare to.
+        assert_eq!(
+            owner.classify_wait(wait(9)),
+            ConditionWaitResolution::Pending
+        );
+        assert_eq!(owner.published_signal(wait(9)), None);
+
+        let transaction = TransactionId::new(1);
+        owner
+            .register_signal(
+                transaction,
+                IngressOrdinal::new(1),
+                ConditionSignal::Stamp { channel, value: 8 },
+            )
+            .unwrap();
+        owner
+            .publish_transaction_at(transaction, ConditionPublicationBoundary::GuestPublication)
+            .unwrap();
+
+        // One short: still pending, and now the reading says by how much.
+        assert_eq!(
+            owner.classify_wait(wait(9)),
+            ConditionWaitResolution::Pending
+        );
+        assert_eq!(
+            owner.published_signal(wait(9)),
+            Some(ConditionSignal::Stamp { channel, value: 8 })
+        );
+
+        // A different channel is a different condition and answers for itself.
+        assert_eq!(
+            owner.published_signal(ExplicitWaitCause::Stamp {
+                source_channel: ChannelId::new(4),
+                value: 8,
+            }),
+            None
         );
     }
 }

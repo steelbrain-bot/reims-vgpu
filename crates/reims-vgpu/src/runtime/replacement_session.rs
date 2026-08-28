@@ -7845,6 +7845,36 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .collect()
     }
 
+    /// Every unresolved wait a live transaction holds, beside what its
+    /// condition has actually published.
+    ///
+    /// An unresolved wait is the ordinary state of a transaction whose producer
+    /// has not arrived, and on a device that has stopped it is the whole
+    /// question. `Pending` alone does not answer it: a stamp wait for 109
+    /// against a channel that has published 108 is a producer still to come,
+    /// and one against a channel that has published nothing is a condition
+    /// nothing ever signalled, and those are different bugs with the same
+    /// reading.
+    pub fn unresolved_wait_diagnostics(&self) -> Vec<String> {
+        self.execution
+            .runtime()
+            .diagnostics()
+            .into_vec()
+            .into_iter()
+            .flat_map(|diagnostic| {
+                let transaction = diagnostic.transaction.get();
+                diagnostic
+                    .unresolved
+                    .into_vec()
+                    .into_iter()
+                    .map(move |cause| {
+                        let published = self.execution.runtime().published_signal(cause);
+                        format!("{transaction}:{cause:?} published={published:?}")
+                    })
+            })
+            .collect()
+    }
+
     pub fn transaction_state_diagnostics(&self) -> Vec<(u64, String)> {
         self.execution
             .runtime()

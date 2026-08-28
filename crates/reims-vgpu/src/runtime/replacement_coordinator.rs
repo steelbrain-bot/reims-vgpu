@@ -6870,6 +6870,11 @@ impl ReplacementDeviceCoordinator<()> {
         self.runtime.transaction_state_diagnostics()
     }
 
+    /// See [`ReplacementRuntimeSession::unresolved_wait_diagnostics`].
+    pub fn unresolved_wait_diagnostics(&self) -> Vec<String> {
+        self.runtime.unresolved_wait_diagnostics()
+    }
+
     /// See [`ReplacementRuntimeSession::ready_unsubmitted_transactions`].
     pub fn ready_unsubmitted_diagnostics(&self) -> Vec<String> {
         self.runtime
@@ -7197,13 +7202,14 @@ impl ReplacementDeviceCoordinator<()> {
             .collect::<Vec<_>>()
             .join(",");
         let ready_unsubmitted = self.ready_unsubmitted_diagnostics().join(",");
+        let unresolved_waits = self.unresolved_wait_diagnostics().join(",");
         let blocked_head = self
             .blocked_drain_diagnostics()
             .first()
             .cloned()
             .unwrap_or_default();
         crate::observe::off(format!(
-            "replacement_pipeline_stalls cpu_live={} cpu_failed=[{cpu_failed}] cpu_publications={} timeline_observations={timeline_observations} timeline_semantics={timeline_semantics} abandoned={} refused_packets={} blocked_retries={} blocked_head=[{blocked_head}] upload_resume={} upload_continuation={} indirect_resume={} accepted_routing={} publication_retire={} publish_fail=[{publish_fail}] publish_retire=[{publish_retire}] ready_unsubmitted=[{ready_unsubmitted}] cleanup_dispatch={} cleanup_completion={} mmio={} continuing_uploads={} continuing_indirects={} suffix_repairs={}/{}/{}/{}",
+            "replacement_pipeline_stalls cpu_live={} cpu_failed=[{cpu_failed}] cpu_publications={} timeline_observations={timeline_observations} timeline_semantics={timeline_semantics} abandoned={} refused_packets={} blocked_retries={} blocked_head=[{blocked_head}] upload_resume={} upload_continuation={} indirect_resume={} accepted_routing={} publication_retire={} publish_fail=[{publish_fail}] publish_retire=[{publish_retire}] ready_unsubmitted=[{ready_unsubmitted}] unresolved_waits=[{unresolved_waits}] cleanup_dispatch={} cleanup_completion={} mmio={} continuing_uploads={} continuing_indirects={} suffix_repairs={}/{}/{}/{}",
             self.cpu.live_packets(),
             self.cpu.pending_publications(),
             self.abandoned_transactions,
