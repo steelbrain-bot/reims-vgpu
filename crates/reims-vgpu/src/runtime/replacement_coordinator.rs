@@ -2176,22 +2176,49 @@ impl<Semantic> ReplacementCpuApplyError<Semantic> {
     /// The refusal reason when no later guest packet can make this apply
     /// succeed, so retrying it only holds the channel.
     ///
+    /// `NotReady` is the one arm a later tick changes: the transaction has not
+    /// reached the head of its ordering yet and nothing has been decided about
+    /// it. Every other arm is a decision -- a control command the session
+    /// declined, a query the device cannot answer, a lifecycle command the
+    /// owner refused -- and re-offering it asks a question whose answer cannot
+    /// change while the guest waits on a completion stamp that will never be
+    /// published. Control is the only family that had this; the other two
+    /// answered `None` for every arm, so a refused delete held its channel for
+    /// the rest of the boot with the device otherwise idle and every census
+    /// reading healthy.
+    ///
     /// See
-    /// [`crate::runtime::replacement_session::ReplacementControlApplyReason::is_terminal_refusal`].
-    fn terminal_refusal(
-        &self,
-    ) -> Option<&crate::runtime::replacement_session::ReplacementControlApplyReason> {
+    /// [`crate::runtime::replacement_session::ReplacementControlApplyReason::is_terminal_refusal`]
+    /// for why control is the family that also has to ask.
+    fn terminal_refusal(&self) -> Option<String> {
         match self {
             Self::Control(failure) => match failure.as_ref() {
                 ReplacementControlApplyError::Apply { reason, .. }
                     if reason.is_terminal_refusal() =>
                 {
-                    Some(reason)
+                    Some(format!("{reason:?}"))
                 }
                 ReplacementControlApplyError::Apply { .. }
                 | ReplacementControlApplyError::NotReady(_) => None,
             },
-            Self::Query(_) | Self::ResourceLifecycle(_) => None,
+            Self::Query(failure) => match failure.as_ref() {
+                ReplacementQueryApplyError::NotReady(_) => None,
+                ReplacementQueryApplyError::DeviceInfo { reason, .. } => {
+                    Some(format!("{reason:?}"))
+                }
+                ReplacementQueryApplyError::ComputeInfo { reason, .. } => {
+                    Some(format!("{reason:?}"))
+                }
+                ReplacementQueryApplyError::HeapTexture { reason, .. } => {
+                    Some(format!("{reason:?}"))
+                }
+            },
+            Self::ResourceLifecycle(failure) => match failure.as_ref() {
+                ReplacementResourceLifecycleApplyError::NotReady(_) => None,
+                ReplacementResourceLifecycleApplyError::Lifecycle { reason, .. } => {
+                    Some(format!("{reason:?}"))
+                }
+            },
         }
     }
 }
@@ -2515,7 +2542,6 @@ impl<Semantic: Clone> ReplacementCpuCoordinator<Semantic> {
                     Ok(applied) => (applied, semantic),
                     Err(failure) => {
                         if let Some(reason) = failure.terminal_refusal() {
-                            let reason = format!("{reason:?}");
                             return Some(self.refuse_cpu_packet(
                                 runtime,
                                 transaction,
@@ -11672,6 +11698,136 @@ mod tests {
             host.get_u32(producer_registers + crate::model::CHILD_REG_HEAD),
             crate::model::PACKET_HEADER_LEN
         );
+    }
+
+    /// A lifecycle command the owner refuses is published as a refusal, not
+    /// retried until the boot ends.
+    ///
+    /// A surface-backing delete captures the resource tree it means at
+    /// admission and the owner re-derives it at apply, so a plane view
+    /// declared over that surface in between makes the two disagree. That is
+    /// a decision -- no later guest packet un-declares the view -- and it used
+    /// to be classified as retryable, so the transaction was re-offered on
+    /// every tick, its completion stamp was never published, and the channel
+    /// behind it stopped. The guest then sends nothing further and the census
+    /// reads healthy, because nothing is refused and nothing is blocked.
+    #[test]
+    fn a_refused_lifecycle_command_publishes_its_refusal() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(12);
+        runtime.define_task(task, 0x40_0000, 2).unwrap();
+        let channel = reims_vgpu_protocol::ChannelId::new(4);
+        runtime.define_channel(channel).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        let backing_pfn = 0x200u64;
+        host.map_range(9u64 << shift, 1usize << shift, 0);
+        host.write_gpa(root + backing_pfn * 4, &9u32.to_le_bytes())
+            .unwrap();
+
+        let surface_object = 41;
+        let mut planes = [reims_vgpu_protocol::SurfaceBackingPlane::default();
+            reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP];
+        planes[0] = reims_vgpu_protocol::SurfaceBackingPlane {
+            offset: 0,
+            width: 4,
+            height: 4,
+            bytes_per_row: 16,
+            bytes_per_element: 4,
+        };
+        crate::runtime::replacement_object_lifecycle::apply_replacement_registered_surface(
+            &mut runtime,
+            task,
+            surface_object,
+            reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(
+                reims_vgpu_protocol::SurfaceBackingDescriptor {
+                    length: 1 << shift,
+                    backing_pfn: backing_pfn as u32,
+                    pixel_format: u32::from_be_bytes(*b"BGRA"),
+                    plane_count: 1,
+                    planes,
+                    width: 4,
+                    height: 4,
+                    bytes_per_row: 16,
+                },
+            ),
+        )
+        .unwrap();
+        let plane_view = |object: u32| {
+            reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(
+                reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor {
+                    surface: reims_vgpu_protocol::ObjectTableRef::new(surface_object),
+                    owner_task: task,
+                    operation_kind: Some(5),
+                    operation_length: Some(32),
+                    own_ref: Some(reims_vgpu_protocol::ObjectTableRef::new(object)),
+                    record_kind: Some(reims_vgpu_protocol::IOSurfacePlaneViewRecordKind::Plane),
+                    unidentified_record_flags: 0,
+                    view: Some(reims_vgpu_protocol::IOSurfacePlaneViewDescriptor {
+                        pixel_format: 80,
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                        plane_index: Some(0),
+                    }),
+                    decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
+                },
+            )
+        };
+        crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+            &mut runtime,
+            task,
+            42,
+            plane_view(42),
+        )
+        .unwrap();
+
+        let admitted = runtime
+            .admit_task_surface_backing_delete(
+                channel,
+                Box::default(),
+                None,
+                task,
+                reims_vgpu_protocol::ObjectTableRef::new(surface_object),
+            )
+            .unwrap();
+        let transaction = admitted.transaction();
+
+        // The tree the delete captured is no longer the tree the surface has.
+        crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+            &mut runtime,
+            task,
+            43,
+            plane_view(43),
+        )
+        .unwrap();
+
+        let mut coordinator = ReplacementCpuCoordinator::default();
+        coordinator
+            .admit(
+                ReplacementAdmittedCpuPacket::ResourceLifecycle(admitted),
+                (),
+            )
+            .unwrap();
+        let progress = coordinator.progress(&mut runtime, &mut host, shift, u32::MAX, transaction);
+        assert!(
+            matches!(progress, Some(ReplacementCpuProgress::Published { .. })),
+            "a refused lifecycle command publishes its position: {progress:?}"
+        );
+        assert_eq!(coordinator.live_packets(), 0);
     }
 
     #[test]
