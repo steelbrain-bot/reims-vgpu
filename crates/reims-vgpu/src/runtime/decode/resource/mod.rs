@@ -3964,7 +3964,7 @@ pub fn decode_iosurface_plane_view_resource(
         width: record.width.get(),
         height: record.height.get(),
         depth: record.depth.get(),
-        plane_index: wire::iosurface_plane_view_record_plane_index(bytes).unwrap_or(0),
+        plane_index: wire::iosurface_plane_view_record_plane_index(bytes),
     };
     if decoded_view.pixel_format != 0
         && decoded_view.width != 0

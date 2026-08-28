@@ -9007,7 +9007,7 @@ mod tests {
                             width: 4,
                             height: 4,
                             depth: 1,
-                            plane_index: 0,
+                            plane_index: Some(0),
                         }),
                         decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
                     },

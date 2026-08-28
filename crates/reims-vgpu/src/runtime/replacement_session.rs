@@ -26491,7 +26491,7 @@ mod tests {
                 width: 640,
                 height: 480,
                 depth: 1,
-                plane_index: 0,
+                plane_index: Some(0),
             }),
             decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
         };
@@ -26713,11 +26713,12 @@ mod tests {
             // was perturbed and only the width may differ here.
             Err(crate::runtime::replacement_object_lifecycle::ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch {
                 record: plane_view.record_kind,
-                plane: plane_view.view.unwrap().plane_index,
+                plane: plane_view.view.unwrap().plane_index.unwrap(),
                 view: (641, plane_view.view.unwrap().height, plane_view.view.unwrap().depth),
                 declared: (
-                    descriptor.planes[plane_view.view.unwrap().plane_index as usize].width,
-                    descriptor.planes[plane_view.view.unwrap().plane_index as usize].height,
+                    descriptor.planes[plane_view.view.unwrap().plane_index.unwrap() as usize].width,
+                    descriptor.planes[plane_view.view.unwrap().plane_index.unwrap() as usize]
+                        .height,
                 ),
             })
         );
@@ -26725,6 +26726,47 @@ mod tests {
             .resolve_resource(
                 task,
                 reims_vgpu_protocol::ObjectTableRef::new(invalid_view_object)
+            )
+            .is_none());
+
+        // A record that named no plane is refused for naming none, not
+        // attributed to plane zero. Zero is a plane the guest did not select,
+        // and on a subsampled surface it is the wrong one by exactly the
+        // subsampling factor -- which then reads as a geometry defect.
+        let unnamed_view_object = 23;
+        let unnamed_view = reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor {
+            own_ref: Some(reims_vgpu_protocol::ObjectTableRef::new(
+                unnamed_view_object,
+            )),
+            view: Some(reims_vgpu_protocol::IOSurfacePlaneViewDescriptor {
+                plane_index: None,
+                ..plane_view.view.unwrap()
+            }),
+            ..plane_view
+        };
+        assert_eq!(
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                unnamed_view_object,
+                reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(unnamed_view),
+            ),
+            Err(
+                crate::runtime::replacement_object_lifecycle::ReplacementIOSurfacePlaneViewRefusal::PlaneIndexAbsent {
+                    record: plane_view.record_kind,
+                    view: (
+                        plane_view.view.unwrap().width,
+                        plane_view.view.unwrap().height,
+                        plane_view.view.unwrap().depth,
+                    ),
+                    count: descriptor.plane_count,
+                }
+            )
+        );
+        assert!(runtime
+            .resolve_resource(
+                task,
+                reims_vgpu_protocol::ObjectTableRef::new(unnamed_view_object)
             )
             .is_none());
 
@@ -26833,7 +26875,7 @@ mod tests {
                 width: 640,
                 height: 480,
                 depth: 1,
-                plane_index: 0,
+                plane_index: Some(0),
             }),
             decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
         };
@@ -27107,7 +27149,7 @@ mod tests {
                         width: planes[plane as usize].width,
                         height: planes[plane as usize].height,
                         depth: 1,
-                        plane_index: plane,
+                        plane_index: Some(plane),
                     }),
                     decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
                 },
@@ -35583,7 +35625,7 @@ mod tests {
                             width: 64,
                             height: 32,
                             depth: 1,
-                            plane_index: 0,
+                            plane_index: Some(0),
                         }),
                         decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
                     },

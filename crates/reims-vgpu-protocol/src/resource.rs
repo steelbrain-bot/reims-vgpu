@@ -881,6 +881,9 @@ pub struct SurfaceBackingDescriptor {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SurfacePlaneLayoutError {
+    /// The view's record ended before the plane index, so which plane it
+    /// selects is not something this descriptor can be asked.
+    PlaneIndexAbsent,
     PlaneOutOfBounds,
     GeometryMismatch,
     EmptyLayout,
@@ -896,7 +899,10 @@ impl SurfaceBackingDescriptor {
         &self,
         view: IOSurfacePlaneViewDescriptor,
     ) -> Result<LinearTextureDescriptor, SurfacePlaneLayoutError> {
-        let plane_index = usize::try_from(view.plane_index)
+        let plane_index = view
+            .plane_index
+            .ok_or(SurfacePlaneLayoutError::PlaneIndexAbsent)?;
+        let plane_index = usize::try_from(plane_index)
             .ok()
             .filter(|index| *index < usize::from(self.plane_count))
             .ok_or(SurfacePlaneLayoutError::PlaneOutOfBounds)?;
@@ -1041,7 +1047,17 @@ pub struct IOSurfacePlaneViewDescriptor {
     pub width: u32,
     pub height: u32,
     pub depth: u32,
-    pub plane_index: u32,
+    /// Which plane of the parent surface this view selects, when the record
+    /// carries it.
+    ///
+    /// `None` is the wire fact that the blob ended before the field, not a
+    /// plane zero. The field is the only wire key for which plane a view is:
+    /// geometry cannot separate a luma plane from an equally-sized alpha one,
+    /// and on a subsampled surface a chroma view's geometry is a plane the
+    /// parent declares at a different index. Defaulting an absent index to
+    /// zero therefore attributes a view to a plane the guest did not name, so
+    /// consumers take a typed refusal instead.
+    pub plane_index: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1718,7 +1734,7 @@ mod tests {
                 width: 64,
                 height: 32,
                 depth: 1,
-                plane_index: 0,
+                plane_index: Some(0),
             })
             .expect("the view exactly matches its declared plane");
         assert_eq!(layout.allocation_size, surface.length);
@@ -1733,9 +1749,24 @@ mod tests {
                 width: 63,
                 height: 32,
                 depth: 1,
-                plane_index: 0,
+                plane_index: Some(0),
             }),
             Err(SurfacePlaneLayoutError::GeometryMismatch)
+        );
+
+        // A view whose record named no plane cannot be projected onto one.
+        // Reading the absence as plane zero would answer with a layout the
+        // guest never asked for, and a one-plane surface is precisely the case
+        // where that wrong answer looks right.
+        assert_eq!(
+            surface.plane_linear_texture(IOSurfacePlaneViewDescriptor {
+                pixel_format: 80,
+                width: 64,
+                height: 32,
+                depth: 1,
+                plane_index: None,
+            }),
+            Err(SurfacePlaneLayoutError::PlaneIndexAbsent)
         );
     }
 }

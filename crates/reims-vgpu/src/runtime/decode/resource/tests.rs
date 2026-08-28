@@ -631,8 +631,48 @@ fn an_iosurface_plane_view_decodes_its_surface_relation_and_nested_view_once() {
             width: 640,
             height: 480,
             depth: 1,
-            plane_index: 2,
+            plane_index: Some(2),
         })
+    );
+}
+
+/// A record that ends before the plane index decodes as naming no plane.
+///
+/// The field is the only wire key for which plane a view selects, so an
+/// absence has to survive decode as an absence. Reading it as plane zero puts
+/// a chroma view on a luma plane and the disagreement then surfaces as a
+/// geometry refusal, which names the wrong defect.
+#[test]
+fn a_plane_view_record_that_stops_before_the_plane_index_names_no_plane() {
+    use reims_vgpu_wire::device_desc::{
+        IOSurfacePlaneViewBuilder, IOSURFACE_PLANE_VIEW_ARG_RECORD,
+        IOSURFACE_PLANE_VIEW_RECORD_PLANE, IOSURFACE_PLANE_VIEW_RECORD_TAG_PLANE,
+    };
+
+    let carried =
+        IOSurfacePlaneViewBuilder::new(0x1234, 7, 99, IOSURFACE_PLANE_VIEW_RECORD_TAG_PLANE)
+            .geometry(0x50, 32, 32, 1)
+            .plane_index(1);
+    let Descriptor::IOSurfacePlaneView(decoded) =
+        decode_descriptor(ObjectKind::IOSurfacePlaneView, carried.bytes()).unwrap()
+    else {
+        panic!("type-5 descriptor did not retain its semantic family");
+    };
+    assert_eq!(decoded.view.unwrap().plane_index, Some(1));
+
+    // Cut the blob to end exactly where the plane index would begin.
+    let short =
+        &carried.bytes()[..IOSURFACE_PLANE_VIEW_ARG_RECORD + IOSURFACE_PLANE_VIEW_RECORD_PLANE];
+    let Descriptor::IOSurfacePlaneView(decoded) =
+        decode_descriptor(ObjectKind::IOSurfacePlaneView, short).unwrap()
+    else {
+        panic!("type-5 descriptor did not retain its semantic family");
+    };
+    let view = decoded.view.expect("the geometry is still complete");
+    assert_eq!(view.width, 32);
+    assert_eq!(
+        view.plane_index, None,
+        "a record that stops before the plane index names no plane"
     );
 }
 

@@ -281,6 +281,19 @@ pub(crate) enum ReplacementIOSurfacePlaneViewRefusal {
         plane: u32,
         count: u8,
     },
+    /// The view's record ended before the plane index, so the guest named no
+    /// plane and this device will not pick one for it.
+    ///
+    /// The view geometry and the parent's plane count are both here because
+    /// together they say whether a plane is *entailed* -- a one-plane parent
+    /// leaves one answer -- or whether the record is simply shorter than the
+    /// plane vocabulary this device decodes. Those are different repairs and
+    /// the refusal alone cannot be acted on without knowing which.
+    PlaneIndexAbsent {
+        record: Option<reims_vgpu_protocol::IOSurfacePlaneViewRecordKind>,
+        view: (u32, u32, u32),
+        count: u8,
+    },
     /// The view's own geometry is not the geometry the parent declared for
     /// the plane it selects.
     ///
@@ -517,13 +530,25 @@ pub(crate) fn apply_replacement_iosurface_plane_view<Semantic: Clone>(
         .ok_or(ReplacementIOSurfacePlaneViewRefusal::Incomplete(
             view_resource.decode_state,
         ))?;
-    let plane = usize::try_from(view.plane_index).ok().filter(|plane| {
+    // Which plane the view selects is a wire field, and a record that ended
+    // before it names no plane at all. Reading that absence as plane zero
+    // attributes the view to a plane the guest did not name -- on a subsampled
+    // surface, a chroma view lands on the luma plane and disagrees with its
+    // geometry by exactly the subsampling factor.
+    let Some(plane_index) = view.plane_index else {
+        return Err(ReplacementIOSurfacePlaneViewRefusal::PlaneIndexAbsent {
+            record: view_resource.record_kind,
+            view: (view.width, view.height, view.depth),
+            count: parent.plane_count,
+        });
+    };
+    let plane = usize::try_from(plane_index).ok().filter(|plane| {
         *plane < usize::from(parent.plane_count)
             && *plane < reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP
     });
     let Some(plane) = plane else {
         return Err(ReplacementIOSurfacePlaneViewRefusal::PlaneOutOfBounds {
-            plane: view.plane_index,
+            plane: plane_index,
             count: parent.plane_count,
         });
     };
@@ -535,7 +560,7 @@ pub(crate) fn apply_replacement_iosurface_plane_view<Semantic: Clone>(
         return Err(
             ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch {
                 record: view_resource.record_kind,
-                plane: view.plane_index,
+                plane: plane_index,
                 view: (view.width, view.height, view.depth),
                 declared: (declared_plane.width, declared_plane.height),
             },
@@ -547,7 +572,7 @@ pub(crate) fn apply_replacement_iosurface_plane_view<Semantic: Clone>(
             reims_vgpu_protocol::ObjectTableRef::new(reference),
             Arc::new(ResourceDescriptor::IOSurfacePlaneView(view_resource)),
             surface,
-            reims_vgpu_protocol::PlaneIndex::new(view.plane_index),
+            reims_vgpu_protocol::PlaneIndex::new(plane_index),
         )
         .map_err(ReplacementIOSurfacePlaneViewRefusal::Declaration)
 }

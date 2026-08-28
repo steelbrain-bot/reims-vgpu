@@ -2362,4 +2362,107 @@ mod tests {
             ImageToImageRefusal::NoCopyableAspect { aspect_mask: empty }
         );
     }
+
+    /// The endpoint walk reports every term it compares, and agrees otherwise.
+    ///
+    /// Only the first term has a caller that reaches it in the boot this was
+    /// written for; a term that is compared but can never be reported is a
+    /// silent loss the moment a guest declares the pair that trips it.
+    #[test]
+    fn each_term_two_image_endpoints_must_agree_on_reports_itself() {
+        use crate::replacement_image_transition::NativeImageTarget;
+
+        let base = NativeImageTarget {
+            image: vk::Image::null(),
+            view: vk::ImageView::null(),
+            image_type: vk::ImageType::TYPE_2D,
+            full_range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 1,
+                level_count: 2,
+                base_array_layer: 3,
+                layer_count: 4,
+            },
+            usage: vk::ImageUsageFlags::TRANSFER_SRC,
+            pixel_format: 7,
+            extent: vk::Extent3D {
+                width: 4,
+                height: 5,
+                depth: 1,
+            },
+            samples: vk::SampleCountFlags::TYPE_1,
+        };
+        assert_eq!(image_endpoints_disagree(&base, &base), None);
+
+        let disagree = |edit: fn(&mut NativeImageTarget)| {
+            let mut destination = base;
+            edit(&mut destination);
+            image_endpoints_disagree(&base, &destination)
+                .expect("an edited endpoint disagrees with the one it was edited from")
+        };
+        assert_eq!(
+            disagree(|target| target.pixel_format = 9),
+            ImageEndpointDisagreement::PixelFormat {
+                source: 7,
+                destination: 9,
+            }
+        );
+        assert_eq!(
+            disagree(|target| target.extent.height = 6),
+            ImageEndpointDisagreement::Extent {
+                source: [4, 5, 1],
+                destination: [4, 6, 1],
+            }
+        );
+        assert_eq!(
+            disagree(|target| target.samples = vk::SampleCountFlags::TYPE_4),
+            ImageEndpointDisagreement::Samples {
+                source: vk::SampleCountFlags::TYPE_1,
+                destination: vk::SampleCountFlags::TYPE_4,
+            }
+        );
+        for (term, edit, source, destination) in [
+            (
+                SubresourceRangeTerm::AspectMask,
+                (|target: &mut NativeImageTarget| {
+                    target.full_range.aspect_mask = vk::ImageAspectFlags::DEPTH
+                }) as fn(&mut NativeImageTarget),
+                vk::ImageAspectFlags::COLOR.as_raw(),
+                vk::ImageAspectFlags::DEPTH.as_raw(),
+            ),
+            (
+                SubresourceRangeTerm::BaseMipLevel,
+                |target| target.full_range.base_mip_level = 9,
+                1,
+                9,
+            ),
+            (
+                SubresourceRangeTerm::LevelCount,
+                |target| target.full_range.level_count = 9,
+                2,
+                9,
+            ),
+            (
+                SubresourceRangeTerm::BaseArrayLayer,
+                |target| target.full_range.base_array_layer = 9,
+                3,
+                9,
+            ),
+            (
+                SubresourceRangeTerm::LayerCount,
+                |target| target.full_range.layer_count = 9,
+                4,
+                9,
+            ),
+        ] {
+            assert_eq!(
+                disagree(edit),
+                ImageEndpointDisagreement::SubresourceRange {
+                    term,
+                    source,
+                    destination,
+                }
+            );
+        }
+    }
 }
