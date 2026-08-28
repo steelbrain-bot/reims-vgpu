@@ -372,11 +372,30 @@ fn prepare_backing_representation<Semantic>(
     host: &mut (impl HostMemory + crate::runtime::host::HostOps),
     page_shift: u32,
     backing: reims_vgpu_protocol::BackingId,
+    view: Option<reims_vgpu_core::BackingView>,
 ) -> Result<(), ReplacementObjectRepresentationPreparationError>
 where
     Semantic: Clone,
 {
-    if let Some(plane_view) = runtime.io_surface_plane_view_owner(backing) {
+    // Which resource owns the native object that is missing is a question the
+    // *view* answers, not the backing. An image view names its owning texture,
+    // and a backing may carry several -- so asking the backing which plane
+    // view it owns returns whichever one it holds first, which is the one that
+    // already materialized, which is why a repair given only the backing
+    // reported success and left the named view absent.
+    //
+    // `None` is for the routes whose refusal genuinely names no view: the
+    // readiness check asks for *any* designated representation, and the
+    // replaced-physical sweep is about a backing's whole set. Those recover
+    // the owner from the backing as they always have, and inventing a view for
+    // them would be a guess rather than a repair.
+    let owner = match view {
+        Some(reims_vgpu_core::BackingView::Image(owner)) => Some(owner.texture()),
+        Some(reims_vgpu_core::BackingView::Bytes) | None => {
+            runtime.io_surface_plane_view_owner(backing)
+        }
+    };
+    if let Some(plane_view) = owner.filter(|resource| runtime.is_io_surface_plane_view(*resource)) {
         return materialize_io_surface_plane_view(runtime, host, page_shift, plane_view);
     }
     prepare_task_address_backing_representation(runtime, host, page_shift, backing)
@@ -512,7 +531,7 @@ fn prepare_replaced_physical_representations<Semantic>(
             ));
             continue;
         }
-        match prepare_backing_representation(runtime, host, page_shift, backing) {
+        match prepare_backing_representation(runtime, host, page_shift, backing, None) {
             Ok(()) => crate::observe::off(format!(
                 "replacement_replaced_physical_representation backing={backing:?} \
                  status=materialized"
@@ -1068,7 +1087,7 @@ where
             );
             if let Some(backing) = missing_execution_representation(&reason) {
                 if let Err(preparation) =
-                    prepare_backing_representation(runtime, host, page_shift, backing)
+                    prepare_backing_representation(runtime, host, page_shift, backing, None)
                 {
                     return Err(Box::new(
                         ReplacementHostExecDispatchFailure::BackingRepresentation {
@@ -1105,7 +1124,8 @@ where
             ready,
             ..
         } => {
-            if let Err(reason) = prepare_backing_representation(runtime, host, page_shift, backing)
+            if let Err(reason) =
+                prepare_backing_representation(runtime, host, page_shift, backing, None)
             {
                 return Err(Box::new(
                     ReplacementHostExecDispatchFailure::BackingRepresentation {
@@ -4518,6 +4538,7 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
     ) -> Vec<(
         reims_vgpu_protocol::TransactionId,
         reims_vgpu_protocol::BackingId,
+        reims_vgpu_core::BackingView,
     )> {
         self.suffixes
             .iter()
@@ -4526,7 +4547,8 @@ impl<Semantic: Clone + PartialEq + Send + 'static>
                 else {
                     return None;
                 };
-                Some((*transaction, failure.missing_representation_backing()?))
+                let (backing, view) = failure.missing_representation_view()?;
+                Some((*transaction, backing, view))
             })
             .collect()
     }
@@ -5915,6 +5937,10 @@ pub(crate) struct ReplacementDeviceCoordinator<Semantic> {
     suffix_repairs_built: u64,
     suffix_repairs_resumed: u64,
     suffix_repairs_deferred: u64,
+    /// Repairs that returned `Ok` and left the named view absent. A non-zero
+    /// reading here is a materializer that does not serve some class, not a
+    /// slow boot: the suffix cannot progress and will be repaired again.
+    suffix_repairs_inert: u64,
     /// Cumulative count of child packets refused because this backend declared
     /// it does not implement them. Each is one lost guest command, named once
     /// on the failure channel.
@@ -6351,6 +6377,7 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
             suffix_repairs_built: 0,
             suffix_repairs_resumed: 0,
             suffix_repairs_deferred: 0,
+            suffix_repairs_inert: 0,
             drain_failures: std::collections::VecDeque::new(),
             last_pipeline_census_ms: 0,
             transitions: ReplacementPipelineTransitions::default(),
@@ -7059,7 +7086,7 @@ impl ReplacementDeviceCoordinator<()> {
             .cloned()
             .unwrap_or_default();
         crate::observe::off(format!(
-            "replacement_pipeline_stalls cpu_live={} cpu_failed=[{cpu_failed}] cpu_publications={} timeline_observations={timeline_observations} timeline_semantics={timeline_semantics} abandoned={} refused_packets={} blocked_retries={} blocked_head=[{blocked_head}] upload_resume={} upload_continuation={} indirect_resume={} accepted_routing={} publication_retire={} publish_fail=[{publish_fail}] publish_retire_head=[{publish_retire_head}] cleanup_dispatch={} cleanup_completion={} mmio={} continuing_uploads={} continuing_indirects={} suffix_repairs={}/{}/{}",
+            "replacement_pipeline_stalls cpu_live={} cpu_failed=[{cpu_failed}] cpu_publications={} timeline_observations={timeline_observations} timeline_semantics={timeline_semantics} abandoned={} refused_packets={} blocked_retries={} blocked_head=[{blocked_head}] upload_resume={} upload_continuation={} indirect_resume={} accepted_routing={} publication_retire={} publish_fail=[{publish_fail}] publish_retire_head=[{publish_retire_head}] cleanup_dispatch={} cleanup_completion={} mmio={} continuing_uploads={} continuing_indirects={} suffix_repairs={}/{}/{}/{}",
             self.cpu.live_packets(),
             self.cpu.pending_publications(),
             self.abandoned_transactions,
@@ -7078,6 +7105,7 @@ impl ReplacementDeviceCoordinator<()> {
             self.suffix_repairs_built,
             self.suffix_repairs_resumed,
             self.suffix_repairs_deferred,
+            self.suffix_repairs_inert,
         ));
         // Where every tracked transaction sits. A blocked head names the
         // producer it waits for, and the only useful next question is what that
@@ -7726,14 +7754,36 @@ impl ReplacementDeviceCoordinator<()> {
     ) -> usize {
         let page_shift = self.transport.page_shift();
         let mut repaired = 0;
-        for (transaction, backing) in self.guest_upload_suffixes.missing_representation_suffixes() {
-            if let Err(reason) =
-                prepare_backing_representation(&mut self.runtime, host, page_shift, backing)
-            {
+        for (transaction, backing, view) in
+            self.guest_upload_suffixes.missing_representation_suffixes()
+        {
+            if let Err(reason) = prepare_backing_representation(
+                &mut self.runtime,
+                host,
+                page_shift,
+                backing,
+                Some(view),
+            ) {
                 report_retained_failure_detail(
                     "replacement_guest_upload_suffix_repair",
                     transaction,
-                    &format!("backing:{}:{reason:?}", backing.get()),
+                    &format!("backing:{}:view:{view:?}:{reason:?}", backing.get()),
+                );
+                continue;
+            }
+            // A repair that returns `Ok` without building the view it was
+            // asked for is indistinguishable from one that worked, and the
+            // suffix then fails preparation identically and is repaired again
+            // -- thousands of times a boot, every one counted as a success.
+            // The only thing that separates the two is asking whether the
+            // named view is there now, so that is asked, and a repair that
+            // changed nothing is reported rather than counted.
+            if !self.runtime.backing_view_is_represented(backing, view) {
+                self.suffix_repairs_inert = self.suffix_repairs_inert.saturating_add(1);
+                report_retained_failure_detail(
+                    "replacement_guest_upload_suffix_repair_inert",
+                    transaction,
+                    &format!("backing:{}:view:{view:?}", backing.get()),
                 );
                 continue;
             }
@@ -9016,7 +9066,7 @@ mod tests {
             .unwrap();
         assert!(!runtime.resource_has_execution_representation(view.resource));
 
-        prepare_backing_representation(&mut runtime, &mut host, shift, view.backing).unwrap();
+        prepare_backing_representation(&mut runtime, &mut host, shift, view.backing, None).unwrap();
         // The plane's own image, which is what every binding of it resolves.
         // The backing carrying *a* representation is not the same statement:
         // materializing a plane builds its staging endpoint before its image,
@@ -9028,8 +9078,147 @@ mod tests {
         // refusal. The repair runs once per drain tick for as long as anything
         // is waiting on the backing, so it is called far more often than it
         // does anything.
-        prepare_backing_representation(&mut runtime, &mut host, shift, view.backing).unwrap();
+        prepare_backing_representation(&mut runtime, &mut host, shift, view.backing, None).unwrap();
         assert!(runtime.resource_has_execution_representation(view.resource));
+    }
+
+    /// Two textures over one registered surface plane are two images, and the
+    /// repair has to be told which one is missing.
+    ///
+    /// A backing carries one native object per view. The late repair recovered
+    /// the resource to materialize by asking the *backing* which plane view it
+    /// owns, which answers with whichever owner it lists first -- the one that
+    /// already materialized. It then returned `Ok` having built nothing, the
+    /// suffix failed preparation identically, and the pair repeated: on a
+    /// driven macos-13 boot, 8 445 repairs and 8 445 resumptions with the
+    /// named view absent throughout, every counter beside it reading healthy.
+    #[test]
+    fn both_plane_views_over_one_surface_plane_are_materialized() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(12);
+        runtime.define_task(task, 0x40_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        // The surface names guest page 0x200 and spans one page, so the task's
+        // page table has to resolve exactly that page.
+        let backing_pfn = 0x200u64;
+        host.map_range(9u64 << shift, 1usize << shift, 0);
+        host.write_gpa(root + backing_pfn * 4, &9u32.to_le_bytes())
+            .unwrap();
+
+        let surface_object = 41;
+        let mut planes = [reims_vgpu_protocol::SurfaceBackingPlane::default();
+            reims_vgpu_wire::device_desc::SURFACE_BACKING_PLANE_CAP];
+        planes[0] = reims_vgpu_protocol::SurfaceBackingPlane {
+            offset: 0,
+            width: 4,
+            height: 4,
+            bytes_per_row: 16,
+            bytes_per_element: 4,
+        };
+        crate::runtime::replacement_object_lifecycle::apply_replacement_registered_surface(
+            &mut runtime,
+            task,
+            surface_object,
+            reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(
+                reims_vgpu_protocol::SurfaceBackingDescriptor {
+                    length: 1 << shift,
+                    backing_pfn: backing_pfn as u32,
+                    pixel_format: u32::from_be_bytes(*b"BGRA"),
+                    plane_count: 1,
+                    planes,
+                    width: 4,
+                    height: 4,
+                    bytes_per_row: 16,
+                },
+            ),
+        )
+        .unwrap();
+        let plane_view = |object: u32| {
+            reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(
+                reims_vgpu_protocol::IOSurfacePlaneViewResourceDescriptor {
+                    surface: reims_vgpu_protocol::ObjectTableRef::new(surface_object),
+                    owner_task: task,
+                    operation_kind: Some(5),
+                    operation_length: Some(32),
+                    own_ref: Some(reims_vgpu_protocol::ObjectTableRef::new(object)),
+                    record_kind: Some(reims_vgpu_protocol::IOSurfacePlaneViewRecordKind::Plane),
+                    unidentified_record_flags: 0,
+                    view: Some(reims_vgpu_protocol::IOSurfacePlaneViewDescriptor {
+                        pixel_format: 80,
+                        width: 4,
+                        height: 4,
+                        depth: 1,
+                        plane_index: Some(0),
+                    }),
+                    decode_state: reims_vgpu_protocol::IOSurfacePlaneViewDecodeState::Complete,
+                },
+            )
+        };
+        let first =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                42,
+                plane_view(42),
+            )
+            .unwrap();
+        let second =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                43,
+                plane_view(43),
+            )
+            .unwrap();
+        assert_eq!(
+            first.backing, second.backing,
+            "two views of one plane are two textures over one backing"
+        );
+        assert!(!runtime.resource_has_execution_representation(first.resource));
+        assert!(!runtime.resource_has_execution_representation(second.resource));
+
+        // Asking with no view builds whichever owner the backing lists first.
+        // That is all a repair given only a backing can do, and it is why the
+        // second view's image never appeared however often it ran.
+        prepare_backing_representation(&mut runtime, &mut host, shift, first.backing, None)
+            .unwrap();
+        let built_first = runtime.resource_has_execution_representation(first.resource);
+        let built_second = runtime.resource_has_execution_representation(second.resource);
+        assert!(
+            built_first != built_second,
+            "the view-less repair builds exactly one of the two"
+        );
+
+        // Naming the view that is missing builds that one. The failure carries
+        // it, so the repair can be asked the same question the refusal asked.
+        let absent = if built_first { second } else { first };
+        let view = reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::owning(
+            absent.resource,
+        ));
+        assert!(!runtime.backing_view_is_represented(absent.backing, view));
+        prepare_backing_representation(&mut runtime, &mut host, shift, absent.backing, Some(view))
+            .unwrap();
+        assert!(
+            runtime.resource_has_execution_representation(absent.resource),
+            "the repair builds the view it was named, not the one already there"
+        );
+        assert!(runtime.backing_view_is_represented(absent.backing, view));
+        assert!(runtime.resource_has_execution_representation(first.resource));
+        assert!(runtime.resource_has_execution_representation(second.resource));
     }
 
     /// Two textures declared over one guest range are two textures, so both
@@ -9113,7 +9302,8 @@ mod tests {
             "one guest range is one backing however many textures name it"
         );
 
-        prepare_backing_representation(&mut runtime, &mut host, shift, first.backing).unwrap();
+        prepare_backing_representation(&mut runtime, &mut host, shift, first.backing, None)
+            .unwrap();
 
         // Both, and each its own. Asking the backing answered yes after the
         // first and the second was never built.
@@ -9211,7 +9401,7 @@ mod tests {
 
         // The image first, the view second. This is the order the installer at
         // declaration exists for.
-        prepare_backing_representation(&mut runtime, &mut host, shift, base.backing).unwrap();
+        prepare_backing_representation(&mut runtime, &mut host, shift, base.backing, None).unwrap();
         assert!(runtime.resource_has_execution_representation(base.resource));
 
         let view = crate::runtime::replacement_object_lifecycle::apply_replacement_texture_view(
@@ -9406,12 +9596,12 @@ mod tests {
             )
             .unwrap();
 
-        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing)
+        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing, None)
             .unwrap();
         assert!(runtime.resource_has_execution_representation(declaration.resource));
         // The second pass is what the retry loop runs. It must find the bytes
         // already there and build nothing.
-        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing)
+        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing, None)
             .unwrap();
     }
 
@@ -9458,7 +9648,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing)
+        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing, None)
             .unwrap();
         let first = runtime
             .execution()

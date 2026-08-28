@@ -562,11 +562,14 @@ impl RenderDispatchPreparationError {
     /// reached the dispatch route and not the guest-upload one, and a suffix
     /// that stopped on it held its submission domain for the life of the
     /// device.
-    pub const fn backing_fault(&self) -> Option<(BackingId, ManagedBackingError)> {
+    pub const fn backing_fault(&self) -> Option<(BackingId, BackingView, ManagedBackingError)> {
         match self {
             Self::Backing {
-                backing, reason, ..
-            } => Some((*backing, *reason)),
+                backing,
+                view,
+                reason,
+                ..
+            } => Some((*backing, *view, *reason)),
             _ => None,
         }
     }
@@ -580,7 +583,7 @@ impl RenderDispatchPreparationError {
     /// reach it.
     pub const fn stale_backing(&self) -> Option<BackingId> {
         match self.backing_fault() {
-            Some((backing, ManagedBackingError::StaleExecutionRepresentation)) => Some(backing),
+            Some((backing, _, ManagedBackingError::StaleExecutionRepresentation)) => Some(backing),
             _ => None,
         }
     }
@@ -592,9 +595,11 @@ impl RenderDispatchPreparationError {
     /// built and the operation is prepared again. Left unrepaired it is not one
     /// lost command --- it holds the whole recorded chain, and every later
     /// transaction in the submission domain refuses behind it.
-    pub const fn missing_representation_backing(&self) -> Option<BackingId> {
+    pub const fn missing_representation_view(&self) -> Option<(BackingId, BackingView)> {
         match self.backing_fault() {
-            Some((backing, ManagedBackingError::MissingExecutionRepresentation)) => Some(backing),
+            Some((backing, view, ManagedBackingError::MissingExecutionRepresentation)) => {
+                Some((backing, view))
+            }
             _ => None,
         }
     }
@@ -1785,20 +1790,49 @@ mod tests {
         let missing = refusal(ManagedBackingError::MissingExecutionRepresentation);
         assert_eq!(
             missing.backing_fault(),
-            Some((backing, ManagedBackingError::MissingExecutionRepresentation))
+            Some((
+                backing,
+                BackingView::Bytes,
+                ManagedBackingError::MissingExecutionRepresentation
+            ))
         );
-        assert_eq!(missing.missing_representation_backing(), Some(backing));
+        // The view travels with the backing, because the repair has to build
+        // one native object and a backing carries one per view. Handing it the
+        // backing alone lets it build whichever view it finds first, report
+        // success, and leave the named one absent -- which reads as a repair
+        // that runs thousands of times and changes nothing.
+        assert_eq!(
+            missing.missing_representation_view(),
+            Some((backing, BackingView::Bytes))
+        );
         assert_eq!(missing.stale_backing(), None);
+
+        let image = RenderDispatchPreparationError::Backing {
+            backing,
+            view: BackingView::Image(crate::ImageOwner::owning(ResourceId::new(3, 1))),
+            resources: Box::new([]),
+            regions: Box::new([]),
+            reads: true,
+            writes: false,
+            reason: ManagedBackingError::MissingExecutionRepresentation,
+        };
+        assert_eq!(
+            image.missing_representation_view(),
+            Some((
+                backing,
+                BackingView::Image(crate::ImageOwner::owning(ResourceId::new(3, 1)))
+            ))
+        );
 
         let stale = refusal(ManagedBackingError::StaleExecutionRepresentation);
         assert_eq!(stale.stale_backing(), Some(backing));
-        assert_eq!(stale.missing_representation_backing(), None);
+        assert_eq!(stale.missing_representation_view(), None);
 
         // A refusal that is not about a backing answers neither, so a repair
         // that asks cannot be handed an unrelated failure's identity.
         let unrelated = RenderDispatchPreparationError::PipelineMismatch;
         assert_eq!(unrelated.backing_fault(), None);
         assert_eq!(unrelated.stale_backing(), None);
-        assert_eq!(unrelated.missing_representation_backing(), None);
+        assert_eq!(unrelated.missing_representation_view(), None);
     }
 }

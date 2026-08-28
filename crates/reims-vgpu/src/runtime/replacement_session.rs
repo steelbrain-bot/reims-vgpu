@@ -4075,9 +4075,18 @@ impl<Semantic> ReplacementGuestUploadSuffixPreparationFailure<Semantic> {
     /// content that has not been produced and an image refusal is about a
     /// claim this transaction may not take yet; neither is repaired by
     /// building anything.
-    pub fn missing_representation_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+    /// The backing *and view* a retained suffix stopped on because that
+    /// native object has not been built yet.
+    ///
+    /// The view is half the answer, not decoration: a backing carries one
+    /// native object per view, so a repair given only the backing builds
+    /// whichever view it finds first and reports success whether or not that
+    /// was the one the suffix named.
+    pub fn missing_representation_view(
+        &self,
+    ) -> Option<(reims_vgpu_protocol::BackingId, reims_vgpu_core::BackingView)> {
         match self {
-            Self::Resources { reason, .. } => reason.missing_representation_backing(),
+            Self::Resources { reason, .. } => reason.missing_representation_view(),
             Self::Readiness { .. } | Self::Images { .. } => None,
         }
     }
@@ -5873,6 +5882,7 @@ impl ReplacementExecAutomaticPreparationError {
         &self,
     ) -> Option<(
         reims_vgpu_protocol::BackingId,
+        reims_vgpu_core::BackingView,
         reims_vgpu_core::ManagedBackingError,
     )> {
         match self {
@@ -5896,9 +5906,11 @@ impl ReplacementExecAutomaticPreparationError {
     /// refused this resource preparation.
     pub(crate) fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
         match self.backing_fault() {
-            Some((backing, reims_vgpu_core::ManagedBackingError::StaleExecutionRepresentation)) => {
-                Some(backing)
-            }
+            Some((
+                backing,
+                _,
+                reims_vgpu_core::ManagedBackingError::StaleExecutionRepresentation,
+            )) => Some(backing),
             _ => None,
         }
     }
@@ -5910,12 +5922,15 @@ impl ReplacementExecAutomaticPreparationError {
     /// [`reims_vgpu_core::RenderDispatchPreparationError::missing_representation_backing`]:
     /// this is the repairable one, and leaving it unrepaired holds a whole
     /// submission domain rather than costing one command.
-    pub(crate) fn missing_representation_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+    pub(crate) fn missing_representation_view(
+        &self,
+    ) -> Option<(reims_vgpu_protocol::BackingId, reims_vgpu_core::BackingView)> {
         match self.backing_fault() {
             Some((
                 backing,
+                view,
                 reims_vgpu_core::ManagedBackingError::MissingExecutionRepresentation,
-            )) => Some(backing),
+            )) => Some((backing, view)),
             _ => None,
         }
     }
@@ -15666,6 +15681,34 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     /// answer is always no, so the materializer rebuilt it on every pass and
     /// the backing refused `DuplicateExecutionRepresentation` -- forever, at
     /// four hundred retries a second, holding the channel behind it.
+    /// Whether one named view of a backing has its native object.
+    ///
+    /// The question a repair asks *after* running, to tell a repair that built
+    /// the view from one that returned `Ok` and built nothing. Those are
+    /// indistinguishable from the repair's own return value, and the second
+    /// costs a retained transaction its whole submission domain while every
+    /// counter beside it reads healthy.
+    pub(crate) fn backing_view_is_represented(
+        &self,
+        backing: reims_vgpu_protocol::BackingId,
+        view: reims_vgpu_core::BackingView,
+    ) -> bool {
+        self.execution
+            .resources()
+            .view_representation(backing, view)
+            .is_ok()
+    }
+
+    /// Whether this resource is a registered surface's plane view, and so is
+    /// something the plane materializer can build.
+    pub(crate) fn is_io_surface_plane_view(
+        &self,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+    ) -> bool {
+        self.io_surface_plane_view_materialization_facts(resource)
+            .is_some()
+    }
+
     pub(crate) fn resource_has_execution_representation(
         &self,
         resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
@@ -18995,7 +19038,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         ReplacementContinuingGuestUpload<Semantic>,
         ReplacementGuestUploadSuffixRetryRefusal<Semantic>,
     > {
-        if failure.missing_representation_backing().is_none() {
+        if failure.missing_representation_view().is_none() {
             return Err(ReplacementGuestUploadSuffixRetryRefusal {
                 failure,
                 preflight: None,

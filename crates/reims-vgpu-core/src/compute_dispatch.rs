@@ -285,6 +285,11 @@ pub enum ComputeDispatchPreparationError {
     },
     Backing {
         backing: BackingId,
+        /// Which view of the backing the failing group addressed. A backing
+        /// carries one native object per view, each with its own content, so
+        /// the backing alone does not say which of them refused -- and a
+        /// repair handed only the backing cannot know which to build.
+        view: BackingView,
         reason: ManagedBackingError,
     },
     Writes(GpuWriteBatchError),
@@ -301,7 +306,7 @@ impl ComputeDispatchPreparationError {
     /// reach it.
     pub const fn stale_backing(&self) -> Option<BackingId> {
         match self.backing_fault() {
-            Some((backing, ManagedBackingError::StaleExecutionRepresentation)) => Some(backing),
+            Some((backing, _, ManagedBackingError::StaleExecutionRepresentation)) => Some(backing),
             _ => None,
         }
     }
@@ -310,9 +315,13 @@ impl ComputeDispatchPreparationError {
     ///
     /// See [`RenderDispatchPreparationError::backing_fault`]; the two dispatch
     /// classes answer the same questions and must answer them the same way.
-    pub const fn backing_fault(&self) -> Option<(BackingId, ManagedBackingError)> {
+    pub const fn backing_fault(&self) -> Option<(BackingId, BackingView, ManagedBackingError)> {
         match self {
-            Self::Backing { backing, reason } => Some((*backing, *reason)),
+            Self::Backing {
+                backing,
+                view,
+                reason,
+            } => Some((*backing, *view, *reason)),
             _ => None,
         }
     }
@@ -321,9 +330,11 @@ impl ComputeDispatchPreparationError {
     /// this refused.
     ///
     /// See [`RenderDispatchPreparationError::missing_representation_backing`].
-    pub const fn missing_representation_backing(&self) -> Option<BackingId> {
+    pub const fn missing_representation_view(&self) -> Option<(BackingId, BackingView)> {
         match self.backing_fault() {
-            Some((backing, ManagedBackingError::MissingExecutionRepresentation)) => Some(backing),
+            Some((backing, view, ManagedBackingError::MissingExecutionRepresentation)) => {
+                Some((backing, view))
+            }
             _ => None,
         }
     }
@@ -549,16 +560,28 @@ pub fn prepare_compute_dispatch<T, NativePipeline>(
     let mut write_requests = Vec::new();
     for ((backing, view), (regions, reads, writes)) in grouped {
         let regions = regions.into_iter().collect::<Vec<_>>().into_boxed_slice();
-        let representation = owner
-            .view_representation(backing, view)
-            .map_err(|reason| ComputeDispatchPreparationError::Backing { backing, reason })?;
+        let representation = owner.view_representation(backing, view).map_err(|reason| {
+            ComputeDispatchPreparationError::Backing {
+                backing,
+                view,
+                reason,
+            }
+        })?;
         if reads {
             let snapshot = owner
                 .snapshot_content(backing, &regions)
-                .map_err(|reason| ComputeDispatchPreparationError::Backing { backing, reason })?;
+                .map_err(|reason| ComputeDispatchPreparationError::Backing {
+                    backing,
+                    view,
+                    reason,
+                })?;
             owner
                 .view_representation_for_snapshot(backing, view, &snapshot)
-                .map_err(|reason| ComputeDispatchPreparationError::Backing { backing, reason })?;
+                .map_err(|reason| ComputeDispatchPreparationError::Backing {
+                    backing,
+                    view,
+                    reason,
+                })?;
         }
         representations.push(ViewRepresentation {
             backing,
@@ -976,6 +999,7 @@ mod tests {
             .unwrap_err(),
             ComputeDispatchPreparationError::Backing {
                 backing: stale,
+                view: BackingView::Image(crate::ImageOwner::owning(ResourceId::new(6, 1))),
                 reason: ManagedBackingError::StaleExecutionRepresentation,
             }
         );
