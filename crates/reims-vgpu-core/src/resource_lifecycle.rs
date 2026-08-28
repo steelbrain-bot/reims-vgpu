@@ -273,7 +273,24 @@ pub enum ValidityTransitionError {
         destination: RepresentationId,
     },
     UnexpectedGuestUploadDestination(BackingId),
-    InvalidGuestUploadRoute(BackingId),
+    /// No route this backing's bytes could be uploaded through.
+    ///
+    /// The backing alone does not say which of the four ways this fails, and
+    /// a boot has already been spent on one of these reporting nothing but
+    /// the name: whether a destination was chosen at all, what route it
+    /// carries, and what route the guest representation carries are three
+    /// independent facts and the refusal is legible only with all three. A
+    /// `destination` of `None` beside a host ingress is "nothing designated";
+    /// a `HostStagingTransfer` destination means the host ingress did not
+    /// pair with it; an `ImportedGuestTransfer` destination means the guest
+    /// representation is not the direct alias that route requires, and
+    /// `guest_route` then says what it is instead.
+    InvalidGuestUploadRoute {
+        backing: BackingId,
+        destination: Option<RepresentationId>,
+        destination_route: Option<RepresentationRoute>,
+        guest_route: Option<RepresentationRoute>,
+    },
     MissingGuestVisibilitySource(BackingId),
     UnexpectedGuestVisibilitySource(BackingId),
     InvalidGuestVisibilityDestination {
@@ -912,11 +929,17 @@ impl<T> ResourceLifecycleOwner<T> {
                     target.backing,
                 ));
             }
+            let guest_route = self
+                .native
+                .representation_route(target.backing, GUEST_REPRESENTATION);
             match target.guest_upload_destination {
                 None if target.host_ingress_destination.is_some() => {
-                    return Err(ValidityTransitionError::InvalidGuestUploadRoute(
-                        target.backing,
-                    ));
+                    return Err(ValidityTransitionError::InvalidGuestUploadRoute {
+                        backing: target.backing,
+                        destination: None,
+                        destination_route: None,
+                        guest_route,
+                    });
                 }
                 None => {}
                 Some(destination) => {
@@ -926,10 +949,7 @@ impl<T> ResourceLifecycleOwner<T> {
                     let route_is_valid = match destination_route {
                         Some(RepresentationRoute::ImportedGuestTransfer { .. }) => {
                             target.host_ingress_destination.is_none()
-                                && self
-                                    .native
-                                    .representation_route(target.backing, GUEST_REPRESENTATION)
-                                    == Some(RepresentationRoute::DirectGuestAlias)
+                                && guest_route == Some(RepresentationRoute::DirectGuestAlias)
                         }
                         Some(RepresentationRoute::HostStagingTransfer { .. }) => {
                             target.host_ingress_destination == Some(HOST_REPRESENTATION)
@@ -937,9 +957,12 @@ impl<T> ResourceLifecycleOwner<T> {
                         _ => false,
                     };
                     if !route_is_valid {
-                        return Err(ValidityTransitionError::InvalidGuestUploadRoute(
-                            target.backing,
-                        ));
+                        return Err(ValidityTransitionError::InvalidGuestUploadRoute {
+                            backing: target.backing,
+                            destination: Some(destination),
+                            destination_route,
+                            guest_route,
+                        });
                     }
                 }
             }
@@ -2478,6 +2501,113 @@ mod tests {
         assert_eq!(released.as_ref(), [child, root]);
         assert_eq!(retired.len(), 1);
         assert_eq!(retired[0].storage.id, backing);
+    }
+
+    /// A refused upload route says which of its three facts was wrong.
+    ///
+    /// The backing on its own does not distinguish "nothing was designated"
+    /// from "the designated route does not pair with the host ingress" from
+    /// "the imported route has no direct guest alias under it", and those are
+    /// three different repairs in three different places. A driven boot has
+    /// already parked on this refusal reporting nothing but a backing id.
+    #[test]
+    fn a_refused_guest_upload_route_names_the_routes_it_refused() {
+        let mut owner = ResourceLifecycleOwner::<()>::new(VulkanDeviceEpochId::new(3));
+        let backing = match owner
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([BackingRegion::Whole]),
+            })
+            .unwrap()
+        {
+            ResourceLifecycleEffect::BackingCreated(backing) => backing,
+            _ => unreachable!(),
+        };
+        let imported = owner
+            .create_representation(
+                backing,
+                RepresentationRoute::ImportedGuestTransfer {
+                    working: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                (),
+            )
+            .unwrap();
+        let transition = |target| {
+            ResolvedResourceLifecycle::ApplyValidity(ResolvedValidityTransition {
+                ops: ResourceValidityOps {
+                    clear_host_valid: 1,
+                    set_host_valid: 0,
+                    clear_guest_valid: 0,
+                    set_guest_valid: 0,
+                },
+                write: None,
+                targets: Box::new([target]),
+            })
+        };
+        let target = ResolvedValidityTarget {
+            backing,
+            regions: Box::new([BackingRegion::Whole]),
+            host_representation: None,
+            host_ingress_destination: None,
+            guest_upload_destination: Some(imported),
+            guest_visibility_source: None,
+            guest_visibility_destination: GUEST_REPRESENTATION,
+        };
+
+        // An imported-guest destination with no direct guest alias beneath it.
+        // `guest_route` is the fact that says so, and it is `None` here
+        // because nothing created that alias at all.
+        assert_eq!(
+            owner.apply(transition(target.clone())).err(),
+            Some(ResourceLifecycleError::Validity(
+                ValidityTransitionError::InvalidGuestUploadRoute {
+                    backing,
+                    destination: Some(imported),
+                    destination_route: Some(RepresentationRoute::ImportedGuestTransfer {
+                        working: crate::WorkingMemoryClass::DeviceLocal,
+                    }),
+                    guest_route: None,
+                },
+            )),
+        );
+
+        // Nothing designated at all, beside a host ingress that needs one.
+        // The ingress endpoint is real, so what this refuses is the missing
+        // upload destination and not the ingress.
+        assert_eq!(
+            owner
+                .create_representation(backing, RepresentationRoute::HostStagingEndpoint, ())
+                .unwrap(),
+            HOST_REPRESENTATION,
+        );
+        assert_eq!(
+            owner
+                .apply(transition(ResolvedValidityTarget {
+                    host_ingress_destination: Some(HOST_REPRESENTATION),
+                    guest_upload_destination: None,
+                    ..target.clone()
+                }))
+                .err(),
+            Some(ResourceLifecycleError::Validity(
+                ValidityTransitionError::InvalidGuestUploadRoute {
+                    backing,
+                    destination: None,
+                    destination_route: None,
+                    guest_route: None,
+                },
+            )),
+        );
+
+        // The alias the imported route requires, so the same transition passes
+        // -- which is what makes the two readings above facts about the route
+        // and not about the transition.
+        assert_eq!(
+            owner
+                .create_representation(backing, RepresentationRoute::DirectGuestAlias, ())
+                .unwrap(),
+            GUEST_REPRESENTATION,
+        );
+        assert!(owner.apply(transition(target)).is_ok());
     }
 
     #[test]
