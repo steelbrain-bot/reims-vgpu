@@ -382,6 +382,7 @@ pub(super) fn drain(id: u64) -> bool {
             let _ = device.tick(&mut QemuHost::new(&ops, actions, &slot.prompt_actions));
         }
         None => {
+            poll_display_refresh(device, &mut NullHost);
             let _ = device.tick(&mut NullHost);
         }
     }
@@ -410,6 +411,7 @@ pub(super) fn poll(id: u64) -> bool {
                     ));
                 }
             }
+            poll_display_refresh(device, &mut host);
             let _ = device.tick(&mut host);
         }
         None => {
@@ -435,6 +437,26 @@ pub(super) fn poll(id: u64) -> bool {
     #[cfg(feature = "host-window")]
     publish_early_window_frame(&slot, product_presented);
     true
+}
+
+/// Raise the display refresh pulse for this poll and report a refusal by name.
+///
+/// Both poll arms call this rather than carrying the same two lines twice:
+/// the lock-free arm and the locked one already diverged once on the display
+/// handshake, and a copy is where the next divergence comes from.
+fn poll_display_refresh(
+    device: &mut ReplacementDeviceCoordinator<()>,
+    host: &mut (impl crate::runtime::host::HostMemory + crate::runtime::host::HostControl),
+) {
+    if let Err(reason) = device.poll_display_refresh(host) {
+        if reason
+            != crate::runtime::replacement_session::ReplacementDisplayRefreshError::NativeLifetimeClosed
+        {
+            crate::observe::fail(format!(
+                "replacement_display_refresh_refused reason={reason:?}"
+            ));
+        }
+    }
 }
 
 fn report_coordinator_failures(

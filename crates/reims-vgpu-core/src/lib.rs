@@ -174,8 +174,10 @@ pub use direct_replay::{
 pub use display::{
     CursorGlyph, CursorPosition, CursorState, DisplayHandshake, DisplayOnlineNotification,
     DisplayOnlineNotificationError, DisplayOnlinePoll, DisplayPresentNotification,
-    DisplayPresentNotificationError, DisplaySharedPage, DISPLAY_ONLINE_EVENT_MASK,
+    DisplayPresentNotificationError, DisplayRefreshCadence, DisplayRefreshNotification,
+    DisplayRefreshNotificationError, DisplaySharedPage, DISPLAY_ONLINE_EVENT_MASK,
     DISPLAY_PRESENT_EVENT_MASK, DISPLAY_SHARED_ENABLE_MASK_OFFSET, DISPLAY_SHARED_PENDING_OFFSET,
+    DISPLAY_VBL_EVENT_MASK,
 };
 pub use draw_preparation::{
     AttachmentPlanDecline, AttachmentTargetRole, DrawPreparationDecline, SamplerBindingSource,

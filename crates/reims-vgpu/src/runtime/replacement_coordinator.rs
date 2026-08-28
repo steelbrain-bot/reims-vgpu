@@ -6893,6 +6893,37 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
         }
     }
 
+    /// Raise one display refresh pulse on this poll.
+    ///
+    /// Paced against the refresh this device advertises in its timing elements
+    /// rather than against the poll rate, so the delivered rate is the one the
+    /// guest was told to expect.
+    pub fn poll_display_refresh(
+        &mut self,
+        host: &mut (impl HostMemory + HostControl),
+    ) -> Result<
+        reims_vgpu_core::DisplayRefreshNotification,
+        crate::runtime::replacement_session::ReplacementDisplayRefreshError,
+    > {
+        if self.terminalize_device_loss() {
+            return Err(
+                crate::runtime::replacement_session::ReplacementDisplayRefreshError::NativeLifetimeClosed,
+            );
+        }
+        self.runtime.progress_display_refresh(
+            host,
+            self.transport
+                .registers()
+                .gfx
+                .interrupt_status_disp
+                .as_ref(),
+            reims_vgpu_core::DisplayRefreshCadence::from_advertised_hz(
+                crate::model::DISPLAY_REFRESH_HZ,
+            ),
+            crate::observe::elapsed_us(),
+        )
+    }
+
     fn next_console_frame_identity(&mut self) -> Result<(u32, u32), ReplacementConsoleFrameError> {
         let mapping_space = u64::from(u32::MAX);
         let generation = u32::try_from(self.next_console_frame / mapping_space)

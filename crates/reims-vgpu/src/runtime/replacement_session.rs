@@ -7780,6 +7780,14 @@ pub(crate) enum ReplacementDisplayOnlineError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementDisplayRefreshError {
+    NativeLifetimeClosed,
+    Planning(reims_vgpu_core::DisplayRefreshNotificationError),
+    AddressOverflow,
+    Host(crate::runtime::host::MemError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementRuntimeResetError {
     Session(DeviceSessionError),
     Execution(ReplacementExecutionResetError),
@@ -17066,6 +17074,94 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         interrupt_status.fetch_or(interrupt_bit, std::sync::atomic::Ordering::AcqRel);
         host.enqueue(crate::runtime::host::HostAction::irq_gfx());
         self.display.record_online_pulse();
+        Ok(notification)
+    }
+
+    /// Raise one display refresh pulse for whichever classes the guest armed.
+    ///
+    /// The guest's display driver holds every swap until a vertical blank
+    /// arrives, so this is what makes a Present happen at all: a device that
+    /// renders everything the guest asks for and never pulses here receives no
+    /// Present, and the guest's own compositor is what stalls.
+    pub fn progress_display_refresh(
+        &mut self,
+        host: &mut (impl crate::runtime::host::HostMemory + crate::runtime::host::HostControl),
+        interrupt_status: &std::sync::atomic::AtomicU32,
+        cadence: reims_vgpu_core::DisplayRefreshCadence,
+        now_us: u64,
+    ) -> Result<reims_vgpu_core::DisplayRefreshNotification, ReplacementDisplayRefreshError> {
+        let (enable_mask, pending) = match self.display.shared_page() {
+            Some(page) if self.display.is_online() => {
+                let enable_gpa = page
+                    .gpa
+                    .checked_add(reims_vgpu_core::DISPLAY_SHARED_ENABLE_MASK_OFFSET)
+                    .ok_or(ReplacementDisplayRefreshError::AddressOverflow)?;
+                let pending_gpa = page
+                    .gpa
+                    .checked_add(reims_vgpu_core::DISPLAY_SHARED_PENDING_OFFSET)
+                    .ok_or(ReplacementDisplayRefreshError::AddressOverflow)?;
+                let read = |gpa| {
+                    let mut bytes = [0; 4];
+                    host.read_gpa(gpa, &mut bytes)
+                        .ok()
+                        .map(|()| reims_vgpu_core::endian::ld32(&bytes))
+                };
+                (read(enable_gpa), read(pending_gpa))
+            }
+            _ => (None, None),
+        };
+        // The classes the guest has armed are the whole input to the decision
+        // below, and a boot that never presents needs to distinguish "the guest
+        // never asked for a vertical blank" from "it asked and we never
+        // delivered". Neither is visible from the pulse alone.
+        if let Some(mask) = enable_mask {
+            use crate::runtime::contract_census::note;
+            if mask & reims_vgpu_core::DISPLAY_VBL_EVENT_MASK != 0 {
+                note("display_enable_vbl");
+            }
+            if mask & reims_vgpu_core::DISPLAY_PRESENT_EVENT_MASK != 0 {
+                note("display_enable_present");
+            }
+            if mask & reims_vgpu_core::DISPLAY_ONLINE_EVENT_MASK != 0 {
+                note("display_enable_online");
+            }
+            if mask == 0 {
+                note("display_enable_none");
+            }
+        }
+        let notification = self
+            .display
+            .plan_refresh_notification(cadence, now_us, enable_mask, pending)
+            .map_err(ReplacementDisplayRefreshError::Planning)?;
+        crate::runtime::contract_census::note(match notification {
+            reims_vgpu_core::DisplayRefreshNotification::NotOnline => "display_refresh_not_online",
+            reims_vgpu_core::DisplayRefreshNotification::Disabled(_) => "display_refresh_disabled",
+            reims_vgpu_core::DisplayRefreshNotification::TooSoon(_) => "display_refresh_too_soon",
+            reims_vgpu_core::DisplayRefreshNotification::Deliver { .. } => {
+                "display_refresh_delivered"
+            }
+        });
+        let reims_vgpu_core::DisplayRefreshNotification::Deliver {
+            page,
+            pending,
+            interrupt_bit,
+            claimed_us,
+            ..
+        } = notification
+        else {
+            return Ok(notification);
+        };
+        let pending_gpa = page
+            .gpa
+            .checked_add(reims_vgpu_core::DISPLAY_SHARED_PENDING_OFFSET)
+            .ok_or(ReplacementDisplayRefreshError::AddressOverflow)?;
+        let mut bytes = [0; 4];
+        reims_vgpu_core::endian::st32(&mut bytes, pending);
+        host.write_gpa(pending_gpa, &bytes)
+            .map_err(ReplacementDisplayRefreshError::Host)?;
+        interrupt_status.fetch_or(interrupt_bit, std::sync::atomic::Ordering::AcqRel);
+        host.enqueue(crate::runtime::host::HostAction::irq_gfx());
+        self.display.record_refresh_pulse(claimed_us);
         Ok(notification)
     }
 
@@ -31486,6 +31582,90 @@ mod tests {
                 object: missing_object,
             }) if missing_task == task && missing_object == object
         ));
+    }
+
+    /// The guest's compositor holds every swap until a vertical blank arrives,
+    /// so this pulse is what makes a Present happen at all. Without it the
+    /// device renders everything the guest asks for and is never asked to show
+    /// any of it.
+    #[test]
+    fn an_online_display_receives_the_vertical_blank_its_compositor_waits_on() {
+        let Some(mut runtime) = runtime_session() else {
+            return;
+        };
+        let publication = crate::runtime::replacement_fifo_control::apply_replacement_shared_state(
+            &mut runtime,
+            14,
+            crate::runtime::replacement_fifo_control::DecodedReplacementSharedState {
+                index: 0,
+                pfn: 7,
+            },
+        )
+        .unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        host.map_range(publication.page.gpa, 0x1000, 0);
+        host.put_u32(
+            publication.page.gpa + reims_vgpu_core::DISPLAY_SHARED_ENABLE_MASK_OFFSET,
+            reims_vgpu_core::DISPLAY_VBL_EVENT_MASK,
+        );
+        let interrupt_status = std::sync::atomic::AtomicU32::new(0);
+        let cadence = reims_vgpu_core::DisplayRefreshCadence::from_advertised_hz(
+            crate::model::DISPLAY_REFRESH_HZ,
+        );
+        // Refresh belongs to a display the guest is driving.
+        assert_eq!(
+            runtime
+                .progress_display_refresh(&mut host, &interrupt_status, cadence, 1_000)
+                .unwrap(),
+            reims_vgpu_core::DisplayRefreshNotification::NotOnline
+        );
+        runtime.acknowledge_display_online();
+
+        assert!(matches!(
+            runtime
+                .progress_display_refresh(&mut host, &interrupt_status, cadence, 1_000)
+                .unwrap(),
+            reims_vgpu_core::DisplayRefreshNotification::Deliver { vbl: true, .. }
+        ));
+        assert_eq!(
+            host.get_u32(publication.page.gpa + reims_vgpu_core::DISPLAY_SHARED_PENDING_OFFSET),
+            reims_vgpu_core::DISPLAY_VBL_EVENT_MASK
+        );
+        assert_eq!(
+            interrupt_status.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            host.action_count(crate::runtime::host::HostActionKind::IrqGfxPulse),
+            1
+        );
+
+        // The grid, not the poll rate, decides the delivered cadence.
+        assert!(matches!(
+            runtime
+                .progress_display_refresh(&mut host, &interrupt_status, cadence, 1_001)
+                .unwrap(),
+            reims_vgpu_core::DisplayRefreshNotification::TooSoon(_)
+        ));
+        assert_eq!(
+            host.action_count(crate::runtime::host::HostActionKind::IrqGfxPulse),
+            1
+        );
+        assert!(matches!(
+            runtime
+                .progress_display_refresh(
+                    &mut host,
+                    &interrupt_status,
+                    cadence,
+                    1_000 + cadence.interval_us(),
+                )
+                .unwrap(),
+            reims_vgpu_core::DisplayRefreshNotification::Deliver { .. }
+        ));
+        assert_eq!(
+            host.action_count(crate::runtime::host::HostActionKind::IrqGfxPulse),
+            2
+        );
     }
 
     #[test]

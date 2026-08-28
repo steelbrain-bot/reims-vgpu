@@ -162,6 +162,19 @@ pub(crate) fn decode_replacement_root_packet(
     payload: &[u8],
 ) -> Result<DecodedReplacementRootPacket, ReplacementRootPacketDecodeError> {
     use crate::model::*;
+    // The same never-fired signal the child ring has: a decoder is silent on
+    // success, so nothing else says which root commands a guest actually sends.
+    crate::runtime::contract_census::note(match opcode {
+        ROOT_OP_SETUP_SHARED_STATE => "root_setup_shared_state",
+        ROOT_OP_DELETE_TASK => "root_delete_task",
+        ROOT_OP_DEVICE_INFO_MONTEREY => "root_device_info_monterey",
+        ROOT_OP_DEVICE_INFO_TAHOE => "root_device_info_tahoe",
+        ROOT_OP_DEFINE_FIFO => "root_define_fifo",
+        ROOT_OP_FREE_FIFO => "root_free_fifo",
+        ROOT_OP_SET_OBJECT_LIST => "root_set_object_list",
+        ROOT_OP_DEFINE_TASK2 => "root_define_task2",
+        _ => "root_unknown_opcode",
+    });
     match opcode {
         ROOT_OP_SETUP_SHARED_STATE => {
             require_len(opcode, payload, CHILD_SHARED_STATE_LEN)?;
