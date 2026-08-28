@@ -45,10 +45,23 @@ pub struct ContentSynchronizationRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentSynchronizationError {
     EmptyRegions(BackingId),
+    /// A GPU write over this region is outstanding and no ordering permits
+    /// reading past it.
+    ///
+    /// `consumer` and the write's own producer are the pair to read first, and
+    /// they must not be equal: a transaction can only wait for a write of its
+    /// own until it submits, and it cannot submit while this refusal holds its
+    /// preparation. `permits` says which of the two ways the permit could be
+    /// missing --- zero means the caller computed no permitted set for this
+    /// backing at all, and non-zero means it computed one that this write is
+    /// not in, which is a set that went stale rather than one that was never
+    /// asked for.
     PendingGpuWrite {
         backing: BackingId,
         representation: reims_vgpu_protocol::RepresentationId,
         write: crate::GpuWriteId,
+        consumer: TransactionId,
+        permits: usize,
     },
     Backing {
         backing: BackingId,
@@ -243,6 +256,10 @@ pub fn prepare_content_synchronization<T>(
                         backing,
                         representation: destination,
                         write,
+                        consumer: transaction,
+                        permits: permitted_pending
+                            .get(&backing)
+                            .map_or(0, std::collections::BTreeSet::len),
                     });
                 }
                 let route = resources
@@ -680,6 +697,8 @@ mod tests {
                 backing,
                 representation: destination,
                 write: submission.into(),
+                consumer: TransactionId::new(7),
+                permits: 0,
             })
         );
 

@@ -9656,6 +9656,108 @@ mod tests {
             .unwrap();
     }
 
+    /// A GPU write planned after a manifest was built is in no permitted set,
+    /// and the query that finds it asks every designated view.
+    ///
+    /// The permits a retained upload manifest carries are a snapshot of the
+    /// submission order taken when it was built. Nothing else about the
+    /// manifest notices a write planned afterwards -- the representations are
+    /// the same and the content has not moved, because the write has not
+    /// landed -- so without this the manifest is read as it stands and content
+    /// synchronization refuses `PendingGpuWrite` on a write no permitted set
+    /// will ever grow to contain, for the rest of the boot.
+    #[test]
+    fn a_write_planned_after_the_permits_were_taken_is_found_against_its_view() {
+        use crate::runtime::host::HostMemory;
+        use reims_vgpu_paging::geometry::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+        let Some(mut runtime) = runtime() else {
+            return;
+        };
+        let shift = crate::model::PAGE_SHIFT_X86;
+        let task = reims_vgpu_protocol::TaskId::new(31);
+        runtime.define_task(task, 0x10_0000, 2).unwrap();
+        let mut host = crate::runtime::host::FakeHost::new();
+        let directory = 2u64 << shift;
+        let root = 3u64 << shift;
+        host.map_range(directory, 1usize << shift, 0);
+        host.map_range(root, 1usize << shift, 0);
+        host.map_range(9u64 << shift, 1usize << shift, 0);
+        let mut directory_bytes = [0u8; 8];
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_ROOT_PFN as usize..], 3);
+        reims_vgpu_core::endian::st32(&mut directory_bytes[DIRECTORY_DEPTH as usize..], 1);
+        host.write_gpa(directory, &directory_bytes).unwrap();
+        host.write_gpa(root + 0x10 * 4, &9u32.to_le_bytes())
+            .unwrap();
+        let declaration =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_linear_resource(
+                &mut runtime,
+                shift,
+                task,
+                61,
+                reims_vgpu_protocol::ResourceDescriptor::Buffer(
+                    reims_vgpu_protocol::BufferDescriptor {
+                        allocation_size: 64,
+                        handle: 0x10,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .unwrap();
+        prepare_backing_representation(&mut runtime, &mut host, shift, declaration.backing, None)
+            .unwrap();
+
+        let backing = declaration.backing;
+        let representation = runtime
+            .execution()
+            .resources()
+            .any_designated_representation(backing)
+            .unwrap();
+        let regions = [reims_vgpu_core::BackingRegion::Whole];
+        let empty = std::collections::BTreeSet::new();
+
+        // Before anything is planned there is nothing to permit.
+        assert_eq!(
+            crate::runtime::replacement_session::unpermitted_pending_write_over(
+                runtime.execution().resources(),
+                backing,
+                &regions,
+                &empty,
+            ),
+            None
+        );
+
+        let write = reims_vgpu_protocol::SubmissionId::new(9);
+        runtime
+            .execution_mut()
+            .resources_mut()
+            .plan_gpu_write(backing, write, representation, regions)
+            .unwrap();
+
+        // A manifest whose permits were taken before the plan cannot name it,
+        // and the write is reported against the view it is outstanding on.
+        assert_eq!(
+            crate::runtime::replacement_session::unpermitted_pending_write_over(
+                runtime.execution().resources(),
+                backing,
+                &regions,
+                &empty,
+            ),
+            Some((representation, write.into()))
+        );
+
+        // A permitted set that does name it is not stale for it.
+        assert_eq!(
+            crate::runtime::replacement_session::unpermitted_pending_write_over(
+                runtime.execution().resources(),
+                backing,
+                &regions,
+                &std::iter::once(reims_vgpu_core::GpuWriteId::from(write)).collect(),
+            ),
+            None
+        );
+    }
+
     #[test]
     fn a_physical_replacement_reinstalls_the_backing_execution_representation() {
         use crate::runtime::host::HostMemory;

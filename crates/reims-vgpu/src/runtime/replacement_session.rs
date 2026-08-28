@@ -3579,6 +3579,15 @@ fn report_guest_upload_refresh(
         ReplacementUploadManifestStaleness::Unreadable { backing } => {
             ("backing_unreadable", backing, String::new())
         }
+        ReplacementUploadManifestStaleness::UnpermittedPendingWrite {
+            backing,
+            representation,
+            write,
+        } => (
+            "pending_write_unpermitted",
+            backing,
+            format!("representation={} write={write:?}", representation.get()),
+        ),
         ReplacementUploadManifestStaleness::Content {
             backing,
             view,
@@ -3647,6 +3656,28 @@ pub(crate) enum ReplacementUploadManifestStaleness {
         representation: reims_vgpu_protocol::RepresentationId,
         required: Box<[reims_vgpu_core::RegionVersion]>,
         holds: Box<[reims_vgpu_core::RegionVersion]>,
+    },
+    /// A GPU write over a region this manifest requires is outstanding and the
+    /// manifest's permitted set does not name it.
+    ///
+    /// The permitted set is a snapshot of the submission order taken when the
+    /// manifest was built, and a write planned after that is in no snapshot.
+    /// Nothing else here notices: the representations are the same ones and
+    /// the content has not moved -- the write has not landed yet, which is the
+    /// whole point -- so every other staleness question answers no, the
+    /// retained manifest is read as it stands, and content synchronization
+    /// refuses `PendingGpuWrite` on a write no permitted set will ever grow to
+    /// contain. The suffix then retries into the same state for the rest of
+    /// the boot.
+    ///
+    /// A fresh preflight is what resolves it, because permits are computed
+    /// against the submission order as it is now. If the write is genuinely
+    /// ordered ahead of this reader the preflight says so by name, which is a
+    /// wait that can end rather than a refusal that cannot.
+    UnpermittedPendingWrite {
+        backing: reims_vgpu_protocol::BackingId,
+        representation: reims_vgpu_protocol::RepresentationId,
+        write: reims_vgpu_core::GpuWriteId,
     },
 }
 
@@ -3744,6 +3775,37 @@ impl ReplacementExecResourceManifest {
     ) -> Option<ReplacementUploadManifestStaleness> {
         self.stale_upload_representation(resources)
             .or_else(|| self.stale_upload_content(resources))
+            .or_else(|| self.unpermitted_pending_write(resources))
+    }
+
+    /// The first outstanding GPU write over a required region that this
+    /// manifest's permitted set does not name.
+    ///
+    /// Asked of the same regions the requirements name and of every designated
+    /// view, because a write is outstanding against a representation and each
+    /// view has its own.
+    fn unpermitted_pending_write(
+        &self,
+        resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
+    ) -> Option<ReplacementUploadManifestStaleness> {
+        self.content_requirements.iter().find_map(|request| {
+            let backing = request.backing;
+            let permitted = self
+                .content_synchronization
+                .iter()
+                .filter(|planned| planned.backing == backing)
+                .flat_map(|planned| planned.permitted_pending_writes.iter().copied())
+                .collect::<std::collections::BTreeSet<_>>();
+            unpermitted_pending_write_over(resources, backing, &request.regions, &permitted).map(
+                |(representation, write)| {
+                    ReplacementUploadManifestStaleness::UnpermittedPendingWrite {
+                        backing,
+                        representation,
+                        write,
+                    }
+                },
+            )
+        })
     }
 }
 
@@ -4857,6 +4919,36 @@ impl ReplacementExecAutomaticPreparationError {
             Self::Assembly { .. } => "Assembly",
         }
     }
+}
+
+/// The first outstanding GPU write over these regions that `permitted` does not
+/// name, with the designated view it is outstanding against.
+///
+/// Asked of every designated view rather than of the backing, because a write
+/// is outstanding against a representation and a backing carries one per
+/// texture declared over its range.
+pub(crate) fn unpermitted_pending_write_over(
+    resources: &reims_vgpu_core::ResourceLifecycleOwner<ReplacementNativeRepresentation>,
+    backing: reims_vgpu_protocol::BackingId,
+    regions: &[reims_vgpu_core::BackingRegion],
+    permitted: &std::collections::BTreeSet<reims_vgpu_core::GpuWriteId>,
+) -> Option<(
+    reims_vgpu_protocol::RepresentationId,
+    reims_vgpu_core::GpuWriteId,
+)> {
+    resources
+        .designated_views(backing)
+        .ok()?
+        .into_iter()
+        .find_map(|(_, representation)| {
+            resources
+                .pending_gpu_writes_overlapping(backing, representation, regions)
+                .ok()?
+                .iter()
+                .copied()
+                .find(|write| !permitted.contains(write))
+                .map(|write| (representation, write))
+        })
 }
 
 /// Why a consumer must wait for a pending GPU write, or `None` if it may read
