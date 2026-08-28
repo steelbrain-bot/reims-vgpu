@@ -7254,7 +7254,7 @@ impl<Semantic> ReplacementSynchronizeDispatchFailure<Semantic> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementLinearResourceDeclarationError {
-    ConflictingDeclaration,
+    ConflictingDeclaration(ReplacementRedeclarationDisagreement),
     InvalidBackingGeometry,
     Lifecycle(ReplacementResourceLifecycleError),
 }
@@ -7273,7 +7273,7 @@ pub(crate) enum ReplacementHeapTextureDeclarationError {
     HeapUnbound,
     InvalidRequirements,
     OffsetMisaligned,
-    ConflictingDeclaration,
+    ConflictingDeclaration(ReplacementRedeclarationDisagreement),
     HeapDeclaration(ReplacementObjectDeclarationError),
     Lifecycle(ReplacementResourceLifecycleError),
 }
@@ -7292,7 +7292,7 @@ pub(crate) enum ReplacementMapperTextureDeclarationError {
     DeclaredReferenceMismatch { declared: u32, object: u32 },
     MapperUnbound,
     MapperSurfaceUnavailable(reims_vgpu_protocol::MapperSurfaceRef),
-    ConflictingDeclaration,
+    ConflictingDeclaration(ReplacementRedeclarationDisagreement),
     Lifecycle(ReplacementResourceLifecycleError),
 }
 
@@ -7406,9 +7406,55 @@ pub(crate) enum ReplacementLoadedMapperRequestApplyError {
     Request(ReplacementMapperRequestRefusal),
 }
 
+/// What a redeclaration expects of the live resource's storage.
+///
+/// The object families that may be redeclared agree on every other term and
+/// differ only in this one: a registered surface owns no backing at all, a
+/// view inherits its parent's, and a plane, mapper or heap texture names the
+/// storage relation itself rather than an identity it cannot know in advance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementDeclaredStorage<'a> {
+    None,
+    Backing(reims_vgpu_protocol::BackingId),
+    Relation(&'a reims_vgpu_core::StorageBacking),
+}
+
+/// The term on which a repeated declaration disagreed with the live resource.
+///
+/// A refusal that says only "conflicting" leaves the next reader to guess
+/// which of four independent comparisons failed, and the four fail for
+/// entirely different reasons: a reused object slot, a changed descriptor, a
+/// redirected allocation, and a reparented view are four defects that share
+/// one word.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementRedeclarationDisagreement {
+    Kind {
+        declared: reims_vgpu_protocol::ObjectKind,
+        live: reims_vgpu_protocol::ObjectKind,
+    },
+    /// The live resource carries no decoded construction input to compare
+    /// against, so the declaration cannot be proved to repeat it.
+    DescriptorAbsent,
+    Descriptor,
+    StorageAbsent,
+    StorageUnexpected(reims_vgpu_protocol::BackingId),
+    StorageDiffers {
+        declared: reims_vgpu_protocol::BackingId,
+        live: reims_vgpu_protocol::BackingId,
+    },
+    /// The live backing exists but does not stand in the storage relation the
+    /// declaration names -- a different plane, mapper surface or heap placement.
+    StorageRelationDiffers(reims_vgpu_protocol::BackingId),
+    ParentCount {
+        declared: usize,
+        live: usize,
+    },
+    ParentAbsent(ResourceId<reims_vgpu_protocol::ResourceObject>),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementRegisteredSurfaceDeclarationError {
-    ConflictingDeclaration,
+    ConflictingDeclaration(ReplacementRedeclarationDisagreement),
     Lifecycle(ReplacementResourceLifecycleError),
 }
 
@@ -7420,14 +7466,14 @@ pub(crate) struct ReplacementRegisteredSurfaceDeclaration {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementViewResourceDeclarationError {
-    ConflictingDeclaration,
+    ConflictingDeclaration(ReplacementRedeclarationDisagreement),
     ParentStorageAbsent,
     Lifecycle(ReplacementResourceLifecycleError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementIOSurfacePlaneViewDeclarationError {
-    ConflictingDeclaration,
+    ConflictingDeclaration(ReplacementRedeclarationDisagreement),
     Lifecycle(ReplacementResourceLifecycleError),
 }
 
@@ -7440,7 +7486,7 @@ pub(crate) struct ReplacementViewResourceDeclaration {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementBufferTextureDeclarationError {
-    ConflictingDeclaration,
+    ConflictingDeclaration(ReplacementRedeclarationDisagreement),
     Lifecycle(ReplacementResourceLifecycleError),
 }
 
@@ -14903,6 +14949,83 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     /// union of those planes. Giving the allocation a backing as well would
     /// put an aggregate with no layout into every exec's resource-state target
     /// set, where it can only ever be missing an execution representation.
+    /// Decide whether a live resource is the declaration being made again.
+    ///
+    /// A repeated declaration of an object the guest has not released is
+    /// idempotent when it agrees in all four terms -- object kind, decoded
+    /// descriptor, storage, and parents -- and is refused when any one of them
+    /// differs, because the live resource is what every admitted transaction
+    /// already resolved against and nothing may redirect it under them.
+    ///
+    /// The rule lives here once because it is one rule for every object family
+    /// that can be redeclared, and the families vary only in what they expect
+    /// of the storage term. Written out at each declaration site it was seven
+    /// spellings of four comparisons, already divergent -- some folded "no
+    /// storage" together with "the wrong storage" and some did not -- and the
+    /// refusal they shared named none of the terms it had just compared.
+    fn redeclaration_disagreement(
+        &self,
+        resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
+        kind: reims_vgpu_protocol::ObjectKind,
+        descriptor: &reims_vgpu_protocol::ResourceDescriptor,
+        storage: ReplacementDeclaredStorage<'_>,
+        parents: &[ResourceId<reims_vgpu_protocol::ResourceObject>],
+    ) -> Option<ReplacementRedeclarationDisagreement> {
+        let graph = self.execution.epoch.resources.graph();
+        let node = graph
+            .resource(resource)
+            .expect("a resolved resource remains in the canonical graph");
+        if node.kind != kind {
+            return Some(ReplacementRedeclarationDisagreement::Kind {
+                declared: kind,
+                live: node.kind,
+            });
+        }
+        match node.descriptor.as_deref() {
+            None => return Some(ReplacementRedeclarationDisagreement::DescriptorAbsent),
+            Some(live) if live != descriptor => {
+                return Some(ReplacementRedeclarationDisagreement::Descriptor);
+            }
+            Some(_) => {}
+        }
+        match (storage, node.storage) {
+            (ReplacementDeclaredStorage::None, None) => {}
+            (ReplacementDeclaredStorage::None, Some(live)) => {
+                return Some(ReplacementRedeclarationDisagreement::StorageUnexpected(
+                    live,
+                ));
+            }
+            (_, None) => return Some(ReplacementRedeclarationDisagreement::StorageAbsent),
+            (ReplacementDeclaredStorage::Backing(declared), Some(live)) if declared != live => {
+                return Some(ReplacementRedeclarationDisagreement::StorageDiffers {
+                    declared,
+                    live,
+                });
+            }
+            (ReplacementDeclaredStorage::Backing(_), Some(_)) => {}
+            (ReplacementDeclaredStorage::Relation(relation), Some(live)) => {
+                if !graph
+                    .storage(live)
+                    .is_some_and(|storage| &storage.backing == relation)
+                {
+                    return Some(
+                        ReplacementRedeclarationDisagreement::StorageRelationDiffers(live),
+                    );
+                }
+            }
+        }
+        if node.parents.len() != parents.len() {
+            return Some(ReplacementRedeclarationDisagreement::ParentCount {
+                declared: parents.len(),
+                live: node.parents.len(),
+            });
+        }
+        if let Some(&absent) = parents.iter().find(|parent| !node.parents.contains(parent)) {
+            return Some(ReplacementRedeclarationDisagreement::ParentAbsent(absent));
+        }
+        None
+    }
+
     pub fn declare_registered_surface_resource(
         &mut self,
         task: reims_vgpu_protocol::TaskId,
@@ -14914,19 +15037,18 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking((*descriptor).clone()),
         );
         if let Some(resource) = self.resolve_resource(task, object) {
-            let node = self
-                .execution
-                .epoch
-                .resources
-                .graph()
-                .resource(resource)
-                .expect("a resolved resource remains in the canonical graph");
-            if node.kind != reims_vgpu_protocol::ObjectKind::SurfaceBacking
-                || node.descriptor.as_deref() != Some(semantic_descriptor.as_ref())
-                || node.storage.is_some()
-                || !node.parents.is_empty()
-            {
-                return Err(ReplacementRegisteredSurfaceDeclarationError::ConflictingDeclaration);
+            if let Some(disagreement) = self.redeclaration_disagreement(
+                resource,
+                reims_vgpu_protocol::ObjectKind::SurfaceBacking,
+                &semantic_descriptor,
+                ReplacementDeclaredStorage::None,
+                &[],
+            ) {
+                return Err(
+                    ReplacementRegisteredSurfaceDeclarationError::ConflictingDeclaration(
+                        disagreement,
+                    ),
+                );
             }
             return Ok(ReplacementRegisteredSurfaceDeclaration {
                 resource,
@@ -15274,32 +15396,29 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ),
             )?;
         if let Some(resource) = self.resolve_resource(task, object) {
-            let graph = self.execution.epoch.resources.graph();
-            let node = graph
-                .resource(resource)
-                .expect("a resolved resource remains in the canonical graph");
-            let backing = node
-                .storage
-                .ok_or(ReplacementMapperTextureDeclarationError::ConflictingDeclaration)?;
-            let exact_backing = graph.storage(backing).is_some_and(|storage| {
-                storage.backing
-                    == reims_vgpu_core::StorageBacking::MapperSurface {
-                        mapper: descriptor.mapper_surface,
-                        plane: descriptor.plane,
-                    }
-            });
-            if node.kind != reims_vgpu_protocol::ObjectKind::IOSurfaceTexture
-                || node.descriptor.as_deref()
-                    != Some(
-                        &reims_vgpu_protocol::ResourceDescriptor::MapperIOSurfaceTextureView(
-                            *descriptor,
-                        ),
-                    )
-                || !exact_backing
-                || !node.parents.is_empty()
-            {
-                return Err(ReplacementMapperTextureDeclarationError::ConflictingDeclaration);
+            let relation = reims_vgpu_core::StorageBacking::MapperSurface {
+                mapper: descriptor.mapper_surface,
+                plane: descriptor.plane,
+            };
+            if let Some(disagreement) = self.redeclaration_disagreement(
+                resource,
+                reims_vgpu_protocol::ObjectKind::IOSurfaceTexture,
+                &reims_vgpu_protocol::ResourceDescriptor::MapperIOSurfaceTextureView(*descriptor),
+                ReplacementDeclaredStorage::Relation(&relation),
+                &[],
+            ) {
+                return Err(
+                    ReplacementMapperTextureDeclarationError::ConflictingDeclaration(disagreement),
+                );
             }
+            let backing = self
+                .execution
+                .epoch
+                .resources
+                .graph()
+                .resource(resource)
+                .and_then(|node| node.storage)
+                .expect("the storage term was just matched against the declared relation");
             return Ok(ReplacementMapperTextureDeclaration {
                 resource,
                 backing,
@@ -15372,39 +15491,37 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             ),
         };
         if let Some(resource) = self.resolve_resource(task, object) {
-            let graph = self.execution.epoch.resources.graph();
-            let node = graph
-                .resource(resource)
-                .expect("a resolved resource remains in the canonical graph");
-            let backing = node
-                .storage
-                .ok_or(ReplacementHeapTextureDeclarationError::ConflictingDeclaration)?;
-            let exact_backing = graph.storage(backing).is_some_and(|storage| {
-                if descriptor.use_offset {
-                    storage.backing
-                        == reims_vgpu_core::StorageBacking::HeapPlacement {
-                            heap,
-                            offset: reims_vgpu_protocol::ByteOffset::new(descriptor.offset),
-                            length: reims_vgpu_protocol::ByteLength::new(requirements.size),
-                        }
-                } else {
-                    storage.backing
-                        == reims_vgpu_core::StorageBacking::HeapAllocation {
-                            heap,
-                            allocation: resource,
-                        }
+            let relation = if descriptor.use_offset {
+                reims_vgpu_core::StorageBacking::HeapPlacement {
+                    heap,
+                    offset: reims_vgpu_protocol::ByteOffset::new(descriptor.offset),
+                    length: reims_vgpu_protocol::ByteLength::new(requirements.size),
                 }
-            });
-            if node.kind != reims_vgpu_protocol::ObjectKind::TextureView
-                || node.descriptor.as_deref()
-                    != Some(&reims_vgpu_protocol::ResourceDescriptor::HeapTexture(
-                        *descriptor,
-                    ))
-                || !exact_backing
-                || !node.parents.is_empty()
-            {
-                return Err(ReplacementHeapTextureDeclarationError::ConflictingDeclaration);
+            } else {
+                reims_vgpu_core::StorageBacking::HeapAllocation {
+                    heap,
+                    allocation: resource,
+                }
+            };
+            if let Some(disagreement) = self.redeclaration_disagreement(
+                resource,
+                reims_vgpu_protocol::ObjectKind::TextureView,
+                &reims_vgpu_protocol::ResourceDescriptor::HeapTexture(*descriptor),
+                ReplacementDeclaredStorage::Relation(&relation),
+                &[],
+            ) {
+                return Err(
+                    ReplacementHeapTextureDeclarationError::ConflictingDeclaration(disagreement),
+                );
             }
+            let backing = self
+                .execution
+                .epoch
+                .resources
+                .graph()
+                .resource(resource)
+                .and_then(|node| node.storage)
+                .expect("the storage term was just matched against the declared relation");
             return Ok(ReplacementHeapTextureDeclaration {
                 resource,
                 backing,
@@ -15458,28 +15575,30 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         let region = reims_vgpu_core::LinearRange::new(0, length.get())
             .ok_or(ReplacementLinearResourceDeclarationError::InvalidBackingGeometry)?;
         if let Some(resource) = self.resolve_resource(task, object) {
-            let graph = self.execution.epoch.resources.graph();
-            let node = graph
-                .resource(resource)
-                .expect("a resolved resource remains in the canonical graph");
-            let backing = node
-                .storage
-                .ok_or(ReplacementLinearResourceDeclarationError::ConflictingDeclaration)?;
-            let exact_backing = graph.storage(backing).is_some_and(|storage| {
-                storage.backing
-                    == reims_vgpu_core::StorageBacking::TaskAddress {
-                        task,
-                        address,
-                        length,
-                    }
-            });
-            if node.kind != kind
-                || node.descriptor.as_deref() != Some(descriptor.as_ref())
-                || !exact_backing
-                || !node.parents.is_empty()
-            {
-                return Err(ReplacementLinearResourceDeclarationError::ConflictingDeclaration);
+            let relation = reims_vgpu_core::StorageBacking::TaskAddress {
+                task,
+                address,
+                length,
+            };
+            if let Some(disagreement) = self.redeclaration_disagreement(
+                resource,
+                kind,
+                &descriptor,
+                ReplacementDeclaredStorage::Relation(&relation),
+                &[],
+            ) {
+                return Err(
+                    ReplacementLinearResourceDeclarationError::ConflictingDeclaration(disagreement),
+                );
             }
+            let backing = self
+                .execution
+                .epoch
+                .resources
+                .graph()
+                .resource(resource)
+                .and_then(|node| node.storage)
+                .expect("the storage term was just matched against the declared relation");
             return Ok(ReplacementLinearResourceDeclaration {
                 resource,
                 backing,
@@ -15567,20 +15686,16 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .and_then(|node| node.storage)
             .ok_or(ReplacementViewResourceDeclarationError::ParentStorageAbsent)?;
         if let Some(resource) = self.resolve_resource(task, object) {
-            let node = self
-                .execution
-                .epoch
-                .resources
-                .graph()
-                .resource(resource)
-                .expect("a resolved resource remains in the canonical graph");
-            if node.kind != kind
-                || node.descriptor.as_deref() != Some(descriptor.as_ref())
-                || node.storage != Some(parent_storage)
-                || node.parents.len() != 1
-                || !node.parents.contains(&parent)
-            {
-                return Err(ReplacementViewResourceDeclarationError::ConflictingDeclaration);
+            if let Some(disagreement) = self.redeclaration_disagreement(
+                resource,
+                kind,
+                &descriptor,
+                ReplacementDeclaredStorage::Backing(parent_storage),
+                &[parent],
+            ) {
+                return Err(
+                    ReplacementViewResourceDeclarationError::ConflictingDeclaration(disagreement),
+                );
             }
             return Ok(ReplacementViewResourceDeclaration {
                 resource,
@@ -15625,32 +15740,33 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     ) -> Result<ReplacementViewResourceDeclaration, ReplacementIOSurfacePlaneViewDeclarationError>
     {
         if let Some(resource) = self.resolve_resource(task, object) {
-            let graph = self.execution.epoch.resources.graph();
-            let node = graph
-                .resource(resource)
-                .expect("a resolved resource remains in the canonical graph");
-            let exact_backing = node.storage.is_some_and(|backing| {
-                graph.storage(backing).is_some_and(|storage| {
-                    storage.backing
-                        == reims_vgpu_core::StorageBacking::IOSurfacePlane {
-                            surface: parent,
-                            plane,
-                        }
-                })
-            });
-            if node.kind != reims_vgpu_protocol::ObjectKind::IOSurfacePlaneView
-                || node.descriptor.as_deref() != Some(descriptor.as_ref())
-                || !exact_backing
-                || node.parents.len() != 1
-                || !node.parents.contains(&parent)
-            {
-                return Err(ReplacementIOSurfacePlaneViewDeclarationError::ConflictingDeclaration);
+            let relation = reims_vgpu_core::StorageBacking::IOSurfacePlane {
+                surface: parent,
+                plane,
+            };
+            if let Some(disagreement) = self.redeclaration_disagreement(
+                resource,
+                reims_vgpu_protocol::ObjectKind::IOSurfacePlaneView,
+                &descriptor,
+                ReplacementDeclaredStorage::Relation(&relation),
+                &[parent],
+            ) {
+                return Err(
+                    ReplacementIOSurfacePlaneViewDeclarationError::ConflictingDeclaration(
+                        disagreement,
+                    ),
+                );
             }
             return Ok(ReplacementViewResourceDeclaration {
                 resource,
-                backing: node
-                    .storage
-                    .expect("an exact plane backing was just matched"),
+                backing: self
+                    .execution
+                    .epoch
+                    .resources
+                    .graph()
+                    .resource(resource)
+                    .and_then(|node| node.storage)
+                    .expect("the storage term was just matched against the plane relation"),
                 newly_declared: false,
             });
         }
@@ -15725,44 +15841,32 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         buffer: ResourceId<reims_vgpu_protocol::ResourceObject>,
     ) -> Result<ReplacementViewResourceDeclaration, ReplacementBufferTextureDeclarationError> {
         if let Some(resource) = self.resolve_resource(task, object) {
-            let node = self
-                .execution
-                .epoch
-                .resources
-                .graph()
-                .resource(resource)
-                .expect("a resolved resource remains in the canonical graph");
-            let exact_descriptor =
-                reims_vgpu_protocol::ResourceDescriptor::BufferTexture(*descriptor);
-            let exact_parent = node.parents.len() == 1 && node.parents.contains(&buffer);
-            let exact_backing = node.storage.and_then(|backing| {
-                self.execution
-                    .epoch
-                    .resources
-                    .graph()
-                    .storage(backing)
-                    .map(|storage| (backing, &storage.backing))
-            });
-            let Some((backing, storage)) = exact_backing else {
-                return Err(ReplacementBufferTextureDeclarationError::ConflictingDeclaration);
+            let relation = reims_vgpu_core::StorageBacking::BufferRange {
+                buffer,
+                offset: reims_vgpu_protocol::ByteOffset::new(descriptor.offset),
+                bytes_per_row: reims_vgpu_protocol::ByteLength::new(descriptor.bytes_per_row),
             };
-            if node.kind != reims_vgpu_protocol::ObjectKind::TextureView
-                || node.descriptor.as_deref() != Some(&exact_descriptor)
-                || !exact_parent
-                || *storage
-                    != (reims_vgpu_core::StorageBacking::BufferRange {
-                        buffer,
-                        offset: reims_vgpu_protocol::ByteOffset::new(descriptor.offset),
-                        bytes_per_row: reims_vgpu_protocol::ByteLength::new(
-                            descriptor.bytes_per_row,
-                        ),
-                    })
-            {
-                return Err(ReplacementBufferTextureDeclarationError::ConflictingDeclaration);
+            if let Some(disagreement) = self.redeclaration_disagreement(
+                resource,
+                reims_vgpu_protocol::ObjectKind::TextureView,
+                &reims_vgpu_protocol::ResourceDescriptor::BufferTexture(*descriptor),
+                ReplacementDeclaredStorage::Relation(&relation),
+                &[buffer],
+            ) {
+                return Err(
+                    ReplacementBufferTextureDeclarationError::ConflictingDeclaration(disagreement),
+                );
             }
             return Ok(ReplacementViewResourceDeclaration {
                 resource,
-                backing,
+                backing: self
+                    .execution
+                    .epoch
+                    .resources
+                    .graph()
+                    .resource(resource)
+                    .and_then(|node| node.storage)
+                    .expect("the storage term was just matched against the buffer range"),
                 newly_declared: false,
             });
         }
@@ -26226,6 +26330,134 @@ mod tests {
         );
     }
 
+    /// A redeclaration that disagrees says which of the four terms disagreed.
+    ///
+    /// Kind, descriptor, storage and parents fail for four unrelated reasons --
+    /// a reused object slot, a changed construction input, a redirected
+    /// allocation, and a reparented view -- and a refusal that says only
+    /// "conflicting" sends the next reader to guess between them.
+    #[test]
+    fn a_redeclaration_names_the_term_it_disagreed_on() {
+        let Some(mut runtime) = runtime_session() else {
+            return;
+        };
+        let task = reims_vgpu_protocol::TaskId::new(4);
+        let address = reims_vgpu_protocol::GuestVirtualAddress::new(0x4000);
+        let length = reims_vgpu_protocol::ByteLength::new(0x1000);
+        let descriptor = reims_vgpu_protocol::ResourceDescriptor::Buffer(
+            reims_vgpu_protocol::BufferDescriptor {
+                allocation_size: length.get(),
+                handle: 0x4000,
+                ..Default::default()
+            },
+        );
+        let declared = runtime
+            .declare_task_address_resource(
+                task,
+                reims_vgpu_protocol::ObjectTableRef::new(3),
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                Arc::new(descriptor.clone()),
+                address,
+                length,
+            )
+            .unwrap();
+        assert!(declared.newly_declared);
+        let relation = reims_vgpu_core::StorageBacking::TaskAddress {
+            task,
+            address,
+            length,
+        };
+
+        // The same four terms again is the same declaration.
+        assert_eq!(
+            runtime.redeclaration_disagreement(
+                declared.resource,
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                &descriptor,
+                ReplacementDeclaredStorage::Relation(&relation),
+                &[],
+            ),
+            None
+        );
+
+        assert_eq!(
+            runtime.redeclaration_disagreement(
+                declared.resource,
+                reims_vgpu_protocol::ObjectKind::TextureView,
+                &descriptor,
+                ReplacementDeclaredStorage::Relation(&relation),
+                &[],
+            ),
+            Some(ReplacementRedeclarationDisagreement::Kind {
+                declared: reims_vgpu_protocol::ObjectKind::TextureView,
+                live: reims_vgpu_protocol::ObjectKind::Buffer,
+            })
+        );
+
+        let widened = reims_vgpu_protocol::ResourceDescriptor::Buffer(
+            reims_vgpu_protocol::BufferDescriptor {
+                allocation_size: length.get() + 1,
+                handle: 0x4000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            runtime.redeclaration_disagreement(
+                declared.resource,
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                &widened,
+                ReplacementDeclaredStorage::Relation(&relation),
+                &[],
+            ),
+            Some(ReplacementRedeclarationDisagreement::Descriptor)
+        );
+
+        // A live backing that does not stand in the declared relation is
+        // distinct from carrying no backing at all, and from carrying one this
+        // caller can name outright.
+        let elsewhere = reims_vgpu_core::StorageBacking::TaskAddress {
+            task,
+            address: reims_vgpu_protocol::GuestVirtualAddress::new(0x8000),
+            length,
+        };
+        assert_eq!(
+            runtime.redeclaration_disagreement(
+                declared.resource,
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                &descriptor,
+                ReplacementDeclaredStorage::Relation(&elsewhere),
+                &[],
+            ),
+            Some(ReplacementRedeclarationDisagreement::StorageRelationDiffers(declared.backing))
+        );
+        assert_eq!(
+            runtime.redeclaration_disagreement(
+                declared.resource,
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                &descriptor,
+                ReplacementDeclaredStorage::None,
+                &[],
+            ),
+            Some(ReplacementRedeclarationDisagreement::StorageUnexpected(
+                declared.backing
+            ))
+        );
+
+        assert_eq!(
+            runtime.redeclaration_disagreement(
+                declared.resource,
+                reims_vgpu_protocol::ObjectKind::Buffer,
+                &descriptor,
+                ReplacementDeclaredStorage::Relation(&relation),
+                &[declared.resource],
+            ),
+            Some(ReplacementRedeclarationDisagreement::ParentCount {
+                declared: 1,
+                live: 0,
+            })
+        );
+    }
+
     #[test]
     fn decoded_linear_resources_and_views_share_exact_backing() {
         let Some(mut runtime) = runtime_session() else {
@@ -26325,7 +26557,9 @@ mod tests {
             ),
             Err(
                 crate::runtime::replacement_object_lifecycle::ReplacementLinearResourceRefusal::Declaration(
-                    ReplacementLinearResourceDeclarationError::ConflictingDeclaration,
+                    ReplacementLinearResourceDeclarationError::ConflictingDeclaration(
+                        ReplacementRedeclarationDisagreement::Descriptor
+                    ),
                 ),
             )
         );
@@ -27346,7 +27580,9 @@ mod tests {
                 reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(conflicting),
             ),
             Err(crate::runtime::replacement_object_lifecycle::ReplacementRegisteredSurfaceRefusal::Declaration(
-                ReplacementRegisteredSurfaceDeclarationError::ConflictingDeclaration
+                ReplacementRegisteredSurfaceDeclarationError::ConflictingDeclaration(
+                    ReplacementRedeclarationDisagreement::Descriptor
+                )
             ))
         );
 
