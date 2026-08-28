@@ -100,6 +100,8 @@ CASE synchronize_resource_gpu_to_cpu PASS managed/shared GPU writes visible to C
 CASE heap_texture_alias_lifecycle PASS one live range was released, reused at offset=0, and addressed as the replacement
 CASE heap_texture_placement_overlap PASS two live definitions at offset=0 executed sequentially and addressed the replacement
 CASE heap_texture_placement_overlap_incompatible_widths PASS two live textures of different bit widths at offset=0 each addressed their own definition
+CASE buffer_backed_alias_incompatible_widths PASS every byte the rgba16Float alias wrote reached the rgba8Unorm one
+CASE buffer_backed_alias_partial_row_range PASS the four-row write landed on exactly its own rows of the wide alias
 CASE ebl_same_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_changed_bind_second_encoder PASS the binding re-issued on the second encoder is the one that drew
 CASE ebl_same_bind_second_command_buffer PASS the binding re-issued on the second encoder is the one that drew
@@ -277,5 +279,5 @@ ROUTE srt_blit_iosurface_source_1920x1080_x4 sl_gpu_resident_landed
 CASE srt_blit_iosurface_source_1920x1080_x4 PASS every surface-to-surface copy moved its own frame's pixels
 CASE srt_blit_buffer_backed_512x512 PASS the copy out of a buffer-backed source moved what the render had written
 CASE command_buffer_cross_queue_shared_event_visibility PASS producer=4 consumer=4 completed_without_host_release=true visible=true
-SUMMARY cases=272 failures=0 skipped=0
+SUMMARY cases=274 failures=0 skipped=0
 DEVICE name=Apple M4 unified=true
