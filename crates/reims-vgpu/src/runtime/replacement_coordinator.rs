@@ -435,6 +435,44 @@ fn missing_execution_representation<Semantic>(
 /// still refuse -- but they refuse saying which class, which is the difference
 /// between a gap someone can go and close and a backing that is simply
 /// "unavailable".
+/// Report a repair that returned `Ok` and built nothing.
+///
+/// A repair's return value cannot tell the two apart, and the difference is a
+/// dispatch that runs from one that refuses `MissingExecutionRepresentation`
+/// again, is repaired again, and reports success on every pass. The
+/// guest-upload suffix route already asks this after its own repair; the exec
+/// dispatch route did not, so a class of backing no materializer serves read as
+/// a repair that worked and a guest kernel that simply produced nothing.
+///
+/// Deduped by backing, because a head in this state is repaired hundreds of
+/// times a second.
+fn report_inert_backing_repair<Semantic: Clone>(
+    runtime: &ReplacementRuntimeSession<Semantic>,
+    backing: reims_vgpu_protocol::BackingId,
+    view: Option<reims_vgpu_core::BackingView>,
+) {
+    let represented = match view {
+        Some(view) => runtime.backing_view_is_represented(backing, view),
+        // The readiness refusal names no view, and what it asked for was *any*
+        // designated representation on the backing -- so that is what is
+        // checked, rather than a view invented to have something to ask about.
+        None => !runtime
+            .execution_representation_coverage(backing)
+            .is_empty(),
+    };
+    if represented {
+        return;
+    }
+    if crate::observe::first_sight("replacement_exec_backing_repair_inert", backing.get()) {
+        crate::observe::fail(format!(
+            "replacement_exec_backing_repair_inert backing={} view={view:?} \
+             storage_class={:?} reason=repair_built_nothing",
+            backing.get(),
+            runtime.backing_storage_class(backing),
+        ));
+    }
+}
+
 fn prepare_backing_representation<Semantic>(
     runtime: &mut ReplacementRuntimeSession<Semantic>,
     host: &mut (impl HostMemory + crate::runtime::host::HostOps),
@@ -1236,6 +1274,7 @@ where
                         },
                     ));
                 }
+                report_inert_backing_repair(runtime, backing, view);
                 runtime
                     .retry_exec_ingress_dispatch(reason)
                     .map_err(|reason| {
@@ -1278,6 +1317,7 @@ where
                     },
                 ));
             }
+            report_inert_backing_repair(runtime, backing, view);
             runtime
                 .retry_exec_ingress_dispatch(dispatch)
                 .map_err(|reason| {
