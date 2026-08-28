@@ -316,6 +316,14 @@ impl ReplacementDeviceEpoch {
         (
             topology,
             reims_vgpu_core::RepresentationCapabilities {
+                // Always false: a direct alias is pinned to the fixed
+                // `GUEST_REPRESENTATION` identity, and a physical replacement
+                // retires the execution representation without freeing that
+                // identity, so an aliased backing cannot be reinstalled after
+                // one. Making the alias reachable needs a distinct execution
+                // identity whose coverage the authority mirrors onto the guest
+                // representation, which is a lifetime change and not a
+                // capability change. See `kb/`.
                 direct_guest_backing: false,
                 imported_transfer: self.context.caps.host_pointer.rung.is_available(),
                 host_visible_working,
