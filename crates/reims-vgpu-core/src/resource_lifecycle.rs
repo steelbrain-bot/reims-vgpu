@@ -1339,6 +1339,16 @@ impl<T> ResourceLifecycleOwner<T> {
             .stale_designated_representations(backing, snapshot)
     }
 
+    /// See
+    /// [`crate::ManagedBackingOwner::host_write_reaches_every_designated_view`].
+    pub fn host_write_reaches_every_designated_view(
+        &self,
+        backing: BackingId,
+    ) -> Result<bool, ManagedBackingError> {
+        self.native
+            .host_write_reaches_every_designated_view(backing)
+    }
+
     /// See [`crate::ManagedBackingOwner::designated_views`].
     pub fn designated_views(
         &self,

@@ -11611,14 +11611,34 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 // which names the same representative. The per-image fan-out
                 // is content synchronization's, which plans a transfer for
                 // every view over these bytes.
+                let backing_error =
+                    |reason| ReplacementExecResourceReadinessError::ValidityRepresentation {
+                        backing: request.backing,
+                        reason,
+                    };
                 let destination = resources
                     .any_designated_representation(request.backing)
-                    .map_err(|reason| {
-                        ReplacementExecResourceReadinessError::ValidityRepresentation {
-                            backing: request.backing,
-                            reason,
-                        }
-                    })?;
+                    .map_err(backing_error)?;
+                // A host-valid declaration lands in the backing's bytes.
+                // Every image declared over those bytes keeps its own copy
+                // and does not receive it, so the declaration is not a
+                // statement that an image view holds this region -- the
+                // region must still be synchronized into each of them. The
+                // shortcut below therefore applies only where the designated
+                // views are the bytes themselves.
+                //
+                // Letting it answer for an image is what left a view empty
+                // for a whole boot: a backing carried one image holding its
+                // content and one holding nothing at all, an earlier
+                // host-valid declaration suppressed the region here, and so
+                // the backing never entered `synchronization_regions` at all
+                // --- the per-view filter below, which does ask every view,
+                // never saw it, and the render bind that addressed the empty
+                // image refused as stale on every retry for the rest of the
+                // boot.
+                let host_write_reaches_every_view = resources
+                    .host_write_reaches_every_designated_view(request.backing)
+                    .map_err(backing_error)?;
                 for region in request.regions {
                     let missing = if mode == ReplacementExecResourcePreflightMode::GuestUploadSuffix
                     {
@@ -11629,10 +11649,11 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                             request.backing,
                             region,
                             |position| {
-                                validity
-                                    .get(&(position, request.backing))
-                                    .and_then(|representations| representations.host_write)
-                                    == Some(destination)
+                                host_write_reaches_every_view
+                                    && validity
+                                        .get(&(position, request.backing))
+                                        .and_then(|representations| representations.host_write)
+                                        == Some(destination)
                             },
                         )
                     };

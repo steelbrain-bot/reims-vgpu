@@ -813,6 +813,32 @@ impl<T> ManagedBackingOwner<T> {
             .collect())
     }
 
+    /// Whether a host-valid declaration over this backing leaves every
+    /// designated view holding those bytes.
+    ///
+    /// A host write lands in the backing's bytes. An image declared over the
+    /// same range keeps its own copy and does not receive it, so on a backing
+    /// that designates any image the declaration says nothing about whether a
+    /// view is current, and the region it covers still has to be synchronized
+    /// into each image. The declaration answers for the whole backing exactly
+    /// when the bytes are the only thing designated over it.
+    ///
+    /// This lives here rather than at the caller for the same reason
+    /// [`Self::stale_designated_representations`] does: it is a question about
+    /// what a backing designates, and a caller that reconstructs it from
+    /// [`Self::designated_views`] has written a second copy of a rule that
+    /// only one type can keep true.
+    pub fn host_write_reaches_every_designated_view(
+        &self,
+        backing: BackingId,
+    ) -> Result<bool, ManagedBackingError> {
+        Ok(self
+            .live_backing(backing)?
+            .execution_representations
+            .keys()
+            .all(|view| *view == BackingView::Bytes))
+    }
+
     /// Every designated view whose representation does not already hold the
     /// required content, in view order.
     ///
@@ -2942,6 +2968,55 @@ mod tests {
             vec![(wide, wide_representation), (narrow, narrow_representation)]
         );
         assert!(owner.is_designated(backing, narrow_representation));
+    }
+
+    /// A host-valid declaration is a statement about the bytes, and an image
+    /// over those bytes does not receive it.
+    ///
+    /// A preflight that reads the declaration as "this backing is current"
+    /// drops the synchronization every image over it is still owed, and the
+    /// loss is silent: the bind that addresses the empty image refuses as
+    /// stale for the rest of the boot while every counter reads healthy. So
+    /// the backing answers, and it answers no as soon as one image exists.
+    #[test]
+    fn a_host_write_answers_for_a_whole_backing_only_until_an_image_is_declared() {
+        let (mut owner, backing) = owner();
+
+        // Nothing designated yet: no image can be missed.
+        assert_eq!(
+            owner.host_write_reaches_every_designated_view(backing),
+            Ok(true)
+        );
+
+        owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                "bytes",
+            )
+            .unwrap();
+        // The bytes are the only thing over the range, so the declaration
+        // leaves nothing behind.
+        assert_eq!(
+            owner.host_write_reaches_every_designated_view(backing),
+            Ok(true)
+        );
+
+        owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Image(ImageOwner::owning(ResourceId::new(11, 1))),
+                "image",
+            )
+            .unwrap();
+        // One image is enough: it keeps its own copy and the declaration did
+        // not reach it.
+        assert_eq!(
+            owner.host_write_reaches_every_designated_view(backing),
+            Ok(false)
+        );
     }
 
     #[test]
