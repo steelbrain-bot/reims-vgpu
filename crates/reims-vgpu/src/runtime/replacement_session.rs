@@ -9209,20 +9209,30 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 }
                 // Both refused before anything was claimed -- the chain never
                 // built, or the resource preparation cancelled its own prefix
-                // -- so the whole phase is prepared again from the exec and the
-                // manifest it arrived with.
-                ReplacementGuestUploadPhasePreparationFailure::Chain {
-                    prepared, manifest, ..
-                }
-                | ReplacementGuestUploadPhasePreparationFailure::Resources {
-                    prepared,
-                    manifest,
-                    ..
-                } => {
-                    let phase = self
-                        .prepare_guest_upload_phase(prepared, manifest)
-                        .map_err(ReplacementExecIngressDispatchFailure::GuestUploadPhase)?;
-                    self.drive_guest_upload_phase(phase)
+                // -- so the exec goes back through the entry it arrived by,
+                // and the manifest it arrived with is discarded rather than
+                // asked again.
+                //
+                // A manifest is a *reading* of the resource authority, taken
+                // once at preflight: which representation each backing's bytes
+                // stage through, which pipeline variant is ready, what content
+                // is owed. The authority keeps moving underneath it. A
+                // representation can enter retirement between the reading and
+                // the transition that consumes it -- its native object taken,
+                // its record not yet removed -- and from that moment the
+                // reading names something the authority will no longer route.
+                // Re-asking it re-asks a question whose answer was already
+                // false when it was written down, so the refusal is not a wait
+                // for anything and the retry never ends. A driven macos-13
+                // boot parked exactly there, refusing `InvalidGuestUploadRoute`
+                // against a designated destination whose route had gone.
+                //
+                // Discarding it costs a preflight, which is the pipeline and
+                // content lookups the first attempt made; a `ReadyPipelineLease`
+                // is a refcounted handle and drops to nothing.
+                ReplacementGuestUploadPhasePreparationFailure::Chain { prepared, .. }
+                | ReplacementGuestUploadPhasePreparationFailure::Resources { prepared, .. } => {
+                    self.dispatch_prepared_direct_ingress(prepared)
                 }
                 // The resources are prepared and held by the retained failure,
                 // so only the image claim is re-asked. Preparing them again
@@ -9233,15 +9243,14 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     manifest,
                     chain,
                 } => {
-                    // An ordering refusal gave the claims back, so the phase is
-                    // built again from the exec and the manifest it arrived
-                    // with -- the same route the two arms above take.
+                    // An ordering refusal gave the claims back, so the exec
+                    // goes back through its arrival entry -- the same route
+                    // the two arms above take, and for the same reason: the
+                    // manifest is a reading and this one is now old.
                     let Some(resources) = reason.resources else {
                         drop(chain);
-                        let phase = self
-                            .prepare_guest_upload_phase(prepared, manifest)
-                            .map_err(ReplacementExecIngressDispatchFailure::GuestUploadPhase)?;
-                        return self.drive_guest_upload_phase(phase);
+                        drop(manifest);
+                        return self.dispatch_prepared_direct_ingress(prepared);
                     };
                     let envelope = match self.prepare_exec_image_states(resources) {
                         Ok(envelope) => envelope,
@@ -33037,31 +33046,23 @@ mod tests {
         })
     }
 
-    /// An exec refused for *ordering* gives back every claim its resource
-    /// preparation took, so the head of its domain can still take them.
+    /// Declare and materialize two linear textures over the guest-upload
+    /// scaffold's one allocation, and hand back their resources, their image
+    /// representations, and the row regions their content is tracked at.
     ///
-    /// The image claim is the last one an exec takes and it is not the only
-    /// one. Resource preparation runs on arrival, and by the time the ordering
-    /// question is asked this transaction already holds write reservations,
-    /// representation uses and pending content transfers. Keeping those across
-    /// an ordering refusal starves the head silently, because the refusal is
-    /// lifted only *by* the head submitting: a pending transfer is granted
-    /// once per region, so the head's own repair is handed an empty plan
-    /// rather than a refusal, plans nothing, never becomes current and never
-    /// submits, while the later transaction goes on refusing behind it. Both
-    /// retry for the life of the device with every stall counter reading
-    /// healthy, which is the deadlock `BehindUnsubmittedPredecessor` was
-    /// written to end, one stage earlier.
-    ///
-    /// The claim this asserts on is the write reservation, because it is the
-    /// one an EXEC of this shape takes; the release is a single act over
-    /// writes, transfers and uses, so it is the same act that frees the
-    /// transfer a driven boot wedged on.
-    #[test]
-    fn an_order_refused_exec_gives_back_the_content_claims_its_head_needs() {
-        let Some(mut scaffold) = guest_upload_scaffold() else {
-            return;
-        };
+    /// Two and not one, because an EXEC copying between two distinct images
+    /// is the cheapest shape that reaches the image stage at all -- one with
+    /// no image use returns before the ordering question is asked -- and it
+    /// is the shape a driven boot wedges in.
+    fn two_textures_over_one_allocation(
+        scaffold: &mut GuestUploadScaffold,
+    ) -> (
+        ResourceId<reims_vgpu_protocol::ResourceObject>,
+        reims_vgpu_protocol::RepresentationId,
+        ResourceId<reims_vgpu_protocol::ResourceObject>,
+        reims_vgpu_protocol::RepresentationId,
+        Box<[reims_vgpu_core::BackingRegion]>,
+    ) {
         let declaration = reims_vgpu_protocol::TextureDeclaration {
             texture_type: reims_vgpu_protocol::TextureType::D2,
             framebuffer_only: false,
@@ -33080,9 +33081,6 @@ mod tests {
             protection_options: 0,
             swizzle: None,
         };
-        // Two textures over one allocation, so the EXEC below copies between
-        // two distinct images and reaches the image stage at all: an EXEC with
-        // no image use returns before the ordering question is asked.
         let texture = |scaffold: &mut GuestUploadScaffold, object: u32| {
             let resource = match scaffold
                 .runtime
@@ -33126,11 +33124,30 @@ mod tests {
                 .unwrap_or_else(|reason| panic!("the texture must materialize: {reason:?}"));
             (resource, representation)
         };
-        let (current_resource, current) = texture(&mut scaffold, 31);
-        let (stale_resource, stale) = texture(&mut scaffold, 32);
+        let (current_resource, current) = texture(scaffold, 31);
+        let (stale_resource, stale) = texture(scaffold, 32);
         assert_ne!(current, stale);
-        let backing = scaffold.backing;
-        let endpoint = |resource| reims_vgpu_core::ResolvedTextureEndpoint {
+        // The granularity a linear texture's content is tracked at. A `Whole`
+        // version does not answer a `Linear` question, so writing the backing
+        // as a whole would leave every view stale for exactly these regions.
+        let rows = (0..4)
+            .map(|row| {
+                reims_vgpu_core::BackingRegion::Linear(
+                    reims_vgpu_core::LinearRange::new(row * 16, 16).unwrap(),
+                )
+            })
+            .collect::<Box<[_]>>();
+        (current_resource, current, stale_resource, stale, rows)
+    }
+
+    /// One endpoint of a copy between the textures
+    /// [`two_textures_over_one_allocation`] declares.
+    fn linear_texture_endpoint(
+        backing: reims_vgpu_protocol::BackingId,
+    ) -> impl Fn(
+        ResourceId<reims_vgpu_protocol::ResourceObject>,
+    ) -> reims_vgpu_core::ResolvedTextureEndpoint {
+        move |resource| reims_vgpu_core::ResolvedTextureEndpoint {
             resource,
             image_owner: resource,
             storage: backing,
@@ -33151,49 +33168,94 @@ mod tests {
                     pixel_format: 70,
                 },
             ),
-        };
+        }
+    }
 
-        // One image holds the backing's content; the other holds none, so an
-        // exec naming the second owes an image-to-image transfer.
-        // The rows the blit reads, in the granularity a linear texture's
-        // content is tracked at: a `Whole` version does not answer a `Linear`
-        // question, so writing the backing as a whole would leave every view
-        // stale for exactly these regions.
-        let rows = (0..4)
-            .map(|row| {
-                reims_vgpu_core::BackingRegion::Linear(
-                    reims_vgpu_core::LinearRange::new(row * 16, 16).unwrap(),
-                )
-            })
-            .collect::<Box<[_]>>();
+    /// A whole-texture copy, and nothing else, in one blit segment.
+    fn texture_copy_exec(
+        submission: SubmissionId,
+        source: reims_vgpu_core::ResolvedTextureEndpoint,
+        destination: reims_vgpu_core::ResolvedTextureEndpoint,
+    ) -> CanonicalReplacementExecTransaction<()> {
+        CanonicalReplacementExecTransaction::<()> {
+            identity: reims_vgpu_protocol::SubmissionIdentity {
+                id: submission,
+                task: reims_vgpu_protocol::TaskId::new(1),
+            },
+            prologue: reims_vgpu_core::ExecPrologue::default(),
+            streams: Box::new([reims_vgpu_core::ResolvedExecStream {
+                stream_index: 0,
+                segments: Box::new([reims_vgpu_core::ResolvedExecSegment {
+                    boundary: reims_vgpu_protocol::SegmentBoundary {
+                        stream_index: 0,
+                        index: 0,
+                        kind: reims_vgpu_protocol::SegmentKind::Blit,
+                        continues_previous: false,
+                        continues_next: false,
+                    },
+                    operations: Box::new([reims_vgpu_core::ResolvedOperation::Blit(Box::new(
+                        reims_vgpu_core::ResolvedBlit::TextureToTexture(
+                            reims_vgpu_core::ResolvedTextureToTextureBlit {
+                                source,
+                                source_origin: reims_vgpu_core::TextureOrigin { x: 0, y: 0, z: 0 },
+                                destination,
+                                destination_origin: reims_vgpu_core::TextureOrigin {
+                                    x: 0,
+                                    y: 0,
+                                    z: 0,
+                                },
+                                extent: reims_vgpu_core::TextureExtent {
+                                    width: 4,
+                                    height: 4,
+                                    depth: 1,
+                                },
+                                aspect: reims_vgpu_core::pixel_format::BlitAspect::Full,
+                            },
+                        ),
+                    ))]),
+                }]),
+            }]),
+            accesses: Box::new([]),
+        }
+    }
+
+    /// Bring `source` current by a completed GPU write and then every other
+    /// designated view current from it, at one version per region.
+    ///
+    /// One version and not one per view: a designated view is stale unless it
+    /// holds the canonical version for the region, so writing each view
+    /// separately would leave all but the last of them stale.
+    fn make_every_view_current(
+        scaffold: &mut GuestUploadScaffold,
+        source: reims_vgpu_protocol::RepresentationId,
+        destinations: &[reims_vgpu_protocol::RepresentationId],
+        rows: &[reims_vgpu_core::BackingRegion],
+    ) {
         let write = SubmissionId::new(90);
         scaffold
             .runtime
             .execution
             .resources_mut()
-            .plan_gpu_write(scaffold.backing, write, current, rows.clone())
+            .plan_gpu_write(scaffold.backing, write, source, rows.to_vec())
             .unwrap();
         scaffold
             .runtime
             .execution
             .resources_mut()
-            .complete_gpu_write(scaffold.backing, write, current)
+            .complete_gpu_write(scaffold.backing, write, source)
             .unwrap();
-        // Every designated view current at that one version, so nothing this
-        // EXEC does is a repair: the claim it takes and must give back is its
-        // own, not one the content authority handed it.
         let snapshot = scaffold
             .runtime
             .execution
             .resources()
-            .snapshot_content(scaffold.backing, &rows)
+            .snapshot_content(scaffold.backing, rows)
             .unwrap();
-        for destination in [scaffold.execution, stale] {
+        for &destination in destinations {
             for key in scaffold
                 .runtime
                 .execution
                 .resources_mut()
-                .plan_transfers(scaffold.backing, current, destination, &snapshot)
+                .plan_transfers(scaffold.backing, source, destination, &snapshot)
                 .unwrap()
             {
                 scaffold
@@ -33204,6 +33266,122 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    /// A retried guest-upload phase re-reads the authority instead of
+    /// re-asking the reading it failed on.
+    ///
+    /// A manifest is taken once at preflight and the authority keeps moving
+    /// under it, so a retry that reuses one asks a question whose answer was
+    /// already false when it was written down -- and because nothing about
+    /// retrying can change that answer, the refusal is not a wait and the
+    /// retry never ends. Here the exec owes an image-to-image repair on its
+    /// first attempt and owes nothing on its second, which is a difference
+    /// only a fresh reading can see.
+    #[test]
+    fn a_retried_guest_upload_phase_takes_a_fresh_manifest() {
+        let Some(mut scaffold) = guest_upload_scaffold() else {
+            return;
+        };
+        let (current_resource, current, stale_resource, stale, rows) =
+            two_textures_over_one_allocation(&mut scaffold);
+        let endpoint = linear_texture_endpoint(scaffold.backing);
+
+        // Nothing is current yet, so the blit's source owes content and the
+        // phase's chain refuses: this EXEC carries no resource-state prologue
+        // to hang an upload on.
+        let channel = reims_vgpu_protocol::ChannelId::new(26);
+        let admitted = scaffold
+            .runtime
+            .execution
+            .runtime_mut()
+            .admit_exec_operations(
+                channel,
+                Box::<[reims_vgpu_core::ResolvedTransactionPrerequisite]>::default(),
+                Some(reims_vgpu_core::CompletionStamp::new(channel.get(), 2)),
+                texture_copy_exec(
+                    SubmissionId::new(73),
+                    endpoint(stale_resource),
+                    endpoint(current_resource),
+                ),
+            )
+            .unwrap();
+        let prepared = Box::new(
+            scaffold
+                .runtime
+                .prepare_admitted_exec(admitted)
+                .unwrap_or_else(|failure| panic!("{:?}", failure.reason)),
+        );
+        let failure = scaffold
+            .runtime
+            .dispatch_prepared_direct_ingress(prepared)
+            .err()
+            .unwrap_or_else(|| panic!("an EXEC owing an upload with no prologue must refuse"));
+        assert!(
+            matches!(
+                &failure,
+                ReplacementExecIngressDispatchFailure::GuestUploadPhase(failure)
+                    if matches!(
+                        failure.as_ref(),
+                        ReplacementGuestUploadPhasePreparationFailure::Chain { .. },
+                    )
+            ),
+            "the first attempt refuses for its missing prefix",
+        );
+
+        // The repair the manifest recorded as owed is now done. A retry that
+        // re-reads sees an EXEC that owes nothing and takes the direct path;
+        // one that re-asks the old reading refuses for the same prefix again,
+        // for the life of the device.
+        let bytes = scaffold.execution;
+        make_every_view_current(&mut scaffold, current, &[bytes, stale], &rows);
+        let retried = scaffold.runtime.retry_exec_ingress_dispatch(failure);
+        assert!(
+            !matches!(
+                &retried,
+                Err(ReplacementExecIngressDispatchFailure::GuestUploadPhase(failure))
+                    if matches!(
+                        failure.as_ref(),
+                        ReplacementGuestUploadPhasePreparationFailure::Chain { .. },
+                    )
+            ),
+            "the retry must re-read the manifest, not re-ask it",
+        );
+    }
+
+    /// An exec refused for *ordering* gives back every claim its resource
+    /// preparation took, so the head of its domain can still take them.
+    ///
+    /// The image claim is the last one an exec takes and it is not the only
+    /// one. Resource preparation runs on arrival, and by the time the ordering
+    /// question is asked this transaction already holds write reservations,
+    /// representation uses and pending content transfers. Keeping those across
+    /// an ordering refusal starves the head silently, because the refusal is
+    /// lifted only *by* the head submitting: a pending transfer is granted
+    /// once per region, so the head's own repair is handed an empty plan
+    /// rather than a refusal, plans nothing, never becomes current and never
+    /// submits, while the later transaction goes on refusing behind it. Both
+    /// retry for the life of the device with every stall counter reading
+    /// healthy, which is the deadlock `BehindUnsubmittedPredecessor` was
+    /// written to end, one stage earlier.
+    ///
+    /// The claim this asserts on is the write reservation, because it is the
+    /// one an EXEC of this shape takes; the release is a single act over
+    /// writes, transfers and uses, so it is the same act that frees the
+    /// transfer a driven boot wedged on.
+    #[test]
+    fn an_order_refused_exec_gives_back_the_content_claims_its_head_needs() {
+        let Some(mut scaffold) = guest_upload_scaffold() else {
+            return;
+        };
+        let (current_resource, current, stale_resource, stale, rows) =
+            two_textures_over_one_allocation(&mut scaffold);
+        let endpoint = linear_texture_endpoint(scaffold.backing);
+        // Every designated view current, so nothing this EXEC does is a
+        // repair: the claim it takes and must give back is its own, not one
+        // the content authority handed it.
+        let bytes = scaffold.execution;
+        make_every_view_current(&mut scaffold, current, &[bytes, stale], &rows);
 
         // Admitted behind the scaffold's own ingress EXEC on that EXEC's
         // channel, so it is not the head of its domain.
@@ -33216,50 +33394,11 @@ mod tests {
                 channel,
                 Box::<[reims_vgpu_core::ResolvedTransactionPrerequisite]>::default(),
                 Some(reims_vgpu_core::CompletionStamp::new(channel.get(), 2)),
-                CanonicalReplacementExecTransaction::<()> {
-                    identity: reims_vgpu_protocol::SubmissionIdentity {
-                        id: SubmissionId::new(72),
-                        task: reims_vgpu_protocol::TaskId::new(1),
-                    },
-                    prologue: reims_vgpu_core::ExecPrologue::default(),
-                    streams: Box::new([reims_vgpu_core::ResolvedExecStream {
-                        stream_index: 0,
-                        segments: Box::new([reims_vgpu_core::ResolvedExecSegment {
-                            boundary: reims_vgpu_protocol::SegmentBoundary {
-                                stream_index: 0,
-                                index: 0,
-                                kind: reims_vgpu_protocol::SegmentKind::Blit,
-                                continues_previous: false,
-                                continues_next: false,
-                            },
-                            operations: Box::new([reims_vgpu_core::ResolvedOperation::Blit(
-                                Box::new(reims_vgpu_core::ResolvedBlit::TextureToTexture(
-                                    reims_vgpu_core::ResolvedTextureToTextureBlit {
-                                        source: endpoint(stale_resource),
-                                        source_origin: reims_vgpu_core::TextureOrigin {
-                                            x: 0,
-                                            y: 0,
-                                            z: 0,
-                                        },
-                                        destination: endpoint(current_resource),
-                                        destination_origin: reims_vgpu_core::TextureOrigin {
-                                            x: 0,
-                                            y: 0,
-                                            z: 0,
-                                        },
-                                        extent: reims_vgpu_core::TextureExtent {
-                                            width: 4,
-                                            height: 4,
-                                            depth: 1,
-                                        },
-                                        aspect: reims_vgpu_core::pixel_format::BlitAspect::Full,
-                                    },
-                                )),
-                            )]),
-                        }]),
-                    }]),
-                    accesses: Box::new([]),
-                },
+                texture_copy_exec(
+                    SubmissionId::new(72),
+                    endpoint(stale_resource),
+                    endpoint(current_resource),
+                ),
             )
             .unwrap();
         let prepared = scaffold
