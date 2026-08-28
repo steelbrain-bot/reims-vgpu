@@ -324,7 +324,8 @@ impl ReplacementDeviceEpoch {
                 // its backing store, so the copy between them is the route and
                 // not a fallback.
                 direct_guest_backing: self.context.caps.host_pointer.rung.is_available()
-                    && topology == reims_vgpu_core::HostMemoryTopology::Unified,
+                    && topology == reims_vgpu_core::HostMemoryTopology::Unified
+                    && guest_alias_permitted(),
                 imported_transfer: self.context.caps.host_pointer.rung.is_available(),
                 host_visible_working,
                 device_local_working,
@@ -996,19 +997,7 @@ impl ReplacementDeviceEpoch {
                 crate::memory::MemoryClass::DeviceLocal
             }
         };
-        self.create_owned_buffer(
-            size,
-            vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
-                | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
-                | vk::BufferUsageFlags::UNIFORM_BUFFER
-                | vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::INDEX_BUFFER
-                | vk::BufferUsageFlags::VERTEX_BUFFER
-                | vk::BufferUsageFlags::INDIRECT_BUFFER,
-            memory,
-        )
+        self.create_owned_buffer(size, crate::host_pointer::EXECUTION_BUFFER_USAGE, memory)
     }
 
     pub fn create_host_staging_buffer(
@@ -1753,5 +1742,25 @@ mod tests {
             ),
             Err(crate::replacement_representation::ReplacementImageAllocationError::DeviceLifetimeClosed)
         ));
+    }
+}
+
+/// Whether the operator has narrowed a direct guest alias away.
+///
+/// Narrowing only: this cannot admit an alias on a host whose import or memory
+/// topology declines one. See [`reims_vgpu_config::GUEST_ALIAS`].
+fn guest_alias_permitted() -> bool {
+    use reims_vgpu_config::{read, Switch, GUEST_ALIAS};
+    match read(GUEST_ALIAS) {
+        (Switch::Off, _) => false,
+        (Switch::Unrecognized, value) => {
+            reims_vgpu_observe::fail(format!(
+                "vk_guest_alias_env_unrecognized var={GUEST_ALIAS} value={:?} (expected on|off; \
+                 the rail is left to the device)",
+                value.unwrap_or_default()
+            ));
+            true
+        }
+        (Switch::On | Switch::Unset, _) => true,
     }
 }

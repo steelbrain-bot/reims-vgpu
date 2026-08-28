@@ -55,20 +55,40 @@ use ash::vk;
 /// * `TRANSFER_DST` — guest pages as the destination of a render or compute
 ///   result, which is the writeback the deferred-flush rail otherwise stages
 ///   through the CPU.
-/// * `VERTEX_BUFFER` / `INDEX_BUFFER` / `STORAGE_BUFFER` / `UNIFORM_BUFFER` —
-///   guest pages bound directly to a draw, with no copy at all.
+/// * `VERTEX_BUFFER` / `INDEX_BUFFER` / `STORAGE_BUFFER` / `UNIFORM_BUFFER` /
+///   `UNIFORM_TEXEL_BUFFER` / `STORAGE_TEXEL_BUFFER` / `INDIRECT_BUFFER` —
+///   guest pages bound directly to a draw or dispatch, with no copy at all.
+///
+/// It is [`EXECUTION_BUFFER_USAGE`] and not a set of its own, because on a
+/// unified host with the import an imported buffer *is* an execution buffer:
+/// a `Shared` allocation takes
+/// [`reims_vgpu_core::RepresentationRoute::DirectGuestAlias`] and the guest's
+/// own pages carry every bind the guest asks for. Two spellings of that set
+/// would drift in exactly one direction -- the import's, because it started
+/// life as a transfer endpoint -- and the drift would land at `vkCmdDraw`
+/// on a guest frame.
 ///
 /// **This query is for the allocation's universal buffer view.** An optimally
 /// tiled image backed by linear guest bytes is not a representation Vulkan
 /// offers. Image use reaches the bytes through this buffer and an explicit
 /// copy.
-pub const GUEST_IMPORT_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+pub const GUEST_IMPORT_USAGE: vk::BufferUsageFlags = EXECUTION_BUFFER_USAGE;
+
+/// Every direction a buffer this device owns can be used in.
+///
+/// One set for every buffer rather than a set per call site: which binds a
+/// buffer will serve is the guest's decision and is not known when the buffer
+/// is created, so narrowing it per site is a guess that fails at bind time.
+pub const EXECUTION_BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
     vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
         | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
         | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
-        | vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw(),
+        | vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw()
+        | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER.as_raw()
+        | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER.as_raw()
+        | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
 );
 
 /// Whether guest RAM can reach this device as a host-pointer import, and when
@@ -614,6 +634,9 @@ mod tests {
             vk::BufferUsageFlags::INDEX_BUFFER,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER,
+            vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER,
+            vk::BufferUsageFlags::INDIRECT_BUFFER,
         ] {
             assert!(GUEST_IMPORT_USAGE.contains(direct));
         }

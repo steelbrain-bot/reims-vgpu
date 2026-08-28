@@ -113,6 +113,20 @@
 /// comparable across compositing regimes and only one pair matched.
 pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 
+/// `off` keeps a `Shared` allocation on the imported-transfer route -- a
+/// separate working buffer with the guest's pages as its transfer endpoint --
+/// even on a unified host where the guest's pages could be the execution
+/// object outright.
+///
+/// This is a narrowing-only A/B control: it cannot make an alias out of a host
+/// that has no import or no unified memory, both of which are measured from the
+/// device. It exists because the two arms differ in *what the guest can see* --
+/// on the alias a GPU write is immediately the guest's bytes, on the transfer
+/// route it is not until something plans a copy -- so a defect that only
+/// appears when the GPU writes guest RAM directly has a single-branch arm to be
+/// bisected against.
+pub const GUEST_ALIAS: &str = "REIMS_VGPU_GUEST_ALIAS";
+
 /// `off` keeps descriptor state on the allocated Vulkan 1.2 set path even when
 /// the device advertises `VK_KHR_push_descriptor` and the layout fits its
 /// reported limit.
@@ -237,8 +251,9 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 5] = [
+pub const ALL: [&str; 6] = [
     GUEST_IMPORT,
+    GUEST_ALIAS,
     PUSH_DESCRIPTORS,
     DRAW_LOG,
     BUFFER_EXTENT,
