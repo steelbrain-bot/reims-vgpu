@@ -3578,10 +3578,15 @@ fn report_guest_upload_refresh(
             backing,
             view,
             representation,
+            required,
+            holds,
         } => (
             "view_content_stale",
             backing,
-            format!("view={view:?} representation={}", representation.get()),
+            format!(
+                "view={view:?} representation={} required={required:?} holds={holds:?}",
+                representation.get()
+            ),
         ),
     };
     let key = (transaction.get() << 32) | backing.get();
@@ -3603,7 +3608,7 @@ fn report_guest_upload_refresh(
 /// the same reading on the census: one live upload. Naming it is what makes
 /// the difference reportable on the failure channel, where an unconverging
 /// repair belongs, because it costs the guest the whole channel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementUploadManifestStaleness {
     /// A representation this manifest recorded is no longer designated for its
     /// backing: physical replacement retired the object it would have read.
@@ -3623,10 +3628,18 @@ pub(crate) enum ReplacementUploadManifestStaleness {
     /// One view over these bytes does not hold the content the manifest
     /// requires. Every image declared over a backing keeps its own copy, so
     /// the answer is per view and this names which one.
+    ///
+    /// It also carries both sides of the comparison. "Stale" alone is the
+    /// right shape for a decision and the wrong one for a diagnostic: a repair
+    /// that keeps being planned is only legible next to what it was supposed
+    /// to produce and what the view holds instead, and a boot has already been
+    /// spent on one of these reporting nothing but the name.
     Content {
         backing: reims_vgpu_protocol::BackingId,
         view: reims_vgpu_core::BackingView,
         representation: reims_vgpu_protocol::RepresentationId,
+        required: Box<[reims_vgpu_core::RegionVersion]>,
+        holds: Box<[reims_vgpu_core::RegionVersion]>,
     },
 }
 
@@ -3706,6 +3719,12 @@ impl ReplacementExecResourceManifest {
                     backing,
                     view,
                     representation,
+                    required: snapshot,
+                    holds: resources
+                        .execution_representation_coverage(backing, view)
+                        .map(|(_, coverage)| coverage)
+                        .unwrap_or_default()
+                        .into(),
                 }
             })
         })
