@@ -213,6 +213,24 @@ pub enum ImageEndpointDisagreement {
     },
 }
 
+/// What a round trip through an allocation's bytes was missing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AliasRoundTripTerm {
+    /// The region names texels. Those are one endpoint's coordinates and the
+    /// disagreement is precisely that they do not carry over to the other's;
+    /// only a byte-denominated region names the same thing to both.
+    RegionNamesTexels,
+    /// The source declares no layout of its own, so where its texels sit in
+    /// the allocation's bytes is not established.
+    SourceLayout,
+    /// The destination declares no layout of its own.
+    DestinationLayout,
+    /// The destination image has no byte buffer to round trip through, so the
+    /// two were not recorded as aliases of one allocation when they were
+    /// declared.
+    TransferBytes,
+}
+
 /// The one place that decides whether two image endpoints agree, and says
 /// which term did not.
 ///
@@ -300,6 +318,14 @@ pub enum ImageToImageRefusal {
     /// A byte range names no image geometry of its own. That is the
     /// buffer/image pair's shape, and it is recorded there.
     LinearRegion,
+    /// The endpoints disagree on a term the allocation's bytes could have
+    /// bridged, and a part of that round trip is not established.
+    /// `disagreement` names why a direct copy was unavailable and `missing`
+    /// names what the round trip lacked, because the two are separate repairs.
+    AliasBytesUnavailable {
+        disagreement: ImageEndpointDisagreement,
+        missing: AliasRoundTripTerm,
+    },
     /// The source declares no aspect `vkCmdCopyImage` can name, so the region
     /// walk produced no command. An empty batch is not a completed transfer:
     /// the destination would stay stale with nothing saying so.
@@ -1034,6 +1060,7 @@ fn resolve_transfer(
             destination,
             destination_key,
             state()?,
+            resolver,
         ),
         _ => Err(ResourceStateTransferRecordError::ImageEndpointMissing(
             transfer,
@@ -1055,6 +1082,10 @@ fn resolve_transfer(
 /// pair that disagrees is not a copy this device can express and is refused by
 /// name: `vkCmdCopyImage` between mismatched formats or extents is not a
 /// narrower copy, it is undefined.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each endpoint contributes an image, a state key and a resolver query"
+)]
 fn resolve_image_image_transfer(
     transfer: TransferKey,
     source: crate::replacement_image_transition::NativeImageTarget,
@@ -1062,12 +1093,34 @@ fn resolve_image_image_transfer(
     destination: crate::replacement_image_transition::NativeImageTarget,
     destination_key: ReplacementImageKey,
     state: &PreparedImageState,
+    resolver: &impl ReplacementBufferResolver,
 ) -> Result<NativeResourceStateTransfer, ResourceStateTransferRecordError> {
     if let Some(disagreement) = image_endpoints_disagree(&source, &destination) {
-        return Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
-            transfer,
-            refusal: ImageToImageRefusal::EndpointsDisagree(disagreement),
-        });
+        // Only a disagreement about how bytes are read can be bridged by the
+        // bytes. A sample count is not a property the allocation carries at
+        // all -- a multisampled image has no linear layout to walk -- and a
+        // subresource-range disagreement is a mismatch in what each endpoint
+        // claims to hold rather than in how it reads what it holds.
+        return match disagreement {
+            ImageEndpointDisagreement::PixelFormat { .. }
+            | ImageEndpointDisagreement::Extent { .. } => resolve_alias_bytes_round_trip(
+                transfer,
+                source,
+                source_key,
+                destination,
+                destination_key,
+                state,
+                resolver,
+                disagreement,
+            ),
+            ImageEndpointDisagreement::Samples { .. }
+            | ImageEndpointDisagreement::SubresourceRange { .. } => {
+                Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
+                    transfer,
+                    refusal: ImageToImageRefusal::EndpointsDisagree(disagreement),
+                })
+            }
+        };
     }
     if !source.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
         || !destination
@@ -1197,6 +1250,99 @@ fn resolve_image_image_transfer(
     ))
 }
 
+/// Make one image current from another over the same allocation when the two
+/// interpret its bytes differently.
+///
+/// Two textures declared over one allocation at different pixel formats share
+/// bytes and not texels: their texel blocks are different widths, so the same
+/// byte range is a different subresource box in each. `vkCmdCopyImage` between
+/// them is undefined and no image view can reinterpret one as the other, which
+/// leaves exactly one thing they hold in common. The copy is therefore a round
+/// trip: the source's texels out to the allocation's bytes in the source's own
+/// layout, then those bytes back in to the destination's texels in the
+/// destination's. The two halves are ordered by an explicit command, because a
+/// command list is recorded in order and nothing else in it separates a write
+/// from the read that follows.
+///
+/// The bytes go to a buffer the destination image owns for this purpose and
+/// nothing else reads. They may not go to the guest's own memory or to the
+/// shared transfer endpoint: both are representations the content authority
+/// accounts for, and writing either would publish content at a version the
+/// authority does not believe those bytes carry.
+///
+/// `disagreement` is the term the endpoints differed on. It is carried through
+/// so that a refusal here still names why a direct copy was not available,
+/// rather than reporting only the missing part of the round trip.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each endpoint contributes an image, a state key, a layout and a resolver query"
+)]
+fn resolve_alias_bytes_round_trip(
+    transfer: TransferKey,
+    source: crate::replacement_image_transition::NativeImageTarget,
+    source_key: ReplacementImageKey,
+    destination: crate::replacement_image_transition::NativeImageTarget,
+    destination_key: ReplacementImageKey,
+    state: &PreparedImageState,
+    resolver: &impl ReplacementBufferResolver,
+    disagreement: ImageEndpointDisagreement,
+) -> Result<NativeResourceStateTransfer, ResourceStateTransferRecordError> {
+    let refuse = |missing| ResourceStateTransferRecordError::ImageToImageUnsupported {
+        transfer,
+        refusal: ImageToImageRefusal::AliasBytesUnavailable {
+            disagreement,
+            missing,
+        },
+    };
+    if matches!(transfer.region, BackingRegion::Image(_)) {
+        return Err(refuse(AliasRoundTripTerm::RegionNamesTexels));
+    }
+    let source_layout = resolver
+        .resolve_linear_texture_layout(transfer.backing, transfer.source)
+        .ok_or_else(|| refuse(AliasRoundTripTerm::SourceLayout))?;
+    let destination_layout = resolver
+        .resolve_linear_texture_layout(transfer.backing, transfer.destination)
+        .ok_or_else(|| refuse(AliasRoundTripTerm::DestinationLayout))?;
+    let bytes = resolver
+        .resolve_alias_transfer_bytes(transfer.backing, transfer.destination)
+        .ok_or_else(|| refuse(AliasRoundTripTerm::TransferBytes))?;
+    let out = transfer_image_regions(&source_layout, transfer)?;
+    let back = transfer_image_regions(&destination_layout, transfer)?;
+    let mut commands = Vec::with_capacity(out.len() + back.len() + 1);
+    for region in out {
+        commands.push(resolve_buffer_image_transfer_region(
+            transfer,
+            bytes,
+            source,
+            source_key,
+            false,
+            state,
+            &source_layout,
+            region,
+        )?);
+    }
+    commands.push(NativeImageBlitCommand::TransferBytesReady {
+        buffer: bytes.buffer,
+        offset: bytes.base_offset,
+        size: bytes.accessible_size,
+    });
+    for region in back {
+        commands.push(resolve_buffer_image_transfer_region(
+            transfer,
+            bytes,
+            destination,
+            destination_key,
+            true,
+            state,
+            &destination_layout,
+            region,
+        )?);
+    }
+    Ok(NativeResourceStateTransfer::Image(
+        commands.into_boxed_slice(),
+    ))
+}
+
 /// The layout a prepared transition puts one endpoint in, once it has proved
 /// the transition grants the usage this transfer needs.
 fn transfer_transition_layout(
@@ -1233,13 +1379,22 @@ fn resolve_buffer_image_transfer(
     state: &PreparedImageState,
     resolver: &impl ReplacementBufferResolver,
 ) -> Result<NativeResourceStateTransfer, ResourceStateTransferRecordError> {
-    let layout_representation = if buffer_to_image {
-        transfer.source
+    // The layout describes how *this image's* texels sit in the backing's
+    // bytes, so it must come from the image endpoint. Two textures declared
+    // over one allocation differ in pixel format and therefore in width, row
+    // stride and texel count, and the transfer endpoint carries whichever of
+    // them was declared first -- reading the layout from there addresses the
+    // second texture in the first one's coordinates. The endpoint's own
+    // descriptor remains the answer when the image carries none, which is
+    // every backing with exactly one texture over it.
+    let (image_representation, buffer_representation) = if buffer_to_image {
+        (transfer.destination, transfer.source)
     } else {
-        transfer.destination
+        (transfer.source, transfer.destination)
     };
     let layout = resolver
-        .resolve_linear_texture_layout(transfer.backing, layout_representation)
+        .resolve_linear_texture_layout(transfer.backing, image_representation)
+        .or_else(|| resolver.resolve_linear_texture_layout(transfer.backing, buffer_representation))
         .ok_or(ResourceStateTransferRecordError::ImageLayoutMissing(
             transfer,
         ))?;
@@ -2450,6 +2605,419 @@ mod tests {
         assert_eq!(stores[1].bytes, [17, 18]);
     }
 
+    /// Two textures over one allocation that read its bytes differently are
+    /// copied through those bytes, in each one's own layout.
+    ///
+    /// This is the shape a guest produces by declaring two textures over one
+    /// buffer at different pixel formats: 32 KiB is 64x64 at eight bytes a
+    /// texel and 128x64 at four, one set of bytes and two texel counts.
+    /// `vkCmdCopyImage` between them is undefined and no view reinterprets
+    /// one as the other, so the recorded program has to leave the texel
+    /// domain -- out to the bytes in the source's layout, an ordering
+    /// command, then back in to the destination's texels in its own.
+    #[test]
+    fn two_textures_reading_one_allocation_differently_copy_through_its_bytes() {
+        use crate::replacement_image_state::{
+            ReplacementImageSharing, ReplacementImageState, ReplacementImageStateOwner,
+            ReplacementImageUse,
+        };
+
+        let backing = BackingId::new(1);
+        let source_key = ReplacementImageKey {
+            backing,
+            representation: RepresentationId::new(2),
+        };
+        let destination_key = ReplacementImageKey {
+            backing,
+            representation: RepresentationId::new(3),
+        };
+        let mut owner = ReplacementImageStateOwner::new(VulkanDeviceEpochId::new(1));
+        for key in [source_key, destination_key] {
+            owner
+                .register(
+                    key,
+                    ReplacementImageState {
+                        layout: vk::ImageLayout::UNDEFINED,
+                        sharing: ReplacementImageSharing::Concurrent,
+                        last_use: None,
+                    },
+                )
+                .unwrap();
+        }
+        let state = owner
+            .prepare(
+                TransactionId::new(1),
+                0,
+                [
+                    ReplacementImageUse {
+                        image: source_key,
+                        required_usage: vk::ImageUsageFlags::TRANSFER_SRC,
+                        use_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        final_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    },
+                    ReplacementImageUse {
+                        image: destination_key,
+                        required_usage: vk::ImageUsageFlags::TRANSFER_DST,
+                        use_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        final_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let layout = |bytes_per_element: u8, width: u32, pixel_format: u16| {
+            std::sync::Arc::new(reims_vgpu_protocol::LinearTextureDescriptor {
+                declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+                    texture_type: reims_vgpu_protocol::TextureType::D2,
+                    framebuffer_only: false,
+                    is_drawable: false,
+                    write_swizzle_enabled: None,
+                    allow_gpu_optimized_contents: false,
+                    usage: 0,
+                    pixel_format,
+                    width,
+                    height: 64,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    resource_options: 0,
+                    protection_options: 0,
+                    swizzle: None,
+                }),
+                allocation_size: 32768,
+                mipmap_level_count: 1,
+                bytes_per_slice: 32768,
+                slice_count: 1,
+                bytes_per_element,
+                row_stride: width * u32::from(bytes_per_element),
+                width,
+                height: 64,
+                depth: 1,
+                levels: vec![reims_vgpu_protocol::TextureLevelLayout {
+                    size: 32768,
+                    row_stride: u64::from(width) * u64::from(bytes_per_element),
+                    width,
+                    height: 64,
+                    depth: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+        let image = |handle: u64, pixel_format: u16, width: u32| {
+            crate::replacement_image_transition::NativeImageTarget {
+                image: vk::Image::from_raw(handle),
+                view: vk::ImageView::null(),
+                image_type: vk::ImageType::TYPE_2D,
+                full_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+                pixel_format,
+                extent: vk::Extent3D {
+                    width,
+                    height: 64,
+                    depth: 1,
+                },
+                samples: vk::SampleCountFlags::TYPE_1,
+            }
+        };
+
+        struct Alias {
+            source: std::sync::Arc<reims_vgpu_protocol::LinearTextureDescriptor>,
+            destination: std::sync::Arc<reims_vgpu_protocol::LinearTextureDescriptor>,
+            bytes: Option<NativeBufferTarget>,
+        }
+        impl ReplacementBufferResolver for Alias {
+            fn resolve_buffer(
+                &self,
+                _backing: BackingId,
+                _representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                None
+            }
+
+            fn resolve_linear_texture_layout(
+                &self,
+                _backing: BackingId,
+                representation: RepresentationId,
+            ) -> Option<std::sync::Arc<reims_vgpu_protocol::LinearTextureDescriptor>> {
+                Some(if representation == RepresentationId::new(2) {
+                    std::sync::Arc::clone(&self.source)
+                } else {
+                    std::sync::Arc::clone(&self.destination)
+                })
+            }
+
+            fn resolve_alias_transfer_bytes(
+                &self,
+                _backing: BackingId,
+                _representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                self.bytes
+            }
+        }
+
+        let transfer = TransferKey {
+            backing,
+            region: BackingRegion::Linear(LinearRange::new(0, 32768).unwrap()),
+            version: reims_vgpu_protocol::ContentVersion::new(19),
+            source: RepresentationId::new(2),
+            destination: RepresentationId::new(3),
+        };
+        let bytes = NativeBufferTarget {
+            buffer: vk::Buffer::from_raw(77),
+            base_offset: 0,
+            accessible_size: 32768,
+            size: 32768,
+            usage: vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+        };
+        let resolver = Alias {
+            source: layout(8, 64, 115),
+            destination: layout(4, 128, 80),
+            bytes: Some(bytes),
+        };
+        let recorded = resolve_image_image_transfer(
+            transfer,
+            image(1, 115, 64),
+            source_key,
+            image(2, 80, 128),
+            destination_key,
+            &state,
+            &resolver,
+        )
+        .expect("two readings of one allocation are copied through its bytes");
+        let NativeResourceStateTransfer::Image(commands) = recorded else {
+            panic!("a round trip through the bytes records image commands");
+        };
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(
+            commands[0],
+            NativeImageBlitCommand::ImageToBuffer(copy)
+                if copy.image == vk::Image::from_raw(1)
+                    && copy.buffer == vk::Buffer::from_raw(77)
+                    && copy.image_layout == vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                    // 64 texels a row in the source's own eight-byte texels.
+                    && copy.buffer_row_length == 64
+                    && copy.extent == [64, 64, 1]
+        ));
+        assert!(matches!(
+            commands[1],
+            NativeImageBlitCommand::TransferBytesReady {
+                buffer,
+                offset: 0,
+                size: 32768,
+            } if buffer == vk::Buffer::from_raw(77)
+        ));
+        assert!(matches!(
+            commands[2],
+            NativeImageBlitCommand::BufferToImage(copy)
+                if copy.image == vk::Image::from_raw(2)
+                    && copy.buffer == vk::Buffer::from_raw(77)
+                    && copy.image_layout == vk::ImageLayout::TRANSFER_DST_OPTIMAL
+                    // The same bytes, read as 128 four-byte texels a row.
+                    && copy.buffer_row_length == 128
+                    && copy.extent == [128, 64, 1]
+        ));
+
+        // Without the bytes to round trip through, the refusal names both the
+        // term that ruled out a direct copy and the part that was missing.
+        let resolver = Alias {
+            source: layout(8, 64, 115),
+            destination: layout(4, 128, 80),
+            bytes: None,
+        };
+        assert!(matches!(
+            resolve_image_image_transfer(
+                transfer,
+                image(1, 115, 64),
+                source_key,
+                image(2, 80, 128),
+                destination_key,
+                &state,
+                &resolver,
+            ),
+            Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
+                refusal: ImageToImageRefusal::AliasBytesUnavailable {
+                    disagreement: ImageEndpointDisagreement::PixelFormat {
+                        source: 115,
+                        destination: 80,
+                    },
+                    missing: AliasRoundTripTerm::TransferBytes,
+                },
+                ..
+            })
+        ));
+    }
+
+    /// A buffer/image copy is addressed in the image's own layout.
+    ///
+    /// The shared transfer endpoint carries a layout too, and it is whichever
+    /// texture was declared over the allocation first. Reading it instead
+    /// addresses every later texture over that allocation in the first one's
+    /// coordinates -- right row stride, wrong texel width -- which lands the
+    /// bytes in the wrong place and reports nothing.
+    #[test]
+    fn a_buffer_image_copy_reads_the_image_endpoints_own_layout() {
+        use crate::replacement_image_state::{
+            ReplacementImageSharing, ReplacementImageState, ReplacementImageStateOwner,
+            ReplacementImageUse,
+        };
+
+        let backing = BackingId::new(1);
+        let image_key = ReplacementImageKey {
+            backing,
+            representation: RepresentationId::new(3),
+        };
+        let mut owner = ReplacementImageStateOwner::new(VulkanDeviceEpochId::new(1));
+        owner
+            .register(
+                image_key,
+                ReplacementImageState {
+                    layout: vk::ImageLayout::UNDEFINED,
+                    sharing: ReplacementImageSharing::Concurrent,
+                    last_use: None,
+                },
+            )
+            .unwrap();
+        let state = owner
+            .prepare(
+                TransactionId::new(1),
+                0,
+                [ReplacementImageUse {
+                    image: image_key,
+                    required_usage: vk::ImageUsageFlags::TRANSFER_DST,
+                    use_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    final_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                }],
+            )
+            .unwrap();
+
+        // The endpoint's layout reads the allocation as eight-byte texels and
+        // the image's own reads it as four, over the same 32 KiB and the same
+        // 512-byte rows.
+        struct Layouts;
+        impl ReplacementBufferResolver for Layouts {
+            fn resolve_buffer(
+                &self,
+                _backing: BackingId,
+                _representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                None
+            }
+
+            fn resolve_linear_texture_layout(
+                &self,
+                _backing: BackingId,
+                representation: RepresentationId,
+            ) -> Option<std::sync::Arc<reims_vgpu_protocol::LinearTextureDescriptor>> {
+                let (bytes_per_element, width, pixel_format) =
+                    if representation == RepresentationId::new(3) {
+                        (4u8, 128u32, 80u16)
+                    } else {
+                        (8, 64, 115)
+                    };
+                Some(std::sync::Arc::new(
+                    reims_vgpu_protocol::LinearTextureDescriptor {
+                        declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+                            texture_type: reims_vgpu_protocol::TextureType::D2,
+                            framebuffer_only: false,
+                            is_drawable: false,
+                            write_swizzle_enabled: None,
+                            allow_gpu_optimized_contents: false,
+                            usage: 0,
+                            pixel_format,
+                            width,
+                            height: 64,
+                            depth: 1,
+                            mipmap_level_count: 1,
+                            sample_count: 1,
+                            array_length: 1,
+                            resource_options: 0,
+                            protection_options: 0,
+                            swizzle: None,
+                        }),
+                        allocation_size: 32768,
+                        mipmap_level_count: 1,
+                        bytes_per_slice: 32768,
+                        slice_count: 1,
+                        bytes_per_element,
+                        row_stride: 512,
+                        width,
+                        height: 64,
+                        depth: 1,
+                        levels: vec![reims_vgpu_protocol::TextureLevelLayout {
+                            size: 32768,
+                            row_stride: 512,
+                            width,
+                            height: 64,
+                            depth: 1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ))
+            }
+        }
+
+        let recorded = resolve_buffer_image_transfer(
+            TransferKey {
+                backing,
+                region: BackingRegion::Linear(LinearRange::new(0, 32768).unwrap()),
+                version: reims_vgpu_protocol::ContentVersion::new(19),
+                source: RepresentationId::new(2),
+                destination: RepresentationId::new(3),
+            },
+            NativeBufferTarget {
+                buffer: vk::Buffer::from_raw(77),
+                base_offset: 0,
+                accessible_size: 32768,
+                size: 32768,
+                usage: vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            },
+            crate::replacement_image_transition::NativeImageTarget {
+                image: vk::Image::from_raw(2),
+                view: vk::ImageView::null(),
+                image_type: vk::ImageType::TYPE_2D,
+                full_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+                pixel_format: 80,
+                extent: vk::Extent3D {
+                    width: 128,
+                    height: 64,
+                    depth: 1,
+                },
+                samples: vk::SampleCountFlags::TYPE_1,
+            },
+            image_key,
+            true,
+            &state,
+            &Layouts,
+        )
+        .expect("a whole-allocation upload into a declared texture is recordable");
+        let NativeResourceStateTransfer::Image(commands) = recorded else {
+            panic!("a buffer/image copy records image commands");
+        };
+        assert!(matches!(
+            commands.as_ref(),
+            [NativeImageBlitCommand::BufferToImage(copy)]
+                // 512 bytes a row is 128 texels in the image's own four-byte
+                // texels and 64 in the endpoint's eight-byte ones.
+                if copy.buffer_row_length == 128 && copy.extent == [128, 64, 1]
+        ));
+    }
+
     /// Each condition that refuses an image-to-image copy names itself.
     ///
     /// The four reach one refusal family and call for different repairs -- a
@@ -2536,6 +3104,16 @@ mod tests {
             source: RepresentationId::new(2),
             destination: RepresentationId::new(3),
         };
+        struct NoAliasBytes;
+        impl ReplacementBufferResolver for NoAliasBytes {
+            fn resolve_buffer(
+                &self,
+                _backing: BackingId,
+                _representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                None
+            }
+        }
         let refusal =
             |transfer: TransferKey, source, destination| match resolve_image_image_transfer(
                 transfer,
@@ -2544,6 +3122,7 @@ mod tests {
                 destination,
                 destination_key,
                 &state,
+                &NoAliasBytes,
             ) {
                 Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
                     refusal, ..
@@ -2560,10 +3139,13 @@ mod tests {
                 target(1, 7, color),
                 target(2, 9, color),
             ),
-            ImageToImageRefusal::EndpointsDisagree(ImageEndpointDisagreement::PixelFormat {
-                source: 7,
-                destination: 9,
-            })
+            ImageToImageRefusal::AliasBytesUnavailable {
+                disagreement: ImageEndpointDisagreement::PixelFormat {
+                    source: 7,
+                    destination: 9,
+                },
+                missing: AliasRoundTripTerm::SourceLayout,
+            }
         );
 
         assert_eq!(

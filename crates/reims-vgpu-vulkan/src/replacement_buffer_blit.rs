@@ -48,6 +48,17 @@ pub trait ReplacementBufferResolver {
         None
     }
 
+    /// The byte buffer an image over this backing uses when a sibling image
+    /// cannot be copied to directly. See
+    /// `replacement_representation::ReplacementImageRepresentation::alias_transfer`.
+    fn resolve_alias_transfer_bytes(
+        &self,
+        _backing: BackingId,
+        _representation: RepresentationId,
+    ) -> Option<NativeBufferTarget> {
+        None
+    }
+
     fn compute_fill_limits(&self) -> Option<NativeComputeFillLimits> {
         None
     }

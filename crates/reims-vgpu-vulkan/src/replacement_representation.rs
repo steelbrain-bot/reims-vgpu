@@ -923,6 +923,33 @@ pub struct ReplacementImageRepresentation {
     flags: vk::ImageCreateFlags,
     attachment_views: BTreeMap<ReplacementImageViewKey, vk::ImageView>,
     shader_views: BTreeMap<ResourceId<ResourceObject>, ReplacementShaderView>,
+    /// How this image's texels sit in the backing's bytes.
+    ///
+    /// The layout belongs to the image and not to the allocation. Two textures
+    /// declared over one allocation are two interpretations of one byte range
+    /// -- differing in pixel format, and therefore in width, row stride and
+    /// texel count -- so a byte range means a different subresource box in
+    /// each. A transfer that addresses this image must use this descriptor,
+    /// never a sibling's and never the transfer endpoint's, which carries
+    /// whichever texture was declared over the allocation first.
+    linear_texture: Option<Arc<reims_vgpu_protocol::LinearTextureDescriptor>>,
+    /// Where this image's bytes go when a sibling image over the same
+    /// allocation cannot be copied to directly.
+    ///
+    /// Two textures over one allocation that disagree on pixel format share
+    /// bytes and not texels, so `vkCmdCopyImage` between them is undefined and
+    /// no image view can reinterpret one as the other -- their texel blocks
+    /// are different widths. The bytes are the only thing they hold in common,
+    /// so the copy is a round trip through them, and it needs somewhere to put
+    /// them that is not the guest's own memory and not the shared transfer
+    /// endpoint: writing either would publish content the authority has not
+    /// been told about, at a version it does not believe those bytes carry.
+    ///
+    /// This buffer exists only on an image whose allocation already carries a
+    /// texture it disagrees with, is written and read within one recording,
+    /// and is destroyed with the image. It is not a cache and holds nothing
+    /// between transfers.
+    alias_transfer: Option<Box<ReplacementNativeRepresentation>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1097,6 +1124,7 @@ impl ReplacementNativeRepresentationLease {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplacementTextureEndpointError {
     NotBuffer,
+    NotImage,
     AllocationSizeMismatch { expected: u64, actual: u64 },
 }
 
@@ -1189,17 +1217,48 @@ impl ReplacementNativeRepresentation {
         &mut self,
         descriptor: Arc<reims_vgpu_protocol::LinearTextureDescriptor>,
     ) -> Result<(), ReplacementTextureEndpointError> {
-        let Self::Buffer(buffer) = self else {
-            return Err(ReplacementTextureEndpointError::NotBuffer);
-        };
-        if descriptor.allocation_size != buffer.target.size {
-            return Err(ReplacementTextureEndpointError::AllocationSizeMismatch {
-                expected: buffer.target.size,
-                actual: descriptor.allocation_size,
-            });
+        match self {
+            Self::Buffer(buffer) => {
+                if descriptor.allocation_size != buffer.target.size {
+                    return Err(ReplacementTextureEndpointError::AllocationSizeMismatch {
+                        expected: buffer.target.size,
+                        actual: descriptor.allocation_size,
+                    });
+                }
+                buffer.linear_texture = Some(descriptor);
+            }
+            // An image has no byte size of its own to check the declaration
+            // against: its native memory is opaquely tiled and unrelated to
+            // the allocation the layout describes. The relation that matters
+            // is the one the caller established -- this descriptor is the
+            // texture whose image this is -- and it is checked where the two
+            // are constructed together.
+            Self::Image(image) => image.linear_texture = Some(descriptor),
         }
-        buffer.linear_texture = Some(descriptor);
         Ok(())
+    }
+
+    /// Give this image the byte buffer a round trip through the allocation
+    /// needs. See `ReplacementImageRepresentation::alias_transfer`.
+    pub fn attach_alias_transfer(
+        &mut self,
+        bytes: Self,
+    ) -> Result<(), ReplacementTextureEndpointError> {
+        let Self::Image(image) = self else {
+            return Err(ReplacementTextureEndpointError::NotImage);
+        };
+        if bytes.buffer().is_none() {
+            return Err(ReplacementTextureEndpointError::NotBuffer);
+        }
+        image.alias_transfer = Some(Box::new(bytes));
+        Ok(())
+    }
+
+    pub fn alias_transfer_bytes(&self) -> Option<NativeBufferTarget> {
+        match self {
+            Self::Image(image) => image.alias_transfer.as_ref()?.buffer(),
+            Self::Buffer(_) => None,
+        }
     }
 
     pub fn linear_texture_layout(
@@ -1207,7 +1266,7 @@ impl ReplacementNativeRepresentation {
     ) -> Option<&Arc<reims_vgpu_protocol::LinearTextureDescriptor>> {
         match self {
             Self::Buffer(buffer) => buffer.linear_texture.as_ref(),
-            Self::Image(_) => None,
+            Self::Image(image) => image.linear_texture.as_ref(),
         }
     }
 
@@ -1485,6 +1544,15 @@ impl ReplacementBufferResolver for ReplacementRepresentationResolver<'_> {
             .linear_texture_layout()
             .cloned()
     }
+
+    fn resolve_alias_transfer_bytes(
+        &self,
+        backing: BackingId,
+        representation: RepresentationId,
+    ) -> Option<NativeBufferTarget> {
+        self.representation(backing, representation)?
+            .alias_transfer_bytes()
+    }
 }
 
 impl ReplacementImageResolver for ReplacementRepresentationResolver<'_> {
@@ -1573,6 +1641,15 @@ impl ReplacementBufferResolver for ReplacementExecutionResolver<'_> {
     ) -> Option<Arc<reims_vgpu_protocol::LinearTextureDescriptor>> {
         self.representations
             .resolve_linear_texture_layout(backing, representation)
+    }
+
+    fn resolve_alias_transfer_bytes(
+        &self,
+        backing: BackingId,
+        representation: RepresentationId,
+    ) -> Option<NativeBufferTarget> {
+        self.representations
+            .resolve_alias_transfer_bytes(backing, representation)
     }
 }
 
@@ -2090,6 +2167,8 @@ pub(crate) fn allocate_owned_image(
             flags: plan.flags,
             attachment_views,
             shader_views,
+            linear_texture: None,
+            alias_transfer: None,
         },
     ))
 }
@@ -2136,6 +2215,8 @@ pub(crate) unsafe fn owned_image(
         flags: vk::ImageCreateFlags::empty(),
         attachment_views: BTreeMap::new(),
         shader_views: BTreeMap::new(),
+        linear_texture: None,
+        alias_transfer: None,
     })
 }
 
@@ -2158,6 +2239,8 @@ pub(crate) unsafe fn external_image(
         flags: vk::ImageCreateFlags::empty(),
         attachment_views: BTreeMap::new(),
         shader_views: BTreeMap::new(),
+        linear_texture: None,
+        alias_transfer: None,
     })
 }
 
@@ -2734,6 +2817,8 @@ mod tests {
             flags: vk::ImageCreateFlags::empty(),
             attachment_views: BTreeMap::new(),
             shader_views: BTreeMap::new(),
+            linear_texture: None,
+            alias_transfer: None,
         });
 
         let resource = ResourceId::new(5, 1);
@@ -2884,6 +2969,8 @@ mod tests {
                 vk::ImageView::from_raw(14),
             )]),
             shader_views: BTreeMap::new(),
+            linear_texture: None,
+            alias_transfer: None,
         });
         assert_eq!(
             native.image_view(derived_range).unwrap().view,

@@ -324,6 +324,19 @@ pub enum NativeImageBlitCommand {
     BufferToImage(NativeBufferImageCopy),
     ImageToBuffer(NativeBufferImageCopy),
     ImageToImage(NativeImageCopy),
+    /// Order the two halves of a round trip through an allocation's bytes.
+    ///
+    /// A command list is recorded in order and nothing else in it separates
+    /// one command's writes from the next command's reads. Where an image's
+    /// bytes are written into a buffer and then read back out into a second
+    /// image over the same allocation, that ordering is the whole content of
+    /// the copy, so it is a command rather than something a recorder is
+    /// trusted to insert.
+    TransferBytesReady {
+        buffer: vk::Buffer,
+        offset: u64,
+        size: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1078,6 +1091,31 @@ pub unsafe fn record_native_image_commands(
                         copy.image_layout,
                         copy.buffer,
                         &[region],
+                    );
+                }
+            }
+            NativeImageBlitCommand::TransferBytesReady {
+                buffer,
+                offset,
+                size,
+            } => {
+                let barrier = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(buffer)
+                    .offset(offset)
+                    .size(size);
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[barrier],
+                        &[],
                     );
                 }
             }

@@ -808,6 +808,27 @@ impl ReplacementDeviceEpoch {
             ))
     }
 
+    /// Allocate the byte buffer an image needs when a sibling image over the
+    /// same allocation reads those bytes differently.
+    ///
+    /// The buffer is device-local and carries only the two transfer usages:
+    /// nothing binds it, nothing maps it, and it holds nothing between the
+    /// two halves of one round trip. See
+    /// `replacement_representation::ReplacementImageRepresentation::alias_transfer`.
+    pub fn create_alias_transfer_buffer(
+        &self,
+        size: u64,
+    ) -> Result<
+        crate::replacement_representation::ReplacementNativeRepresentation,
+        crate::replacement_representation::ReplacementBufferAllocationError,
+    > {
+        self.create_owned_buffer(
+            size,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+            crate::memory::MemoryClass::DeviceLocal,
+        )
+    }
+
     /// Allocate the contract-unrestricted native representation of a Metal
     /// buffer. Unlike textures, buffer construction carries no usage mask, so
     /// every operation class supported by the replacement recorder is a legal

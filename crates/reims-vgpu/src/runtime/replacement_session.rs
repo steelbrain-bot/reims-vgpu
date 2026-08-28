@@ -2835,17 +2835,20 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .descriptor
             .as_deref()
             .ok_or(ReplacementRepresentationConstructionError::DescriptorAbsent(resource))?;
-        let declaration = match descriptor {
-            reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor) => {
+        // A heap placement and a mapper view have no allocation-relative
+        // layout of their own, so only an ordinary texture carries one.
+        let (declaration, linear_texture) = match descriptor {
+            reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor) => (
                 descriptor.declaration.ok_or(
                     ReplacementRepresentationConstructionError::TextureDeclarationAbsent(resource),
-                )?
-            }
+                )?,
+                Some(Arc::new(descriptor.clone())),
+            ),
             reims_vgpu_protocol::ResourceDescriptor::HeapTexture(descriptor) => {
-                descriptor.declaration
+                (descriptor.declaration, None)
             }
             reims_vgpu_protocol::ResourceDescriptor::MapperIOSurfaceTextureView(descriptor) => {
-                descriptor.declaration
+                (descriptor.declaration, None)
             }
             _ => {
                 return Err(
@@ -2853,14 +2856,22 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                 );
             }
         };
-        self.materialize_texture_declaration(device, resource, declaration, route)
+        self.materialize_texture_declaration(device, resource, declaration, linear_texture, route)
     }
 
+    /// `linear_texture` is how this texture's texels sit in the backing's
+    /// bytes, and it belongs to the image rather than to the allocation. Two
+    /// textures declared over one allocation are two interpretations of one
+    /// byte range, so a transfer addressing either of them needs that one's
+    /// own descriptor; the shared transfer endpoint carries only whichever was
+    /// declared first. A texture with no allocation-relative layout -- a heap
+    /// placement, a mapper view -- passes `None` and no transfer reads one.
     fn materialize_texture_declaration(
         &mut self,
         device: &ReplacementDeviceEpoch,
         resource: ResourceId<reims_vgpu_protocol::ResourceObject>,
         declaration: reims_vgpu_protocol::TextureDeclaration,
+        linear_texture: Option<Arc<reims_vgpu_protocol::LinearTextureDescriptor>>,
         route: reims_vgpu_core::RepresentationRoute,
     ) -> Result<reims_vgpu_protocol::RepresentationId, ReplacementRepresentationConstructionError>
     {
@@ -2907,9 +2918,47 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
             .graph()
             .texture_binding_views_for_image_owner(resource)
             .map_err(ReplacementRepresentationConstructionError::TextureView)?;
-        let native = device
+        let mut native = device
             .create_owned_texture(declaration, Box::new([]), shader_views, memory)
             .map_err(ReplacementRepresentationConstructionError::TextureAllocation)?;
+        if let Some(layout) = linear_texture {
+            // A second texture over this allocation that reads its bytes
+            // differently cannot be copied to or from this one directly:
+            // their texel blocks are different widths, so no `vkCmdCopyImage`
+            // and no image view relates them, and the bytes are the only
+            // thing they share. Give this image somewhere to put them.
+            //
+            // The transfer endpoint carries whichever texture was declared
+            // over the allocation first, so it is the one interpretation
+            // every later texture is compared against. A pair that both
+            // disagree with it therefore has at least one buffer between
+            // them, which is all a round trip needs -- two textures that
+            // agree with the endpoint agree with each other and are copied
+            // directly.
+            let established = [
+                reims_vgpu_core::GUEST_REPRESENTATION,
+                reims_vgpu_core::HOST_REPRESENTATION,
+            ]
+            .into_iter()
+            .find_map(|endpoint| {
+                self.epoch
+                    .resources
+                    .representation(backing, endpoint)?
+                    .linear_texture_layout()
+                    .cloned()
+            });
+            if established.is_some_and(|established| *established != *layout) {
+                let bytes = device
+                    .create_alias_transfer_buffer(layout.allocation_size)
+                    .map_err(ReplacementRepresentationConstructionError::BufferAllocation)?;
+                native
+                    .attach_alias_transfer(bytes)
+                    .map_err(ReplacementRepresentationConstructionError::TextureEndpoint)?;
+            }
+            native
+                .attach_linear_texture_layout(layout)
+                .map_err(ReplacementRepresentationConstructionError::TextureEndpoint)?;
+        }
         let representation = self
             .epoch
             .resources
@@ -3044,7 +3093,13 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                     ReplacementRepresentationConstructionError::Lifecycle(failure.reason)
                 })?;
         }
-        self.materialize_texture_declaration(device, resource, declaration, route)
+        self.materialize_texture_declaration(
+            device,
+            resource,
+            declaration,
+            Some(Arc::clone(&layout)),
+            route,
+        )
     }
 
     /// Bind one page-backed linear texture allocation as an exact transfer
