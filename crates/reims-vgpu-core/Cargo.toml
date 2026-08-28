@@ -16,3 +16,9 @@ reims-vgpu-memory = { path = "../reims-vgpu-memory" }
 reims-vgpu-observe = { path = "../reims-vgpu-observe" }
 reims-vgpu-paging = { path = "../reims-vgpu-paging" }
 reims-vgpu-protocol = { path = "../reims-vgpu-protocol" }
+
+[dev-dependencies]
+# `cfg(test)` does not reach a dependency, so the always-on sinks stay pointed at
+# the live product log unless this crate asks for the per-process test paths.
+# A test run and a boot share one machine here; see `reims-vgpu-observe::sink`.
+reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["test-fixtures"] }

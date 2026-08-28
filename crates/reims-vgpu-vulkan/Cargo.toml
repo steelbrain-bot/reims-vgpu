@@ -30,3 +30,7 @@ spirv = "0.4"
 
 [dev-dependencies]
 reims-vgpu-testkit = { path = "../reims-vgpu-testkit" }
+# `cfg(test)` does not reach a dependency, so the always-on sinks stay pointed at
+# the live product log unless this crate asks for the per-process test paths.
+# A test run and a boot share one machine here; see `reims-vgpu-observe::sink`.
+reims-vgpu-observe = { path = "../reims-vgpu-observe", features = ["test-fixtures"] }
