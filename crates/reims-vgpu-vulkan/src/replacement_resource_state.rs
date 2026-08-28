@@ -1058,6 +1058,58 @@ pub fn classify_transfer_endpoints(
     }
 }
 
+/// Which endpoints of a transfer resolve to native images.
+///
+/// The image-state batch is built from this: an image read by a transfer needs
+/// a transfer-source transition and one written needs a transfer-destination
+/// one, and the pair says which. Deriving it from the representation
+/// identities instead --- "an endpoint identity is the shared byte endpoint,
+/// so the other side must be the image" --- is a rule about identities rather
+/// than about what they resolve to, and it registers a designated *byte* view
+/// as an image, which then fails to prepare as one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransferImageEndpoints {
+    pub source: bool,
+    pub destination: bool,
+}
+
+impl TransferImageEndpoints {
+    /// Neither endpoint is an image, which is what a caller with no resolver
+    /// to ask must assume.
+    pub const NEITHER: Self = Self {
+        source: false,
+        destination: false,
+    };
+
+    /// Whether this transfer reaches an image at all.
+    pub const fn any(self) -> bool {
+        self.source || self.destination
+    }
+}
+
+/// Which endpoints of a transfer the native registry resolves to images.
+pub fn transfer_image_endpoints(
+    transfer: TransferKey,
+    resolver: &(impl ReplacementBufferResolver
+          + crate::replacement_image_transition::ReplacementImageResolver),
+) -> TransferImageEndpoints {
+    match classify_transfer_endpoints(transfer, resolver) {
+        TransferEndpoints::Buffers | TransferEndpoints::Unrecordable => {
+            TransferImageEndpoints::NEITHER
+        }
+        TransferEndpoints::BufferImage {
+            buffer_to_image, ..
+        } => TransferImageEndpoints {
+            source: !buffer_to_image,
+            destination: buffer_to_image,
+        },
+        TransferEndpoints::ImageImage { .. } => TransferImageEndpoints {
+            source: true,
+            destination: true,
+        },
+    }
+}
+
 /// Whether recording this transfer reaches a native image, and so needs the
 /// prepared image-state batch that [`resolve_transfer`] reads.
 pub fn transfer_requires_image_state(

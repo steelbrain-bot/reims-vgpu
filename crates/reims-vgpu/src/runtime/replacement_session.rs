@@ -12610,6 +12610,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             &self.execution.epoch.resources,
             &self.execution.epoch.images,
         );
+        // Which endpoint of each transfer resolves to a native image. The
+        // recorder decides that from the native registry when it resolves the
+        // transfer, and this is the same question one step earlier, so it is
+        // asked through the same classification rather than restated here.
         let image_transfers = resources
             .inputs()
             .resource_states
@@ -12626,21 +12630,19 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     .flat_map(|batch| batch.transfers().iter()),
             )
             .copied()
-            // Which transfers reach an image at all, for a region that does
-            // not say so itself. The recorder decides that from the native
-            // registry when it resolves the transfer, and this is the same
-            // question one step earlier, so it is asked through the same
-            // classification rather than restated here.
-            .filter(|transfer| {
-                reims_vgpu_vulkan::replacement_resource_state::transfer_requires_image_state(
-                    *transfer,
-                    &transfer_endpoints,
+            .map(|transfer| {
+                (
+                    transfer,
+                    reims_vgpu_vulkan::replacement_resource_state::transfer_image_endpoints(
+                        transfer,
+                        &transfer_endpoints,
+                    ),
                 )
             })
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeMap<_, _>>();
         let has_images = match reims_vgpu_vulkan::replacement_exec_image::exec_has_image_uses_with_transfer_classifier(
                 &resources,
-                |transfer| image_transfers.contains(&transfer),
+                |transfer| image_transfers.get(&transfer).copied().unwrap_or_default(),
             ) {
                 Ok(has_images) => has_images,
                 Err(reason) => {
@@ -12772,7 +12774,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             &resources,
             queue_family,
             &final_layouts,
-            |transfer| image_transfers.contains(&transfer),
+            |transfer| image_transfers.get(&transfer).copied().unwrap_or_default(),
         ) {
             Ok(image_states) => Ok(ReplacementPreparedExecEnvelope {
                 resources,
