@@ -308,8 +308,26 @@ pub(crate) enum ReplacementIOSurfacePlaneViewRefusal {
     PlaneGeometryMismatch {
         record: Option<reims_vgpu_protocol::IOSurfacePlaneViewRecordKind>,
         plane: u32,
+        /// The view's own `MTLPixelFormat` ordinal and geometry.
+        ///
+        /// The format is here because a geometry disagreement and a format
+        /// reinterpretation are the same numbers seen from two sides: a view
+        /// half the plane's width and half its height over an element four
+        /// times as wide addresses exactly the plane's bytes, and reading that
+        /// as a wrong extent names the wrong defect. Only the two formats
+        /// beside the two extents distinguish them.
+        view_format: u16,
         view: (u32, u32, u32),
+        /// The plane's declared extent, and the element width it declares
+        /// those texels in.
         declared: (u32, u32),
+        declared_bytes_per_element: u8,
+        /// The parent's plane count and IOSurface pixel-format word, which say
+        /// whether the selected plane is one of several -- a subsampled
+        /// surface's planes differ in extent by construction -- or the only
+        /// one the surface has.
+        count: u8,
+        surface_format: u32,
     },
     Declaration(crate::runtime::replacement_session::ReplacementIOSurfacePlaneViewDeclarationError),
 }
@@ -561,8 +579,12 @@ pub(crate) fn apply_replacement_iosurface_plane_view<Semantic: Clone>(
             ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch {
                 record: view_resource.record_kind,
                 plane: plane_index,
+                view_format: view.pixel_format,
                 view: (view.width, view.height, view.depth),
                 declared: (declared_plane.width, declared_plane.height),
+                declared_bytes_per_element: declared_plane.bytes_per_element,
+                count: parent.plane_count,
+                surface_format: parent.pixel_format,
             },
         );
     }

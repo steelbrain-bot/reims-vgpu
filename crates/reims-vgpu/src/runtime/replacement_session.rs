@@ -26714,12 +26714,18 @@ mod tests {
             Err(crate::runtime::replacement_object_lifecycle::ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch {
                 record: plane_view.record_kind,
                 plane: plane_view.view.unwrap().plane_index.unwrap(),
+                view_format: plane_view.view.unwrap().pixel_format,
                 view: (641, plane_view.view.unwrap().height, plane_view.view.unwrap().depth),
                 declared: (
                     descriptor.planes[plane_view.view.unwrap().plane_index.unwrap() as usize].width,
                     descriptor.planes[plane_view.view.unwrap().plane_index.unwrap() as usize]
                         .height,
                 ),
+                declared_bytes_per_element: descriptor.planes
+                    [plane_view.view.unwrap().plane_index.unwrap() as usize]
+                    .bytes_per_element,
+                count: descriptor.plane_count,
+                surface_format: descriptor.pixel_format,
             })
         );
         assert!(runtime
