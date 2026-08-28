@@ -135,10 +135,17 @@ pub enum ImageLayoutRefusal {
     /// The byte range covers a shape no single texel box expresses -- a
     /// part-row start with a multi-row length, or a row count past the level
     /// that does not divide into whole images.
+    ///
+    /// `tight_row_stride` is the level's `width * bytes_per_element`, and it
+    /// is here because the interesting case is a range that is rectangular in
+    /// the level's tight rows and not in its padded ones. Against `row_stride`
+    /// it says whether the producer computed the range from the wrong stride,
+    /// and it is not recoverable from the other terms. The range's own length
+    /// is not repeated: the `TransferKey` beside this refusal carries it.
     RangeNotRectangular {
         offset_in_row: u64,
-        length: u64,
         row_stride: u64,
+        tight_row_stride: u64,
         row: u64,
         height: u32,
     },
@@ -1588,8 +1595,8 @@ fn transfer_image_region(
             let not_rectangular = || {
                 unsupported(ImageLayoutRefusal::RangeNotRectangular {
                     offset_in_row: x_bytes,
-                    length,
                     row_stride: level.row_stride,
+                    tight_row_stride: u64::from(level.width) * bytes_per_element,
                     row: y,
                     height: level.height,
                 })
@@ -2244,8 +2251,8 @@ mod tests {
                 transfer: ragged,
                 refusal: ImageLayoutRefusal::RangeNotRectangular {
                     offset_in_row: 1,
-                    length: 16,
                     row_stride: 8,
+                    tight_row_stride: 4,
                     row: 0,
                     height: 4,
                 },
