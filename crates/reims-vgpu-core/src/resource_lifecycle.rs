@@ -147,14 +147,19 @@ pub enum ResolvedResourceLifecycle {
     /// A registered IOSurface owns no backing itself and its plane views own
     /// one each, so a tree release retires a *set*: one backing for a single
     /// plane surface and one per plane for a biplanar one.
+    ///
+    /// The set is derived from `root` when the command applies, not carried
+    /// from where it was admitted. The guest means "this surface and whatever
+    /// hangs off it", and what hangs off it can change between admission and
+    /// the head of the channel: a plane view declared in between belongs to
+    /// the tree the guest is deleting.
     ReleaseResourceTree {
         root: ResourceId<ResourceObject>,
-        resources: Box<[ResourceId<ResourceObject>]>,
-        backings: Box<[BackingId]>,
     },
+    /// Release every resource the task still owns, derived at apply for the
+    /// same reason as [`Self::ReleaseResourceTree`].
     ReleaseTask {
         task: TaskId,
-        resources: Box<[ResourceId<ResourceObject>]>,
     },
     CreateMapping(MappingNode),
     ReleaseMapping {
@@ -255,8 +260,6 @@ pub enum ResourceLifecycleError {
     InvalidHeapTextureRequirements,
     HeapTextureOffsetMisaligned,
     MapperTextureRelationMismatch,
-    TaskResourceSetMismatch,
-    ResourceTreeMismatch,
     EmptyValidityBatch,
     DuplicateValidityBatchBacking(BackingId),
     DuplicatePhysicalReplacement(ResourceId<ResourceObject>),
@@ -529,21 +532,12 @@ impl<T> ResourceLifecycleOwner<T> {
                     automatically_retired,
                 })
             }
-            ResolvedResourceLifecycle::ReleaseResourceTree {
-                root,
-                resources,
-                backings,
-            } => {
-                let expected = self
+            ResolvedResourceLifecycle::ReleaseResourceTree { root } => {
+                let resources = self
                     .graph
                     .live_resource_tree_child_first(root)
                     .ok_or(GraphError::ResourceAbsent)?;
-                if resources.as_ref() != expected.as_ref() {
-                    return Err(ResourceLifecycleError::ResourceTreeMismatch);
-                }
-                if backings.as_ref() != self.graph.resource_tree_backings(&resources).as_ref() {
-                    return Err(ResourceLifecycleError::ResourceTreeMismatch);
-                }
+                let backings = self.graph.resource_tree_backings(&resources);
                 for &backing in backings.iter() {
                     self.graph
                         .validate_storage_retirement_after_resources(backing, &resources)?;
@@ -573,13 +567,8 @@ impl<T> ResourceLifecycleOwner<T> {
                     retired,
                 })
             }
-            ResolvedResourceLifecycle::ReleaseTask { task, resources } => {
-                let mut declared = resources.to_vec();
-                declared.sort();
-                declared.dedup();
-                if declared.as_slice() != self.graph.live_resources_for_task(task).as_ref() {
-                    return Err(ResourceLifecycleError::TaskResourceSetMismatch);
-                }
+            ResolvedResourceLifecycle::ReleaseTask { task } => {
+                let declared = self.graph.live_resources_for_task(task).to_vec();
                 for resource in &declared {
                     self.graph.release_resource(*resource)?;
                 }
@@ -2337,7 +2326,7 @@ mod tests {
     }
 
     #[test]
-    fn task_release_requires_the_exact_resolved_generation_set() {
+    fn a_task_release_takes_the_resources_the_task_still_owns() {
         let mut owner = ResourceLifecycleOwner::<()>::new(VulkanDeviceEpochId::new(3));
         let first = match owner
             .apply(ResolvedResourceLifecycle::CreateResource {
@@ -2367,24 +2356,19 @@ mod tests {
             ResourceLifecycleEffect::ResourceCreated(resource) => resource,
             _ => unreachable!(),
         };
-        assert!(matches!(
-            owner.apply(ResolvedResourceLifecycle::ReleaseTask {
+        let ResourceLifecycleEffect::TaskReleased { resources, .. } = owner
+            .apply(ResolvedResourceLifecycle::ReleaseTask {
                 task: TaskId::new(1),
-                resources: Box::new([first]),
-            }),
-            Err(ResourceLifecycleError::TaskResourceSetMismatch)
-        ));
-        assert!(owner.graph().resource(first).is_some());
-        assert!(owner.graph().resource(second).is_some());
-        assert!(matches!(
-            owner
-                .apply(ResolvedResourceLifecycle::ReleaseTask {
-                    task: TaskId::new(1),
-                    resources: Box::new([second, first]),
-                })
-                .unwrap(),
-            ResourceLifecycleEffect::TaskReleased { .. }
-        ));
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            resources.as_ref(),
+            [first, second],
+            "a task release takes whatever the task still owns when it applies"
+        );
         assert!(owner.graph().resources_for_task(TaskId::new(1)).is_empty());
     }
 
@@ -2519,19 +2503,12 @@ mod tests {
         else {
             unreachable!()
         };
-        let resources = owner.graph().live_resource_tree_child_first(root).unwrap();
-        assert_eq!(resources.as_ref(), [child, root]);
-
         let ResourceLifecycleEffect::ResourceTreeReleased {
             root: found,
             resources: released,
             retired,
         } = owner
-            .apply(ResolvedResourceLifecycle::ReleaseResourceTree {
-                root,
-                resources,
-                backings: Box::new([backing]),
-            })
+            .apply(ResolvedResourceLifecycle::ReleaseResourceTree { root })
             .unwrap()
         else {
             unreachable!()

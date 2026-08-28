@@ -13423,28 +13423,11 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 actual,
             });
         }
-        let resources = self
-            .execution
-            .epoch
-            .resources
-            .graph()
-            .live_resource_tree_child_first(resource)
-            .expect("the resolved surface root remains in its canonical graph");
-        let backings = self
-            .execution
-            .epoch
-            .resources
-            .graph()
-            .resource_tree_backings(&resources);
         self.admit_resource_lifecycle(
             channel,
             prerequisites,
             completion_stamp,
-            reims_vgpu_core::ResolvedResourceLifecycle::ReleaseResourceTree {
-                root: resource,
-                resources,
-                backings,
-            },
+            reims_vgpu_core::ResolvedResourceLifecycle::ReleaseResourceTree { root: resource },
         )
         .map_err(ReplacementNamedResourceLifecycleAdmissionError::Admission)
     }
@@ -16932,15 +16915,8 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         reims_vgpu_core::ResourceLifecycleEffect<ReplacementNativeRepresentation>,
         ReplacementResourceLifecycleError,
     > {
-        let resources = self
-            .execution
-            .epoch
-            .resources
-            .graph()
-            .live_resources_for_task(task);
         self.apply_resource_lifecycle(reims_vgpu_core::ResolvedResourceLifecycle::ReleaseTask {
             task,
-            resources,
         })
     }
 
