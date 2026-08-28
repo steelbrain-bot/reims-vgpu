@@ -274,8 +274,8 @@ pub use managed_backing::{
     RepresentationRegionCoverage, RepresentationUse, TransferBatchError, ViewRepresentation,
 };
 pub use managed_resource::{
-    plan_representation, HostMemoryTopology, RepresentationCapabilities, RepresentationRefusal,
-    RepresentationRoute, WorkingMemoryClass,
+    plan_representation, GuestWriteStaging, HostMemoryTopology, RepresentationCapabilities,
+    RepresentationRefusal, RepresentationRoute, WorkingMemoryClass,
 };
 pub use map_audit::{MapAudit, MapIntervals, PageSize};
 pub use mapper::{

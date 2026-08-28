@@ -7913,6 +7913,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     ) -> Vec<(
         reims_vgpu_core::BackingView,
         reims_vgpu_protocol::RepresentationId,
+        Option<reims_vgpu_core::RepresentationRoute>,
         String,
     )> {
         let resources = self.execution.resources();
@@ -7932,6 +7933,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 Some((
                     view,
                     representation,
+                    // The route is what says whether an empty coverage is a
+                    // transfer that has not run or a route that never plans
+                    // one, and no other line reports it.
+                    resources.representation_route(backing, representation),
                     coverage
                         .iter()
                         .map(|held| format!("{:?}@{}", held.region, held.version.get()))
@@ -12010,23 +12015,42 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                             );
                         }
                     };
+                    // Where a guest write reaches this route's object is the
+                    // route's own fact, so `RepresentationRoute` answers it
+                    // and this maps the answer onto the pair the transition
+                    // carries. A catch-all here read as "no staging needed"
+                    // and meant "no route matched": the object then stayed
+                    // empty and every later bind of it refused
+                    // `StaleExecutionRepresentation` for the life of the boot
+                    // with nothing planned that could repair it.
                     match representation.and_then(|representation| {
                         resources
                             .representation_route(target.backing, representation)
-                            .map(|route| (representation, route))
+                            .map(|route| (representation, route.guest_write_staging()))
                     }) {
+                        Some((representation, reims_vgpu_core::GuestWriteStaging::Transfer)) => {
+                            (None, Some(representation))
+                        }
                         Some((
                             representation,
-                            reims_vgpu_core::RepresentationRoute::HostStagingTransfer { .. },
+                            reims_vgpu_core::GuestWriteStaging::StageThenTransfer,
                         )) => (
                             Some(reims_vgpu_core::HOST_REPRESENTATION),
                             Some(representation),
                         ),
+                        // Already held, or storage the guest cannot write.
+                        // Nothing to plan either way; a bind that then refuses
+                        // names the route on the stale-representation line.
                         Some((
-                            representation,
-                            reims_vgpu_core::RepresentationRoute::ImportedGuestTransfer { .. },
-                        )) => (None, Some(representation)),
-                        _ => (None, None),
+                            _,
+                            reims_vgpu_core::GuestWriteStaging::AlreadyHeld
+                            | reims_vgpu_core::GuestWriteStaging::Unwritable,
+                        )) => (None, None),
+                        // No designated representation yet, or one with no
+                        // native object. The bytes are recorded against the
+                        // guest representation and whatever is built later
+                        // synchronizes from it.
+                        None => (None, None),
                     }
                 } else {
                     (None, None)

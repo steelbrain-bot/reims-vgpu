@@ -44,6 +44,50 @@ pub enum RepresentationRoute {
     HostStagingTransfer { working: WorkingMemoryClass },
 }
 
+/// How a guest CPU write reaches the object a route builds.
+///
+/// The routes differ in where the guest's bytes live relative to the object
+/// that executes over them, and that difference is the whole content of the
+/// question "what has to happen before this object holds what the guest just
+/// wrote". Answering it anywhere but here means answering it per caller, and
+/// a caller that fell through to "nothing has to happen" planned no upload at
+/// all --- so the object stayed empty and every later bind of it refused
+/// `StaleExecutionRepresentation` with nothing that could ever repair it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestWriteStaging {
+    /// The object *is* the guest's allocation, imported. The store the guest
+    /// made is already in it and there is nothing to plan.
+    AlreadyHeld,
+    /// One allocation the host can write and the GPU can read. The upload is a
+    /// transfer from the guest representation straight into it.
+    Transfer,
+    /// Working memory the host cannot reach. The guest's bytes land in a
+    /// staging buffer first and a GPU transfer moves them on.
+    StageThenTransfer,
+    /// Storage the guest cannot CPU write at all --- private working memory
+    /// and render-pass memoryless attachments. A host-valid clear naming one
+    /// is a statement this device has no contract for.
+    Unwritable,
+}
+
+impl RepresentationRoute {
+    /// See [`GuestWriteStaging`]. Exhaustive by construction: a route added
+    /// without deciding this does not compile.
+    pub const fn guest_write_staging(self) -> GuestWriteStaging {
+        match self {
+            Self::DirectGuestAlias => GuestWriteStaging::AlreadyHeld,
+            Self::HostVisibleWorking | Self::HostStagingEndpoint => GuestWriteStaging::Transfer,
+            // The import is the guest's bytes, so nothing stages; the transfer
+            // carries them from the import into working memory.
+            Self::ImportedGuestTransfer { .. } => GuestWriteStaging::Transfer,
+            Self::HostStagingTransfer { .. } => GuestWriteStaging::StageThenTransfer,
+            Self::NativeWorking { .. } | Self::RenderPassMemoryless => {
+                GuestWriteStaging::Unwritable
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepresentationRefusal {
     UndeclaredStorageMode,
@@ -192,5 +236,59 @@ mod tests {
                 working: WorkingMemoryClass::HostVisible
             })
         );
+    }
+
+    /// Every route says what a guest write has to do to reach its object.
+    ///
+    /// The classification used to be a `match` inside the validity path with a
+    /// catch-all arm, and two routes fell into it: `HostVisibleWorking` and
+    /// `HostStagingEndpoint`, both of which are one allocation a transfer
+    /// fills. Falling through planned no upload, so the object held nothing
+    /// and every later bind of it refused `StaleExecutionRepresentation` on
+    /// every retry --- 123 748 of them on one driven macos-13 boot, holding
+    /// the head of its channel from 77 s in until the boot was killed.
+    ///
+    /// This asserts the whole table rather than the two that were wrong,
+    /// because the failure was a route nobody had decided about and the next
+    /// one added is the next such route.
+    #[test]
+    fn every_route_says_how_a_guest_write_reaches_it() {
+        let working = WorkingMemoryClass::DeviceLocal;
+        for (route, staging) in [
+            (
+                RepresentationRoute::DirectGuestAlias,
+                GuestWriteStaging::AlreadyHeld,
+            ),
+            (
+                RepresentationRoute::HostVisibleWorking,
+                GuestWriteStaging::Transfer,
+            ),
+            (
+                RepresentationRoute::HostStagingEndpoint,
+                GuestWriteStaging::Transfer,
+            ),
+            (
+                RepresentationRoute::ImportedGuestTransfer { working },
+                GuestWriteStaging::Transfer,
+            ),
+            (
+                RepresentationRoute::HostStagingTransfer { working },
+                GuestWriteStaging::StageThenTransfer,
+            ),
+            (
+                RepresentationRoute::NativeWorking { memory: working },
+                GuestWriteStaging::Unwritable,
+            ),
+            (
+                RepresentationRoute::RenderPassMemoryless,
+                GuestWriteStaging::Unwritable,
+            ),
+        ] {
+            assert_eq!(
+                route.guest_write_staging(),
+                staging,
+                "{route:?} must say how a guest write reaches it"
+            );
+        }
     }
 }
