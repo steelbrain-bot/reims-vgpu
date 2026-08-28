@@ -14131,6 +14131,52 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         };
         let slot = window.recording.slot();
         let acquire_suboptimal = window.acquire_suboptimal;
+        let source = &allocated.prepared.present().source;
+        // What the guest actually handed the swapchain, reported on every change
+        // rather than every present. A present that never reaches the screen and
+        // one that reaches it carrying black are indistinguishable from the
+        // pipeline counters alone; the geometry, format and backing behind the
+        // present are what separate "the wrong surface" from "the right surface,
+        // wrong contents".
+        // Keyed on the backing rather than the display, because the guest flips
+        // between several scanout buffers and the question this answers is how
+        // many of them there are and which representation each present picks.
+        // Keying on the display would report the first buffer and go quiet.
+        if reims_vgpu_observe::state_changed(
+            "replacement_window_present_source",
+            source.backing.get(),
+            allocated.prepared.representation().get(),
+        ) {
+            let image = allocated.prepared.image();
+            crate::observe::off(format!(
+                "replacement_window_present_source display={} width={} height={} format={} \
+                 backing={:?} resource={:?} native_image={:?} native_format={} \
+                 native_extent={}x{}x{}",
+                source.display_index,
+                source.width,
+                source.height,
+                source.pixel_format,
+                source.backing,
+                source.resource,
+                image.image,
+                image.pixel_format,
+                image.extent.width,
+                image.extent.height,
+                image.extent.depth,
+            ));
+            // The layouts the present asks the driver for. A source barrier
+            // whose old layout is UNDEFINED discards the image's contents by
+            // definition, and the result on screen is exactly the black a
+            // present that never ran would leave -- so the pair has to be
+            // readable without a debugger.
+            for barrier in &allocated.native_image_state.transitions.before.images {
+                crate::observe::off(format!(
+                    "replacement_window_present_transition phase=before image={:?} \
+                     old_layout={:?} new_layout={:?}",
+                    barrier.image, barrier.old_layout, barrier.new_layout,
+                ));
+            }
+        }
         let surface =
             reims_vgpu_protocol::SurfaceId::new(allocated.prepared.present().source.display_index);
         let offered = reims_vgpu_core::SwapchainState {

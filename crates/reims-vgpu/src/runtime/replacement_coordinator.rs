@@ -2953,6 +2953,28 @@ pub(crate) enum ReplacementPresentQueueCoordinatorProgress {
     WrongStage,
 }
 
+impl ReplacementPresentQueueCoordinatorProgress {
+    /// The census name for one step of a present's trip to the swapchain.
+    ///
+    /// A present that never reaches the screen looks identical from outside to
+    /// one that reaches it carrying black, and the two have nothing in common:
+    /// the first is a stage that refused, the second is content. These names are
+    /// what separates them without a debugger.
+    pub(crate) const fn census_step(&self) -> &'static str {
+        match self {
+            Self::Prepared => "present_prepared",
+            Self::Busy => "present_busy",
+            Self::Pending => "present_pending",
+            Self::DriverAccepted { .. } => "present_driver_accepted",
+            Self::FailedPreparation => "present_failed_preparation",
+            Self::FailedEnqueue => "present_failed_enqueue",
+            Self::DriverRefused => "present_driver_refused",
+            Self::FailedAcceptance => "present_failed_acceptance",
+            Self::WrongStage => "present_wrong_stage",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementPresentCompletionProgress {
     TimelineComplete,
@@ -2964,6 +2986,23 @@ pub(crate) enum ReplacementPresentCompletionProgress {
     FailedNotificationApply,
     FailedPublication,
     WrongStage,
+}
+
+impl ReplacementPresentCompletionProgress {
+    /// The census name for one step of a completed present's retirement.
+    pub(crate) const fn census_step(&self) -> &'static str {
+        match self {
+            Self::TimelineComplete => "present_timeline_complete",
+            Self::NotificationPrepared => "present_notification_prepared",
+            Self::Notified => "present_notified",
+            Self::Published { .. } => "present_published",
+            Self::FailedTimeline => "present_failed_timeline",
+            Self::FailedNotificationPreparation => "present_failed_notification_preparation",
+            Self::FailedNotificationApply => "present_failed_notification_apply",
+            Self::FailedPublication => "present_failed_publication",
+            Self::WrongStage => "present_completion_wrong_stage",
+        }
+    }
 }
 
 pub(crate) struct ReplacementPresentCoordinator<Semantic> {
@@ -7708,6 +7747,7 @@ impl ReplacementDeviceCoordinator<()> {
                 step => step,
             };
             if let Some(step) = step {
+                crate::runtime::contract_census::note(step.census_step());
                 progress.push(step);
             }
         }
@@ -7738,6 +7778,7 @@ impl ReplacementDeviceCoordinator<()> {
                         if step == ReplacementPresentCompletionProgress::TimelineComplete {
                             self.product_presented = true;
                         }
+                        crate::runtime::contract_census::note(step.census_step());
                         progress.push(step);
                     }
                 }
@@ -7766,6 +7807,7 @@ impl ReplacementDeviceCoordinator<()> {
                 .prepare_notification(&self.runtime, host, transaction)
             {
                 if step != ReplacementPresentCompletionProgress::WrongStage {
+                    crate::runtime::contract_census::note(step.census_step());
                     progress.push(step);
                 }
             }
