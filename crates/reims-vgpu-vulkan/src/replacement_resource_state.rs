@@ -1182,11 +1182,59 @@ fn resolve_image_image_transfer(
             ];
             vec![(region.mip, region.layer, extent, origin)]
         }
+        // A byte range names no texels on its own, but these two endpoints
+        // agree on how bytes are read -- that is what reaching this point
+        // means -- so one layout translates the range for both, and the copy
+        // stays a direct image-to-image one. Only a backing with no declared
+        // layout at all leaves the range untranslatable.
         BackingRegion::Linear(_) => {
-            return Err(ResourceStateTransferRecordError::ImageToImageUnsupported {
-                transfer,
-                refusal: ImageToImageRefusal::LinearRegion,
-            });
+            let layout = resolver
+                .resolve_linear_texture_layout(transfer.backing, transfer.source)
+                .or_else(|| {
+                    resolver.resolve_linear_texture_layout(transfer.backing, transfer.destination)
+                })
+                .ok_or(ResourceStateTransferRecordError::ImageToImageUnsupported {
+                    transfer,
+                    refusal: ImageToImageRefusal::LinearRegion,
+                })?;
+            transfer_image_regions(&layout, transfer)?
+                .into_iter()
+                .map(|region| {
+                    (
+                        region.mip,
+                        region.layer,
+                        [
+                            region.texels.end[0] - region.texels.origin[0],
+                            region.texels.end[1] - region.texels.origin[1],
+                            region.texels.end[2] - region.texels.origin[2],
+                        ],
+                        [
+                            i32::try_from(region.texels.origin[0]),
+                            i32::try_from(region.texels.origin[1]),
+                            i32::try_from(region.texels.origin[2]),
+                        ],
+                    )
+                })
+                .map(|(mip, layer, extent, origin)| {
+                    let [x, y, z] = origin;
+                    Ok((
+                        mip,
+                        layer,
+                        extent,
+                        [
+                            x.map_err(|_| {
+                                ResourceStateTransferRecordError::RangeOutOfBounds(transfer)
+                            })?,
+                            y.map_err(|_| {
+                                ResourceStateTransferRecordError::RangeOutOfBounds(transfer)
+                            })?,
+                            z.map_err(|_| {
+                                ResourceStateTransferRecordError::RangeOutOfBounds(transfer)
+                            })?,
+                        ],
+                    ))
+                })
+                .collect::<Result<Vec<_>, ResourceStateTransferRecordError>>()?
         }
     };
     let mut commands = Vec::with_capacity(subresources.len());
@@ -3170,6 +3218,173 @@ mod tests {
         ));
     }
 
+    /// Two images that agree on how bytes are read copy a byte range
+    /// directly, in the texels that range covers.
+    ///
+    /// A byte range names no texels on its own, and the resolver used to stop
+    /// there -- so a guest that wrote part of one texture over an allocation
+    /// and read it through another declared the same way lost the copy, on a
+    /// pair where nothing was ambiguous. One layout answers for both, because
+    /// agreeing is exactly what reaching this point means.
+    #[test]
+    fn a_byte_range_between_agreeing_images_copies_the_texels_it_covers() {
+        use crate::replacement_image_state::{
+            ReplacementImageSharing, ReplacementImageState, ReplacementImageStateOwner,
+            ReplacementImageUse,
+        };
+
+        let backing = BackingId::new(1);
+        let source_key = ReplacementImageKey {
+            backing,
+            representation: RepresentationId::new(2),
+        };
+        let destination_key = ReplacementImageKey {
+            backing,
+            representation: RepresentationId::new(3),
+        };
+        let mut owner = ReplacementImageStateOwner::new(VulkanDeviceEpochId::new(1));
+        for key in [source_key, destination_key] {
+            owner
+                .register(
+                    key,
+                    ReplacementImageState {
+                        layout: vk::ImageLayout::UNDEFINED,
+                        sharing: ReplacementImageSharing::Concurrent,
+                        last_use: None,
+                    },
+                )
+                .unwrap();
+        }
+        let state = owner
+            .prepare(
+                TransactionId::new(1),
+                0,
+                [
+                    ReplacementImageUse {
+                        image: source_key,
+                        required_usage: vk::ImageUsageFlags::TRANSFER_SRC,
+                        use_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        final_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    },
+                    ReplacementImageUse {
+                        image: destination_key,
+                        required_usage: vk::ImageUsageFlags::TRANSFER_DST,
+                        use_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        final_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    },
+                ],
+            )
+            .unwrap();
+
+        struct OneLayout;
+        impl ReplacementBufferResolver for OneLayout {
+            fn resolve_buffer(
+                &self,
+                _backing: BackingId,
+                _representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                None
+            }
+
+            fn resolve_linear_texture_layout(
+                &self,
+                _backing: BackingId,
+                _representation: RepresentationId,
+            ) -> Option<std::sync::Arc<reims_vgpu_protocol::LinearTextureDescriptor>> {
+                Some(std::sync::Arc::new(
+                    reims_vgpu_protocol::LinearTextureDescriptor {
+                        declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+                            texture_type: reims_vgpu_protocol::TextureType::D2,
+                            framebuffer_only: false,
+                            is_drawable: false,
+                            write_swizzle_enabled: None,
+                            allow_gpu_optimized_contents: false,
+                            usage: 0,
+                            pixel_format: 80,
+                            width: 64,
+                            height: 64,
+                            depth: 1,
+                            mipmap_level_count: 1,
+                            sample_count: 1,
+                            array_length: 1,
+                            resource_options: 0,
+                            protection_options: 0,
+                            swizzle: None,
+                        }),
+                        allocation_size: 16384,
+                        mipmap_level_count: 1,
+                        bytes_per_slice: 16384,
+                        slice_count: 1,
+                        bytes_per_element: 4,
+                        row_stride: 256,
+                        width: 64,
+                        height: 64,
+                        depth: 1,
+                        levels: vec![reims_vgpu_protocol::TextureLevelLayout {
+                            size: 16384,
+                            row_stride: 256,
+                            width: 64,
+                            height: 64,
+                            depth: 1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ))
+            }
+        }
+
+        let image = |handle: u64| crate::replacement_image_transition::NativeImageTarget {
+            image: vk::Image::from_raw(handle),
+            view: vk::ImageView::null(),
+            image_type: vk::ImageType::TYPE_2D,
+            full_range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            usage: vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST,
+            pixel_format: 80,
+            extent: vk::Extent3D {
+                width: 64,
+                height: 64,
+                depth: 1,
+            },
+            samples: vk::SampleCountFlags::TYPE_1,
+        };
+        // Rows 4 through 7 of a 64x64 four-byte-texel level.
+        let recorded = resolve_image_image_transfer(
+            TransferKey {
+                backing,
+                region: BackingRegion::Linear(LinearRange::new(1024, 1024).unwrap()),
+                version: reims_vgpu_protocol::ContentVersion::new(33),
+                source: RepresentationId::new(2),
+                destination: RepresentationId::new(3),
+            },
+            image(1),
+            source_key,
+            image(2),
+            destination_key,
+            &state,
+            &OneLayout,
+        )
+        .expect("a byte range between two identically declared images is a direct copy");
+        let NativeResourceStateTransfer::Image(commands) = recorded else {
+            panic!("an image-to-image copy records image commands");
+        };
+        assert!(matches!(
+            commands.as_ref(),
+            [NativeImageBlitCommand::ImageToImage(copy)]
+                if copy.source == vk::Image::from_raw(1)
+                    && copy.destination == vk::Image::from_raw(2)
+                    && copy.source_offset == [0, 4, 0]
+                    && copy.destination_offset == [0, 4, 0]
+                    && copy.extent == [64, 4, 1]
+        ));
+    }
+
     /// Each condition that refuses an image-to-image copy names itself.
     ///
     /// The four reach one refusal family and call for different repairs -- a
@@ -3308,6 +3523,9 @@ mod tests {
             ),
             ImageToImageRefusal::SameImage
         );
+        // A byte range is translatable through either endpoint's layout, and
+        // these two agree -- so the range is only untranslatable when the
+        // backing declares no layout at all, which is what this resolver is.
         assert_eq!(
             refusal(
                 key(BackingRegion::Linear(LinearRange::new(0, 16).unwrap())),
