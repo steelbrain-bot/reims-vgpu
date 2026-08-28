@@ -7317,6 +7317,43 @@ pub(crate) enum ReplacementNamedResourceLifecycleAdmissionError {
     Admission(reims_vgpu_core::TransactionRuntimeError),
 }
 
+impl ReplacementNamedResourceLifecycleAdmissionError {
+    /// Whether no later guest packet can make this lifecycle packet applicable.
+    ///
+    /// A named lifecycle packet -- a delete, a physical replacement -- addresses
+    /// one object-table slot of one task. Both refusals below are statements
+    /// about what that slot *is*, and the packet asking is the head of its own
+    /// channel: nothing behind it can run, so nothing behind it can register the
+    /// object it is waiting for. Holding it therefore does not wait for the
+    /// answer, it prevents the answer.
+    ///
+    /// - **`UnknownResource`** is a slot this device holds no resource for. The
+    ///   packet's whole effect is to revoke a representation, and there is none
+    ///   to revoke, so it is a no-op. `apply_replacement_object_delete` already
+    ///   takes exactly this view of exactly this state and reports
+    ///   `no_registered_object`.
+    /// - **`WrongKind`** is a slot holding an object of another class. A later
+    ///   packet does not change a live object's kind; it would have to delete
+    ///   and recreate, and that recreation arrives with its own lifecycle
+    ///   packet.
+    ///
+    /// `Admission` is not this. That is the transaction runtime declining the
+    /// ordering -- not the submission head yet, a prerequisite outstanding --
+    /// which is precisely the state a retry resolves.
+    ///
+    /// The cost of getting this wrong in the other direction is a whole boot: a
+    /// `ReplacePhysical` naming an unregistered object retried 56 895 times at
+    /// the head of a child channel, and every channel whose stamps waited on
+    /// that one stopped with it -- the compositor included, mid-frame, with the
+    /// desktop already on screen.
+    pub(crate) const fn is_terminal_refusal(&self) -> bool {
+        match self {
+            Self::UnknownResource { .. } | Self::WrongKind { .. } => true,
+            Self::Admission(_) => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementTaskAddressReplacementError {
     UnknownTask(reims_vgpu_protocol::TaskId),
@@ -14142,10 +14179,22 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         // between several scanout buffers and the question this answers is how
         // many of them there are and which representation each present picks.
         // Keying on the display would report the first buffer and go quiet.
+        // The state is the native image behind the representation, not the
+        // representation id: a backing whose physical representation is
+        // rematerialized keeps its id and gets a **new, empty** image, which is
+        // exactly the transition that turns a rendered desktop back into black
+        // and the one a representation-keyed line cannot see.
+        let native_image_state = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            format!("{:?}", allocated.prepared.image().image).hash(&mut hasher);
+            allocated.prepared.representation().get().hash(&mut hasher);
+            hasher.finish()
+        };
         if reims_vgpu_observe::state_changed(
             "replacement_window_present_source",
             source.backing.get(),
-            allocated.prepared.representation().get(),
+            native_image_state,
         ) {
             let image = allocated.prepared.image();
             crate::observe::off(format!(
@@ -23276,6 +23325,66 @@ mod tests {
             ) => assert_eq!(parked, upload_transaction),
             _ => panic!("a retried upload cannot change recording routes"),
         }
+    }
+
+    /// A physical replacement naming an object this device holds no resource
+    /// for is a no-op, and it must refuse rather than wait: it is the head of
+    /// its own channel, so nothing behind it can register the object it would
+    /// be waiting for. A driven macos-13 boot retried exactly this packet
+    /// 56 895 times at the head of a child channel and stopped every channel
+    /// whose stamps waited on that one -- the compositor included, with the
+    /// desktop already on screen.
+    #[test]
+    fn a_physical_replacement_naming_no_resource_refuses_instead_of_holding_its_channel() {
+        let Some(mut runtime) = runtime_session() else {
+            return;
+        };
+        let task = reims_vgpu_protocol::TaskId::new(1);
+        runtime.define_task(task, 0x40_0000, 2).unwrap();
+        let channel = reims_vgpu_protocol::ChannelId::new(2);
+        runtime.define_channel(channel).unwrap();
+        let object = reims_vgpu_protocol::ObjectTableRef::new(15);
+        let reason =
+            crate::runtime::replacement_child_packet::admit_replacement_physical_replacement(
+                &mut runtime,
+                channel,
+                Box::new([]),
+                None,
+                crate::runtime::replacement_child_packet::DecodedReplacementResourceDelete {
+                    task,
+                    object,
+                },
+            )
+            .expect_err("no resource is registered in that slot");
+        assert_eq!(
+            reason,
+            ReplacementNamedResourceLifecycleAdmissionError::UnknownResource { task, object }
+        );
+        assert!(reason.is_terminal_refusal());
+        // The ingress wrapper is what the channel actually consults, so the
+        // two must agree or the refusal never reaches the packet.
+        let ingress =
+            crate::runtime::replacement_child_packet::ReplacementChildCpuPacketIngressError::ResourceAdmission {
+                reason,
+                route: crate::runtime::replacement_child_packet::ReplacementChildPacketRoute::ReplacePhysical(
+                    crate::runtime::replacement_child_packet::DecodedReplacementResourceDelete {
+                        task,
+                        object,
+                    },
+                ),
+            };
+        assert!(ingress.is_terminal_refusal());
+    }
+
+    /// The transaction runtime declining the ordering is the opposite case: it
+    /// is exactly the state a retry resolves, and refusing it would drop guest
+    /// work that was only early.
+    #[test]
+    fn a_lifecycle_packet_declined_for_its_ordering_still_waits() {
+        assert!(!ReplacementNamedResourceLifecycleAdmissionError::Admission(
+            reims_vgpu_core::TransactionRuntimeError::UnknownChannel
+        )
+        .is_terminal_refusal());
     }
 
     fn runtime_session() -> Option<ReplacementRuntimeSession<()>> {

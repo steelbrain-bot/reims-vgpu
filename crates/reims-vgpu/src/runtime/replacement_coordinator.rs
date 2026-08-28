@@ -7816,11 +7816,13 @@ impl ReplacementDeviceCoordinator<()> {
                     .apply_notification(&self.runtime, host, &self.transport, transaction)
             {
                 if step != ReplacementPresentCompletionProgress::WrongStage {
+                    crate::runtime::contract_census::note(step.census_step());
                     progress.push(step);
                 }
             }
             if let Some(step) = self.present.complete(&mut self.runtime, transaction) {
                 if step != ReplacementPresentCompletionProgress::WrongStage {
+                    crate::runtime::contract_census::note(step.census_step());
                     progress.push(step);
                 }
             }

@@ -551,10 +551,12 @@ impl ReplacementChildCpuPacketIngressError {
     /// answered, so the only thing retrying it buys is the channel behind it.
     ///
     /// See
-    /// [`crate::runtime::replacement_session::ReplacementStandaloneInvalidationError::is_terminal_refusal`].
-    /// Everything else here waits on state a later packet supplies -- a task, a
-    /// resource, a mapping, a display present's resolution -- and the retry is
-    /// exactly what delivers it.
+    /// [`crate::runtime::replacement_session::ReplacementStandaloneInvalidationError::is_terminal_refusal`]
+    /// and
+    /// [`crate::runtime::replacement_session::ReplacementNamedResourceLifecycleAdmissionError::is_terminal_refusal`],
+    /// which carry the argument for their own arms. Everything else here waits
+    /// on state a later packet supplies -- a task, a mapping, a display
+    /// present's resolution -- and the retry is exactly what delivers it.
     pub(crate) const fn is_terminal_refusal(&self) -> bool {
         match self {
             Self::InvalidationAdmission { reason, .. } => match reason {
@@ -563,6 +565,7 @@ impl ReplacementChildCpuPacketIngressError {
                 }
                 ReplacementChildInvalidationAdmissionError::Admission(_) => false,
             },
+            Self::ResourceAdmission { reason, .. } => reason.is_terminal_refusal(),
             Self::Decode(_)
             | Self::RequiresTransport(_)
             | Self::TypedRefusal { .. }
@@ -570,7 +573,6 @@ impl ReplacementChildCpuPacketIngressError {
             | Self::PresentAdmission { .. }
             | Self::ControlAdmission { .. }
             | Self::QueryAdmission { .. }
-            | Self::ResourceAdmission { .. }
             | Self::MappingChangeAdmission { .. } => false,
         }
     }
