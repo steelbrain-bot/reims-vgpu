@@ -2675,25 +2675,28 @@ impl<Semantic: Clone> ReplacementExecutionOwners<Semantic> {
                     resource,
                 ))?;
         let (topology, mut capabilities) = device.representation_environment();
+        let runs = guest.runs().len();
         // A host-pointer import accepts one contiguous host range, so a guest
         // allocation that reaches this device as several physical runs has no
-        // import to take and falls to a staging route. That is a different
-        // object from an imported one -- it holds nothing until something plans
-        // its upload -- and which allocations land there is the first fact a
-        // stale-representation reading needs. It is silent otherwise: the route
-        // is chosen correctly and no refusal is emitted.
-        if capabilities.imported_transfer && guest.runs().len() != 1 {
+        // import to take and falls to a staging route.
+        capabilities.imported_transfer &= runs == 1;
+        let route = Self::guest_transfer_route(descriptor.storage_mode(), topology, capabilities)?;
+        // A staging object is not an imported one: it aliases nothing and holds
+        // nothing until something plans its upload. Which allocations land
+        // there, what storage mode they declare and whether the import was
+        // unavailable to the host or only to this allocation are the three
+        // facts a stale-representation reading needs, and none of them could be
+        // recovered from the log. The route is chosen the same way either way,
+        // so this changes no decision the guest depends on.
+        if let reims_vgpu_core::RepresentationRoute::HostStagingTransfer { working } = route {
+            let resource = resource.index();
+            let backing = backing.get();
+            let mode = descriptor.storage_mode();
+            let bytes = descriptor.allocation_size;
             crate::observe::off(format!(
-                "replacement_scattered_guest_allocation resource={} backing={}                  storage_mode={:?} runs={} bytes={}",
-                resource.index(),
-                backing.get(),
-                descriptor.storage_mode(),
-                guest.runs().len(),
-                descriptor.allocation_size
+                "replacement_staging_representation resource={resource} backing={backing} storage_mode={mode:?} working={working:?} runs={runs} bytes={bytes}"
             ));
         }
-        capabilities.imported_transfer &= guest.runs().len() == 1;
-        let route = Self::guest_transfer_route(descriptor.storage_mode(), topology, capabilities)?;
         match route {
             reims_vgpu_core::RepresentationRoute::ImportedGuestTransfer { working } => {
                 if self

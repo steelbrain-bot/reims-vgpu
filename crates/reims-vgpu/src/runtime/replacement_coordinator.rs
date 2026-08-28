@@ -8503,11 +8503,11 @@ impl ReplacementDeviceCoordinator<()> {
                     for (view, representation, route, holds) in
                         self.runtime.execution_representation_coverage(backing)
                     {
+                        let channel = channel.get();
+                        let backing = backing.get();
+                        let representation = representation.get();
                         crate::observe::fail(format!(
-                            "replacement_refused_stale_representation channel={} backing={}                              view={view:?} representation={} route={route:?} holds=[{holds}]",
-                            channel.get(),
-                            backing.get(),
-                            representation.get()
+                            "replacement_refused_stale_representation channel={channel} backing={backing} view={view:?} representation={representation} route={route:?} holds=[{holds}]"
                         ));
                     }
                 }
