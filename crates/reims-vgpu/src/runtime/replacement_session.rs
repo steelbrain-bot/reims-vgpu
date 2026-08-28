@@ -6184,7 +6184,7 @@ impl ReplacementExecResourceTableError {
     pub(crate) const fn is_terminal_refusal(&self) -> bool {
         match self {
             Self::ResourceAbsent {
-                slot: reims_vgpu_core::ObjectSlotState::Released,
+                slot: reims_vgpu_core::ObjectSlotState::Released(_),
                 ..
             } => true,
             Self::ResourceAbsent { .. }
@@ -15186,14 +15186,14 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .graph()
             .resource(resource)
             .expect("a resolved resource remains in the canonical graph");
-        let (task, object) = (node.task, node.object);
+        let (task, object, live_kind) = (node.task, node.object, node.kind);
         if crate::observe::first_sight(
             "replacement_object_name_rebound",
             synchronize_object_discriminant(task, object),
         ) {
             crate::observe::off(format!(
                 "replacement_object_name_rebound task={} object={} released={resource:?} \
-                 reason={disagreement:?}",
+                 live_kind={live_kind:?} declared_kind={kind:?} reason={disagreement:?}",
                 task.get(),
                 object.get()
             ));
@@ -22020,7 +22020,7 @@ mod tests {
             )
         };
 
-        let released = absent(reims_vgpu_core::ObjectSlotState::Released);
+        let released = absent(reims_vgpu_core::ObjectSlotState::Released(None));
         assert!(released.is_terminal_refusal());
         let reservations = released
             .into_terminal_reservations()
@@ -37615,7 +37615,7 @@ mod tests {
         };
 
         assert!(
-            absent(reims_vgpu_core::ObjectSlotState::Released).is_terminal_refusal(),
+            absent(reims_vgpu_core::ObjectSlotState::Released(None)).is_terminal_refusal(),
             "a name the guest has retired cannot be bound again under the same \
              identity, so re-offering the packet asks a question whose answer \
              cannot change"

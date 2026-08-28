@@ -674,6 +674,12 @@ struct NamespaceSlot {
     index: u32,
     next_generation: u32,
     current: Option<AnyResourceId>,
+    /// The generation this name last held, kept after release.
+    ///
+    /// A refusal that says only "released" cannot be acted on: it does not say
+    /// whether the name was retired long ago or emptied a moment before by a
+    /// rebind whose replacement never landed, and those are opposite defects.
+    released: Option<AnyResourceId>,
 }
 
 /// What [`ResourceGraph::slot_state`] found for one object-table name.
@@ -682,8 +688,9 @@ pub enum ObjectSlotState {
     /// No declaration this device admitted has ever named this slot.
     Undeclared,
     /// The slot was bound and its object has since been released, so the name
-    /// is free for the guest to reuse under a new generation.
-    Released,
+    /// is free for the guest to reuse under a new generation. Carries the
+    /// generation it last held, which is what says *which* release emptied it.
+    Released(Option<AnyResourceId>),
     /// The slot names a live resource.
     Bound(AnyResourceId),
 }
@@ -972,6 +979,7 @@ impl ResourceGraph {
                 index,
                 next_generation: 1,
                 current: None,
+                released: None,
             })
         };
         let id = ResourceId::new(slot.index, slot.next_generation);
@@ -1045,7 +1053,7 @@ impl ResourceGraph {
             None => ObjectSlotState::Undeclared,
             Some(slot) => match slot.current {
                 Some(resource) => ObjectSlotState::Bound(resource),
-                None => ObjectSlotState::Released,
+                None => ObjectSlotState::Released(slot.released),
             },
         }
     }
@@ -2104,6 +2112,7 @@ impl ResourceGraph {
             return Err(GraphError::ReferenceUnbound);
         }
         slot.current = None;
+        slot.released = Some(id);
         self.resources
             .get_mut(&id)
             .ok_or(GraphError::ResourceAbsent)?
@@ -2248,7 +2257,8 @@ mod tests {
         graph.release_resource(resource).unwrap();
         assert_eq!(
             graph.slot_state(task(), object(47)),
-            ObjectSlotState::Released
+            ObjectSlotState::Released(Some(resource)),
+            "an emptied name says which generation emptied it"
         );
         assert_eq!(graph.resolve(task(), object(47)), None);
 
