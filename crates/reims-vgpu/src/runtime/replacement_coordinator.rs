@@ -386,17 +386,30 @@ where
     //
     // `None` is for the routes whose refusal genuinely names no view: the
     // readiness check asks for *any* designated representation, and the
-    // replaced-physical sweep is about a backing's whole set. Those recover
-    // the owner from the backing as they always have, and inventing a view for
-    // them would be a guess rather than a repair.
-    let owner = match view {
-        Some(reims_vgpu_core::BackingView::Image(owner)) => Some(owner.texture()),
+    // replaced-physical sweep is about a backing's whole set. Those name no
+    // owner, so they get all of them --- a plane may be viewed more than once
+    // and each view is its own texture with its own image, so building the
+    // first and stopping is the per-view question asked of the backing one
+    // more time. Inventing a *single* view for them would be that guess; the
+    // whole set is not a guess, it is what the backing declares.
+    let owners = match view {
+        Some(reims_vgpu_core::BackingView::Image(owner)) => vec![owner.texture()],
         Some(reims_vgpu_core::BackingView::Bytes) | None => {
-            runtime.io_surface_plane_view_owner(backing)
+            runtime.io_surface_plane_view_owners(backing)
         }
     };
-    if let Some(plane_view) = owner.filter(|resource| runtime.is_io_surface_plane_view(*resource)) {
-        return materialize_io_surface_plane_view(runtime, host, page_shift, plane_view);
+    let mut planes = owners
+        .into_iter()
+        .filter(|resource| runtime.is_io_surface_plane_view(*resource))
+        .peekable();
+    if planes.peek().is_some() {
+        // Each plane view carries its own guard against rebuilding an image it
+        // already has, so this is a repair of exactly the ones that are
+        // missing however many times it runs.
+        for plane_view in planes.collect::<Vec<_>>() {
+            materialize_io_surface_plane_view(runtime, host, page_shift, plane_view)?;
+        }
+        return Ok(());
     }
     prepare_task_address_backing_representation(runtime, host, page_shift, backing)
 }
@@ -525,12 +538,17 @@ fn prepare_replaced_physical_representations<Semantic>(
     Semantic: Clone,
 {
     for &backing in backings {
-        if runtime.backing_has_execution_representation(backing) {
-            crate::observe::off(format!(
-                "replacement_replaced_physical_representation backing={backing:?} status=retained"
-            ));
-            continue;
-        }
+        // No "does this backing have one already" short circuit. Replacement
+        // revokes *every* view a backing designated, and a backing carries one
+        // image per texture declared over its range, so `any designated` is the
+        // per-view question asked of the backing again: a backing whose second
+        // texture had re-materialized first would read as retained and leave
+        // the first absent for the rest of the boot.
+        //
+        // Running unconditionally costs nothing, because the materializer this
+        // calls already walks the backing's resources and skips each one that
+        // has its own view. That per-resource skip is the correct one and it is
+        // the only one there should be.
         match prepare_backing_representation(runtime, host, page_shift, backing, None) {
             Ok(()) => crate::observe::off(format!(
                 "replacement_replaced_physical_representation backing={backing:?} \
@@ -9072,7 +9090,6 @@ mod tests {
         // materializing a plane builds its staging endpoint before its image,
         // so the backing answers yes at a point where the image does not exist.
         assert!(runtime.resource_has_execution_representation(view.resource));
-        assert!(runtime.backing_has_execution_representation(view.backing));
 
         // Repairing again is a no-op rather than a second image or a duplicate
         // refusal. The repair runs once per drain tick for as long as anything
@@ -9191,34 +9208,68 @@ mod tests {
         assert!(!runtime.resource_has_execution_representation(first.resource));
         assert!(!runtime.resource_has_execution_representation(second.resource));
 
-        // Asking with no view builds whichever owner the backing lists first.
-        // That is all a repair given only a backing can do, and it is why the
-        // second view's image never appeared however often it ran.
+        // Naming no view means the backing's whole set, which is what the two
+        // routes that pass `None` -- the readiness check and the
+        // replaced-physical sweep -- actually mean by it. Building the first
+        // owner and stopping is what left the second view's image absent
+        // however often the repair ran, and it is what this asserts against:
+        // both views, from one call, with neither built beforehand.
         prepare_backing_representation(&mut runtime, &mut host, shift, first.backing, None)
             .unwrap();
-        let built_first = runtime.resource_has_execution_representation(first.resource);
-        let built_second = runtime.resource_has_execution_representation(second.resource);
-        assert!(
-            built_first != built_second,
-            "the view-less repair builds exactly one of the two"
-        );
-
-        // Naming the view that is missing builds that one. The failure carries
-        // it, so the repair can be asked the same question the refusal asked.
-        let absent = if built_first { second } else { first };
-        let view = reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::owning(
-            absent.resource,
-        ));
-        assert!(!runtime.backing_view_is_represented(absent.backing, view));
-        prepare_backing_representation(&mut runtime, &mut host, shift, absent.backing, Some(view))
-            .unwrap();
-        assert!(
-            runtime.resource_has_execution_representation(absent.resource),
-            "the repair builds the view it was named, not the one already there"
-        );
-        assert!(runtime.backing_view_is_represented(absent.backing, view));
         assert!(runtime.resource_has_execution_representation(first.resource));
         assert!(runtime.resource_has_execution_representation(second.resource));
+
+        // Idempotent: every plane view guards its own image, so a repair that
+        // runs once per drain tick builds nothing the second time rather than
+        // refusing a duplicate.
+        prepare_backing_representation(&mut runtime, &mut host, shift, first.backing, None)
+            .unwrap();
+        assert!(runtime.resource_has_execution_representation(first.resource));
+        assert!(runtime.resource_has_execution_representation(second.resource));
+
+        // A third view of the same plane, declared after the others are built,
+        // is the case a *named* repair exists for: the refusal carries the
+        // view, and the repair builds that one rather than reporting success
+        // over an image that was already there.
+        let third =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                44,
+                plane_view(44),
+            )
+            .unwrap();
+        assert_eq!(third.backing, first.backing);
+        let named = reims_vgpu_core::BackingView::Image(reims_vgpu_core::ImageOwner::owning(
+            third.resource,
+        ));
+        assert!(!runtime.backing_view_is_represented(third.backing, named));
+        prepare_backing_representation(&mut runtime, &mut host, shift, third.backing, Some(named))
+            .unwrap();
+        assert!(runtime.backing_view_is_represented(third.backing, named));
+        assert!(runtime.resource_has_execution_representation(third.resource));
+
+        // And the replaced-physical sweep reaches the same set. It used to ask
+        // whether the backing had *any* representation and report `retained`
+        // when it did, which on a backing carrying more than one view is the
+        // per-view question asked of the backing again: whichever view came
+        // back first suppressed the repair of every other one.
+        let fourth =
+            crate::runtime::replacement_object_lifecycle::apply_replacement_iosurface_plane_view(
+                &mut runtime,
+                task,
+                45,
+                plane_view(45),
+            )
+            .unwrap();
+        assert!(!runtime.resource_has_execution_representation(fourth.resource));
+        prepare_replaced_physical_representations(
+            &mut runtime,
+            &mut host,
+            shift,
+            &[fourth.backing],
+        );
+        assert!(runtime.resource_has_execution_representation(fourth.resource));
     }
 
     /// Two textures declared over one guest range are two textures, so both

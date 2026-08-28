@@ -15427,19 +15427,36 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     /// node for it lets a repair that starts from a backing reach the same
     /// materializer the object-ready route reaches from a resource, rather than
     /// carrying a second idea of which resource describes a plane.
-    pub(crate) fn io_surface_plane_view_owner(
+    /// Every plane view declared over one plane's backing, in owner order.
+    ///
+    /// Plural because a plane may be viewed more than once and each view is
+    /// its own texture with its own image. A caller that takes the first owner
+    /// and stops has answered a per-view question with a backing again, which
+    /// on a driven boot left one of two views absent for the rest of the run
+    /// while the repair that was supposed to build it reported success.
+    ///
+    /// Empty for a backing that is not a plane, which is the caller's signal
+    /// to take the task-address route instead.
+    pub(crate) fn io_surface_plane_view_owners(
         &self,
         backing: reims_vgpu_protocol::BackingId,
-    ) -> Option<ResourceId<reims_vgpu_protocol::ResourceObject>> {
+    ) -> Vec<ResourceId<reims_vgpu_protocol::ResourceObject>> {
         let graph = self.execution.resources().graph();
-        let storage = graph.storage(backing)?;
+        let Some(storage) = graph.storage(backing) else {
+            return Vec::new();
+        };
         if storage.backing.class() != reims_vgpu_core::StorageClass::IOSurfacePlane {
-            return None;
+            return Vec::new();
         }
-        storage.owners.iter().copied().find(|owner| {
-            self.io_surface_plane_view_materialization_facts(*owner)
-                .is_some()
-        })
+        storage
+            .owners
+            .iter()
+            .copied()
+            .filter(|owner| {
+                self.io_surface_plane_view_materialization_facts(*owner)
+                    .is_some()
+            })
+            .collect()
     }
 
     pub(crate) fn io_surface_plane_view_materialization_facts(
@@ -15619,16 +15636,6 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .resolved_backing(resource)
     }
 
-    pub(crate) fn backing_has_execution_representation(
-        &self,
-        backing: reims_vgpu_protocol::BackingId,
-    ) -> bool {
-        self.execution
-            .resources()
-            .any_designated_representation(backing)
-            .is_ok()
-    }
-
     /// Whether this resource is installed onto another resource's image
     /// rather than owning one of its own.
     ///
@@ -15690,10 +15697,9 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     /// Whether this resource's own view of its backing has been materialized.
     ///
     /// The question materialization has to ask, and it is not
-    /// [`Self::backing_has_execution_representation`]: a backing carries one
-    /// image per texture declared over its range, so another texture having
-    /// materialized says nothing about this one. Asking the backing skips the
-    /// second alias, and every draw that names it then refuses with
+    /// a question about the backing: a backing carries one image per texture
+    /// declared over its range, so another texture having materialized says
+    /// nothing about this one. Asking the backing skips the second alias, and every draw that names it then refuses with
     /// `MissingExecutionRepresentation` and parks its channel.
     ///
     /// It asks about the *view this resource materializes into* rather than
