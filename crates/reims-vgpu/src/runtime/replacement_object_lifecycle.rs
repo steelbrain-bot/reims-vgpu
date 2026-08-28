@@ -281,7 +281,23 @@ pub(crate) enum ReplacementIOSurfacePlaneViewRefusal {
         plane: u32,
         count: u8,
     },
-    PlaneGeometryMismatch,
+    /// The view's own geometry is not the geometry the parent declared for
+    /// the plane it selects.
+    ///
+    /// Both geometries, the plane, and the record variant, because none of
+    /// them is inferable from the others and the repair differs by which
+    /// term is wrong: a factor of two on one axis is chroma subsampling
+    /// counted in the wrong units, a small excess is an alignment the parent
+    /// declaration rounds and the view does not, and a `ColorView` that
+    /// mismatches where a `Plane` would not means the two record variants do
+    /// not in fact share a geometry contract. A boot has already been spent
+    /// on this refusal reporting only its own name.
+    PlaneGeometryMismatch {
+        record: Option<reims_vgpu_protocol::IOSurfacePlaneViewRecordKind>,
+        plane: u32,
+        view: (u32, u32, u32),
+        declared: (u32, u32),
+    },
     Declaration(crate::runtime::replacement_session::ReplacementIOSurfacePlaneViewDeclarationError),
 }
 
@@ -512,9 +528,18 @@ pub(crate) fn apply_replacement_iosurface_plane_view<Semantic: Clone>(
         });
     };
     let declared_plane = parent.planes[plane];
-    if view.width != declared_plane.width || view.height != declared_plane.height || view.depth != 1
-    {
-        return Err(ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch);
+    // `depth` is not re-checked here: the decoder admits a view only when it
+    // decodes as 1, so a second test of it could never fail and would read as
+    // cover this refusal does not have.
+    if view.width != declared_plane.width || view.height != declared_plane.height {
+        return Err(
+            ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch {
+                record: view_resource.record_kind,
+                plane: view.plane_index,
+                view: (view.width, view.height, view.depth),
+                declared: (declared_plane.width, declared_plane.height),
+            },
+        );
     }
     runtime
         .declare_io_surface_plane_view(

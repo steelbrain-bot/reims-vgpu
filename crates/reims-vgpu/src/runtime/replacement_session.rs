@@ -26708,7 +26708,18 @@ mod tests {
                 invalid_view_object,
                 reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(invalid_view),
             ),
-            Err(crate::runtime::replacement_object_lifecycle::ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch)
+            // Every term the refusal carries, so a reading of it off a boot
+            // can be trusted to name the axis that is wrong: only the width
+            // was perturbed and only the width may differ here.
+            Err(crate::runtime::replacement_object_lifecycle::ReplacementIOSurfacePlaneViewRefusal::PlaneGeometryMismatch {
+                record: plane_view.record_kind,
+                plane: plane_view.view.unwrap().plane_index,
+                view: (641, plane_view.view.unwrap().height, plane_view.view.unwrap().depth),
+                declared: (
+                    descriptor.planes[plane_view.view.unwrap().plane_index as usize].width,
+                    descriptor.planes[plane_view.view.unwrap().plane_index as usize].height,
+                ),
+            })
         );
         assert!(runtime
             .resolve_resource(
