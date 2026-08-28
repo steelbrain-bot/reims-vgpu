@@ -14278,6 +14278,26 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 ));
             }
         }
+        // Which backing this present took, reported whenever it differs from
+        // the one before it. The line above is keyed per backing and so goes
+        // quiet once each buffer has been seen once; this one is keyed on the
+        // display, so it draws the guest's own flip chain. A guest that draws
+        // only its damage into whichever buffer it takes needs that buffer to
+        // still hold what it held when it was last presented, and a chain that
+        // has collapsed to one buffer -- or that never returns to a buffer it
+        // used -- is the difference between a desktop and a black screen with
+        // the newest damage on it.
+        if reims_vgpu_observe::state_changed(
+            "replacement_window_present_rotation",
+            u64::from(source.display_index),
+            source.backing.get(),
+        ) {
+            crate::observe::off(format!(
+                "replacement_window_present_rotation display={} backing={}",
+                source.display_index,
+                source.backing.get()
+            ));
+        }
         let surface =
             reims_vgpu_protocol::SurfaceId::new(allocated.prepared.present().source.display_index);
         let offered = reims_vgpu_core::SwapchainState {

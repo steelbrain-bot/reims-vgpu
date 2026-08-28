@@ -3062,6 +3062,28 @@ pub(crate) fn resolve_render_pass_attachments<Semantic: Clone>(
                 })
             })
             .transpose()?;
+        // Which backing this pass writes and how it opens it, once per
+        // backing and again whenever that backing's opening changes. A guest
+        // that composites only its damage opens the scanout it took with
+        // `Load` and relies on the buffer still holding the frame it last
+        // presented; a scanout opened with `Clear` or `DontCare` instead is a
+        // black screen carrying only the newest damage, which is what the
+        // counters alone cannot separate from a present that never ran.
+        if reims_vgpu_observe::state_changed(
+            "replacement_render_attachment_open",
+            target.backing.get(),
+            u64::from(load as u32) << 8 | u64::from(store as u32),
+        ) {
+            crate::observe::off(format!(
+                "replacement_render_attachment_open backing={} slot={slot} load={} store={} \
+                 extent={}x{}",
+                target.backing.get(),
+                load_action_census_name(load),
+                store_action_census_name(store),
+                target.extent[0],
+                target.extent[1],
+            ));
+        }
         resolved.push(ResolvedRenderAttachment {
             role,
             resource: target.resource,
