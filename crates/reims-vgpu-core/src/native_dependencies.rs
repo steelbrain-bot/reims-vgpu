@@ -118,6 +118,17 @@ impl NativeDependencyOwner {
         Ok(())
     }
 
+    /// Whether this transaction has a native submission point yet.
+    ///
+    /// A producer without one cannot be waited on natively, so a consumer that
+    /// names it is parked until it appears. Asked *before* a consumer takes an
+    /// exclusive claim, this is what keeps the consumer from holding what the
+    /// producer needs in order to reach a point at all.
+    #[must_use]
+    pub fn has_submission_point(&self, transaction: TransactionId) -> bool {
+        self.points.contains_key(&transaction)
+    }
+
     /// Candidates still parked, each with the producers that have no native
     /// submission point yet.
     ///

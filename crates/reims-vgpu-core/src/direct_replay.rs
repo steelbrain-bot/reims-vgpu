@@ -301,6 +301,12 @@ impl<Semantic: Clone> DirectReplayNativeOwner<Semantic> {
         self.dependencies.parked_candidates()
     }
 
+    /// See [`NativeDependencyOwner::has_submission_point`].
+    #[must_use]
+    pub fn has_submission_point(&self, transaction: TransactionId) -> bool {
+        self.dependencies.has_submission_point(transaction)
+    }
+
     pub fn queue_candidate(
         &mut self,
         transaction: TransactionId,

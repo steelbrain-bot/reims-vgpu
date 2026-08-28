@@ -4871,6 +4871,17 @@ pub(crate) enum ReplacementExecImagePreparationRefusal {
     /// The predecessor's own position travels with the refusal so the log can
     /// be read against `replacement_submission_order` directly.
     BehindUnsubmittedPredecessor(reims_vgpu_core::UnsubmittedPredecessor),
+    /// A producer this transaction waits on has no native submission point
+    /// yet, so this transaction cannot submit either.
+    ///
+    /// The same fact as [`Self::BehindUnsubmittedPredecessor`] reached across
+    /// domains rather than along one. A guest wait bound to a stamp another
+    /// channel signals gives a consumer a producer that was admitted *after*
+    /// it, on whatever domain that channel uses, so the domain-sequence rule
+    /// cannot see the pair -- and an exclusive image claim taken here is held
+    /// until the producer submits, which the producer cannot do while it is
+    /// refused for the very image the consumer holds.
+    BehindUnsubmittedProducer(reims_vgpu_protocol::TransactionId),
     /// No runtime tracks this transaction's order, so nothing can be said
     /// about what it sits behind.
     ///
@@ -4902,7 +4913,9 @@ impl ReplacementExecImagePreparationRefusal {
     pub const fn releases_prepared_resources(self) -> bool {
         match self {
             Self::Images(_) => false,
-            Self::BehindUnsubmittedPredecessor(_) | Self::SubmissionOrderUntracked => true,
+            Self::BehindUnsubmittedPredecessor(_)
+            | Self::BehindUnsubmittedProducer(_)
+            | Self::SubmissionOrderUntracked => true,
         }
     }
 }
@@ -12804,7 +12817,46 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         // The order is read from the runtime that tracks this transaction, not
         // from the active generation, because an exec is not active-scoped.
         let transaction = resources.transaction();
-        let refusal = match self.execution.runtime_owning_submission_order(transaction) {
+        // A producer this transaction waits on that has no native submission
+        // point yet is the same fact as an unsubmitted predecessor, reached
+        // across domains instead of along one. A guest wait bound to a stamp
+        // another channel signals makes the consumer's producer arrive *after*
+        // the consumer was admitted, so the two need not share a domain and
+        // the sequence rule below cannot see the pair at all.
+        //
+        // Holding the claim then prevents the release: the consumer cannot
+        // submit until the producer does, the producer cannot record while the
+        // consumer holds an image it uses, and both retry forever with every
+        // stall counter reading healthy.
+        let unsubmitted_producer = match self.execution.runtime_owning_submission_order(transaction)
+        {
+            Some(runtime) => match runtime.native_submission_dependencies(transaction) {
+                Ok(reims_vgpu_core::NativeSubmissionProjection::Native(producers)) => producers
+                    .iter()
+                    .map(|&(producer, _)| producer)
+                    .find(|producer| !self.execution.epoch.native.has_submission_point(*producer)),
+                Ok(reims_vgpu_core::NativeSubmissionProjection::AwaitingHostProducer(producer)) => {
+                    Some(producer)
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let producer_refusal = unsubmitted_producer.map(|producer| {
+            if crate::observe::first_sight(
+                "replacement_behind_unsubmitted_producer",
+                (producer.get() << 20) | (transaction.get() & 0xf_ffff),
+            ) {
+                crate::observe::fail(format!(
+                    "replacement_behind_unsubmitted_producer producer={} consumer={} \
+                     reason=claim_behind_unsubmitted_producer",
+                    producer.get(),
+                    transaction.get()
+                ));
+            }
+            ReplacementExecImagePreparationRefusal::BehindUnsubmittedProducer(producer)
+        });
+        let refusal = producer_refusal.or(match self.execution.runtime_owning_submission_order(transaction) {
             Some(runtime) => match runtime.unsubmitted_submission_predecessor(transaction) {
                 Ok(Some(ahead)) => {
                     // Report the answering runtime's own entry for the
@@ -12863,7 +12915,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 Err(_) => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
             },
             None => Some(ReplacementExecImagePreparationRefusal::SubmissionOrderUntracked),
-        };
+        });
         if let Some(reason) = refusal {
             // Give the claims back before the refusal is retained. Everything
             // this preparation took -- resource uses, planned GPU writes, and
@@ -35076,6 +35128,100 @@ mod tests {
             reason.resources.is_none(),
             "an ordering refusal keeps nothing"
         );
+    }
+
+    /// A consumer whose producer has not submitted takes no image claim, even
+    /// when it is its own domain's head.
+    ///
+    /// The domain-sequence rule beside this one cannot see the pair: a guest
+    /// wait bound to a stamp another channel signals gives a consumer a
+    /// producer on a *different* domain, admitted after it, so both are heads
+    /// and both pass that rule. A driven macos-13 boot wedged its whole
+    /// compositor on exactly that shape --- a recorded transaction parked on a
+    /// producer it waits for, holding the image the producer needed in order
+    /// to record at all, with `blocked_retries` climbing past forty thousand
+    /// and every stall counter reading healthy.
+    #[test]
+    fn a_consumer_whose_producer_has_not_submitted_takes_no_image_claim() {
+        let Some(mut scaffold) = guest_upload_scaffold() else {
+            return;
+        };
+        let (current_resource, current, stale_resource, stale, rows) =
+            two_textures_over_one_allocation(&mut scaffold);
+        let endpoint = linear_texture_endpoint(scaffold.backing);
+        let bytes = scaffold.execution;
+        make_every_view_current(&mut scaffold, current, &[bytes, stale], &rows);
+
+        // Its own channel, so it is its domain's head and the sequence rule
+        // beside this one has nothing to say about it. Its producer is the
+        // scaffold's, on another domain, with no native submission point.
+        let producer = scaffold.producer.transaction.id;
+        let channel = reims_vgpu_protocol::ChannelId::new(27);
+        scaffold
+            .runtime
+            .execution
+            .runtime_mut()
+            .define_channel(channel)
+            .unwrap();
+        let consumer = scaffold
+            .runtime
+            .execution
+            .runtime_mut()
+            .admit_exec_operations(
+                channel,
+                vec![reims_vgpu_core::ResolvedTransactionPrerequisite {
+                    prerequisite: reims_vgpu_core::TransactionPrerequisite::Stamp {
+                        wait: reims_vgpu_protocol::StampWait {
+                            index: channel.get(),
+                            value: 1,
+                        },
+                    },
+                    resolution: reims_vgpu_core::PrerequisiteResolution::Producer(producer),
+                }],
+                Some(reims_vgpu_core::CompletionStamp::new(channel.get(), 2)),
+                texture_copy_exec(
+                    SubmissionId::new(73),
+                    endpoint(stale_resource),
+                    endpoint(current_resource),
+                ),
+            )
+            .unwrap();
+        let prepared = scaffold
+            .runtime
+            .prepare_admitted_exec(consumer)
+            .unwrap_or_else(|failure| panic!("the consumer must prepare: {:?}", failure.reason));
+        let manifest = scaffold
+            .runtime
+            .preflight_prepared_guest_upload_resources(&prepared)
+            .unwrap_or_else(|reason| panic!("the consumer must preflight: {reason:?}"));
+        assert!(!manifest.requires_guest_upload());
+        let resources = scaffold
+            .runtime
+            .prepare_preflighted_exec_resources(&prepared, manifest)
+            .unwrap_or_else(|_| panic!("the consumer's resource preparation must succeed"));
+        let failure = *scaffold
+            .runtime
+            .prepare_exec_image_states(resources)
+            .err()
+            .unwrap_or_else(|| {
+                panic!("a consumer waiting on an unsubmitted producer must not take the claim")
+            });
+        assert!(
+            matches!(
+                failure.reason,
+                ReplacementExecImagePreparationRefusal::BehindUnsubmittedProducer(named)
+                    if named == producer
+            ),
+            "{:?}",
+            failure.reason
+        );
+        assert!(
+            failure.resources.is_none(),
+            "an ordering refusal keeps nothing"
+        );
+
+        drop(scaffold.runtime);
+        drop(scaffold._guest);
     }
 
     /// A guest-upload phase that refused before it claimed anything is
