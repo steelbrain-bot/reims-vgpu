@@ -132,23 +132,6 @@ pub enum ImageLayoutRefusal {
     OffsetNotElementAligned { offset: u64, bytes_per_element: u64 },
     /// The byte range is not a whole number of elements.
     LengthNotElementAligned { length: u64, bytes_per_element: u64 },
-    /// The byte range covers a shape no single texel box expresses -- a
-    /// part-row start with a multi-row length, or a row count past the level
-    /// that does not divide into whole images.
-    ///
-    /// `tight_row_stride` is the level's `width * bytes_per_element`, and it
-    /// is here because the interesting case is a range that is rectangular in
-    /// the level's tight rows and not in its padded ones. Against `row_stride`
-    /// it says whether the producer computed the range from the wrong stride,
-    /// and it is not recoverable from the other terms. The range's own length
-    /// is not repeated: the `TransferKey` beside this refusal carries it.
-    RangeNotRectangular {
-        offset_in_row: u64,
-        row_stride: u64,
-        tight_row_stride: u64,
-        row: u64,
-        height: u32,
-    },
     /// The derived origin and extent are not a texel box.
     ExtentNotATexelBox { origin: [u32; 3], extent: [u32; 3] },
     /// A transfer region that is neither an image region nor a byte range.
@@ -1294,20 +1277,48 @@ fn resolve_alias_bytes_round_trip(
             missing,
         },
     };
-    if matches!(transfer.region, BackingRegion::Image(_)) {
-        return Err(refuse(AliasRoundTripTerm::RegionNamesTexels));
-    }
     let source_layout = resolver
         .resolve_linear_texture_layout(transfer.backing, transfer.source)
         .ok_or_else(|| refuse(AliasRoundTripTerm::SourceLayout))?;
     let destination_layout = resolver
         .resolve_linear_texture_layout(transfer.backing, transfer.destination)
-        .ok_or_else(|| refuse(AliasRoundTripTerm::DestinationLayout))?;
+        .ok_or_else(|| refuse(AliasRoundTripTerm::TransferBytes))?;
     let bytes = resolver
         .resolve_alias_transfer_bytes(transfer.backing, transfer.destination)
         .ok_or_else(|| refuse(AliasRoundTripTerm::TransferBytes))?;
     let out = transfer_image_regions(&source_layout, transfer)?;
-    let back = transfer_image_regions(&destination_layout, transfer)?;
+    // A byte-denominated region means the same thing to both endpoints and
+    // each reads it in its own layout. A texel box does not: it is named in
+    // the coordinates of whichever endpoint recorded the write, and the
+    // disagreement is precisely that those do not carry over. The source is
+    // the endpoint that has to be able to address it -- it is what the first
+    // half of the round trip reads -- so the box is checked against the
+    // source's layout, turned into the bytes it occupies there, and the
+    // destination's texels are derived from those bytes rather than assumed
+    // to be the same box.
+    let back = match transfer.region {
+        BackingRegion::Image(region) => {
+            if !image_region_fits_layout(&source_layout, region, bytes.size) {
+                return Err(refuse(AliasRoundTripTerm::RegionNamesTexels));
+            }
+            let mut derived = Vec::new();
+            for range in image_region_byte_ranges(&source_layout, region)
+                .ok_or_else(|| refuse(AliasRoundTripTerm::RegionNamesTexels))?
+            {
+                derived.extend(transfer_image_regions(
+                    &destination_layout,
+                    TransferKey {
+                        region: BackingRegion::Linear(range),
+                        ..transfer
+                    },
+                )?);
+            }
+            derived
+        }
+        BackingRegion::Whole | BackingRegion::Linear(_) => {
+            transfer_image_regions(&destination_layout, transfer)?
+        }
+    };
     let mut commands = Vec::with_capacity(out.len() + back.len() + 1);
     for region in out {
         commands.push(resolve_buffer_image_transfer_region(
@@ -1591,6 +1602,52 @@ fn resolve_buffer_image_transfer_region(
     })
 }
 
+/// The bytes one texel box occupies in a layout, as the fewest ranges that
+/// cover them.
+///
+/// A row-strided image relates texels to bytes one row at a time, so a box
+/// narrower than its level is a range per row; a full-width box is contiguous
+/// across the rows it spans, and a full-height one across the planes, so those
+/// coalesce back into single ranges. `None` where the arithmetic leaves the
+/// layout's declared extents, which is the caller's cue that the box does not
+/// belong to this layout at all.
+fn image_region_byte_ranges(
+    layout: &reims_vgpu_protocol::LinearTextureDescriptor,
+    region: reims_vgpu_core::ImageRegion,
+) -> Option<Vec<reims_vgpu_core::LinearRange>> {
+    let level = layout.level(region.mip)?;
+    let bytes_per_element = u64::from(layout.bytes_per_element);
+    if bytes_per_element == 0 || level.row_stride == 0 {
+        return None;
+    }
+    let level_offset = layout.subresource_offset(region.layer, region.mip)?;
+    let image_stride = level.row_stride.checked_mul(u64::from(level.height))?;
+    let width = u64::from(region.texels.end[0].checked_sub(region.texels.origin[0])?);
+    let length = width.checked_mul(bytes_per_element)?;
+    if length == 0 {
+        return None;
+    }
+    let mut ranges: Vec<reims_vgpu_core::LinearRange> = Vec::new();
+    for plane in region.texels.origin[2]..region.texels.end[2] {
+        for row in region.texels.origin[1]..region.texels.end[1] {
+            let start = level_offset
+                .checked_add(u64::from(plane).checked_mul(image_stride)?)?
+                .checked_add(u64::from(row).checked_mul(level.row_stride)?)?
+                .checked_add(u64::from(region.texels.origin[0]).checked_mul(bytes_per_element)?)?;
+            match ranges.last_mut() {
+                Some(previous) if previous.end() == start => {
+                    *previous = reims_vgpu_core::LinearRange::new(
+                        previous.start(),
+                        previous.end() - previous.start() + length,
+                    )?;
+                }
+                _ => ranges.push(reims_vgpu_core::LinearRange::new(start, length)?),
+            }
+        }
+    }
+    (!ranges.is_empty()).then_some(ranges)
+}
+
 fn transfer_image_regions(
     layout: &reims_vgpu_protocol::LinearTextureDescriptor,
     transfer: TransferKey,
@@ -1671,18 +1728,30 @@ fn transfer_image_regions(
                 ),
                 ..transfer
             };
-            regions.push(transfer_image_region(layout, region_transfer)?);
+            regions.extend(transfer_image_region(layout, region_transfer)?);
         }
     }
     Ok(regions)
 }
 
+/// The texel boxes one byte range covers inside one subresource.
+///
+/// A row-strided image relates bytes to texels one row at a time, so a byte
+/// range is a union of row segments and not, in general, a rectangle: it may
+/// start part way along a row, end part way along another, and pass over the
+/// padding between a row's declared width and its stride, which belongs to no
+/// texel and carries no content. Reading it as a single box refused every
+/// range that was not already rectangular -- a whole class of ordinary guest
+/// writes -- and reading it as one box per row would emit a copy command for
+/// every row of every upload. So the walk is per row and the result is
+/// coalesced back up: contiguous full-width rows become one box, and
+/// contiguous full-height planes become one box after that.
 fn transfer_image_region(
     layout: &reims_vgpu_protocol::LinearTextureDescriptor,
     transfer: TransferKey,
-) -> Result<reims_vgpu_core::ImageRegion, ResourceStateTransferRecordError> {
+) -> Result<Vec<reims_vgpu_core::ImageRegion>, ResourceStateTransferRecordError> {
     if let BackingRegion::Image(region) = transfer.region {
-        return Ok(region);
+        return Ok(vec![region]);
     }
     let unsupported =
         |refusal| ResourceStateTransferRecordError::ImageLayoutUnsupported { transfer, refusal };
@@ -1723,7 +1792,6 @@ fn transfer_image_region(
             if range.start() < base || range.end() > end {
                 continue;
             }
-            let relative = range.start() - base;
             let image_stride = level
                 .row_stride
                 .checked_mul(u64::from(level.height))
@@ -1736,84 +1804,127 @@ fn transfer_image_region(
                     image_stride,
                 }));
             }
-            let z = relative / image_stride;
-            let within_image = relative % image_stride;
-            let y = within_image / level.row_stride;
-            let x_bytes = within_image % level.row_stride;
-            let length = range.end() - range.start();
-            if x_bytes % bytes_per_element != 0 {
-                return Err(unsupported(ImageLayoutRefusal::OffsetNotElementAligned {
-                    offset: x_bytes,
-                    bytes_per_element,
-                }));
+            let tight_row = u64::from(level.width)
+                .checked_mul(bytes_per_element)
+                .ok_or(ResourceStateTransferRecordError::RangeAddressOverflow(
+                    transfer,
+                ))?;
+            let mut rows: Vec<[u64; 4]> = Vec::new();
+            let mut cursor = range.start() - base;
+            let relative_end = range.end() - base;
+            while cursor < relative_end {
+                let plane = cursor / image_stride;
+                let within_image = cursor % image_stride;
+                let row = within_image / level.row_stride;
+                let offset_in_row = within_image % level.row_stride;
+                let row_base = cursor - offset_in_row;
+                let next_row = row_base + level.row_stride;
+                // The padding past the declared width is not addressable as
+                // texels and holds nothing, so a range that only reaches into
+                // it contributes no copy and simply moves on.
+                let texel_end = relative_end.min(next_row).min(row_base + tight_row);
+                if texel_end > cursor {
+                    if offset_in_row % bytes_per_element != 0 {
+                        return Err(unsupported(ImageLayoutRefusal::OffsetNotElementAligned {
+                            offset: offset_in_row,
+                            bytes_per_element,
+                        }));
+                    }
+                    let length = texel_end - cursor;
+                    if length % bytes_per_element != 0 {
+                        return Err(unsupported(ImageLayoutRefusal::LengthNotElementAligned {
+                            length,
+                            bytes_per_element,
+                        }));
+                    }
+                    rows.push([
+                        plane,
+                        row,
+                        offset_in_row / bytes_per_element,
+                        (offset_in_row + length) / bytes_per_element,
+                    ]);
+                }
+                cursor = next_row;
             }
-            let not_rectangular = || {
-                unsupported(ImageLayoutRefusal::RangeNotRectangular {
-                    offset_in_row: x_bytes,
-                    row_stride: level.row_stride,
-                    tight_row_stride: u64::from(level.width) * bytes_per_element,
-                    row: y,
-                    height: level.height,
-                })
-            };
-            let (width, height, depth) = if length <= level.row_stride - x_bytes {
-                if length % bytes_per_element != 0 {
-                    return Err(unsupported(ImageLayoutRefusal::LengthNotElementAligned {
-                        length,
-                        bytes_per_element,
-                    }));
-                }
-                (length / bytes_per_element, 1, 1)
-            } else if x_bytes == 0 && length % level.row_stride == 0 {
-                let rows = length / level.row_stride;
-                let rows_left = u64::from(level.height).saturating_sub(y);
-                if rows <= rows_left {
-                    (u64::from(level.width), rows, 1)
-                } else if y == 0
-                    && level.row_stride == u64::from(level.width) * bytes_per_element
-                    && rows % u64::from(level.height) == 0
-                {
-                    (
-                        u64::from(level.width),
-                        u64::from(level.height),
-                        rows / u64::from(level.height),
-                    )
-                } else {
-                    return Err(not_rectangular());
-                }
-            } else {
-                return Err(not_rectangular());
-            };
             let coordinate = |term, value| {
                 move |_| unsupported(ImageLayoutRefusal::CoordinateNotRepresentable { term, value })
             };
-            let x_texels = x_bytes / bytes_per_element;
-            let origin = [
-                u32::try_from(x_texels)
-                    .map_err(coordinate(LayoutCoordinateTerm::OriginX, x_texels))?,
-                u32::try_from(y).map_err(coordinate(LayoutCoordinateTerm::OriginY, y))?,
-                u32::try_from(z).map_err(coordinate(LayoutCoordinateTerm::OriginZ, z))?,
-            ];
-            let extent = [
-                u32::try_from(width).map_err(coordinate(LayoutCoordinateTerm::Width, width))?,
-                u32::try_from(height).map_err(coordinate(LayoutCoordinateTerm::Height, height))?,
-                u32::try_from(depth).map_err(coordinate(LayoutCoordinateTerm::Depth, depth))?,
-            ];
-            let texels = reims_vgpu_core::TexelBox::new(origin, extent).ok_or_else(|| {
-                unsupported(ImageLayoutRefusal::ExtentNotATexelBox { origin, extent })
-            })?;
-            if texels.end[0] > level.width
-                || texels.end[1] > level.height
-                || texels.end[2] > level.planes()
-            {
+            // Contiguous full rows of one plane, then contiguous full planes:
+            // an aligned whole-level range therefore records as one command
+            // rather than one per row.
+            let mut boxes: Vec<[u64; 6]> = Vec::new();
+            for [plane, row, first, last] in rows {
+                match boxes.last_mut() {
+                    Some(previous)
+                        if previous[2] == plane
+                            && previous[0] == first
+                            && previous[1] == last
+                            && first == 0
+                            && last == u64::from(level.width)
+                            && previous[3] + previous[4] == row =>
+                    {
+                        previous[4] += 1;
+                    }
+                    _ => boxes.push([first, last, plane, row, 1, 1]),
+                }
+            }
+            let mut merged: Vec<[u64; 6]> = Vec::new();
+            for current in boxes {
+                match merged.last_mut() {
+                    Some(previous)
+                        if previous[0] == current[0]
+                            && previous[1] == current[1]
+                            && previous[3] == current[3]
+                            && previous[4] == current[4]
+                            && current[3] == 0
+                            && current[4] == u64::from(level.height)
+                            && previous[2] + previous[5] == current[2] =>
+                    {
+                        previous[5] += 1;
+                    }
+                    _ => merged.push(current),
+                }
+            }
+            let mut regions = Vec::with_capacity(merged.len());
+            for [first, last, plane, row, height, depth] in merged {
+                let width = last - first;
+                let origin = [
+                    u32::try_from(first)
+                        .map_err(coordinate(LayoutCoordinateTerm::OriginX, first))?,
+                    u32::try_from(row).map_err(coordinate(LayoutCoordinateTerm::OriginY, row))?,
+                    u32::try_from(plane)
+                        .map_err(coordinate(LayoutCoordinateTerm::OriginZ, plane))?,
+                ];
+                let extent = [
+                    u32::try_from(width).map_err(coordinate(LayoutCoordinateTerm::Width, width))?,
+                    u32::try_from(height)
+                        .map_err(coordinate(LayoutCoordinateTerm::Height, height))?,
+                    u32::try_from(depth).map_err(coordinate(LayoutCoordinateTerm::Depth, depth))?,
+                ];
+                let texels = reims_vgpu_core::TexelBox::new(origin, extent).ok_or_else(|| {
+                    unsupported(ImageLayoutRefusal::ExtentNotATexelBox { origin, extent })
+                })?;
+                if texels.end[0] > level.width
+                    || texels.end[1] > level.height
+                    || texels.end[2] > level.planes()
+                {
+                    return Err(ResourceStateTransferRecordError::RangeOutOfBounds(transfer));
+                }
+                regions.push(reims_vgpu_core::ImageRegion {
+                    aspect: reims_vgpu_core::ImageAspect::Color,
+                    mip,
+                    layer,
+                    texels,
+                });
+            }
+            // A range wholly inside one subresource's row padding names no
+            // texels at all. It is not a transfer this device can record and
+            // it is not a loss either, but an empty command list would read as
+            // a completed copy, so it refuses under the range's own name.
+            if regions.is_empty() {
                 return Err(ResourceStateTransferRecordError::RangeOutOfBounds(transfer));
             }
-            return Ok(reims_vgpu_core::ImageRegion {
-                aspect: reims_vgpu_core::ImageAspect::Color,
-                mip,
-                layer,
-                texels,
-            });
+            return Ok(regions);
         }
     }
     Err(ResourceStateTransferRecordError::RangeOutOfBounds(transfer))
@@ -2393,31 +2504,32 @@ mod tests {
             })
         );
 
-        // A byte range that starts mid-row and spans past it is a shape no
-        // single texel box expresses, and the terms that decide that are the
-        // ones carried.
+        // A byte range that starts mid-row and ends mid-row is three row
+        // segments: the tail of the row it starts in, the whole rows between,
+        // and the head of the row it ends in. The four bytes of padding at
+        // the end of each eight-byte row name no texels and are stepped over.
         let ragged = TransferKey {
             region: BackingRegion::Linear(LinearRange::new(1, 16).unwrap()),
             ..transfer
         };
+        let regions = transfer_image_region(&layout(1, false), ragged).unwrap();
         assert_eq!(
-            transfer_image_region(&layout(1, false), ragged),
-            Err(ResourceStateTransferRecordError::ImageLayoutUnsupported {
-                transfer: ragged,
-                refusal: ImageLayoutRefusal::RangeNotRectangular {
-                    offset_in_row: 1,
-                    row_stride: 8,
-                    tight_row_stride: 4,
-                    row: 0,
-                    height: 4,
-                },
-            })
+            regions
+                .iter()
+                .map(|region| (region.texels.origin, region.texels.end))
+                .collect::<Vec<_>>(),
+            vec![
+                ([1, 0, 0], [4, 1, 1]),
+                ([0, 1, 0], [4, 2, 1]),
+                ([0, 2, 0], [1, 3, 1]),
+            ]
         );
 
-        // And the supported shape still resolves.
-        let region = transfer_image_region(&layout(1, false), transfer).unwrap();
-        assert_eq!(region.texels.origin, [0, 0, 0]);
-        assert_eq!(region.texels.end, [4, 4, 1]);
+        // A whole level is still one box and not one per row.
+        let regions = transfer_image_region(&layout(1, false), transfer).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].texels.origin, [0, 0, 0]);
+        assert_eq!(regions[0].texels.end, [4, 4, 1]);
     }
 
     #[test]
@@ -2823,6 +2935,46 @@ mod tests {
                     // The same bytes, read as 128 four-byte texels a row.
                     && copy.buffer_row_length == 128
                     && copy.extent == [128, 64, 1]
+        ));
+
+        // The same pair, with the region named in the source's texels rather
+        // than in bytes. The box is the source's whole 128x64 image; the
+        // destination's own layout reads those same 32 KiB as 64x64, and the
+        // recorded copy has to say so rather than repeat the box.
+        let resolver = Alias {
+            source: layout(4, 128, 80),
+            destination: layout(8, 64, 115),
+            bytes: Some(bytes),
+        };
+        let recorded = resolve_image_image_transfer(
+            TransferKey {
+                region: BackingRegion::Image(reims_vgpu_core::ImageRegion {
+                    aspect: reims_vgpu_core::ImageAspect::Color,
+                    mip: 0,
+                    layer: 0,
+                    texels: reims_vgpu_core::TexelBox::new([0, 0, 0], [128, 64, 1]).unwrap(),
+                }),
+                ..transfer
+            },
+            image(1, 80, 128),
+            source_key,
+            image(2, 115, 64),
+            destination_key,
+            &state,
+            &resolver,
+        )
+        .expect("a box in the source's texels reaches the destination through the bytes");
+        let NativeResourceStateTransfer::Image(commands) = recorded else {
+            panic!("a round trip through the bytes records image commands");
+        };
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(
+            commands[0],
+            NativeImageBlitCommand::ImageToBuffer(copy) if copy.extent == [128, 64, 1]
+        ));
+        assert!(matches!(
+            commands[2],
+            NativeImageBlitCommand::BufferToImage(copy) if copy.extent == [64, 64, 1]
         ));
 
         // Without the bytes to round trip through, the refusal names both the
