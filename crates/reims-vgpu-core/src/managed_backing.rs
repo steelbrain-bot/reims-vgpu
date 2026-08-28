@@ -78,6 +78,15 @@ pub enum ManagedBackingError {
     MissingExecutionRepresentation,
     ExecutionRepresentationAlreadyRetiring,
     StaleExecutionRepresentation,
+    /// The designated object does not hold what the operation needs, and
+    /// something that still exists does.
+    ///
+    /// The repairable half of [`Self::StaleExecutionRepresentation`]. An
+    /// upload or a transfer out of the live holder makes this object current,
+    /// so the operation is early rather than lost -- most often the guest
+    /// wrote its own pages and this object's refresh is still queued behind
+    /// the submission head.
+    ExecutionRepresentationAwaitingContent,
     RepresentationIdentityExhausted,
     MixedEpochs,
     TimelineRegressed,
@@ -94,21 +103,29 @@ impl ManagedBackingError {
     /// life of the device; refusing what a later packet would have satisfied
     /// costs the guest one command it should have kept.
     ///
-    /// Only two arms are waits. A backing this owner does not know is one the
+    /// Three arms are waits. A backing this owner does not know is one the
     /// guest has not declared yet, and a backing with no execution
     /// representation is one nothing has materialized an object over --- both
-    /// are answered by a packet that has not arrived.
+    /// are answered by a packet that has not arrived. The third is
+    /// [`Self::ExecutionRepresentationAwaitingContent`], which is answered by
+    /// an upload already plannable out of a live holder.
     ///
     /// [`Self::StaleExecutionRepresentation`] is deliberately not among them,
     /// and it is the one worth naming. It says the canonical content version
     /// is held by no live representation, which happens when the object that
     /// held it retired; no route plans a transfer out of an object that no
     /// longer exists, so re-offering the operation asks a question whose
-    /// answer can only stay the same.
+    /// answer can only stay the same. Which of the two a stale object is, is
+    /// not a judgement any caller can make from the error --- it is
+    /// [`crate::content_authority::RegionContentState::outstanding_snapshot_is_repairable`],
+    /// asked where the coverage is, so the two never have to be told apart
+    /// again downstream.
     #[must_use]
     pub const fn awaits_declaration(&self) -> bool {
         match self {
-            Self::UnknownBacking | Self::MissingExecutionRepresentation => true,
+            Self::UnknownBacking
+            | Self::MissingExecutionRepresentation
+            | Self::ExecutionRepresentationAwaitingContent => true,
             Self::DuplicateBacking
             | Self::AuthorityMismatch
             | Self::BackingRetiring
@@ -126,6 +143,26 @@ impl ManagedBackingError {
             | Self::TimelineRegressed
             | Self::Content(_)
             | Self::Retirement(_) => false,
+        }
+    }
+}
+
+impl<T> ManagedBacking<T> {
+    /// Which half of "the object does not hold this" applies, asked where the
+    /// coverage lives. See
+    /// [`ManagedBackingError::ExecutionRepresentationAwaitingContent`].
+    fn stale_or_awaiting(
+        &self,
+        candidates: impl IntoIterator<Item = RepresentationId>,
+        snapshot: &[RegionVersion],
+    ) -> ManagedBackingError {
+        if candidates.into_iter().any(|candidate| {
+            self.authority
+                .outstanding_snapshot_is_repairable(candidate, snapshot)
+        }) {
+            ManagedBackingError::ExecutionRepresentationAwaitingContent
+        } else {
+            ManagedBackingError::StaleExecutionRepresentation
         }
     }
 }
@@ -907,7 +944,10 @@ impl<T> ManagedBackingOwner<T> {
                         .as_ref()?,
                 ))
             })
-            .ok_or(ManagedBackingError::StaleExecutionRepresentation)
+            .ok_or_else(|| {
+                record
+                    .stale_or_awaiting(record.execution_representations.values().copied(), snapshot)
+            })
     }
 
     /// Whether one representation is still a view this backing designates.
@@ -1126,7 +1166,7 @@ impl<T> ManagedBackingOwner<T> {
             .authority
             .representation_matches(representation, snapshot)
         {
-            return Err(ManagedBackingError::StaleExecutionRepresentation);
+            return Err(record.stale_or_awaiting([representation], snapshot));
         }
         Ok(representation)
     }
@@ -1149,7 +1189,7 @@ impl<T> ManagedBackingOwner<T> {
             .authority
             .representation_matches(representation, snapshot)
         {
-            return Err(ManagedBackingError::StaleExecutionRepresentation);
+            return Err(record.stale_or_awaiting([representation], snapshot));
         }
         Ok((
             representation,
@@ -2520,6 +2560,45 @@ mod tests {
         (owner, backing)
     }
 
+    /// A stale object is two facts, and they need opposite answers.
+    ///
+    /// Repairable while the guest still holds the content, settled once the
+    /// only holder is gone. One refusal for both cost a driven macos-13 boot
+    /// its whole device: a working buffer waiting for an upload queued behind
+    /// the submission head was refused as unrecoverable, its transaction
+    /// abandoned, and the channel's stamp never advanced again.
+    #[test]
+    fn a_stale_object_the_guest_can_still_repair_is_not_the_same_refusal() {
+        let (mut owner, backing) = owner();
+        let execution = owner
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostVisibleWorking,
+                BackingView::Bytes,
+                "execution",
+            )
+            .unwrap();
+        let snapshot = owner
+            .snapshot_content(backing, &[BackingRegion::Whole])
+            .unwrap();
+        assert_eq!(
+            owner.execution_representation_for_snapshot(backing, BackingView::Bytes, &snapshot),
+            Err(ManagedBackingError::ExecutionRepresentationAwaitingContent)
+        );
+        assert!(ManagedBackingError::ExecutionRepresentationAwaitingContent.awaits_declaration());
+
+        assert!(!ManagedBackingError::StaleExecutionRepresentation.awaits_declaration());
+        // The repair the classification promised is plannable.
+        let transfer = owner
+            .plan_transfers(backing, crate::GUEST_REPRESENTATION, execution, &snapshot)
+            .unwrap();
+        owner.complete_transfer(transfer[0]).unwrap();
+        assert_eq!(
+            owner.execution_representation_for_snapshot(backing, BackingView::Bytes, &snapshot),
+            Ok((execution, &"execution"))
+        );
+    }
+
     /// An execution alias is retired and rebuilt by a physical replacement.
     ///
     /// It has to take an ordinary identity for that to be possible. Pinned to
@@ -2694,9 +2773,12 @@ mod tests {
         let snapshot = owner
             .snapshot_content(backing, &[BackingRegion::Whole])
             .unwrap();
+        // Awaiting rather than stale, and the next two lines are why: the
+        // guest holds this content and a transfer out of it repairs the
+        // object. A refusal here would give up a command that was early.
         assert_eq!(
             owner.execution_representation_for_snapshot(backing, BackingView::Bytes, &snapshot),
-            Err(ManagedBackingError::StaleExecutionRepresentation)
+            Err(ManagedBackingError::ExecutionRepresentationAwaitingContent)
         );
 
         let transfer = owner
@@ -2758,7 +2840,7 @@ mod tests {
         assert_ne!(newer, snapshot);
         assert_eq!(
             owner.execution_representation_for_snapshot(backing, BackingView::Bytes, &newer),
-            Err(ManagedBackingError::StaleExecutionRepresentation)
+            Err(ManagedBackingError::ExecutionRepresentationAwaitingContent)
         );
         let transfer = owner
             .plan_transfers(backing, GUEST_REPRESENTATION, replacement, &newer)

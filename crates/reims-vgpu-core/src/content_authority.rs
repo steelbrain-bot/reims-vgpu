@@ -760,6 +760,32 @@ impl RegionContentState {
             })
     }
 
+    /// Whether what `representation` is missing of `snapshot` is still held,
+    /// at that version, by something that exists.
+    ///
+    /// This is the difference between a stale object an upload can repair and
+    /// a stale object nothing can. Both look identical from the consumer's
+    /// side -- the designated object does not hold what the operation needs --
+    /// and they need opposite answers: the first is "not ready yet" and must
+    /// be re-offered, the second is content the retirement of its last holder
+    /// took with it, and re-offering that asks a question whose answer cannot
+    /// change. Refusing the first costs the guest a command it should have
+    /// kept and, because a refusal abandons the transaction, the rest of its
+    /// channel with it.
+    pub fn outstanding_snapshot_is_repairable(
+        &self,
+        representation: RepresentationId,
+        snapshot: &[RegionVersion],
+    ) -> bool {
+        self.outstanding_snapshot(representation, snapshot)
+            .iter()
+            .all(|owed| {
+                self.representations.iter().any(|(held, coverage)| {
+                    *held != representation && coverage.covers(owed.region, owed.version)
+                })
+            })
+    }
+
     /// The parts of `snapshot` one representation does not already hold.
     ///
     /// [`RegionContentState::representation_matches`] collapses this to a
@@ -1507,6 +1533,18 @@ impl ContentAuthority {
             .ensure_representation(representation);
     }
 
+    /// See [`RegionContentState::outstanding_snapshot_is_repairable`].
+    pub fn outstanding_snapshot_is_repairable(
+        &self,
+        representation: RepresentationId,
+        snapshot: &[RegionVersion],
+    ) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .outstanding_snapshot_is_repairable(representation, snapshot)
+    }
+
     /// See [`RegionContentState::alias_guest_representation`].
     pub fn alias_guest_representation(&self, representation: RepresentationId) {
         self.0
@@ -2167,6 +2205,34 @@ mod tests {
         );
         assert!(state.representation_matches(GPU, &state.snapshot(&[region])));
         assert!(state.representation_matches(GPU, &state.snapshot(&[linear(0, 64)])));
+    }
+
+    /// The settled half: content whose only holder is gone is unrepairable.
+    ///
+    /// This is what separates a stale object a route can fix from one nothing
+    /// can, and the two must not share a refusal --- one is re-offered until
+    /// the upload lands, the other would be re-offered for the life of the
+    /// device.
+    #[test]
+    fn content_no_other_representation_holds_is_not_repairable() {
+        let whole = BackingRegion::Whole;
+        let mut state = state(whole);
+        state.ensure_representation(GPU);
+        let snapshot = state.snapshot(&[whole]);
+        // The guest holds it, so the empty GPU object is merely early.
+        assert!(state.outstanding_snapshot_is_repairable(GPU, &snapshot));
+
+        // A GPU write the guest has not been given makes the GPU the only
+        // holder, so the *guest* is now the one waiting -- and once that
+        // object is gone, nothing holds it and nothing can plan a repair.
+        state
+            .plan_gpu_write(SubmissionId::new(1), GPU, [whole])
+            .unwrap();
+        state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+        let newer = state.snapshot(&[whole]);
+        assert!(state.outstanding_snapshot_is_repairable(GUEST, &newer));
+        state.remove_representation(GPU);
+        assert!(!state.outstanding_snapshot_is_repairable(GUEST, &newer));
     }
 
     /// An alias and the guest hold one content statement in both directions.

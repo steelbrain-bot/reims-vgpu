@@ -1413,7 +1413,8 @@ mod tests {
             ),
             Err(RenderDispatchPreparationError::Backing {
                 backing,
-                reason: ManagedBackingError::StaleExecutionRepresentation,
+                // Repairable: the guest holds the target's content.
+                reason: ManagedBackingError::ExecutionRepresentationAwaitingContent,
                 ..
             }) if backing == stale_target
         ));

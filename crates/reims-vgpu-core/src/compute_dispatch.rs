@@ -1015,7 +1015,8 @@ mod tests {
             ComputeDispatchPreparationError::Backing {
                 backing: stale,
                 view: BackingView::Image(crate::ImageOwner::owning(ResourceId::new(6, 1))),
-                reason: ManagedBackingError::StaleExecutionRepresentation,
+                // Repairable: the guest holds this image's content.
+                reason: ManagedBackingError::ExecutionRepresentationAwaitingContent,
             }
         );
 

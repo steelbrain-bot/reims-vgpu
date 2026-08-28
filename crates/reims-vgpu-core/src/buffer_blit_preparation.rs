@@ -611,7 +611,10 @@ mod tests {
             failure.reason,
             BufferBlitPreparationError::Source {
                 backing: source,
-                reason: ManagedBackingError::StaleExecutionRepresentation,
+                // The guest still holds this content, so the copy is early
+                // rather than lost. See
+                // [`ManagedBackingError::ExecutionRepresentationAwaitingContent`].
+                reason: ManagedBackingError::ExecutionRepresentationAwaitingContent,
             }
         );
         assert!(failure.live_writes.is_empty());
