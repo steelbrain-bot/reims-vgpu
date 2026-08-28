@@ -5,8 +5,16 @@
 //! Usage: PROBE_AIR=/path/to/x.air [PROBE_STAGE=vertex] \
 //!   cargo test --test reflection_probe -- --test-threads=1 --nocapture
 
+/// Never share the live product logs with a concurrent boot. `cfg(test)` does
+/// not reach the lib from an integration binary, so the redirect is this
+/// binary's own responsibility.
+fn isolate_logs() {
+    reims_vgpu::observe::redirect_logs_for_tests();
+}
+
 #[test]
 fn print_reflection() {
+    isolate_logs();
     let Some(path) = std::env::var_os("PROBE_AIR") else {
         eprintln!("PROBE_AIR unset; skipping");
         return;

@@ -66,8 +66,16 @@ const FIXTURES: &[(&str, Stage)] = &[
 /// violations, exactly the per-translate guard on the live guest — and (b)
 /// complete: every reflected texture binding classifies to a representable
 /// sampled `Kind`, never `Absent` (missing) or `Unsupported` (unrepresentable).
+/// Never share the live product logs with a concurrent boot. `cfg(test)` does
+/// not reach the lib from an integration binary, so the redirect is this
+/// binary's own responsibility.
+fn isolate_logs() {
+    reims_vgpu::observe::redirect_logs_for_tests();
+}
+
 #[test]
 fn reflection_is_wellformed_and_complete_for_every_texture_binding() {
+    isolate_logs();
     if !have_llvm_dis() {
         eprintln!("skipping: llvm-dis not on PATH");
         return;
@@ -126,6 +134,7 @@ fn reflection_is_wellformed_and_complete_for_every_texture_binding() {
 /// translator-validated module, proving the reflection path is live on this host.
 #[test]
 fn reflected_translate_populates_datalayout_and_stage() {
+    isolate_logs();
     if !have_llvm_dis() {
         eprintln!("skipping: llvm-dis not on PATH");
         return;
@@ -157,6 +166,7 @@ fn reflected_translate_populates_datalayout_and_stage() {
 /// vertices 4..7 needs the exclusive prefixes 112 and 56 bytes respectively.
 #[test]
 fn translated_vertex_footprints_bound_the_draws_buffer_prefixes() {
+    isolate_logs();
     if !have_llvm_dis() {
         eprintln!("skipping: llvm-dis not on PATH");
         return;

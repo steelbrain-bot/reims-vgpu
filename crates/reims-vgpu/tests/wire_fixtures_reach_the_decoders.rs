@@ -508,9 +508,17 @@ fn carries_a_guest_opcode(selector: &str) -> bool {
         && !selector.starts_with("mapCoordinateInternal:")
 }
 
+/// Never share the live product logs with a concurrent boot. `cfg(test)` does
+/// not reach the lib from an integration binary, so the redirect is this
+/// binary's own responsibility.
+fn isolate_logs() {
+    reims_vgpu::observe::redirect_logs_for_tests();
+}
+
 #[test]
 #[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn no_record_apples_serializer_produced_is_refused_for_its_shape() {
+    isolate_logs();
     let root = fixtures();
 
     let mut decoded = 0usize;
@@ -625,6 +633,7 @@ fn repaint_unwritten(bytes: &[u8], mask: &[u8], one: bool) -> Vec<u8> {
 #[test]
 #[cfg_attr(not(wire_fixtures), ignore = "run scripts/wire-oracle/wire-oracle.sh")]
 fn no_decoder_reads_a_bit_apples_serializer_never_wrote() {
+    isolate_logs();
     let root = fixtures();
 
     let mut poisoned = 0usize;
