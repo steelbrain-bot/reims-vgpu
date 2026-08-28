@@ -199,6 +199,16 @@ impl<Semantic> ReplacementHostExecDispatchFailure<Semantic> {
 pub(crate) struct ReplacementRefusedChildPacket {
     lease: crate::runtime::replacement_transport::ReplacementChildPacketLease,
     detail: String,
+    /// The backing whose canonical content no live representation holds, when
+    /// that is what refused this packet.
+    ///
+    /// A `StaleExecutionRepresentation` names a backing and nothing else, which
+    /// leaves the next question -- what do its representations hold instead --
+    /// with nowhere to start. The refusal is the last moment this backing is
+    /// still in hand: after it the packet is gone and the periodic
+    /// `replacement_stale_representation` census, which walks the *blocked*
+    /// queue, no longer sees it at all.
+    stale_backing: Option<reims_vgpu_protocol::BackingId>,
     /// What the refused packet's transaction still holds, when the refusal was
     /// decided after admission.
     ///
@@ -221,10 +231,12 @@ impl ReplacementDeferredChildDispatchFailure<()> {
         match *self {
             Self::Exec { failure, lease } => {
                 let detail = replacement_host_exec_failure_diagnostic(&failure);
+                let stale_backing = failure.stale_backing();
                 match failure.into_terminal_reservations() {
                     Ok(reservations) => Ok(ReplacementRefusedChildPacket {
                         lease,
                         detail,
+                        stale_backing,
                         reservations: Some(reservations),
                     }),
                     Err(failure) => Err(Box::new(Self::Exec { failure, lease })),
@@ -232,10 +244,12 @@ impl ReplacementDeferredChildDispatchFailure<()> {
             }
             Self::Synchronize { failure, lease } => {
                 let detail = format!("route=deferred_synchronize {}", failure.diagnostic());
+                let stale_backing = failure.stale_backing();
                 match (*failure).into_terminal_reservations() {
                     Ok(reservations) => Ok(ReplacementRefusedChildPacket {
                         lease,
                         detail,
+                        stale_backing,
                         reservations: Some(reservations),
                     }),
                     Err(failure) => Err(Box::new(Self::Synchronize { failure, lease })),
@@ -1519,6 +1533,7 @@ impl ReplacementChildPacketLeaseFailure<()> {
                 Ok(ReplacementRefusedChildPacket {
                     lease,
                     detail: format!("stage=child_ingress reason={reason:?}"),
+                    stale_backing: None,
                     // An ingress refusal names an object the guest's own table
                     // does not hold, which is decided before the packet becomes
                     // a transaction. There is no runtime place to give up.
@@ -8472,6 +8487,7 @@ impl ReplacementDeviceCoordinator<()> {
         let ReplacementRefusedChildPacket {
             lease,
             detail,
+            stale_backing,
             reservations,
         } = refused;
         let channel = lease.channel;
@@ -8483,6 +8499,18 @@ impl ReplacementDeviceCoordinator<()> {
                     "replacement_child_packet_refused channel={} opcode={opcode:#x} {detail}",
                     channel.get()
                 ));
+                if let Some(backing) = stale_backing {
+                    for (view, representation, route, holds) in
+                        self.runtime.execution_representation_coverage(backing)
+                    {
+                        crate::observe::fail(format!(
+                            "replacement_refused_stale_representation channel={} backing={}                              view={view:?} representation={} route={route:?} holds=[{holds}]",
+                            channel.get(),
+                            backing.get(),
+                            representation.get()
+                        ));
+                    }
+                }
                 // The other half of giving the packet up. Only once the lease
                 // is spent, because a transaction released while its packet
                 // still owns the ring head would be re-offered from that head

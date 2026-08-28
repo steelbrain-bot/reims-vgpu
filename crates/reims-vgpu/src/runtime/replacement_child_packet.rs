@@ -1247,6 +1247,15 @@ impl<Semantic> ReplacementDeferredSynchronizeDispatchFailure<Semantic> {
         }
     }
 
+    /// See
+    /// [`crate::runtime::replacement_session::ReplacementSynchronizeDispatchFailure::stale_backing`].
+    pub(crate) fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self {
+            Self::Admitted(failure) => failure.stale_backing(),
+            Self::PreAdmission { .. } => None,
+        }
+    }
+
     /// The reservations a terminal refusal must give up, or this failure back
     /// if it is not one.
     ///

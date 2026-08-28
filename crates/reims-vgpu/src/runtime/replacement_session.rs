@@ -7579,6 +7579,28 @@ impl<Semantic> ReplacementSynchronizeDispatchFailure<Semantic> {
         }
     }
 
+    /// The backing whose canonical content no live representation holds, if
+    /// that is what refused this synchronize.
+    ///
+    /// See [`ReplacementExecAutomaticPreparationError::stale_backing`]: the
+    /// same question the EXEC route answers, asked of the route that reaches
+    /// the same readiness phase. Answering it in one place and not the other is
+    /// how the `replacement_stale_representation` census came to report the
+    /// EXEC's stale backings and none of the synchronize's.
+    pub(crate) fn stale_backing(&self) -> Option<reims_vgpu_protocol::BackingId> {
+        match self {
+            Self::Resources(failure) => match failure.backing_fault() {
+                Some((
+                    backing,
+                    _,
+                    reims_vgpu_core::ManagedBackingError::StaleExecutionRepresentation,
+                )) => Some(backing),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The reservations a terminal refusal must give up, or this failure back
     /// if it is not one.
     ///
@@ -7881,7 +7903,22 @@ pub(crate) enum ReplacementRenderAttachmentResolutionError {
     ResourceUnavailable,
     View(reims_vgpu_core::TextureViewResolveError),
     StorageUnavailable,
-    BaseDescriptorUnavailable,
+    /// The view's base resource is not in the graph yet.
+    BaseResourceAbsent,
+    /// The base resource is declared but carries no descriptor yet.
+    BaseDescriptorAbsent,
+    /// The base is a registered surface, so the attachment must be one of its
+    /// plane views, and this resource carries no descriptor yet.
+    SurfacePlaneViewDescriptorAbsent,
+    /// The base is a registered surface and this resource is fully declared as
+    /// something that is not one of its plane views. Nothing later changes a
+    /// declaration that has already been made.
+    NotSurfacePlaneView(reims_vgpu_protocol::ObjectKind),
+    /// A registered surface's plane view whose geometry has not been declared.
+    SurfacePlaneGeometryAbsent,
+    /// The base is fully declared as neither a registered surface nor a
+    /// texture, so no attachment can be resolved through it.
+    BaseNotTexture(reims_vgpu_protocol::ObjectKind),
     SubresourceOutOfBounds,
     EmptyExtent,
 }
@@ -7936,13 +7973,24 @@ impl ReplacementTextureResolutionError {
 
 impl ReplacementRenderAttachmentResolutionError {
     /// See [`reims_vgpu_core::TextureViewResolveError::awaits_declaration`].
+    ///
+    /// The absent arms name a lifecycle packet that has not arrived. The two
+    /// `Not*` arms are the opposite: the resource is fully declared and is not
+    /// the shape an attachment through this base can be, so re-offering the
+    /// draw at its channel's head asks a question whose answer cannot change.
     pub(crate) const fn awaits_declaration(self) -> bool {
         match self {
             Self::ResourceUnavailable
             | Self::StorageUnavailable
-            | Self::BaseDescriptorUnavailable => true,
+            | Self::BaseResourceAbsent
+            | Self::BaseDescriptorAbsent
+            | Self::SurfacePlaneViewDescriptorAbsent
+            | Self::SurfacePlaneGeometryAbsent => true,
             Self::View(reason) => reason.awaits_declaration(),
-            Self::SubresourceOutOfBounds | Self::EmptyExtent => false,
+            Self::NotSurfacePlaneView(_)
+            | Self::BaseNotTexture(_)
+            | Self::SubresourceOutOfBounds
+            | Self::EmptyExtent => false,
         }
     }
 }
@@ -17353,13 +17401,11 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             .checked_add(u64::from(level))
             .and_then(|value| u32::try_from(value).ok())
             .ok_or(Error::SubresourceOutOfBounds)?;
-        let base = graph
-            .resource(view.base)
-            .ok_or(Error::BaseDescriptorUnavailable)?;
+        let base = graph.resource(view.base).ok_or(Error::BaseResourceAbsent)?;
         let base_descriptor = base
             .descriptor
             .as_deref()
-            .ok_or(Error::BaseDescriptorUnavailable)?;
+            .ok_or(Error::BaseDescriptorAbsent)?;
         if let reims_vgpu_protocol::ResourceDescriptor::SurfaceBacking(_) = base_descriptor {
             if level != 0 || slice != 0 || depth_plane != 0 {
                 return Err(Error::SubresourceOutOfBounds);
@@ -17367,13 +17413,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             let resource_descriptor = node
                 .descriptor
                 .as_deref()
-                .ok_or(Error::BaseDescriptorUnavailable)?;
+                .ok_or(Error::SurfacePlaneViewDescriptorAbsent)?;
             let reims_vgpu_protocol::ResourceDescriptor::IOSurfacePlaneView(plane) =
                 resource_descriptor
             else {
-                return Err(Error::BaseDescriptorUnavailable);
+                return Err(Error::NotSurfacePlaneView(node.kind));
             };
-            let plane = plane.view.ok_or(Error::BaseDescriptorUnavailable)?;
+            let plane = plane.view.ok_or(Error::SurfacePlaneGeometryAbsent)?;
             let extent = [plane.width, plane.height, plane.depth];
             let texels =
                 reims_vgpu_core::TexelBox::new([0, 0, 0], extent).ok_or(Error::EmptyExtent)?;
@@ -17393,7 +17439,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             });
         }
         let reims_vgpu_protocol::ResourceDescriptor::Texture(descriptor) = base_descriptor else {
-            return Err(Error::BaseDescriptorUnavailable);
+            return Err(Error::BaseNotTexture(base.kind));
         };
         let layout = descriptor.level(mip).ok_or(Error::SubresourceOutOfBounds)?;
         let (layer, z) = if view.texture_type == reims_vgpu_protocol::TextureType::D3 {
@@ -23840,6 +23886,38 @@ mod tests {
                 .resolve_resource(task, reims_vgpu_protocol::ObjectTableRef::new(plane_object))
                 .expect("the plane view is live")
         );
+    }
+
+    /// A render attachment names which term stopped it, and the two settled
+    /// terms refuse.
+    ///
+    /// One `BaseDescriptorUnavailable` stood for six different facts: an
+    /// absent base resource, an undeclared base descriptor, an undeclared
+    /// plane-view descriptor, a plane view with no geometry, a resource that is
+    /// not a plane view of the registered surface it names, and a base that is
+    /// not a texture at all. Four are waits and two are settled declarations,
+    /// so answering them with one name meant the settled two were re-offered at
+    /// their channel's head forever -- and left the boot with nothing saying
+    /// which of the six it had.
+    #[test]
+    fn a_render_attachment_refusal_names_which_term_it_refused() {
+        use ReplacementRenderAttachmentResolutionError as Error;
+
+        for waiting in [
+            Error::BaseResourceAbsent,
+            Error::BaseDescriptorAbsent,
+            Error::SurfacePlaneViewDescriptorAbsent,
+            Error::SurfacePlaneGeometryAbsent,
+        ] {
+            assert!(waiting.awaits_declaration(), "{waiting:?}");
+        }
+
+        for settled in [
+            Error::NotSurfacePlaneView(reims_vgpu_protocol::ObjectKind::Texture),
+            Error::BaseNotTexture(reims_vgpu_protocol::ObjectKind::Buffer),
+        ] {
+            assert!(!settled.awaits_declaration(), "{settled:?}");
+        }
     }
 
     /// A readiness refusal over content no live object holds is settled.
