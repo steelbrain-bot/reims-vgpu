@@ -1331,8 +1331,14 @@ fn resolve_alias_bytes_round_trip(
     let destination_layout = resolver
         .resolve_linear_texture_layout(transfer.backing, transfer.destination)
         .ok_or_else(|| refuse(AliasRoundTripTerm::DestinationLayout))?;
+    // Either endpoint's buffer will do -- the bytes are written and read
+    // within one recording and nothing else reads them, so which image owns
+    // the buffer decides nothing. It has to be either, because only the
+    // texture that disagreed with the allocation's first-declared layout was
+    // given one, and that is as often the source as the destination.
     let bytes = resolver
         .resolve_alias_transfer_bytes(transfer.backing, transfer.destination)
+        .or_else(|| resolver.resolve_alias_transfer_bytes(transfer.backing, transfer.source))
         .ok_or_else(|| refuse(AliasRoundTripTerm::TransferBytes))?;
     let out = transfer_image_regions(&source_layout, transfer)?;
     // A byte-denominated region means the same thing to both endpoints and
@@ -3024,6 +3030,58 @@ mod tests {
             commands[2],
             NativeImageBlitCommand::BufferToImage(copy) if copy.extent == [64, 64, 1]
         ));
+
+        // The buffer belongs to whichever of the two disagreed with the
+        // allocation's first-declared layout, which is as often the source as
+        // the destination -- so a round trip finds it on either.
+        struct SourceOwnsBytes(Alias, NativeBufferTarget);
+        impl ReplacementBufferResolver for SourceOwnsBytes {
+            fn resolve_buffer(
+                &self,
+                backing: BackingId,
+                representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                self.0.resolve_buffer(backing, representation)
+            }
+
+            fn resolve_linear_texture_layout(
+                &self,
+                backing: BackingId,
+                representation: RepresentationId,
+            ) -> Option<std::sync::Arc<reims_vgpu_protocol::LinearTextureDescriptor>> {
+                self.0
+                    .resolve_linear_texture_layout(backing, representation)
+            }
+
+            fn resolve_alias_transfer_bytes(
+                &self,
+                _backing: BackingId,
+                representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                (representation == RepresentationId::new(2)).then_some(self.1)
+            }
+        }
+        let recorded = resolve_image_image_transfer(
+            transfer,
+            image(1, 115, 64),
+            source_key,
+            image(2, 80, 128),
+            destination_key,
+            &state,
+            &SourceOwnsBytes(
+                Alias {
+                    source: layout(8, 64, 115),
+                    destination: layout(4, 128, 80),
+                    bytes: None,
+                },
+                bytes,
+            ),
+        )
+        .expect("the round trip finds the bytes on whichever endpoint owns them");
+        let NativeResourceStateTransfer::Image(commands) = recorded else {
+            panic!("a round trip through the bytes records image commands");
+        };
+        assert_eq!(commands.len(), 3);
 
         // Without the bytes to round trip through, the refusal names both the
         // term that ruled out a direct copy and the part that was missing.
