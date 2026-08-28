@@ -10162,13 +10162,15 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                         let storage = graph
                             .storage(backing)
                             .ok_or(ReplacementExecResourceTableError::BackingAbsent(backing))?;
-                        let regions = storage
-                            .content
-                            .snapshot_all()
-                            .iter()
-                            .map(|entry| entry.region)
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice();
+                        // The backing's declared coordinate vocabulary, not
+                        // its current coverage entries. A validity statement
+                        // says the guest wrote this allocation, and the
+                        // entries present at that moment are an accident of
+                        // whoever wrote last -- a render pass leaves texel
+                        // boxes behind, and a host ingress derived from those
+                        // is a byte copy asked for in texels, which nothing
+                        // downstream can issue.
+                        let regions = storage.content.declared_regions();
                         Ok(reims_vgpu_core::ResolvedResourceStateTarget { backing, regions })
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -13538,16 +13540,13 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                 .copied()
                 .filter(|backing| seen.insert(*backing))
                 .map(|backing| {
+                    // The declared vocabulary, for the reason given at the
+                    // other site that builds these targets.
                     let regions = graph
                         .storage(backing)
                         .expect("an aliased backing remains in the canonical graph")
                         .content
-                        .snapshot_all()
-                        .into_vec()
-                        .into_iter()
-                        .map(|version| version.region)
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
+                        .declared_regions();
                     reims_vgpu_core::ResolvedResourceStateTarget { backing, regions }
                 })
                 .collect::<Vec<_>>();

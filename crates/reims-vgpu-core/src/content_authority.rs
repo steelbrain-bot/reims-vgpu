@@ -276,6 +276,16 @@ impl CoverageMap {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RegionContentState {
     backing: Option<BackingId>,
+    /// The coordinate vocabulary this backing was created with.
+    ///
+    /// A backing is declared once, in one coordinate space -- byte ranges for
+    /// a linear allocation, texel boxes where the contract declares the image
+    /// geometry, or the complete backing where it declares neither -- and that
+    /// space is fixed for its lifetime. Coverage *entries* drift as writes land
+    /// and subdivide, so the entries currently present are an accident of who
+    /// wrote last; the declaration is not, and it is what every operation over
+    /// the backing must be expressed in to be issuable at all.
+    declared: Box<[BackingRegion]>,
     next_version: u64,
     canonical: CoverageMap,
     representations: BTreeMap<RepresentationId, CoverageMap>,
@@ -287,6 +297,12 @@ pub struct RegionContentState {
 }
 
 impl RegionContentState {
+    /// See the field's own documentation: this is the backing's coordinate
+    /// vocabulary, not what it currently holds.
+    pub fn declared_regions(&self) -> &[BackingRegion] {
+        &self.declared
+    }
+
     pub fn snapshot_all(&self) -> Box<[RegionVersion]> {
         self.canonical.entries.clone().into_boxed_slice()
     }
@@ -370,6 +386,7 @@ impl RegionContentState {
         representations.insert(initial_representation, representation);
         Ok(Self {
             backing: Some(backing),
+            declared: regions,
             next_version: 2,
             canonical,
             representations,
@@ -391,6 +408,7 @@ impl RegionContentState {
         representations.insert(initial_representation, representation);
         Self {
             backing: None,
+            declared: Box::new([BackingRegion::Whole]),
             next_version: 2,
             canonical,
             representations,
@@ -1074,6 +1092,15 @@ impl ContentAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .snapshot_all()
+    }
+
+    /// See [`RegionContentState::declared_regions`].
+    pub fn declared_regions(&self) -> Box<[BackingRegion]> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .declared_regions()
+            .into()
     }
 
     pub fn validate_reservations(&self, count: usize) -> Result<(), ContentAuthorityError> {
@@ -1899,6 +1926,47 @@ mod tests {
             .snapshot(&[BackingRegion::Whole, image([0, 0, 0], [16, 16, 1])])
             .iter()
             .all(|entry| entry.version == new));
+    }
+
+    /// A backing's coordinate vocabulary is what it was declared with, and
+    /// writes never change it.
+    ///
+    /// Coverage entries subdivide as writes land, so the entries present at
+    /// any moment say who wrote last and not what coordinates this backing can
+    /// be addressed in. A validity statement built from the entries inherits
+    /// whatever the previous writer used -- a render pass leaves texel boxes
+    /// behind -- and the host ingress that follows it is a byte copy asked for
+    /// in texels, which nothing downstream can issue.
+    #[test]
+    fn the_declared_coordinate_vocabulary_outlives_every_write_over_it() {
+        let mut bytes = state(linear(0, 128));
+        assert_eq!(bytes.declared_regions(), [linear(0, 128)]);
+
+        bytes
+            .plan_gpu_write(SubmissionId::new(1), GPU, [linear(32, 32)])
+            .unwrap();
+        bytes.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+
+        // The entries have fragmented and the vocabulary has not.
+        assert!(bytes.snapshot_all().len() > 1);
+        assert_eq!(bytes.declared_regions(), [linear(0, 128)]);
+
+        // A whole-backing declaration written through in texels keeps saying
+        // the complete backing, which is the only form a byte copy can issue.
+        let mut whole = state(BackingRegion::Whole);
+        whole
+            .plan_gpu_write(
+                SubmissionId::new(1),
+                GPU,
+                [image([0, 0, 0], [1280, 1024, 1])],
+            )
+            .unwrap();
+        whole.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+        assert_eq!(
+            whole.snapshot_all()[0].region,
+            image([0, 0, 0], [1280, 1024, 1])
+        );
+        assert_eq!(whole.declared_regions(), [BackingRegion::Whole]);
     }
 
     /// A transfer is named in coordinates its source can issue against.
