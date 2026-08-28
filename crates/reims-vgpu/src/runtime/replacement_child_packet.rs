@@ -39,12 +39,70 @@ pub(crate) enum ReplacementChildPacketFamily {
     Deprecated(u16),
 }
 
+impl ReplacementChildPacketFamily {
+    /// The census name for this family.
+    ///
+    /// Every decoder in `decode/` is silent on success, so "opcode X never
+    /// appears in the log" says nothing about whether the guest sent it. This
+    /// counter is the only never-fired signal for the child stream, and it is
+    /// what distinguishes "the guest asked and we refused" from "the guest
+    /// never asked" -- two readings that send an investigation to opposite
+    /// halves of the device.
+    pub(crate) const fn census_route(self) -> &'static str {
+        match self {
+            Self::Debug => "child_debug",
+            Self::SetupSharedState => "child_setup_shared_state",
+            Self::OnlineAck => "child_online_ack",
+            Self::CursorGlyph => "child_cursor_glyph",
+            Self::CursorShow => "child_cursor_show",
+            Self::DisplayTransaction2 => "child_display_transaction2",
+            Self::DisplayTransaction3 => "child_display_transaction3",
+            Self::DisplaySwap => "child_display_swap",
+            Self::DisplaySleepState => "child_display_sleep_state",
+            Self::DisplaySetProperties => "child_display_set_properties",
+            Self::Nop => "child_nop",
+            Self::DeleteTask => "child_delete_task",
+            Self::UnmapMemory => "child_unmap_memory",
+            Self::DeleteResource => "child_delete_resource",
+            Self::DeleteObject => "child_delete_object",
+            Self::SetObjectList => "child_set_object_list",
+            Self::InvalidateResources => "child_invalidate_resources",
+            Self::SynchronizeResources => "child_synchronize_resources",
+            Self::DeleteSurfaceBacking => "child_delete_surface_backing",
+            Self::ExecIndirect2 => "child_exec_indirect2",
+            Self::DefineTask2 => "child_define_task2",
+            Self::MapMemory2 => "child_map_memory2",
+            Self::GetComputeInfo => "child_get_compute_info",
+            Self::ReplacePhysical => "child_replace_physical",
+            Self::Delay => "child_delay",
+            Self::SynchronizeAndDiscardResources => "child_synchronize_and_discard_resources",
+            Self::DiscardResources => "child_discard_resources",
+            Self::HeapTextureSizeAndAlign => "child_heap_texture_size_and_align",
+            Self::Deprecated(_) => "child_deprecated",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplacementChildCutoverStatus {
     Implemented,
     ContractNoOp,
     TypedRefusal,
     Blocked,
+}
+
+impl ReplacementChildCutoverStatus {
+    /// The census name for a status that costs the guest its packet, or `None`
+    /// for one that does not. An implemented family needs no second counter:
+    /// its own family count already says the guest asked and was served.
+    pub(crate) const fn census_route(self) -> Option<&'static str> {
+        match self {
+            Self::Implemented => None,
+            Self::ContractNoOp => Some("child_contract_noop"),
+            Self::TypedRefusal => Some("child_typed_refusal"),
+            Self::Blocked => Some("child_blocked"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -537,8 +595,20 @@ pub(crate) fn decode_replacement_child_packet(
     use crate::model::*;
     use crate::runtime::replacement_session::ReplacementControlCommand as Control;
 
-    let disposition = classify_replacement_child_opcode(opcode)
-        .map_err(ReplacementChildPacketDecodeError::Opcode)?;
+    let disposition = match classify_replacement_child_opcode(opcode) {
+        Ok(disposition) => disposition,
+        Err(reason) => {
+            crate::runtime::contract_census::note(match reason {
+                ReplacementChildOpcodeError::Unassigned(_) => "child_opcode_unassigned",
+                ReplacementChildOpcodeError::OutOfRange { .. } => "child_opcode_out_of_range",
+            });
+            return Err(ReplacementChildPacketDecodeError::Opcode(reason));
+        }
+    };
+    crate::runtime::contract_census::note(disposition.family.census_route());
+    if let Some(route) = disposition.status.census_route() {
+        crate::runtime::contract_census::note(route);
+    }
     match disposition.status {
         ReplacementChildCutoverStatus::Blocked => {
             Ok(ReplacementChildPacketRoute::Blocked(disposition.family))
@@ -1540,6 +1610,67 @@ mod tests {
                 max: CHILD_OP_MAX,
             })
         );
+    }
+
+    /// Two families sharing a census name make one guest command invisible
+    /// behind another's count, which is the reading this counter exists to
+    /// prevent. The population comes from the classifier rather than from a
+    /// hand-written list, so a family reached by a new opcode is covered
+    /// without anyone remembering to add it.
+    #[test]
+    fn every_child_family_the_classifier_reaches_has_its_own_census_name() {
+        use crate::model::CHILD_OP_MAX;
+        let mut named = std::collections::BTreeMap::new();
+        for opcode in 0..=CHILD_OP_MAX {
+            let Ok(disposition) = classify_replacement_child_opcode(opcode) else {
+                continue;
+            };
+            // Every deprecated opcode is one family by design.
+            if matches!(
+                disposition.family,
+                ReplacementChildPacketFamily::Deprecated(_)
+            ) {
+                assert_eq!(disposition.family.census_route(), "child_deprecated");
+                continue;
+            }
+            if let Some(other) = named.insert(disposition.family.census_route(), disposition.family)
+            {
+                assert_eq!(
+                    other,
+                    disposition.family,
+                    "{:?} and {other:?} both census as {}",
+                    disposition.family,
+                    disposition.family.census_route()
+                );
+            }
+        }
+        assert_eq!(
+            named.get("child_display_swap"),
+            Some(&ReplacementChildPacketFamily::DisplaySwap),
+            "the display families are the ones a boot is read for"
+        );
+        assert_eq!(
+            named.get("child_display_transaction3"),
+            Some(&ReplacementChildPacketFamily::DisplayTransaction3)
+        );
+    }
+
+    /// A status that costs the guest its packet must be countable on its own;
+    /// an implemented one must not add a second count, or the census stops
+    /// adding up.
+    #[test]
+    fn only_a_child_status_that_loses_the_packet_carries_its_own_census_name() {
+        assert_eq!(
+            ReplacementChildCutoverStatus::Implemented.census_route(),
+            None
+        );
+        for status in [
+            ReplacementChildCutoverStatus::ContractNoOp,
+            ReplacementChildCutoverStatus::TypedRefusal,
+            ReplacementChildCutoverStatus::Blocked,
+        ] {
+            assert!(status.census_route().is_some(), "{status:?}");
+        }
     }
 
     #[test]
