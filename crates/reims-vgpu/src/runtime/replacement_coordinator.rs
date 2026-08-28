@@ -136,17 +136,54 @@ impl<Semantic> ReplacementHostExecDispatchFailure<Semantic> {
         }
     }
 
-    /// See [`crate::runtime::replacement_session::ReplacementRepresentationConstructionError::is_unimplemented_case`].
-    const fn is_unimplemented_case(&self) -> bool {
+    /// Whether this failure is a declared refusal, and what refusing it must
+    /// give up beyond the ring lease.
+    ///
+    /// Classifying and extracting are one walk on purpose. They were two, and
+    /// two is how a failure comes to be refused as terminal by the first while
+    /// the second says it holds nothing --- which leaves the transaction's
+    /// submission-order position held for the life of the device, with the
+    /// channel correctly advanced past the packet and nothing in any census
+    /// pointing at the difference.
+    ///
+    /// `Err` hands the failure back to be re-offered. `Ok` carrying no
+    /// reservations is a real answer and a different one: a construction
+    /// refusal over a representation is decided while the packet is still a
+    /// packet, so there is no runtime place to give up. The backing-repair arm
+    /// is the exception, because it reached construction only *after* a
+    /// dispatch had prepared and failed, and that dispatch's reservations are
+    /// still held.
+    ///
+    /// A dispatch failure naming an object-table slot the guest has released
+    /// can never be repaired by a later packet, so re-offering it parks the
+    /// channel for the life of the device.
+    ///
+    /// See
+    /// [`crate::runtime::replacement_session::ReplacementRepresentationConstructionError::is_unimplemented_case`].
+    fn into_terminal_reservations(
+        self,
+    ) -> Result<
+        crate::runtime::replacement_session::ReplacementRefusedExecReservations<Semantic>,
+        Box<Self>,
+    > {
+        use crate::runtime::replacement_session::ReplacementRefusedExecReservations as Reservations;
         match self {
-            Self::Representation { reason, .. } | Self::BackingRepresentation { reason, .. } => {
-                reason.is_unimplemented_case()
+            Self::Representation { reason, ready: _ } if reason.is_unimplemented_case() => {
+                Ok(Reservations::none())
             }
-            // A dispatch failure naming an object-table slot the guest has
-            // released can never be repaired by a later packet, so re-offering
-            // it parks the channel for the life of the device.
-            Self::Dispatch { reason, .. } => reason.is_terminal_refusal(),
-            Self::Load { .. } | Self::ObjectPreparation(_) => false,
+            Self::BackingRepresentation {
+                backing: _,
+                reason,
+                dispatch,
+                ready: _,
+            } if reason.is_unimplemented_case() => Ok(dispatch
+                .into_terminal_reservations()
+                .unwrap_or_else(|_| Reservations::none())),
+            Self::Dispatch { reason, ready } => match reason.into_terminal_reservations() {
+                Ok(reservations) => Ok(reservations),
+                Err(reason) => Err(Box::new(Self::Dispatch { reason, ready })),
+            },
+            failure => Err(Box::new(failure)),
         }
     }
 }
@@ -161,6 +198,15 @@ impl<Semantic> ReplacementHostExecDispatchFailure<Semantic> {
 pub(crate) struct ReplacementRefusedChildPacket {
     lease: crate::runtime::replacement_transport::ReplacementChildPacketLease,
     detail: String,
+    /// What the refused packet's transaction still holds, when the refusal was
+    /// decided after admission.
+    ///
+    /// Committing the lease advances the channel past the *packet*. It says
+    /// nothing about the *transaction*, which is a separate place with its own
+    /// submission-order position, and a refusal that consumes only the lease
+    /// leaves that position held for the life of the device.
+    reservations:
+        Option<crate::runtime::replacement_session::ReplacementRefusedExecReservations<()>>,
 }
 
 impl ReplacementDeferredChildDispatchFailure<()> {
@@ -172,9 +218,16 @@ impl ReplacementDeferredChildDispatchFailure<()> {
     /// for what makes a reason declared rather than pending.
     fn into_refusal(self: Box<Self>) -> Result<ReplacementRefusedChildPacket, Box<Self>> {
         match *self {
-            Self::Exec { failure, lease } if failure.is_unimplemented_case() => {
+            Self::Exec { failure, lease } => {
                 let detail = replacement_host_exec_failure_diagnostic(&failure);
-                Ok(ReplacementRefusedChildPacket { lease, detail })
+                match failure.into_terminal_reservations() {
+                    Ok(reservations) => Ok(ReplacementRefusedChildPacket {
+                        lease,
+                        detail,
+                        reservations: Some(reservations),
+                    }),
+                    Err(failure) => Err(Box::new(Self::Exec { failure, lease })),
+                }
             }
             failure => Err(Box::new(failure)),
         }
@@ -1347,6 +1400,10 @@ impl ReplacementChildPacketLeaseFailure<()> {
                 Ok(ReplacementRefusedChildPacket {
                     lease,
                     detail: format!("stage=child_ingress reason={reason:?}"),
+                    // An ingress refusal names an object the guest's own table
+                    // does not hold, which is decided before the packet becomes
+                    // a transaction. There is no runtime place to give up.
+                    reservations: None,
                 })
             }
             failure => Err(Box::new(failure)),
@@ -8105,7 +8162,11 @@ impl ReplacementDeviceCoordinator<()> {
         host: &mut impl HostMemory,
         refused: ReplacementRefusedChildPacket,
     ) -> usize {
-        let ReplacementRefusedChildPacket { lease, detail } = refused;
+        let ReplacementRefusedChildPacket {
+            lease,
+            detail,
+            reservations,
+        } = refused;
         let channel = lease.channel;
         let opcode = lease.packet.opcode;
         match self.transport.commit_child_packet(host, lease) {
@@ -8115,6 +8176,19 @@ impl ReplacementDeviceCoordinator<()> {
                     "replacement_child_packet_refused channel={} opcode={opcode:#x} {detail}",
                     channel.get()
                 ));
+                // The other half of giving the packet up. Only once the lease
+                // is spent, because a transaction released while its packet
+                // still owns the ring head would be re-offered from that head
+                // and admitted a second time.
+                if let Some(reservations) = reservations {
+                    match self.runtime.abandon_refused_exec(reservations, ()) {
+                        Ok(facts) => self.publications.enqueue(facts),
+                        Err(reason) => crate::observe::fail(format!(
+                            "replacement_refused_exec_abandon_refused channel={} opcode={opcode:#x} reason={reason:?}",
+                            channel.get()
+                        )),
+                    }
+                }
                 1
             }
             Err(failure) => {

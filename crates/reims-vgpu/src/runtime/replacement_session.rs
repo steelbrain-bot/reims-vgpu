@@ -4688,6 +4688,53 @@ impl<Completion> ReplacementPreparedGuestUploadPhase<Completion> {
     ) {
         (self.prepared, self.manifest, self.chain, self.envelope)
     }
+
+    /// Everything this phase reserved, for giving it up.
+    ///
+    /// The continuation comes out with the rest because it holds a native queue
+    /// point: [`Self::into_parts`] drops it, which is right for a phase that is
+    /// going on to be recorded and wrong for one that never will.
+    fn into_abandoned_reservations(self) -> ReplacementRefusedExecReservations<Completion> {
+        ReplacementRefusedExecReservations {
+            transaction: Some(self.prepared.admitted.transaction.id),
+            continuation: self.continuation,
+            envelope: Some(self.envelope),
+        }
+    }
+}
+
+/// What a terminally refused EXEC still holds when the refusal is decided.
+///
+/// A refusal consumes the guest's ring lease so the channel advances past the
+/// packet. That is only half of giving it up: everything here outlives the
+/// packet, and until it is released the transaction keeps its submission-order
+/// position, every later transaction on its domain refuses behind it with
+/// `NotSubmissionHead`, and the published-fact retirement chain that names it
+/// can never reach its tail.
+///
+/// `transaction` is `None` for a refusal decided before admission, where there
+/// is no runtime place to give up. The other two are `None` when the refusing
+/// stage had not prepared them yet.
+pub(crate) struct ReplacementRefusedExecReservations<Completion> {
+    transaction: Option<TransactionId>,
+    continuation: Option<ReplacementGuestUploadContinuationOwner<Completion>>,
+    envelope: Option<ReplacementPreparedExecEnvelope>,
+}
+
+impl<Completion> ReplacementRefusedExecReservations<Completion> {
+    /// A refusal decided before the packet became a transaction. Nothing to
+    /// release, which is an answer and not an absence of one.
+    pub(crate) const fn none() -> Self {
+        Self {
+            transaction: None,
+            continuation: None,
+            envelope: None,
+        }
+    }
+
+    pub(crate) const fn transaction(&self) -> Option<TransactionId> {
+        self.transaction
+    }
 }
 
 #[derive(Debug)]
@@ -6188,6 +6235,44 @@ impl<Completion> ReplacementExecIngressDispatchFailure<Completion> {
             | Self::GuestUploadDispatch(_)
             | Self::IndirectRangeReadiness { .. }
             | Self::IndirectRange(_) => false,
+        }
+    }
+
+    /// The reservations a terminal refusal must give up, or this failure back
+    /// if it is not one.
+    ///
+    /// The arms are exactly those [`Self::is_terminal_refusal`] admits, in its
+    /// order, so the two cannot disagree about which failures are terminal.
+    /// An admission that failed never reached the runtime, so it has no place
+    /// to give up and no reservations to cancel; the other two refuse after
+    /// preparation and carry both.
+    pub(crate) fn into_terminal_reservations(
+        self,
+    ) -> Result<ReplacementRefusedExecReservations<Completion>, Self> {
+        match self {
+            Self::Ingress(ReplacementExecIngressPreparationError::Admission(reason))
+                if reason.is_terminal_refusal() =>
+            {
+                Ok(ReplacementRefusedExecReservations {
+                    transaction: None,
+                    continuation: None,
+                    envelope: None,
+                })
+            }
+            Self::DirectDispatch(ReplacementResourceReadyDispatchFailure::Resolution(failure))
+                if failure.reason.is_terminal_refusal() =>
+            {
+                let ReplacementResourceReadyExec { prepared, envelope } = failure.ready;
+                Ok(ReplacementRefusedExecReservations {
+                    transaction: Some(prepared.admitted.transaction.id),
+                    continuation: None,
+                    envelope: Some(envelope),
+                })
+            }
+            Self::GuestUploadResolution(failure) if failure.reason.is_terminal_refusal() => {
+                Ok(failure.phase.into_abandoned_reservations())
+            }
+            failure => Err(failure),
         }
     }
 }
@@ -14413,20 +14498,6 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         }
     }
 
-    /// Give up one transaction that reached a typed refusal it cannot recover
-    /// from, releasing every reservation it still holds.
-    ///
-    /// A refused transaction is terminal, but terminal is not the same as
-    /// finished: until this ran, it kept its submission-order domain head, its
-    /// encoder continuation, its publication position, its prepared image-state
-    /// transitions and its prepared resource uses. Every later transaction on
-    /// the same channel then refused behind it, and the resources it named
-    /// could never retire. One unimplemented case cost the whole device.
-    ///
-    /// `resources` and `image_states` are what the failing stage had already
-    /// prepared, if it got that far. Both are cancelled before the runtime
-    /// place is given up, because cancellation is what proves nothing else
-    /// still depends on them.
     /// Give up one refused guest-upload suffix, with the native chain it had
     /// already reserved a queue point for.
     ///
@@ -14459,6 +14530,66 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         )
     }
 
+    /// Give up one terminally refused EXEC, releasing every reservation the
+    /// refusing stage still held.
+    ///
+    /// Order matters and is the same order [`Self::abandon_guest_upload_suffix`]
+    /// uses: the native chain first, because the queue point it holds is what a
+    /// later transaction on the same recording worker would wait behind, then
+    /// the prepared resources and image states, then the runtime place.
+    ///
+    /// A refusal decided before admission has no runtime place, and there is
+    /// nothing to publish for it -- the guest is told by the refusal record
+    /// itself.
+    pub fn abandon_refused_exec(
+        &mut self,
+        reservations: ReplacementRefusedExecReservations<Semantic>,
+        semantic: Semantic,
+    ) -> Result<
+        Vec<reims_vgpu_core::PublishedFact<Semantic>>,
+        reims_vgpu_core::TransactionRuntimeError,
+    > {
+        let ReplacementRefusedExecReservations {
+            transaction,
+            continuation,
+            envelope,
+        } = reservations;
+        if let Some(continuation) = continuation {
+            self.execution
+                .native_mut()
+                .cancel_execution_chain(continuation.native)
+                .unwrap_or_else(|failure| {
+                    unreachable!(
+                        "a refused upload phase reserved its queue point and never submitted it: {:?}",
+                        failure.reason
+                    )
+                });
+        }
+        let (resources, image_states) = match envelope {
+            Some(envelope) => (Some(envelope.resources), envelope.image_states),
+            None => (None, None),
+        };
+        let Some(transaction) = transaction else {
+            debug_assert!(resources.is_none() && image_states.is_none());
+            return Ok(Vec::new());
+        };
+        self.abandon_transaction(transaction, resources, image_states, semantic)
+    }
+
+    /// Give up one transaction that reached a typed refusal it cannot recover
+    /// from, releasing every reservation it still holds.
+    ///
+    /// A refused transaction is terminal, but terminal is not the same as
+    /// finished: until this ran, it kept its submission-order domain head, its
+    /// encoder continuation, its publication position, its prepared image-state
+    /// transitions and its prepared resource uses. Every later transaction on
+    /// the same channel then refused behind it, and the resources it named
+    /// could never retire. One unimplemented case cost the whole device.
+    ///
+    /// `resources` and `image_states` are what the failing stage had already
+    /// prepared, if it got that far. Both are cancelled before the runtime
+    /// place is given up, because cancellation is what proves nothing else
+    /// still depends on them.
     pub fn abandon_transaction(
         &mut self,
         transaction: TransactionId,
@@ -21427,6 +21558,52 @@ mod tests {
     /// one that is treated as a wait is a deadlock rather than a slow path ---
     /// `Same` most of all, because the write it names lands only once the
     /// transaction doing the waiting submits.
+    /// A terminal refusal names the reservations it must give up, and a
+    /// repairable one is handed back untouched.
+    ///
+    /// Committing the guest's ring lease advances the channel past the packet
+    /// and says nothing about the transaction, which is a separate place. A
+    /// refusal that consumed only the lease left that place held: the
+    /// transaction kept its submission-order position, every later transaction
+    /// on its domain refused behind it with `NotSubmissionHead`, and the
+    /// published-fact retirement chain that named it could never reach its
+    /// tail. A driven boot ended that way with one refusal recorded and
+    /// nineteen transactions stranded behind it.
+    ///
+    /// This is the pre-admission arm, where the answer is that there is
+    /// nothing to give up --- which is an answer, and is why the extractor
+    /// returns `Ok` carrying no transaction rather than declining.
+    #[test]
+    fn a_terminal_exec_refusal_yields_its_reservations_and_a_repairable_one_does_not() {
+        let absent = |slot| {
+            ReplacementExecIngressDispatchFailure::<()>::Ingress(
+                ReplacementExecIngressPreparationError::Admission(
+                    ReplacementDecodedExecAdmissionError::ResourceTable(
+                        ReplacementExecResourceTableError::ResourceAbsent {
+                            task: reims_vgpu_protocol::TaskId::new(3),
+                            object: reims_vgpu_protocol::ObjectTableRef::new(7),
+                            slot,
+                        },
+                    ),
+                ),
+            )
+        };
+
+        let released = absent(reims_vgpu_core::ObjectSlotState::Released);
+        assert!(released.is_terminal_refusal());
+        let reservations = released
+            .into_terminal_reservations()
+            .unwrap_or_else(|_| panic!("a terminal refusal must name what it gives up"));
+        // Admission is decided before the packet becomes a transaction.
+        assert_eq!(reservations.transaction(), None);
+
+        // An undeclared slot is exactly what a later packet binds, so this one
+        // keeps waiting and must come back whole.
+        let undeclared = absent(reims_vgpu_core::ObjectSlotState::Undeclared);
+        assert!(!undeclared.is_terminal_refusal());
+        assert!(undeclared.into_terminal_reservations().is_err());
+    }
+
     #[test]
     fn a_pending_write_is_a_wait_only_when_its_producer_submits_first() {
         assert_eq!(
