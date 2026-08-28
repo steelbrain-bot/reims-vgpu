@@ -10389,6 +10389,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                         set_guest_valid: ops.set_guest_valid,
                     },
                     write: None,
+                    // A standalone invalidation packet is applied once and
+                    // never re-prepared, so it has no operation identity to
+                    // repeat and does not need one.
+                    guest_write: None,
                     targets: targets
                         .into_iter()
                         .map(

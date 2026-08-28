@@ -57,6 +57,39 @@ pub enum GpuWriteId {
     },
 }
 
+/// Which admitted operation a guest write belongs to.
+///
+/// A guest write is one operation's statement that the guest wrote these bytes,
+/// and preparing that operation twice is the same statement made twice rather
+/// than two writes. An EXEC that refuses after its resource states are prepared
+/// gives its claims up and re-prepares them on the retry, so without an
+/// identity every retry minted a fresh content version -- which invalidates
+/// every representation of the backing, including the one whose upload the
+/// retry is waiting on. That is a live-lock, and it is not a slow one: a driven
+/// macos-13 conformance boot reached 126 667 retries against one backing, with
+/// the required version 126 036 ahead of anything any representation held, and
+/// the guest never got its first case out.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct GuestWriteId {
+    pub transaction: TransactionId,
+    pub submission: SubmissionId,
+    pub index: usize,
+}
+
+impl GuestWriteId {
+    pub const fn operation(
+        transaction: TransactionId,
+        submission: SubmissionId,
+        index: usize,
+    ) -> Self {
+        Self {
+            transaction,
+            submission,
+            index,
+        }
+    }
+}
+
 impl GpuWriteId {
     pub const fn operation(
         transaction: TransactionId,
@@ -293,6 +326,14 @@ pub struct RegionContentState {
     pending_transfers: BTreeMap<TransferKey, usize>,
     pending_host_landings: BTreeMap<HostLandingKey, usize>,
     pending_host_ingresses: BTreeMap<HostIngressKey, usize>,
+    /// Which operation last wrote each region as the guest, and at what
+    /// version, so re-preparing that operation repeats its statement instead of
+    /// making a new one. See [`GuestWriteId`].
+    ///
+    /// One entry per region the guest has written, superseded by the next
+    /// operation to write it -- so this is bounded by the backing's own
+    /// declared regions and needs no sweep to stay that way.
+    guest_writes: BTreeMap<BackingRegion, (GuestWriteId, ContentVersion)>,
     discarded: Vec<BackingRegion>,
 }
 
@@ -394,6 +435,7 @@ impl RegionContentState {
             pending_transfers: BTreeMap::new(),
             pending_host_landings: BTreeMap::new(),
             pending_host_ingresses: BTreeMap::new(),
+            guest_writes: BTreeMap::new(),
             discarded: Vec::new(),
         })
     }
@@ -416,6 +458,7 @@ impl RegionContentState {
             pending_transfers: BTreeMap::new(),
             pending_host_landings: BTreeMap::new(),
             pending_host_ingresses: BTreeMap::new(),
+            guest_writes: BTreeMap::new(),
             discarded: Vec::new(),
         }
     }
@@ -437,13 +480,34 @@ impl RegionContentState {
         self.representations.remove(&representation);
     }
 
+    /// Record that the guest wrote one region, under the operation that says so.
+    ///
+    /// `write` is what makes this idempotent: an operation that already wrote
+    /// this region gets the version it was given rather than a new one, because
+    /// re-preparing an operation is the same statement made twice. `None` is
+    /// for the routes with no operation identity to offer -- a standalone
+    /// invalidation packet, applied once -- and always mints.
     pub fn guest_write(
         &mut self,
+        write: Option<GuestWriteId>,
         representation: RepresentationId,
         region: BackingRegion,
     ) -> Result<RegionVersion, ContentAuthorityError> {
         self.validate_guest_write(representation)?;
+        if let Some((owner, version)) = self.guest_writes.get(&region) {
+            if Some(*owner) == write {
+                return Ok(RegionVersion {
+                    region,
+                    version: *version,
+                });
+            }
+        }
         let version = self.reserve_version()?;
+        if let Some(write) = write {
+            self.guest_writes.insert(region, (write, version));
+        } else {
+            self.guest_writes.remove(&region);
+        }
         self.canonical.assign(region, version);
         self.representations
             .get_mut(&representation)
@@ -1280,13 +1344,14 @@ impl ContentAuthority {
 
     pub fn guest_write_region(
         &self,
+        write: Option<GuestWriteId>,
         representation: RepresentationId,
         region: BackingRegion,
     ) -> Result<RegionVersion, ContentAuthorityError> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .guest_write(representation, region)
+            .guest_write(write, representation, region)
     }
 
     pub fn plan_gpu_write_regions(
@@ -2164,13 +2229,51 @@ mod tests {
         );
     }
 
+    /// One operation's guest write is one version however many times that
+    /// operation is prepared.
+    ///
+    /// An EXEC that refuses after its resource states are prepared gives its
+    /// claims up and prepares them again on the retry. Minting a version per
+    /// preparation makes every representation of the backing stale on every
+    /// retry -- including the one an upload is running to bring current, which
+    /// then can never finish, which is what the retry is waiting for. The
+    /// device live-locks with nothing refusing and every counter reading
+    /// healthy; the only line that says so is the required version running away
+    /// from what anything holds.
+    #[test]
+    fn one_operations_guest_write_is_one_version_however_often_it_is_prepared() {
+        let mut state = state(linear(0, 128));
+        let region = linear(0, 128);
+        let operation = GuestWriteId::operation(TransactionId::new(7), SubmissionId::new(3), 1);
+
+        let first = state.guest_write(Some(operation), GUEST, region).unwrap();
+        for _ in 0..4 {
+            assert_eq!(
+                state.guest_write(Some(operation), GUEST, region).unwrap(),
+                first,
+                "re-preparing one operation repeats its statement"
+            );
+        }
+        assert_eq!(state.snapshot(&[region]).as_ref(), [first]);
+
+        // A different operation is a different write and takes its own version.
+        let later = GuestWriteId::operation(TransactionId::new(7), SubmissionId::new(3), 2);
+        let second = state.guest_write(Some(later), GUEST, region).unwrap();
+        assert!(second.version > first.version);
+
+        // And the first operation prepared again after that is a new statement
+        // too: the region it wrote is no longer the one it left behind.
+        let again = state.guest_write(Some(operation), GUEST, region).unwrap();
+        assert!(again.version > second.version);
+    }
+
     #[test]
     fn stale_overlapping_gpu_completion_cannot_replace_a_newer_guest_write() {
         let mut state = state(linear(0, 128));
         state
             .plan_gpu_write(SubmissionId::new(1), GPU, [linear(0, 128)])
             .unwrap();
-        let guest = state.guest_write(GUEST, linear(32, 32)).unwrap();
+        let guest = state.guest_write(None, GUEST, linear(32, 32)).unwrap();
         state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
         assert_eq!(state.snapshot(&[linear(32, 32)]).as_ref(), [guest]);
         let outside = state.snapshot(&[linear(0, 32), linear(64, 64)]);
@@ -2222,7 +2325,7 @@ mod tests {
     #[test]
     fn transfer_plans_only_missing_coverage_and_never_duplicates_a_live_key() {
         let mut state = state(linear(0, 128));
-        let first = state.guest_write(GUEST, linear(0, 128)).unwrap();
+        let first = state.guest_write(None, GUEST, linear(0, 128)).unwrap();
         let snapshot = state.snapshot(&[linear(0, 128)]);
         let planned = state.plan_transfers(GUEST, GPU, &snapshot).unwrap();
         assert_eq!(planned.len(), 1);
@@ -2282,7 +2385,9 @@ mod tests {
         .unwrap();
         state.ensure_representation(HOST_REPRESENTATION);
 
-        let write = state.guest_write(GUEST_REPRESENTATION, region).unwrap();
+        let write = state
+            .guest_write(None, GUEST_REPRESENTATION, region)
+            .unwrap();
         let ingress = state.plan_host_ingress(write).unwrap();
         assert!(!state.representation_matches(HOST_REPRESENTATION, &[write]));
         state.remove_representation_region(GUEST_REPRESENTATION, region);
@@ -2290,9 +2395,13 @@ mod tests {
         state.complete_host_ingress(ingress).unwrap();
         assert!(state.representation_matches(HOST_REPRESENTATION, &[write]));
 
-        let stale = state.guest_write(GUEST_REPRESENTATION, region).unwrap();
+        let stale = state
+            .guest_write(None, GUEST_REPRESENTATION, region)
+            .unwrap();
         let stale_ingress = state.plan_host_ingress(stale).unwrap();
-        state.guest_write(GUEST_REPRESENTATION, region).unwrap();
+        state
+            .guest_write(None, GUEST_REPRESENTATION, region)
+            .unwrap();
         assert_eq!(
             state.validate_complete_host_ingress(stale_ingress),
             Err(ContentAuthorityError::HostIngressSourceNotCurrent)
@@ -2311,7 +2420,7 @@ mod tests {
     #[test]
     fn cancelled_transfer_publishes_no_coverage_and_can_be_planned_again() {
         let mut state = state(linear(0, 128));
-        state.guest_write(GUEST, linear(16, 32)).unwrap();
+        state.guest_write(None, GUEST, linear(16, 32)).unwrap();
         let snapshot = state.snapshot(&[linear(16, 32)]);
         let key = state.plan_transfers(GUEST, GPU, &snapshot).unwrap()[0];
 
@@ -2328,7 +2437,7 @@ mod tests {
     #[test]
     fn shared_transfer_demands_cancel_independently_and_complete_once() {
         let mut state = state(linear(0, 128));
-        state.guest_write(GUEST, linear(0, 64)).unwrap();
+        state.guest_write(None, GUEST, linear(0, 64)).unwrap();
         let snapshot = state.snapshot(&[linear(0, 64)]);
         let first = state.plan_transfer_demands(GUEST, GPU, &snapshot).unwrap()[0];
         let second = state.plan_transfer_demands(GUEST, GPU, &snapshot).unwrap()[0];
@@ -2382,7 +2491,7 @@ mod tests {
         state.discard(linear(32, 32));
         assert!(state.snapshot(&[linear(32, 32)]).is_empty());
         assert_eq!(state.snapshot(&[linear(0, 32)]).len(), 1);
-        let restored = state.guest_write(GUEST, linear(32, 32)).unwrap();
+        let restored = state.guest_write(None, GUEST, linear(32, 32)).unwrap();
         assert_eq!(state.snapshot(&[linear(32, 32)]).as_ref(), [restored]);
     }
 

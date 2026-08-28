@@ -61,6 +61,7 @@ mod tests {
         let transition = crate::ResolvedValidityTransition::bind(
             &update,
             Some(reims_vgpu_protocol::SubmissionId::new(9).into()),
+            None,
             |found| {
                 assert_eq!(found, backing);
                 crate::ValidityRepresentations {

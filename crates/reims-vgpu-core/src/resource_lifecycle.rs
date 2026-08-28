@@ -44,6 +44,10 @@ pub struct ResolvedValidityTransition {
     pub ops: ResourceValidityOps,
     /// The EXEC whose eventual GPU completion makes set-host content current.
     pub write: Option<crate::GpuWriteId>,
+    /// The operation whose statement the clear-host guest write is, so
+    /// re-preparing it repeats that statement rather than making a new one.
+    /// See [`crate::GuestWriteId`].
+    pub guest_write: Option<crate::GuestWriteId>,
     pub targets: Box<[ResolvedValidityTarget]>,
 }
 
@@ -74,11 +78,13 @@ impl ResolvedValidityTransition {
     pub fn bind(
         state: &crate::ResolvedResourceState,
         write: Option<crate::GpuWriteId>,
+        guest_write: Option<crate::GuestWriteId>,
         mut representations: impl FnMut(BackingId) -> ValidityRepresentations,
     ) -> Self {
         Self {
             ops: state.ops,
             write,
+            guest_write,
             targets: state
                 .targets
                 .iter()
@@ -669,7 +675,7 @@ impl<T> ResourceLifecycleOwner<T> {
             }
             ResolvedResourceLifecycle::GuestWrite { backing, region } => self
                 .native
-                .guest_write(backing, region)
+                .guest_write(backing, None, region)
                 .map(ResourceLifecycleEffect::GuestWrite)
                 .map_err(Into::into),
             ResolvedResourceLifecycle::Discard { backing, region } => {
@@ -1120,7 +1126,7 @@ impl<T> ResourceLifecycleOwner<T> {
                 for region in target.regions.iter().copied() {
                     let version = self
                         .native
-                        .guest_write(target.backing, region)
+                        .guest_write(target.backing, transition.guest_write, region)
                         .unwrap_or_else(|_| unreachable!("validity guest write was prevalidated"));
                     guest_writes.push((target.backing, version));
                     if let Some(destination) = target.guest_upload_destination {
@@ -2567,6 +2573,7 @@ mod tests {
             .unwrap();
         let transition = |target| {
             ResolvedResourceLifecycle::ApplyValidity(ResolvedValidityTransition {
+                guest_write: None,
                 ops: ResourceValidityOps {
                     clear_host_valid: 1,
                     set_host_valid: 0,
@@ -2663,6 +2670,7 @@ mod tests {
         let effect = owner
             .apply(ResolvedResourceLifecycle::ApplyValidity(
                 ResolvedValidityTransition {
+                    guest_write: None,
                     ops: ResourceValidityOps {
                         clear_host_valid: 1,
                         set_host_valid: 1,
@@ -2774,6 +2782,7 @@ mod tests {
         let region = BackingRegion::Linear(LinearRange::new(0, 0x1000).unwrap());
         let transition = ResolvedValidityTransition {
             ops: ResourceValidityOps::PAGE_ON,
+            guest_write: None,
             write: None,
             targets: Box::new([
                 ResolvedValidityTarget {
@@ -2829,6 +2838,7 @@ mod tests {
         let second = create_backing(&mut owner);
         let region = BackingRegion::Linear(LinearRange::new(0, 0x1000).unwrap());
         let transition = |backing, ops| ResolvedValidityTransition {
+            guest_write: None,
             ops,
             write: None,
             targets: Box::new([ResolvedValidityTarget {
@@ -2901,6 +2911,7 @@ mod tests {
         let effect = owner
             .apply(ResolvedResourceLifecycle::ApplyValidity(
                 ResolvedValidityTransition {
+                    guest_write: None,
                     ops: ResourceValidityOps {
                         clear_host_valid: 0,
                         set_host_valid: 0,

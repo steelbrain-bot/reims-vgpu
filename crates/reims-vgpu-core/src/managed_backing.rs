@@ -1084,15 +1084,18 @@ impl<T> ManagedBackingOwner<T> {
             .pending_gpu_writes_overlapping(representation, regions))
     }
 
+    /// See [`crate::content_authority::ContentAuthority::guest_write`] for what
+    /// `write` is and why a guest write has an identity at all.
     pub fn guest_write(
         &mut self,
         backing: BackingId,
+        write: Option<crate::GuestWriteId>,
         region: BackingRegion,
     ) -> Result<RegionVersion, ManagedBackingError> {
         let record = self.live_backing(backing)?;
         record
             .authority
-            .guest_write_region(GUEST_REPRESENTATION, region)
+            .guest_write_region(write, GUEST_REPRESENTATION, region)
             .map_err(ManagedBackingError::Content)
     }
 
@@ -2570,7 +2573,9 @@ mod tests {
         );
         assert_eq!(owner.representation(backing, execution), None);
 
-        owner.guest_write(backing, BackingRegion::Whole).unwrap();
+        owner
+            .guest_write(backing, None, BackingRegion::Whole)
+            .unwrap();
         let newer = owner
             .snapshot_content(backing, &[BackingRegion::Whole])
             .unwrap();
@@ -2705,7 +2710,9 @@ mod tests {
         let destination = owner
             .create_representation(backing, RepresentationRoute::HostVisibleWorking, "working")
             .unwrap();
-        owner.guest_write(backing, BackingRegion::Whole).unwrap();
+        owner
+            .guest_write(backing, None, BackingRegion::Whole)
+            .unwrap();
         let snapshot = owner
             .snapshot_content(backing, &[BackingRegion::Whole])
             .unwrap();
@@ -2746,7 +2753,9 @@ mod tests {
                 "working",
             )
             .unwrap();
-        owner.guest_write(backing, BackingRegion::Whole).unwrap();
+        owner
+            .guest_write(backing, None, BackingRegion::Whole)
+            .unwrap();
         let snapshot = owner
             .snapshot_content(backing, &[BackingRegion::Whole])
             .unwrap();
@@ -2927,7 +2936,7 @@ mod tests {
             .is_empty());
         owner.complete_transfer(first[0]).unwrap();
 
-        owner.guest_write(backing, right).unwrap();
+        owner.guest_write(backing, None, right).unwrap();
         let newer = owner.snapshot_content(backing, &[right]).unwrap();
         let second = owner
             .plan_transfers(backing, GUEST_REPRESENTATION, working, &newer)

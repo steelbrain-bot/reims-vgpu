@@ -142,9 +142,9 @@ pub use condition_owner::{
     ReleasedConditionIdentities, SynchronizationConditionOwner, TaskConditionIdentities,
 };
 pub use content_authority::{
-    BackingRegion, ContentAuthority, ContentAuthorityError, GpuWriteId, HostIngressKey,
-    HostIngressTransfer, HostLandingKey, ImageRegion, RegionContentState, RegionVersion,
-    TransferKey, GPU_REPRESENTATION, GUEST_REPRESENTATION, HOST_REPRESENTATION,
+    BackingRegion, ContentAuthority, ContentAuthorityError, GpuWriteId, GuestWriteId,
+    HostIngressKey, HostIngressTransfer, HostLandingKey, ImageRegion, RegionContentState,
+    RegionVersion, TransferKey, GPU_REPRESENTATION, GUEST_REPRESENTATION, HOST_REPRESENTATION,
 };
 pub use content_synchronization::*;
 pub use content_tracking::{

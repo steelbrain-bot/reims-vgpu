@@ -446,7 +446,7 @@ impl ContentAuthority {
     }
 
     pub fn guest_wrote(&self) -> Result<ContentVersion, ContentError> {
-        self.guest_write_region(GUEST_REPRESENTATION, BackingRegion::Whole)
+        self.guest_write_region(None, GUEST_REPRESENTATION, BackingRegion::Whole)
             .map(|write| write.version)
             .map_err(content_error)
     }
@@ -2755,7 +2755,7 @@ mod tests {
         let first_authority = graph.resource(first).unwrap().content.clone();
         let second_authority = graph.resource(second).unwrap().content.clone();
         let write = first_authority
-            .guest_write_region(GUEST_REPRESENTATION, right)
+            .guest_write_region(None, GUEST_REPRESENTATION, right)
             .unwrap();
         assert!(first_authority.same_authority(&second_authority));
         assert_eq!(

@@ -518,6 +518,13 @@ pub fn prepare_resource_state<T>(
             submission,
             index,
         )),
+        // The same operation identity the GPU write carries, for the same
+        // reason: this preparation may be given up and made again, and the
+        // second one is this operation's statement repeated rather than a
+        // second write by the guest.
+        guest_write: (operation.ops.clear_host_valid != 0).then_some(
+            crate::GuestWriteId::operation(admitted.transaction(), submission, index),
+        ),
         targets: resolved
             .iter()
             .map(|(target, representations)| crate::ResolvedValidityTarget {
