@@ -65,11 +65,24 @@ pub struct SubmissionReady {
     pub sequence: DomainSequence,
 }
 
+/// Where one accepted transaction sits relative to another.
+///
+/// Read as a statement about *submission* order, not about domains: two
+/// transactions on one domain are `Before` or `After` each other, never
+/// `Same`. `Same` is returned for a transaction against itself and for nothing
+/// else, which is what makes it the answer a consumer gets when it finds a
+/// pending write of its own -- ordered by its recorded chain rather than by
+/// this, and never something to wait for, because it lands only once the
+/// transaction that is asking submits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmissionOrderRelation {
+    /// One transaction against itself.
     Same,
+    /// Earlier in the same domain's submission order than the other.
     Before,
+    /// Later in the same domain's submission order than the other.
     After,
+    /// On different domains, which declare no order between them.
     Independent,
 }
 

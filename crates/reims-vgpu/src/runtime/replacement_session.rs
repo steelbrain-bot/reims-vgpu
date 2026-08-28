@@ -4859,6 +4859,45 @@ impl ReplacementExecAutomaticPreparationError {
     }
 }
 
+/// Why a consumer must wait for a pending GPU write, or `None` if it may read
+/// past it.
+///
+/// One decision point for the whole rule, because every arm of it is a
+/// statement about what the guest asked for and getting one wrong is a
+/// deadlock rather than a slow path.
+///
+/// - [`SubmissionOrderRelation::After`] is the only genuine wait: the producer
+///   submits first in the same domain, so its write lands before the read and
+///   reading past it would return the wrong bytes.
+/// - [`SubmissionOrderRelation::Before`] orders the producer behind the reader,
+///   so its write concerns a later read and not this one.
+/// - [`SubmissionOrderRelation::Independent`] is two queues with no order
+///   declared between them. Either order is a valid execution, so serializing
+///   the reader ahead of the writer is one of them --- the guest orders across
+///   queues by committing an explicit shared-event wait, which arrives as a
+///   prerequisite rather than as a pending write discovered here. Waiting
+///   invents an order the guest never asked for and deadlocks whenever the
+///   producer's own progress runs through the queue now parked on it.
+/// - [`SubmissionOrderRelation::Same`] is returned for a transaction against
+///   itself and for nothing else, so it names a write recorded in the very
+///   chain being prepared. Its order against the read is that chain's own,
+///   expressed by the barriers derived from the recorded accesses, and a
+///   staging transfer scheduled ahead of the chain could not be ordered
+///   against it in any case. Waiting for it is unsatisfiable rather than slow:
+///   the write lands only once this transaction submits, and it cannot submit
+///   while its own preparation is refused for it. A driven macos-13 boot held
+///   channel 1 on exactly this for 72 000 retries with nothing in flight.
+fn denying_submission_order(
+    relation: reims_vgpu_core::SubmissionOrderRelation,
+) -> Option<reims_vgpu_core::SubmissionOrderRelation> {
+    match relation {
+        reims_vgpu_core::SubmissionOrderRelation::After => Some(relation),
+        reims_vgpu_core::SubmissionOrderRelation::Before
+        | reims_vgpu_core::SubmissionOrderRelation::Independent
+        | reims_vgpu_core::SubmissionOrderRelation::Same => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ReplacementExecResourceReadinessError {
     GuestUploadContinuationRequired(Box<[reims_vgpu_protocol::BackingId]>),
@@ -11758,32 +11797,12 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                             .runtime()
                             .submission_order_relation(transaction, producer)
                         {
-                            // The producer is ordered behind this reader, so
-                            // its write lands after the read and does not
-                            // concern it.
-                            Ok(reims_vgpu_core::SubmissionOrderRelation::Before)
-                            // Or the two are on queues with no order between
-                            // them at all. A queue that is blocked does not
-                            // impose its own completion-publication order on an
-                            // independent queue: with no ordering declared,
-                            // either order is a valid execution, so serializing
-                            // the reader ahead of the writer is one of them.
-                            // The guest orders across queues by committing an
-                            // explicit shared-event wait, and that arrives as a
-                            // prerequisite rather than as a pending write
-                            // discovered here -- so waiting on this one invents
-                            // an order the guest never asked for, and deadlocks
-                            // whenever the producer's own progress runs through
-                            // the queue now parked on it.
-                            | Ok(reims_vgpu_core::SubmissionOrderRelation::Independent) => {
-                                permitted.push(write);
-                            }
-                            Ok(
-                                relation @ (reims_vgpu_core::SubmissionOrderRelation::Same
-                                | reims_vgpu_core::SubmissionOrderRelation::After),
-                            ) => {
-                                denied_by.insert(write, relation);
-                            }
+                            Ok(relation) => match denying_submission_order(relation) {
+                                None => permitted.push(write),
+                                Some(relation) => {
+                                    denied_by.insert(write, relation);
+                                }
+                            },
                             Err(reason) => {
                                 return Some(Err(
                                     ReplacementExecResourceReadinessError::ContentProducerOrder {
@@ -21168,6 +21187,33 @@ fn merge_waiters(
 
 #[cfg(test)]
 mod tests {
+    use super::denying_submission_order;
+    use reims_vgpu_core::SubmissionOrderRelation;
+
+    /// Only a producer that submits ahead of the reader in the same domain is
+    /// a wait. The other three are orders the guest never asked for, and each
+    /// one that is treated as a wait is a deadlock rather than a slow path ---
+    /// `Same` most of all, because the write it names lands only once the
+    /// transaction doing the waiting submits.
+    #[test]
+    fn a_pending_write_is_a_wait_only_when_its_producer_submits_first() {
+        assert_eq!(
+            denying_submission_order(SubmissionOrderRelation::After),
+            Some(SubmissionOrderRelation::After)
+        );
+        for permitted in [
+            SubmissionOrderRelation::Before,
+            SubmissionOrderRelation::Independent,
+            SubmissionOrderRelation::Same,
+        ] {
+            assert_eq!(
+                denying_submission_order(permitted),
+                None,
+                "{permitted:?} is not an order to wait on"
+            );
+        }
+    }
+
     use super::*;
     use crate::runtime::replacement_services::ComputeProgramDecline;
     use reims_vgpu_core::{ReflectedShaderStage, ShaderInterface, StorageImageAccess};
