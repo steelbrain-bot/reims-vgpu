@@ -96,6 +96,18 @@ pub struct DisplayHandshake {
     /// Timestamp of the refresh grid slot this generation last consumed, or
     /// `None` before the first one. See [`DisplayRefreshCadence`].
     last_refresh_us: Option<u64>,
+    /// Whether this generation's descriptor page has been written yet.
+    ///
+    /// The guest builds its display attributes — the timing elements it picks a
+    /// mode from, the panel size its EDID carries, the cursor capability it
+    /// doorbells against — out of that page, once, while it is bringing the pipe
+    /// up. A registration whose descriptor is still zeroes therefore does not
+    /// produce a guest that renders at the wrong size; it produces a guest with
+    /// a one-pixel display, whose compositor has nothing to composite and never
+    /// swaps. So the write is not an optimisation of the handshake, it is a
+    /// precondition of it, and [`DisplayHandshake::plan_online_notification`]
+    /// refuses to reach `Deliver` until it has happened.
+    descriptor_published: bool,
 }
 
 /// Published display shared page and the interrupt bit that belongs to it.
@@ -228,6 +240,11 @@ pub enum DisplayPresentNotificationError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisplayOnlineNotification {
     Idle,
+    /// This generation's descriptor page has not been written yet. The caller
+    /// owns the bytes and must write them, then call
+    /// [`DisplayHandshake::record_descriptor_publication`]; no online pulse is
+    /// planned until it does.
+    DescriptorPending(DisplaySharedPage),
     WaitingForEnable(DisplaySharedPage),
     Deliver {
         page: DisplaySharedPage,
@@ -271,6 +288,7 @@ impl DisplayHandshake {
         self.online_tries = 0;
         self.poll_ctr = 0;
         self.last_refresh_us = None;
+        self.descriptor_published = false;
         was_online
     }
 
@@ -399,6 +417,9 @@ impl DisplayHandshake {
         if self.online_acked {
             return Ok(DisplayOnlineNotification::Idle);
         }
+        if !self.descriptor_published {
+            return Ok(DisplayOnlineNotification::DescriptorPending(page));
+        }
         let enable_mask =
             enable_mask.ok_or(DisplayOnlineNotificationError::EnableMaskUnreadable(page))?;
         if enable_mask & DISPLAY_ONLINE_EVENT_MASK == 0 {
@@ -415,6 +436,20 @@ impl DisplayHandshake {
             interrupt_bit,
             first_pulse: self.online_tries == 0,
         })
+    }
+
+    /// Note that this generation's descriptor page now carries its contents.
+    ///
+    /// Idempotent, and deliberately separate from the write: the caller owns the
+    /// bytes and this owns the ordering, so a caller that fails to write cannot
+    /// advance the handshake by having asked.
+    pub fn record_descriptor_publication(&mut self) {
+        self.descriptor_published = true;
+    }
+
+    /// Whether this generation's descriptor page has been written.
+    pub const fn descriptor_published(&self) -> bool {
+        self.descriptor_published
     }
 
     /// Advance one online poll and decide whether the caller may inspect/pulse.
@@ -627,6 +662,40 @@ mod tests {
         );
     }
 
+    /// The guest reads its mode list out of the descriptor page once, while it
+    /// is bringing the pipe up, so an online offer raised over a page of zeroes
+    /// buys a one-pixel display rather than an early one.
+    #[test]
+    fn no_online_pulse_is_planned_until_the_descriptor_page_carries_its_modes() {
+        let mut display = DisplayHandshake::default();
+        display.reinitialize(3, 0x1000);
+        let page = display.shared_page().expect("published");
+        assert_eq!(
+            display.plan_online_notification(Some(DISPLAY_ONLINE_EVENT_MASK), Some(0)),
+            Ok(DisplayOnlineNotification::DescriptorPending(page))
+        );
+        display.record_descriptor_publication();
+        assert!(matches!(
+            display.plan_online_notification(Some(DISPLAY_ONLINE_EVENT_MASK), Some(0)),
+            Ok(DisplayOnlineNotification::Deliver { .. })
+        ));
+    }
+
+    /// Republishing the page is a fresh registration, and the guest rebuilds its
+    /// attributes from the descriptor again — so the descriptor is owed again.
+    #[test]
+    fn republishing_the_shared_page_owes_a_fresh_descriptor() {
+        let mut display = online();
+        display.record_descriptor_publication();
+        assert!(display.descriptor_published());
+        display.reinitialize(0, 0x2000);
+        assert!(!display.descriptor_published());
+        assert!(matches!(
+            display.plan_online_notification(Some(DISPLAY_ONLINE_EVENT_MASK), Some(0)),
+            Ok(DisplayOnlineNotification::DescriptorPending(_))
+        ));
+    }
+
     /// A republished shared page is a new display generation, and the old
     /// generation's grid slot must not hold the new one's first pulse back.
     #[test]
@@ -728,6 +797,7 @@ mod tests {
     fn replacement_online_plan_never_abandons_an_unacknowledged_generation() {
         let mut display = DisplayHandshake::default();
         display.reinitialize(3, 0x4000);
+        display.record_descriptor_publication();
         for pulse in 0..1_000 {
             let planned = display
                 .plan_online_notification(

@@ -7775,6 +7775,7 @@ pub(crate) struct ReplacementRuntimeResetEffect {
 pub(crate) enum ReplacementDisplayOnlineError {
     NativeLifetimeClosed,
     Planning(reims_vgpu_core::DisplayOnlineNotificationError),
+    Descriptor(crate::runtime::replacement_display_descriptor::ReplacementDisplayDescriptorError),
     AddressOverflow,
     Host(crate::runtime::host::MemError),
 }
@@ -17025,10 +17026,42 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         page
     }
 
+    /// Write this registration's descriptor page, once, before any online pulse.
+    ///
+    /// The page carries the timing elements the guest builds its mode list from,
+    /// so a guest that acknowledges online over a descriptor of zeroes comes up
+    /// with a one-pixel display and never composites. Core owns the ordering —
+    /// `plan_online_notification` cannot reach `Deliver` until this has run —
+    /// and this owns the bytes, which are the device's own advertised geometry.
+    fn publish_display_descriptor(
+        &mut self,
+        host: &mut impl crate::runtime::host::HostMemory,
+        page: reims_vgpu_core::DisplaySharedPage,
+        page_bytes: u64,
+    ) -> Result<(), ReplacementDisplayOnlineError> {
+        let fields =
+            crate::runtime::replacement_display_descriptor::replacement_display_descriptor(
+                page.display_index,
+                page_bytes,
+            )
+            .map_err(ReplacementDisplayOnlineError::Descriptor)?;
+        for field in &fields {
+            let gpa = page
+                .gpa
+                .checked_add(field.offset())
+                .ok_or(ReplacementDisplayOnlineError::AddressOverflow)?;
+            host.write_gpa(gpa, field.bytes())
+                .map_err(ReplacementDisplayOnlineError::Host)?;
+        }
+        self.display.record_descriptor_publication();
+        Ok(())
+    }
+
     pub fn progress_display_online(
         &mut self,
         host: &mut (impl crate::runtime::host::HostMemory + crate::runtime::host::HostControl),
         interrupt_status: &std::sync::atomic::AtomicU32,
+        page_bytes: u64,
     ) -> Result<reims_vgpu_core::DisplayOnlineNotification, ReplacementDisplayOnlineError> {
         let (enable_mask, pending) = match self.display.shared_page() {
             Some(page) if !self.display.is_online() => {
@@ -17050,10 +17083,18 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             }
             _ => (None, None),
         };
-        let notification = self
+        let mut notification = self
             .display
             .plan_online_notification(enable_mask, pending)
             .map_err(ReplacementDisplayOnlineError::Planning)?;
+        if let reims_vgpu_core::DisplayOnlineNotification::DescriptorPending(page) = notification {
+            crate::runtime::contract_census::note("display_descriptor_published");
+            self.publish_display_descriptor(host, page, page_bytes)?;
+            notification = self
+                .display
+                .plan_online_notification(enable_mask, pending)
+                .map_err(ReplacementDisplayOnlineError::Planning)?;
+        }
         let reims_vgpu_core::DisplayOnlineNotification::Deliver {
             page,
             pending,
@@ -31696,7 +31737,7 @@ mod tests {
         for first_pulse in [true, false] {
             assert!(matches!(
                 runtime
-                    .progress_display_online(&mut host, &interrupt_status)
+                    .progress_display_online(&mut host, &interrupt_status, 0x1000)
                     .unwrap(),
                 reims_vgpu_core::DisplayOnlineNotification::Deliver {
                     page,
@@ -31717,6 +31758,21 @@ mod tests {
             host.action_count(crate::runtime::host::HostActionKind::IrqGfxPulse),
             2
         );
+        // The guest builds its mode list out of the descriptor page before it
+        // acknowledges the offer, so the pulses above are only useful if the
+        // page already carries the modes this device advertises.
+        assert!(runtime.display().descriptor_published());
+        assert_eq!(
+            host.get_u32(publication.page.gpa + crate::model::DISPLAY_DESC_TIMING_COUNT) & 0xffff,
+            4
+        );
+        assert_eq!(
+            host.get_u32(
+                publication.page.gpa + crate::runtime::decode::fifo::DISPLAY_DESC_TIMING_BASE
+            ),
+            u32::from(crate::model::DISPLAY_MODE_EFI_W)
+                | (u32::from(crate::model::DISPLAY_MODE_EFI_H) << 16)
+        );
         let ack = crate::runtime::replacement_child_packet::decode_replacement_online_ack(&[
             1, 2, 3, 4, 5,
         ]);
@@ -31730,7 +31786,7 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .progress_display_online(&mut host, &interrupt_status)
+                .progress_display_online(&mut host, &interrupt_status, 0x1000)
                 .unwrap(),
             reims_vgpu_core::DisplayOnlineNotification::Idle
         );

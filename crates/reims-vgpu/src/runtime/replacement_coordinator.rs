@@ -6874,6 +6874,7 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
                 crate::runtime::replacement_session::ReplacementDisplayOnlineError::NativeLifetimeClosed,
             );
         }
+        let page_bytes = 1u64 << self.transport.page_shift();
         match self.runtime.progress_display_online(
             host,
             self.transport
@@ -6881,6 +6882,7 @@ impl<Semantic: Clone + PartialEq + Send + 'static> ReplacementDeviceCoordinator<
                 .gfx
                 .interrupt_status_disp
                 .as_ref(),
+            page_bytes,
         ) {
             Ok(notification) => {
                 self.display_online_failure = None;

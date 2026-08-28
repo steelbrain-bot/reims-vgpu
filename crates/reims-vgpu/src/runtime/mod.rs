@@ -20,6 +20,7 @@ pub(crate) mod replacement_child_packet;
 pub(crate) mod replacement_compute_projection;
 pub(crate) mod replacement_compute_state;
 pub(crate) mod replacement_coordinator;
+pub(crate) mod replacement_display_descriptor;
 #[path = "exec/replacement_decode.rs"]
 pub(crate) mod replacement_exec_decode;
 pub(crate) mod replacement_exec_support;
