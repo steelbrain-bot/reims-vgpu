@@ -275,20 +275,10 @@ fn replacement_host_exec_failure_diagnostic(
         }
         ReplacementHostExecDispatchFailure::Dispatch { reason, .. } => match reason {
             Dispatch::Ingress(reason) => replacement_ingress_preparation_diagnostic(reason),
-            Dispatch::DirectResources(reason) => match reason {
-                crate::runtime::replacement_session::ReplacementResourceReadyExecFailure::Readiness { reason, .. } => {
-                    format!("stage=direct_resources.readiness reason={reason:?}")
-                }
-                crate::runtime::replacement_session::ReplacementResourceReadyExecFailure::Resources { reason, .. } => {
-                    format!(
-                        "stage=direct_resources.resources {}",
-                        replacement_automatic_preparation_diagnostic(reason)
-                    )
-                }
-                crate::runtime::replacement_session::ReplacementResourceReadyExecFailure::Images { reason, .. } => {
-                    format!("stage=direct_resources.images reason={reason:?}")
-                }
-            },
+            Dispatch::DirectResources(reason) => format!(
+                "stage=direct_resources.{}",
+                replacement_resource_ready_exec_diagnostic(reason)
+            ),
             Dispatch::DirectDispatch(reason) => match reason {
                 crate::runtime::replacement_session::ReplacementResourceReadyDispatchFailure::Resolution(failure) => {
                     format!(
@@ -1011,6 +1001,25 @@ fn replacement_ingress_preparation_diagnostic(
         Ingress::IndirectRange(failure) => {
             format!("stage=ingress.indirect_range reason={:?}", failure.reason)
         }
+    }
+}
+
+/// Which resource phase of an exec refused, and why.
+///
+/// Shared by the exec ingress route and the synchronize route, which reach the
+/// same three phases: naming them separately is how one of the two comes to
+/// say only `resources` while the other says what was in it.
+pub(crate) fn replacement_resource_ready_exec_diagnostic<Semantic>(
+    failure: &crate::runtime::replacement_session::ReplacementResourceReadyExecFailure<Semantic>,
+) -> String {
+    use crate::runtime::replacement_session::ReplacementResourceReadyExecFailure as Failure;
+    match failure {
+        Failure::Readiness { reason, .. } => format!("readiness reason={reason:?}"),
+        Failure::Resources { reason, .. } => format!(
+            "resources {}",
+            replacement_automatic_preparation_diagnostic(reason)
+        ),
+        Failure::Images { reason, .. } => format!("images reason={reason:?}"),
     }
 }
 

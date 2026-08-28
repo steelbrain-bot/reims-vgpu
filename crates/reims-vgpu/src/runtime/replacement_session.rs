@@ -4861,6 +4861,44 @@ pub(crate) enum ReplacementResourceReadyExecFailure<Completion> {
     },
 }
 
+impl<Completion> ReplacementResourceReadyExecFailure<Completion> {
+    /// The backing this refused on, the view that named it when the phase
+    /// knows one, and what was wrong with it.
+    ///
+    /// Two phases report a backing fault and they name different amounts of
+    /// it. Readiness asks whether a backing has *any* designated
+    /// representation, so it names a backing and no view. Resource
+    /// preparation asks for the representation one binding resolves to, so it
+    /// names the view as well, and the view is what says which of a backing's
+    /// images the fault is about.
+    ///
+    /// It lives here rather than on either wrapper because both the exec
+    /// ingress route and the synchronize route reach this same failure, and a
+    /// question answered twice is answered differently once. That is not
+    /// hypothetical: the repair for a missing execution representation was
+    /// wired to the exec route only, so a synchronize refused the same way
+    /// held its channel head for the rest of the boot.
+    pub(crate) fn backing_fault(
+        &self,
+    ) -> Option<(
+        reims_vgpu_protocol::BackingId,
+        Option<reims_vgpu_core::BackingView>,
+        reims_vgpu_core::ManagedBackingError,
+    )> {
+        match self {
+            Self::Readiness {
+                reason:
+                    ReplacementExecResourceReadinessError::ValidityRepresentation { backing, reason },
+                ..
+            } => Some((*backing, None, *reason)),
+            Self::Resources { reason, .. } => reason
+                .backing_fault()
+                .map(|(backing, view, reason)| (backing, Some(view), reason)),
+            Self::Readiness { .. } | Self::Images { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ReplacementExecImagePreparationFailure {
     pub reason: ReplacementExecImagePreparationRefusal,
@@ -6369,17 +6407,7 @@ impl<Completion> ReplacementExecIngressDispatchFailure<Completion> {
         reims_vgpu_core::ManagedBackingError,
     )> {
         match self {
-            Self::DirectResources(ReplacementResourceReadyExecFailure::Readiness {
-                reason:
-                    ReplacementExecResourceReadinessError::ValidityRepresentation { backing, reason },
-                ..
-            }) => Some((*backing, None, *reason)),
-            Self::DirectResources(ReplacementResourceReadyExecFailure::Resources {
-                reason,
-                ..
-            }) => reason
-                .backing_fault()
-                .map(|(backing, view, reason)| (backing, Some(view), reason)),
+            Self::DirectResources(failure) => failure.backing_fault(),
             _ => None,
         }
     }
@@ -7458,7 +7486,11 @@ impl<Semantic> ReplacementSynchronizeDispatchFailure<Semantic> {
             Self::Accesses(reason) => format!("accesses={reason:?}"),
             Self::Admission(reason) => format!("admission={reason:?}"),
             Self::Preparation(failure) => format!("preparation={:?}", failure.reason),
-            Self::Resources(_) => "resources".to_owned(),
+            Self::Resources(failure) => {
+                crate::runtime::replacement_coordinator::replacement_resource_ready_exec_diagnostic(
+                    failure,
+                )
+            }
             Self::Dispatch(_) => "dispatch".to_owned(),
         }
     }
