@@ -395,6 +395,30 @@ pub fn prepare_content_synchronization<T>(
                                 reason,
                             })?;
                         for region in take_available_regions(&mut remaining, &guest_regions) {
+                            // One request asks about several regions, and a
+                            // representation whose coverage is the complete
+                            // backing answers more than one of them with that
+                            // same complete backing -- it has no finer terms
+                            // to answer in. Those asks are then the same
+                            // bytes at the same version to the same
+                            // destination, and an ingress is consumed exactly
+                            // once when it completes, so planning it again is
+                            // not more work: it is the same work counted
+                            // twice, and the batch refuses the whole request
+                            // rather than perform it.
+                            let key = crate::HostIngressKey {
+                                backing,
+                                region,
+                                version: required.version,
+                            };
+                            let transfer = HostIngressTransfer {
+                                ingress: key,
+                                destination,
+                            };
+                            if deferred.contains(&transfer) {
+                                used_representations.insert(HOST_REPRESENTATION);
+                                continue;
+                            }
                             let ingress = resources
                                 .plan_host_ingress(
                                     backing,
@@ -407,6 +431,10 @@ pub fn prepare_content_synchronization<T>(
                                     backing,
                                     reason,
                                 })?;
+                            debug_assert_eq!(
+                                ingress, key,
+                                "an ingress is named by its backing, region and version"
+                            );
                             host_ingresses.push(ingress);
                             deferred.push(HostIngressTransfer {
                                 ingress,
@@ -759,6 +787,58 @@ mod tests {
         .unwrap();
         assert!(prepared.transfers().is_empty());
         assert!(prepared.host_ingresses().is_empty());
+        cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
+    }
+
+    /// A whole-backing source answers two asks with one ingress.
+    ///
+    /// A backing created with whole-backing coverage has no finer terms to
+    /// answer in, so every region a request names comes back as the complete
+    /// backing. Two asks in one request are then the same bytes at the same
+    /// version to the same destination -- and an ingress is consumed exactly
+    /// once when it completes, so a second is not more work but the same work
+    /// counted twice, which the completion batch refuses as a whole.
+    #[test]
+    fn two_asks_answered_by_one_whole_backing_plan_one_ingress() {
+        let mut resources = ResourceLifecycleOwner::new(VulkanDeviceEpochId::new(1));
+        let ResourceLifecycleEffect::BackingCreated(backing) = resources
+            .apply(ResolvedResourceLifecycle::CreateBacking {
+                backing: StorageBacking::Dedicated,
+                regions: Box::new([BackingRegion::Whole]),
+            })
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        resources
+            .create_representation(backing, RepresentationRoute::HostStagingEndpoint, ())
+            .unwrap();
+        resources
+            .create_execution_representation(
+                backing,
+                RepresentationRoute::HostStagingTransfer {
+                    working: crate::WorkingMemoryClass::DeviceLocal,
+                },
+                BackingView::Bytes,
+                (),
+            )
+            .unwrap();
+
+        let prepared = prepare_content_synchronization(
+            &mut resources,
+            TransactionId::new(11),
+            [ContentSynchronizationRequest {
+                backing,
+                regions: Box::new([
+                    BackingRegion::Whole,
+                    BackingRegion::Linear(LinearRange::new(0, 64).unwrap()),
+                ]),
+                permitted_pending_writes: Box::new([]),
+            }],
+        )
+        .unwrap();
+        assert_eq!(prepared.host_ingresses().len(), 1);
+        assert_eq!(prepared.host_ingresses()[0].region, BackingRegion::Whole);
         cancel_prepared_content_synchronization(&mut resources, prepared).unwrap();
     }
 
