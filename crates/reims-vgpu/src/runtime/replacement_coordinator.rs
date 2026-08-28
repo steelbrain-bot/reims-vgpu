@@ -7135,9 +7135,12 @@ impl ReplacementDeviceCoordinator<()> {
             )
             .collect::<std::collections::BTreeSet<_>>();
         for backing in stale_backings {
-            for (representation, holds) in self.runtime.execution_representation_coverage(backing) {
+            for (view, representation, holds) in
+                self.runtime.execution_representation_coverage(backing)
+            {
                 crate::observe::off(format!(
-                    "replacement_stale_representation backing={} representation={} holds=[{holds}]",
+                    "replacement_stale_representation backing={} view={view:?} \
+                     representation={} holds=[{holds}]",
                     backing.get(),
                     representation.get()
                 ));

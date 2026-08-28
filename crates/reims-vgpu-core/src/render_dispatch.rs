@@ -537,6 +537,10 @@ pub enum RenderDispatchPreparationError {
     InvalidIndirectBinding(u32),
     Backing {
         backing: BackingId,
+        /// Which view of the backing the failing group addressed. A backing
+        /// carries one native object per view, each with its own content, so
+        /// the backing alone does not say which of them disagreed.
+        view: BackingView,
         resources: Box<[ResourceId<ResourceObject>]>,
         regions: Box<[BackingRegion]>,
         reads: bool,
@@ -685,6 +689,7 @@ pub fn prepare_render_dispatch<T, NativePipeline>(
         let resources = resources.into_iter().collect::<Vec<_>>().into_boxed_slice();
         let backing_error = |reason| RenderDispatchPreparationError::Backing {
             backing,
+            view,
             resources: resources.clone(),
             regions: regions.clone(),
             reads,
@@ -1769,6 +1774,7 @@ mod tests {
         let backing = BackingId::new(7);
         let refusal = |reason| RenderDispatchPreparationError::Backing {
             backing,
+            view: BackingView::Bytes,
             resources: Box::new([]),
             regions: Box::new([]),
             reads: true,

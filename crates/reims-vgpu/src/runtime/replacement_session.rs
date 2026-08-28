@@ -7247,19 +7247,27 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
     pub fn execution_representation_coverage(
         &self,
         backing: reims_vgpu_protocol::BackingId,
-    ) -> Vec<(reims_vgpu_protocol::RepresentationId, String)> {
+    ) -> Vec<(
+        reims_vgpu_core::BackingView,
+        reims_vgpu_protocol::RepresentationId,
+        String,
+    )> {
         let resources = self.execution.resources();
         let Ok(designated) = resources.designated_views(backing) else {
             return Vec::new();
         };
         // Every view, because a stale refusal names only the backing and the
-        // stale one may be any image over it.
+        // stale one may be any image over it. The view travels with the
+        // reading: two representations over one backing hold different content
+        // by design, and without it the line says which is empty but not which
+        // binding wanted it.
         designated
             .into_iter()
             .filter_map(|(view, _)| {
                 let (representation, coverage) =
                     resources.execution_representation_coverage(backing, view)?;
                 Some((
+                    view,
                     representation,
                     coverage
                         .iter()
