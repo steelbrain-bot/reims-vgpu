@@ -12588,6 +12588,10 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
         &mut self,
         resources: PreparedReplacementExecResources,
     ) -> Result<ReplacementPreparedExecEnvelope, Box<ReplacementExecImagePreparationFailure>> {
+        let transfer_endpoints = self.session.vulkan.execution_resolver(
+            &self.execution.epoch.resources,
+            &self.execution.epoch.images,
+        );
         let image_transfers = resources
             .inputs()
             .resource_states
@@ -12605,31 +12609,15 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
             )
             .copied()
             // Which transfers reach an image at all, for a region that does
-            // not say so itself. Two shapes qualify and they are different
-            // rails: a byte range staged between an image and a buffer that
-            // carries a linear texture layout, and a copy between two images
-            // over one backing --- which is what the content authority plans
-            // when a guest's own content lands in one texture over an
-            // allocation and a second texture over the same allocation has to
-            // be brought current from it.
+            // not say so itself. The recorder decides that from the native
+            // registry when it resolves the transfer, and this is the same
+            // question one step earlier, so it is asked through the same
+            // classification rather than restated here.
             .filter(|transfer| {
-                let representations = self.execution.resources();
-                let source = representations.representation(transfer.backing, transfer.source);
-                let destination =
-                    representations.representation(transfer.backing, transfer.destination);
-                let (Some(source), Some(destination)) = (source, destination) else {
-                    return false;
-                };
-                let staged =
-                    |image: &ReplacementNativeRepresentation,
-                     bytes: &ReplacementNativeRepresentation| {
-                        image.image().is_some()
-                            && bytes.buffer().is_some()
-                            && bytes.linear_texture_layout().is_some()
-                    };
-                (source.image().is_some() && destination.image().is_some())
-                    || staged(source, destination)
-                    || staged(destination, source)
+                reims_vgpu_vulkan::replacement_resource_state::transfer_requires_image_state(
+                    *transfer,
+                    &transfer_endpoints,
+                )
             })
             .collect::<std::collections::BTreeSet<_>>();
         let has_images = match reims_vgpu_vulkan::replacement_exec_image::exec_has_image_uses_with_transfer_classifier(

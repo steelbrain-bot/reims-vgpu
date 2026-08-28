@@ -977,16 +977,46 @@ fn resolve_buffer_transfer(
     })
 }
 
-fn resolve_transfer(
-    backings: &[BackingId],
+/// The endpoint shapes a transfer between two representations over one backing
+/// can have, decided once from the native registry.
+///
+/// Recording a transfer and deciding whether the EXEC needs a prepared
+/// image-state batch are the same question asked at two moments, so they ask
+/// it through this one classification. A second spelling of it drifts: a
+/// classifier that qualified a buffer/image pair only when the buffer already
+/// carried a linear texture layout withheld the batch from a pair that
+/// `resolve_transfer` then declined for wanting it, and that decline is
+/// waitable, so the channel head retried it forever.
+pub enum TransferEndpoints {
+    /// Neither endpoint resolves to an image: a plain buffer copy.
+    Buffers,
+    /// One endpoint is an image and the other its bytes.
+    BufferImage {
+        buffer: crate::replacement_buffer_blit::NativeBufferTarget,
+        image: crate::replacement_image_transition::NativeImageTarget,
+        image_key: ReplacementImageKey,
+        /// The image is the destination.
+        buffer_to_image: bool,
+    },
+    /// Two images over one allocation.
+    ImageImage {
+        source: crate::replacement_image_transition::NativeImageTarget,
+        source_key: ReplacementImageKey,
+        destination: crate::replacement_image_transition::NativeImageTarget,
+        destination_key: ReplacementImageKey,
+    },
+    /// An endpoint reaches an image and the pair is none of the above --- a
+    /// representation carrying both shapes, or one carrying neither opposite a
+    /// one that carries an image.
+    Unrecordable,
+}
+
+/// Classify a transfer's endpoints through the native registry.
+pub fn classify_transfer_endpoints(
     transfer: TransferKey,
-    image_state: Option<&PreparedImageState>,
     resolver: &(impl ReplacementBufferResolver
           + crate::replacement_image_transition::ReplacementImageResolver),
-) -> Result<NativeResourceStateTransfer, ResourceStateTransferRecordError> {
-    if !backings.contains(&transfer.backing) {
-        return Err(ResourceStateTransferRecordError::TransferBackingNotDeclared(transfer.backing));
-    }
+) -> TransferEndpoints {
     let source_buffer = resolver.resolve_buffer(transfer.backing, transfer.source);
     let destination_buffer = resolver.resolve_buffer(transfer.backing, transfer.destination);
     let source_key = ReplacementImageKey {
@@ -999,44 +1029,88 @@ fn resolve_transfer(
     };
     let source_image = resolver.resolve_image(source_key);
     let destination_image = resolver.resolve_image(destination_key);
-    if source_image.is_none() && destination_image.is_none() {
-        return resolve_buffer_transfer(backings, transfer, resolver)
-            .map(NativeResourceStateTransfer::Buffer);
-    }
-    // The prepared image state is a prerequisite of exactly one endpoint
-    // shape -- the buffer/image pair below is the only arm that reads it.
-    // Demanding it before the shape is known reports every *other* shape as a
-    // missing preparation, which reads as "not ready yet" and is retried
-    // forever, when the truth is a transfer this device cannot record at all
-    // and must decline once by its own name.
-    let state = || {
-        image_state.ok_or(ResourceStateTransferRecordError::ImageTransferRequiresState(transfer))
-    };
     match (
         source_buffer,
         source_image,
         destination_buffer,
         destination_image,
     ) {
-        (Some(buffer), None, None, Some(image)) => resolve_buffer_image_transfer(
-            transfer,
+        (_, None, _, None) => TransferEndpoints::Buffers,
+        (Some(buffer), None, None, Some(image)) => TransferEndpoints::BufferImage {
             buffer,
             image,
-            destination_key,
-            true,
-            state()?,
-            resolver,
-        ),
-        (None, Some(image), Some(buffer), None) => resolve_buffer_image_transfer(
-            transfer,
+            image_key: destination_key,
+            buffer_to_image: true,
+        },
+        (None, Some(image), Some(buffer), None) => TransferEndpoints::BufferImage {
             buffer,
             image,
+            image_key: source_key,
+            buffer_to_image: false,
+        },
+        (None, Some(source), None, Some(destination)) => TransferEndpoints::ImageImage {
+            source,
             source_key,
-            false,
+            destination,
+            destination_key,
+        },
+        _ => TransferEndpoints::Unrecordable,
+    }
+}
+
+/// Whether recording this transfer reaches a native image, and so needs the
+/// prepared image-state batch that [`resolve_transfer`] reads.
+pub fn transfer_requires_image_state(
+    transfer: TransferKey,
+    resolver: &(impl ReplacementBufferResolver
+          + crate::replacement_image_transition::ReplacementImageResolver),
+) -> bool {
+    !matches!(
+        classify_transfer_endpoints(transfer, resolver),
+        TransferEndpoints::Buffers
+    )
+}
+
+fn resolve_transfer(
+    backings: &[BackingId],
+    transfer: TransferKey,
+    image_state: Option<&PreparedImageState>,
+    resolver: &(impl ReplacementBufferResolver
+          + crate::replacement_image_transition::ReplacementImageResolver),
+) -> Result<NativeResourceStateTransfer, ResourceStateTransferRecordError> {
+    if !backings.contains(&transfer.backing) {
+        return Err(ResourceStateTransferRecordError::TransferBackingNotDeclared(transfer.backing));
+    }
+    // The prepared image state is a prerequisite of every endpoint shape that
+    // reaches an image, and of none that does not. Demanding it before the
+    // shape is known reports a plain buffer copy as a missing preparation,
+    // which reads as "not ready yet" and is retried forever.
+    let state = || {
+        image_state.ok_or(ResourceStateTransferRecordError::ImageTransferRequiresState(transfer))
+    };
+    match classify_transfer_endpoints(transfer, resolver) {
+        TransferEndpoints::Buffers => resolve_buffer_transfer(backings, transfer, resolver)
+            .map(NativeResourceStateTransfer::Buffer),
+        TransferEndpoints::BufferImage {
+            buffer,
+            image,
+            image_key,
+            buffer_to_image,
+        } => resolve_buffer_image_transfer(
+            transfer,
+            buffer,
+            image,
+            image_key,
+            buffer_to_image,
             state()?,
             resolver,
         ),
-        (None, Some(source), None, Some(destination)) => resolve_image_image_transfer(
+        TransferEndpoints::ImageImage {
+            source,
+            source_key,
+            destination,
+            destination_key,
+        } => resolve_image_image_transfer(
             transfer,
             source,
             source_key,
@@ -1045,9 +1119,9 @@ fn resolve_transfer(
             state()?,
             resolver,
         ),
-        _ => Err(ResourceStateTransferRecordError::ImageEndpointMissing(
-            transfer,
-        )),
+        TransferEndpoints::Unrecordable => Err(
+            ResourceStateTransferRecordError::ImageEndpointMissing(transfer),
+        ),
     }
 }
 
@@ -3273,6 +3347,89 @@ mod tests {
                 // 512 bytes a row is 128 texels in the image's own four-byte
                 // texels and 64 in the endpoint's eight-byte ones.
                 if copy.buffer_row_length == 128 && copy.extent == [128, 64, 1]
+        ));
+    }
+
+    /// Whether an EXEC needs a prepared image-state batch is decided by the
+    /// same classification that records the transfer, so a pair the recorder
+    /// resolves as buffer/image is a pair the classifier qualifies --- however
+    /// little the bytes endpoint declares about itself.
+    ///
+    /// A classifier that additionally required the bytes endpoint to carry a
+    /// linear texture layout withheld the batch from a pair the recorder then
+    /// declined for wanting it. That decline is waitable, so the channel head
+    /// retried it for the life of the boot.
+    #[test]
+    fn a_transfer_the_recorder_reaches_an_image_through_is_a_transfer_that_needs_state() {
+        struct Endpoints;
+        impl ReplacementBufferResolver for Endpoints {
+            fn resolve_buffer(
+                &self,
+                _backing: BackingId,
+                representation: RepresentationId,
+            ) -> Option<NativeBufferTarget> {
+                (representation == RepresentationId::new(2)).then_some(NativeBufferTarget {
+                    buffer: vk::Buffer::from_raw(77),
+                    base_offset: 0,
+                    accessible_size: 32768,
+                    size: 32768,
+                    usage: vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                })
+            }
+        }
+        impl crate::replacement_image_transition::ReplacementImageResolver for Endpoints {
+            fn resolve_image(
+                &self,
+                image: ReplacementImageKey,
+            ) -> Option<crate::replacement_image_transition::NativeImageTarget> {
+                (image.representation == RepresentationId::new(3)).then_some(
+                    crate::replacement_image_transition::NativeImageTarget {
+                        image: vk::Image::from_raw(2),
+                        view: vk::ImageView::null(),
+                        image_type: vk::ImageType::TYPE_2D,
+                        full_range: vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        usage: vk::ImageUsageFlags::TRANSFER_SRC
+                            | vk::ImageUsageFlags::TRANSFER_DST,
+                        pixel_format: 80,
+                        extent: vk::Extent3D {
+                            width: 128,
+                            height: 64,
+                            depth: 1,
+                        },
+                        samples: vk::SampleCountFlags::TYPE_1,
+                    },
+                )
+            }
+        }
+
+        let backing = BackingId::new(1);
+        let transfer = TransferKey {
+            backing,
+            region: BackingRegion::Whole,
+            version: reims_vgpu_protocol::ContentVersion::new(3),
+            source: RepresentationId::new(2),
+            destination: RepresentationId::new(3),
+        };
+        assert!(transfer_requires_image_state(transfer, &Endpoints));
+        assert!(matches!(
+            resolve_transfer(&[backing], transfer, None, &Endpoints),
+            Err(ResourceStateTransferRecordError::ImageTransferRequiresState(found))
+                if found == transfer
+        ));
+        // And the pair with no image on either end is a plain buffer copy,
+        // which must not be made to wait for a batch it never reads.
+        assert!(!transfer_requires_image_state(
+            TransferKey {
+                destination: RepresentationId::new(2),
+                ..transfer
+            },
+            &Endpoints
         ));
     }
 
