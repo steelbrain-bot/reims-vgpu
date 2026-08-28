@@ -50,7 +50,10 @@ pub enum ResourceStateTransferRecordError {
         refusal: ImageToImageRefusal,
     },
     ImageLayoutMissing(TransferKey),
-    ImageLayoutUnsupported(TransferKey),
+    ImageLayoutUnsupported {
+        transfer: TransferKey,
+        refusal: ImageLayoutRefusal,
+    },
     ImageUsageMissing(TransferKey),
     MissingHostStaging(HostLandingKey),
     HostLandingImageLayoutMissing(HostLandingKey),
@@ -70,9 +73,90 @@ impl ResourceStateTransferRecordError {
     pub const fn is_terminal_refusal(&self) -> bool {
         matches!(
             self,
-            Self::ImageToImageUnsupported { .. } | Self::ImageLayoutUnsupported(_)
+            Self::ImageToImageUnsupported { .. } | Self::ImageLayoutUnsupported { .. }
         )
     }
+}
+
+/// Which term of a linear texture layout a buffer/image copy could not express.
+///
+/// One name for thirty-one refusal sites was one name too few. Every one of
+/// them says "this layout is unsupported", they are spread over three
+/// functions that walk the same descriptor, and a boot that hits one reports a
+/// transfer key and nothing about which term of the layout stopped it -- so the
+/// next question, what to implement, has nowhere to start. This is the same
+/// move [`ImageEndpointDisagreement`] makes for the image-to-image pair, for
+/// the same reason.
+///
+/// Deciding and reporting stay one walk: these are constructed exactly where
+/// the refusal is decided, never reconstructed afterwards from the layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageLayoutRefusal {
+    /// The layout declares no level at this mip.
+    LevelAbsent { mip: u32 },
+    /// A compressed layout. This device does not translate block coordinates.
+    CompressedLayout,
+    /// The layout declares a zero element size, so no byte offset divides into
+    /// texels.
+    ZeroBytesPerElement,
+    /// A row stride that is not a whole number of elements.
+    /// `vkCmdCopyBufferToImage` takes `bufferRowLength` in texels and there is
+    /// no remainder to give it.
+    RowStrideNotElementAligned {
+        row_stride: u64,
+        bytes_per_element: u64,
+    },
+    /// A row length in elements that does not fit the Vulkan field.
+    RowLengthNotRepresentable { row_length: u64 },
+    /// The layout declares no offset for this subresource.
+    SubresourceOffsetAbsent { layer: u32, mip: u32 },
+    /// The region does not reduce to one exact Vulkan subresource range.
+    SubresourceRangeInexact,
+    /// A texel coordinate or extent that does not fit its Vulkan field.
+    CoordinateNotRepresentable {
+        term: LayoutCoordinateTerm,
+        value: u64,
+    },
+    /// The layout declares no pixel format, so nothing says how wide a texel
+    /// is.
+    PixelFormatUndeclared,
+    /// A depth or stencil format reached through a byte range. A linear range
+    /// names bytes and a copy needs an aspect, and this device does not pick
+    /// one for the guest.
+    DepthStencilFormat { pixel_format: u16 },
+    /// The layout declares no physical slice count.
+    SliceCountUndeclared,
+    /// A zero row or image stride, which no byte offset divides by.
+    ZeroStride { row_stride: u64, image_stride: u64 },
+    /// The byte range does not begin on an element boundary.
+    OffsetNotElementAligned { offset: u64, bytes_per_element: u64 },
+    /// The byte range is not a whole number of elements.
+    LengthNotElementAligned { length: u64, bytes_per_element: u64 },
+    /// The byte range covers a shape no single texel box expresses -- a
+    /// part-row start with a multi-row length, or a row count past the level
+    /// that does not divide into whole images.
+    RangeNotRectangular {
+        offset_in_row: u64,
+        length: u64,
+        row_stride: u64,
+        row: u64,
+        height: u32,
+    },
+    /// The derived origin and extent are not a texel box.
+    ExtentNotATexelBox { origin: [u32; 3], extent: [u32; 3] },
+    /// A transfer region that is neither an image region nor a byte range.
+    RegionNotLinear,
+}
+
+/// Which coordinate a layout translation could not fit into its Vulkan field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LayoutCoordinateTerm {
+    OriginX,
+    OriginY,
+    OriginZ,
+    Width,
+    Height,
+    Depth,
 }
 
 /// One of the five terms `same_subresource_range` compares.
@@ -1189,23 +1273,40 @@ fn resolve_buffer_image_transfer_region(
     if !image_region_fits_layout(layout, region, buffer.size) {
         return Err(ResourceStateTransferRecordError::RangeOutOfBounds(transfer));
     }
-    let level = layout.level(region.mip).ok_or(
-        ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-    )?;
+    let unsupported =
+        |refusal| ResourceStateTransferRecordError::ImageLayoutUnsupported { transfer, refusal };
+    let level = layout
+        .level(region.mip)
+        .ok_or_else(|| unsupported(ImageLayoutRefusal::LevelAbsent { mip: region.mip }))?;
     let bytes_per_element = u64::from(layout.bytes_per_element);
-    if layout.compressed_layout
-        || bytes_per_element == 0
-        || level.row_stride % bytes_per_element != 0
-    {
-        return Err(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-            transfer,
+    if layout.compressed_layout {
+        return Err(unsupported(ImageLayoutRefusal::CompressedLayout));
+    }
+    if bytes_per_element == 0 {
+        return Err(unsupported(ImageLayoutRefusal::ZeroBytesPerElement));
+    }
+    if level.row_stride % bytes_per_element != 0 {
+        return Err(unsupported(
+            ImageLayoutRefusal::RowStrideNotElementAligned {
+                row_stride: level.row_stride,
+                bytes_per_element,
+            },
         ));
     }
-    let row_length = u32::try_from(level.row_stride / bytes_per_element)
-        .map_err(|_| ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer))?;
-    let level_offset = layout.subresource_offset(region.layer, region.mip).ok_or(
-        ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-    )?;
+    let row_length_texels = level.row_stride / bytes_per_element;
+    let row_length = u32::try_from(row_length_texels).map_err(|_| {
+        unsupported(ImageLayoutRefusal::RowLengthNotRepresentable {
+            row_length: row_length_texels,
+        })
+    })?;
+    let level_offset = layout
+        .subresource_offset(region.layer, region.mip)
+        .ok_or_else(|| {
+            unsupported(ImageLayoutRefusal::SubresourceOffsetAbsent {
+                layer: region.layer,
+                mip: region.mip,
+            })
+        })?;
     let image_stride = level
         .row_stride
         .checked_mul(u64::from(level.height))
@@ -1262,9 +1363,7 @@ fn resolve_buffer_image_transfer_region(
     let range = crate::replacement_image_transition::exact_image_subresource_range(
         BackingRegion::Image(region),
     )
-    .ok_or(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-        transfer,
-    ))?;
+    .ok_or_else(|| unsupported(ImageLayoutRefusal::SubresourceRangeInexact))?;
     let mip_end = image
         .full_range
         .base_mip_level
@@ -1298,12 +1397,24 @@ fn resolve_buffer_image_transfer_region(
         mip: region.mip,
         layer: region.layer,
         image_offset: [
-            i32::try_from(region.texels.origin[0])
-                .map_err(|_| ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer))?,
-            i32::try_from(region.texels.origin[1])
-                .map_err(|_| ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer))?,
-            i32::try_from(region.texels.origin[2])
-                .map_err(|_| ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer))?,
+            i32::try_from(region.texels.origin[0]).map_err(|_| {
+                unsupported(ImageLayoutRefusal::CoordinateNotRepresentable {
+                    term: LayoutCoordinateTerm::OriginX,
+                    value: u64::from(region.texels.origin[0]),
+                })
+            })?,
+            i32::try_from(region.texels.origin[1]).map_err(|_| {
+                unsupported(ImageLayoutRefusal::CoordinateNotRepresentable {
+                    term: LayoutCoordinateTerm::OriginY,
+                    value: u64::from(region.texels.origin[1]),
+                })
+            })?,
+            i32::try_from(region.texels.origin[2]).map_err(|_| {
+                unsupported(ImageLayoutRefusal::CoordinateNotRepresentable {
+                    term: LayoutCoordinateTerm::OriginZ,
+                    value: u64::from(region.texels.origin[2]),
+                })
+            })?,
         ],
         extent: [
             region.texels.end[0] - region.texels.origin[0],
@@ -1325,33 +1436,36 @@ fn transfer_image_regions(
     if let BackingRegion::Image(region) = transfer.region {
         return Ok(vec![region]);
     }
+    let unsupported =
+        |refusal| ResourceStateTransferRecordError::ImageLayoutUnsupported { transfer, refusal };
     if matches!(transfer.region, BackingRegion::Whole) {
-        let format = layout.declared_pixel_format().ok_or(
-            ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-        )?;
+        let format = layout
+            .declared_pixel_format()
+            .ok_or_else(|| unsupported(ImageLayoutRefusal::PixelFormatUndeclared))?;
         if reims_vgpu_core::pixel_format::format_has_depth_aspect(format)
             || reims_vgpu_core::pixel_format::format_has_stencil_aspect(format)
         {
-            return Err(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-                transfer,
-            ));
+            return Err(unsupported(ImageLayoutRefusal::DepthStencilFormat {
+                pixel_format: format,
+            }));
         }
-        let slices = layout.physical_slice_count().ok_or(
-            ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-        )?;
+        let slices = layout
+            .physical_slice_count()
+            .ok_or_else(|| unsupported(ImageLayoutRefusal::SliceCountUndeclared))?;
         let mut regions = Vec::new();
         for layer in 0..slices {
             for mip in 0..layout.mipmap_level_count {
-                let level = layout.level(mip).ok_or(
-                    ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-                )?;
-                let texels = reims_vgpu_core::TexelBox::new(
-                    [0, 0, 0],
-                    [level.width, level.height, level.planes()],
-                )
-                .ok_or(
-                    ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-                )?;
+                let level = layout
+                    .level(mip)
+                    .ok_or_else(|| unsupported(ImageLayoutRefusal::LevelAbsent { mip }))?;
+                let extent = [level.width, level.height, level.planes()];
+                let texels =
+                    reims_vgpu_core::TexelBox::new([0, 0, 0], extent).ok_or_else(|| {
+                        unsupported(ImageLayoutRefusal::ExtentNotATexelBox {
+                            origin: [0, 0, 0],
+                            extent,
+                        })
+                    })?;
                 regions.push(reims_vgpu_core::ImageRegion {
                     aspect: reims_vgpu_core::ImageAspect::Color,
                     mip,
@@ -1368,9 +1482,9 @@ fn transfer_image_regions(
     if range.end() > layout.allocation_size {
         return Err(ResourceStateTransferRecordError::RangeOutOfBounds(transfer));
     }
-    let slices = layout.physical_slice_count().ok_or(
-        ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-    )?;
+    let slices = layout
+        .physical_slice_count()
+        .ok_or_else(|| unsupported(ImageLayoutRefusal::SliceCountUndeclared))?;
     let mut regions = Vec::new();
     for layer in 0..slices {
         for mip in 0..layout.mipmap_level_count {
@@ -1408,27 +1522,31 @@ fn transfer_image_region(
     if let BackingRegion::Image(region) = transfer.region {
         return Ok(region);
     }
+    let unsupported =
+        |refusal| ResourceStateTransferRecordError::ImageLayoutUnsupported { transfer, refusal };
     let BackingRegion::Linear(range) = transfer.region else {
-        return Err(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-            transfer,
-        ));
+        return Err(unsupported(ImageLayoutRefusal::RegionNotLinear));
     };
-    let pixel_format = layout.declared_pixel_format().ok_or(
-        ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-    )?;
+    let pixel_format = layout
+        .declared_pixel_format()
+        .ok_or_else(|| unsupported(ImageLayoutRefusal::PixelFormatUndeclared))?;
     if reims_vgpu_core::pixel_format::format_has_depth_aspect(pixel_format)
         || reims_vgpu_core::pixel_format::format_has_stencil_aspect(pixel_format)
-        || layout.compressed_layout
-        || layout.bytes_per_element == 0
     {
-        return Err(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-            transfer,
-        ));
+        return Err(unsupported(ImageLayoutRefusal::DepthStencilFormat {
+            pixel_format,
+        }));
+    }
+    if layout.compressed_layout {
+        return Err(unsupported(ImageLayoutRefusal::CompressedLayout));
+    }
+    if layout.bytes_per_element == 0 {
+        return Err(unsupported(ImageLayoutRefusal::ZeroBytesPerElement));
     }
     let bytes_per_element = u64::from(layout.bytes_per_element);
-    let slices = layout.physical_slice_count().ok_or(
-        ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-    )?;
+    let slices = layout
+        .physical_slice_count()
+        .ok_or_else(|| unsupported(ImageLayoutRefusal::SliceCountUndeclared))?;
     for layer in 0..slices {
         for mip in 0..layout.mipmap_level_count {
             let Some(level) = layout.level(mip) else {
@@ -1451,9 +1569,10 @@ fn transfer_image_region(
                     transfer,
                 ))?;
             if image_stride == 0 || level.row_stride == 0 {
-                return Err(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-                    transfer,
-                ));
+                return Err(unsupported(ImageLayoutRefusal::ZeroStride {
+                    row_stride: level.row_stride,
+                    image_stride,
+                }));
             }
             let z = relative / image_stride;
             let within_image = relative % image_stride;
@@ -1461,15 +1580,26 @@ fn transfer_image_region(
             let x_bytes = within_image % level.row_stride;
             let length = range.end() - range.start();
             if x_bytes % bytes_per_element != 0 {
-                return Err(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-                    transfer,
-                ));
+                return Err(unsupported(ImageLayoutRefusal::OffsetNotElementAligned {
+                    offset: x_bytes,
+                    bytes_per_element,
+                }));
             }
+            let not_rectangular = || {
+                unsupported(ImageLayoutRefusal::RangeNotRectangular {
+                    offset_in_row: x_bytes,
+                    length,
+                    row_stride: level.row_stride,
+                    row: y,
+                    height: level.height,
+                })
+            };
             let (width, height, depth) = if length <= level.row_stride - x_bytes {
                 if length % bytes_per_element != 0 {
-                    return Err(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-                        transfer,
-                    ));
+                    return Err(unsupported(ImageLayoutRefusal::LengthNotElementAligned {
+                        length,
+                        bytes_per_element,
+                    }));
                 }
                 (length / bytes_per_element, 1, 1)
             } else if x_bytes == 0 && length % level.row_stride == 0 {
@@ -1487,40 +1617,29 @@ fn transfer_image_region(
                         rows / u64::from(level.height),
                     )
                 } else {
-                    return Err(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-                        transfer,
-                    ));
+                    return Err(not_rectangular());
                 }
             } else {
-                return Err(ResourceStateTransferRecordError::ImageLayoutUnsupported(
-                    transfer,
-                ));
+                return Err(not_rectangular());
             };
+            let coordinate = |term, value| {
+                move |_| unsupported(ImageLayoutRefusal::CoordinateNotRepresentable { term, value })
+            };
+            let x_texels = x_bytes / bytes_per_element;
             let origin = [
-                u32::try_from(x_bytes / bytes_per_element).map_err(|_| {
-                    ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer)
-                })?,
-                u32::try_from(y).map_err(|_| {
-                    ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer)
-                })?,
-                u32::try_from(z).map_err(|_| {
-                    ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer)
-                })?,
+                u32::try_from(x_texels)
+                    .map_err(coordinate(LayoutCoordinateTerm::OriginX, x_texels))?,
+                u32::try_from(y).map_err(coordinate(LayoutCoordinateTerm::OriginY, y))?,
+                u32::try_from(z).map_err(coordinate(LayoutCoordinateTerm::OriginZ, z))?,
             ];
             let extent = [
-                u32::try_from(width).map_err(|_| {
-                    ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer)
-                })?,
-                u32::try_from(height).map_err(|_| {
-                    ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer)
-                })?,
-                u32::try_from(depth).map_err(|_| {
-                    ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer)
-                })?,
+                u32::try_from(width).map_err(coordinate(LayoutCoordinateTerm::Width, width))?,
+                u32::try_from(height).map_err(coordinate(LayoutCoordinateTerm::Height, height))?,
+                u32::try_from(depth).map_err(coordinate(LayoutCoordinateTerm::Depth, depth))?,
             ];
-            let texels = reims_vgpu_core::TexelBox::new(origin, extent).ok_or(
-                ResourceStateTransferRecordError::ImageLayoutUnsupported(transfer),
-            )?;
+            let texels = reims_vgpu_core::TexelBox::new(origin, extent).ok_or_else(|| {
+                unsupported(ImageLayoutRefusal::ExtentNotATexelBox { origin, extent })
+            })?;
             if texels.end[0] > level.width
                 || texels.end[1] > level.height
                 || texels.end[2] > level.planes()
@@ -1883,7 +2002,7 @@ mod tests {
             fn resolve_image(&self, image: ReplacementImageKey) -> Option<NativeImageTarget> {
                 (image.backing == self.backing).then(|| {
                     let mut target = target();
-                    target.image = vk::Image::from_raw(u64::from(image.representation.get()) + 1);
+                    target.image = vk::Image::from_raw(image.representation.get() + 1);
                     target
                 })
             }
@@ -2033,6 +2152,110 @@ mod tests {
             ..transfer
         };
         assert_eq!(transfer_image_regions(&layout, whole).unwrap(), regions);
+    }
+
+    /// A layout refusal names the term that stopped it, not just the transfer.
+    ///
+    /// Thirty-one sites over three functions answered "this layout is
+    /// unsupported" and nothing else, so a boot that hit one reported a
+    /// transfer key and left the next question -- what to implement -- with
+    /// nowhere to start.
+    #[test]
+    fn an_unsupported_layout_refusal_names_which_term_it_refused() {
+        let layout = |bytes_per_element: u8, compressed: bool| {
+            reims_vgpu_protocol::LinearTextureDescriptor {
+                allocation_size: 64,
+                mipmap_level_count: 1,
+                bytes_per_slice: 64,
+                slice_count: 1,
+                bytes_per_element,
+                row_stride: 8,
+                width: 4,
+                height: 4,
+                depth: 1,
+                compressed_layout: compressed,
+                declaration: Some(reims_vgpu_protocol::TextureDeclaration {
+                    texture_type: reims_vgpu_protocol::TextureType::D2,
+                    framebuffer_only: false,
+                    is_drawable: false,
+                    write_swizzle_enabled: None,
+                    allow_gpu_optimized_contents: false,
+                    usage: reims_vgpu_protocol::TEXTURE_USAGE_SHADER_READ,
+                    pixel_format: reims_vgpu_core::pixel_format::MTL_FORMAT_R8_UNORM,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    resource_options: 0,
+                    protection_options: 0,
+                    swizzle: None,
+                }),
+                levels: vec![reims_vgpu_protocol::TextureLevelLayout {
+                    offset: 0,
+                    size: 32,
+                    row_stride: 8,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                }],
+                ..Default::default()
+            }
+        };
+        let transfer = TransferKey {
+            backing: BackingId::new(1),
+            region: BackingRegion::Linear(LinearRange::new(0, 32).unwrap()),
+            version: reims_vgpu_protocol::ContentVersion::new(1),
+            source: RepresentationId::new(3),
+            destination: RepresentationId::new(4),
+        };
+
+        // A compressed layout is a block coordinate space this device does not
+        // translate, and it says so by that name.
+        assert_eq!(
+            transfer_image_region(&layout(1, true), transfer),
+            Err(ResourceStateTransferRecordError::ImageLayoutUnsupported {
+                transfer,
+                refusal: ImageLayoutRefusal::CompressedLayout,
+            })
+        );
+
+        // A zero element size is a different refusal and must not be reported
+        // as the same one.
+        assert_eq!(
+            transfer_image_region(&layout(0, false), transfer),
+            Err(ResourceStateTransferRecordError::ImageLayoutUnsupported {
+                transfer,
+                refusal: ImageLayoutRefusal::ZeroBytesPerElement,
+            })
+        );
+
+        // A byte range that starts mid-row and spans past it is a shape no
+        // single texel box expresses, and the terms that decide that are the
+        // ones carried.
+        let ragged = TransferKey {
+            region: BackingRegion::Linear(LinearRange::new(1, 16).unwrap()),
+            ..transfer
+        };
+        assert_eq!(
+            transfer_image_region(&layout(1, false), ragged),
+            Err(ResourceStateTransferRecordError::ImageLayoutUnsupported {
+                transfer: ragged,
+                refusal: ImageLayoutRefusal::RangeNotRectangular {
+                    offset_in_row: 1,
+                    length: 16,
+                    row_stride: 8,
+                    row: 0,
+                    height: 4,
+                },
+            })
+        );
+
+        // And the supported shape still resolves.
+        let region = transfer_image_region(&layout(1, false), transfer).unwrap();
+        assert_eq!(region.texels.origin, [0, 0, 0]);
+        assert_eq!(region.texels.end, [4, 4, 1]);
     }
 
     #[test]
