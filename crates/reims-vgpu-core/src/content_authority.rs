@@ -392,14 +392,25 @@ impl RegionContentState {
             .representations
             .get(&source)
             .ok_or(ContentAuthorityError::UnknownRepresentation)?;
-        if snapshot
-            .iter()
-            .any(|required| !source_coverage.covers(required.region, required.version))
-        {
+        let destination_coverage = self
+            .representations
+            .get(&destination)
+            .ok_or(ContentAuthorityError::UnknownRepresentation)?;
+        // The source is asked to cover what will actually be copied, which is
+        // what the destination is missing and not the whole snapshot the
+        // consumer named. The two differ whenever canonical content is split
+        // across representations -- a GPU write of four bytes into a page the
+        // guest otherwise still holds current leaves no single object covering
+        // the page, and demanding one refuses a readback as `StaleSource` over
+        // content nothing is stale about. Both planners below narrow by the
+        // same `missing`, so a plan this admits is a plan they can build.
+        if snapshot.iter().any(|required| {
+            destination_coverage
+                .missing(required.region, required.version)
+                .into_iter()
+                .any(|region| !source_coverage.covers(region, required.version))
+        }) {
             return Err(ContentAuthorityError::StaleSource);
-        }
-        if !self.representations.contains_key(&destination) {
-            return Err(ContentAuthorityError::UnknownRepresentation);
         }
         if self.backing.is_none() {
             return Err(ContentAuthorityError::UnboundBacking);
@@ -680,6 +691,40 @@ impl RegionContentState {
                     .iter()
                     .all(|required| coverage.covers(required.region, required.version))
             })
+    }
+
+    /// The parts of `snapshot` one representation does not already hold.
+    ///
+    /// [`RegionContentState::representation_matches`] collapses this to a
+    /// yes/no, and the yes/no is the wrong shape for a *source* search. A
+    /// backing whose GPU wrote four bytes of a page has its canonical content
+    /// split across two representations -- the object that wrote those bytes,
+    /// and the guest that still holds the rest -- so no single object covers
+    /// the whole snapshot and a search for one refuses stale over content
+    /// nothing is stale about. What a consumer is owed is only what it does
+    /// not already hold, and that remainder is held whole by the object that
+    /// produced it.
+    pub fn outstanding_snapshot(
+        &self,
+        representation: RepresentationId,
+        snapshot: &[RegionVersion],
+    ) -> Box<[RegionVersion]> {
+        let Some(coverage) = self.representations.get(&representation) else {
+            return snapshot.to_vec().into_boxed_slice();
+        };
+        snapshot
+            .iter()
+            .flat_map(|required| {
+                coverage
+                    .missing(required.region, required.version)
+                    .into_iter()
+                    .map(|region| RegionVersion {
+                        region,
+                        version: required.version,
+                    })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 
     /// Every region one representation currently holds, with the version it
@@ -1329,6 +1374,18 @@ impl ContentAuthority {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .representation_matches(representation, snapshot)
+    }
+
+    /// See [`RegionContentState::outstanding_snapshot`].
+    pub fn outstanding_snapshot(
+        &self,
+        representation: RepresentationId,
+        snapshot: &[RegionVersion],
+    ) -> Box<[RegionVersion]> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .outstanding_snapshot(representation, snapshot)
     }
 
     /// See [`RegionContentState::representation_coverage`].
@@ -2043,6 +2100,45 @@ mod tests {
         );
         assert!(state.representation_matches(GPU, &state.snapshot(&[region])));
         assert!(state.representation_matches(GPU, &state.snapshot(&[linear(0, 64)])));
+    }
+
+    /// A source covers what will be copied, not what the consumer named.
+    ///
+    /// A compute readback of one `u32` writes four bytes of a page and leaves
+    /// the rest with the guest, so the page's canonical content is split and
+    /// no single representation covers it. Requiring one to made the guest's
+    /// own readback route unsatisfiable: the transfer that would have served
+    /// it plans nothing but the four bytes, and refusing it as a stale source
+    /// refused content nothing was stale about.
+    #[test]
+    fn a_split_page_transfers_from_the_object_holding_the_part_that_moved() {
+        let page = linear(0, 4096);
+        let mut state = state(page);
+        let head = linear(0, 4);
+        state
+            .plan_gpu_write(SubmissionId::new(1), GPU, [head])
+            .unwrap();
+        state.complete_gpu_write(SubmissionId::new(1), GPU).unwrap();
+
+        // The guest holds the tail and the GPU object holds the head, and
+        // neither holds the page.
+        let snapshot = state.snapshot(&[page]);
+        assert!(!state.representation_matches(GPU, &snapshot));
+        assert!(!state.representation_matches(GUEST, &snapshot));
+        assert_eq!(
+            state.outstanding_snapshot(GUEST, &snapshot).as_ref(),
+            [RegionVersion {
+                region: head,
+                version: state.snapshot(&[head])[0].version,
+            }]
+        );
+
+        state
+            .validate_plan_transfers(GPU, GUEST, &snapshot)
+            .unwrap();
+        let planned = state.plan_transfers(GPU, GUEST, &snapshot).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].region, head);
     }
 
     /// Writing part of a whole-covered backing gives up the whole claim.

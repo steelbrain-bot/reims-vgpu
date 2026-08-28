@@ -462,6 +462,17 @@ impl<T> ResourceLifecycleOwner<T> {
             .representation_matches(backing, representation, snapshot)
     }
 
+    /// See [`crate::ManagedBackingOwner::outstanding_snapshot`].
+    pub fn outstanding_snapshot(
+        &self,
+        backing: BackingId,
+        representation: RepresentationId,
+        snapshot: &[RegionVersion],
+    ) -> Result<Box<[RegionVersion]>, ManagedBackingError> {
+        self.native
+            .outstanding_snapshot(backing, representation, snapshot)
+    }
+
     pub fn current_native_representation_for_snapshot(
         &self,
         backing: BackingId,

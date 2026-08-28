@@ -1156,6 +1156,20 @@ impl<T> ManagedBackingOwner<T> {
             .representation_matches(representation, snapshot))
     }
 
+    /// See [`crate::content_authority::RegionContentState::outstanding_snapshot`].
+    pub fn outstanding_snapshot(
+        &self,
+        backing: BackingId,
+        representation: RepresentationId,
+        snapshot: &[RegionVersion],
+    ) -> Result<Box<[RegionVersion]>, ManagedBackingError> {
+        let record = self.live_backing(backing)?;
+        known_representation(record, representation)?;
+        Ok(record
+            .authority
+            .outstanding_snapshot(representation, snapshot))
+    }
+
     pub fn pending_gpu_writes_overlapping(
         &self,
         backing: BackingId,

@@ -12515,8 +12515,20 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                                 reason,
                             }
                         })?;
-                    if resources
-                        .representation_matches(
+                    // The guest is owed only the bytes it does not already
+                    // hold current, and that remainder -- not the whole span
+                    // the transition named -- is what a source has to cover.
+                    // Canonical content splits across representations the
+                    // moment the GPU writes part of a page: a compute readback
+                    // of one `u32` leaves four bytes on the object that wrote
+                    // them and the rest with the guest, so no single object
+                    // covers the page and a search for one refuses
+                    // `StaleExecutionRepresentation` over content nothing is
+                    // stale about. That refusal was 144 of one driven macos-13
+                    // boot's refused packets, all of them the guest's readback
+                    // route.
+                    let outstanding = resources
+                        .outstanding_snapshot(
                             target.backing,
                             reims_vgpu_core::GUEST_REPRESENTATION,
                             &snapshot,
@@ -12526,19 +12538,18 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                                 backing: target.backing,
                                 reason,
                             }
-                        })?
-                    {
+                        })?;
+                    if outstanding.is_empty() {
                         (None, reims_vgpu_core::GUEST_REPRESENTATION)
                     } else {
-                        let representation = resources
-                            .designated_representation_for_snapshot(target.backing, &snapshot)
+                        let (representation, _) = resources
+                            .designated_representation_for_snapshot(target.backing, &outstanding)
                             .map_err(|reason| {
                                 ReplacementExecResourceReadinessError::ValidityRepresentation {
                                     backing: target.backing,
                                     reason,
                                 }
-                            })?
-                            .0;
+                            })?;
                         let destination = resources
                             .representation_route(target.backing, representation)
                             .filter(|route| {
