@@ -4921,6 +4921,42 @@ impl ReplacementExecAutomaticPreparationError {
     }
 }
 
+/// Name a synchronization request dropped because every designated view
+/// already holds what it asked for.
+///
+/// This is the preflight's one silent exit and it is the one that has been
+/// wrong twice, so it reports rather than returning quietly. The distinction
+/// it exists to make is not "was the request dropped" -- an `OFF` line saying
+/// a backing is current is ordinary control flow -- it is **whether the
+/// snapshot it was judged against is empty**. A view matches an empty snapshot
+/// vacuously, so an empty one drops the request for every backing whatever any
+/// view actually holds, and the render that reads it then refuses
+/// `StaleExecutionRepresentation` for the rest of the boot with nothing
+/// anywhere saying why.
+///
+/// The regions travel with it because that is the input a mismatch would be
+/// in: a snapshot is taken at the granularity the regions name, and content
+/// recorded as `Linear` or `Image` is not answered by a request for `Whole`.
+fn report_content_synchronization_satisfied(
+    backing: reims_vgpu_protocol::BackingId,
+    regions: &[reims_vgpu_core::BackingRegion],
+    snapshot: &[reims_vgpu_core::RegionVersion],
+) {
+    let line = format!(
+        "replacement_content_synchronization_satisfied backing={} regions={regions:?} \
+         snapshot={snapshot:?}",
+        backing.get(),
+    );
+    let mut key = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&line, &mut key);
+    if crate::observe::first_sight(
+        "content_synchronization_satisfied",
+        std::hash::Hasher::finish(&key),
+    ) {
+        crate::observe::off(line);
+    }
+}
+
 /// The first outstanding GPU write over these regions that `permitted` does not
 /// name, with the designated view it is outstanding against.
 ///
@@ -11856,6 +11892,7 @@ impl<Semantic: Clone> ReplacementRuntimeSession<Semantic> {
                     Err(reason) => return Some(Err(validity_error(reason))),
                 };
                 if stale.is_empty() {
+                    report_content_synchronization_satisfied(backing, &regions, &snapshot);
                     return None;
                 }
                 let mut permitted = permitted_pending_writes.into_vec();
