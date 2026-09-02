@@ -227,7 +227,7 @@ impl BindTableClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PastTableBind {
     pub class: BindTableClass,
-    pub stage: crate::runtime::decode::render::Stage,
+    pub stage: reims_vgpu_protocol::render::ShaderStage,
     /// The guest's own slot index, so it reads against [`BindTableClass::table`].
     pub index: u32,
     /// The object bound there. Never zero — see [`first_bind_past_table`].
@@ -236,11 +236,10 @@ pub struct PastTableBind {
 
 impl PastTableBind {
     pub fn stage_name(&self) -> &'static str {
-        match self.stage {
-            crate::runtime::decode::render::Stage::Vertex => "vertex",
-            crate::runtime::decode::render::Stage::Fragment => "fragment",
-            crate::runtime::decode::render::Stage::Unknown => "unknown",
-        }
+        // Two arms, because `ShaderStage` is the render opcode set's whole
+        // stage vocabulary. The "unknown" this used to answer with named a
+        // variant no decoder arm ever produced.
+        self.stage.name()
     }
 }
 
@@ -271,7 +270,7 @@ impl PastTableBind {
 /// wrong is a Metal exception that takes the process down, and because the check
 /// that once stood at each consumer had already drifted three ways.
 pub fn first_bind_past_table(req: &DrawEncodeRequest) -> Option<PastTableBind> {
-    use crate::runtime::decode::render::Stage;
+    use reims_vgpu_protocol::render::ShaderStage as Stage;
 
     let buffers = [
         (Stage::Vertex, &req.vertex_buffers),

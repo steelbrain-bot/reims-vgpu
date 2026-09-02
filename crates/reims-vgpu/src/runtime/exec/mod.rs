@@ -30,7 +30,7 @@ use crate::runtime::decode::compute_spi::{self, Kind as ComputeKind};
 use crate::runtime::decode::render::{
     self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
     decode_color_attachment, decode_depth_attachment, decode_stencil_attachment, ColorAttachment,
-    DepthAttachment, Kind as RenderKind, LevelSupport, ScissorRect, Stage, StencilAttachment,
+    DepthAttachment, Kind as RenderKind, LevelSupport, ScissorRect, StencilAttachment,
     PASS_MAX_COLOR_ATTACHMENTS,
 };
 use crate::runtime::draw::{
@@ -54,7 +54,7 @@ use reims_vgpu_protocol::pass_action::{
     MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
     MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
-use reims_vgpu_protocol::render::RenderKind as ProtoRenderKind;
+use reims_vgpu_protocol::render::{RenderKind as ProtoRenderKind, ShaderStage};
 use reims_vgpu_protocol::resource_state::ContentDirective;
 use reims_vgpu_protocol::segment::{SegmentBody, SegmentKind, SegmentLifetime, SegmentStream};
 use reims_vgpu_wire::ops::blit as wire_blit;
@@ -2574,6 +2574,321 @@ fn handle_render_stream_state(task_id: u32, opcode: u32, cmd_bytes: &[u8], acc: 
     }
 }
 
+/// Whether this record binds into one of the six argument tables, or moves an
+/// offset inside one.
+///
+/// The second group of the render encoder's cutover. Its fields are the six
+/// bind tables and `unrepresentable` — and `unrepresentable` is shared with the
+/// pass descriptor, which is why the claim here is not the sole-writer one
+/// [`is_render_stream_state`] makes. It is the weaker one that still forbids a
+/// disagreement: `unrepresentable` is a **first-wins latch** whose insert order
+/// is the stream's own record order, which no change of decoder can alter, so
+/// two writers cannot produce two answers the way two writers of a value could.
+///
+/// Exhaustive over `RenderKind` for the reason [`is_render_stream_state`] is.
+const fn is_render_bind(kind: ProtoRenderKind) -> bool {
+    use ProtoRenderKind as K;
+    match kind {
+        K::SetVertexBuffers
+        | K::SetVertexBuffersWithStride
+        | K::SetVertexBufferOffset
+        | K::SetVertexBufferOffsetStride
+        | K::SetVertexTextures
+        | K::SetVertexSamplers
+        | K::SetVertexSamplersWithLod
+        | K::SetFragmentBuffers
+        | K::SetFragmentBufferOffset
+        | K::SetFragmentTextures
+        | K::SetFragmentSamplers
+        | K::SetFragmentSamplersWithLod => true,
+
+        K::Draw
+        | K::DrawWide
+        | K::DrawInstanced
+        | K::DrawInstancedWide
+        | K::DrawInstancedBase
+        | K::DrawInstancedBaseWide
+        | K::DrawIndexed
+        | K::DrawIndexedWide
+        | K::DrawIndexedInstanced
+        | K::DrawIndexedInstancedWide
+        | K::DrawIndexedInstancedBase
+        | K::DrawIndexedInstancedBaseWide
+        | K::DrawIndirect
+        | K::DrawIndexedIndirect
+        | K::WriteDescriptor
+        | K::SetColorStoreAction
+        | K::SetDepthStoreAction
+        | K::SetStencilStoreAction
+        | K::SetRenderPipelineState
+        | K::SetDepthStencilState
+        | K::SetStencilReference
+        | K::SetBlendColor
+        | K::SetCullMode
+        | K::SetFrontFacingWinding
+        | K::SetDepthClipMode
+        | K::SetTriangleFillMode
+        | K::SetDepthBias
+        | K::SetLineWidth
+        | K::SetViewport
+        | K::SetViewports
+        | K::SetScissorRect
+        | K::SetScissorRects
+        | K::SetVisibilityResultMode => false,
+    }
+}
+
+/// Apply one render-encoder bind or offset record, lifted by the protocol
+/// crate.
+///
+/// **The stage is no longer a field this device fills in.** It comes from
+/// `RenderKind::bind_stage`, which is total over the bind rows, so a bind whose
+/// stage is neither vertex nor fragment cannot be constructed — the state the
+/// flat command reached as `Stage::Unknown`, and which `apply_binds` answered
+/// by counting a clear against a table it could not name.
+///
+/// **A `None` from `make` is the wire's zero ref and nothing else.** Each of
+/// the five entry shapes says which field carries that ref, so a record with no
+/// stride field cannot produce a stride of zero and one with no LOD clamp
+/// cannot produce a clamp of zero — the two states the flat command's
+/// `has_attribute_stride`/`has_lod_clamp` flags stood beside.
+fn handle_render_binds<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    opcode: u32,
+    cmd_bytes: &[u8],
+    out: &mut ExecResult,
+    acc: &mut StreamAccum,
+) {
+    use reims_vgpu_protocol::decode::render::RenderRecord;
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    let record = match reims_vgpu_protocol::decode::render::decode(&framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            return note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+        }
+    };
+    match record {
+        RenderRecord::BindBuffers(r) => {
+            let cleared = apply_binds(
+                r.entries,
+                r.first,
+                BindTarget {
+                    stage: r.stage,
+                    class: BindClass::Buffer,
+                },
+                BindTables {
+                    vertex: &mut acc.vertex_buffers,
+                    fragment: &mut acc.fragment_buffers,
+                    refused: &mut acc.unrepresentable,
+                },
+                |b| b.index,
+                |index, e| {
+                    let buffer_ref = e.buffer_ref.get();
+                    (buffer_ref != 0).then_some(BufferBind {
+                        index,
+                        buffer_ref,
+                        resource: objects::resolve_resource(state, host, task_id, buffer_ref).ok(),
+                        offset: e.offset.get(),
+                        // The record with no stride field cannot state one. The
+                        // slot keeps whatever an earlier strided bind left.
+                        attribute_stride: None,
+                    })
+                },
+            );
+            out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
+        }
+        RenderRecord::BindBuffersWithStride(r) => {
+            let cleared = apply_binds(
+                r.entries,
+                r.first,
+                BindTarget {
+                    // No fragment form exists: the API has no fragment attribute
+                    // stride, which is why the payload names no stage.
+                    stage: ShaderStage::Vertex,
+                    class: BindClass::Buffer,
+                },
+                BindTables {
+                    vertex: &mut acc.vertex_buffers,
+                    fragment: &mut acc.fragment_buffers,
+                    refused: &mut acc.unrepresentable,
+                },
+                |b| b.index,
+                |index, e| {
+                    let buffer_ref = e.buffer_ref.get();
+                    (buffer_ref != 0).then_some(BufferBind {
+                        index,
+                        buffer_ref,
+                        resource: objects::resolve_resource(state, host, task_id, buffer_ref).ok(),
+                        offset: e.offset.get(),
+                        attribute_stride: Some(e.attribute_stride.get()),
+                    })
+                },
+            );
+            out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
+        }
+        RenderRecord::BindTextures(r) => {
+            let cleared = apply_binds(
+                r.entries,
+                r.first,
+                BindTarget {
+                    stage: r.stage,
+                    class: BindClass::Texture,
+                },
+                BindTables {
+                    vertex: &mut acc.vertex_textures,
+                    fragment: &mut acc.fragment_textures,
+                    refused: &mut acc.unrepresentable,
+                },
+                |b| b.index,
+                |index, e| {
+                    let texture_ref = e.object_ref.get();
+                    if texture_ref == 0 {
+                        return None;
+                    }
+                    if !out.texture_refs.contains(&texture_ref) {
+                        out.texture_refs.push(texture_ref);
+                    }
+                    if let Some(m) =
+                        objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
+                    {
+                        if !out.mapper_ref_texture_mappings.contains(&m) {
+                            out.mapper_ref_texture_mappings.push(m);
+                        }
+                    } else if objects::resolve_backing(state, host, texture_ref) {
+                        // x86 backing: object ref is surface_id / mapping_id.
+                        if !out.mapper_ref_texture_mappings.contains(&texture_ref) {
+                            out.mapper_ref_texture_mappings.push(texture_ref);
+                        }
+                    }
+                    Some(TextureBind {
+                        index,
+                        texture_ref,
+                        resource: objects::resolve_resource(state, host, task_id, texture_ref).ok(),
+                    })
+                },
+            );
+            out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
+        }
+        RenderRecord::BindSamplers(r) => {
+            let cleared = apply_binds(
+                r.entries,
+                r.first,
+                BindTarget {
+                    stage: r.stage,
+                    class: BindClass::Sampler,
+                },
+                BindTables {
+                    vertex: &mut acc.vertex_samplers,
+                    fragment: &mut acc.fragment_samplers,
+                    refused: &mut acc.unrepresentable,
+                },
+                |b| b.index,
+                |index, e| {
+                    let sampler_ref = e.object_ref.get();
+                    (sampler_ref != 0).then_some(SamplerBind {
+                        index,
+                        sampler_ref,
+                        // The record carries no clamp pair, so the slot gets
+                        // none. This used to be a zero beside a `has_lod_clamp`
+                        // flag, which made "unclamped" and "clamped to zero"
+                        // the same slot.
+                        lod_clamp: None,
+                    })
+                },
+            );
+            out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
+        }
+        RenderRecord::BindSamplersWithLod(r) => {
+            let cleared = apply_binds(
+                r.entries,
+                r.first,
+                BindTarget {
+                    stage: r.stage,
+                    class: BindClass::Sampler,
+                },
+                BindTables {
+                    vertex: &mut acc.vertex_samplers,
+                    fragment: &mut acc.fragment_samplers,
+                    refused: &mut acc.unrepresentable,
+                },
+                |b| b.index,
+                |index, e| {
+                    let sampler_ref = e.sampler_ref.get();
+                    // The clamp pair travels with the ref in one entry, so a
+                    // slot can no longer be paired with another slot's clamp —
+                    // the flat command carried two lists and zipped them.
+                    (sampler_ref != 0).then_some(SamplerBind {
+                        index,
+                        sampler_ref,
+                        lod_clamp: Some((
+                            e.lod_min_clamp.get().to_bits(),
+                            e.lod_max_clamp.get().to_bits(),
+                        )),
+                    })
+                },
+            );
+            out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
+        }
+        RenderRecord::RebindBufferOffset(r) => {
+            if r.index >= BindClass::Buffer.table() {
+                // The slot is outside the table, so the bind that would have
+                // occupied it was already dropped by `apply_binds` and counted
+                // under `render_buffer_bind_slot_past_table`. This is the
+                // *second* record the guest spends on that slot, counted
+                // separately because these are different records.
+                crate::runtime::drain::note_store_route("render_buffer_offset_slot_past_table");
+                let over = BufferOffsetSlotPastTable {
+                    stage: r.stage,
+                    index: r.index,
+                };
+                crate::observe::Emit::decline("render_buffer_offset", &over)
+                    .fail_once((u64::from(r.stage as u32) << 32) | u64::from(r.index));
+                acc.unrepresentable
+                    .get_or_insert(StreamRefusal::BufferOffset(over));
+                return;
+            }
+            let list = match r.stage {
+                ShaderStage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
+                ShaderStage::Fragment => Arc::make_mut(&mut acc.fragment_buffers),
+            };
+            match list.iter_mut().find(|b| b.index == r.index) {
+                Some(b) => {
+                    b.offset = r.offset;
+                    // Only when this record carried one. The plain and strided
+                    // rebinds are different opcodes, and the plain one must not
+                    // clear a stride an earlier bind established — which is what
+                    // `stride: Option<u64>` says where a flag beside a zero did
+                    // not.
+                    if let Some(stride) = r.stride {
+                        b.attribute_stride = Some(stride);
+                    }
+                }
+                // A healthy zero, and a sharp one. Metal requires a buffer
+                // already bound at the index before
+                // `setVertexBufferOffset:atIndex:`, and a render encoder's bind
+                // state does not outlive the encoder, so the guest and this
+                // table should agree on which slots are live. A firing means
+                // they do not, and the offset lands on nothing.
+                None => {
+                    crate::runtime::drain::note_store_route("render_buffer_offset_slot_unbound")
+                }
+            }
+        }
+        // `is_render_bind` selected these twelve kinds and `decode::render`
+        // maps each of them to an arm above. Arriving here is the two
+        // disagreeing rather than a guest case.
+        other => crate::observe::fail(format!(
+            "render_bind_record_not_a_bind task={task_id} opcode={opcode:#x} \
+             (the rail routed this row to the bind arm and the lift produced {other:?})"
+        )),
+    }
+}
+
 fn handle_render_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
@@ -2630,10 +2945,17 @@ fn handle_render_record<M: HostMemory + HostOps>(
     // answering at all is the ledger's settlement: the rows it does not name
     // are the ones the contract has not closed, and they keep this device's own
     // decoder below.
-    if reims_vgpu_protocol::render::RenderKind::of_opcode(opcode)
-        .is_some_and(is_render_stream_state)
-    {
-        return handle_render_stream_state(task_id, opcode, cmd_bytes, acc);
+    if let Some(kind) = ProtoRenderKind::of_opcode(opcode) {
+        if is_render_stream_state(kind) {
+            return handle_render_stream_state(task_id, opcode, cmd_bytes, acc);
+        }
+        // **The encoder's argument tables.** Twelve rows writing the six bind
+        // tables and the `unrepresentable` latch — see [`is_render_bind`] for
+        // why a latch two classes insert into is still a group boundary the
+        // rest of the rail cannot disagree across.
+        if is_render_bind(kind) {
+            return handle_render_binds(state, host, task_id, opcode, cmd_bytes, out, acc);
+        }
     }
     let cmd = match render::decode(cmd_bytes) {
         Ok(c) => c,
@@ -2653,177 +2975,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
     };
     match cmd.kind {
-        RenderKind::SetBuffer => {
-            // Slots first..first+n from the archive layout's entry array.
-            // `render::decode` refuses `count == 0` with `ErrBadLength`, and
-            // sets `cmd.buffer_ref` from `buffer_binds.first()`, so a decoded
-            // SetBuffer always carries at least one entry and there is no
-            // single-entry wire form to fall back to.
-            let cleared = apply_binds(
-                &cmd.buffer_binds,
-                cmd.first,
-                BindTarget {
-                    stage: cmd.stage,
-                    class: BindClass::Buffer,
-                },
-                BindTables {
-                    vertex: &mut acc.vertex_buffers,
-                    fragment: &mut acc.fragment_buffers,
-                    refused: &mut acc.unrepresentable,
-                },
-                |b| b.index,
-                |index, b| {
-                    (b.buffer_ref != 0).then_some(BufferBind {
-                        index,
-                        buffer_ref: b.buffer_ref,
-                        resource: objects::resolve_resource(state, host, task_id, b.buffer_ref)
-                            .ok(),
-                        offset: b.offset,
-                        attribute_stride: b.attribute_stride,
-                    })
-                },
-            );
-            out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
-        }
-        RenderKind::SetBufferOffset => {
-            // Archive apply_buffer_offset: update offset on an already-bound slot.
-            if cmd.first >= BindClass::Buffer.table() {
-                // The slot is outside the table, so the bind that would have
-                // occupied it was already dropped by `apply_binds` and counted
-                // under `render_buffer_bind_slot_past_table`. This is the
-                // *second* record the guest spends on that slot. Counted
-                // separately rather than folded in, because these are different
-                // records.
-                //
-                // In a conforming stream the bind came first and already refused
-                // the draws — Metal requires a buffer bound at the index before
-                // `setVertexBufferOffset:atIndex:`. This does not rely on that:
-                // an offset record naming a slot this device has no table entry
-                // for is on its own a record it cannot carry, and a stream where
-                // the bind did *not* come first is exactly the one where relying
-                // on it would be wrong.
-                crate::runtime::drain::note_store_route("render_buffer_offset_slot_past_table");
-                let over = BufferOffsetSlotPastTable {
-                    stage: cmd.stage,
-                    index: cmd.first,
-                };
-                crate::observe::Emit::decline("render_buffer_offset", &over)
-                    .fail_once((u64::from(cmd.stage as u32) << 32) | u64::from(cmd.first));
-                acc.unrepresentable
-                    .get_or_insert(StreamRefusal::BufferOffset(over));
-                return;
-            }
-            let list = match cmd.stage {
-                Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
-                Stage::Fragment => Arc::make_mut(&mut acc.fragment_buffers),
-                // An offset update names a slot in a table; with no stage
-                // there is no table, and inventing one would move somebody
-                // else's binding.
-                Stage::Unknown => return,
-            };
-            match list.iter_mut().find(|b| b.index == cmd.first) {
-                Some(b) => {
-                    b.offset = cmd.buffer_offset;
-                    // Only when this record carried one.
-                    // `setVertexBufferOffset:atIndex:` and its strided sibling
-                    // are different opcodes, and the plain one must not clear a
-                    // stride an earlier bind established.
-                    if let Some(stride) = cmd.attribute_stride {
-                        b.attribute_stride = Some(stride);
-                    }
-                }
-                // A healthy zero, and a sharp one. Metal requires a buffer
-                // already bound at the index before
-                // `setVertexBufferOffset:atIndex:`, and a render encoder's bind
-                // state does not outlive the encoder, so the guest and this
-                // table should agree on which slots are live. A firing means
-                // they do not — a bind this device dropped, refused or never
-                // decoded — and the offset lands on nothing.
-                None => {
-                    crate::runtime::drain::note_store_route("render_buffer_offset_slot_unbound")
-                }
-            }
-        }
-        RenderKind::SetTexture => {
-            // As for SetBuffer: `ref_binds` is never empty on a decoded record,
-            // and the clone the removed fallback needed went with it.
-            let cleared = apply_binds(
-                &cmd.ref_binds,
-                cmd.first,
-                BindTarget {
-                    stage: cmd.stage,
-                    class: BindClass::Texture,
-                },
-                BindTables {
-                    vertex: &mut acc.vertex_textures,
-                    fragment: &mut acc.fragment_textures,
-                    refused: &mut acc.unrepresentable,
-                },
-                |b| b.index,
-                |index, texture_ref| {
-                    if texture_ref == 0 {
-                        return None;
-                    }
-                    if !out.texture_refs.contains(&texture_ref) {
-                        out.texture_refs.push(texture_ref);
-                    }
-                    if let Some(m) =
-                        objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref)
-                    {
-                        if !out.mapper_ref_texture_mappings.contains(&m) {
-                            out.mapper_ref_texture_mappings.push(m);
-                        }
-                    } else if objects::resolve_backing(state, host, texture_ref) {
-                        // x86 backing: object ref is surface_id / mapping_id.
-                        if !out.mapper_ref_texture_mappings.contains(&texture_ref) {
-                            out.mapper_ref_texture_mappings.push(texture_ref);
-                        }
-                    }
-                    Some(TextureBind {
-                        index,
-                        texture_ref,
-                        resource: objects::resolve_resource(state, host, task_id, texture_ref).ok(),
-                    })
-                },
-            );
-            out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
-        }
-        RenderKind::SetSampler => {
-            // The two LOD forms carry a clamp pair per entry; the plain forms
-            // carry none, and `sampler_lod_binds` is empty for them. Zipped
-            // rather than indexed into inside the builder, so a record whose
-            // two lists ever disagreed in length binds the slots it has refs
-            // for and clamps only those it has clamps for, instead of
-            // panicking or pairing a slot with another slot's clamp.
-            let entries: Vec<(u32, Option<(u32, u32)>)> = cmd
-                .ref_binds
-                .iter()
-                .enumerate()
-                .map(|(i, &r)| (r, cmd.sampler_lod_binds.get(i).copied()))
-                .collect();
-            let cleared = apply_binds(
-                &entries,
-                cmd.first,
-                BindTarget {
-                    stage: cmd.stage,
-                    class: BindClass::Sampler,
-                },
-                BindTables {
-                    vertex: &mut acc.vertex_samplers,
-                    fragment: &mut acc.fragment_samplers,
-                    refused: &mut acc.unrepresentable,
-                },
-                |b| b.index,
-                |index, (sampler_ref, lod_clamp)| {
-                    (sampler_ref != 0).then_some(SamplerBind {
-                        index,
-                        sampler_ref,
-                        lod_clamp,
-                    })
-                },
-            );
-            out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
-        }
         RenderKind::RenderPass => {
             // The pass's own tail, decoded and not applied. Four counters
             // rather than one, because they name four different losses and one
@@ -3287,13 +3438,18 @@ fn handle_render_record<M: HostMemory + HostOps>(
         RenderKind::DrawIndirect => {
             execute_indirect_draw(state, host, task_id, &cmd, acc);
         }
-        // The fifteen encoder-state rows moved to `handle_render_stream_state`,
+        // The twelve bind rows moved to `handle_render_binds` and the fifteen
+        // encoder-state rows to `handle_render_stream_state`,
         // beside the residency declarations, the barriers and the fence pair
         // the ledger's own class answers. All of them are routed before this
         // decoder is reached, so arriving here is that routing disagreeing with
         // itself rather than a guest case, and it is named instead of being
         // answered a second time.
-        RenderKind::SetPipeline
+        RenderKind::SetBuffer
+        | RenderKind::SetBufferOffset
+        | RenderKind::SetTexture
+        | RenderKind::SetSampler
+        | RenderKind::SetPipeline
         | RenderKind::SetViewport
         | RenderKind::SetScissor
         | RenderKind::SetBlendColor
@@ -3676,7 +3832,7 @@ impl BindClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BindSlotPastTable {
     class: BindClass,
-    stage: Stage,
+    stage: ShaderStage,
     /// The first slot the walk refused — the guest's own index, not the
     /// position within the record, so it can be read against the table size.
     index: u32,
@@ -3692,15 +3848,7 @@ impl crate::observe::Decline for BindSlotPastTable {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         vec![
-            (
-                "stage",
-                match self.stage {
-                    Stage::Vertex => "vertex",
-                    Stage::Fragment => "fragment",
-                    Stage::Unknown => "unknown",
-                }
-                .to_string(),
-            ),
+            ("stage", self.stage.name().to_string()),
             ("index", self.index.to_string()),
             ("slots", self.slots.to_string()),
             ("table", self.class.table().to_string()),
@@ -3798,7 +3946,7 @@ const _: () = assert!(
 /// lost it.
 #[derive(Clone, Copy, Debug)]
 struct BindTarget {
-    stage: Stage,
+    stage: ShaderStage,
     class: BindClass,
 }
 
@@ -3857,7 +4005,7 @@ enum StreamRefusal {
 /// The counter stays and says how much; this says which slot, once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BufferOffsetSlotPastTable {
-    stage: Stage,
+    stage: ShaderStage,
     /// The slot the record named. `cmd.first` is the whole of it — this wire
     /// form updates one slot, so there is no run to report a length for.
     index: u32,
@@ -3870,15 +4018,7 @@ impl crate::observe::Decline for BufferOffsetSlotPastTable {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         vec![
-            (
-                "stage",
-                match self.stage {
-                    Stage::Vertex => "vertex",
-                    Stage::Fragment => "fragment",
-                    Stage::Unknown => "unknown",
-                }
-                .to_string(),
-            ),
+            ("stage", self.stage.name().to_string()),
             ("index", self.index.to_string()),
             ("table", BindClass::Buffer.table().to_string()),
             ("apple_table", BindClass::Buffer.apple_table().to_string()),
@@ -3916,13 +4056,13 @@ struct BindTables<'a, B> {
 /// texture arm's mapper-ref-texture mapping list — with the caller. The clear count comes
 /// back as a return value rather than through an `&mut` counter so `make` can
 /// hold the rest of `ExecResult`.
-fn apply_binds<T: Copy, B: Clone>(
+fn apply_binds<T, B: Clone>(
     entries: &[T],
     first: u32,
     target: BindTarget,
     tables: BindTables<'_, B>,
     slot: impl Fn(&B) -> u32,
-    mut make: impl FnMut(u32, T) -> Option<B>,
+    mut make: impl FnMut(u32, &T) -> Option<B>,
 ) -> u32 {
     let BindTarget { stage, class } = target;
     let BindTables {
@@ -3938,7 +4078,7 @@ fn apply_binds<T: Copy, B: Clone>(
         crate::runtime::drain::note_store_route(class.reach_route(reach));
     }
     let mut cleared = 0u32;
-    for (i, entry) in entries.iter().copied().enumerate() {
+    for (i, entry) in entries.iter().enumerate() {
         let index = first.saturating_add(i as u32);
         if index >= class.table() {
             // The walk stops here, and it used to stop in silence — a `break`
@@ -4004,15 +4144,13 @@ fn apply_binds<T: Copy, B: Clone>(
             break;
         }
         let bind = make(index, entry);
+        // Two arms and no third: `ShaderStage` is the render opcode set's whole
+        // vocabulary, so "the record named no stage" — which used to reach here
+        // as `Stage::Unknown` and count the clear against a table it could not
+        // name — is not a state a lifted bind can be in.
         let list = match stage {
-            Stage::Vertex => Arc::make_mut(vertex),
-            Stage::Fragment => Arc::make_mut(fragment),
-            // No table to bind into, but a slot the guest cleared is still
-            // cleared: the count is what the record said, not what we modelled.
-            Stage::Unknown => {
-                cleared = cleared.saturating_add(bind.is_none() as u32);
-                continue;
-            }
+            ShaderStage::Vertex => Arc::make_mut(vertex),
+            ShaderStage::Fragment => Arc::make_mut(fragment),
         };
         let Some(bind) = bind else {
             list.retain(|b| slot(b) != index);

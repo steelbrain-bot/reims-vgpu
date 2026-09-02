@@ -2401,7 +2401,7 @@ mod tests {
             MetalIcbInheritanceDecline::BindSlotPastTable {
                 bind: PastTableBind {
                     class: BindTableClass::Buffer,
-                    stage: crate::runtime::decode::render::Stage::Vertex,
+                    stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
                     index: MAX_BUFFER_BIND_SLOTS,
                     resource_ref: 1,
                 },

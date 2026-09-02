@@ -2379,7 +2379,7 @@ fn the_bind_table_accessor_answers_with_each_class_own_bound() {
 /// refused draw.
 #[test]
 fn a_live_bind_past_its_table_is_reported_and_a_cleared_one_is_not() {
-    use crate::runtime::decode::render::Stage;
+    use reims_vgpu_protocol::render::ShaderStage as Stage;
 
     let in_range = DrawEncodeRequest {
         vertex_buffers: vec![BufferBind {

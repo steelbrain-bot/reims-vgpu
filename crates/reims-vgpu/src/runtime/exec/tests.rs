@@ -1778,7 +1778,7 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
         }],
         0,
         BindTarget {
-            stage: Stage::Vertex,
+            stage: ShaderStage::Vertex,
             class: BindClass::Buffer,
         },
         BindTables {
@@ -1787,7 +1787,7 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
             refused: &mut acc.unrepresentable,
         },
         |b| b.index,
-        |index, b: crate::runtime::decode::render::DecodedBufferBind| {
+        |index, b: &crate::runtime::decode::render::DecodedBufferBind| {
             Some(BufferBind {
                 index,
                 buffer_ref: b.buffer_ref,
@@ -3243,7 +3243,7 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
         "render_bind_overflow",
         &BindSlotPastTable {
             class: BindClass::Texture,
-            stage: render::Stage::Vertex,
+            stage: ShaderStage::Vertex,
             index: MAX_TEXTURE_BIND_SLOTS,
             slots: 9,
         },
@@ -3261,7 +3261,7 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
         "render_bind_overflow",
         &BindSlotPastTable {
             class: BindClass::Buffer,
-            stage: render::Stage::Fragment,
+            stage: ShaderStage::Fragment,
             index: MAX_BUFFER_BIND_SLOTS,
             slots: 1,
         },
@@ -5105,7 +5105,7 @@ fn a_buffer_offset_past_the_table_refuses_the_stream() {
     let line = crate::observe::Emit::decline(
         "render_buffer_offset",
         &BufferOffsetSlotPastTable {
-            stage: render::Stage::Vertex,
+            stage: ShaderStage::Vertex,
             index: FIRST,
         },
     )
@@ -6906,4 +6906,270 @@ fn a_plural_viewport_or_scissor_of_count_zero_keeps_what_the_stream_already_boun
     }
     assert_eq!(acc.viewports.len(), 1, "the bound viewport must stand");
     assert_eq!(acc.scissors.len(), 1, "the bound scissor must stand");
+}
+
+/// Each of the twelve bind rows writes the one argument table its opcode names,
+/// and none of the other five.
+///
+/// **The stage is the opcode and nothing else.** No wire field carries it, so a
+/// record routed by layout rather than by kind would find no stage and bind
+/// into whichever table it reached — which is the defect this asserts against
+/// rather than describes. Six tables and twelve rows, so a single misrouted
+/// arm shows up as a texture in the sampler table or a vertex bind in the
+/// fragment one, both of which bind nothing the shader asked for and refuse
+/// nothing either.
+///
+/// The two offset rows write a slot an earlier bind established, so the
+/// accumulator is seeded before them: an offset naming an unbound slot lands on
+/// nothing by design, and would make this test pass for the wrong reason.
+#[test]
+fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
+    use reims_vgpu_wire::ops::render as wire_r;
+    use reims_vgpu_wire::OP_HEADER_LEN as HEAD;
+
+    // `first`, `count`, then `count` entries of `entry_len` bytes.
+    let bind = |op: u32, first: u32, entry_len: usize, entry: &[u8]| {
+        let total = HEAD + render::BIND_ENTRIES + entry_len;
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total as u32);
+        st32(&mut v[HEAD + render::BIND_FIRST..], first);
+        st32(&mut v[HEAD + render::BIND_COUNT..], 1);
+        v[HEAD + render::BIND_ENTRIES..HEAD + render::BIND_ENTRIES + entry.len()]
+            .copy_from_slice(entry);
+        v
+    };
+    let flat = |op: u32, body: &[u8]| {
+        let total = HEAD + body.len();
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total as u32);
+        v[HEAD..].copy_from_slice(body);
+        v
+    };
+
+    let buffer_entry = {
+        let mut e = vec![0u8; render::BUFFER_BIND_ENTRY_SIZE];
+        st32(&mut e[0..], 5151);
+        st64(&mut e[4..], 0x100);
+        e
+    };
+    let buffer_stride_entry = {
+        let mut e = vec![0u8; render::BUFFER_STRIDE_BIND_ENTRY_SIZE];
+        st32(&mut e[0..], 5151);
+        st64(&mut e[4..], 0x100);
+        st64(&mut e[12..], 0x20);
+        e
+    };
+    let ref_entry = {
+        let mut e = vec![0u8; render::REF_BIND_ENTRY_SIZE];
+        st32(&mut e[0..], 0x51);
+        e
+    };
+    let sampler_lod_entry = {
+        let mut e = vec![0u8; render::SAMPLER_LOD_BIND_ENTRY_SIZE];
+        st32(&mut e[0..], 0x51);
+        st32(&mut e[4..], 0.5f32.to_bits());
+        st32(&mut e[8..], 4.0f32.to_bits());
+        e
+    };
+    // `index`, then a 64-bit offset — and the strided form's stride after it.
+    let offset_body = {
+        let mut b = vec![0u8; 12];
+        st32(&mut b[0..], 0);
+        st64(&mut b[4..], 0x900);
+        b
+    };
+    let offset_stride_body = {
+        let mut b = vec![0u8; 20];
+        st32(&mut b[0..], 0);
+        st64(&mut b[4..], 0x900);
+        st64(&mut b[12..], 0x30);
+        b
+    };
+
+    const VB: &str = "vertex_buffers";
+    const FB: &str = "fragment_buffers";
+    const VT: &str = "vertex_textures";
+    const FT: &str = "fragment_textures";
+    const VS: &str = "vertex_samplers";
+    const FS: &str = "fragment_samplers";
+    const ALL: [&str; 6] = [VB, FB, VT, FT, VS, FS];
+
+    let tables = |acc: &StreamAccum| -> Vec<(&'static str, String)> {
+        vec![
+            (VB, format!("{:?}", acc.vertex_buffers)),
+            (FB, format!("{:?}", acc.fragment_buffers)),
+            (VT, format!("{:?}", acc.vertex_textures)),
+            (FT, format!("{:?}", acc.fragment_textures)),
+            (VS, format!("{:?}", acc.vertex_samplers)),
+            (FS, format!("{:?}", acc.fragment_samplers)),
+        ]
+    };
+
+    for (selector, command, table, seed) in [
+        (
+            "setVertexBuffers:offsets:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_BUFFER,
+                0,
+                render::BUFFER_BIND_ENTRY_SIZE,
+                &buffer_entry,
+            ),
+            VB,
+            false,
+        ),
+        (
+            "setVertexBuffers:offsets:attributeStrides:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_BUFFER_STRIDE,
+                0,
+                render::BUFFER_STRIDE_BIND_ENTRY_SIZE,
+                &buffer_stride_entry,
+            ),
+            VB,
+            false,
+        ),
+        (
+            "setFragmentBuffers:offsets:withRange:",
+            bind(
+                wire_r::OPCODE_SET_FRAGMENT_BUFFER,
+                0,
+                render::BUFFER_BIND_ENTRY_SIZE,
+                &buffer_entry,
+            ),
+            FB,
+            false,
+        ),
+        (
+            "setVertexTextures:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_TEXTURE,
+                0,
+                render::REF_BIND_ENTRY_SIZE,
+                &ref_entry,
+            ),
+            VT,
+            false,
+        ),
+        (
+            "setFragmentTextures:withRange:",
+            bind(
+                wire_r::OPCODE_SET_FRAGMENT_TEXTURE,
+                0,
+                render::REF_BIND_ENTRY_SIZE,
+                &ref_entry,
+            ),
+            FT,
+            false,
+        ),
+        (
+            "setVertexSamplerStates:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_SAMPLER,
+                0,
+                render::REF_BIND_ENTRY_SIZE,
+                &ref_entry,
+            ),
+            VS,
+            false,
+        ),
+        (
+            "setFragmentSamplerStates:withRange:",
+            bind(
+                wire_r::OPCODE_SET_FRAGMENT_SAMPLER,
+                0,
+                render::REF_BIND_ENTRY_SIZE,
+                &ref_entry,
+            ),
+            FS,
+            false,
+        ),
+        (
+            "setVertexSamplerStates:lodMinClamps:lodMaxClamps:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_SAMPLER_LOD,
+                0,
+                render::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                &sampler_lod_entry,
+            ),
+            VS,
+            false,
+        ),
+        (
+            "setFragmentSamplerStates:lodMinClamps:lodMaxClamps:withRange:",
+            bind(
+                wire_r::OPCODE_SET_FRAGMENT_SAMPLER_LOD,
+                0,
+                render::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                &sampler_lod_entry,
+            ),
+            FS,
+            false,
+        ),
+        (
+            "setVertexBufferOffset:atIndex:",
+            flat(wire_r::OPCODE_SET_VERTEX_BUFFER_OFFSET, &offset_body),
+            VB,
+            true,
+        ),
+        (
+            "setVertexBufferOffset:attributeStride:atIndex:",
+            flat(
+                wire_r::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE,
+                &offset_stride_body,
+            ),
+            VB,
+            true,
+        ),
+        (
+            "setFragmentBufferOffset:atIndex:",
+            flat(wire_r::OPCODE_SET_FRAGMENT_BUFFER_OFFSET, &offset_body),
+            FB,
+            true,
+        ),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        if seed {
+            // The slot the offset record moves. Both stages are seeded, so a
+            // fragment offset reaching the vertex table would still be caught.
+            let occupant = BufferBind {
+                index: 0,
+                buffer_ref: 5151,
+                offset: 0x100,
+                ..Default::default()
+            };
+            Arc::make_mut(&mut acc.vertex_buffers).push(occupant.clone());
+            Arc::make_mut(&mut acc.fragment_buffers).push(occupant);
+        }
+        let before = tables(&acc);
+        let opcode = ld32(&command[0..]);
+        handle_render_record(&mut state, &host, 1, opcode, &command, &mut out, &mut acc);
+        let after = tables(&acc);
+        for ((name, was), (_, now)) in before.iter().zip(after.iter()) {
+            if *name == table {
+                assert_ne!(
+                    was, now,
+                    "{selector} ({opcode:#x}) left {name} at {was}, so the record reached no table"
+                );
+            } else {
+                assert_eq!(
+                    was, now,
+                    "{selector} ({opcode:#x}) moved {name} from {was} to {now}, which its opcode \
+                     does not name"
+                );
+            }
+        }
+        assert!(
+            ALL.contains(&table),
+            "the expected table must be one of the six"
+        );
+        assert!(
+            acc.unrepresentable.is_none(),
+            "{selector} ({opcode:#x}) refused the stream's draws"
+        );
+    }
 }
