@@ -899,9 +899,12 @@ pub(super) fn note_info_record_unanswered(task_id: u32, opcode: u32, len: usize)
 /// with a guest-declared zero would report the two as one.
 pub(super) struct ResidencyWriteDeclared {
     opcode: u32,
-    count: u32,
+    count: usize,
     usage: reims_vgpu_protocol::residency::ResourceUsage,
-    stages: reims_vgpu_protocol::residency::RenderStages,
+    /// `None` when the selector carries no stages argument at all — reported as
+    /// its own word rather than as a zero mask, which would be a stage set the
+    /// guest never named.
+    stages: Option<reims_vgpu_protocol::residency::RenderStages>,
 }
 
 impl crate::observe::Decline for ResidencyWriteDeclared {
@@ -918,7 +921,11 @@ impl crate::observe::Decline for ResidencyWriteDeclared {
             ("op", format!("{:#x}", self.opcode)),
             ("count", self.count.to_string()),
             ("usage", format!("{:#x}", self.usage.0)),
-            ("stages", format!("{:#x}", self.stages.0)),
+            (
+                "stages",
+                self.stages
+                    .map_or_else(|| "none".to_string(), |s| format!("{:#x}", s.0)),
+            ),
             (
                 "undeclared_usage",
                 format!("{:#x}", self.usage.undeclared_bits()),
@@ -929,34 +936,51 @@ impl crate::observe::Decline for ResidencyWriteDeclared {
 
 /// Price and, where the no-op argument does not cover it, name one residency
 /// record.
+///
+/// `usage` and `stages` are `Option` because the four selectors do not all
+/// carry them: the heap forms take no usage argument and the unqualified pair
+/// inherited from the encoder base class takes no stages. A `None` is "the
+/// selector has no such argument" and can never be a guest declaring nothing,
+/// which is the distinction every counter below rests on.
 pub(super) fn note_residency_declaration(
     task_id: u32,
     is_heap: bool,
     opcode: u32,
-    count: u32,
-    usage: reims_vgpu_protocol::residency::ResourceUsage,
-    stages: reims_vgpu_protocol::residency::RenderStages,
+    count: usize,
+    usage: Option<reims_vgpu_protocol::residency::ResourceUsage>,
+    stages: Option<reims_vgpu_protocol::residency::RenderStages>,
 ) {
     use reims_vgpu_protocol::residency::UsageClass;
-    let class = usage.classify();
+    let class = usage.map(reims_vgpu_protocol::residency::ResourceUsage::classify);
     crate::runtime::drain::note_store_route(match (is_heap, class) {
         // `useHeap:`/`useHeaps:count:` carry no usage argument, so there is no
         // class to report — the route says only that a heap was declared.
         (true, _) => "render_residency_heap",
-        (false, UsageClass::Empty) => "render_residency_empty",
-        (false, UsageClass::ReadOnly) => "render_residency_read",
-        (false, UsageClass::Writes) => "render_residency_write",
-        (false, UsageClass::Undeclared) => "render_residency_undeclared",
+        (false, Some(UsageClass::Empty)) => "render_residency_empty",
+        (false, Some(UsageClass::ReadOnly)) => "render_residency_read",
+        (false, Some(UsageClass::Writes)) => "render_residency_write",
+        (false, Some(UsageClass::Undeclared)) => "render_residency_undeclared",
+        // Unreachable: every resource form on this rail carries a usage word.
+        // Named rather than folded onto an empty declaration, which would
+        // report a usage the guest did not state.
+        (false, None) => "render_residency_resource_without_usage",
     });
     // A stage this device has no encoder for, named separately: it is the same
     // gap the tile records report one arm over, and counting it with the render
     // stages would hide which of the two a reading came from.
-    if stages.names_unexecuted_stage() {
-        crate::runtime::drain::note_store_route("render_residency_unexecuted_stage");
+    //
+    // A record with no stages *argument* reaches neither counter, where the
+    // flat command reached them both with a zero.
+    if let Some(stages) = stages {
+        if stages.names_unexecuted_stage() {
+            crate::runtime::drain::note_store_route("render_residency_unexecuted_stage");
+        }
+        if stages.undeclared_bits() != 0 {
+            crate::runtime::drain::note_store_route("render_residency_stages_undeclared");
+        }
     }
-    if stages.undeclared_bits() != 0 {
-        crate::runtime::drain::note_store_route("render_residency_stages_undeclared");
-    }
+    let Some(usage) = usage else { return };
+    let class = usage.classify();
     if is_heap || matches!(class, UsageClass::Empty | UsageClass::ReadOnly) {
         return;
     }
@@ -971,5 +995,5 @@ pub(super) fn note_residency_declaration(
     };
     crate::observe::Emit::decline("render_residency", &decline)
         .field("task", task_id)
-        .fail_once(u64::from(usage.0) << 32 | u64::from(stages.0));
+        .fail_once(u64::from(usage.0) << 32 | u64::from(stages.map_or(0, |s| s.0)));
 }

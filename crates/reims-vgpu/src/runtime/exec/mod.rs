@@ -2248,6 +2248,138 @@ fn handle_blit_unsettled_record(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
     }
 }
 
+/// Frame one render record for a protocol decoder, or say the frame disagreed
+/// with itself.
+fn frame_render_record<'a>(
+    task_id: u32,
+    opcode: u32,
+    cmd_bytes: &'a [u8],
+) -> Option<reims_vgpu_wire::op::Op<'a>> {
+    match reims_vgpu_protocol::decode::op(cmd_bytes, 0) {
+        Ok(framed) => Some(framed),
+        Err(_) => {
+            crate::observe::fail(format!(
+                "render_record_unframed task={task_id} opcode={opcode:#x} len={} (the segment \
+                 walk framed this record and the op header did not)",
+                cmd_bytes.len()
+            ));
+            None
+        }
+    }
+}
+
+/// Count and report one render record a protocol decoder refused.
+///
+/// Latched on the opcode: the guest re-encodes the same stream every frame, and
+/// this rail is the hottest in the crate.
+fn note_render_record_refused(
+    task_id: u32,
+    opcode: u32,
+    len: usize,
+    refusal: &reims_vgpu_protocol::decode::DecodeRefusal,
+) {
+    crate::observe::Emit::decline("render_record", refusal)
+        .field("task", task_id)
+        .field("len", len)
+        .fail_once(u64::from(opcode));
+}
+
+/// Order one render-encoder fence.
+///
+/// The encoder numbers its own fences and the three rails' pairs are nowhere
+/// near each other, so the rail is what says which pair an opcode belongs to.
+/// This arm used to read the direction from the opcode a second time and carry
+/// an `_ =>` for the case where a record classed as a fence was neither an
+/// update nor a wait — a state `reims_vgpu_protocol::sync::fence_kind` makes
+/// unrepresentable, because the same function decides both that this *is* a
+/// fence and which side of one it is.
+fn handle_render_fence(state: &mut DeviceState, task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    match reims_vgpu_protocol::decode::sync::decode(Rail::Render, &framed) {
+        Ok(SyncRecord::Fence(record)) => {
+            // `updateFence:afterStages:` is what a guest uses to order work
+            // inside one render encoder against a later one, so a dropped one
+            // is lost encoder synchronisation on every pass that asked for it.
+            let action = match record.kind {
+                reims_vgpu_protocol::sync::FenceKind::Update => FenceAction::Update,
+                reims_vgpu_protocol::sync::FenceKind::Wait => FenceAction::Wait,
+            };
+            fence_exec::execute_fence(
+                state,
+                task_id,
+                FenceDomain::RenderFence,
+                record.fence_ref,
+                action,
+            );
+        }
+        // `fence_kind` answers for exactly the two fence opcodes on this rail,
+        // so the class and the lift agreeing is the protocol crate's invariant.
+        // Unreachable, and named rather than ignored.
+        Ok(_) => crate::observe::fail(format!(
+            "render_fence_not_a_fence task={task_id} opcode={opcode:#x} (the ledger calls this a \
+             fence and the lift produced another ordering record)"
+        )),
+        Err(refusal) => note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
+/// Price one render-encoder barrier, which this device answers by doing
+/// nothing.
+///
+/// One slug for all three shapes, as before the ledger answered the class: the
+/// claim being priced is "this device ordered nothing here", and it is the same
+/// claim for a resource list, a scope word and `textureBarrier`.
+fn note_render_barrier(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    match reims_vgpu_protocol::decode::sync::decode(Rail::Render, &framed) {
+        Ok(SyncRecord::Barrier(_)) => {
+            crate::runtime::drain::note_store_route("render_noop_barrier");
+        }
+        Ok(_) => crate::observe::fail(format!(
+            "render_barrier_not_a_barrier task={task_id} opcode={opcode:#x} (the ledger calls \
+             this a barrier and the lift produced another ordering record)"
+        )),
+        Err(refusal) => note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
+/// Price one render residency declaration by what it declared.
+///
+/// **A heap declaration carries no usage and a stage-less form carries no
+/// stages**, and both are now the record's own shape rather than zeros the
+/// decoder filled in. The flat command had a `residency_usage` and a
+/// `residency_stages` on every record, so "the guest declared nothing" and "the
+/// selector has no such argument" were the same word on the counters whose
+/// whole job is telling them apart — and this rail has all four forms, the
+/// qualified pair that carries stages and the unqualified pair inherited from
+/// the encoder base class that does not.
+fn note_render_residency(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    use reims_vgpu_protocol::decode::residency::ResidencySubject;
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    // `lift` rather than `decode`: every residency row is unresolved, so
+    // `decode` refuses them on principle and is right to. This arm wants the
+    // layout question answered on its own — it is a census, not a claim that
+    // the contract is settled.
+    match reims_vgpu_protocol::decode::residency::lift(Rail::Render, &framed) {
+        Ok(record) => note_residency_declaration(
+            task_id,
+            matches!(record.subject, ResidencySubject::Heaps),
+            opcode,
+            record.refs.len(),
+            record.usage,
+            record.stages,
+        ),
+        Err(refusal) => note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
 fn handle_render_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
@@ -2257,6 +2389,41 @@ fn handle_render_record<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &mut StreamAccum,
 ) {
+    // **Which class of record this is, is the closure ledger's answer.** The
+    // render rail carries the widest set on this device: the encoder's own
+    // records, the fence pair, the barriers, the indirect-command executions,
+    // the residency declarations inherited from the encoder base class, and
+    // twenty-six rows the ledger has not settled. This device answered all of
+    // them with one `Kind`, decoded in the same pass that read the fields, so a
+    // record's class and its layout were one verdict.
+    //
+    // Three are answered here, and they are the three that own nothing on this
+    // rail. The fences reach `fence_exec`, which keeps its own generations; the
+    // barriers and the residency declarations are counted. **None of them
+    // touches `StreamAccum`**, which is what makes them separable from the rest
+    // of the rail rather than merely convenient to move first — the
+    // indirect-command executions look equally self-contained and are not,
+    // because they push onto `acc.execute_icb`.
+    match reims_vgpu_protocol::closure::find(Rail::Render, opcode)
+        .and_then(reims_vgpu_core::operation::classify)
+    {
+        Some(OperationHome::Stream(OperationClass::Fence)) => {
+            return handle_render_fence(state, task_id, opcode, cmd_bytes);
+        }
+        Some(OperationHome::Stream(OperationClass::Barrier)) => {
+            return note_render_barrier(task_id, opcode, cmd_bytes);
+        }
+        // `None` is a row the ledger has not settled. The four residency
+        // declarations are among them and are *declined* rather than executed,
+        // so their layout can come from `decode::residency::lift` — which
+        // answers what the guest wrote without claiming the row is settled.
+        // The other twenty-two unsettled rows drive work or are counted from
+        // fields this device reads itself, and stay below.
+        None if reims_vgpu_protocol::decode::residency::is_residency(Rail::Render, opcode) => {
+            return note_render_residency(task_id, opcode, cmd_bytes);
+        }
+        _ => {}
+    }
     let cmd = match render::decode(cmd_bytes) {
         Ok(c) => c,
         // Was `Err(_) => return`: a malformed render command dropped with no
@@ -2801,38 +2968,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 args_buffer_offset: cmd.icb_args_buffer_offset,
             });
         }
-        RenderKind::Fence => {
-            // The render encoder's own fence opcodes, not the blit encoder's.
-            // Each encoder numbers its selectors in its own space and the two
-            // fence pairs are nowhere near each other, so matching a render
-            // opcode against `wire_blit`'s constants never succeeded and sent
-            // every render fence to the arm below. `updateFence:afterStages:`
-            // is what a guest uses to order work inside one render encoder
-            // against a later one, so what it dropped was encoder
-            // synchronisation on every pass that asked for it.
-            let action = match cmd.opcode {
-                wire_render::OPCODE_UPDATE_FENCE => FenceAction::Update,
-                wire_render::OPCODE_WAIT_FOR_FENCE => FenceAction::Wait,
-                opcode => {
-                    // A render fence record whose opcode is neither update nor
-                    // wait drops the guest's encoder synchronisation. The
-                    // counter that stood here had no reader, so this was silent.
-                    crate::observe::fail(format!(
-                        "render_fence_opcode reason=render_fence_opcode_unknown \
-                         task={task_id} opcode={opcode:#x} fence={}",
-                        cmd.fence_ref
-                    ));
-                    return;
-                }
-            };
-            fence_exec::execute_fence(
-                state,
-                task_id,
-                FenceDomain::RenderFence,
-                cmd.fence_ref,
-                action,
-            );
-        }
         RenderKind::OtherAccepted => {
             // An undecoded render opcode: the decoder accepts it (catch-all)
             // but no executor exists, so the guest command is effectively
@@ -3048,18 +3183,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
         RenderKind::DrawIndirect => {
             execute_indirect_draw(state, host, task_id, &cmd, acc);
         }
-        RenderKind::UseResource | RenderKind::UseHeap => {
-            note_residency_declaration(
-                task_id,
-                cmd.kind == RenderKind::UseHeap,
-                cmd.opcode,
-                cmd.count,
-                cmd.residency_usage,
-                cmd.residency_stages,
-            );
-        }
-        RenderKind::Barrier => {
-            crate::runtime::drain::note_store_route("render_noop_barrier");
+        // The residency declarations, the barriers and the fence pair are
+        // answered by the ledger's own class before this decoder is reached.
+        // Arriving here is that routing disagreeing with itself rather than a
+        // guest case, so it is named instead of being answered a second time.
+        RenderKind::UseResource | RenderKind::UseHeap | RenderKind::Barrier | RenderKind::Fence => {
+            crate::observe::fail(format!(
+                "render_record_misrouted task={task_id} opcode={opcode:#x} kind={:?} (the ledger \
+                 classed this row and it reached the rail's own decoder)",
+                cmd.kind
+            ));
         }
         // The tile-shader family. Nine opcodes that used to reach
         // `OtherAccepted` together, split here into the three different things

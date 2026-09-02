@@ -4102,70 +4102,6 @@ fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
     );
 }
 
-/// The records this rail answers by doing nothing still say they arrived.
-///
-/// `UseResource`, `UseHeap` and `Barrier` all reached the dispatch's
-/// catch-all, so a guest's residency declaration and its barriers were
-/// indistinguishable from a record that had been executed — the arm they
-/// fell into was shared with `Kind::Unknown` and with every guarded arm's
-/// else-case. Doing nothing is still the answer; being silent about it is
-/// not, and a counter nobody reads back cannot show it is wired up.
-#[test]
-fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
-    use crate::runtime::drain::store_route_count;
-
-    for (op, route, payload_len) in [
-        // A zero-filled `useResource` declares residency with no access at
-        // all, which is its own class: it is not the read case, and reporting
-        // it as one would let the reading that confirms the no-op absorb a
-        // shape the argument does not describe.
-        (
-            wire_render::OPCODE_USE_RESOURCE,
-            "render_residency_empty",
-            render::USE_RESOURCE_REFS + 4,
-        ),
-        // `useHeap:` carries no usage argument, so its zero is a property of
-        // the selector rather than a guest declaration.
-        (
-            wire_render::OPCODE_USE_HEAP,
-            "render_residency_heap",
-            render::USE_HEAP_REFS + 4,
-        ),
-        (
-            wire_render::OPCODE_MEMORY_BARRIER_RESOURCES,
-            "render_noop_barrier",
-            0,
-        ),
-        (
-            wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
-            "render_noop_barrier",
-            0,
-        ),
-    ] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let host = FakeHost::new();
-        let mut out = ExecResult::default();
-        let mut acc = StreamAccum::default();
-
-        let total = reims_vgpu_wire::OP_HEADER_LEN + payload_len;
-        let mut command = vec![0u8; total];
-        st32(&mut command[0..], op);
-        st32(&mut command[4..], total as u32);
-        if payload_len > 0 {
-            // One resource named, so the count-led extent is satisfied.
-            st32(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 1);
-        }
-
-        let before = store_route_count(route);
-        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
-        assert_eq!(
-            store_route_count(route),
-            before + 1,
-            "op {op:#x} did not reach {route}"
-        );
-    }
-}
-
 /// The three ICB blit records are told apart rather than refused as one.
 ///
 /// They used to be declined before decode under a single shared reason,
@@ -6421,5 +6357,203 @@ fn an_undeclared_dispatch_type_refuses_its_record_and_leaves_the_pass_type_alone
         store_route_count("compute_dispatch_type_unknown"),
         before + 3,
         "the line is deduped; the count is not"
+    );
+}
+
+/// The three render-rail classes the closure ledger now routes each reach a
+/// counter that names them, and none of them reaches another's.
+///
+/// Before the ledger answered the class, all three were arms of this device's
+/// own `render::Kind`, decoded in the same pass that read the fields. The
+/// routing is what this asserts, in both directions — a barrier must not be
+/// counted as a residency declaration and a residency declaration must not be
+/// counted as a barrier, because the first is ordering this device argues it
+/// already provides and the second is a hint it argues it does not need.
+///
+/// It also pins the claim that makes this group a group: none of the three
+/// touches `StreamAccum`. The indirect-command executions look equally
+/// self-contained and are not — they push onto `acc.execute_icb` — which is why
+/// they stayed behind.
+#[test]
+fn each_ledger_routed_render_class_reaches_a_counter_that_names_which_one_it_is() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let head_then_refs = |op: u32, head: &[u8], refs: &[u32]| {
+        let total = (OP_HEADER_LEN + head.len() + refs.len() * 4) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v[OP_HEADER_LEN..OP_HEADER_LEN + head.len()].copy_from_slice(head);
+        for (i, r) in refs.iter().enumerate() {
+            st32(&mut v[OP_HEADER_LEN + head.len() + i * 4..], *r);
+        }
+        v
+    };
+    // `useResource:usage:stages:` — count, then a 16-bit usage and a 16-bit
+    // stages sharing one word.
+    let use_resource = |usage: u16, stages: u16, refs: &[u32]| {
+        let mut head = vec![0u8; 8];
+        st32(&mut head[0..], refs.len() as u32);
+        st16(&mut head[4..], usage);
+        st16(&mut head[6..], stages);
+        head_then_refs(wire_r::OPCODE_USE_RESOURCE, &head, refs)
+    };
+    // `useHeap:stages:` — no usage at all, so `stages` sits alone at `+4` and
+    // the refs begin at `+6`.
+    let use_heap = |stages: u16, refs: &[u32]| {
+        let mut head = vec![0u8; 6];
+        st32(&mut head[0..], refs.len() as u32);
+        st16(&mut head[4..], stages);
+        head_then_refs(wire_r::OPCODE_USE_HEAP, &head, refs)
+    };
+    let bare = |op: u32, total: u32| {
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v
+    };
+
+    const BARRIER: &str = "render_noop_barrier";
+    const HEAP: &str = "render_residency_heap";
+    const EMPTY: &str = "render_residency_empty";
+    const READ: &str = "render_residency_read";
+    const WRITE: &str = "render_residency_write";
+    const ALL: [&str; 5] = [BARRIER, HEAP, EMPTY, READ, WRITE];
+
+    let mut resources_head = vec![0u8; 8];
+    st32(&mut resources_head[0..], 2);
+    let barrier_resources = head_then_refs(
+        wire_r::OPCODE_MEMORY_BARRIER_RESOURCES,
+        &resources_head,
+        &[5151, 4343],
+    );
+
+    for (op, command, route) in [
+        (
+            wire_r::OPCODE_MEMORY_BARRIER_RESOURCES,
+            barrier_resources,
+            BARRIER,
+        ),
+        (
+            wire_r::OPCODE_MEMORY_BARRIER_SCOPE,
+            bare(
+                wire_r::OPCODE_MEMORY_BARRIER_SCOPE,
+                wire_r::MEMORY_BARRIER_SCOPE_TOTAL_LEN,
+            ),
+            BARRIER,
+        ),
+        (
+            wire_r::OPCODE_TEXTURE_BARRIER,
+            bare(
+                wire_r::OPCODE_TEXTURE_BARRIER,
+                wire_r::TEXTURE_BARRIER_TOTAL_LEN,
+            ),
+            BARRIER,
+        ),
+        (wire_r::OPCODE_USE_HEAP, use_heap(1, &[77]), HEAP),
+        // A `useResource` declaring no access at all is its own class: it is
+        // not the read case, and reporting it as one would let the reading
+        // that confirms the no-op absorb a shape the argument does not
+        // describe.
+        (
+            wire_r::OPCODE_USE_RESOURCE,
+            use_resource(0, 1, &[88]),
+            EMPTY,
+        ),
+        (
+            wire_r::OPCODE_USE_RESOURCE,
+            use_resource(
+                reims_vgpu_protocol::residency::ResourceUsage::READ as u16,
+                1,
+                &[88, 99],
+            ),
+            READ,
+        ),
+        (
+            wire_r::OPCODE_USE_RESOURCE,
+            use_resource(
+                reims_vgpu_protocol::residency::ResourceUsage::WRITE as u16,
+                1,
+                &[88],
+            ),
+            WRITE,
+        ),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let before: Vec<u64> = ALL.iter().map(|r| store_route_count(r)).collect();
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        for (name, was) in ALL.iter().zip(before) {
+            let now = store_route_count(name);
+            let want = was + u64::from(*name == route);
+            assert_eq!(
+                now, want,
+                "{op:#x} should have been counted once as {route} and {name} moved from {was} to \
+                 {now}"
+            );
+        }
+        assert!(
+            acc.pipeline_ref == 0 && acc.execute_icb.is_empty() && acc.viewports.is_empty(),
+            "{op:#x} moved stream state it does not own"
+        );
+    }
+}
+
+/// A render fence's direction comes from the same answer that says it is a
+/// fence, so a fence that is neither an update nor a wait is unrepresentable.
+///
+/// The arm this replaces read the opcode a second time to pick the direction
+/// and carried a third case for neither — a state
+/// `reims_vgpu_protocol::sync::fence_kind` cannot produce, because the same
+/// function decides both that this is a fence and which side of one it is.
+#[test]
+fn a_render_fence_orders_in_the_direction_its_own_opcode_names() {
+    use crate::runtime::plan::event_sync::Domain;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let fence = |op: u32, fence_ref: u32| {
+        let mut v = vec![0u8; wire_r::FENCE_TOTAL_LEN as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], wire_r::FENCE_TOTAL_LEN);
+        st32(&mut v[OP_HEADER_LEN..], fence_ref);
+        v
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    // An update lands on the render domain's generation; the wait that follows
+    // it is satisfied by that update rather than left pending, which is the
+    // only way to tell the two directions apart from outside.
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_r::OPCODE_UPDATE_FENCE,
+        &fence(wire_r::OPCODE_UPDATE_FENCE, 4242),
+        &mut out,
+        &mut acc,
+    );
+    let after_update = fence_exec::execute_fence(
+        &mut state,
+        1,
+        Domain::RenderFence,
+        4242,
+        crate::runtime::plan::event_sync::FenceAction::Wait,
+    );
+    assert!(
+        !matches!(
+            after_update,
+            crate::runtime::fence_exec::FenceStatus::Missing
+        ),
+        "the update must have reached the render domain: {after_update:?}"
+    );
+    assert!(
+        acc.pipeline_ref == 0 && acc.execute_icb.is_empty(),
+        "a fence moves no stream state"
     );
 }
