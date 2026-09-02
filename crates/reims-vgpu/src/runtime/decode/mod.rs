@@ -7,4 +7,3 @@ pub mod compute;
 mod ledger;
 pub mod render;
 pub mod resource;
-pub mod stream;

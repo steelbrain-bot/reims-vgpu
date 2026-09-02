@@ -179,7 +179,7 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
 /// One segment header whose declared length runs `overshoot` bytes past the
 /// buffer, followed by `tail` bytes of would-be records.
 fn truncated_segment(type_: u8, overshoot: usize, tail: usize) -> Vec<u8> {
-    use crate::runtime::decode::stream::SEGMENT_HEADER_LEN;
+    use reims_vgpu_protocol::segment::SEGMENT_HEADER_LEN;
     let mut stream = vec![0u8; SEGMENT_HEADER_LEN + tail];
     st32(
         &mut stream[0..4],
@@ -195,7 +195,7 @@ fn sink_body() -> String {
 
 #[test]
 fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
-    use crate::runtime::decode::stream::SEGMENT_TYPE_RENDER;
+    use reims_vgpu_protocol::segment::SegmentKind;
     // The defect this pins: `walk_stream` opened with `Err(_) => return`, so a
     // stream the framing decoder rejected executed zero records and produced
     // zero log lines — byte-for-byte indistinguishable at the sink from an
@@ -212,7 +212,7 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
         &mut state,
         &mut host,
         task_id,
-        &truncated_segment(SEGMENT_TYPE_RENDER, 64, 0),
+        &truncated_segment(SegmentKind::Render.wire_type(), 64, 0),
         &mut out,
         &mut acc,
     );
@@ -222,9 +222,10 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
         "a stream that will not frame must reach the always-on sink, got:\n{added}"
     );
     assert!(
-        added.contains("reason=stream_seg_len_past_buffer_end"),
+        added.contains("reason=framing_segment_length_past_stream_end"),
         "the line must name which framing check refused, not just that one \
-         did — 17 checks shared `ErrBadLength`. got:\n{added}"
+         did — 17 checks shared `ErrBadLength` in the framer this replaced. \
+         got:\n{added}"
     );
     assert!(
         added.contains(&format!("task={task_id}")),
@@ -232,67 +233,77 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
     );
 }
 
+/// A well-formed segment carrying a record that overruns it names the check
+/// rather than looking like end-of-records.
+///
+/// `Err(_) => break` in the walker this replaced treated a self-inconsistent
+/// segment exactly like `Done`: the remaining records went unexecuted with
+/// nothing logged.
+///
+/// The *segment*-level half of that defect is no longer expressible. The framer
+/// this device carried handed the record walker an already-parsed `Segment`
+/// whose `command_offset`/`command_length` could name bytes the buffer did not
+/// hold, and `validate_segment` re-checked them on every record — sixteen
+/// re-validation refusals for a state a caller should not have been able to
+/// construct. `FramedSegment` carries the command window as a slice, so a
+/// segment cannot claim bytes that are not there and the whole re-validation
+/// family is gone with the state it guarded.
+///
+/// What is left is the record's own length, which is still the guest's, and
+/// that is what this drives.
 #[test]
-fn a_truncated_segment_names_the_check_rather_than_looking_like_end_of_records() {
-    use crate::runtime::decode::stream::{
-        segment_type_name, Segment, SEGMENT_HEADER_LEN, SEGMENT_TYPE_INFO,
-    };
-    // `Err(_) => break` treated a self-inconsistent segment exactly like
-    // `Done`: the remaining records went unexecuted with nothing logged.
-    let stream = vec![0u8; SEGMENT_HEADER_LEN + 4];
-    // A segment claiming a longer body than the buffer holds, handed straight
-    // to the record walker — the shape `iter_segments` would have rejected but
-    // that an already-parsed `Segment` can still carry.
-    let seg = Segment {
-        offset: 0,
-        length: (SEGMENT_HEADER_LEN + 64) as u32,
-        type_: SEGMENT_TYPE_INFO,
-        command_offset: SEGMENT_HEADER_LEN as u32,
-        command_length: 64,
-        ..Segment::default()
-    };
+fn a_record_overrunning_its_segment_names_the_check_rather_than_ending_quietly() {
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    // Two records in an info segment: one well formed, then one whose declared
+    // length runs past the window it sits in.
+    let mut commands = Vec::new();
+    for (opcode, length) in [(0x1d1u32, 8u32), (0x1d1, 64)] {
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], opcode);
+        st32(&mut hdr[4..8], length);
+        commands.extend_from_slice(&hdr);
+    }
     let before = sink_body().len();
     let mut handled = 0usize;
-    walk_segment_records(&stream, &seg, |_, _| handled += 1);
+    walk_segment_records(
+        SegmentKind::Info,
+        SEGMENT_HEADER_LEN as u32,
+        &commands,
+        |_, _| handled += 1,
+    );
     let added = sink_body()[before..].to_string();
-    assert_eq!(handled, 0, "the malformed segment yields no records");
+    assert_eq!(handled, 1, "the well-formed record ahead of it still ran");
     assert!(
         added.contains("stream_record_fail"),
         "dropping a segment's records must reach the sink, got:\n{added}"
     );
     assert!(
-        added.contains("reason=stream_reval_span_oob"),
-        "the line must name the failing re-validation check, got:\n{added}"
+        added.contains("reason=stream_rec_bad_length") && added.contains("length=64"),
+        "the line must name the check and the length the guest declared, \
+         got:\n{added}"
     );
     assert!(
-        added.contains(&format!(
-            "seg={}",
-            segment_type_name(u32::from(SEGMENT_TYPE_INFO))
-        )),
+        added.contains("seg=info"),
         "the line must say which segment family lost its records, got:\n{added}"
     );
 }
 
 #[test]
 fn walking_a_well_formed_segment_to_its_end_logs_nothing() {
-    use crate::runtime::decode::stream::{iter_segments, SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
-    // The other half of the obligation: `Done` is how every segment ends, so
-    // if it produced a line the sink would carry one per segment per frame.
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    // The other half of the obligation: every segment ends, so if the end
+    // produced a line the sink would carry one per segment per frame.
     let mut records = [0u8; 8];
     st32(&mut records[0..4], 0x190);
     st32(&mut records[4..8], 8);
-    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
-    st32(
-        &mut stream[0..4],
-        (SEGMENT_HEADER_LEN + records.len()) as u32,
-    );
-    stream[4] = SEGMENT_TYPE_EVENT;
-    stream.extend_from_slice(&records);
-
-    let segs = iter_segments(&stream).expect("a well-formed stream frames");
     let before = sink_body().len();
     let mut handled = 0usize;
-    walk_segment_records(&stream, &segs[0], |_, _| handled += 1);
+    walk_segment_records(
+        SegmentKind::Event,
+        SEGMENT_HEADER_LEN as u32,
+        &records,
+        |_, _| handled += 1,
+    );
     let added = sink_body()[before..].to_string();
     assert_eq!(handled, 1, "the one record is handed over");
     assert!(
@@ -301,42 +312,97 @@ fn walking_a_well_formed_segment_to_its_end_logs_nothing() {
     );
 }
 
+/// An unknown segment family stops the walk and says so; the type-5 envelope is
+/// skipped in silence.
+///
+/// The walker this replaced ended in `_ => {}`, which gave one silence to two
+/// very different things: a protection envelope is a contract-correct skip, and
+/// an unrecognised type is wire format this host has never seen.
+///
+/// **The unknown case now ends the stream rather than being stepped over, and
+/// that is a behaviour change.** `FramingRefusal::UnknownType` states the
+/// reason: a family whose record framing is unknown can only be skipped on its
+/// declared length, and skipping on that hands the next segment an encoder
+/// state derived from bytes nothing here understands. The reference host
+/// rejects a non-continuation type it has no decoder for rather than stepping
+/// over it. So the segments before the unknown one execute, the ones after it
+/// do not, and the line says how many ran.
 #[test]
-fn an_unknown_segment_family_is_refused_and_the_type_5_envelope_is_not() {
-    use crate::observe::Refusal;
-    use crate::runtime::decode::stream::{
-        segment_disposition, SegmentDisposition, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_PROTECTION_OPTIONS,
+fn an_unknown_segment_family_ends_the_walk_and_the_envelope_does_not() {
+    use crate::model::FENCE_DOMAIN_EVENT;
+    use reims_vgpu_protocol::segment::{
+        segment_role, SegmentKind, SegmentRole, SEGMENT_HEADER_LEN, SEGMENT_TYPE_PROTECTION_OPTIONS,
     };
-    // `walk_stream` ended in `_ => {}`, which gave one silence to two very
-    // different things. Ref-texture is a contract-correct skip; function is wire
-    // format the host has never seen.
+
     assert_eq!(
-        segment_disposition(SEGMENT_TYPE_PROTECTION_OPTIONS),
-        SegmentDisposition::Envelope
+        segment_role(SEGMENT_TYPE_PROTECTION_OPTIONS),
+        Some(SegmentRole::ProtectionEnvelope)
+    );
+    assert_eq!(segment_role(6), None, "6 is not a family this host knows");
+    assert_eq!(segment_role(0xff), None);
+
+    // A protection envelope, then an event segment that signals, then an
+    // unknown family, then a second event segment that must not run.
+    let push = |stream: &mut Vec<u8>, type_: u8, body: &[u8]| {
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], (SEGMENT_HEADER_LEN + body.len()) as u32);
+        hdr[4] = type_;
+        stream.extend_from_slice(&hdr);
+        stream.extend_from_slice(body);
+    };
+    let signal = |event_ref: u32, value: u64| {
+        let mut rec = vec![0u8; 0x14];
+        st32(&mut rec[0..4], 0x191);
+        st32(&mut rec[4..8], 0x14);
+        st32(&mut rec[8..12], event_ref);
+        st64(&mut rec[12..20], value);
+        rec
+    };
+    let mut stream = Vec::new();
+    push(&mut stream, SEGMENT_TYPE_PROTECTION_OPTIONS, &[0u8; 8]);
+    push(&mut stream, SegmentKind::Event.wire_type(), &signal(21, 4));
+    push(&mut stream, 6, &[0u8; 8]);
+    push(&mut stream, SegmentKind::Event.wire_type(), &signal(22, 9));
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let task_id = 0x5731_0002;
+    let cap = crate::observe::FailCapture::start();
+    walk_stream(&mut state, &mut host, task_id, &stream, &mut out, &mut acc);
+    let lines = cap.lines();
+
+    assert_eq!(
+        state.fence_generation(task_id, FENCE_DOMAIN_EVENT, 21),
+        Some(4),
+        "the segments ahead of the unknown family still execute — and the \
+         envelope ahead of them is skipped, not walked as records"
     );
     assert_eq!(
-        segment_disposition(SEGMENT_TYPE_PROTECTION_OPTIONS).refusal(),
+        state.fence_generation(task_id, FENCE_DOMAIN_EVENT, 22),
         None,
-        "the envelope arrives on healthy frames; a line here is a flood"
+        "the walk stops at the unknown family"
     );
-    assert_eq!(
-        segment_disposition(SEGMENT_TYPE_BLIT),
-        SegmentDisposition::Walk
+    assert!(
+        lines.iter().any(|l| l.contains("stream_frame_fail")
+            && l.contains("reason=framing_segment_type_unknown")
+            && l.contains("wire_type=0x6")
+            && l.contains("segments_before=2")),
+        "the line must name the type and how many segments ran: {lines:?}"
     );
-    assert_eq!(
-        segment_disposition(6).refusal(),
-        Some("stream_segment_type_unknown")
-    );
-    assert_eq!(
-        segment_disposition(0xff).refusal(),
-        Some("stream_segment_type_unknown")
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("framing_envelope_window_not_payload")),
+        "an eight-byte envelope window is the payload and must not refuse: {lines:?}"
     );
 }
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn render_preflight_collects_content_pipelines_without_duplicates() {
-    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
     use wire_render::OPCODE_SET_RENDER_PIPELINE_STATE;
 
     let mut records = Vec::new();
@@ -350,7 +416,7 @@ fn render_preflight_collects_content_pipelines_without_duplicates() {
     let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
     let stream_len = stream.len() + records.len();
     st32(&mut stream[0..4], stream_len as u32);
-    stream[4] = SEGMENT_TYPE_RENDER;
+    stream[4] = SegmentKind::Render.wire_type();
     stream.extend_from_slice(&records);
 
     assert_eq!(super::vulkan::render_pipeline_refs(&stream), vec![41, 77]);
@@ -359,7 +425,7 @@ fn render_preflight_collects_content_pipelines_without_duplicates() {
 #[cfg(feature = "backend-vulkan")]
 #[test]
 fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
-    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_COMPUTE};
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
 
     let mut records = Vec::new();
     let mut pipeline = [0u8; 12];
@@ -386,7 +452,7 @@ fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
     let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
     let stream_len = stream.len() + records.len();
     st32(&mut stream[0..4], stream_len as u32);
-    stream[4] = SEGMENT_TYPE_COMPUTE;
+    stream[4] = SegmentKind::Compute.wire_type();
     stream.extend_from_slice(&records);
 
     assert_eq!(
@@ -401,7 +467,7 @@ fn event_segment_signal_wait_in_stream() {
     use reims_vgpu_protocol::sync::{OPCODE_SIGNAL_EVENT, OPCODE_WAIT_EVENT};
     // The record's own body, from the crate that owns its layout.
     let signal_wait_payload_len = core::mem::size_of::<reims_vgpu_wire::ops::event::SignalWait>();
-    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
 
     fn push_segment(buf: &mut Vec<u8>, type_: u8, payload: &[u8]) {
         let len = (SEGMENT_HEADER_LEN + payload.len()) as u32;
@@ -428,7 +494,7 @@ fn event_segment_signal_wait_in_stream() {
     push_event_record(&mut records, OPCODE_WAIT_EVENT, 11, 7);
     push_event_record(&mut records, OPCODE_WAIT_EVENT, 11, 8); // pending
     let mut stream = Vec::new();
-    push_segment(&mut stream, SEGMENT_TYPE_EVENT, &records);
+    push_segment(&mut stream, SegmentKind::Event.wire_type(), &records);
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -457,7 +523,7 @@ fn event_segment_signal_wait_in_stream() {
 #[test]
 fn a_bounded_event_wait_is_refused_by_contract_and_leaves_the_generation_alone() {
     use crate::model::FENCE_DOMAIN_EVENT;
-    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
     use reims_vgpu_protocol::sync::{OPCODE_SIGNAL_EVENT, OPCODE_WAIT_EVENT_TIMEOUT};
 
     // The bounded wait's own body: the signal/wait pair plus its timeout word.
@@ -477,7 +543,7 @@ fn a_bounded_event_wait_is_refused_by_contract_and_leaves_the_generation_alone()
     let len = (SEGMENT_HEADER_LEN + records.len()) as u32;
     let mut hdr = [0u8; 8];
     st32(&mut hdr[0..4], len);
-    hdr[4] = SEGMENT_TYPE_EVENT;
+    hdr[4] = SegmentKind::Event.wire_type();
     stream.extend_from_slice(&hdr);
     stream.extend_from_slice(&records);
 
@@ -5330,7 +5396,7 @@ fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
 #[test]
 fn a_render_encoder_fence_reaches_the_render_fence_domain() {
     use crate::model::{FENCE_DOMAIN_BLIT, FENCE_DOMAIN_RENDER};
-    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
     use reims_vgpu_wire::ops::render as wire_render;
 
     const FENCE_REF: u32 = 6464;
@@ -5355,7 +5421,7 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
     let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
     let stream_len = stream.len() + records.len();
     st32(&mut stream[0..4], stream_len as u32);
-    stream[4] = SEGMENT_TYPE_RENDER;
+    stream[4] = SegmentKind::Render.wire_type();
     stream.extend_from_slice(&records);
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);

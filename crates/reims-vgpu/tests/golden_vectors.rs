@@ -7,7 +7,7 @@
 
 use reims_vgpu::protocol::endian::{st32, st64};
 use reims_vgpu::protocol::pixel_format;
-use reims_vgpu::runtime::decode::{blit, stream};
+use reims_vgpu::runtime::decode::blit;
 
 /// Never share the live product logs with a concurrent boot.
 fn isolate_logs() {
@@ -31,8 +31,17 @@ fn pixel_format_c_matrix_rows() {
     );
 }
 
+/// The same vector, through the framing that now reads it.
+///
+/// This device's own segment/record framer is gone;
+/// `reims_vgpu_protocol::segment::SegmentStream` locates segments and
+/// `reims_vgpu_wire::op::OpStream` locates the records inside one. The bytes are
+/// unchanged, so the vector still says what it always said.
 #[test]
 fn stream_segment_record_roundtrip_shape() {
+    use reims_vgpu::protocol::segment::{
+        SegmentBody, SegmentKind, SegmentStream, SEGMENT_HEADER_LEN,
+    };
     isolate_logs();
     let mut payload = Vec::new();
     // record: opcode 0x12d, length 0x28
@@ -42,19 +51,25 @@ fn stream_segment_record_roundtrip_shape() {
     payload.extend_from_slice(&rec);
 
     let mut stream_bytes = Vec::new();
-    let seg_len = (8 + payload.len()) as u32;
+    let seg_len = (SEGMENT_HEADER_LEN + payload.len()) as u32;
     let mut hdr = [0u8; 8];
     st32(&mut hdr[0..], seg_len);
-    hdr[4] = stream::SEGMENT_TYPE_BLIT;
+    hdr[4] = SegmentKind::Blit.wire_type();
     stream_bytes.extend_from_slice(&hdr);
     stream_bytes.extend_from_slice(&payload);
 
-    let segs = stream::iter_segments(&stream_bytes).unwrap();
+    let segs: Vec<_> = SegmentStream::new(&stream_bytes)
+        .expect("the vector is addressable")
+        .collect::<Result<_, _>>()
+        .expect("a well-formed stream frames");
     assert_eq!(segs.len(), 1);
-    let mut c = 0;
-    let rec = stream::decode_first_record(&stream_bytes, &segs[0], &mut c).unwrap();
-    assert_eq!(rec.opcode, 0x12d);
-    let blit_cmd = blit::decode(&stream_bytes[rec.offset as usize..]).unwrap();
+    let SegmentBody::Encoder { kind, commands } = segs[0].body else {
+        panic!("a blit segment carries records");
+    };
+    assert_eq!(kind, SegmentKind::Blit);
+    let op = reims_vgpu::protocol::decode::op(commands, 0).expect("the record frames");
+    assert_eq!(op.opcode(), 0x12d);
+    let blit_cmd = blit::decode(commands).unwrap();
     assert_eq!(blit_cmd.opcode, 0x12d);
 }
 
@@ -94,7 +109,11 @@ fn corpus_property_random_decode_no_panic() {
         &[0x12, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00],
     ];
     for s in seeds {
-        let _ = stream::iter_segments(s);
+        if let Ok(segments) = reims_vgpu::protocol::segment::SegmentStream::new(s) {
+            for framed in segments {
+                let _ = framed;
+            }
+        }
         let _ = blit::decode(s);
         if let Ok(op) = reims_vgpu::protocol::decode::op(s, 0) {
             let _ = reims_vgpu::protocol::decode::sync::decode(

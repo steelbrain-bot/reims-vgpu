@@ -48,9 +48,16 @@
 use crate::closure::Rail;
 use reims_vgpu_wire::ops::segment::{
     protection_options_envelope, segment_header, PROTECTION_OPTIONS_ENVELOPE_LEN,
-    SEGMENT_HEADER_LEN, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_INFO,
-    SEGMENT_TYPE_RENDER,
+    SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE, SEGMENT_TYPE_INFO, SEGMENT_TYPE_RENDER,
 };
+
+/// Bytes a segment header allocates.
+///
+/// Wire's, re-exported for the same reason the type bytes are: a caller that
+/// has to build or bound a segment reaches the framing layer for it, and a
+/// second literal is a number that can disagree with the framer. The
+/// allocation, not the struct — the header's eighth byte belongs to no field.
+pub use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
 
 /// The segment type that introduces a protection-options envelope.
 ///
@@ -207,6 +214,51 @@ impl FramingRefusal {
             Self::LengthPastStreamEnd { .. } => "framing_segment_length_past_stream_end",
             Self::UnknownType { .. } => "framing_segment_type_unknown",
             Self::EnvelopeWindowNotItsPayload { .. } => "framing_envelope_window_not_payload",
+        }
+    }
+}
+
+/// Every framing refusal is one check, and the fields are the numbers it saw.
+///
+/// The slug is [`FramingRefusal::reason`] rather than a second set of strings,
+/// for the reason `DecodeRefusal`'s is: a layer that may not depend on
+/// `observe` still has to name the refusal it forwards, and two spellings can
+/// drift.
+///
+/// `at` is on every variant that has one because a stream that stopped framing
+/// stopped *somewhere*, and the offset is what turns "this stream is malformed"
+/// into a place a reader can look.
+impl reims_vgpu_observe::Decline for FramingRefusal {
+    fn slug(&self) -> &'static str {
+        self.reason()
+    }
+
+    fn fields(&self) -> alloc::vec::Vec<(&'static str, alloc::string::String)> {
+        use alloc::string::ToString;
+        match *self {
+            Self::StreamTooLong { length } => alloc::vec![("length", length.to_string())],
+            Self::ShortHeader { at, remaining } => {
+                alloc::vec![("at", at.to_string()), ("remaining", remaining.to_string())]
+            }
+            Self::LengthBelowHeader { at, length } => {
+                alloc::vec![("at", at.to_string()), ("length", length.to_string())]
+            }
+            Self::LengthPastStreamEnd {
+                at,
+                length,
+                remaining,
+            } => alloc::vec![
+                ("at", at.to_string()),
+                ("length", length.to_string()),
+                ("remaining", remaining.to_string())
+            ],
+            Self::UnknownType { at, wire_type } => alloc::vec![
+                ("at", at.to_string()),
+                ("wire_type", alloc::format!("{wire_type:#x}"))
+            ],
+            Self::EnvelopeWindowNotItsPayload { at, length } => {
+                alloc::vec![("at", at.to_string()), ("length", length.to_string())]
+            }
         }
     }
 }

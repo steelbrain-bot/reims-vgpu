@@ -88,30 +88,33 @@ pub(crate) fn render_pipeline_refs(stream: &[u8]) -> Vec<u32> {
     // Deliberately silent on a framing refusal: this is a speculative pre-scan of
     // the very stream `walk_stream` is about to frame and report on. Logging here
     // would double every `stream_frame_fail` line for no added information.
-    let Ok(segs) = stream::iter_segments(stream) else {
+    let Ok(segments) = SegmentStream::new(stream) else {
         return Vec::new();
     };
     let mut pipelines = Vec::new();
-    for seg in segs {
-        if seg.type_ != SEGMENT_TYPE_RENDER {
+    for framed in segments {
+        // A framing refusal ends the scan, exactly as it ends `walk_stream`'s.
+        // Continuing past one here would pre-translate pipelines out of
+        // segments the walk is about to refuse to execute.
+        let Ok(framed) = framed else { break };
+        let SegmentBody::Encoder {
+            kind: SegmentKind::Render,
+            commands,
+        } = framed.body
+        else {
             continue;
-        }
-        let mut cursor = 0usize;
-        let mut next = decode_first_record(stream, &seg, &mut cursor);
-        while let Ok(rec) = next {
-            let start = rec.bytes_offset as usize;
-            let end = start.saturating_add(rec.length as usize);
-            if let Some(bytes) = stream.get(start..end) {
-                if let Ok(cmd) = render::decode(bytes) {
-                    if cmd.kind == RenderKind::SetPipeline
-                        && cmd.pipeline_ref != 0
-                        && !pipelines.contains(&cmd.pipeline_ref)
-                    {
-                        pipelines.push(cmd.pipeline_ref);
-                    }
+        };
+        for op in reims_vgpu_wire::op::OpStream::new(commands) {
+            let Ok(op) = op else { break };
+            let bytes = &commands[op.offset..op.offset + op.length() as usize];
+            if let Ok(cmd) = render::decode(bytes) {
+                if cmd.kind == RenderKind::SetPipeline
+                    && cmd.pipeline_ref != 0
+                    && !pipelines.contains(&cmd.pipeline_ref)
+                {
+                    pipelines.push(cmd.pipeline_ref);
                 }
             }
-            next = decode_next_record(stream, &seg, &mut cursor);
         }
     }
 
@@ -172,47 +175,48 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
 pub(crate) fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
     // Silent for the same reason as `render_pipeline_refs`: a pre-scan whose
     // framing refusal `walk_stream` will report once, with the task attached.
-    let Ok(segs) = stream::iter_segments(stream) else {
+    let Ok(segments) = SegmentStream::new(stream) else {
         return Vec::new();
     };
     let mut inputs = Vec::new();
-    for seg in segs {
-        if seg.type_ != SEGMENT_TYPE_COMPUTE {
+    for framed in segments {
+        let Ok(framed) = framed else { break };
+        let SegmentBody::Encoder {
+            kind: SegmentKind::Compute,
+            commands,
+        } = framed.body
+        else {
             continue;
-        }
+        };
         let mut pipeline_ref = 0u32;
-        let mut cursor = 0usize;
-        let mut next = decode_first_record(stream, &seg, &mut cursor);
-        while let Ok(rec) = next {
-            let start = rec.bytes_offset as usize;
-            let end = start.saturating_add(rec.length as usize);
-            if let Some(bytes) = stream.get(start..end) {
-                if let Ok(cmd) = compute::decode(bytes) {
-                    match cmd.kind {
-                        ComputeKind::Pipeline => pipeline_ref = cmd.pipeline_ref,
-                        ComputeKind::DispatchThreadgroups
-                        | ComputeKind::DispatchThreadgroupsIndirect
-                        | ComputeKind::DispatchThreads => {
-                            let dims = cmd.threads_per_threadgroup;
-                            let local_size = [
-                                u32::try_from(dims.x).ok(),
-                                u32::try_from(dims.y).ok(),
-                                u32::try_from(dims.z).ok(),
-                            ];
-                            if pipeline_ref != 0 {
-                                if let [Some(x), Some(y), Some(z)] = local_size {
-                                    let item = (pipeline_ref, [x, y, z]);
-                                    if x != 0 && y != 0 && z != 0 && !inputs.contains(&item) {
-                                        inputs.push(item);
-                                    }
-                                }
+        for op in reims_vgpu_wire::op::OpStream::new(commands) {
+            let Ok(op) = op else { break };
+            let bytes = &commands[op.offset..op.offset + op.length() as usize];
+            let Ok(cmd) = compute::decode(bytes) else {
+                continue;
+            };
+            match cmd.kind {
+                ComputeKind::Pipeline => pipeline_ref = cmd.pipeline_ref,
+                ComputeKind::DispatchThreadgroups
+                | ComputeKind::DispatchThreadgroupsIndirect
+                | ComputeKind::DispatchThreads => {
+                    let dims = cmd.threads_per_threadgroup;
+                    let local_size = [
+                        u32::try_from(dims.x).ok(),
+                        u32::try_from(dims.y).ok(),
+                        u32::try_from(dims.z).ok(),
+                    ];
+                    if pipeline_ref != 0 {
+                        if let [Some(x), Some(y), Some(z)] = local_size {
+                            let item = (pipeline_ref, [x, y, z]);
+                            if x != 0 && y != 0 && z != 0 && !inputs.contains(&item) {
+                                inputs.push(item);
                             }
                         }
-                        _ => {}
                     }
                 }
+                _ => {}
             }
-            next = decode_next_record(stream, &seg, &mut cursor);
         }
     }
     inputs

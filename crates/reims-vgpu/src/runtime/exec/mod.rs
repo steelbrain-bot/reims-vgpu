@@ -33,10 +33,6 @@ use crate::runtime::decode::render::{
     DepthAttachment, Kind as RenderKind, LevelSupport, ScissorRect, Stage, StencilAttachment,
     PASS_MAX_COLOR_ATTACHMENTS,
 };
-use crate::runtime::decode::stream::{
-    self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
-    SEGMENT_TYPE_EVENT, SEGMENT_TYPE_INFO, SEGMENT_TYPE_RENDER,
-};
 use crate::runtime::draw::{
     self, BindTable, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
     MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
@@ -54,6 +50,7 @@ use reims_vgpu_protocol::pass_action::{
     MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
     MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
+use reims_vgpu_protocol::segment::{SegmentBody, SegmentKind, SegmentLifetime, SegmentStream};
 use reims_vgpu_wire::ops::blit as wire_blit;
 use reims_vgpu_wire::ops::render as wire_render;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
@@ -940,50 +937,143 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
 /// simply sending that many. Counted per segment family, because a blit record
 /// and a render record cost nothing like the same and the mix is what says which
 /// of the two the wall clock belongs to.
-fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl FnMut(u32, &[u8])) {
-    let mut cursor = 0usize;
+fn walk_segment_records(
+    kind: SegmentKind,
+    commands_offset: u32,
+    commands: &[u8],
+    mut handle: impl FnMut(u32, &[u8]),
+) {
     let mut records = 0u64;
-    let mut next = decode_first_record(stream, seg, &mut cursor);
-    let (route, route_us) = match seg.type_ {
-        SEGMENT_TYPE_RENDER => ("walk_records_render", "walk_render_us"),
-        SEGMENT_TYPE_BLIT => ("walk_records_blit", "walk_blit_us"),
-        SEGMENT_TYPE_COMPUTE => ("walk_records_compute", "walk_compute_us"),
-        _ => ("walk_records_other", "walk_other_us"),
+    let (route, route_us) = match kind {
+        SegmentKind::Render => ("walk_records_render", "walk_render_us"),
+        SegmentKind::Blit => ("walk_records_blit", "walk_blit_us"),
+        SegmentKind::Compute => ("walk_records_compute", "walk_compute_us"),
+        SegmentKind::Event | SegmentKind::Info => ("walk_records_other", "walk_other_us"),
     };
     // One clock pair per *segment*, not per record. A stream carries at most a
     // handful of segments and tens of thousands of records, so this splits
     // `exec_phase walk_us` by family for a cost that does not show up, where
     // per-record timing would cost more than the handlers it measured.
     let started = std::time::Instant::now();
-    loop {
+    let mut ops = reims_vgpu_wire::op::OpStream::new(commands);
+    let mut refusal = None;
+    for next in ops.by_ref() {
         match next {
-            Ok(rec) => {
+            Ok(op) => {
                 records += 1;
-                let start = rec.bytes_offset as usize;
-                handle(rec.opcode, &stream[start..start + rec.length as usize]);
-                next = decode_next_record(stream, seg, &mut cursor);
+                let start = op.offset;
+                handle(op.opcode(), &commands[start..start + op.length() as usize]);
             }
-            // `Done` is end-of-segment and yields `None` here, so the normal exit
-            // path stays silent; anything else names the check that refused.
-            Err(status) => {
-                crate::runtime::drain::note_store_route_n(route, records);
-                crate::runtime::drain::note_store_route_us(
-                    route_us,
-                    started.elapsed().as_micros() as u64,
-                );
-                if let Some(e) = crate::observe::Emit::refusal("stream_record_fail", &status) {
-                    // Latch per segment family: a guest re-submitting a malformed
-                    // stream sends it on every frame and the second line carries
-                    // nothing the first did not. Keying on the family still tells
-                    // a broken blit segment from a broken render one, which
-                    // keying on the reason alone would hide.
-                    e.field("seg", stream::segment_type_name(u32::from(seg.type_)))
-                        .field("seg_off", seg.offset)
-                        .field("seg_len", seg.length)
-                        .field("cursor", cursor)
-                        .fail_once(u64::from(seg.type_));
-                }
-                return;
+            // The iterator stops after yielding a refusal, so this is the last
+            // item and the loop ends with it.
+            Err(e) => refusal = Some(RecordFraming::from(e)),
+        }
+    }
+    crate::runtime::drain::note_store_route_n(route, records);
+    crate::runtime::drain::note_store_route_us(route_us, started.elapsed().as_micros() as u64);
+    if let Some(status) = refusal {
+        if let Some(e) = crate::observe::Emit::refusal("stream_record_fail", &status) {
+            // Latch per segment family: a guest re-submitting a malformed
+            // stream sends it on every frame and the second line carries
+            // nothing the first did not. Keying on the family still tells
+            // a broken blit segment from a broken render one, which
+            // keying on the reason alone would hide.
+            e.field("seg", kind.name())
+                .field("seg_cmd_off", commands_offset)
+                .field("seg_cmd_len", commands.len())
+                .field("cursor", ops.consumed())
+                .fail_once(u64::from(kind.wire_type()));
+        }
+    }
+}
+
+/// Why a segment's records stopped framing.
+///
+/// **The name is this device's; the fact is `reims_vgpu_wire`'s.** That crate
+/// has no dependencies on purpose, so it cannot carry a `Decline`, and the
+/// device is the layer that has to say which check stopped a walk. Everything
+/// numeric a reader needs is on the emitted line, so this is a name and not a
+/// second reading of the bytes.
+///
+/// The two length refusals the device's own framer had — "below its own header"
+/// and "past the segment's end" — are one variant here, because
+/// [`reims_vgpu_wire::op::op`] makes one check of both. Which of the two it was
+/// is still legible: `length` under eight is the first and `length` over
+/// `remaining` is the second, and both are on the line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordFraming {
+    ShortHeader {
+        need: usize,
+        have: usize,
+    },
+    BadLength {
+        opcode: u32,
+        length: u32,
+        remaining: usize,
+    },
+    /// Neither is reachable from a record walk — `op` views at offset zero of a
+    /// slice and counts nothing — and both are named rather than folded into a
+    /// catch-all, so a walk that started producing one would say so instead of
+    /// borrowing another check's name.
+    OutOfRange {
+        offset: usize,
+        len: usize,
+    },
+    CountOverflow {
+        count: usize,
+        elem: usize,
+    },
+}
+
+impl From<reims_vgpu_wire::WireError> for RecordFraming {
+    fn from(e: reims_vgpu_wire::WireError) -> Self {
+        use reims_vgpu_wire::WireError as W;
+        match e {
+            W::Short { need, have } => Self::ShortHeader { need, have },
+            W::BadLength {
+                opcode,
+                length,
+                remaining,
+            } => Self::BadLength {
+                opcode,
+                length,
+                remaining,
+            },
+            W::OutOfRange { offset, len } => Self::OutOfRange { offset, len },
+            W::CountOverflow { count, elem } => Self::CountOverflow { count, elem },
+        }
+    }
+}
+
+impl crate::observe::Refusal for RecordFraming {
+    fn refusal(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::ShortHeader { .. } => "stream_rec_short_header",
+            Self::BadLength { .. } => "stream_rec_bad_length",
+            Self::OutOfRange { .. } => "stream_rec_view_out_of_range",
+            Self::CountOverflow { .. } => "stream_rec_count_overflow",
+        })
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match *self {
+            Self::ShortHeader { need, have } => {
+                vec![("need", need.to_string()), ("have", have.to_string())]
+            }
+            Self::BadLength {
+                opcode,
+                length,
+                remaining,
+            } => vec![
+                ("opcode", format!("{opcode:#x}")),
+                ("length", length.to_string()),
+                ("remaining", remaining.to_string()),
+            ],
+            Self::OutOfRange { offset, len } => {
+                vec![("offset", offset.to_string()), ("len", len.to_string())]
+            }
+            Self::CountOverflow { count, elem } => {
+                vec![("count", count.to_string()), ("elem", elem.to_string())]
             }
         }
     }
@@ -997,44 +1087,77 @@ fn walk_stream<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &mut StreamAccum,
 ) {
-    let segs = match stream::iter_segments(stream) {
-        Ok(s) => s,
-        Err(status) => {
-            // The outermost frame in the crate. A stream that will not frame
-            // executes *nothing* — and until now that was indistinguishable from
-            // an idle guest: no records, no work, no line.
-            if let Some(e) = crate::observe::Emit::refusal("stream_frame_fail", &status) {
-                e.field("task", task_id)
-                    .field("bytes", stream.len())
-                    .fail_once(u64::from(task_id));
-            }
+    // The outermost frame in the crate, and it is
+    // `reims_vgpu_protocol::segment`'s. This device had its own segment framer
+    // whose per-segment index was found by re-walking the stream from zero — a
+    // quadratic scan over a stream a driven boot puts ninety-five thousand
+    // segments in. `SegmentStream` counts the index it already knows.
+    let mut segments = match SegmentStream::new(stream) {
+        Ok(segments) => segments,
+        Err(refusal) => {
+            // A stream that will not frame executes *nothing*, and that used to
+            // be indistinguishable from an idle guest: no records, no work, no
+            // line.
+            crate::observe::Emit::decline("stream_frame_fail", &refusal)
+                .field("task", task_id)
+                .field("bytes", stream.len())
+                .fail_once(u64::from(task_id));
             return;
         }
     };
-    for seg in segs {
-        if let Some(e) =
-            crate::observe::Emit::refusal("stream_segment", &stream::segment_disposition(seg.type_))
-        {
-            e.field("seg_type", seg.type_)
-                .field("seg_off", seg.offset)
-                .field("seg_len", seg.length)
-                .fail_once(u64::from(seg.type_));
-            continue;
-        }
-        match seg.type_ {
-            SEGMENT_TYPE_RENDER => {
-                walk_segment_records(stream, &seg, |op, cmd| {
+    for framed in segments.by_ref() {
+        let framed = match framed {
+            Ok(framed) => framed,
+            // **The iterator stops here, and every later segment goes
+            // unexecuted.** That is `reims_vgpu_protocol::segment`'s reading and
+            // it is stricter than the framer it replaces, which reported an
+            // unknown segment type and then walked on to the next one. Its
+            // reason is on `FramingRefusal::UnknownType`: a family whose record
+            // framing is unknown can be skipped only on its declared length,
+            // and skipping on that hands the following segment an encoder state
+            // derived from bytes nothing here understands. The reference host
+            // rejects a non-continuation type it has no decoder for rather than
+            // stepping over it.
+            Err(refusal) => {
+                crate::observe::Emit::decline("stream_frame_fail", &refusal)
+                    .field("task", task_id)
+                    .field("bytes", stream.len())
+                    .field("segments_before", segments.segments())
+                    .fail_once(u64::from(task_id));
+                return;
+            }
+        };
+        let (kind, commands) = match framed.body {
+            SegmentBody::Encoder { kind, commands } => (kind, commands),
+            // `-beginSegment:protectionOptions:` emits a segment-level envelope
+            // before the real segment, and skipping it is contract-correct — so
+            // it is control flow and stays silent, where a line would land in
+            // the sink on every healthy frame that carries one. This device
+            // implements no protection domain, so nothing acts on the value;
+            // that it is *read* rather than stepped over is what lets that
+            // sentence be a choice rather than a limitation.
+            SegmentBody::ProtectionEnvelope { .. } => continue,
+        };
+        // The encoder-lifetime census, counted once per segment. The two
+        // pre-scans on the Vulkan rail used to walk the same stream through the
+        // same framer, so every segment of every stream was counted three times
+        // on that rail and the reading was a rail-dependent multiple of the
+        // truth.
+        crate::runtime::drain::note_store_route(segment_chain_route(framed.lifetime));
+        match kind {
+            SegmentKind::Render => {
+                walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
                     handle_render_record(state, host, task_id, op, cmd, out, acc)
                 });
             }
-            SEGMENT_TYPE_BLIT => {
-                walk_segment_records(stream, &seg, |op, cmd| {
+            SegmentKind::Blit => {
+                walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
                     handle_blit_record(state, host, task_id, op, cmd)
                 });
             }
-            SEGMENT_TYPE_COMPUTE => {
+            SegmentKind::Compute => {
                 let mut compute = crate::runtime::compute_session::ComputeSegment::default();
-                walk_segment_records(stream, &seg, |op, cmd| {
+                walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
                     handle_compute_record(state, host, task_id, op, cmd, out, &mut compute)
                 });
                 if let Some(st) = crate::runtime::compute_session::finish_session(
@@ -1055,21 +1178,45 @@ fn walk_stream<M: HostMemory + HostOps>(
                     }
                 }
             }
-            SEGMENT_TYPE_EVENT => {
-                walk_segment_records(stream, &seg, |_op, cmd| {
+            SegmentKind::Event => {
+                walk_segment_records(kind, framed.commands_offset, commands, |_op, cmd| {
                     handle_event_record(state, task_id, cmd)
                 });
             }
-            SEGMENT_TYPE_INFO => {
-                walk_segment_records(stream, &seg, |op, cmd| {
+            SegmentKind::Info => {
+                walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
                     handle_info_record(state, host, task_id, op, cmd)
                 });
             }
-            // Unreachable: `segment_disposition` already answered `Walk` for
-            // exactly the five families above, and `continue`d on the rest.
-            _ => {}
         }
     }
+}
+
+/// Every census route [`segment_chain_route`] can answer, in the order
+/// `(continues_previous, continues_into_next)` counts up.
+///
+/// Exported so a reading is over a named set rather than over whichever names a
+/// grep of the log happened to find, and so the four cannot be spelled twice.
+pub const SEGMENT_CHAIN_ROUTES: [&str; 4] = [
+    "seg_chain_none",
+    "seg_chain_next",
+    "seg_chain_prev",
+    "seg_chain_both",
+];
+
+/// Which of [`SEGMENT_CHAIN_ROUTES`] a segment's encoder lifetime selects.
+///
+/// Takes the [`SegmentLifetime`] rather than two bytes side by side. The edge is
+/// recorded from both ends of it — the serializer writes the `beginSegment:`
+/// `BOOL` into the header it opens and reaches back to mark the preceding one —
+/// so a caller handed the two halves separately could carry one and drop the
+/// other. The `!= 0` reading of each byte is the protocol crate's and is not
+/// repeated here.
+#[must_use]
+pub fn segment_chain_route(lifetime: SegmentLifetime) -> &'static str {
+    let index =
+        usize::from(lifetime.continues_previous) << 1 | usize::from(lifetime.continues_into_next);
+    SEGMENT_CHAIN_ROUTES[index]
 }
 
 fn handle_info_record<M: HostMemory + HostOps>(
