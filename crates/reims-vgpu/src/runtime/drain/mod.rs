@@ -2448,9 +2448,16 @@ fn process_root_packet<H: HostMemory + HostOps>(
             }
             let bit = 1u32 << ch;
             match transition {
-                control::ChannelTransition::Open => state.active_child_mask |= bit,
+                control::ChannelTransition::Open => {
+                    state.active_child_mask |= bit;
+                    // The observation half. See the field's own doc: this is the
+                    // only writer of it, because a definition packet is the only
+                    // event the model's `open_channels` has.
+                    state.channels_defined_by_packet |= bit;
+                }
                 control::ChannelTransition::Free => {
                     state.active_child_mask &= !bit;
+                    state.channels_defined_by_packet &= !bit;
                     // Only a free clears it: an open is not a claim that
                     // nothing is pending on the channel, and clearing it
                     // there would drop a drain the guest is owed.
@@ -4290,12 +4297,63 @@ fn is_retired_control_slot(opcode: u16) -> bool {
     ControlKind::of(WireChannel::Child, opcode) == Some(ControlKind::RetiredSlot)
 }
 
+/// Whether a packet's own domain was opened by a channel definition, which is
+/// the gate the replacement model applies and this device does not.
+///
+/// # The question this exists to answer, and why a reading cannot
+///
+/// `reims_vgpu_core::session::SessionModel::admit` refuses any packet whose
+/// domain is not in `open_channels`, and `open_channels` has exactly one event:
+/// `ControlOp::Channel { transition: Open }`. This device has three events that
+/// make a child domain live — that packet, the locked `GFX_REG_CHILD_DOORBELL`
+/// write in `crate::runtime::mmio`, and the lock-free ring
+/// [`fold_rung_child_doorbells`] folds in — and two of them say nothing about a
+/// definition. `DeviceState::active_child_mask` is the union, so it cannot tell
+/// the three apart after the fact.
+///
+/// That difference decides whether channel lifetime can be the first group to
+/// cut over. If this guest ever puts work on a domain it never defined, the
+/// model's gate turns every packet on that domain into a typed refusal — which
+/// is a hang that names itself, and still a hang. If it never does, the gate is
+/// a restatement of what this device already requires and the group can move.
+///
+/// # It selects nothing
+///
+/// The disposition is unchanged either way. This reads a mask no behaviour
+/// consults and writes two routes, which is what
+/// `crates/reims-vgpu-observe` is for: it describes the decision the model
+/// *would* make, on a device that is not making it.
+///
+/// `child_packet_domain_defined` is the denominator's other half — without it a
+/// boot where every packet's domain was defined and a boot where the guest sent
+/// no child packets at all read the same.
+fn note_packet_domain_definition(state: &DeviceState, channel_id: u32, opcode: u16) {
+    let defined = state.channels_defined_by_packet & (1u32 << channel_id) != 0;
+    if defined {
+        note_store_route("child_packet_domain_defined");
+        return;
+    }
+    note_store_route("child_packet_domain_undefined");
+    if crate::observe::first_sight(
+        "child_packet_domain_undefined",
+        u64::from(channel_id) << 32 | u64::from(opcode),
+    ) {
+        crate::observe::fail(format!(
+            "child_packet_domain_undefined channel={channel_id} op={opcode:#x} (this domain \
+             was made live by a doorbell and never by a channel definition, so the \
+             replacement model would refuse every packet on it — the definition is the \
+             only event its open-channel set has)"
+        ));
+    }
+}
+
 fn process_child_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     channel_id: u32,
     packet: &Packet,
 ) -> ChildPacketDisposition {
+    note_packet_domain_definition(state, channel_id, packet.opcode);
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
             apply_define_task2(state, host, &packet.payload, Some(channel_id));

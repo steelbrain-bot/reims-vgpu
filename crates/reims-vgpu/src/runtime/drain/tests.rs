@@ -1231,6 +1231,108 @@ fn a_channel_lifetime_outside_the_channel_range_is_reported() {
     }
 }
 
+/// A doorbell makes a domain live and a definition makes it *defined*, and the
+/// census tells the two apart on a device where one mask holds both.
+///
+/// The distinction is the whole reason the field exists. `SessionModel::admit`
+/// gates on the definition alone, so a boot that put work on doorbell-only
+/// domains would be a boot the first group's cutover hangs. `active_child_mask`
+/// is the union of three events and cannot answer that after the fact.
+#[test]
+fn a_packet_on_a_doorbell_only_domain_is_told_apart_from_one_on_a_defined_domain() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let channel = 1u32;
+    let bit = 1u32 << channel;
+
+    // The lock-free ring: the domain becomes live with no definition anywhere.
+    state
+        .gfx
+        .child_doorbell_rung
+        .store(bit, std::sync::atomic::Ordering::Release);
+    crate::runtime::drain::fold_rung_child_doorbells(&mut state);
+    assert_eq!(
+        state.active_child_mask & bit,
+        bit,
+        "a ring makes the domain drainable"
+    );
+    assert_eq!(
+        state.channels_defined_by_packet & bit,
+        0,
+        "and says nothing about a definition"
+    );
+
+    let defined = store_route_count("child_packet_domain_defined");
+    let undefined = store_route_count("child_packet_domain_undefined");
+    let nop = Packet {
+        opcode: CHILD_OP_NOP,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN,
+        completion_stamp: 0,
+        payload: Vec::new(),
+        next_head: 0,
+    };
+    let _ = process_child_packet(&mut state, &mut host, channel, &nop);
+    assert_eq!(
+        (
+            store_route_count("child_packet_domain_defined"),
+            store_route_count("child_packet_domain_undefined"),
+        ),
+        (defined, undefined + 1),
+        "the model would have refused this packet, and the census says so"
+    );
+
+    // Now the definition packet for the same domain.
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEFINE_FIFO,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 4,
+            completion_stamp: 0,
+            payload: channel.to_le_bytes().to_vec(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        state.channels_defined_by_packet & bit,
+        bit,
+        "a definition is the one event the model's open-channel set has"
+    );
+    let _ = process_child_packet(&mut state, &mut host, channel, &nop);
+    assert_eq!(
+        (
+            store_route_count("child_packet_domain_defined"),
+            store_route_count("child_packet_domain_undefined"),
+        ),
+        (defined + 1, undefined + 1),
+        "and now the same packet on the same domain is one the model admits"
+    );
+
+    // A free takes the definition back, because the model's set has that event
+    // too: a domain whose positions have drained stops being nameable.
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_FREE_FIFO,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 4,
+            completion_stamp: 0,
+            payload: channel.to_le_bytes().to_vec(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        state.channels_defined_by_packet & bit,
+        0,
+        "a free is not a definition that stands"
+    );
+}
+
 /// FIFO redefine/free retires scheduler ownership so a removed producer
 /// cannot strand later display transactions behind a stale bit.
 #[test]

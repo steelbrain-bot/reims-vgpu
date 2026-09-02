@@ -2642,6 +2642,24 @@ pub struct DeviceState {
     pub gfx: GfxRegs,
     pub iosfc: IosfcRegs,
     pub active_child_mask: u32,
+    /// Which child domains a `CmdDefineChannel` packet has opened, as a mask.
+    ///
+    /// **An observation, not a gate.** Nothing on this device reads it to decide
+    /// anything; [`Self::active_child_mask`] remains the whole of what makes a
+    /// FIFO drainable. It exists because
+    /// `reims_vgpu_core::session::SessionModel::admit` refuses any packet whose
+    /// domain is not in the set a channel *definition* opened, and this device
+    /// has three ways a domain becomes active — the definition packet, a locked
+    /// doorbell register write, and a lock-free doorbell ring folded in later.
+    /// Two of the three say nothing about a definition.
+    ///
+    /// So "would the model have refused this packet" is not answerable from
+    /// `active_child_mask`, and the answer decides whether channel lifetime can
+    /// be the first group to cut over: a guest that rings a doorbell on a domain
+    /// it never defined would, under the model's gate, have every packet on that
+    /// domain refused — a hang with a typed reason, which is still a hang.
+    /// `crate::runtime::drain::note_packet_domain_definition` is the reader.
+    pub channels_defined_by_packet: u32,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
     /// immutable AIR translation is still loading. The packet head and stamp
     /// remain untouched until retry, so this is scheduler state rather than a
@@ -3123,6 +3141,7 @@ impl DeviceState {
             iosfc: IosfcRegs::default(),
             gva_store_witness: Default::default(),
             active_child_mask: 0,
+            channels_defined_by_packet: 0,
             translation_deferred_mask: 0,
             stamp_deferred_mask: 0,
             translation_order_hold_mask: 0,
