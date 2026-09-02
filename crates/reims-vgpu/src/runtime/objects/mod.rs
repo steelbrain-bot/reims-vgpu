@@ -1842,6 +1842,13 @@ fn note_backing_window_alias<M: HostMemory>(
         state.take_backing_window(task_id, obj_ref, base);
         return None;
     }
+    // Recorded before the reporting gate, and on every sighting rather than the
+    // first. The hot paths that ask `DeviceState::reference_is_aliased` are
+    // only as sharp as this set is early and complete, and construction is the
+    // earliest moment either name exists — a payment for a reference the set
+    // has not heard of yet is a payment the alarm cannot examine.
+    state.note_aliased_reference(task_id, obj_ref);
+    state.note_aliased_reference(task_id, holder);
     if !crate::observe::first_sight("backing_window_alias", (u64::from(task_id) << 40) ^ base) {
         return Some(holder);
     }
