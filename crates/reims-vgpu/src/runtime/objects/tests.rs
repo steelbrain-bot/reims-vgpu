@@ -2836,3 +2836,156 @@ fn a_window_whose_holder_the_guest_freed_is_not_an_alias() {
         "the live reference took the window when the dead holder lost it"
     );
 }
+
+/// A re-point drops the host copies of every reference over the window, not
+/// only of the reference the packet names.
+///
+/// Both host caches are keyed `(task, reference)`, and a driven macos-15 boot
+/// found the compositor holding its 1920×1080 scanout allocation under **two**
+/// live references at once. Dropping only the named one leaves the other
+/// serving a texture built from pages the packet has just said are different
+/// pages — a wrong surface with no refusal anywhere, on the one buffer this
+/// device re-points.
+///
+/// Fails without the fix: the peer's copy survives the packet.
+#[test]
+fn a_repoint_drops_every_reference_over_the_window_it_moved() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, named, peer, elsewhere) = (1u32, 2u32, 3u32, 4u32);
+
+    let write_object = |host: &mut FakeHost, ref_: u32, desc_gva: u64, handle: u64| {
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+        desc[8..16].copy_from_slice(&handle.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + desc_gva, &desc);
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+    // Two references over one allocation, and a third over another so the
+    // sweep is shown to be selective rather than a task-wide flush.
+    write_object(&mut host, named, 0x100, 0x20);
+    write_object(&mut host, peer, 0x120, 0x20);
+    write_object(&mut host, elsewhere, 0x140, 0x30);
+
+    let surface = |fill: u8| crate::model::HostSurface {
+        width: 4,
+        height: 4,
+        bgra: std::sync::Arc::new(vec![fill; 4 * 4 * 4]),
+        host_gen: 1,
+        producer_object_type: 0,
+        last_touch: 0,
+        backing: None,
+        guest_holds_bytes: false,
+        source_gva: 0,
+    };
+    for (ref_, fill) in [(named, 0xAAu8), (peer, 0xBB), (elsewhere, 0xCC)] {
+        state
+            .host_texture_surfaces
+            .insert((task, ref_), surface(fill));
+    }
+
+    super::replace_physical(&mut state, &mut host, task, named);
+
+    assert!(
+        !state.host_texture_surfaces.contains_key(&(task, named)),
+        "the named reference's copy was read from pages the guest has re-pointed"
+    );
+    assert!(
+        !state.host_texture_surfaces.contains_key(&(task, peer)),
+        "the second reference over the same allocation kept a copy of the pages \
+         the packet says have already changed, and every later bind of it would \
+         have been served them"
+    );
+    assert!(
+        state.host_texture_surfaces.contains_key(&(task, elsewhere)),
+        "a reference over a different allocation was not re-pointed, and a sweep \
+         that dropped it would turn one packet into a task-wide cache flush"
+    );
+}
+
+/// A guest object reference becomes a canonical backing identity, or a refusal
+/// that says which contract term is missing.
+///
+/// Two references over one allocation get **one** identity — that is what the
+/// dependency compiler draws its hazard edges on, and what a name-derived id
+/// gets wrong in the direction that drops the edge. A re-point gives the same
+/// window a **different** identity, because the pages changed and work already
+/// accepted must keep the old ones.
+#[test]
+fn one_allocation_has_one_identity_and_a_repoint_gives_it_another() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, named, peer, elsewhere) = (1u32, 2u32, 3u32, 4u32);
+
+    let write_object = |host: &mut FakeHost, ref_: u32, desc_gva: u64, handle: u64| {
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+        desc[8..16].copy_from_slice(&handle.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + desc_gva, &desc);
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+    write_object(&mut host, named, 0x100, 0x20);
+    write_object(&mut host, peer, 0x120, 0x20);
+    write_object(&mut host, elsewhere, 0x140, 0x30);
+
+    let id = |state: &DeviceState, host: &FakeHost, ref_: u32| {
+        super::backing_id(state, host, task, ref_).expect("a buffer names an allocation")
+    };
+    let before = id(&state, &host, named);
+    assert_eq!(
+        id(&state, &host, peer),
+        before,
+        "two references over one allocation are one backing, and an identity \
+         that told them apart would drop the hazard edge between them"
+    );
+    assert_ne!(
+        id(&state, &host, elsewhere),
+        before,
+        "a different allocation is different storage"
+    );
+    assert_eq!(
+        id(&state, &host, named),
+        before,
+        "asking twice is not an event, and an identity that moved when it was \
+         read would never compare equal to itself"
+    );
+
+    super::replace_physical(&mut state, &mut host, task, named);
+    let after = id(&state, &host, named);
+    assert_ne!(
+        after, before,
+        "the packet says these are different pages, and an equal identity would \
+         let a claim on the old ones be satisfied by the new"
+    );
+    assert_eq!(
+        id(&state, &host, peer),
+        after,
+        "the second name over the window moved with it"
+    );
+
+    // The mapper-ref texture the fixture lists at reference 1 reaches its
+    // storage through a mapping, which has its own counter and its own
+    // resolver. Answering it here with an address-derived number would be a
+    // plausible answer to a question this function is not asked.
+    assert_eq!(
+        super::backing_id(&state, &host, task, 1),
+        Err(super::BackingIdRefusal::NamedByMapping { object_type: 11 }),
+        "storage reached through a mapping is refused by name, not guessed at"
+    );
+}

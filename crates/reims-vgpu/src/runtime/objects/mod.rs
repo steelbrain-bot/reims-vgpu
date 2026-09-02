@@ -2672,7 +2672,10 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     // reference names now. A reference this device never constructed has only
     // the second.
     match repointed_window(state, host, task_id, object_id) {
-        Some(base) => state.bump_storage_incarnation(task_id, base),
+        Some(base) => {
+            state.bump_storage_incarnation(task_id, base);
+            invalidate_window_peers(state, host, task_id, object_id, base);
+        }
         // No window. That is only a loss for storage this device reaches *by
         // address*: an object that owns a mapping carries its incarnation in
         // that mapping's generation instead, which the arm below moves, and
@@ -2934,6 +2937,201 @@ pub enum HeapReference {
         object_type: u8,
         descriptor_length: u32,
     },
+}
+
+/// Why a guest object reference has no canonical backing identity.
+///
+/// Every variant is a contract term this device does not have, named rather
+/// than guessed. `reims_vgpu_core::access::BackingId`'s own doc says why the
+/// guess is not available: an identity that is wrong in the equal direction
+/// hands storage back under a live reader, and one that is wrong in the
+/// distinct direction drops a hazard edge. Neither failure has a symptom at
+/// the point it is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackingIdRefusal {
+    /// The reference names nothing in the task's object list, or its
+    /// descriptor did not read.
+    Unresolved(LadderRung),
+    /// The object reaches its storage through a mapping rather than by an
+    /// address in its task — a mapper-ref texture, a dual-plane texture, an
+    /// IOSurface backing.
+    ///
+    /// Not a gap: that storage has an identity, and it is the mapping's, which
+    /// `reims_vgpu_core::resolve::MappingResolver` asks for and this function
+    /// deliberately does not answer. A resolver that answered both from one
+    /// method would let a caller ask the wrong question and get a plausible
+    /// number, which is the same reason the two traits are separate.
+    NamedByMapping { object_type: u8 },
+    /// The object is placed inside a heap, and a heap's extent is unrecovered.
+    ///
+    /// A placement names a heap reference and an offset. The heap's identity is
+    /// settled — it is an object-list object like any other — but without its
+    /// *length* nothing can say which two offsets in it overlap, so two
+    /// placements sharing bytes would come out distinct. That is a dropped
+    /// hazard edge, so the identity is refused until the extent is recovered.
+    HeapPlaced,
+    /// The object names no storage at all: a function, a serializer object, a
+    /// texture view over another object's bytes.
+    NamesNoStorage { object_type: u8 },
+}
+
+impl BackingIdRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Unresolved(_) => "backing_id_unresolved",
+            Self::NamedByMapping { .. } => "backing_id_named_by_mapping",
+            Self::HeapPlaced => "backing_id_heap_placed",
+            Self::NamesNoStorage { .. } => "backing_id_names_no_storage",
+        }
+    }
+}
+
+/// The canonical backing identity of the storage a guest object reference
+/// names.
+///
+/// # What makes this the identity and not a name
+///
+/// `reims_vgpu_core::access::BackingId` is what two resources sharing backing
+/// must share, and the dependency compiler draws its hazard edges on it. So it
+/// is derived from *where the storage is* and never from what it is called: two
+/// references over one allocation arrive here at one number — which a driven
+/// boot proved is not hypothetical, the compositor holds its scanout buffer
+/// under two — and one reference across a physical replacement arrives at two,
+/// because the pages changed.
+///
+/// The window is the allocation's, not the texel base's, so two textures placed
+/// at different offsets in one allocation are one backing with two extents.
+/// The extent is `reims_vgpu_core::access::ByteRange`'s and is not asked here.
+///
+/// # Errors
+///
+/// [`BackingIdRefusal`], one variant per contract term this device does not
+/// have for the reference. None of them is a failure to try harder.
+pub fn backing_id<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+) -> Result<reims_vgpu_core::access::BackingId, BackingIdRefusal> {
+    let entry = lookup_list_entry(state, host, task_id, obj_ref)
+        .ok_or(BackingIdRefusal::Unresolved(LadderRung::NoListEntry))?;
+    let descriptor = read_descriptor(state, host, task_id, &entry).ok_or(
+        BackingIdRefusal::Unresolved(LadderRung::DescRead {
+            declared_len: entry.descriptor_length,
+        }),
+    )?;
+    match backing_window(state.page_shift, &entry, &descriptor) {
+        Some((base, _)) => Ok(state.backing_identity(task_id, base)),
+        // The two address-named types are the only ones `backing_window`
+        // answers for, so everything else is one of the three refusals — and
+        // which one it is says what would have to land for it to stop being a
+        // refusal, which is the reason they are not one variant.
+        None => Err(backing_id_refusal(&entry, &descriptor)),
+    }
+}
+
+/// Which of the three "no window" answers this object is.
+///
+/// Split from [`backing_id`] so the classification is exhaustive over the
+/// object types the resource constructor accepts, rather than a fallthrough
+/// from a decode that happened not to produce a window.
+fn backing_id_refusal(entry: &ListObjectEntry, descriptor: &[u8]) -> BackingIdRefusal {
+    use crate::runtime::decode::resource::{
+        texture_view_opcode, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
+        OBJECT_TYPE_DUAL_PLANE_TEXTURE,
+    };
+    match entry.object_type {
+        OBJECT_TYPE_MAPPER_REF_TEXTURE | OBJECT_TYPE_DUAL_PLANE_TEXTURE => {
+            BackingIdRefusal::NamedByMapping {
+                object_type: entry.object_type,
+            }
+        }
+        // A texture whose descriptor is a heap placement, which is a record at
+        // its own opcode rather than an object type of its own -- the placement
+        // is how a texture is made, not what kind of object it is.
+        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
+            if matches!(
+                texture_view_opcode(descriptor),
+                Some(HEAP_TEXTURE_OPCODE) | Some(HEAP_TEXTURE_WIDE_OPCODE)
+            ) =>
+        {
+            BackingIdRefusal::HeapPlaced
+        }
+        // A texture or buffer that produced no window has a descriptor the
+        // guest has not finished writing -- a zero handle or a zero allocation
+        // size. That is the ladder's `DescRead` in substance: the bytes are
+        // there and they do not yet name an allocation.
+        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS | OBJECT_TYPE_BUFFER => {
+            BackingIdRefusal::Unresolved(LadderRung::DescRead {
+                declared_len: entry.descriptor_length,
+            })
+        }
+        other => BackingIdRefusal::NamesNoStorage { object_type: other },
+    }
+}
+
+/// Drop the host copies held under *every other* reference over the re-pointed
+/// window.
+///
+/// # The defect this closes
+///
+/// A re-point invalidated the host copies keyed by the reference its packet
+/// named, on the reading that a reference is a resource and a resource has one
+/// set of copies. Both host caches are keyed `(task, reference)`, so a second
+/// reference over the same allocation kept its texture — built from pages the
+/// packet has just said are different pages, and served to every later draw
+/// that binds it. That is a wrong surface with no refusal anywhere, which is
+/// the failure the whole window derivation exists to prevent, reached through
+/// the cache rather than through the identity.
+///
+/// It is not hypothetical: `note_backing_window_alias` found the compositor
+/// holding its 1920×1080 scanout allocation under two live references, and the
+/// scanout buffer is the one this device re-points.
+///
+/// # Why the peers are found by walking the caches
+///
+/// The set that matters is the set that *has* a copy to drop, and that is
+/// exactly the keys in the two caches. It is small — a host copy per bound
+/// resource, not per reference the guest published — and it needs no index
+/// this device would then have to keep true. A window→references map would be
+/// a third thing to invalidate on every lifetime event, and the events it
+/// would have to see include the one no packet announces.
+fn invalidate_window_peers<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    named: u32,
+    base: u64,
+) {
+    let peers: Vec<u32> = state
+        .host_texture_surfaces
+        .keys()
+        .chain(state.host_linear_textures.keys())
+        .filter(|&&(task, ref_)| task == task_id && ref_ != named)
+        .map(|&(_, ref_)| ref_)
+        .collect();
+    for peer in peers {
+        if repointed_window(state, host, task_id, peer) != Some(base) {
+            continue;
+        }
+        let (texture, linear) = state.invalidate_object_host_copies(task_id, peer);
+        if texture || linear {
+            crate::runtime::drain::note_store_route("replace_physical_window_peer_dropped");
+            if crate::observe::first_sight(
+                "replace_physical_window_peer",
+                u64::from(task_id) << 32 | u64::from(peer),
+            ) {
+                crate::observe::fail(format!(
+                    "replace_physical_window_peer task={task_id} named={named} peer={peer} \
+                     base={base:#x} tex={texture} lin={linear} (a second reference over the \
+                     re-pointed window was holding a host copy built from the pages the \
+                     packet says have already changed, and every later bind of it would \
+                     have been served those pages)"
+                ));
+            }
+        }
+    }
 }
 
 /// The guest-VA window a re-point packet's reference names.

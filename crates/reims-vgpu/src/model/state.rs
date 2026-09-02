@@ -4,6 +4,7 @@ use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
 use crate::runtime::decode::resource::{
     DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry, SamplerDescriptor,
 };
+use reims_vgpu_core::access::BackingId;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -802,12 +803,55 @@ impl TaskResources {
 ///
 /// Behind a lock for the reason [`TaskResources`] is: the claim is made on the
 /// resolve path, which holds [`DeviceState`] shared.
-#[derive(Default)]
-pub struct BackingWindowRefs(Mutex<BTreeMap<(u32, u64), u32>>);
+pub struct BackingWindowRefs {
+    windows: Mutex<BTreeMap<(u32, u64), WindowFacts>>,
+    /// The next dense backing identity to hand out.
+    ///
+    /// Monotone and never reused, which is the whole of what makes an id an
+    /// identity: two windows that are different storage must not be able to
+    /// arrive at one number, and a counter that wrapped or recycled could.
+    /// A `u64` at one per re-point does not run out.
+    next_id: Mutex<u64>,
+}
+
+/// What this device knows about one guest-VA window in one task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowFacts {
+    /// The reference that first constructed an object over this window.
+    ///
+    /// `None` when the entry was created by an identity lookup rather than by
+    /// a construction. The two reach this table by different paths and a
+    /// placeholder reference number would be reported as a live claimant by
+    /// the alias reading, which is a finding about nobody.
+    first_ref: Option<u32>,
+    /// The incarnation [`Self::id`] was minted for.
+    ///
+    /// The entry holds one identity, not a history: when the pages behind the
+    /// window are replaced, the *current* id becomes a new one and the previous
+    /// one stops being mintable — which is right, because nothing needs to mint
+    /// an old identity. Work planned against it holds it already, in its own
+    /// claim, and that is what keeps the old storage alive. Keeping a history
+    /// here would make the table grow with the boot instead of with the live
+    /// namespace, for entries no caller could ever ask for.
+    incarnation: StorageIncarnation,
+    /// The canonical backing identity of this window at that incarnation.
+    id: u64,
+}
+
+impl Default for BackingWindowRefs {
+    fn default() -> Self {
+        Self {
+            windows: Mutex::new(BTreeMap::new()),
+            // Zero is never handed out, so a zeroed structure cannot read as a
+            // valid identity -- the same rule `SlotGeneration` follows.
+            next_id: Mutex::new(1),
+        }
+    }
+}
 
 impl std::fmt::Debug for BackingWindowRefs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let claims = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let claims = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("BackingWindowRefs")
             .field("windows", &claims.len())
             .finish()
@@ -815,33 +859,90 @@ impl std::fmt::Debug for BackingWindowRefs {
 }
 
 impl BackingWindowRefs {
-    fn claim(&self, task_id: u32, ref_: u32, base: u64) -> Option<u32> {
+    /// Reserve an identity for a window this device has not seen before.
+    ///
+    /// Split from the insert so the counter is never advanced under the
+    /// windows lock, and so a lookup that finds a current entry does not touch
+    /// it at all.
+    fn mint(&self) -> u64 {
+        let mut next = self.next_id.lock().unwrap_or_else(|e| e.into_inner());
+        let id = *next;
+        *next += 1;
+        id
+    }
+
+    fn claim(
+        &self,
+        task_id: u32,
+        ref_: u32,
+        base: u64,
+        incarnation: StorageIncarnation,
+    ) -> Option<u32> {
+        let fresh = WindowFacts {
+            first_ref: Some(ref_),
+            incarnation,
+            id: 0,
+        };
         match self
-            .0
+            .windows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry((task_id, base))
         {
             std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(ref_);
+                slot.insert(fresh);
                 None
             }
-            std::collections::btree_map::Entry::Occupied(slot) => {
-                let holder = *slot.get();
-                (holder != ref_).then_some(holder)
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                match slot.get().first_ref {
+                    // Created by an identity lookup, so no construction has
+                    // claimed it. This one is the first.
+                    None => {
+                        slot.get_mut().first_ref = Some(ref_);
+                        None
+                    }
+                    Some(holder) => (holder != ref_).then_some(holder),
+                }
             }
         }
     }
 
-    fn take(&self, task_id: u32, ref_: u32, base: u64) {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((task_id, base), ref_);
+    fn take(&self, task_id: u32, ref_: u32, base: u64, incarnation: StorageIncarnation) {
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        windows
+            .entry((task_id, base))
+            .and_modify(|facts| facts.first_ref = Some(ref_))
+            .or_insert(WindowFacts {
+                first_ref: Some(ref_),
+                incarnation,
+                id: 0,
+            });
+    }
+
+    /// The identity of this window at this incarnation, minting one if the
+    /// window is new or its pages have been replaced since it was last asked.
+    fn identity(&self, task_id: u32, base: u64, incarnation: StorageIncarnation) -> u64 {
+        // Minted outside the windows lock, and discarded unspent when the entry
+        // turns out to be current. An identity is never reused, so an unspent
+        // one is a gap in the sequence and not a hazard -- the invariant is
+        // that two different pieces of storage never share a number, not that
+        // every number is used.
+        let candidate = self.mint();
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let facts = windows.entry((task_id, base)).or_insert(WindowFacts {
+            first_ref: None,
+            incarnation,
+            id: 0,
+        });
+        if facts.id == 0 || facts.incarnation != incarnation {
+            facts.incarnation = incarnation;
+            facts.id = candidate;
+        }
+        facts.id
     }
 
     fn delete_task(&self, task_id: u32) {
-        self.0
+        self.windows
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|&(t, _), _| t != task_id);
@@ -3612,7 +3713,34 @@ impl DeviceState {
     /// lock, and the claim is published under the same race the register there
     /// resolves: first writer wins and every later reader sees that one.
     pub fn claim_backing_window(&self, task_id: u32, ref_: u32, base: u64) -> Option<u32> {
-        self.backing_window_refs.claim(task_id, ref_, base)
+        self.backing_window_refs
+            .claim(task_id, ref_, base, self.storage_incarnation(task_id, base))
+    }
+
+    /// The canonical identity of the storage behind a guest-VA window in this
+    /// task, right now.
+    ///
+    /// This is what `reims_vgpu_core::access::BackingId` is: two resources over
+    /// one piece of storage get one number, and a re-point gives the same
+    /// window a different one because it is different storage. It is interned
+    /// rather than computed, because the three things that decide it — a
+    /// task, a 64-bit address and an incarnation pair — do not fit in the
+    /// `u64` the identity is, and a hash of them would trade a guaranteed
+    /// distinction for a probable one. False equality here hands storage back
+    /// under a live reader.
+    ///
+    /// The table holds one entry per live window and is cleared with the task,
+    /// so it is bounded by the namespace and not by how long the device has
+    /// run. A replaced incarnation does not accumulate: the entry moves to the
+    /// new identity and the old one stops being mintable, which is correct
+    /// because nothing mints an identity it already holds.
+    #[must_use]
+    pub fn backing_identity(&self, task_id: u32, base: u64) -> BackingId {
+        BackingId(self.backing_window_refs.identity(
+            task_id,
+            base,
+            self.storage_incarnation(task_id, base),
+        ))
     }
 
     /// Move a window's claim to `ref_`, for a holder the guest's own list no
@@ -3625,7 +3753,8 @@ impl DeviceState {
     /// window") true, and stops the next claimant being compared against a
     /// reference that has been gone for a thousand frames.
     pub fn take_backing_window(&self, task_id: u32, ref_: u32, base: u64) {
-        self.backing_window_refs.take(task_id, ref_, base);
+        self.backing_window_refs
+            .take(task_id, ref_, base, self.storage_incarnation(task_id, base));
     }
 
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).
