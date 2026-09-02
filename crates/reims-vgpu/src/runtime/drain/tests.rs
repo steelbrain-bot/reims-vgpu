@@ -6488,6 +6488,84 @@ fn a_delete_object_counts_the_kind_its_record_names() {
     );
 }
 
+/// A fence delete says whether its ref names a fence this device holds
+/// generations for, which is the question of whether two reference spaces are
+/// one.
+///
+/// The consequence if they are: `fence_generations` outlives the delete, and a
+/// guest that reuses the ref gets a fence that is already signalled — the first
+/// wait on the new object passes without the work behind it. The consequence if
+/// they are not: retiring on this ref would clear a live fence that happened to
+/// share the integer, which is the failure the object table's own boot measured.
+/// Neither is assumed here; the arm counts and does nothing.
+#[test]
+fn a_fence_delete_says_whether_its_ref_names_a_fence_this_device_holds() {
+    use crate::model::FENCE_DOMAIN_BLIT;
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::destroy::{DELETE_TOTAL_LEN, OPCODE_DELETE_FENCE};
+
+    let mut host = FakeHost::new();
+    let destroy_packet = |object_ref: u32| {
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 2);
+        st32(&mut payload[4..], OPCODE_DELETE_FENCE);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], object_ref);
+        Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    state.define_task(2, 0x2000, 9);
+
+    let live = store_route_count("delete_fence_ref_live");
+    let absent = store_route_count("delete_fence_ref_absent");
+
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(40));
+    assert_eq!(
+        (
+            store_route_count("delete_fence_ref_live"),
+            store_route_count("delete_fence_ref_absent"),
+        ),
+        (live, absent + 1),
+        "no generation is held for this ref, so the delete names nothing here"
+    );
+
+    // Now the same ref, with a generation this device stored under it.
+    state.set_fence_generation(2, FENCE_DOMAIN_BLIT, 40, 3);
+    let domains = store_route_count("delete_fence_ref_live_domains");
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(40));
+    assert_eq!(
+        (
+            store_route_count("delete_fence_ref_live"),
+            store_route_count("delete_fence_ref_absent"),
+        ),
+        (live + 1, absent + 1),
+        "and now it names one, which is the reading that would justify retiring it"
+    );
+    assert_eq!(
+        store_route_count("delete_fence_ref_live_domains"),
+        domains + 1,
+        "one domain held it; the count is how many, since one guest fence can \
+         hold a generation under each encoder domain this device splits it into"
+    );
+
+    // Still nothing retired. The census is the whole of this change: acting on
+    // a ref whose space is not established is what the object table's boot
+    // ruled out.
+    assert_eq!(
+        state.fence_generation(2, FENCE_DOMAIN_BLIT, 40),
+        Some(3),
+        "the arm counts and does not act"
+    );
+}
+
 /// The host's retired slots are reported as retired, not as undecodable.
 ///
 /// Fifteen opcodes share one deprecated handler on the reference host: it

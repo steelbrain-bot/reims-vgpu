@@ -3455,6 +3455,37 @@ impl DeviceState {
             .copied()
     }
 
+    /// Every fence-domain tag under which this task holds a generation for
+    /// `fence_ref`, in tag order.
+    ///
+    /// **Asked to find out whether two reference spaces are one.** A
+    /// `CmdDeleteObject` carrying `OPCODE_DELETE_FENCE` names a ref in the
+    /// *serializer's* per-kind space; `fence_generations` is keyed by the ref a
+    /// command stream's fence record carries. Whether those are the same number
+    /// for the same object is not something this device can assume — see
+    /// `crate::runtime::drain::apply_delete_object` for the boot that measured
+    /// the object table against the same question and found the spaces
+    /// unrelated — so it is measured before anything acts on it.
+    ///
+    /// The tag is this device's own split of one guest fence across encoder
+    /// domains, not a guest-visible term, so one ref can hold up to four
+    /// generations and all of them are the same object's.
+    #[must_use]
+    pub fn fence_domains_holding(&self, task_id: u32, fence_ref: u32) -> Vec<u8> {
+        [
+            FENCE_DOMAIN_EVENT,
+            FENCE_DOMAIN_BLIT,
+            FENCE_DOMAIN_COMPUTE,
+            FENCE_DOMAIN_RENDER,
+        ]
+        .into_iter()
+        .filter(|tag| {
+            self.fence_generations
+                .contains_key(&(task_id, *tag, fence_ref))
+        })
+        .collect()
+    }
+
     /// Store fence generation (monotonic update owned by the planner).
     pub fn set_fence_generation(&mut self, task_id: u32, domain: u8, fence_ref: u32, value: u64) {
         if fence_ref == 0 {

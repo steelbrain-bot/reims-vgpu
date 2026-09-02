@@ -331,6 +331,40 @@ fn apply_delete_object(
     // `..._delete_absent` about a table that rail never fills — and on a
     // Metal-only build fell through to `note_unimplemented` instead. One rail,
     // two builds, two different answers about the same guest command.
+    // **Is the serializer's fence ref the same number as a fence record's?**
+    // `DeviceState::fence_generations` is keyed by `(task, domain, ref)` and a
+    // wait is satisfied when the stored generation is at or past its target —
+    // so if the two spaces coincide, a deleted fence whose ref the guest later
+    // reuses starts life already signalled, and the first wait on the new fence
+    // passes without the work behind it. If they do not coincide, retiring on
+    // this ref would clear a live fence that happened to share the integer,
+    // which is the failure this arm's doc records having measured for the
+    // object table.
+    //
+    // Neither is assumed. The overlap is counted, with a denominator, and the
+    // arm still does nothing — the same shape the resource-lifecycle group's
+    // refusals were answered in. `_live` above zero on a driven guest is the
+    // evidence that the retirement belongs here.
+    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_FENCE {
+        let holding = state.fence_domains_holding(task_id, object_ref);
+        if holding.is_empty() {
+            note_store_route("delete_fence_ref_absent");
+        } else {
+            note_store_route("delete_fence_ref_live");
+            note_store_route_n("delete_fence_ref_live_domains", holding.len() as u64);
+            if crate::observe::first_sight(
+                "delete_fence_ref_live",
+                (u64::from(task_id) << 32) | u64::from(object_ref),
+            ) {
+                crate::observe::fail(format!(
+                    "delete_fence_ref_live task={task_id} ref={object_ref} domains={holding:?} \
+                     (the serializer's fence ref names a fence this device holds generations \
+                     for, so the two reference spaces are one and a reused ref inherits a \
+                     signalled generation — the delete owes those entries)"
+                ));
+            }
+        }
+    }
     let retained = match op.opcode() {
         reims_vgpu_wire::ops::destroy::OPCODE_DELETE_DEPTH_STENCIL_STATE => {
             Some(RetainedObject::DepthStencilState)
