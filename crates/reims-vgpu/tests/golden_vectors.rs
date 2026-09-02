@@ -128,7 +128,7 @@ fn corpus_property_random_decode_no_panic() {
                 &op,
             );
         }
-        let _ = reims_vgpu::runtime::decode::compute::decode(s);
+        let _ = reims_vgpu::runtime::decode::compute_spi::decode(s);
         let _ = reims_vgpu::runtime::decode::render::decode(s);
         let _ = reims_vgpu::runtime::decode::resource::decode_list_object_entry(s);
     }

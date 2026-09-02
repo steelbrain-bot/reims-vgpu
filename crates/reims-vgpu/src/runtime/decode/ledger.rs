@@ -80,22 +80,71 @@ fn the_render_decoder_recognises_every_render_operation_the_ledger_records() {
     }
 }
 
+/// Every compute-rail row reaches exactly one decoder, and `classify` is what
+/// says which.
+///
+/// The same two claims the blit test below makes, on the rail whose split is
+/// wider. The seventeen records the ledger has settled are lifted by
+/// `reims_vgpu_protocol::decode::compute`, the two barriers by `decode::sync`,
+/// the compressed-reinterpretation flush by `decode::resource_state`, the
+/// unqualified residency pair by `decode::residency`, and the eleven rows the
+/// ledger has **not settled** by this crate's `decode::compute_spi`.
+///
+/// No row is dropped by every decoder, and no row is claimed by two. The second
+/// is the claim a single decoder could not make, and it is what catches a
+/// settled row growing a second reading of its bytes — which on this rail is
+/// the specific failure the cutover removed, since the eleven unsettled rows
+/// keep a decoder of their own and drive real work from it.
 #[test]
-fn the_compute_decoder_recognises_every_compute_operation_the_ledger_records() {
-    use super::compute::{decode, DecodeStatus};
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Compute)
-        .filter_map(|o| o.opcode)
-    {
-        let refused_the_opcode = matches!(
-            decode(&zero_record(op, GENEROUS_PAYLOAD)),
-            Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrUnsupportedOpcode)
-        );
-        assert!(
-            !refused_the_opcode,
-            "the closure ledger records compute {op:#x} and this rail's decoder \
-             refuses the opcode itself"
+fn every_compute_row_reaches_exactly_one_decoder_and_the_ledger_picks_it() {
+    use reims_vgpu_protocol::decode::{compute, residency, resource_state, sync, DecodeRefusal};
+    for op in LEDGER.iter().filter(|o| o.rail == Rail::Compute) {
+        let Some(opcode) = op.opcode else { continue };
+        let bytes = zero_record(opcode, GENEROUS_PAYLOAD);
+        let framed = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+        // "Claims this record" means: does not refuse it for being an opcode
+        // this decoder does not own. A refusal for a payload of zeroes is a
+        // statement about the bytes, not about ownership.
+        fn disowned<T>(r: &Result<T, DecodeRefusal>) -> bool {
+            matches!(
+                r,
+                Err(DecodeRefusal::UnknownOpcode { .. }) | Err(DecodeRefusal::Unjudged { .. })
+            )
+        }
+        let claimants: Vec<&str> = [
+            ("record", !disowned(&compute::decode(&framed))),
+            ("sync", !disowned(&sync::decode(Rail::Compute, &framed))),
+            (
+                "resource_state",
+                !disowned(&resource_state::decode(Rail::Compute, &framed)),
+            ),
+            // `lift` rather than `decode`: the residency pair is unsettled, so
+            // `decode` refuses it on principle, and the question here is which
+            // decoder owns the *layout*.
+            (
+                "residency",
+                !disowned(&residency::lift(Rail::Compute, &framed)),
+            ),
+            (
+                "unsettled",
+                !matches!(
+                    super::compute_spi::decode(&bytes),
+                    Err(super::compute_spi::DecodeStatus::ErrUnknownOpcode)
+                        | Err(super::compute_spi::DecodeStatus::ErrSettledElsewhere)
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, claimed)| claimed.then_some(name))
+        .collect();
+        assert_eq!(
+            claimants.len(),
+            1,
+            "the closure ledger records compute {opcode:#x} ({}) and {} decoder(s) claim it: \
+             {claimants:?} — a row with none is work this device drops in silence, and a row \
+             with two is the second reading of one record's bytes the cutover exists to remove",
+            op.selector,
+            claimants.len(),
         );
     }
 }

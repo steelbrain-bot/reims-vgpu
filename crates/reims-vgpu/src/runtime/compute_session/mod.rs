@@ -32,7 +32,7 @@ use crate::backend::compute_session::ComputeSession;
 use crate::backend::Backend as _;
 use crate::model::DeviceState;
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
-use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+use crate::runtime::decode::compute_spi::{Command as ComputeCommand, Kind};
 use crate::runtime::host::{HostMemory, HostOps};
 use reims_vgpu_protocol::compute::DispatchType;
 

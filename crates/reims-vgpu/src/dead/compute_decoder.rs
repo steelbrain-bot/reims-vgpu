@@ -1,3 +1,26 @@
+// DISCONNECTED — this file is not a module. Nothing here compiles or links.
+//
+// It was `crates/reims-vgpu/src/runtime/decode/compute.rs`: the compute rail's
+// single decoder, which assigned a `Kind` in the same pass that read the fields
+// and so gave a record's class and its layout as one verdict. The seventeen
+// rows the closure ledger has settled are lifted by
+// `reims_vgpu_protocol::decode::compute` and routed by
+// `reims_vgpu_core::operation::classify`; the barriers, the compressed-
+// reinterpretation flush and the unqualified residency pair are answered from
+// their own protocol decoders in `runtime::exec`; the eleven rows the ledger
+// has not settled are decoded by `runtime::decode::compute_spi`.
+//
+// Read it to learn what the old arms did. Nothing is resurrected from here, and
+// no build-time or run-time switch may reach it — see `dead/README.md`.
+//
+// What is *not* here, because it never had a successor: `OpcodeConfidence`,
+// `opcode_apple_rejected` and `REJECTED_85`/`REJECTED_88`/`REJECTED_C7`. Those
+// three opcodes are rows Apple's serializer was shown not to emit, and the
+// closure ledger has no entry for any of them, so `ErrUnsupportedOpcode` —
+// "this is a real compute opcode this decoder does not handle" — has no
+// question left to answer. A record carrying one of them is
+// `compute_decode_unknown_opcode` now, which is what the ledger says it is.
+
 //! Compute command decoder (port of `host/utils/reims-vgpu-compute-decode`).
 
 use crate::protocol::endian::ld32;

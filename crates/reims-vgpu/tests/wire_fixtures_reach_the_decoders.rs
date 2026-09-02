@@ -43,7 +43,7 @@
 //! `REIMS_WIRE_FIXTURES_REQUIRED=1` (any Apple host, and CI) makes their
 //! absence fail the build rather than stand the tests down.
 
-use reims_vgpu::runtime::decode::{blit_spi, compute, render};
+use reims_vgpu::runtime::decode::{blit_spi, compute_spi, render};
 use reims_vgpu_testkit::{fixtures, unhex};
 
 /// One decoder's answer for one record: what it made of the bytes, and what
@@ -99,21 +99,65 @@ fn render_verdict(bytes: &[u8]) -> Reading {
     }
 }
 
+/// The compute rail's answer, which is five decoders' answers.
+///
+/// Same shape as [`blit_verdict`] below and for the same reason: the record's
+/// class comes from the closure ledger and each class is lifted by the layer
+/// that owns its layout. The question here is the simpler one — did *anything*
+/// in this device read these bytes as the record they are — so the verdict is
+/// the union, and `ledger.rs` is what asserts at most one owner claims a row.
 fn compute_verdict(bytes: &[u8]) -> Reading {
-    use compute::DecodeStatus as S;
-    let decoded = compute::decode(bytes);
+    use reims_vgpu::protocol::closure::Rail;
+    use reims_vgpu::protocol::decode::{self, DecodeRefusal};
+
+    let Ok(op) = decode::op(bytes, 0) else {
+        return Reading {
+            verdict: Verdict::WrongShape("compute_record_unframed"),
+            signature: "unframed".to_string(),
+        };
+    };
+    let attempts: [Result<String, DecodeRefusal>; 4] = [
+        decode::compute::decode(&op).map(|r| format!("{r:?}")),
+        decode::sync::decode(Rail::Compute, &op).map(|r| format!("{r:?}")),
+        decode::resource_state::decode(Rail::Compute, &op).map(|r| format!("{r:?}")),
+        // `lift`, not `decode`: the unqualified residency pair is unsettled, so
+        // `decode` refuses it on principle and the layout question is the one
+        // this test asks.
+        decode::residency::lift(Rail::Compute, &op).map(|r| format!("{r:?}")),
+    ];
+    if let Some(signature) = attempts.iter().find_map(|r| r.as_ref().ok()) {
+        return Reading {
+            verdict: Verdict::Decoded,
+            signature: signature.clone(),
+        };
+    }
+    // The eleven rows the ledger has not settled, which this device decodes for
+    // itself and executes.
+    let decoded = compute_spi::decode(bytes);
     let verdict = match &decoded {
         Ok(_) => Verdict::Decoded,
-        Err(S::ErrUnknownOpcode) => Verdict::NotImplemented("compute_decode_unknown_opcode"),
-        Err(S::ErrUnsupportedOpcode) => {
-            Verdict::NotImplemented("compute_decode_unsupported_opcode")
+        Err(compute_spi::DecodeStatus::ErrShort) => Verdict::WrongShape("compute_decode_short"),
+        // Unreachable: a settled row would have been decoded above. Named
+        // rather than folded into "not implemented", which would report a gap
+        // where there is a disagreement between two decoders.
+        Err(compute_spi::DecodeStatus::ErrSettledElsewhere) => {
+            Verdict::WrongShape("compute_decode_settled_elsewhere")
         }
-        // `ErrShort` is now the compute arm's only shape failure, the way the
-        // blit arm's became after `ErrUnimplementedOpcode` went. Every compute
-        // refusal that is not an unknown or unsupported opcode is a layout this
-        // project has wrong, which makes the arm strictly stronger than when a
-        // second variant could absorb one.
-        Err(S::ErrShort) => Verdict::WrongShape("compute_decode_short"),
+        Err(compute_spi::DecodeStatus::ErrUnknownOpcode) => {
+            // No decoder on this rail claims the opcode. If the protocol
+            // decoders refused it for its *shape* rather than its opcode, that
+            // is a layout this project has wrong and must not read as a gap.
+            if attempts.iter().any(|r| {
+                !matches!(
+                    r,
+                    Err(DecodeRefusal::UnknownOpcode { .. }) | Err(DecodeRefusal::Unjudged { .. })
+                )
+            }) {
+                Verdict::WrongShape("compute_record_wrong_shape")
+            } else {
+                Verdict::NotImplemented("compute_decode_unknown_opcode")
+            }
+        }
     };
     Reading {
         verdict,

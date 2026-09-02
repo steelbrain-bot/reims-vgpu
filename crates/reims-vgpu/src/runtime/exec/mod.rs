@@ -26,7 +26,7 @@ use crate::protocol::pixel_format::{self, ClearImageEncoding};
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit_spi;
-use crate::runtime::decode::compute::{self, Kind as ComputeKind};
+use crate::runtime::decode::compute_spi::{self, Kind as ComputeKind};
 use crate::runtime::decode::render::{
     self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
     decode_color_attachment, decode_depth_attachment, decode_stencil_attachment, ColorAttachment,
@@ -1451,7 +1451,7 @@ fn handle_compute_record<M: HostMemory + HostOps>(
     // evidence this project gathered outside the ledger, and holding them back
     // is what keeps a settled record and an unsettled one from sharing a
     // decoder.
-    let cmd = match compute::decode(cmd_bytes) {
+    let cmd = match compute_spi::decode(cmd_bytes) {
         Ok(c) => c,
         // Same silent drop as the render path above.
         Err(status) => {

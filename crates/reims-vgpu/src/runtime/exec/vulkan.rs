@@ -11,6 +11,7 @@
 //! never names it.
 
 use super::*;
+use reims_vgpu_protocol::decode::compute::{ComputeRecord, DispatchRecord};
 
 pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -191,20 +192,32 @@ pub(crate) fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> 
         let mut pipeline_ref = 0u32;
         for op in reims_vgpu_wire::op::OpStream::new(commands) {
             let Ok(op) = op else { break };
-            let bytes = &commands[op.offset..op.offset + op.length() as usize];
-            let Ok(cmd) = compute::decode(bytes) else {
+            let Ok(record) = reims_vgpu_protocol::decode::compute::decode(&op) else {
                 continue;
             };
-            match cmd.kind {
-                ComputeKind::Pipeline => pipeline_ref = cmd.pipeline_ref,
-                ComputeKind::DispatchThreadgroups
-                | ComputeKind::DispatchThreadgroupsIndirect
-                | ComputeKind::DispatchThreads => {
-                    let dims = cmd.threads_per_threadgroup;
+            // The three dispatches that *state* a threadgroup size. The fully
+            // indirect one reads it from a buffer, and the record has no such
+            // field to offer — where the flat command offered a zeroed one,
+            // which this scan then had to reject as an out-of-range extent
+            // rather than as a size the record never carried.
+            let threads_per_group = match record {
+                ComputeRecord::SetPipeline(r) => {
+                    pipeline_ref = r.pipeline_ref;
+                    continue;
+                }
+                ComputeRecord::Dispatch(DispatchRecord::Threadgroups(r)) => r.threads_per_group,
+                ComputeRecord::Dispatch(DispatchRecord::Threads(r)) => r.threads_per_group,
+                ComputeRecord::Dispatch(DispatchRecord::ThreadgroupsIndirect(r)) => {
+                    r.threads_per_group
+                }
+                _ => continue,
+            };
+            {
+                {
                     let local_size = [
-                        u32::try_from(dims.x).ok(),
-                        u32::try_from(dims.y).ok(),
-                        u32::try_from(dims.z).ok(),
+                        u32::try_from(threads_per_group.width).ok(),
+                        u32::try_from(threads_per_group.height).ok(),
+                        u32::try_from(threads_per_group.depth).ok(),
                     ];
                     if pipeline_ref != 0 {
                         if let [Some(x), Some(y), Some(z)] = local_size {
@@ -215,7 +228,6 @@ pub(crate) fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> 
                         }
                     }
                 }
-                _ => {}
             }
         }
     }

@@ -241,8 +241,8 @@ fn execute_icb_command(
     icb_ref: u32,
     location: u64,
     length: u64,
-) -> crate::runtime::decode::compute::Command {
-    use crate::runtime::decode::compute::{Command, Kind};
+) -> crate::runtime::decode::compute_spi::Command {
+    use crate::runtime::decode::compute_spi::{Command, Kind};
     Command {
         kind: Kind::ExecuteCommandsInBuffer,
         indirect_command_buffer_ref: icb_ref,

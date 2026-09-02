@@ -33,9 +33,7 @@ use crate::protocol::pixel_format;
 // settled: the fence pair, the seven control-flow records and the two indirect
 // command executions. The seventeen it has settled arrive as a
 // `reims_vgpu_protocol::decode::compute::ComputeRecord`.
-use crate::runtime::decode::compute::{
-    BufferBinding, Command as ComputeCommand, RefBinding, SamplerBinding,
-};
+use crate::runtime::decode::compute_spi::Command as ComputeCommand;
 use crate::runtime::decode::resource::{
     decode_heap_texture, decode_serializer_object_descriptor, decode_texture_descriptor,
     texture_view_opcode, ComputeStageInputDescriptor, Descriptor as ResourceDescriptor,
@@ -249,18 +247,6 @@ impl BufferBindEntry for reims_vgpu_wire::ops::render::BufferStrideBind {
     }
 }
 
-impl BufferBindEntry for BufferBinding {
-    fn buffer_ref(&self) -> u32 {
-        self.ref_
-    }
-    fn offset(&self) -> u64 {
-        self.offset
-    }
-    fn stride(&self) -> Option<u64> {
-        self.has_attribute_stride.then_some(self.attribute_stride)
-    }
-}
-
 impl ObjectBindEntry for reims_vgpu_wire::ops::render::RefBind {
     fn object_ref(&self) -> u32 {
         self.object_ref.get()
@@ -276,22 +262,6 @@ impl ObjectBindEntry for reims_vgpu_wire::ops::render::SamplerLodBind {
             self.lod_min_clamp.get().to_bits(),
             self.lod_max_clamp.get().to_bits(),
         ))
-    }
-}
-
-impl ObjectBindEntry for RefBinding {
-    fn object_ref(&self) -> u32 {
-        self.ref_
-    }
-}
-
-impl ObjectBindEntry for SamplerBinding {
-    fn object_ref(&self) -> u32 {
-        self.ref_
-    }
-    fn lod_clamp(&self) -> Option<(u32, u32)> {
-        self.has_lod_clamp
-            .then_some((self.lod_min_bits, self.lod_max_bits))
     }
 }
 

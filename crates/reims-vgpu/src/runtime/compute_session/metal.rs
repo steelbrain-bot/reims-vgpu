@@ -16,7 +16,7 @@
 use super::{ComputeAccum, ComputeStatus};
 use crate::model::DeviceState;
 use crate::runtime::compute_exec;
-use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+use crate::runtime::decode::compute_spi::{Command as ComputeCommand, Kind};
 use crate::runtime::host::{HostMemory, HostOps};
 use reims_vgpu_protocol::compute::DispatchType;
 
