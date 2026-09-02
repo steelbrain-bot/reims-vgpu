@@ -2447,6 +2447,9 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 return;
             }
             let bit = 1u32 << ch;
+            // What the model would answer this transition, on a device that is
+            // not asking it. See `note_channel_transition_verdict`.
+            note_channel_transition_verdict(state, transition, ch, bit);
             match transition {
                 control::ChannelTransition::Open => {
                     state.active_child_mask |= bit;
@@ -4295,6 +4298,65 @@ fn sync_exec_stalled(total_us: u64) -> bool {
 /// drain discharges them for every accepted packet whatever this returns.
 fn is_retired_control_slot(opcode: u16) -> bool {
     ControlKind::of(WireChannel::Child, opcode) == Some(ControlKind::RetiredSlot)
+}
+
+/// What `SessionModel::apply_control` would answer this channel transition, on a
+/// device that is not asking it.
+///
+/// # Two refusals this device does not have
+///
+/// The model's channel set is a `BTreeSet` with two guarded doors, and both
+/// guards are things this device does without complaint:
+///
+/// * `open_channel` refuses `ChannelAlreadyOpen`. Here an open is
+///   `active_child_mask |= bit` — idempotent, and a redefinition is a real event
+///   on this interface: `forget_child_channel` resets the ring cursor and the
+///   translation masks precisely so a redefined FIFO does not inherit the
+///   previous producer's position.
+/// * `retire_channel` refuses `ChannelNotOpen` for a free of a domain no
+///   definition opened, and `Owed` for one that still holds unreleased
+///   positions. Here a free is `&= !bit` whatever the domain's history.
+///
+/// A refusal there does not withhold the packet's envelope — the model's own doc
+/// says a control transaction publishes its completion word whether its
+/// transition happened or not — so neither refusal is a hang. What each one is
+/// is an **effect that does not happen**: a refused redefinition leaves the
+/// model's set unchanged where this device would have reset the channel, and a
+/// refused free leaves the domain open. Whether that matters is a question about
+/// what this guest actually sends, which is what these two routes count.
+///
+/// `channel_open_of_open_domain` and `channel_free_of_undefined_domain` are the
+/// two the model refuses; `channel_transition_model_agrees` is the denominator,
+/// without which a boot that sent no channel commands reads like a clean one.
+///
+/// The `Owed` refusal is deliberately **not** modelled here. It is a question
+/// about unreleased publication positions, which is the publisher's state and
+/// not this device's, and a count derived from a mask would be an answer to a
+/// different question wearing the right name.
+fn note_channel_transition_verdict(
+    state: &DeviceState,
+    transition: control::ChannelTransition,
+    channel: u32,
+    bit: u32,
+) {
+    let defined = state.channels_defined_by_packet & bit != 0;
+    let refused = match transition {
+        control::ChannelTransition::Open if defined => Some("channel_open_of_open_domain"),
+        control::ChannelTransition::Free if !defined => Some("channel_free_of_undefined_domain"),
+        _ => None,
+    };
+    let Some(route) = refused else {
+        note_store_route("channel_transition_model_agrees");
+        return;
+    };
+    note_store_route(route);
+    if crate::observe::first_sight(route, u64::from(channel)) {
+        crate::observe::fail(format!(
+            "{route} channel={channel} (this device performs the transition and the \
+             replacement model refuses it, so the effect the transition has here would \
+             not happen there)"
+        ));
+    }
 }
 
 /// Whether a packet's own domain was opened by a channel definition, which is

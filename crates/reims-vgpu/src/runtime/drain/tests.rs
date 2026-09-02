@@ -1231,6 +1231,79 @@ fn a_channel_lifetime_outside_the_channel_range_is_reported() {
     }
 }
 
+/// The two channel transitions the replacement model refuses and this device
+/// performs are counted apart from the ones it agrees with.
+///
+/// Neither refusal withholds a completion word, so neither is a hang. Each is an
+/// effect that would not happen — a redefinition that does not reset the
+/// channel, a free that leaves the domain open — and whether this guest sends
+/// either is the term the first group's cutover turns on.
+#[test]
+fn the_channel_transitions_the_model_would_refuse_are_counted_apart() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let channel = 2u32;
+    let transition = |state: &mut DeviceState, host: &mut FakeHost, opcode| {
+        process_root_packet(
+            state,
+            host,
+            &Packet {
+                opcode,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN + 4,
+                completion_stamp: 0,
+                payload: channel.to_le_bytes().to_vec(),
+                next_head: 0,
+            },
+        );
+    };
+
+    let agrees = store_route_count("channel_transition_model_agrees");
+    let reopen = store_route_count("channel_open_of_open_domain");
+    let orphan_free = store_route_count("channel_free_of_undefined_domain");
+
+    // A free before any definition: the model has nothing to remove.
+    transition(&mut state, &mut host, ROOT_OP_FREE_FIFO);
+    assert_eq!(
+        (
+            store_route_count("channel_transition_model_agrees"),
+            store_route_count("channel_free_of_undefined_domain"),
+        ),
+        (agrees, orphan_free + 1),
+    );
+
+    // The first definition is the one both agree on.
+    transition(&mut state, &mut host, ROOT_OP_DEFINE_FIFO);
+    assert_eq!(
+        store_route_count("channel_transition_model_agrees"),
+        agrees + 1,
+    );
+
+    // The second, over a domain still open, is the one the model refuses —
+    // while this device resets the channel through `forget_child_channel`.
+    transition(&mut state, &mut host, ROOT_OP_DEFINE_FIFO);
+    assert_eq!(
+        (
+            store_route_count("channel_transition_model_agrees"),
+            store_route_count("channel_open_of_open_domain"),
+        ),
+        (agrees + 1, reopen + 1),
+    );
+
+    // And the free that follows a definition is agreed on again.
+    transition(&mut state, &mut host, ROOT_OP_FREE_FIFO);
+    assert_eq!(
+        (
+            store_route_count("channel_transition_model_agrees"),
+            store_route_count("channel_open_of_open_domain"),
+            store_route_count("channel_free_of_undefined_domain"),
+        ),
+        (agrees + 2, reopen + 1, orphan_free + 1),
+    );
+}
+
 /// A doorbell makes a domain live and a definition makes it *defined*, and the
 /// census tells the two apart on a device where one mask holds both.
 ///
