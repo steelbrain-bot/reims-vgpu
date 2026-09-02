@@ -119,7 +119,7 @@ pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 /// indexes with no bound check of its own.
 pub const MAX_CHANNELS: usize = 32;
 
-/// `active_child_mask`, `pending.child_mask` and `child_doorbell_rung` are each
+/// `DeviceState::open_child_mask`, `pending.child_mask` and `child_doorbell_rung` are each
 /// a `u32` carrying one bit per channel, and every producer reaches them with a
 /// bare `1u32 << channel_id`. That is only defined because a channel id is
 /// bounded by 32 — a `MAX_CHANNELS` above `u32::BITS` would make every one of

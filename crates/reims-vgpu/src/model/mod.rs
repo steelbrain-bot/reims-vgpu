@@ -354,7 +354,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             start.wrapping_add(total)
         );
-        assert!(d.state.active_child_mask & (1 << 1) != 0);
+        assert!(d.state.child_domain_open(1));
         assert_eq!(h.get_u32(pfn_to_gpa(0x10, PAGE_SHIFT_ARM64E)), 0x11);
         assert!(h.action_count(HostActionKind::IrqGfxPulse) >= 1);
     }
@@ -758,7 +758,7 @@ mod tests {
         let mut h = FakeHost::new();
         setup_boot_regs(&mut d, &mut h);
         let ch = 1u32;
-        d.state.active_child_mask |= 1 << ch;
+        d.state.open_child_domains_for_test(1 << ch);
         // Minimal child ring setup is covered by main DEFINE_FIFO + drain path.
         let payload = ch.to_le_bytes();
         write_main_packet(&mut h, 0, ROOT_OP_DEFINE_FIFO, 2, &payload);
@@ -769,14 +769,14 @@ mod tests {
         d.state.gfx.fifo_written = PACKET_HEADER_LEN + 4;
         d.state.pending.main_drain = true;
         d.drain(&mut h);
-        assert!(d.state.active_child_mask & (1 << ch) != 0);
+        assert!(d.state.child_domain_open(ch));
     }
 
     #[test]
     fn doorbell_sets_pending_child() {
         let mut d = dev();
         let mut h = FakeHost::new();
-        d.state.active_child_mask = 1 << 3;
+        d.state.open_child_domains_for_test(1 << 3);
         // Child doorbells publish work and schedule the BH; the vCPU MMIO path
         // must not synchronously consume render work.
         d.gfx_write(&mut h, GFX_REG_CHILD_DOORBELL, 3, MMIO_U32);
@@ -786,7 +786,7 @@ mod tests {
             "doorbell leaves pending work for the BH"
         );
         assert!(
-            d.state.active_child_mask & (1 << 3) != 0,
+            d.state.child_domain_open(3),
             "doorbell keeps channel active"
         );
         assert!(

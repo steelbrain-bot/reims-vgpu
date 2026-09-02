@@ -1048,7 +1048,7 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
     state.gfx.root_page = root_pfn;
     state.gfx.fifo_base_page = stamp_pfn;
-    state.active_child_mask = producer_bit | sibling_bit;
+    state.open_child_domains_for_test(producer_bit | sibling_bit);
     state.pending.child_mask = sibling_bit;
     state.translation_deferred_mask = producer_bit;
 
@@ -1171,7 +1171,7 @@ fn define_fifo_forgets_the_previous_occupants_translation_state() {
         },
     );
 
-    assert_eq!(state.active_child_mask & bit, bit, "the channel is open");
+    assert!(state.child_domain_open(1), "the channel is open");
     assert_eq!(state.translation_deferred_mask & bit, 0);
     assert_eq!(state.translation_order_hold_mask & bit, 0);
     assert_eq!(state.present_translation_hold_mask & bit, 0);
@@ -1201,7 +1201,7 @@ fn a_channel_lifetime_outside_the_channel_range_is_reported() {
         for opcode in [ROOT_OP_DEFINE_FIFO, ROOT_OP_FREE_FIFO] {
             let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
             let mut host = FakeHost::new();
-            let before = state.active_child_mask;
+            let before = state.open_child_mask();
             let cap = crate::observe::FailCapture::start();
             process_root_packet(
                 &mut state,
@@ -1224,11 +1224,76 @@ fn a_channel_lifetime_outside_the_channel_range_is_reported() {
                 "channel {channel} on {opcode:#x} said nothing: {lines:?}"
             );
             assert_eq!(
-                state.active_child_mask, before,
+                state.open_child_mask(),
+                before,
                 "an out-of-range id must move no mask bit"
             );
         }
     }
+}
+
+/// A channel definition opens the domain in the semantic model, and nothing
+/// else on this device does.
+///
+/// The cutover's own assertion. Openness used to be a `DeviceState` field that
+/// three events wrote — a definition, a locked doorbell register write, and a
+/// lock-free ring — and the two doorbell events wrote it for a different
+/// question. Each of the three is driven here and only the definition may move
+/// the answer; the doorbells must move the pending-work mask instead, which is
+/// the question they actually answer.
+#[test]
+fn a_definition_opens_the_domain_in_the_model_and_a_doorbell_does_not() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let channel = 4u32;
+    let bit = 1u32 << channel;
+
+    // A lock-free ring.
+    state
+        .gfx
+        .child_doorbell_rung
+        .store(bit, std::sync::atomic::Ordering::Release);
+    crate::runtime::drain::fold_rung_child_doorbells(&mut state);
+    assert_eq!(
+        state.pending.child_mask & bit,
+        bit,
+        "a ring is work waiting on the domain"
+    );
+    assert!(
+        !state.child_domain_open(channel),
+        "and it is not a claim that the guest defined one"
+    );
+    assert_eq!(
+        state.drainable_child_mask() & bit,
+        bit,
+        "the union the drain walks still holds it, which is what a ring is for"
+    );
+
+    // The definition, which is the model's one event for openness.
+    let transition = |state: &mut DeviceState, host: &mut FakeHost, opcode| {
+        process_root_packet(
+            state,
+            host,
+            &Packet {
+                opcode,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN + 4,
+                completion_stamp: 0,
+                payload: channel.to_le_bytes().to_vec(),
+                next_head: 0,
+            },
+        );
+    };
+    transition(&mut state, &mut host, ROOT_OP_DEFINE_FIFO);
+    assert!(state.child_domain_open(channel));
+    assert_eq!(state.open_child_mask() & bit, bit);
+
+    // The free takes it back, and takes the pending bit with it — an open is
+    // not a claim that nothing is pending, but a free is.
+    transition(&mut state, &mut host, ROOT_OP_FREE_FIFO);
+    assert!(!state.child_domain_open(channel));
+    assert_eq!(state.pending.child_mask & bit, 0);
+    assert_eq!(state.drainable_child_mask() & bit, 0);
 }
 
 /// The two channel transitions the replacement model refuses and this device
@@ -1309,7 +1374,7 @@ fn the_channel_transitions_the_model_would_refuse_are_counted_apart() {
 ///
 /// The distinction is the whole reason the field exists. `SessionModel::admit`
 /// gates on the definition alone, so a boot that put work on doorbell-only
-/// domains would be a boot the first group's cutover hangs. `active_child_mask`
+/// domains would be a boot this cutover hangs. The old `active_child_mask`
 /// is the union of three events and cannot answer that after the fact.
 #[test]
 fn a_packet_on_a_doorbell_only_domain_is_told_apart_from_one_on_a_defined_domain() {
@@ -1327,12 +1392,12 @@ fn a_packet_on_a_doorbell_only_domain_is_told_apart_from_one_on_a_defined_domain
         .store(bit, std::sync::atomic::Ordering::Release);
     crate::runtime::drain::fold_rung_child_doorbells(&mut state);
     assert_eq!(
-        state.active_child_mask & bit,
+        state.pending.child_mask & bit,
         bit,
         "a ring makes the domain drainable"
     );
     assert_eq!(
-        state.channels_defined_by_packet & bit,
+        u32::from(state.child_domain_open(channel)) * bit,
         0,
         "and says nothing about a definition"
     );
@@ -1371,7 +1436,7 @@ fn a_packet_on_a_doorbell_only_domain_is_told_apart_from_one_on_a_defined_domain
         },
     );
     assert_eq!(
-        state.channels_defined_by_packet & bit,
+        u32::from(state.child_domain_open(channel)) * bit,
         bit,
         "a definition is the one event the model's open-channel set has"
     );
@@ -1400,7 +1465,7 @@ fn a_packet_on_a_doorbell_only_domain_is_told_apart_from_one_on_a_defined_domain
         },
     );
     assert_eq!(
-        state.channels_defined_by_packet & bit,
+        u32::from(state.child_domain_open(channel)) * bit,
         0,
         "a free is not a definition that stands"
     );
@@ -1413,7 +1478,7 @@ fn free_fifo_clears_translation_scheduler_state() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let bit = 1 << 1;
-    state.active_child_mask = bit;
+    state.open_child_domains_for_test(bit);
     state.pending.child_mask = bit;
     state.translation_deferred_mask = bit;
     state.translation_order_hold_mask = bit;
@@ -1432,7 +1497,7 @@ fn free_fifo_clears_translation_scheduler_state() {
         },
     );
 
-    assert_eq!(state.active_child_mask & bit, 0);
+    assert!(!state.child_domain_open(1));
     assert_eq!(state.pending.child_mask & bit, 0);
     assert_eq!(state.translation_deferred_mask & bit, 0);
     assert_eq!(state.translation_order_hold_mask & bit, 0);
@@ -1780,7 +1845,7 @@ fn child_drain_yields_after_present_for_display_consumer() {
     host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
     state.gfx.root_page = root_pfn;
     state.gfx.fifo_base_page = stamp_pfn;
-    state.active_child_mask = 1u32 << channel;
+    state.open_child_domains_for_test(1u32 << channel);
     state.pending.child_mask = 1u32 << channel;
 
     drain_pending(&mut state, &mut host);
@@ -1853,7 +1918,7 @@ fn set_mapping_geom_size_change_resets_content_generation() {
 fn drain_other_child_fifos_is_a_safe_noop_without_rings() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.active_child_mask = (1 << 1) | (1 << 4);
+    state.open_child_domains_for_test((1 << 1) | (1 << 4));
     state.pending.child_mask = 1 << 1;
     state.gfx.control_fifo = 1;
     // No root_page / rings: the drain returns immediately.
@@ -1874,7 +1939,7 @@ fn poll_rescue_only_publishes_work_for_async_drain() {
         .fifo_read
         .store(3, std::sync::atomic::Ordering::Release);
     state.gfx.fifo_written = 4;
-    state.active_child_mask = (1 << 2) | (1 << 5);
+    state.open_child_domains_for_test((1 << 2) | (1 << 5));
 
     assert!(publish_stranded_fifos(&mut state, &mut host));
     assert!(state.pending.main_drain);
@@ -5137,7 +5202,7 @@ fn every_short_control_packet_names_itself() {
         next_head: 0,
     };
 
-    let before_mask = state.active_child_mask;
+    let before_mask = state.open_child_mask();
     for (opcode, need) in [
         (ROOT_OP_DEVICE_INFO_TAHOE, TAHOE.reply_pfn_offset() + 4),
         (
@@ -5152,7 +5217,8 @@ fn every_short_control_packet_names_itself() {
         process_root_packet(&mut state, &mut host, &short(opcode, need - 1));
     }
     assert_eq!(
-        state.active_child_mask, before_mask,
+        state.open_child_mask(),
+        before_mask,
         "a short DEFINE_FIFO must not open a channel"
     );
 

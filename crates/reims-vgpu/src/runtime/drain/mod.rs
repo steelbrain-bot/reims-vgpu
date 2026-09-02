@@ -2447,25 +2447,19 @@ fn process_root_packet<H: HostMemory + HostOps>(
                 return;
             }
             let bit = 1u32 << ch;
-            // What the model would answer this transition, on a device that is
-            // not asking it. See `note_channel_transition_verdict`.
-            note_channel_transition_verdict(state, transition, ch, bit);
-            match transition {
-                control::ChannelTransition::Open => {
-                    state.active_child_mask |= bit;
-                    // The observation half. See the field's own doc: this is the
-                    // only writer of it, because a definition packet is the only
-                    // event the model's `open_channels` has.
-                    state.channels_defined_by_packet |= bit;
-                }
-                control::ChannelTransition::Free => {
-                    state.active_child_mask &= !bit;
-                    state.channels_defined_by_packet &= !bit;
-                    // Only a free clears it: an open is not a claim that
-                    // nothing is pending on the channel, and clearing it
-                    // there would drop a drain the guest is owed.
-                    state.pending.child_mask &= !bit;
-                }
+            // **The transition is the model's now.** This arm used to set and
+            // clear a bit of `DeviceState::active_child_mask`; the domain's
+            // openness is `SessionModel::open_channels` and this is the one
+            // writer of it. What stays here is everything that is *not* the
+            // domain's publication lifetime: the pending-work bit, and the
+            // per-channel drain state `forget_child_channel` resets.
+            let verdict = state.session.apply_control(op);
+            note_channel_transition_verdict(verdict, transition, ch);
+            if transition == control::ChannelTransition::Free {
+                // Only a free clears it: an open is not a claim that nothing is
+                // pending on the channel, and clearing it there would drop a
+                // drain the guest is owed.
+                state.pending.child_mask &= !bit;
             }
             forget_child_channel(state, ch, bit);
         }
@@ -4300,34 +4294,32 @@ fn is_retired_control_slot(opcode: u16) -> bool {
     ControlKind::of(WireChannel::Child, opcode) == Some(ControlKind::RetiredSlot)
 }
 
-/// What `SessionModel::apply_control` would answer this channel transition, on a
-/// device that is not asking it.
+/// What `SessionModel::apply_control` answered this channel transition.
 ///
-/// # Two refusals this device does not have
+/// # Two refusals this device did not have
 ///
-/// The model's channel set is a `BTreeSet` with two guarded doors, and both
-/// guards are things this device does without complaint:
+/// The model's channel set has two guarded doors, and this device had neither
+/// guard while it kept its own bit:
 ///
-/// * `open_channel` refuses `ChannelAlreadyOpen`. Here an open is
-///   `active_child_mask |= bit` — idempotent, and a redefinition is a real event
-///   on this interface: `forget_child_channel` resets the ring cursor and the
-///   translation masks precisely so a redefined FIFO does not inherit the
+/// * a definition of a domain already open is `ChannelAlreadyOpen`. Here an open
+///   was `active_child_mask |= bit` — idempotent — and a redefinition is a real
+///   event on this interface: `forget_child_channel` resets the ring cursor and
+///   the translation masks precisely so a redefined FIFO does not inherit the
 ///   previous producer's position.
-/// * `retire_channel` refuses `ChannelNotOpen` for a free of a domain no
-///   definition opened, and `Owed` for one that still holds unreleased
-///   positions. Here a free is `&= !bit` whatever the domain's history.
+/// * a free of a domain no definition opened is `ChannelNotOpen`, and one that
+///   still holds unreleased publication positions is `Owed`. Here a free was
+///   `&= !bit` whatever the domain's history.
 ///
-/// A refusal there does not withhold the packet's envelope — the model's own doc
-/// says a control transaction publishes its completion word whether its
-/// transition happened or not — so neither refusal is a hang. What each one is
-/// is an **effect that does not happen**: a refused redefinition leaves the
-/// model's set unchanged where this device would have reset the channel, and a
-/// refused free leaves the domain open. Whether that matters is a question about
-/// what this guest actually sends, which is what these two routes count.
+/// A refusal withholds no completion word — a control transaction publishes its
+/// stamp whether its transition happened or not, which the model's own doc
+/// states, and the drain still owns that envelope. What a refusal costs is the
+/// model-side *effect*: a refused redefinition leaves the domain open where this
+/// device would have re-opened it, and a refused free leaves it open too. The
+/// device-side effects either way are unchanged, because
+/// `forget_child_channel` runs on the transition and not on the verdict.
 ///
-/// `channel_open_of_open_domain` and `channel_free_of_undefined_domain` are the
-/// two the model refuses; `channel_transition_model_agrees` is the denominator,
-/// without which a boot that sent no channel commands reads like a clean one.
+/// `channel_transition_model_agrees` is the denominator, without which a boot
+/// that sent no channel commands reads like a clean one.
 ///
 /// # What a driven boot answered, and why five is the population
 ///
@@ -4336,38 +4328,31 @@ fn is_retired_control_slot(opcode: u16) -> bool {
 /// boot's 1916: **`channel_transition_model_agrees=5`,
 /// `channel_open_of_open_domain=0`, `channel_free_of_undefined_domain=0`.**
 ///
-/// The five did not move under the workload, and that is the finding rather
-/// than a thin sample. This guest establishes its FIFO set once, at accelerator
+/// The five did not move under the workload, and that is the finding rather than
+/// a thin sample. This guest establishes its FIFO set once, at accelerator
 /// start, and per-application GPU contexts share those channels — launching and
 /// quitting applications creates and destroys no domain. So five is what a boot
-/// *has*, and the model refuses none of them.
-///
-/// The `Owed` refusal is deliberately **not** modelled here. It is a question
-/// about unreleased publication positions, which is the publisher's state and
-/// not this device's, and a count derived from a mask would be an answer to a
-/// different question wearing the right name.
+/// *has*, the model refuses none of them, and that is what let this lifetime
+/// move.
 fn note_channel_transition_verdict(
-    state: &DeviceState,
+    verdict: Result<(), reims_vgpu_core::session::ControlRefusal>,
     transition: control::ChannelTransition,
     channel: u32,
-    bit: u32,
 ) {
-    let defined = state.channels_defined_by_packet & bit != 0;
-    let refused = match transition {
-        control::ChannelTransition::Open if defined => Some("channel_open_of_open_domain"),
-        control::ChannelTransition::Free if !defined => Some("channel_free_of_undefined_domain"),
-        _ => None,
-    };
-    let Some(route) = refused else {
+    let Err(refusal) = verdict else {
         note_store_route("channel_transition_model_agrees");
         return;
+    };
+    let route = match transition {
+        control::ChannelTransition::Open => "channel_open_of_open_domain",
+        control::ChannelTransition::Free => "channel_free_of_undefined_domain",
     };
     note_store_route(route);
     if crate::observe::first_sight(route, u64::from(channel)) {
         crate::observe::fail(format!(
-            "{route} channel={channel} (this device performs the transition and the \
-             replacement model refuses it, so the effect the transition has here would \
-             not happen there)"
+            "{route} channel={channel} reason={} (the guest asked for a transition the \
+             domain's lifetime owner refuses, so the domain is left as it was)",
+            refusal.slug()
         ));
     }
 }
@@ -4418,8 +4403,7 @@ fn note_channel_transition_verdict(
 /// the one that would have been a hang. The other two are what
 /// [`note_channel_transition_verdict`] counts, and they are not hangs.
 fn note_packet_domain_definition(state: &DeviceState, channel_id: u32, opcode: u16) {
-    let defined = state.channels_defined_by_packet & (1u32 << channel_id) != 0;
-    if defined {
+    if state.child_domain_open(channel_id) {
         note_store_route("child_packet_domain_defined");
         return;
     }
@@ -6154,8 +6138,9 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
 /// Used by DisplaySwap Dekker rescue and stranded paths — **not** by
 /// `render_wait_surface` (archive wait is surface-keyed async completion only).
 ///
-/// Mask matches archive `poll_tick`: `active_child_mask | pending_child_mask`
-/// so work doorbell'd while a drain was in flight is not skipped. Skips
+/// Mask matches archive `poll_tick`: open domains **or** domains holding work,
+/// which is `DeviceState::drainable_child_mask`, so work doorbell'd while a
+/// drain was in flight is not skipped. Skips
 /// `skip_channel` and every bit in `state.draining_mask` so nested drains
 /// cannot re-enter a mid-packet channel (same head re-process).
 pub fn drain_other_child_fifos<H: HostMemory + HostOps>(
@@ -6163,7 +6148,7 @@ pub fn drain_other_child_fifos<H: HostMemory + HostOps>(
     host: &mut H,
     skip_channel: u32,
 ) {
-    let mask = state.active_child_mask | state.pending.child_mask;
+    let mask = state.drainable_child_mask();
     let nested = state.draining_mask;
 
     // A cold-translation EXEC is already the oldest accepted item in the host
@@ -6267,8 +6252,9 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
             state.pending.main_drain = true;
             published = true;
         }
-        if state.active_child_mask != 0 {
-            state.pending.child_mask |= state.active_child_mask;
+        let open = state.open_child_mask();
+        if open != 0 {
+            state.pending.child_mask |= open;
             published = true;
         }
     }
@@ -6352,11 +6338,19 @@ const CHILD_DOORBELL_REFILLS: u32 = 3;
 /// [`crate::model::GfxRegs::child_doorbell_rung`] for why that register can be
 /// taken that way and no other can. This is where the bits become work.
 ///
-/// `active_child_mask` is set as well as `pending.child_mask`, because that is
-/// what the locked handler in `runtime::mmio` does for the same register and the
-/// two must not disagree: `publish_stranded_fifos` re-publishes from
-/// `active_child_mask`, so a channel that only ever rang lock-free would be
-/// invisible to the stranded-FIFO rescue.
+/// **Only `pending.child_mask`.** This used to set an `active_child_mask` bit as
+/// well, so that a channel which had only ever rung lock-free would still be
+/// seen by the stranded-FIFO rescue — which read that field. It cannot any more,
+/// and must not: a doorbell says there is work on a domain, it does not say the
+/// guest defined one, and openness is `DeviceState::session`'s with a channel
+/// definition as its one event.
+///
+/// What the rescue reads instead is `DeviceState::open_child_mask`, so a domain
+/// that was rung and never defined is no longer re-published by it. That is a
+/// real difference and it is answered rather than assumed: across four driven
+/// boots this guest put **zero** packets on a domain no definition opened — see
+/// [`note_packet_domain_definition`] — so a channel with a stranded ring is a
+/// defined channel, and a defined channel is in the mask the rescue reads.
 pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
     let rung = state
         .gfx
@@ -6365,7 +6359,6 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
     if rung == 0 {
         return;
     }
-    state.active_child_mask |= rung;
     state.pending.child_mask |= rung;
 }
 

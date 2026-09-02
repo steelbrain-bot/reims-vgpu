@@ -201,7 +201,7 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
     // Here rather than only inside `drain_pending`, because this is the one
     // point every entry to the drain passes through. `device_drain` returns
     // before `drain_pending` when the device has no host ops, and
-    // `publish_stranded_fifos` re-publishes from `active_child_mask` — a ring
+    // `publish_stranded_fifos` re-publishes from the open-domain set — a ring
     // left unfolded would be invisible to both.
     crate::runtime::drain::fold_rung_child_doorbells(&mut inner.device.state);
     inner
@@ -416,7 +416,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
         // It is the one register that can be served this way, because it
         // carries no state the decode depends on — its effect is to say a
         // channel has work. `fold_rung_child_doorbells` turns the bit into
-        // `active_child_mask` / `pending.child_mask`, which is exactly what the
+        // the open-domain set / `pending.child_mask`, which is exactly what the
         // locked handler in `crate::runtime::mmio` does for the same register.
         //
         // The channel-number check mirrors that handler rather than trusting
@@ -675,7 +675,7 @@ pub fn device_poll(id: u64) -> bool {
     };
     let DeviceInner { device, actions } = &mut *d;
     let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
-    // Before the rescue reads `active_child_mask`, which is the mask a
+    // Before the rescue reads the open-domain set, which is the mask a
     // lock-free ring lands in only once folded. Without this the Dekker rescue
     // could not see the very channels the doorbell rail is responsible for.
     crate::runtime::drain::fold_rung_child_doorbells(&mut device.state);
