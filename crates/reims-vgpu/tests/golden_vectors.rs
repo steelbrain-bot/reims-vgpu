@@ -7,7 +7,6 @@
 
 use reims_vgpu::protocol::endian::{st32, st64};
 use reims_vgpu::protocol::pixel_format;
-use reims_vgpu::runtime::decode::blit;
 
 /// Never share the live product logs with a concurrent boot.
 fn isolate_logs() {
@@ -69,8 +68,15 @@ fn stream_segment_record_roundtrip_shape() {
     assert_eq!(kind, SegmentKind::Blit);
     let op = reims_vgpu::protocol::decode::op(commands, 0).expect("the record frames");
     assert_eq!(op.opcode(), 0x12d);
-    let blit_cmd = blit::decode(commands).unwrap();
-    assert_eq!(blit_cmd.opcode, 0x12d);
+    // 0x12d is `copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:`,
+    // and the lift that reads it in production is the protocol crate's. The
+    // vector's bytes are unchanged, so it still says what it always said — it
+    // now says it about the decoder the rail actually calls.
+    let record = reims_vgpu::protocol::decode::blit::decode(&op).expect("the vector lifts");
+    assert!(matches!(
+        record,
+        reims_vgpu::protocol::decode::blit::BlitRecord::BufferToBuffer(_)
+    ));
 }
 
 /// The same golden vector, through the lift that now reads it.
@@ -114,8 +120,9 @@ fn corpus_property_random_decode_no_panic() {
                 let _ = framed;
             }
         }
-        let _ = blit::decode(s);
         if let Ok(op) = reims_vgpu::protocol::decode::op(s, 0) {
+            let _ = reims_vgpu::protocol::decode::blit::decode(&op);
+            let _ = reims_vgpu::runtime::decode::blit_spi::decode(s);
             let _ = reims_vgpu::protocol::decode::sync::decode(
                 reims_vgpu::protocol::closure::Rail::Event,
                 &op,

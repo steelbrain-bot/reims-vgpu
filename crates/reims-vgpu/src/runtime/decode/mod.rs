@@ -1,6 +1,6 @@
 //! Framing and wire decoders (batch B).
 
-pub mod blit;
+pub mod blit_spi;
 pub mod compute;
 /// Cross-checks between the closure ledger and these decoders.
 #[cfg(test)]

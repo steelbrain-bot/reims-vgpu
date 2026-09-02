@@ -175,6 +175,27 @@ impl BlitRecord {
             Self::GenerateMipmaps(_) => BlitKind::GenerateMipmaps,
         }
     }
+
+    /// The guest refs this record reads from and writes to.
+    ///
+    /// Nine records name their endpoints under nine different field names, and
+    /// a reader that wants "what did this copy touch" — a failure line, a
+    /// residency census — otherwise has to restate the whole match to find out.
+    /// `None` is an end the record does not have: a fill has no source, and
+    /// `generateMipmapsForTexture:` reads and writes the same texture, so both
+    /// ends are it.
+    #[must_use]
+    pub const fn refs(&self) -> (Option<u32>, Option<u32>) {
+        match self {
+            Self::BufferToBuffer(r) => (Some(r.source_ref), Some(r.dest_ref)),
+            Self::BufferToTexture(r) => (Some(r.source_ref), Some(r.dest.texture_ref)),
+            Self::TextureToBuffer(r) => (Some(r.source.texture_ref), Some(r.dest_ref)),
+            Self::TextureRegion(r) => (Some(r.source.texture_ref), Some(r.dest.texture_ref)),
+            Self::TextureSlices(r) => (Some(r.source_ref), Some(r.dest_ref)),
+            Self::FillBuffer(r) => (None, Some(r.buffer_ref)),
+            Self::GenerateMipmaps(r) => (Some(r.texture_ref), Some(r.texture_ref)),
+        }
+    }
 }
 
 /// Lift a transfer record out of its bytes.
@@ -463,6 +484,101 @@ mod tests {
                 assert_eq!(source.origin.x, 0x11);
             }
             _ => panic!("wrong shapes"),
+        }
+    }
+
+    /// `copyFromTexture:toBuffer:` reads two bytes of `options`, not four.
+    ///
+    /// It is the one copy record that narrows the field, and reading it four
+    /// bytes wide once cost every depth-aspect copy on the rail: the two bytes
+    /// past it belong to no field, so on a guest's wire they hold whatever the
+    /// command ring last contained. They are poisoned here to stand in for
+    /// that, and the sibling that really is four bytes wide is read beside it
+    /// so this stays a per-record narrowing rather than a family rule.
+    #[test]
+    fn a_texture_to_buffer_copy_reads_no_byte_past_its_options() {
+        const CTB_OPTIONS: usize = core::mem::offset_of!(wire::CopyTextureToBuffer, options);
+        const CTB_LEN: usize = core::mem::size_of::<wire::CopyTextureToBuffer>();
+        for written in [0u16, 4] {
+            let mut payload = vec![0u8; CTB_LEN];
+            for b in payload.iter_mut().skip(CTB_OPTIONS + 2) {
+                *b = 0xAA;
+            }
+            payload[CTB_OPTIONS..CTB_OPTIONS + 2].copy_from_slice(&written.to_le_bytes());
+            let bytes = record(wire::OPCODE_COPY_TEXTURE_TO_BUFFER, &payload);
+            match decode_bytes(&bytes).expect("a well-formed copy lifts") {
+                BlitRecord::TextureToBuffer(r) => assert_eq!(
+                    r.options, written,
+                    "options picked up a byte the serializer never wrote"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        const CBT_OPTIONS: usize = core::mem::offset_of!(wire::CopyBufferToTexture, options);
+        const CBT_LEN: usize = core::mem::size_of::<wire::CopyBufferToTexture>();
+        let mut payload = vec![0u8; CBT_LEN];
+        payload[CBT_OPTIONS..CBT_OPTIONS + 4].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        match decode_bytes(&record(wire::OPCODE_COPY_BUFFER_TO_TEXTURE, &payload))
+            .expect("the sibling lifts")
+        {
+            BlitRecord::BufferToTexture(r) => assert_eq!(r.options, 0x0001_0000),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The `options:` region copy is four bytes longer than its plain sibling,
+    /// and a record written at the plain length is refused rather than having
+    /// its options word read out of the bytes after it.
+    #[test]
+    fn a_region_copy_with_options_is_refused_at_the_plain_forms_length() {
+        let plain_len = core::mem::size_of::<wire::CopyTextureRegion>();
+        let with_options = core::mem::size_of::<wire::CopyTextureRegionOptions>();
+        assert_eq!(with_options - plain_len, 4);
+        assert!(decode_bytes(&record(
+            wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS,
+            &vec![0u8; with_options]
+        ))
+        .is_ok());
+        assert!(matches!(
+            decode_bytes(&record(
+                wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS,
+                &vec![0u8; plain_len]
+            )),
+            Err(DecodeRefusal::Short { .. })
+        ));
+    }
+
+    /// The slice-and-level copy carries six `u16` after its two refs, and the
+    /// record keeps them in the order the wire writes them.
+    ///
+    /// Every fixture value is distinct so a crossed pair cannot read back
+    /// correct — the base slice and the base level of one end are adjacent
+    /// halves of one word, and swapping them copies a real region that is not
+    /// the one the guest named.
+    #[test]
+    fn a_slice_and_level_copy_lifts_its_six_counts_in_the_records_order() {
+        let mut payload = u32s(&[2121, 3131]);
+        for value in [1u16, 2, 3, 4, 5, 6] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        match decode_bytes(&record(wire::OPCODE_COPY_TEXTURE_SLICES, &payload))
+            .expect("the record lifts")
+        {
+            BlitRecord::TextureSlices(r) => assert_eq!(
+                r,
+                TextureSlices {
+                    source_ref: 2121,
+                    source_slice: 1,
+                    source_level: 2,
+                    dest_ref: 3131,
+                    dest_slice: 3,
+                    dest_level: 4,
+                    slice_count: 5,
+                    level_count: 6,
+                }
+            ),
+            other => panic!("{other:?}"),
         }
     }
 

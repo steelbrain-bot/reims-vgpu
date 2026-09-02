@@ -100,22 +100,85 @@ fn the_compute_decoder_recognises_every_compute_operation_the_ledger_records() {
     }
 }
 
+/// Every blit-rail row reaches exactly one decoder, and `classify` is what
+/// says which.
+///
+/// The rail no longer has *a* decoder. A record's class comes from the ledger
+/// row, and each class is lifted by the layer that owns its layout: the nine
+/// transfers by `reims_vgpu_protocol::decode::blit`, fences by `decode::sync`,
+/// the indirect-command hint by `decode::icb`, the content directives by
+/// `decode::resource_state`, and the four rows the ledger has **not settled**
+/// by this crate's `decode::blit_spi`.
+///
+/// So the claim the old single-decoder test made — "the decoder recognises
+/// every row" — is now two claims, and both are worth more than the one was:
+/// no row is dropped by every decoder, and no row is claimed by two. The
+/// second is the one a single decoder could not make at all, and it is the one
+/// that catches a settled row growing a second reading of its bytes.
 #[test]
-fn the_blit_decoder_recognises_every_blit_operation_the_ledger_records() {
-    use super::blit::{decode, DecodeStatus};
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Blit)
-        .filter_map(|o| o.opcode)
-    {
-        let refused_the_opcode = matches!(
-            decode(&zero_record(op, GENEROUS_PAYLOAD)),
-            Err(DecodeStatus::ErrUnknownOpcode)
-        );
-        assert!(
-            !refused_the_opcode,
-            "the closure ledger records blit {op:#x} and this rail's decoder \
-             refuses the opcode itself"
+fn every_blit_row_reaches_exactly_one_decoder_and_the_ledger_picks_it() {
+    use reims_vgpu_protocol::decode::{blit, icb, resource_state, sync};
+    for op in LEDGER.iter().filter(|o| o.rail == Rail::Blit) {
+        let Some(opcode) = op.opcode else { continue };
+        let bytes = zero_record(opcode, GENEROUS_PAYLOAD);
+        let framed = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+        // "Claims this record" means: does not refuse it for being an opcode
+        // this decoder does not own. A refusal for a payload of zeroes is a
+        // statement about the bytes, and a generously sized zero record is not
+        // a record any of these selectors would write.
+        let owns = |refused_opcode: bool| !refused_opcode;
+        let claimants: Vec<&str> = [
+            (
+                "transfer",
+                owns(matches!(
+                    blit::decode(&framed),
+                    Err(reims_vgpu_protocol::decode::DecodeRefusal::UnknownOpcode { .. })
+                        | Err(reims_vgpu_protocol::decode::DecodeRefusal::Unjudged { .. })
+                )),
+            ),
+            (
+                "sync",
+                owns(matches!(
+                    sync::decode(Rail::Blit, &framed),
+                    Err(reims_vgpu_protocol::decode::DecodeRefusal::UnknownOpcode { .. })
+                        | Err(reims_vgpu_protocol::decode::DecodeRefusal::Unjudged { .. })
+                )),
+            ),
+            (
+                "icb",
+                owns(matches!(
+                    icb::decode(Rail::Blit, &framed),
+                    Err(reims_vgpu_protocol::decode::DecodeRefusal::UnknownOpcode { .. })
+                        | Err(reims_vgpu_protocol::decode::DecodeRefusal::Unjudged { .. })
+                )),
+            ),
+            (
+                "resource_state",
+                owns(matches!(
+                    resource_state::decode(Rail::Blit, &framed),
+                    Err(reims_vgpu_protocol::decode::DecodeRefusal::UnknownOpcode { .. })
+                        | Err(reims_vgpu_protocol::decode::DecodeRefusal::Unjudged { .. })
+                )),
+            ),
+            (
+                "unsettled",
+                owns(matches!(
+                    super::blit_spi::decode(&bytes),
+                    Err(super::blit_spi::DecodeStatus::ErrUnknownOpcode)
+                )),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, claimed)| claimed.then_some(name))
+        .collect();
+        assert_eq!(
+            claimants.len(),
+            1,
+            "the closure ledger records blit {opcode:#x} ({}) and {} decoder(s) claim it: {claimants:?} \
+             — a row with none is work this device drops in silence, and a row with two is \
+             the second reading of one record's bytes the cutover exists to remove",
+            op.selector,
+            claimants.len(),
         );
     }
 }

@@ -25,7 +25,7 @@ use crate::protocol::fifo::{
 use crate::protocol::pixel_format::{self, ClearImageEncoding};
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
-use crate::runtime::decode::blit::{self, Kind as BlitKind};
+use crate::runtime::decode::blit_spi;
 use crate::runtime::decode::compute::{self, Kind as ComputeKind};
 use crate::runtime::decode::render::{
     self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
@@ -47,6 +47,7 @@ use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
 use reims_vgpu_core::operation::{OperationClass, OperationHome};
 use reims_vgpu_protocol::closure::Rail;
+use reims_vgpu_protocol::decode::blit::BlitRecord;
 use reims_vgpu_protocol::decode::sync::SyncRecord;
 use reims_vgpu_protocol::pass_action::{
     store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
@@ -1496,18 +1497,13 @@ impl crate::observe::Decline for IcbRecordDropped {
 /// this device does not have; the bytes form needs the staging buffer read and
 /// the pattern tiled across the region, and nothing converted. A single count
 /// could not tell which of those a driven boot is asking for.
-struct TextureFillDropped(blit::FillSource);
+struct TextureFillDropped(blit_spi::FillSource);
 
 impl crate::observe::Decline for TextureFillDropped {
     fn slug(&self) -> &'static str {
         match self.0 {
-            blit::FillSource::Color => "blit_fill_texture_color_dropped",
-            blit::FillSource::Bytes => "blit_fill_texture_bytes_dropped",
-            // Unreachable while both decode arms set the source: `FillSource`
-            // defaults to `None` and only a `Kind::FillTexture` gets here. A
-            // firing means a third fill form reached this kind without naming
-            // where its value comes from. A healthy zero.
-            blit::FillSource::None => "blit_fill_texture_source_unset",
+            blit_spi::FillSource::Color => "blit_fill_texture_color_dropped",
+            blit_spi::FillSource::Bytes => "blit_fill_texture_bytes_dropped",
         }
     }
 
@@ -1675,14 +1671,29 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // The two are one arm because they share one decoder. Which of them a
         // record is, is still asked: the decline arms inside are exactly the
         // unresolved rows.
-        Some(OperationClass::Blit) | None => handle_blit_device_decoded_record(
+        // The transfers. Nine records lifted by the protocol decoder that owns
+        // their layouts, and executed from the enum — the record's class and
+        // its field offsets are no longer one verdict.
+        Some(OperationClass::Blit) => handle_blit_transfer_record(
             state,
             host,
             task_id,
             opcode,
-            cmd_bytes,
+            &framed,
+            cmd_bytes.len(),
             record_started,
         ),
+        // The rows the ledger has **not settled**.
+        //
+        // `classify` answers `None` for an unresolved row, because a model that
+        // promises ordering and completion for everything in its vocabulary may
+        // not admit an operation it cannot describe. This device is not that
+        // model: it decodes those records and *declines* them, and the decline's
+        // count is the evidence that will settle the row. So an unsettled row
+        // goes to this rail's own decoder, which is the only thing that can
+        // name it — routing it to a generic line instead would delete the
+        // instrument that says how much of it a workload issues.
+        None => handle_blit_unsettled_record(task_id, opcode, cmd_bytes),
         // A class the blit rail does not carry at all. `classify` maps this
         // rail's settled opcodes onto four classes and this is none of them, so
         // reaching here means `classify` and this dispatch disagree about which
@@ -1697,10 +1708,10 @@ fn handle_blit_record<M: HostMemory + HostOps>(
             ));
         }
     }
-    if !matches!(record_class, Some(OperationClass::Blit) | None) {
+    if !matches!(record_class, Some(OperationClass::Blit)) {
         // The transfer arm charges its own clock inside
-        // `handle_blit_transfer_record`, which is where the decode it still
-        // owns happens.
+        // `handle_blit_transfer_record`, which is the only arm whose bucket
+        // depends on which record it lifted.
         let route = match record_class {
             Some(OperationClass::Fence) => "blitrec_fence_us",
             Some(OperationClass::ResourceState) => "blitrec_noop_us",
@@ -1758,34 +1769,121 @@ fn note_blit_icb_dropped(
         .fail_once(u64::from(opcode));
 }
 
-/// The records this rail still decodes for itself: the transfers, and the rows
-/// the closure ledger has not settled.
+/// The transfers: nine records that move bytes, lifted by the layer that owns
+/// their layouts.
 ///
-/// **The transfers are the remaining wiring step on this rail.**
-/// `reims_vgpu_protocol::decode::blit` lifts the same records into a
-/// `BlitRecord` enum; `blit_exec::execute_blit` takes the flat
-/// `blit::Command`, so moving one means moving the other and it is its own
-/// commit.
+/// The nine field orders do not rhyme — a buffer copy puts both refs first, a
+/// texture-to-buffer copy narrows its options word to sixteen bits where its
+/// sibling uses thirty-two, and the region copy's `options:` form is a
+/// different opcode at a different length. None of that is derivable from the
+/// selector, so all of it belongs to `reims_vgpu_protocol::decode::blit`, whose
+/// fields come from the pinned wire views. What is left here is the routing:
+/// which executor a lifted record reaches, and what is said when one refuses.
 ///
-/// **The unsettled rows are not a wiring step at all.** An unresolved row has
-/// no established contract, so no layer above the wire may give it a shape —
-/// and this device's decline of it, counted per record, is the measurement that
-/// settles it. The ICB reset and copy and the two texture fills are here for
-/// that reason and not because nothing has got round to them.
-fn handle_blit_device_decoded_record<M: HostMemory + HostOps>(
+/// `generateMipmapsForTexture:` is a transfer by opcode and a filter chain by
+/// execution, so it is answered here and not by `execute_blit` — the record
+/// names one texture and `runtime::mipmap` owns the chain.
+fn handle_blit_transfer_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
     opcode: u32,
-    cmd_bytes: &[u8],
+    framed: &reims_vgpu_wire::op::Op<'_>,
+    cmd_len: usize,
     record_started: std::time::Instant,
 ) {
-    let cmd = match blit::decode(cmd_bytes) {
+    let record = match reims_vgpu_protocol::decode::blit::decode(framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            note_blit_record_refused(task_id, opcode, cmd_len, &refusal);
+            return;
+        }
+    };
+    if let BlitRecord::GenerateMipmaps(m) = record {
+        match mipmap::generate_mipmaps_linear(state, host, task_id, m.texture_ref) {
+            MipmapStatus::Ok => {}
+            st => {
+                // Was `st={st:?}` with no `reason=` at all, so none of the
+                // eight outcomes was greppable and the Debug spelling was
+                // the only handle on which check refused.
+                if let Some(e) = crate::observe::Emit::refusal("blit_generate_mipmaps", &st) {
+                    e.field("resource", m.texture_ref).fail();
+                }
+            }
+        }
+    } else {
+        match blit_exec::execute_blit(state, host, task_id, &record) {
+            BlitStatus::Ok | BlitStatus::ZeroExtent => {}
+            st => {
+                // Icon/upload path often uses blit copies; fail-visible for RE.
+                // The reason names the specific failing site inside blit_exec
+                // that produced the coarse `st` — 177 checks collapse into
+                // eight statuses, so the status alone says almost nothing.
+                // `Refusal` supplies it, and an uninstrumented site now reads
+                // `blit_unattributed` rather than rendering a bare `reason=`.
+                //
+                // The endpoints and extents are the record's own Debug rather
+                // than a hand-picked list of fields: the fields a record has
+                // are the fields it has, and a list written here could name one
+                // the record does not carry.
+                let (src_ref, dst_ref) = record.refs();
+                let object_type = |r: Option<u32>| {
+                    r.and_then(|r| objects::lookup_list_entry(state, host, task_id, r))
+                        .map_or(0, |e| e.object_type)
+                };
+                let src_ty = object_type(src_ref);
+                let dst_ty = object_type(dst_ref);
+                if let Some(e) = crate::observe::Emit::refusal("blit_fail", &st) {
+                    e.field("st", format!("{st:?}"))
+                        .field("kind", format!("{:?}", record.kind()))
+                        .field("opcode", format!("{opcode:#x}"))
+                        .field("src_ty", src_ty)
+                        .field("dst_ty", dst_ty)
+                        .field("record", format!("{record:?}"))
+                        .fail();
+                }
+            }
+        }
+    }
+    crate::runtime::drain::note_store_route_us(
+        transfer_route(record.kind(), "us"),
+        record_started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route(transfer_route(record.kind(), "n"));
+}
+
+/// The census bucket a lifted transfer is charged to.
+///
+/// One function for the microsecond clock and the count, because the two used
+/// to be written as two matches over the same tag and a record could be counted
+/// in one bucket and timed in another.
+fn transfer_route(kind: reims_vgpu_protocol::blit::BlitKind, suffix: &str) -> &'static str {
+    use reims_vgpu_protocol::blit::BlitKind;
+    match (kind, suffix) {
+        (BlitKind::FillBuffer | BlitKind::FillBufferPattern4, "us") => "blitrec_fill_us",
+        (BlitKind::FillBuffer | BlitKind::FillBufferPattern4, _) => "blitrec_fill_n",
+        (BlitKind::GenerateMipmaps, "us") => "blitrec_noop_us",
+        (BlitKind::GenerateMipmaps, _) => "blitrec_noop_n",
+        (_, "us") => "blitrec_copy_us",
+        (_, _) => "blitrec_copy_n",
+    }
+}
+
+/// The rows the closure ledger has **not settled**, which this device decodes
+/// for itself and declines.
+///
+/// This is not a wiring step waiting to happen. An unresolved row has no
+/// established contract, so no layer above the wire may give it a shape — and
+/// this device's decline of it, counted per record, is the measurement that
+/// settles it. The indirect-command-buffer reset and copy and the two texture
+/// fills are here for that reason and not because nothing has got round to
+/// them.
+fn handle_blit_unsettled_record(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let cmd = match blit_spi::decode(cmd_bytes) {
         Ok(c) => c,
         // Was `Err(_) => return`: a decoded blit record dropped with no line at
         // all, which on a live boot is indistinguishable from a segment that
-        // carried no blit work. The status names which of the four checks
-        // refused.
+        // carried no blit work. The status names which of the checks refused.
         Err(status) => {
             if let Some(e) = crate::observe::Emit::refusal("blit_decode", &status) {
                 e.field("opcode", format!("{opcode:#x}"))
@@ -1795,20 +1893,8 @@ fn handle_blit_device_decoded_record<M: HostMemory + HostOps>(
             return;
         }
     };
-    match cmd.kind {
-        BlitKind::Resource if cmd.opcode == wire_blit::OPCODE_GENERATE_MIPMAPS => {
-            match mipmap::generate_mipmaps_linear(state, host, task_id, cmd.resource) {
-                MipmapStatus::Ok => {}
-                st => {
-                    // Was `st={st:?}` with no `reason=` at all, so none of the
-                    // eight outcomes was greppable and the Debug spelling was
-                    // the only handle on which check refused.
-                    if let Some(e) = crate::observe::Emit::refusal("blit_generate_mipmaps", &st) {
-                        e.field("resource", cmd.resource).fail();
-                    }
-                }
-            }
-        }
+    use crate::observe::Decline as _;
+    match cmd {
         // The indirect-command-buffer records the ledger has not settled: the
         // reset and the copy. Both change what a later `executeCommandsInBuffer:`
         // will run — a reset the device drops leaves commands live that the
@@ -1826,22 +1912,25 @@ fn handle_blit_device_decoded_record<M: HostMemory + HostOps>(
         // host ICBs on the Metal arm only, and it reads 0.00% on a driven x86
         // boot — so the count is what says whether an executor is worth building,
         // and for which of the two.
-        BlitKind::IcbRange | BlitKind::IcbCopy => {
-            use crate::observe::Decline as _;
-            let decline = IcbRecordDropped(cmd.opcode);
+        blit_spi::UnsettledRecord::IcbMutation {
+            range_location,
+            range_length,
+            ..
+        } => {
+            let decline = IcbRecordDropped(opcode);
             crate::runtime::drain::note_store_route(decline.slug());
             crate::observe::Emit::decline("blit_icb", &decline)
                 .field("task", task_id)
-                .field("range_loc", cmd.range_location)
-                .field("range_len", cmd.range_length)
-                .fail_once(u64::from(cmd.opcode));
+                .field("range_loc", range_location)
+                .field("range_len", range_length)
+                .fail_once(u64::from(opcode));
         }
-        // `fillTexture:…:color:` and `fillTexture:…:bytes:length:`. Unlike the
-        // invalidate above these are writes the guest expects to land, so a
-        // dropped one leaves the region holding what it held before and the
-        // guest reads back content it believes it just wrote. Counted and
-        // fail-visible, with the extent named, because the extent is what
-        // decides whether an executor is worth building.
+        // `fillTexture:…:color:` and `fillTexture:…:bytes:length:`. These are
+        // writes the guest expects to land, so a dropped one leaves the region
+        // holding what it held before and the guest reads back content it
+        // believes it just wrote. Counted and fail-visible, with the extent
+        // named, because the extent is what decides whether an executor is
+        // worth building.
         //
         // Not executed here on purpose. A texture fill needs the destination
         // resolved through the backing/5/11 rails, the region walked per row,
@@ -1849,96 +1938,28 @@ fn handle_blit_device_decoded_record<M: HostMemory + HostOps>(
         // texture's pixel format, which is a converter this device does not
         // have. The count is what says whether to build one, and for which of
         // the two sources.
-        BlitKind::FillTexture => {
-            use crate::observe::Decline as _;
-            let decline = TextureFillDropped(cmd.fill_source);
+        blit_spi::UnsettledRecord::TextureFill {
+            source,
+            texture,
+            level,
+            slice,
+            size,
+            ..
+        } => {
+            let decline = TextureFillDropped(source);
             crate::runtime::drain::note_store_route(decline.slug());
             crate::observe::Emit::decline("blit_fill_texture", &decline)
                 .field("task", task_id)
-                .field("texture", cmd.texture)
-                .field("level", cmd.level)
-                .field("slice", cmd.slice)
+                .field("texture", texture)
+                .field("level", level)
+                .field("slice", slice)
                 .field(
                     "extent",
-                    format!(
-                        "{}x{}x{}",
-                        cmd.fill_size.width, cmd.fill_size.height, cmd.fill_size.depth
-                    ),
+                    format!("{}x{}x{}", size.width, size.height, size.depth),
                 )
-                .fail_once(cmd.opcode as u64);
-        }
-        BlitKind::FillBuffer | BlitKind::FillBufferPattern4 | BlitKind::Copy => {
-            match blit_exec::execute_blit(state, host, task_id, &cmd) {
-                BlitStatus::Ok | BlitStatus::ZeroExtent => {}
-                st => {
-                    // Icon/upload path often uses blit copies; fail-visible for RE.
-                    // The reason names the specific failing site inside blit_exec
-                    // that produced the coarse `st` — 177 checks collapse into
-                    // eight statuses, so the status alone says almost nothing.
-                    // `Refusal` supplies it, and an uninstrumented site now reads
-                    // `blit_unattributed` rather than rendering a bare `reason=`.
-                    let src_ty = objects::lookup_list_entry(state, host, task_id, cmd.source)
-                        .map(|e| e.object_type)
-                        .unwrap_or(0);
-                    let dst_ty = objects::lookup_list_entry(state, host, task_id, cmd.destination)
-                        .map(|e| e.object_type)
-                        .unwrap_or(0);
-                    if let Some(e) = crate::observe::Emit::refusal("blit_fail", &st) {
-                        e.field("st", format!("{st:?}"))
-                            .field("kind", format!("{:?}", cmd.kind))
-                            .field("opcode", format!("{:#x}", cmd.opcode))
-                            .field("src", cmd.source)
-                            .field("src_ty", src_ty)
-                            .field("dst", cmd.destination)
-                            .field("dst_ty", dst_ty)
-                            .field("off", cmd.source_offset)
-                            .field(
-                                "lvl",
-                                format!("{}/{}", cmd.destination_level, cmd.source_level),
-                            )
-                            .field(
-                                "size",
-                                format!(
-                                    "{}x{}x{}",
-                                    cmd.source_size.width,
-                                    cmd.source_size.height,
-                                    cmd.source_size.depth
-                                ),
-                            )
-                            .fail();
-                    }
-                }
-            }
-        }
-        // Every kind the ledger calls a transfer is answered above. The rest of
-        // this device's `Kind` vocabulary belongs to the classes lifted by
-        // their own protocol decoders in the caller, so reaching one here would
-        // mean `classify` and this decoder disagree about which records are
-        // transfers.
-        kind => {
-            crate::observe::fail(format!(
-                "blit_transfer_not_a_transfer task={task_id} opcode={:#x} kind={kind:?} len={} \
-                 (the ledger calls this a transfer and this rail's decoder does not)",
-                cmd.opcode,
-                cmd_bytes.len()
-            ));
+                .fail_once(u64::from(opcode));
         }
     }
-    crate::runtime::drain::note_store_route_us(
-        match cmd.kind {
-            BlitKind::Copy => "blitrec_copy_us",
-            BlitKind::FillBuffer | BlitKind::FillBufferPattern4 => "blitrec_fill_us",
-            BlitKind::Resource => "blitrec_noop_us",
-            _ => "blitrec_other_us",
-        },
-        record_started.elapsed().as_micros() as u64,
-    );
-    crate::runtime::drain::note_store_route(match cmd.kind {
-        BlitKind::Copy => "blitrec_copy_n",
-        BlitKind::FillBuffer | BlitKind::FillBufferPattern4 => "blitrec_fill_n",
-        BlitKind::Resource => "blitrec_noop_n",
-        _ => "blitrec_other_n",
-    });
 }
 
 fn handle_render_record<M: HostMemory + HostOps>(

@@ -129,7 +129,6 @@ pub mod refusal;
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus, ResidentServe};
-use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::{GuestRamImport, ImportId};
@@ -138,6 +137,7 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::resident_target::ResidentTarget;
 use crate::runtime::writeback_debt::GvaWritebackDebt;
 pub(crate) use compute_session::ComputeSession;
+use reims_vgpu_protocol::decode::blit::TextureSlices as BlitSliceCopy;
 use std::sync::Arc;
 
 /// How a rail's own completion thread announces a finished stamp back to the
@@ -296,7 +296,7 @@ pub(crate) trait Backend: Copy {
         _state: &mut DeviceState,
         _host: &mut M,
         _task_id: u32,
-        _cmd: &BlitCommand,
+        _cmd: &BlitSliceCopy,
     ) -> Option<BlitStatus> {
         None
     }
@@ -1285,7 +1285,7 @@ impl Backend for SelectedBackend {
         state: &mut DeviceState,
         host: &mut M,
         task_id: u32,
-        cmd: &BlitCommand,
+        cmd: &BlitSliceCopy,
     ) -> Option<BlitStatus> {
         match self {
             #[cfg(feature = "backend-metal")]

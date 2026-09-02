@@ -8,7 +8,6 @@ use super::*;
 use crate::model::{DeviceId, FENCE_DOMAIN_BLIT, PAGE_SHIFT_ARM64E};
 use crate::protocol::endian::{st16, st32, st64};
 use crate::protocol::pixel_format::{MTL_FORMAT_BGRA8_UNORM, MTL_FORMAT_RGBA8_UNORM};
-use crate::runtime::decode::blit::{self, Point, Size};
 use crate::runtime::decode::resource::{
     list_object_entry_offset, LINEAR_DESC_HANDLE, LINEAR_DESC_MIN_LEN, LINEAR_DESC_SIZE,
     OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER, RESOURCE_PAGE_SHIFT,
@@ -16,6 +15,10 @@ use crate::runtime::decode::resource::{
 use crate::runtime::gva_mem::write_task_gva_arm64e;
 use crate::runtime::host::FakeHost;
 use crate::runtime::objects;
+use reims_vgpu_protocol::decode::blit::{
+    BlitRecord, BufferToBuffer, BufferToTexture, FillBuffer, FillPattern, Origin as Point, Size,
+    TextureEndpoint, TextureRegion, TextureSlices, TextureToBuffer,
+};
 
 /// The channel is the whole diagnostic for this rail: 177 checks collapse
 /// into eight statuses, so a refusal that reaches the dispatch line without a
@@ -77,15 +80,80 @@ fn blit_device() -> (FakeHost, DeviceState) {
     (host, state)
 }
 
-/// A copy command naming its two object refs. Every rectangular blit case
-/// starts here and then sets the one field it is about.
-fn copy_cmd(copy_kind: CopyKind, source: u32, destination: u32) -> Command {
-    let mut cmd = Command::default();
-    cmd.kind = Kind::Copy;
-    cmd.copy_kind = copy_kind;
-    cmd.source = source;
-    cmd.destination = destination;
-    cmd
+/// A texture endpoint at slice 0, level 0, origin 0 — what every rectangular
+/// case starts from before it sets the one field it is about.
+fn endpoint(texture_ref: u32) -> TextureEndpoint {
+    TextureEndpoint {
+        texture_ref,
+        slice: 0,
+        level: 0,
+        origin: Point::default(),
+    }
+}
+
+fn b2b(source_ref: u32, dest_ref: u32) -> BufferToBuffer {
+    BufferToBuffer {
+        source_ref,
+        source_offset: 0,
+        dest_ref,
+        dest_offset: 0,
+        size: 0,
+    }
+}
+
+fn b2t(source_ref: u32, dest_ref: u32) -> BufferToTexture {
+    BufferToTexture {
+        source_ref,
+        source_offset: 0,
+        bytes_per_row: 0,
+        bytes_per_image: 0,
+        size: Size::default(),
+        dest: endpoint(dest_ref),
+        options: 0,
+    }
+}
+
+fn t2b(source_ref: u32, dest_ref: u32) -> TextureToBuffer {
+    TextureToBuffer {
+        source: endpoint(source_ref),
+        size: Size::default(),
+        dest_ref,
+        dest_offset: 0,
+        bytes_per_row: 0,
+        bytes_per_image: 0,
+        options: 0,
+    }
+}
+
+fn t2t(source_ref: u32, dest_ref: u32) -> TextureRegion {
+    TextureRegion {
+        source: endpoint(source_ref),
+        dest: endpoint(dest_ref),
+        size: Size::default(),
+        options: 0,
+    }
+}
+
+fn t2t_slices(source_ref: u32, dest_ref: u32) -> TextureSlices {
+    TextureSlices {
+        source_ref,
+        source_slice: 0,
+        source_level: 0,
+        dest_ref,
+        dest_slice: 0,
+        dest_level: 0,
+        slice_count: 0,
+        level_count: 0,
+    }
+}
+
+fn fill(buffer_ref: u32, pattern: FillPattern) -> FillBuffer {
+    FillBuffer {
+        buffer_ref,
+        location: 0,
+        length: 0,
+        pattern,
+    }
 }
 
 /// Back `mapping_id` with one guest data page at `pfn` and mark it mapped.
@@ -212,9 +280,9 @@ fn a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy() {
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     rig(&mut host, &mut state);
-    let mut cmd = copy_cmd(CopyKind::BufferToBuffer, 7, 8);
+    let mut cmd = b2b(7, 8);
     cmd.size = LEN;
-    let st = execute_blit(&mut state, &mut host, 1, &cmd);
+    let st = execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToBuffer(cmd));
     assert_eq!(
         host.rewires_fired(),
         1,
@@ -273,50 +341,17 @@ fn range_fits_helper() {
 }
 
 #[test]
-fn decode_fill_and_plan() {
-    let mut v = vec![0u8; 0x20];
-    st32(&mut v[0..], wire_blit::OPCODE_FILL_BUFFER);
-    st32(&mut v[4..], 0x20);
-    st32(&mut v[8..], 3);
-    st64(&mut v[0x0c..], 0x10);
-    st64(&mut v[0x14..], 8);
-    v[0x1c] = 0xa5;
-    let cmd = blit::decode(&v).unwrap();
-    assert_eq!(cmd.kind, Kind::FillBuffer);
-    assert_eq!(cmd.buffer, 3);
-    assert_eq!(cmd.range_location, 0x10);
-    assert_eq!(cmd.range_length, 8);
-    assert_eq!(cmd.fill_value, 0xa5);
-}
-
-#[test]
-fn decode_b2b() {
-    let mut v = vec![0u8; 0x28];
-    st32(&mut v[0..], wire_blit::OPCODE_COPY_BUFFER_TO_BUFFER);
-    st32(&mut v[4..], 0x28);
-    st32(&mut v[8..], 1);
-    st32(&mut v[12..], 2);
-    st64(&mut v[0x10..], 4);
-    st64(&mut v[0x18..], 8);
-    st64(&mut v[0x20..], 16);
-    let cmd = blit::decode(&v).unwrap();
-    assert_eq!(cmd.copy_kind, CopyKind::BufferToBuffer);
-    assert_eq!(cmd.size, 16);
-    assert_eq!(cmd.source_offset, 4);
-    assert_eq!(cmd.destination_offset, 8);
-}
-
-#[test]
 fn fill_buffer_roundtrip() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 7, 1, 256);
-    let mut cmd = Command::default();
-    cmd.kind = Kind::FillBuffer;
-    cmd.buffer = 7;
-    cmd.range_location = 16;
-    cmd.range_length = 8;
-    cmd.fill_value = 0x5a;
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    let mut cmd = fill(7, FillPattern::Byte(0));
+    cmd.location = 16;
+    cmd.length = 8;
+    cmd.pattern = FillPattern::Byte(0x5a);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
+        BlitStatus::Ok
+    );
     let mut out = [0u8; 8];
     let gva = (1u64 << RESOURCE_PAGE_SHIFT) + 16;
     assert!(
@@ -338,13 +373,14 @@ fn fill_buffer_roundtrip() {
 fn fill_buffer_pattern4_roundtrip() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 7, 1, 256);
-    let mut cmd = Command::default();
-    cmd.kind = Kind::FillBufferPattern4;
-    cmd.buffer = 7;
-    cmd.range_location = 16;
-    cmd.range_length = 10;
-    cmd.fill_pattern = 0x89ab_cdef;
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    let mut cmd = fill(7, FillPattern::Pattern4(0));
+    cmd.location = 16;
+    cmd.length = 10;
+    cmd.pattern = FillPattern::Pattern4(0x89ab_cdef);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
+        BlitStatus::Ok
+    );
     let mut out = [0u8; 12];
     let gva = (1u64 << RESOURCE_PAGE_SHIFT) + 16;
     assert!(
@@ -371,14 +407,12 @@ fn fill_buffer_pattern4_roundtrip() {
 fn an_unaligned_pattern_fill_is_refused_rather_than_guessed() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 7, 1, 256);
-    let mut cmd = Command::default();
-    cmd.kind = Kind::FillBufferPattern4;
-    cmd.buffer = 7;
-    cmd.range_location = 17;
-    cmd.range_length = 8;
-    cmd.fill_pattern = 0x89ab_cdef;
+    let mut cmd = fill(7, FillPattern::Pattern4(0));
+    cmd.location = 17;
+    cmd.length = 8;
+    cmd.pattern = FillPattern::Pattern4(0x89ab_cdef);
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
         BlitStatus::Unsupported
     );
     assert_eq!(
@@ -406,7 +440,7 @@ fn an_unaligned_pattern_fill_is_refused_rather_than_guessed() {
 /// anything if the equivalence is checked.
 #[test]
 fn a_byte_fill_and_a_four_equal_byte_pattern_fill_write_the_same_bytes() {
-    let read_back = |cmd: &Command| {
+    let read_back = |cmd: &BlitRecord| {
         let (mut host, mut state) = blit_device();
         install_buffer(&mut host, &mut state, 7, 1, 256);
         assert_eq!(execute_blit(&mut state, &mut host, 1, cmd), BlitStatus::Ok);
@@ -418,17 +452,15 @@ fn a_byte_fill_and_a_four_equal_byte_pattern_fill_write_the_same_bytes() {
         );
         out
     };
-    let mut byte_fill = Command::default();
-    byte_fill.kind = Kind::FillBuffer;
-    byte_fill.buffer = 7;
-    byte_fill.range_location = 16;
-    byte_fill.range_length = 10;
-    byte_fill.fill_value = 0x5a;
-    let mut pattern_fill = byte_fill.clone();
-    pattern_fill.kind = Kind::FillBufferPattern4;
-    pattern_fill.fill_value = 0;
-    pattern_fill.fill_pattern = u32::from_le_bytes([0x5a; 4]);
-    assert_eq!(read_back(&byte_fill), read_back(&pattern_fill));
+    let mut byte_fill = fill(7, FillPattern::Byte(0x5a));
+    byte_fill.location = 16;
+    byte_fill.length = 10;
+    let mut pattern_fill = byte_fill;
+    pattern_fill.pattern = FillPattern::Pattern4(u32::from_le_bytes([0x5a; 4]));
+    assert_eq!(
+        read_back(&BlitRecord::FillBuffer(byte_fill)),
+        read_back(&BlitRecord::FillBuffer(pattern_fill))
+    );
 }
 
 /// The reason channel names *which* collapsed check fired for a coarse
@@ -440,37 +472,38 @@ fn blit_fail_reason_names_distinct_causes_and_resets_per_command() {
     install_buffer(&mut host, &mut state, 7, 1, 256);
 
     // ref==0 → MissingResource, reason "buf_ref_zero".
-    let mut cmd = Command::default();
-    cmd.kind = Kind::FillBuffer;
-    cmd.buffer = 0;
-    cmd.range_length = 8;
+    let mut cmd = fill(0, FillPattern::Byte(0));
+    cmd.length = 8;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
         BlitStatus::MissingResource
     );
     assert_eq!(blit_fail_reason(), "buf_ref_zero");
 
     // Unbound ref → same coarse status, DIFFERENT reason "buf_no_list_entry".
-    cmd.buffer = 42; // never installed
+    cmd.buffer_ref = 42; // never installed
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
         BlitStatus::MissingResource
     );
     assert_eq!(blit_fail_reason(), "buf_no_list_entry");
 
     // In-bounds range on a valid buffer → the channel is reset at entry and the
     // successful blit leaves it empty (no stale "buf_no_list_entry").
-    cmd.buffer = 7;
-    cmd.range_location = 16;
-    cmd.range_length = 8;
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    cmd.buffer_ref = 7;
+    cmd.location = 16;
+    cmd.length = 8;
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
+        BlitStatus::Ok
+    );
     assert_eq!(blit_fail_reason(), "");
 
     // Out-of-range fill on a valid buffer → Bounds, reason "fill_range_oob".
-    cmd.range_location = 250;
-    cmd.range_length = 64; // 250+64 > 256
+    cmd.location = 250;
+    cmd.length = 64; // 250+64 > 256
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
         BlitStatus::Bounds
     );
     assert_eq!(blit_fail_reason(), "fill_range_oob");
@@ -484,11 +517,14 @@ fn copy_buffer_to_buffer_roundtrip() {
     let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     let pat = [1u8, 2, 3, 4, 5, 6, 7, 8];
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva + 4, &pat);
-    let mut cmd = copy_cmd(CopyKind::BufferToBuffer, 1, 2);
+    let mut cmd = b2b(1, 2);
     cmd.source_offset = 4;
-    cmd.destination_offset = 8;
+    cmd.dest_offset = 8;
     cmd.size = 8;
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToBuffer(cmd)),
+        BlitStatus::Ok
+    );
     let mut out = [0u8; 8];
     let dst_gva = (2u64 << RESOURCE_PAGE_SHIFT) + 8;
     assert!(
@@ -502,12 +538,12 @@ fn copy_buffer_to_buffer_roundtrip() {
 fn copy_b2b_overlap_rejected() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 1, 1, 256);
-    let mut cmd = copy_cmd(CopyKind::BufferToBuffer, 1, 1);
+    let mut cmd = b2b(1, 1);
     cmd.source_offset = 0;
-    cmd.destination_offset = 4;
+    cmd.dest_offset = 4;
     cmd.size = 16;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToBuffer(cmd)),
         BlitStatus::Overlap
     );
 }
@@ -525,16 +561,19 @@ fn copy_buffer_to_mapper_ref_texture_roundtrip() {
     let mapping_id = 9u32;
     install_mapper_ref_texture(&mut host, &mut state, 3, mapping_id, 0x20);
 
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 3);
+    let mut cmd = b2t(1, 3);
     cmd.source_offset = 0;
-    cmd.source_bytes_per_row = 8;
-    cmd.source_size = Size {
+    cmd.bytes_per_row = 8;
+    cmd.size = Size {
         width: 2,
         height: 1,
         depth: 1,
     };
-    cmd.destination_origin = Point { x: 0, y: 1, z: 0 };
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    cmd.dest.origin = Point { x: 0, y: 1, z: 0 };
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
+        BlitStatus::Ok
+    );
 
     // Read back the written row via mapping_write.
     let mut back = [0u8; 8];
@@ -554,7 +593,10 @@ fn copy_buffer_to_mapper_ref_texture_roundtrip() {
     assert_eq!(back, pat);
     // Blit again — unified memory: pages are the only content; gen advances.
     let gen_before = state.mappings[&mapping_id].content_generation;
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
+        BlitStatus::Ok
+    );
     assert!(state.mappings[&mapping_id].content_generation > gen_before);
 }
 
@@ -580,13 +622,16 @@ fn copy_mapper_ref_texture_to_mapper_ref_texture_writes_dst_pages() {
         8
     ));
     // Origins default to zero: this is the whole 2×2 surface.
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
-    cmd.source_size = Size {
+    let mut cmd = t2t(3, 4);
+    cmd.size = Size {
         width: 2,
         height: 2,
         depth: 1,
     };
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
+        BlitStatus::Ok
+    );
     let mut back = [0u8; 16];
     assert!(mapping_write::read_rect_raw(
         &mut state,
@@ -629,26 +674,26 @@ fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
         depth: 1,
     };
 
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
-    cmd.source_size = over;
+    let mut cmd = t2t(3, 4);
+    cmd.size = over;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
         BlitStatus::Bounds
     );
     assert_eq!(blit_fail_reason(), "t2t_extent_oob");
 
-    let mut cmd = copy_cmd(CopyKind::TextureToBuffer, 3, 5);
-    cmd.source_size = over;
+    let mut cmd = t2b(3, 5);
+    cmd.size = over;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureToBuffer(cmd)),
         BlitStatus::Bounds
     );
     assert_eq!(blit_fail_reason(), "t2b_extent_oob");
 
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 5, 3);
-    cmd.source_size = over;
+    let mut cmd = b2t(5, 3);
+    cmd.size = over;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
         BlitStatus::Bounds
     );
     assert_eq!(blit_fail_reason(), "b2t_extent_oob");
@@ -656,13 +701,16 @@ fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
     // An extent that exactly fills the target is not past the edge. The bound
     // is inclusive, and a refusal here would decline every full-surface copy —
     // which is most of them.
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
-    cmd.source_size = Size {
+    let mut cmd = t2t(3, 4);
+    cmd.size = Size {
         width: 2,
         height: 2,
         depth: 1,
     };
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
+        BlitStatus::Ok
+    );
 }
 
 /// The reason channel names *which* collapsed check fired inside each of the
@@ -678,71 +726,74 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     install_buffer(&mut host, &mut state, 5, 5, 4096);
 
     // texture→texture: destination origin past a 2×2 target → Bounds.
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
-    cmd.destination_origin.x = 3; // > width 2
-    cmd.source_size = Size {
+    let mut cmd = t2t(3, 4);
+    cmd.dest.origin.x = 3; // > width 2
+    cmd.size = Size {
         width: 1,
         height: 1,
         depth: 1,
     };
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
         BlitStatus::Bounds
     );
     assert_eq!(blit_fail_reason(), "t2t_origin_oob");
 
     // texture→texture: a mapper-ref-texture endpoint with a non-zero z origin (mapper-ref-texture
     // is 2D) → Unsupported, a DIFFERENT reason under the same executor.
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
-    cmd.source_origin.z = 1;
-    cmd.source_size = Size {
+    let mut cmd = t2t(3, 4);
+    cmd.source.origin.z = 1;
+    cmd.size = Size {
         width: 1,
         height: 1,
         depth: 1,
     };
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
         BlitStatus::Unsupported
     );
     assert_eq!(blit_fail_reason(), "t2t_t11_z");
 
     // texture→buffer: source origin past bounds → Bounds "t2b_origin_oob".
-    let mut cmd = copy_cmd(CopyKind::TextureToBuffer, 3, 5);
-    cmd.source_origin.x = 3; // > width 2
-    cmd.source_size = Size {
+    let mut cmd = t2b(3, 5);
+    cmd.source.origin.x = 3; // > width 2
+    cmd.size = Size {
         width: 1,
         height: 1,
         depth: 1,
     };
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureToBuffer(cmd)),
         BlitStatus::Bounds
     );
     assert_eq!(blit_fail_reason(), "t2b_origin_oob");
 
     // buffer→texture: destination origin past bounds → Bounds "b2t_origin_oob".
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 5, 3);
-    cmd.destination_origin.x = 3; // > width 2
-    cmd.source_size = Size {
+    let mut cmd = b2t(5, 3);
+    cmd.dest.origin.x = 3; // > width 2
+    cmd.size = Size {
         width: 1,
         height: 1,
         depth: 1,
     };
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
         BlitStatus::Bounds
     );
     assert_eq!(blit_fail_reason(), "b2t_origin_oob");
 
     // A full-target valid mapper-ref-texture→mapper-ref-texture copy succeeds and resets the
     // channel, so no stale slug leaks into the next command's dispatch line.
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 3, 4);
-    cmd.source_size = Size {
+    let mut cmd = t2t(3, 4);
+    cmd.size = Size {
         width: 2,
         height: 2,
         depth: 1,
     };
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
+        BlitStatus::Ok
+    );
     assert_eq!(blit_fail_reason(), "");
 }
 
@@ -1106,15 +1157,18 @@ fn biplanar_mapper_ref_texture_y_and_uv_planes_distinct() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &y_pat);
     }
 
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 10); // Y
+    let mut cmd = b2t(1, 10); // Y
     cmd.source_offset = 0;
-    cmd.source_bytes_per_row = 4;
-    cmd.source_size = Size {
+    cmd.bytes_per_row = 4;
+    cmd.size = Size {
         width: 4,
         height: 2,
         depth: 1,
     };
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
+        BlitStatus::Ok
+    );
 
     // Y plane base 512, bpr 64: rows at 512 and 576.
     let mut row0 = [0u8; 4];
@@ -1166,14 +1220,17 @@ fn biplanar_mapper_ref_texture_y_and_uv_planes_distinct() {
         let buf_gva = 2u64 << crate::runtime::decode::resource::RESOURCE_PAGE_SHIFT;
         write_task_gva_arm64e(&mut host, &state.tasks[1], buf_gva, &uv_pat);
     }
-    cmd.destination = 11;
-    cmd.source_bytes_per_row = 4;
-    cmd.source_size = Size {
+    cmd.dest.texture_ref = 11;
+    cmd.bytes_per_row = 4;
+    cmd.size = Size {
         width: 2,
         height: 1,
         depth: 1,
     };
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
+        BlitStatus::Ok
+    );
 
     let mut uv = [0u8; 4];
     assert!(mapping_write::read_rect_raw_at(
@@ -1280,16 +1337,19 @@ fn copy_buffer_to_texture_view_view_of_mapper_ref_texture() {
     let pat = [0xaau8, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
     let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8); // texture-view
+    let mut cmd = b2t(1, 8); // texture-view
     cmd.source_offset = 0;
-    cmd.source_bytes_per_row = 8;
-    cmd.source_size = Size {
+    cmd.bytes_per_row = 8;
+    cmd.size = Size {
         width: 2,
         height: 1,
         depth: 1,
     };
-    cmd.destination_origin.y = 0;
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    cmd.dest.origin.y = 0;
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
+        BlitStatus::Ok
+    );
     let mut back = [0u8; 8];
     assert!(mapping_write::read_rect_raw(
         &mut state,
@@ -1322,15 +1382,15 @@ fn texture_view_swizzled_view_rejected_for_blit() {
         0,
         Some([4, 3, 2, 5]),
     );
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
-    cmd.source_size = Size {
+    let mut cmd = b2t(1, 8);
+    cmd.size = Size {
         width: 1,
         height: 1,
         depth: 1,
     };
-    cmd.source_bytes_per_row = 4;
+    cmd.bytes_per_row = 4;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
         BlitStatus::Unsupported
     );
 }
@@ -1350,15 +1410,15 @@ fn texture_view_level_base_on_mapper_ref_texture_rejected() {
         1, // level_base
         None,
     );
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
-    cmd.source_size = Size {
+    let mut cmd = b2t(1, 8);
+    cmd.size = Size {
         width: 1,
         height: 1,
         depth: 1,
     };
-    cmd.source_bytes_per_row = 4;
+    cmd.bytes_per_row = 4;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
         BlitStatus::Unsupported
     );
 }
@@ -1789,17 +1849,22 @@ fn copy_buffer_to_multilevel_view_l1() {
     let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
-    cmd.source_level = 1; // relative → absolute L1
-    cmd.destination_level = 1;
+    // The source is a buffer and has no levels; the destination level is the
+    // whole of what this record says about levels, and the record has no field
+    // for the other one to be set in.
+    let mut cmd = b2t(1, 8);
+    cmd.dest.level = 1;
     cmd.source_offset = 0;
-    cmd.source_bytes_per_row = 8;
-    cmd.source_size = Size {
+    cmd.bytes_per_row = 8;
+    cmd.size = Size {
         width: 2,
         height: 1,
         depth: 1,
     };
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
+        BlitStatus::Ok
+    );
 
     // Read L1 from texture handle 2 GVA + 32.
     let l1_gva = ((handle as u64) << RESOURCE_PAGE_SHIFT) + 32;
@@ -1818,16 +1883,16 @@ fn multilevel_view_relative_level_oob() {
     install_mapper_ref_texture(&mut host, &mut state, 3, 9, 0x20);
     // View over mapper-ref-texture with level_count=1, level_base=0; command level 1 is OOB.
     install_texture_view(&mut host, &mut state, 8, 3, MTL_FORMAT_BGRA8_UNORM, 0, None);
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, 8);
-    cmd.destination_level = 1; // relative 1 >= count 1
-    cmd.source_size = Size {
+    let mut cmd = b2t(1, 8);
+    cmd.dest.level = 1; // relative 1 >= count 1
+    cmd.size = Size {
         width: 1,
         height: 1,
         depth: 1,
     };
-    cmd.source_bytes_per_row = 4;
+    cmd.bytes_per_row = 4;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
         BlitStatus::Bounds
     );
 }
@@ -1855,43 +1920,19 @@ fn texture_view_type_helpers() {
 }
 
 #[test]
-fn decode_copy_slice_level_0x13e() {
-    use crate::runtime::decode::blit::{self};
-    let mut v = vec![0u8; 0x1c];
-    st32(&mut v[0..], wire_blit::OPCODE_COPY_TEXTURE_SLICES);
-    st32(&mut v[4..], 0x1c);
-    st32(&mut v[8..], 2);
-    st32(&mut v[12..], 3);
-    st16(&mut v[0x10..], 1);
-    st16(&mut v[0x12..], 0);
-    st16(&mut v[0x14..], 0);
-    st16(&mut v[0x16..], 1);
-    st16(&mut v[0x18..], 2);
-    st16(&mut v[0x1a..], 3);
-    let c = blit::decode(&v).unwrap();
-    assert_eq!(c.copy_kind, CopyKind::TextureToTextureSliceLevel);
-    assert_eq!(c.source, 2);
-    assert_eq!(c.destination, 3);
-    assert_eq!(c.source_slice, 1);
-    assert_eq!(c.destination_level, 1);
-    assert_eq!(c.slice_count, 2);
-    assert_eq!(c.level_count, 3);
-}
-
-#[test]
 fn slice_level_zero_counts_are_noop() {
     let (mut host, mut state) = blit_device();
-    let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 1, 2);
+    let mut cmd = t2t_slices(1, 2);
     cmd.slice_count = 0;
     cmd.level_count = 1;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd)),
         BlitStatus::ZeroExtent
     );
     cmd.slice_count = 1;
     cmd.level_count = 0;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd)),
         BlitStatus::ZeroExtent
     );
 }
@@ -2075,14 +2116,17 @@ fn whole_surface_0x13e_single_level_copy() {
     }
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
 
-    let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
+    let mut cmd = t2t_slices(2, 3);
     cmd.source_slice = 0;
     cmd.source_level = 0;
-    cmd.destination_slice = 0;
-    cmd.destination_level = 0;
+    cmd.dest_slice = 0;
+    cmd.dest_level = 0;
     cmd.slice_count = 1;
     cmd.level_count = 1;
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd)),
+        BlitStatus::Ok
+    );
 
     let mut back = vec![0u8; 32];
     assert!(gva_mem::read_task_gva(
@@ -2138,11 +2182,11 @@ fn a_mapper_ref_texture_whole_surface_copy_lands_every_row_in_order() {
         8
     ));
 
-    let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
+    let mut cmd = t2t_slices(2, 3);
     cmd.slice_count = 1;
     cmd.level_count = 1;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd)),
         BlitStatus::Ok,
         "a mapper-ref-texture to mapper-ref-texture whole-surface copy must execute"
     );
@@ -2183,14 +2227,14 @@ fn t2t_identity_self_copy_is_noop_ok() {
     }
     write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
 
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 2, 2); // same texture, same origin => identity
-    cmd.source_size = Size {
+    let mut cmd = t2t(2, 2); // same texture, same origin => identity
+    cmd.size = Size {
         width: 4,
         height: 2,
         depth: 1,
     };
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
         BlitStatus::Ok,
         "identity self-copy must succeed as a no-op, not Overlap"
     );
@@ -2221,15 +2265,15 @@ fn t2t_shifted_column_self_copy_moves_bytes() {
     }
     write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
     // Copy column x=0 (4 rows) to column x=2 within the same texture.
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 2, 2);
-    cmd.destination_origin.x = 2;
-    cmd.source_size = Size {
+    let mut cmd = t2t(2, 2);
+    cmd.dest.origin.x = 2;
+    cmd.size = Size {
         width: 1,
         height: 4,
         depth: 1,
     };
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
         BlitStatus::Ok,
         "disjoint shifted column copy must succeed, not phantom-Overlap"
     );
@@ -2256,14 +2300,17 @@ fn t2t_overlapping_self_copy_stages_the_source_region() {
     let gva = 4u64 << RESOURCE_PAGE_SHIFT;
     let pat: Vec<u8> = (0..64).map(|i| i as u8).collect();
     write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 4, 4);
-    cmd.destination_origin.x = 1; // src x[0,2), dst x[1,3) overlap at x=1
-    cmd.source_size = Size {
+    let mut cmd = t2t(4, 4);
+    cmd.dest.origin.x = 1; // src x[0,2), dst x[1,3) overlap at x=1
+    cmd.size = Size {
         width: 2,
         height: 4,
         depth: 1,
     };
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
+        BlitStatus::Ok
+    );
     let mut back = vec![0u8; 64];
     gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
         .expect("copied texture remains readable");
@@ -2295,14 +2342,17 @@ fn t2t_vertical_overlap_reads_every_source_row_before_writing() {
     }
     write_task_gva_arm64e(&mut host, &state.tasks[1], gva, &pat);
 
-    let mut cmd = copy_cmd(CopyKind::TextureToTexture, 5, 5);
-    cmd.destination_origin.y = 12;
-    cmd.source_size = Size {
+    let mut cmd = t2t(5, 5);
+    cmd.dest.origin.y = 12;
+    cmd.size = Size {
         width: 1,
         height: 18,
         depth: 1,
     };
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
+        BlitStatus::Ok
+    );
 
     let mut back = vec![0u8; pat.len()];
     gva_mem::read_task_gva(&host, &state.tasks[1], gva, &mut back, PAGE_SHIFT_ARM64E)
@@ -2372,10 +2422,13 @@ fn whole_surface_0x13e_two_levels() {
     write_task_gva_arm64e(&mut host, &state.tasks[1], base + 16, &l0_row1);
     write_task_gva_arm64e(&mut host, &state.tasks[1], base + 32, &l1);
 
-    let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
+    let mut cmd = t2t_slices(2, 3);
     cmd.slice_count = 1;
     cmd.level_count = 2;
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd)),
+        BlitStatus::Ok
+    );
 
     let dst = 3u64 << RESOURCE_PAGE_SHIFT;
     let mut back_l0 = [0u8; 16];
@@ -2456,12 +2509,15 @@ fn whole_surface_0x13e_volume_depth_planes() {
     }
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &vol);
 
-    let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
+    let mut cmd = t2t_slices(2, 3);
     cmd.source_slice = 0;
-    cmd.destination_slice = 0;
+    cmd.dest_slice = 0;
     cmd.slice_count = 1;
     cmd.level_count = 1;
-    assert_eq!(execute_blit(&mut state, &mut host, 1, &cmd), BlitStatus::Ok);
+    assert_eq!(
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd)),
+        BlitStatus::Ok
+    );
 
     let mut back = vec![0u8; 48];
     assert!(gva_mem::read_task_gva(
@@ -2480,11 +2536,11 @@ fn whole_surface_0x13e_volume_rejects_multi_slice() {
     let (mut host, mut state) = blit_device();
     install_linear_rgba_volume(&mut host, &mut state, 2, 2, 2, 2, 2, 8);
     install_linear_rgba_volume(&mut host, &mut state, 3, 3, 2, 2, 2, 8);
-    let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3);
+    let mut cmd = t2t_slices(2, 3);
     cmd.slice_count = 2; // Metal: 3D requires sliceCount==1
     cmd.level_count = 1;
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd)),
         BlitStatus::Unsupported
     );
 }
@@ -2494,14 +2550,14 @@ fn whole_surface_0x13e_volume_rejects_nonzero_slice() {
     let (mut host, mut state) = blit_device();
     install_linear_rgba_volume(&mut host, &mut state, 2, 2, 2, 2, 2, 8);
     install_linear_rgba_volume(&mut host, &mut state, 3, 3, 2, 2, 2, 8);
-    let mut cmd = copy_cmd(CopyKind::TextureToTextureSliceLevel, 2, 3); // Non-zero slice on 3D whole-surface is fail-closed (Metal forbids).
-                                                                        // Status may be Bounds
-                                                                        // (slice packing) or
-                                                                        // Unsupported (3D rule).
+    let mut cmd = t2t_slices(2, 3); // Non-zero slice on 3D whole-surface is fail-closed (Metal forbids).
+                                    // Status may be Bounds
+                                    // (slice packing) or
+                                    // Unsupported (3D rule).
     cmd.source_slice = 1;
     cmd.slice_count = 1;
     cmd.level_count = 1;
-    let st = execute_blit(&mut state, &mut host, 1, &cmd);
+    let st = execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd));
     assert!(
         matches!(st, BlitStatus::Bounds | BlitStatus::Unsupported),
         "expected Bounds or Unsupported, got {st:?}"
@@ -2576,7 +2632,7 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
     use crate::protocol::pixel_format::{
         MTL_FORMAT_A8_UNORM, MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, MTL_FORMAT_RGBA16_FLOAT,
     };
-    use crate::runtime::decode::blit::{
+    use reims_vgpu_protocol::blit::{
         MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL, MTL_BLIT_OPTION_NONE,
         MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL,
     };
@@ -2621,22 +2677,16 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
     );
 
     // copy_aspect_for_options: option bit -> (aspect, bpp).
-    let with_opts = |opts: u32| {
-        let mut cmd = Command::default();
-        cmd.has_options = true;
-        cmd.options = opts;
-        cmd
-    };
     // No option on a color format -> full aspect, no plane routing.
     assert_eq!(
-        copy_aspect_for_options(MTL_FORMAT_BGRA8_UNORM, &with_opts(MTL_BLIT_OPTION_NONE)),
+        copy_aspect_for_options(MTL_FORMAT_BGRA8_UNORM, MTL_BLIT_OPTION_NONE),
         Ok((BlitAspect::Full, 4)),
     );
     // Depth option on a depth-stencil format -> depth plane (4 B), no stencil.
     assert_eq!(
         copy_aspect_for_options(
             MTL_FORMAT_DEPTH32_FLOAT_STENCIL8,
-            &with_opts(MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL),
+            MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL,
         ),
         Ok((BlitAspect::Depth, 4)),
     );
@@ -2644,13 +2694,13 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
     assert_eq!(
         copy_aspect_for_options(
             MTL_FORMAT_DEPTH32_FLOAT_STENCIL8,
-            &with_opts(MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL),
+            MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL,
         ),
         Ok((BlitAspect::Stencil, 1)),
     );
     // Unknown option bit -> visible failure (no invented aspect).
     assert_eq!(
-        copy_aspect_for_options(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, &with_opts(1 << 8)),
+        copy_aspect_for_options(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, 1 << 8),
         Err(BlitStatus::Unsupported),
     );
 }
@@ -2821,16 +2871,16 @@ fn a_copy_follows_a_view_chain_as_deep_as_a_sample_does() {
     let pat = [0xaau8, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
     let src_gva = 1u64 << RESOURCE_PAGE_SHIFT;
     write_task_gva_arm64e(&mut host, &state.tasks[1], src_gva, &pat);
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, outermost);
+    let mut cmd = b2t(1, outermost);
     cmd.source_offset = 0;
-    cmd.source_bytes_per_row = 8;
-    cmd.source_size = Size {
+    cmd.bytes_per_row = 8;
+    cmd.size = Size {
         width: 2,
         height: 1,
         depth: 1,
     };
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
         BlitStatus::Ok,
         "the copy arm refused a chain the sample arm just followed"
     );
@@ -2898,16 +2948,16 @@ fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
         "the sample arm must refuse a chain past the contract depth"
     );
 
-    let mut cmd = copy_cmd(CopyKind::BufferToTexture, 1, outermost);
+    let mut cmd = b2t(1, outermost);
     cmd.source_offset = 0;
-    cmd.source_bytes_per_row = 8;
-    cmd.source_size = Size {
+    cmd.bytes_per_row = 8;
+    cmd.size = Size {
         width: 2,
         height: 1,
         depth: 1,
     };
     assert_eq!(
-        execute_blit(&mut state, &mut host, 1, &cmd),
+        execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
         BlitStatus::Unsupported,
         "the copy arm followed a chain the sample arm refused"
     );

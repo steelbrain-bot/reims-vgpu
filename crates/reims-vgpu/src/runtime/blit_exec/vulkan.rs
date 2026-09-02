@@ -49,19 +49,19 @@ pub(crate) fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    cmd: &TextureSlices,
 ) -> Option<BlitStatus> {
     use crate::runtime::drain::note_store_route;
     let key = crate::runtime::writeback_debt::GvaResourceKey {
         task_id,
-        texture_ref: cmd.source,
+        texture_ref: cmd.source_ref,
     };
     let debt = state.pending_writebacks.get_gva(key);
     if let Err(refusal) = gpu_whole_plane_admissible(
         cmd.level_count,
         cmd.slice_count,
-        cmd.source,
-        cmd.destination,
+        cmd.source_ref,
+        cmd.dest_ref,
         debt.is_some(),
     ) {
         note_store_route(refusal.route());
@@ -75,9 +75,9 @@ pub(crate) fn try_copy_whole_plane_on_gpu<M: HostMemory + HostOps>(
         state,
         host,
         task_id,
-        cmd.destination,
-        cmd.destination_level,
-        cmd.destination_slice,
+        cmd.dest_ref,
+        cmd.dest_level,
+        cmd.dest_slice,
     ) {
         Ok(t) => t,
         Err(_) => {

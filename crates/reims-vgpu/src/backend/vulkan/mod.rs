@@ -38,7 +38,6 @@ use crate::backend::{
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus, ResidentServe};
-use crate::runtime::decode::blit::Command as BlitCommand;
 use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::drain;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus, GvaSpan};
@@ -48,6 +47,7 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::render_writeback::SettleSite;
 use crate::runtime::scanout;
 use crate::runtime::writeback_debt::{GvaWindow, GvaWritebackDebt};
+use reims_vgpu_protocol::decode::blit::TextureSlices as BlitSliceCopy;
 
 /// The Vulkan rail's [`Backend`] handle.
 ///
@@ -402,7 +402,7 @@ impl Backend for VulkanBackend {
         state: &mut DeviceState,
         host: &mut M,
         task_id: u32,
-        cmd: &BlitCommand,
+        cmd: &BlitSliceCopy,
     ) -> Option<BlitStatus> {
         blit_exec::vulkan::try_copy_whole_plane_on_gpu(state, host, task_id, cmd)
     }
