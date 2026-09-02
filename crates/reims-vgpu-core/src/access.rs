@@ -50,8 +50,8 @@ use crate::identity::{ChannelId, ResourceId};
 ///
 /// This crate consumes `BackingId`s and cannot mint one: minting requires
 /// reading a guest descriptor and a page table, which is the device's. A survey
-/// of what this interface's objects actually name found that the device cannot
-/// mint one correctly yet either, and the reason is a contract question rather
+/// of what this interface's objects actually name found that the device could
+/// not mint one correctly either, and the reason was a contract question rather
 /// than missing code. Recorded here, at the type that demands the value,
 /// because the failure mode is silent: an id that is *too distinct* — two names
 /// for one piece of storage getting different ids — makes
@@ -59,9 +59,13 @@ use crate::identity::{ChannelId, ResourceId};
 /// that was ordering a real read against a real write. Nothing refuses, nothing
 /// logs, and the frame is wrong intermittently.
 ///
-/// Two of the three joins are settled. The one that is not is named here with
-/// what would settle it — a value somebody has to supply, not a question
-/// somebody has to think about.
+/// Two of the three joins are settled, and the device mints against both of
+/// them now — an address-named window through one entry point, a mapping's
+/// surface through the other, interned from one counter so the two key spaces
+/// are one identity space. The join that is not settled is named below with
+/// what would settle it: a value somebody has to supply, not a question
+/// somebody has to think about. An object whose identity turns on it is refused
+/// by name and never approximated.
 ///
 /// ## Settled: every name this device can see is a window of one address space
 ///

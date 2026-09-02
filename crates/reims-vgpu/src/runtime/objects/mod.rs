@@ -1783,20 +1783,29 @@ fn holder_still_names<M: HostMemory>(
 ///
 /// `reims_vgpu_core::access::BackingId` is the identity two resources sharing
 /// backing must share, and the derivation this device is committed to is the
-/// window plus an incarnation. The incarnation is counted *per reference*:
-/// `replace_physical` advances the count for the reference its packet names and
-/// for no other, because that is the only name the packet carries.
+/// window plus an incarnation. The incarnation was counted *per reference*,
+/// because a re-point packet names a reference and nothing else.
 ///
 /// That is canonical exactly as long as one window has one live name. If two
-/// references in one task ever name one window, then re-pointing through one of
-/// them advances that reference's count and leaves the other where it was — and
-/// the same bytes then carry two ids. Two ids for one backing is a hazard edge
-/// the dependency compiler never draws, which is a data race, and it is the
-/// failure direction `BackingId`'s own doc calls false distinctness.
+/// references in one task name one window, then re-pointing through one of them
+/// advances that reference's count and leaves the other where it was — and the
+/// same bytes carry two ids. Two ids for one backing is a hazard edge the
+/// dependency compiler never draws, which is a data race, and it is the failure
+/// direction `BackingId`'s own doc calls false distinctness.
 ///
-/// So this is not a diagnostic about tidiness. **A single sighting falsifies
-/// the derivation** and says the count has to move from the reference to the
-/// window. A boot that never sights one is the evidence that it does not.
+/// So this was never a diagnostic about tidiness: a single sighting falsifies
+/// the derivation. **It sighted one.** A driven macos-15 boot examined 74
+/// collisions and one was a genuine alias — two live references over a single
+/// 8 294 400-byte window, 1920×1080×4, the compositor's own scanout allocation
+/// and so the most hazard-critical backing on the device. The count moved from
+/// the reference to the window, which is where `DeviceState::storage_incarnation`
+/// keeps it now.
+///
+/// That is not the end of this instrument's job. It still adjudicates every
+/// collision, and it is what fills the aliased-reference set the per-reference
+/// state that *remains* is checked against — see
+/// [`note_reference_shares_storage`]. A second sighting on a window nothing has
+/// re-keyed is still a finding.
 ///
 /// # The confound this has to exclude, and how
 ///
@@ -1855,9 +1864,9 @@ fn note_backing_window_alias<M: HostMemory>(
     crate::observe::fail(format!(
         "backing_window_alias task={task_id} base={base:#x} size={size} \
          refs=[{holder},{obj_ref}] (two live references in one task name one \
-         guest-VA window, so a per-reference incarnation gives the same bytes \
-         two backing identities and a re-point through one leaves the other \
-         claiming the old frames; the count belongs on the window)"
+         guest-VA window; the storage incarnation is keyed on the window so both \
+         names move together, and this line is what any per-reference state \
+         still standing for storage has to be checked against)"
     ));
     Some(holder)
 }
