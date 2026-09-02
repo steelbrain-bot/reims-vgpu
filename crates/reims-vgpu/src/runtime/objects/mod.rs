@@ -2033,13 +2033,14 @@ pub fn declared_storage(
 /// identity of a mapping's surface storage, and that is the whole of what this
 /// trait asks.
 ///
-/// The object half is not implementable yet and its absence is not an oversight:
-/// `RefResolver` answers a `ResourceId`, which carries a slot *generation*, and
-/// generations are `reims_vgpu_core::namespace::Namespace`'s to issue. This
-/// device has no namespace yet; it has a construction cache keyed by
-/// `(task, reference)` with no generation in it. Implementing the trait over
-/// that cache would mint generations from nothing, which is the second lifetime
-/// model the replacement plan forbids.
+/// The object half is answered by [`TaskRefResolver`], and what unblocked it was
+/// the device taking a namespace: `RefResolver` answers a `ResourceId`, which
+/// carries a slot *generation*, and generations are
+/// `reims_vgpu_core::namespace::Namespace`'s to issue. While this device had
+/// only a construction cache keyed by `(task, reference)` with no generation in
+/// it, implementing the trait over that cache would have minted generations from
+/// nothing — the second lifetime model the replacement plan forbids. It now has
+/// the namespace, so the answer is the namespace's and is not minted here.
 ///
 /// # A refusal is `None`, and that is the trait's own shape
 ///
@@ -2055,6 +2056,56 @@ impl reims_vgpu_core::resolve::MappingResolver for DeviceState {
         mapping: reims_vgpu_core::identity::MappingId,
     ) -> Option<reims_vgpu_core::access::BackingId> {
         mapping_backing_id(self, mapping.0).ok()
+    }
+}
+
+/// The device answering the semantic model's object-namespace resolver, for one
+/// task.
+///
+/// # Why this is a borrow of the device and not the device
+///
+/// `reims_vgpu_core::resolve::RefResolver::resource` takes an `object_ref` and
+/// nothing else, because in the model a resolver *is* one namespace: the
+/// interpreter that holds one is already inside the task whose refs it is
+/// resolving. This device holds every task's namespace at once, keyed by
+/// `task_id`, so it cannot implement the trait itself without inventing an
+/// answer to "which task" — and the two plausible inventions, a current-task
+/// field or a default, are both a place for the wrong namespace to answer a
+/// well-formed question.
+///
+/// So the task is bound at construction and the trait is implemented on the
+/// binding. A caller that has not said which task cannot ask, which is the
+/// property the trait's shape assumes and this device would otherwise not have.
+///
+/// # It resolves and does not lease
+///
+/// [`DeviceState::object_name`] is the whole implementation, and it asks the
+/// namespace's non-consuming door. A resolver that took a lease would be a claim
+/// on a resource nobody acquired, made by a lookup — the dependency compiler
+/// resolves refs to draw edges, not to hold things.
+#[derive(Clone, Copy)]
+pub struct TaskRefResolver<'a> {
+    state: &'a DeviceState,
+    task_id: u32,
+}
+
+impl<'a> TaskRefResolver<'a> {
+    /// Bind this device's resolution to one task's namespace.
+    #[must_use]
+    pub const fn new(state: &'a DeviceState, task_id: u32) -> Self {
+        Self { state, task_id }
+    }
+
+    /// The task whose namespace this answers from.
+    #[must_use]
+    pub const fn task_id(self) -> u32 {
+        self.task_id
+    }
+}
+
+impl reims_vgpu_core::resolve::RefResolver for TaskRefResolver<'_> {
+    fn resource(&self, object_ref: u32) -> Option<reims_vgpu_core::identity::ResourceId> {
+        self.state.object_name(self.task_id, object_ref)
     }
 }
 

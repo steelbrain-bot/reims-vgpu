@@ -3767,3 +3767,59 @@ fn a_heap_placement_is_refused_an_identity_rather_than_given_a_number() {
          an allocation would use are its own header"
     );
 }
+
+/// The device answers the model's object resolver, per task, and two tasks
+/// holding the same reference number get two different answers.
+///
+/// The trait resolves `object_ref` and nothing else, so the whole question this
+/// test exists for is whether the *right* namespace answered. Two tasks reusing
+/// one reference number is the ordinary case on this interface — a reference is
+/// an index into the task's own object list — and a resolver that let one task's
+/// list answer for another's would hand the dependency compiler a `ResourceId`
+/// for storage the asking task cannot reach.
+#[test]
+fn the_device_answers_the_models_object_resolver_from_the_bound_tasks_namespace() {
+    use super::TaskRefResolver;
+    use reims_vgpu_core::resolve::RefResolver as _;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let (task, ref_) = (1u32, 1u32);
+
+    assert_eq!(
+        TaskRefResolver::new(&state, task).resource(ref_),
+        None,
+        "a slot nothing has been constructed into names nothing"
+    );
+
+    resolve_resource(&state, &host, task, ref_).expect("construction");
+    let name = state
+        .object_name(task, ref_)
+        .expect("construction names it");
+    assert_eq!(
+        TaskRefResolver::new(&state, task).resource(ref_),
+        Some(name),
+        "the model gets the name the device's own callers get, not a second \
+         identity for one object"
+    );
+
+    // A task that has never been defined has no namespace, and a reference
+    // number it shares with a live task must not reach into that task's list.
+    assert_eq!(
+        TaskRefResolver::new(&state, task + 1).resource(ref_),
+        None,
+        "the binding is what decides which namespace answers, and an unbound \
+         task's namespace is empty rather than the neighbouring task's"
+    );
+    assert_eq!(
+        TaskRefResolver::new(&state, task + 1).task_id(),
+        task + 1,
+        "and the binding says which task it is, so a caller can check"
+    );
+
+    // The name stops resolving when the object does, through the trait as
+    // through every other door.
+    assert!(state.delete_object(task, ref_));
+    assert_eq!(TaskRefResolver::new(&state, task).resource(ref_), None);
+}

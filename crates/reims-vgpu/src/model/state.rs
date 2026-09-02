@@ -3763,7 +3763,7 @@ impl DeviceState {
     /// Returns the whole [`Declared`], displacement included, because a
     /// declaration over a slot that still held a live object is an event with an
     /// owed teardown and dropping it would leak the previous occupant's storage.
-    #[must_use]
+    /// `Declared` carries the `#[must_use]` itself, so it is not restated here.
     pub fn declare_object(
         &self,
         task_id: u32,
