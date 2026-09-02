@@ -4389,6 +4389,19 @@ fn note_channel_transition_verdict(
 /// `child_packet_domain_defined` is the denominator's other half — without it a
 /// boot where every packet's domain was defined and a boot where the guest sent
 /// no child packets at all read the same.
+///
+/// # What a driven boot answered
+///
+/// x86 Vulkan, macos-15, 391 s to the desktop with a guest frame presented:
+/// **`child_packet_domain_defined=1395`, `child_packet_domain_undefined=0`**.
+/// Every child packet this guest sent was on a domain a `CmdDefineChannel` had
+/// opened, so the model's `ChannelNotOpen` gate would have refused none of
+/// them. The doorbell-only path is real in this device's code and this guest
+/// does not carry packets on a domain it did not define.
+///
+/// That is one of the three terms the channel-lifetime group needs, and it is
+/// the one that would have been a hang. The other two are what
+/// [`note_channel_transition_verdict`] counts, and they are not hangs.
 fn note_packet_domain_definition(state: &DeviceState, channel_id: u32, opcode: u16) {
     let defined = state.channels_defined_by_packet & (1u32 << channel_id) != 0;
     if defined {
