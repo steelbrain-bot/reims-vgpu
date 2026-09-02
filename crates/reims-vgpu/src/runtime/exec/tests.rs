@@ -597,8 +597,8 @@ fn multi_attachment_decode_in_pass() {
             1.0f64.to_bits(),
         );
     }
-    let a0 = decode_color_attachment(&payload, 0);
-    let a1 = decode_color_attachment(&payload, 1);
+    let a0 = render::decode_color_attachment(&payload, 0);
+    let a1 = render::decode_color_attachment(&payload, 1);
     assert_eq!(a0.texture_ref, 41);
     assert_eq!(a1.texture_ref, 42);
     let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
@@ -696,7 +696,11 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
         PASS_ATTACH_TEXREF, PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF,
     };
     let pass = |level: u16, resolve: u32| {
-        let mut payload = vec![0u8; 0x200];
+        // The record's own length. A pass descriptor shorter than
+        // `RenderPassBody` is refused now rather than read at whichever offsets
+        // fit, so a fixture that was 0x200 bytes was testing a record Apple's
+        // serializer does not emit.
+        let mut payload = vec![0u8; wire_pass::RENDER_PASS_TOTAL_LEN as usize - OP_HEADER_LEN];
         st32(
             &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
             77,
@@ -1130,11 +1134,12 @@ fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_
     use crate::protocol::endian::st32;
     use crate::runtime::decode::render::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
-        PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
+        PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF,
     };
 
     let pass_resolving = |level: u16, slice: u16, plane: u16, resolve: u32| {
-        let total = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
+        // Full length: see `an_unsupported_depth_attachment_is_named_not_just_dropped`.
+        let total = wire_pass::RENDER_PASS_TOTAL_LEN as usize;
         let mut cmd = vec![0u8; total];
         st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
         st32(&mut cmd[4..], total as u32);
@@ -1325,17 +1330,15 @@ fn the_pass_extent_census_scores_either_resolve_arm() {
     use crate::runtime::drain::store_route_count;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let cmd = crate::runtime::decode::render::Command {
-        pass_render_target_width: 960,
-        pass_render_target_height: 540,
-        ..Default::default()
-    };
+    // The pass's stated extent, which is the only thing the census reads off
+    // the record — the two numbers rather than a whole decoded command.
+    let extent = (960u64, 540u64);
     // One mapping, reached by the id either arm would hand over.
     assert!(state.map_surface(7));
     let _ = state.set_mapping_geom(7, 1920, 1080, 0);
 
     let before = store_route_count("pass_extent_le25");
-    note_pass_extent_for_slot(&state, 1, 0, 7, &cmd);
+    note_pass_extent_for_slot(&state, 1, 0, 7, extent);
     assert_eq!(
         store_route_count("pass_extent_le25"),
         before + 1,
@@ -1347,8 +1350,8 @@ fn the_pass_extent_census_scores_either_resolve_arm() {
     // the census is defined on slot 0, the second because there is no
     // fraction to take.
     let before: u64 = PASS_EXTENT_SLUGS.iter().map(|s| store_route_count(s)).sum();
-    note_pass_extent_for_slot(&state, 1, 1, 7, &cmd);
-    note_pass_extent_for_slot(&state, 1, 0, 4242, &cmd);
+    note_pass_extent_for_slot(&state, 1, 1, 7, extent);
+    note_pass_extent_for_slot(&state, 1, 0, 4242, extent);
     assert_eq!(
         PASS_EXTENT_SLUGS
             .iter()
@@ -7172,4 +7175,177 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             "{selector} ({opcode:#x}) refused the stream's draws"
         );
     }
+}
+
+/// A pass descriptor shorter than the record refuses instead of reading the
+/// attachments that happen to fit.
+///
+/// **This is the reading W11c changed, and it is asserted in both directions.**
+/// The legacy decoder accepted anything from depth + stencil + one colour slot
+/// and answered the other seven slots as unattached — which is exactly what a
+/// guest attaching one slot also produces, so a truncated descriptor and a
+/// one-attachment pass were the same state. Apple's serializer writes all 592
+/// bytes. The short form is now named under the row's own opcode and moves no
+/// pass state; the full-length record with the same first attachment is
+/// honoured, which is what says the refusal is about the length and not about
+/// the bytes.
+#[test]
+fn a_pass_descriptor_short_of_its_record_is_refused_rather_than_read_at_the_offsets_that_fit() {
+    use crate::runtime::decode::render::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
+
+    let pass = |payload_len: usize| {
+        let mut payload = vec![0u8; payload_len];
+        st32(
+            &mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            4242,
+        );
+        let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
+        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
+        st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
+        cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
+        cmd
+    };
+    let run = |cmd: &[u8]| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_pass::OPCODE_RENDER_PASS,
+            cmd,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    let full = wire_pass::RENDER_PASS_TOTAL_LEN as usize - OP_HEADER_LEN;
+    let honoured = run(&pass(full));
+    assert_eq!(
+        honoured.color_slots.len(),
+        1,
+        "the full-length record's colour slot 0 must still reach the slot list"
+    );
+
+    // One byte short of the record. Every offset this attachment lives at is
+    // still inside the buffer, which is precisely why the old reading could not
+    // tell the two apart.
+    let short = run(&pass(full - 1));
+    assert!(
+        short.color_slots.is_empty()
+            && short.clears.is_empty()
+            && short.color_targets.is_empty()
+            && short.depth_attach.is_none()
+            && short.stencil_attach.is_none(),
+        "a short pass descriptor moved pass state: {short:?}"
+    );
+}
+
+/// Each store-action override lands on the attachment its own target names.
+///
+/// The record's target is a `StoreActionTarget` and not an opcode read a second
+/// time, so the fourth case the legacy arm carried — a store action for none of
+/// the three — is unrepresentable. What is still worth asserting is that the
+/// three that do exist do not reach each other: a colour override landing on the
+/// depth attachment, or on the wrong colour slot, changes what the pass
+/// publishes to guest pages with nothing on any channel to say so.
+#[test]
+fn each_store_action_override_reaches_the_attachment_its_target_names() {
+    use crate::runtime::decode::render::{PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF};
+    use crate::runtime::decode::render::{PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE};
+    use crate::runtime::decode::render::{PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF};
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    // A pass declaring colour slots 0 and 3, a depth and a stencil attachment,
+    // every one of them `DontCare` so an override to `Store` is visible.
+    let mut payload = vec![0u8; wire_pass::RENDER_PASS_TOTAL_LEN as usize - OP_HEADER_LEN];
+    for (base, texture_ref) in [
+        (PASS_DEPTH_ATTACH_OFF, 44u32),
+        (PASS_STENCIL_ATTACH_OFF, 55),
+        (PASS_COLOR_ATTACH_OFF, 41),
+        (PASS_COLOR_ATTACH_OFF + 3 * PASS_COLOR_ATTACH_STRIDE, 43),
+    ] {
+        st32(&mut payload[base + PASS_ATTACH_TEXREF..], texture_ref);
+        st16(&mut payload[base + PASS_ATTACH_STORE_ACTION..], 0);
+    }
+    let mut descriptor = vec![0u8; OP_HEADER_LEN + payload.len()];
+    st32(&mut descriptor[0..], wire_pass::OPCODE_RENDER_PASS);
+    st32(&mut descriptor[4..], (OP_HEADER_LEN + payload.len()) as u32);
+    descriptor[OP_HEADER_LEN..].copy_from_slice(&payload);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_pass::OPCODE_RENDER_PASS,
+        &descriptor,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(acc.color_slots.len(), 2, "the pass declared slots 0 and 3");
+    assert!(acc.depth_attach.is_some() && acc.stencil_attach.is_some());
+
+    // `setColorStoreAction:atIndex:` — a 32-bit action then the slot index.
+    let colour = |action: u32, index: u32| {
+        let mut v = vec![0u8; wire_r::SET_COLOR_STORE_ACTION_TOTAL_LEN as usize];
+        st32(&mut v[0..], wire_r::OPCODE_SET_COLOR_STORE_ACTION);
+        st32(&mut v[4..], wire_r::SET_COLOR_STORE_ACTION_TOTAL_LEN);
+        st32(&mut v[OP_HEADER_LEN..], action);
+        st32(&mut v[OP_HEADER_LEN + 4..], index);
+        v
+    };
+    // The depth and stencil forms carry no index: one 64-bit action.
+    let bare = |op: u32, action: u64| {
+        let mut v = vec![0u8; wire_r::SET_MODE_TOTAL_LEN as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], wire_r::SET_MODE_TOTAL_LEN);
+        st64(&mut v[OP_HEADER_LEN..], action);
+        v
+    };
+
+    // `setColorStoreAction:atIndex:` naming slot 3, then the depth and stencil
+    // forms — all three against one pass that declares all four attachments, so
+    // an override reaching the wrong one is visible rather than merely absent.
+    for command in [
+        colour(MTL_STORE_ACTION_STORE.into(), 3),
+        bare(
+            wire_r::OPCODE_SET_DEPTH_STORE_ACTION,
+            MTL_STORE_ACTION_STORE.into(),
+        ),
+        bare(
+            wire_r::OPCODE_SET_STENCIL_STORE_ACTION,
+            MTL_STORE_ACTION_STORE.into(),
+        ),
+    ] {
+        let opcode = ld32(&command[0..]);
+        handle_render_record(&mut state, &host, 1, opcode, &command, &mut out, &mut acc);
+    }
+
+    let slot0 = acc.color_slots.iter().find(|(s, _)| *s == 0).unwrap().1;
+    let slot3 = acc.color_slots.iter().find(|(s, _)| *s == 3).unwrap().1;
+    assert_eq!(
+        slot0.store_action, 0,
+        "the colour override named slot 3 and reached slot 0"
+    );
+    assert_eq!(
+        slot3.store_action, MTL_STORE_ACTION_STORE,
+        "the colour override did not reach the slot its index names"
+    );
+    assert_eq!(
+        acc.depth_attach.unwrap().store_action,
+        MTL_STORE_ACTION_STORE,
+        "the depth override did not reach the depth attachment"
+    );
+    assert_eq!(
+        acc.stencil_attach.unwrap().store_action,
+        MTL_STORE_ACTION_STORE,
+        "the stencil override did not reach the stencil attachment"
+    );
 }

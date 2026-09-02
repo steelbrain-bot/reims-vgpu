@@ -898,7 +898,7 @@ pub fn opcode_supported(opcode: u32) -> bool {
 /// So a pass rendering into array slice 1 — a cube face, a texture-array layer,
 /// a layered shadow map — reported mip level 65536 and lost its slice entirely.
 /// Both are decoded now.
-fn color_from_wire(c: &wire_pass::ColorAttachmentBody) -> ColorAttachment {
+pub(crate) fn color_from_wire(c: &wire_pass::ColorAttachmentBody) -> ColorAttachment {
     let p = &c.prefix;
     ColorAttachment {
         texture_ref: p.texture_ref.get(),
@@ -912,7 +912,7 @@ fn color_from_wire(c: &wire_pass::ColorAttachmentBody) -> ColorAttachment {
     }
 }
 
-fn depth_from_wire(d: &wire_pass::DepthAttachmentBody) -> DepthAttachment {
+pub(crate) fn depth_from_wire(d: &wire_pass::DepthAttachmentBody) -> DepthAttachment {
     let p = &d.prefix;
     DepthAttachment {
         texture_ref: p.texture_ref.get(),
@@ -926,7 +926,7 @@ fn depth_from_wire(d: &wire_pass::DepthAttachmentBody) -> DepthAttachment {
     }
 }
 
-fn stencil_from_wire(s: &wire_pass::StencilAttachmentBody) -> StencilAttachment {
+pub(crate) fn stencil_from_wire(s: &wire_pass::StencilAttachmentBody) -> StencilAttachment {
     let p = &s.prefix;
     StencilAttachment {
         texture_ref: p.texture_ref.get(),

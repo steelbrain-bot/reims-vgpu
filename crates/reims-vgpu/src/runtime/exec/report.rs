@@ -320,7 +320,11 @@ pub(super) fn note_pass_extent_for_slot(
     task_id: u32,
     slot: u32,
     mapping_id: u32,
-    cmd: &crate::runtime::decode::render::Command,
+    // The pass's own `renderTargetWidth`/`Height`, which is not the attached
+    // texture's — a guest may bind a 4096-wide texture and ask for a 640-wide
+    // pass. Taken as the two numbers rather than as the whole decoded command,
+    // so this cannot be handed a record of a different class.
+    target_extent: (u64, u64),
 ) {
     if slot != 0 {
         return;
@@ -335,12 +339,7 @@ pub(super) fn note_pass_extent_for_slot(
     match state.mappings.get(&mapping_id) {
         Some(e) => {
             note_pass_target(task_id, mapping_id, Some((e.width, e.height)));
-            note_pass_extent_coverage(
-                cmd.pass_render_target_width,
-                cmd.pass_render_target_height,
-                e.width,
-                e.height,
-            );
+            note_pass_extent_coverage(target_extent.0, target_extent.1, e.width, e.height);
         }
         None => note_pass_target(task_id, mapping_id, None),
     }

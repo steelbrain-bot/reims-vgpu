@@ -29,9 +29,8 @@ use crate::runtime::decode::blit_spi;
 use crate::runtime::decode::compute_spi::{self, Kind as ComputeKind};
 use crate::runtime::decode::render::{
     self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
-    decode_color_attachment, decode_depth_attachment, decode_stencil_attachment, ColorAttachment,
-    DepthAttachment, Kind as RenderKind, LevelSupport, ScissorRect, StencilAttachment,
-    PASS_MAX_COLOR_ATTACHMENTS,
+    ColorAttachment, DepthAttachment, Kind as RenderKind, LevelSupport, ScissorRect,
+    StencilAttachment,
 };
 use crate::runtime::draw::{
     self, BindTable, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
@@ -2889,6 +2888,368 @@ fn handle_render_binds<M: HostMemory + HostOps>(
     }
 }
 
+/// Whether this record states the pass's attachments, or overrides one
+/// attachment's store action.
+///
+/// The third group. Its fields are `clears`, `color_slots`, `color_targets`,
+/// `depth_attach`, `stencil_attach` and `visibility_buffer_ref` — and the three
+/// store-action rows are *in* the group rather than beside it precisely because
+/// they mutate `color_slots`, `depth_attach` and `stencil_attach`, which the
+/// descriptor writes. Splitting them would put two decoders on one attachment's
+/// `store_action`, which is the disagreement the plan forbids.
+///
+/// `unrepresentable` is shared with the bind group and is a first-wins latch, as
+/// [`is_render_bind`] records.
+///
+/// Exhaustive over `RenderKind` for the reason [`is_render_stream_state`] is.
+const fn is_render_pass_state(kind: ProtoRenderKind) -> bool {
+    use ProtoRenderKind as K;
+    match kind {
+        K::WriteDescriptor
+        | K::SetColorStoreAction
+        | K::SetDepthStoreAction
+        | K::SetStencilStoreAction => true,
+
+        K::Draw
+        | K::DrawWide
+        | K::DrawInstanced
+        | K::DrawInstancedWide
+        | K::DrawInstancedBase
+        | K::DrawInstancedBaseWide
+        | K::DrawIndexed
+        | K::DrawIndexedWide
+        | K::DrawIndexedInstanced
+        | K::DrawIndexedInstancedWide
+        | K::DrawIndexedInstancedBase
+        | K::DrawIndexedInstancedBaseWide
+        | K::DrawIndirect
+        | K::DrawIndexedIndirect
+        | K::SetVertexBuffers
+        | K::SetVertexBuffersWithStride
+        | K::SetVertexBufferOffset
+        | K::SetVertexBufferOffsetStride
+        | K::SetVertexSamplers
+        | K::SetVertexSamplersWithLod
+        | K::SetVertexTextures
+        | K::SetFragmentBuffers
+        | K::SetFragmentBufferOffset
+        | K::SetFragmentSamplers
+        | K::SetFragmentSamplersWithLod
+        | K::SetFragmentTextures
+        | K::SetRenderPipelineState
+        | K::SetDepthStencilState
+        | K::SetStencilReference
+        | K::SetBlendColor
+        | K::SetCullMode
+        | K::SetFrontFacingWinding
+        | K::SetDepthClipMode
+        | K::SetTriangleFillMode
+        | K::SetDepthBias
+        | K::SetLineWidth
+        | K::SetViewport
+        | K::SetViewports
+        | K::SetScissorRect
+        | K::SetScissorRects
+        | K::SetVisibilityResultMode => false,
+    }
+}
+
+/// Apply the pass descriptor or one store-action override, lifted by the
+/// protocol crate.
+///
+/// **The descriptor is one wire view now, not three offset computations.**
+/// `decode_{depth,stencil,color}_attachment` each re-derived the section's base
+/// from `size_of` sums this module also wrote down; the record's own
+/// `RenderPassBody` carries `depth`, `stencil` and a `[ColorAttachmentBody; 8]`,
+/// so the eight slots are an iteration and the offsets are not restated.
+///
+/// **Carries one behaviour change.** A pass record shorter than
+/// `RenderPassBody` is refused rather than read at the offsets that happen to
+/// fit. The legacy decoder accepted anything from `PASS_MIN_PAYLOAD` — depth,
+/// stencil and one colour slot — and answered the other seven slots as
+/// unattached, which is indistinguishable from a guest that attached one. Apple's
+/// serializer writes all 592 bytes; the short form was a tolerance for this
+/// repo's own fixtures, and a truncated descriptor read as a shorter one is a
+/// pass rendered with attachments the guest did not retire. `render_record`
+/// names it under the row's own opcode.
+fn handle_render_pass_state<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    opcode: u32,
+    cmd_bytes: &[u8],
+    out: &mut ExecResult,
+    acc: &mut StreamAccum,
+) {
+    use reims_vgpu_protocol::decode::render::RenderRecord;
+    use reims_vgpu_protocol::render::StoreActionTarget;
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    let record = match reims_vgpu_protocol::decode::render::decode(&framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            return note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+        }
+    };
+    match record {
+        RenderRecord::WriteDescriptor(r) => {
+            let descriptor = r.descriptor;
+            let target_extent = (
+                descriptor.render_target_width.get(),
+                descriptor.render_target_height.get(),
+            );
+            // The pass's own tail, decoded and not applied. Four counters
+            // rather than one, because they name four different losses and one
+            // of them is not a loss at all when it is zero.
+            //
+            // `render_target_width`/`height` are the guest's explicit extent
+            // and this device renders at the attachment's instead, which is a
+            // silent over-render whenever the two differ. `array_length` is
+            // layered rendering. The visibility buffer is the other half of
+            // `setVisibilityResultMode:offset:` — that record already counts
+            // its own drop, and this counts the buffer it would have written
+            // to, so the two should track and a divergence means one of the
+            // arms is wrong. All four report only a non-default value: a pass
+            // that asks for the API default is asking for what already happens.
+            //
+            // The extent one is **not** a healthy zero and the others are. On a
+            // driven arm64/Vulkan boot it reads 1 575 over 127 one-second
+            // windows while the visibility buffer, the array length and the
+            // colour subresource all read 0 — so the macOS window server states
+            // an explicit pass extent on essentially every pass, and this
+            // device renders at the attachment's instead. Whether that is a
+            // loss is settled by `note_pass_extent_coverage`'s bands and not by
+            // this count: the two agree, so this is the denominator of a
+            // measurement rather than an alarm.
+            // Kept, not counted: this is where the pass says which guest buffer
+            // its occlusion counts land in, and `finish_stream` writes them
+            // there. `0` is a pass that named none, which leaves the arming
+            // below with nowhere to write.
+            acc.visibility_buffer_ref = descriptor.visibility_result_buffer_ref.get();
+            // Refused rather than drawn into layer 0, the decision the colour
+            // subresource arm below already made for the same shape of loss:
+            // the layer a draw selects is a coordinate the pass did not name,
+            // so rendering anyway lands geometry meant for one layer on top of
+            // another's correct content.
+            if descriptor.render_target_array_length.get() > 1 {
+                let drop = note_pass_array_length_unsupported(
+                    task_id,
+                    descriptor.render_target_array_length.get(),
+                );
+                acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
+            }
+            if descriptor.render_target_width.get() != 0
+                || descriptor.render_target_height.get() != 0
+            {
+                note_pass_target_extent();
+            }
+            {
+                // A depth or stencil attachment this device cannot bind used to
+                // be left out and the pass run without it, which turns depth
+                // testing off for every draw in it: the near geometry stops
+                // occluding the far, and the colour target — which was correct
+                // before the pass — is overwritten with a picture assembled in
+                // the wrong order. That is not a degraded frame, it is wrong
+                // content written over right content, and nothing downstream can
+                // tell because a pass with no depth attachment is exactly what a
+                // guest that wanted none also produces.
+                let depth = render::depth_from_wire(&descriptor.depth);
+                if depth.texture_ref != 0 {
+                    if attachment_subresource_is_bindable(depth.into(), LevelSupport::LevelZeroOnly)
+                    {
+                        acc.depth_attach = Some(depth);
+                    } else {
+                        let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
+                        acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
+                    }
+                }
+                let stencil = render::stencil_from_wire(&descriptor.stencil);
+                if stencil.texture_ref != 0 {
+                    if attachment_subresource_is_bindable(
+                        stencil.into(),
+                        LevelSupport::LevelZeroOnly,
+                    ) {
+                        acc.stencil_attach = Some(stencil);
+                    } else {
+                        let drop =
+                            note_depth_stencil_unsupported(task_id, "stencil", &stencil.into());
+                        acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
+                    }
+                }
+                for (i, slot_body) in descriptor.color.iter().enumerate() {
+                    let att = render::color_from_wire(slot_body);
+                    if att.texture_ref == 0 {
+                        continue;
+                    }
+                    let slot = i as u32;
+                    // A slice or depth plane is rendered past rather than into,
+                    // and the pass is refused
+                    // for it. This used to be reported and then rendered anyway,
+                    // on the argument that dropping the pass "would trade wrong
+                    // pixels for none, which is worse". That argument does not
+                    // survive asking *whose* pixels: the pass does not land in
+                    // the guest's slice 3 and come out wrong, it lands in
+                    // **slice 0 of the same texture**, overwriting the image the
+                    // guest is sampling there. A cube face becomes face 0 every
+                    // time. That is wrong content written over right content,
+                    // which is worse than none — and unlike none it also
+                    // corrupts a resource the guest did not name in this pass.
+                    //
+                    // A **mip level** is the one coordinate that is not in that
+                    // class, which is why this arm passes `AnyLevel`: the linear
+                    // rung of `render_target` resolves the named level's own
+                    // plane out of the guest allocation, so the pass renders
+                    // into it rather than over level 0. macOS 26's compositor
+                    // renders a blur pyramid level by level and every one of
+                    // those passes was being dropped here.
+                    //
+                    // A resolve destination is not a source coordinate. It stays
+                    // on the attachment so the backend can perform the
+                    // end-of-pass resolve or refuse that exact operation.
+                    if !color_attachment_subresource_is_bindable(att.into()) {
+                        let drop = note_color_subresource_unsupported(task_id, slot, &att);
+                        acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
+                    }
+                    if !acc
+                        .color_slots
+                        .iter()
+                        .any(|(s, a)| *s == slot || a.texture_ref == att.texture_ref)
+                    {
+                        acc.color_slots.push((slot, att));
+                    } else if let Some(entry) = acc.color_slots.iter_mut().find(|(s, _)| *s == slot)
+                    {
+                        entry.1 = att;
+                    }
+                    let published_ref = if att.resolve_texture_ref != 0 {
+                        att.resolve_texture_ref
+                    } else {
+                        att.texture_ref
+                    };
+                    if !acc.color_targets.contains(&published_ref) {
+                        acc.color_targets.push(published_ref);
+                    }
+                    if !out.texture_refs.contains(&att.texture_ref) {
+                        out.texture_refs.push(att.texture_ref);
+                    }
+                    if att.resolve_texture_ref != 0
+                        && !out.texture_refs.contains(&att.resolve_texture_ref)
+                    {
+                        out.texture_refs.push(att.resolve_texture_ref);
+                    }
+                    if let Some(m) =
+                        objects::resolve_mapper_ref_texture(state, host, task_id, published_ref)
+                    {
+                        note_pass_extent_for_slot(state, task_id, slot, m, target_extent);
+                        if !out.mapper_ref_texture_mappings.contains(&m) {
+                            out.mapper_ref_texture_mappings.push(m);
+                        }
+                    } else if objects::resolve_backing(state, host, published_ref) {
+                        // A backing attachment is its own mapping id — the arm
+                        // below pushes `att.texture_ref` where the mapper-ref-texture arm
+                        // pushes the id it resolved to.
+                        note_pass_extent_for_slot(
+                            state,
+                            task_id,
+                            slot,
+                            published_ref,
+                            target_extent,
+                        );
+                        if !out.mapper_ref_texture_mappings.contains(&published_ref) {
+                            out.mapper_ref_texture_mappings.push(published_ref);
+                        }
+                    }
+                    // The load action decides this, and only the load action.
+                    //
+                    // A `Clear` + non-`Store` attachment used to be dropped from
+                    // this list entirely, which conflated the two jobs the list
+                    // does: it is the pass's CLEAR **seed** for the draws, and
+                    // it is the set whose colour may be **published** to guest
+                    // pages. `MTLStoreAction` governs only the second. Dropping
+                    // it from both meant a drawn pass began on the attachment's
+                    // stale contents — wrong for anything that blends, depth-
+                    // tests, or draws less than the full extent — and the store
+                    // action never licensed that.
+                    //
+                    // macOS 26 asks for the pair 23 times in a 25 s drag and
+                    // macOS 14 twice, against zero on 11/12/13; the branch was
+                    // written as a healthy-zero alarm and those are firings.
+                    // `clears_reaching_guest_pages` is where the store action is
+                    // honoured instead.
+                    if att.load_action == MTL_LOAD_ACTION_CLEAR {
+                        acc.clears.push(att);
+                    }
+                }
+            }
+            // The `color0` block that stood here is gone with the second reading it
+            // needed. It re-pushed slot 0 onto `clears` from a field the decoder had
+            // lifted separately, guarded by "it is not already there" — and the loop
+            // above pushes exactly that attachment under exactly that condition, so the
+            // guard could never pass. It was reachable only when the loop and the field
+            // disagreed about slot 0, which is a state one wire view cannot be in.
+        }
+        RenderRecord::SetStoreAction(r) => {
+            // The store action is a `u16` in every attachment struct, so a mode
+            // that does not fit is not narrowed into a different action; it is
+            // left alone and named.
+            let Ok(action) = u16::try_from(r.action) else {
+                crate::runtime::drain::note_store_route("render_store_action_out_of_range");
+                crate::observe::fail(format!(
+                    "render_store_action fail reason=render_store_action_out_of_range \
+                     op={opcode:#x} mode={} target={:?}",
+                    r.action, r.target
+                ));
+                return;
+            };
+            match r.target {
+                // By pass slot, which is what the record's index names and what
+                // `color_slots` is keyed by — not by position, since a pass
+                // declaring slots 0 and 3 has two entries.
+                StoreActionTarget::Color(index) => {
+                    match acc.color_slots.iter_mut().find(|(slot, _)| *slot == index) {
+                        Some((_, att)) => att.store_action = action,
+                        // A slot the pass never declared. The override has
+                        // nothing to override and inventing an attachment for it
+                        // would give the draw a target the guest did not ask
+                        // for, so it is named instead.
+                        None => {
+                            crate::runtime::drain::note_store_route(
+                                "render_store_action_slot_undeclared",
+                            );
+                            crate::observe::fail(format!(
+                                "render_store_action fail \
+                                 reason=render_store_action_slot_undeclared \
+                                 index={index} declared={}",
+                                acc.color_slots.len()
+                            ));
+                        }
+                    }
+                }
+                // Neither of these carries an index: there is one depth and one
+                // stencil attachment, so the record names only the action. The
+                // fourth case the opcode match used to carry — a store action
+                // for none of the three — is gone with `StoreActionTarget`,
+                // which is total over the three rows.
+                StoreActionTarget::Depth => match acc.depth_attach.as_mut() {
+                    Some(d) => d.store_action = action,
+                    None => note_store_action_no_attachment("depth", action),
+                },
+                StoreActionTarget::Stencil => match acc.stencil_attach.as_mut() {
+                    Some(s) => s.store_action = action,
+                    None => note_store_action_no_attachment("stencil", action),
+                },
+            }
+        }
+        // `is_render_pass_state` selected these four kinds and `decode::render`
+        // maps each of them to an arm above.
+        other => crate::observe::fail(format!(
+            "render_pass_record_not_pass_state task={task_id} opcode={opcode:#x} \
+             (the rail routed this row to the pass arm and the lift produced {other:?})"
+        )),
+    }
+}
+
 fn handle_render_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
@@ -2956,6 +3317,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
         if is_render_bind(kind) {
             return handle_render_binds(state, host, task_id, opcode, cmd_bytes, out, acc);
         }
+        // **The pass descriptor and its three store-action overrides.** One
+        // group because the overrides mutate attachments the descriptor writes
+        // — see [`is_render_pass_state`].
+        if is_render_pass_state(kind) {
+            return handle_render_pass_state(state, host, task_id, opcode, cmd_bytes, out, acc);
+        }
     }
     let cmd = match render::decode(cmd_bytes) {
         Ok(c) => c,
@@ -2975,195 +3342,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
     };
     match cmd.kind {
-        RenderKind::RenderPass => {
-            // The pass's own tail, decoded and not applied. Four counters
-            // rather than one, because they name four different losses and one
-            // of them is not a loss at all when it is zero.
-            //
-            // `render_target_width`/`height` are the guest's explicit extent
-            // and this device renders at the attachment's instead, which is a
-            // silent over-render whenever the two differ. `array_length` is
-            // layered rendering. The visibility buffer is the other half of
-            // `setVisibilityResultMode:offset:` — that record already counts
-            // its own drop, and this counts the buffer it would have written
-            // to, so the two should track and a divergence means one of the
-            // arms is wrong. All four report only a non-default value: a pass
-            // that asks for the API default is asking for what already happens.
-            //
-            // The extent one is **not** a healthy zero and the others are. On a
-            // driven arm64/Vulkan boot it reads 1 575 over 127 one-second
-            // windows while the visibility buffer, the array length and the
-            // colour subresource all read 0 — so the macOS window server states
-            // an explicit pass extent on essentially every pass, and this
-            // device renders at the attachment's instead. Whether that is a
-            // loss is settled by `note_pass_extent_coverage`'s bands and not by
-            // this count: the two agree, so this is the denominator of a
-            // measurement rather than an alarm.
-            // Kept, not counted: this is where the pass says which guest buffer
-            // its occlusion counts land in, and `finish_stream` writes them
-            // there. `0` is a pass that named none, which leaves the arming
-            // below with nowhere to write.
-            acc.visibility_buffer_ref = cmd.pass_visibility_result_buffer_ref;
-            // Refused rather than drawn into layer 0, the decision the colour
-            // subresource arm below already made for the same shape of loss:
-            // the layer a draw selects is a coordinate the pass did not name,
-            // so rendering anyway lands geometry meant for one layer on top of
-            // another's correct content.
-            if cmd.pass_render_target_array_length > 1 {
-                let drop = note_pass_array_length_unsupported(
-                    task_id,
-                    cmd.pass_render_target_array_length,
-                );
-                acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
-            }
-            if cmd.pass_render_target_width != 0 || cmd.pass_render_target_height != 0 {
-                note_pass_target_extent();
-            }
-            // Full multi-attachment: re-decode all color slots from payload.
-            if cmd_bytes.len() >= 8 {
-                let payload = &cmd_bytes[8..];
-                // A depth or stencil attachment this device cannot bind used to
-                // be left out and the pass run without it, which turns depth
-                // testing off for every draw in it: the near geometry stops
-                // occluding the far, and the colour target — which was correct
-                // before the pass — is overwritten with a picture assembled in
-                // the wrong order. That is not a degraded frame, it is wrong
-                // content written over right content, and nothing downstream can
-                // tell because a pass with no depth attachment is exactly what a
-                // guest that wanted none also produces.
-                let depth = decode_depth_attachment(payload);
-                if depth.texture_ref != 0 {
-                    if attachment_subresource_is_bindable(depth.into(), LevelSupport::LevelZeroOnly)
-                    {
-                        acc.depth_attach = Some(depth);
-                    } else {
-                        let drop = note_depth_stencil_unsupported(task_id, "depth", &depth.into());
-                        acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
-                    }
-                }
-                let stencil = decode_stencil_attachment(payload);
-                if stencil.texture_ref != 0 {
-                    if attachment_subresource_is_bindable(
-                        stencil.into(),
-                        LevelSupport::LevelZeroOnly,
-                    ) {
-                        acc.stencil_attach = Some(stencil);
-                    } else {
-                        let drop =
-                            note_depth_stencil_unsupported(task_id, "stencil", &stencil.into());
-                        acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
-                    }
-                }
-                for i in 0..PASS_MAX_COLOR_ATTACHMENTS {
-                    let att = decode_color_attachment(payload, i);
-                    if att.texture_ref == 0 {
-                        continue;
-                    }
-                    let slot = i as u32;
-                    // A slice or depth plane is rendered past rather than into,
-                    // and the pass is refused
-                    // for it. This used to be reported and then rendered anyway,
-                    // on the argument that dropping the pass "would trade wrong
-                    // pixels for none, which is worse". That argument does not
-                    // survive asking *whose* pixels: the pass does not land in
-                    // the guest's slice 3 and come out wrong, it lands in
-                    // **slice 0 of the same texture**, overwriting the image the
-                    // guest is sampling there. A cube face becomes face 0 every
-                    // time. That is wrong content written over right content,
-                    // which is worse than none — and unlike none it also
-                    // corrupts a resource the guest did not name in this pass.
-                    //
-                    // A **mip level** is the one coordinate that is not in that
-                    // class, which is why this arm passes `AnyLevel`: the linear
-                    // rung of `render_target` resolves the named level's own
-                    // plane out of the guest allocation, so the pass renders
-                    // into it rather than over level 0. macOS 26's compositor
-                    // renders a blur pyramid level by level and every one of
-                    // those passes was being dropped here.
-                    //
-                    // A resolve destination is not a source coordinate. It stays
-                    // on the attachment so the backend can perform the
-                    // end-of-pass resolve or refuse that exact operation.
-                    if !color_attachment_subresource_is_bindable(att.into()) {
-                        let drop = note_color_subresource_unsupported(task_id, slot, &att);
-                        acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
-                    }
-                    if !acc
-                        .color_slots
-                        .iter()
-                        .any(|(s, a)| *s == slot || a.texture_ref == att.texture_ref)
-                    {
-                        acc.color_slots.push((slot, att));
-                    } else if let Some(entry) = acc.color_slots.iter_mut().find(|(s, _)| *s == slot)
-                    {
-                        entry.1 = att;
-                    }
-                    let published_ref = if att.resolve_texture_ref != 0 {
-                        att.resolve_texture_ref
-                    } else {
-                        att.texture_ref
-                    };
-                    if !acc.color_targets.contains(&published_ref) {
-                        acc.color_targets.push(published_ref);
-                    }
-                    if !out.texture_refs.contains(&att.texture_ref) {
-                        out.texture_refs.push(att.texture_ref);
-                    }
-                    if att.resolve_texture_ref != 0
-                        && !out.texture_refs.contains(&att.resolve_texture_ref)
-                    {
-                        out.texture_refs.push(att.resolve_texture_ref);
-                    }
-                    if let Some(m) =
-                        objects::resolve_mapper_ref_texture(state, host, task_id, published_ref)
-                    {
-                        note_pass_extent_for_slot(state, task_id, slot, m, &cmd);
-                        if !out.mapper_ref_texture_mappings.contains(&m) {
-                            out.mapper_ref_texture_mappings.push(m);
-                        }
-                    } else if objects::resolve_backing(state, host, published_ref) {
-                        // A backing attachment is its own mapping id — the arm
-                        // below pushes `att.texture_ref` where the mapper-ref-texture arm
-                        // pushes the id it resolved to.
-                        note_pass_extent_for_slot(state, task_id, slot, published_ref, &cmd);
-                        if !out.mapper_ref_texture_mappings.contains(&published_ref) {
-                            out.mapper_ref_texture_mappings.push(published_ref);
-                        }
-                    }
-                    // The load action decides this, and only the load action.
-                    //
-                    // A `Clear` + non-`Store` attachment used to be dropped from
-                    // this list entirely, which conflated the two jobs the list
-                    // does: it is the pass's CLEAR **seed** for the draws, and
-                    // it is the set whose colour may be **published** to guest
-                    // pages. `MTLStoreAction` governs only the second. Dropping
-                    // it from both meant a drawn pass began on the attachment's
-                    // stale contents — wrong for anything that blends, depth-
-                    // tests, or draws less than the full extent — and the store
-                    // action never licensed that.
-                    //
-                    // macOS 26 asks for the pair 23 times in a 25 s drag and
-                    // macOS 14 twice, against zero on 11/12/13; the branch was
-                    // written as a healthy-zero alarm and those are firings.
-                    // `clears_reaching_guest_pages` is where the store action is
-                    // honoured instead.
-                    if att.load_action == MTL_LOAD_ACTION_CLEAR {
-                        acc.clears.push(att);
-                    }
-                }
-            }
-            // Also keep color0 from command for convenience.
-            if cmd.color0.texture_ref != 0
-                && cmd.color0.load_action == MTL_LOAD_ACTION_CLEAR
-                && store_action_publishes_single_sample(cmd.color0.store_action)
-                && !acc
-                    .clears
-                    .iter()
-                    .any(|a| a.texture_ref == cmd.color0.texture_ref)
-            {
-                acc.clears.push(cmd.color0);
-            }
-        }
         RenderKind::Draw => {
             if cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_WIDE {
                 crate::observe::line(format!(
@@ -3329,81 +3507,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 crate::runtime::drain::note_store_route("render_tessellation_scale_dropped");
             }
         }
-        RenderKind::SetStoreAction => {
-            // `setColorStoreAction:atIndex:` and its depth and stencil siblings
-            // replace what the render-pass descriptor declared for one
-            // attachment. All three of those declared actions are honoured —
-            // colour in `encode_draw_chain`'s writeback loop, depth and stencil
-            // through `draw::depth_stencil` — so dropping the override was a
-            // real loss in both directions, and the expensive one is a pass
-            // declared `DontCare` and overridden to `Store`: content the guest
-            // asked to keep and never got back.
-            //
-            // The store action is a `u16` in every attachment struct, so a mode
-            // that does not fit is not narrowed into a different action; it is
-            // left alone and named, the same reading `SetIntState` takes of its
-            // own low half.
-            let Ok(action) = u16::try_from(cmd.mode) else {
-                crate::runtime::drain::note_store_route("render_store_action_out_of_range");
-                crate::observe::fail(format!(
-                    "render_store_action fail reason=render_store_action_out_of_range \
-                     op={:#x} mode={} index={}",
-                    cmd.opcode, cmd.mode, cmd.first
-                ));
-                return;
-            };
-            match cmd.opcode {
-                wire_render::OPCODE_SET_COLOR_STORE_ACTION => {
-                    // By pass slot, which is what the record's index names and
-                    // what `color_slots` is keyed by — not by position, since a
-                    // pass declaring slots 0 and 3 has two entries.
-                    match acc
-                        .color_slots
-                        .iter_mut()
-                        .find(|(slot, _)| *slot == cmd.first)
-                    {
-                        Some((_, att)) => att.store_action = action,
-                        // A slot the pass never declared. The override has
-                        // nothing to override and inventing an attachment for it
-                        // would give the draw a target the guest did not ask
-                        // for, so it is named instead.
-                        None => {
-                            crate::runtime::drain::note_store_route(
-                                "render_store_action_slot_undeclared",
-                            );
-                            crate::observe::fail(format!(
-                                "render_store_action fail \
-                                 reason=render_store_action_slot_undeclared \
-                                 index={} declared={}",
-                                cmd.first,
-                                acc.color_slots.len()
-                            ));
-                        }
-                    }
-                }
-                // Neither of these carries an index: there is one depth and one
-                // stencil attachment, so the record names only the action.
-                wire_render::OPCODE_SET_DEPTH_STORE_ACTION => match acc.depth_attach.as_mut() {
-                    Some(d) => d.store_action = action,
-                    None => note_store_action_no_attachment("depth", action),
-                },
-                wire_render::OPCODE_SET_STENCIL_STORE_ACTION => match acc.stencil_attach.as_mut() {
-                    Some(s) => s.store_action = action,
-                    None => note_store_action_no_attachment("stencil", action),
-                },
-                // Not a catch-all standing in for the stencil arm: the decoder
-                // maps exactly three opcodes to this kind, so a fourth reaching
-                // here means the decoder grew an arm this one did not, and the
-                // guest's store action lands on nothing.
-                op => {
-                    crate::runtime::drain::note_store_route("render_store_action_opcode_unknown");
-                    crate::observe::fail(format!(
-                        "render_store_action fail reason=render_store_action_opcode_unknown \
-                         op={op:#x} action={action}"
-                    ));
-                }
-            }
-        }
+
         RenderKind::SetVertexAmplification => {
             // Amplification makes one vertex invocation produce several views,
             // so a dropped record renders one view where the guest asked for
@@ -3445,7 +3549,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // decoder is reached, so arriving here is that routing disagreeing with
         // itself rather than a guest case, and it is named instead of being
         // answered a second time.
-        RenderKind::SetBuffer
+        RenderKind::RenderPass
+        | RenderKind::SetStoreAction
+        | RenderKind::SetBuffer
         | RenderKind::SetBufferOffset
         | RenderKind::SetTexture
         | RenderKind::SetSampler
