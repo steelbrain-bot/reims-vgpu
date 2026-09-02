@@ -5306,6 +5306,19 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         // which leaves its content authority on the old pages.
                         Err(refusal) => {
                             note_store_route(refusal.route());
+                            // The type pair, separately. `route` puts a
+                            // no-bytes reference whose integer also names a
+                            // live mapping surface under the mapping arm — the
+                            // one that would mean a real re-point went unheard
+                            // — and that shadows the kind the guest's own list
+                            // is holding there. Both are needed: the integer
+                            // agreeing is a collision until the type agrees too.
+                            if matches!(
+                                refusal,
+                                crate::runtime::objects::RepointStorageRefusal::NoBytes { .. }
+                            ) {
+                                note_store_route(refusal.no_bytes_kind_route());
+                            }
                             if refusal.leaves_authority_stale()
                                 && crate::observe::first_sight(
                                     "replace_physical_storage_undescribable",

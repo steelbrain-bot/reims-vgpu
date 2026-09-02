@@ -3892,6 +3892,21 @@ impl RepointStorageRefusal {
                 mapping_names_a_surface: true,
                 ..
             } => "replace_physical_storage_no_bytes_but_mapping_names_a_surface",
+            Self::NoBytes { .. } => self.no_bytes_kind_route(),
+            Self::Refused(_) => self.refused_route(),
+        }
+    }
+
+    /// The kind at the object-list entry, whatever the mapping namespace says.
+    ///
+    /// [`Self::route`]'s no-bytes arms are shadowed by the mapping arm, and the
+    /// mapping arm is exactly the case where the type pair decides whether the
+    /// two namespaces are naming one thing or the integer merely collided.
+    /// So the caller counts both, and only this one answers "what is the guest's
+    /// own list holding at that reference".
+    #[must_use]
+    pub const fn no_bytes_kind_route(self) -> &'static str {
+        match self {
             Self::NoBytes {
                 object_type: OBJECT_TYPE_FUNCTION,
                 ..
@@ -3917,6 +3932,12 @@ impl RepointStorageRefusal {
                 ..
             } => "replace_physical_storage_no_bytes_mapper_ref_texture",
             Self::NoBytes { .. } => "replace_physical_storage_no_bytes_other",
+            _ => "replace_physical_storage_kind_not_asked",
+        }
+    }
+
+    const fn refused_route(self) -> &'static str {
+        match self {
             Self::Refused(StorageRefusal::ExtentUnrecovered { .. }) => {
                 "replace_physical_storage_extent_unrecovered"
             }
@@ -3932,6 +3953,7 @@ impl RepointStorageRefusal {
             Self::Refused(StorageRefusal::Backing(BackingIdRefusal::NamesNoStorage { .. })) => {
                 "replace_physical_storage_names_no_storage"
             }
+            _ => "replace_physical_storage_refusal_not_asked",
         }
     }
 
