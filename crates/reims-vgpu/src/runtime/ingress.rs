@@ -227,9 +227,22 @@ pub enum Gap {
     /// first form counted live tasks and resources and reported `tasks=1
     /// resources=0`, which reads as the open case and is not one: a task is a
     /// namespace and has interned nothing, and the number the dependency
-    /// compiler compares is the mint counter. Neither denominator is large
-    /// enough to conclude from yet, and that is recorded here so the next
-    /// attempt spends its boot rather than its reasoning.
+    /// compiler compares is the mint counter.
+    ///
+    /// The corrected form's first driven boot — x86 Vulkan, macos-15, 391 s to
+    /// the desktop — answered `device_info_reply_scanned=1`,
+    /// `device_info_reply_before_any_identity=1`,
+    /// `device_info_reply_after_an_identity=0`. **One sample is what a boot can
+    /// contribute**, because the guest asks device-info once at accelerator
+    /// start and never again, which the reply path documents and this
+    /// denominator confirms rather than assumes. So the population grows with
+    /// boots and not with runtime, and "the denominator is small" is a
+    /// statement about how many boots have been run, not about instrumentation
+    /// that is missing.
+    ///
+    /// The GVA half's denominator is the one that is still thin:
+    /// `query_reply_scanned=5` with `query_reply_inside_an_allocation=0` across
+    /// two earlier boots.
     ReplyDestination,
 }
 
