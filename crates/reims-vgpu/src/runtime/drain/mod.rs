@@ -509,6 +509,23 @@ impl RefSpacePopulation {
             }
         }
     }
+
+    /// The census route for whether the semantic model can name this reference.
+    ///
+    /// Separate from [`Self::route`] because the two answer different
+    /// questions and a boot needs both: the list entry says whether the *guest*
+    /// still holds the object, and this says whether the *model* still holds
+    /// its name. A destroy that arrives after the guest has cleared its slot is
+    /// the ordinary case, and it is only a problem if the model has no name for
+    /// it either — that is the packet the bridge would have to refuse.
+    const fn named_route(self, named: bool) -> &'static str {
+        match (self, named) {
+            (Self::Untracked, true) => "delete_object_ref_model_named",
+            (Self::Untracked, false) => "delete_object_ref_model_unnamed",
+            (Self::Retained, true) => "delete_object_retained_ref_model_named",
+            (Self::Retained, false) => "delete_object_retained_ref_model_unnamed",
+        }
+    }
 }
 
 /// What a destroy record's ref names in the guest's own object list.
@@ -537,6 +554,17 @@ fn note_delete_object_ref_space<M: HostMemory>(
         d::OPCODE_DELETE_FUNCTION => OBJECT_TYPE_FUNCTION,
         _ => OBJECT_TYPE_SERIALIZER_OBJECT,
     };
+    // Whether the *model* can name this reference, which is a different
+    // question from whether the guest's list still holds an entry for it and is
+    // the one that decides whether this command can cross the bridge.
+    //
+    // `objects::name_resource` — which is what the production `RefResolver`
+    // answers with — consults `DeviceState::object_name` **before** the guest's
+    // list, so a reference the model has already named still resolves after the
+    // guest has cleared its slot. Asked read-only here: `name_resource` would
+    // declare, and a census that declared would be answering a question it had
+    // just changed.
+    note_store_route(retained.named_route(state.object_name(task_id, object_ref).is_some()));
     let Some(entry) = crate::runtime::objects::lookup_list_entry(state, host, task_id, object_ref)
     else {
         note_store_route(retained.route(RefSpaceAnswer::NoListEntry));
