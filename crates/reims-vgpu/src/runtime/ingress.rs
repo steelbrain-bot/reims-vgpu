@@ -184,11 +184,36 @@ pub enum Gap {
     ///
     /// **Amended by the resource-lifecycle group's cutover: `Lifecycle` *is*
     /// production state**, held by `DeviceState` and reached through its
-    /// lifetime doors. What is left is not a missing owner any more — it is that
-    /// this bridge is given namespaces and no `AccessSource`, and the source is
-    /// a `&mut` borrow of that owner for one task and one domain. It closes when
-    /// this bridge is handed one, which is the ordering and publication group's
-    /// work and not this one's.
+    /// lifetime doors. What is left is not a missing owner any more.
+    ///
+    /// # There are three inputs, not two, and the third is guest memory
+    ///
+    /// The sentence above this — "`walk::exec` needs two things and both exist"
+    /// — was counting what `walk::exec`'s *signature* takes. It is not what an
+    /// exec packet costs, and the difference is a whole subsystem:
+    ///
+    /// 1. A `RefResolver`. It exists. `resolve::InTask` binds one out of
+    ///    [`Resolvers::objects`], and in production that resolver names a
+    ///    reference on demand out of the guest's object list, which the model's
+    ///    own `TaskNamespaces` cannot do because it holds no guest memory.
+    /// 2. An `AccessSource`. It exists — `Lifecycle::access` for the packet's
+    ///    task and domain — and it is a `&mut` borrow, which is why it cannot
+    ///    join [`Resolvers`]: that bundle is `Copy` and holds shared references
+    ///    on purpose. It arrives as its own argument, or through a device door
+    ///    that takes the lock per participation.
+    /// 3. **The command stream bytes, which are not in the packet.** An
+    ///    `EXEC_INDIRECT2` payload carries a header, a resource table and
+    ///    `cmdbuf_count` descriptors of `{gva, length}` — the streams themselves
+    ///    live in the task's *address space*, and reading them is a page-table
+    ///    walk per buffer. `drain::Packet` has no records field and never had
+    ///    one; `crate::runtime::exec` does that walk itself. So this bridge
+    ///    cannot become a pure function of the drained packet for this class the
+    ///    way it is for the other four, and giving it two resolvers would leave
+    ///    it holding descriptors it cannot follow.
+    ///
+    /// That third input is what makes this gap the ordering and publication
+    /// group's and not a resolver away: whoever hands this bridge the streams is
+    /// also whoever owns the executor that runs them.
     ExecResolution,
     /// The pages behind a re-pointed object, which its packet does not carry.
     ///
