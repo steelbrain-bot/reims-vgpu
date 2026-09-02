@@ -2057,6 +2057,69 @@ impl Lifecycle {
     }
 }
 
+/// The lifecycle owner answering what a guest reference names.
+///
+/// # Why the owner and not the namespace
+///
+/// `Namespace` already implements [`crate::resolve::RefResolver`], and one
+/// namespace is one task. A caller that has not yet decoded which task a packet
+/// is about cannot pick one — which is the whole reason
+/// [`crate::resolve::TaskNamespaces`] exists — and the holder of *every* task's
+/// namespace is this type. So the routing lives here, and it is routing and
+/// nothing else: the generation in the answer is the namespace's, and nothing
+/// on this path mints, leases or retires.
+///
+/// A task this owner does not hold answers `None`, which is the same answer a
+/// slot holding nothing gives and is correct for both: a reference into an
+/// address space that does not exist names nothing.
+impl crate::resolve::TaskNamespaces for Lifecycle {
+    fn resource(&self, task: TaskId, object_ref: u32) -> Option<ResourceId> {
+        use crate::resolve::RefResolver as _;
+        self.tasks.get(&task)?.namespace.resource(object_ref)
+    }
+}
+
+/// The lifecycle owner answering where a named resource's bytes are.
+///
+/// # It can carry the heap term, and nothing else can
+///
+/// [`crate::access::ResourceKey`] holds a backing *and* the heap it was
+/// allocated from, so that a heap-use record and a member's access have
+/// something to compare — without it the coarser rung silently orders against
+/// nothing. A device that mints identities from an allocation base has no heap
+/// term at all and must answer `None`; this owner placed the resource itself, so
+/// it has the placement and the heap's membership generation, and answers with
+/// them.
+///
+/// The membership generation is asked for at the moment of the question rather
+/// than stored in the placement, because that is what a `HeapId` is: two
+/// accesses to one heap taken either side of a placement are not comparable, and
+/// a key carrying a stale generation would say they were.
+///
+/// `None` when the task is not held, the name does not resolve in it, or the
+/// name resolves and owns no bytes. All three are "there is no key for this",
+/// which is what the trait asks; a caller turns it into
+/// `AccessKey::DomainOnly` rather than dropping the access.
+impl crate::resolve::ResourceStorage for Lifecycle {
+    fn storage(&self, task: TaskId, resource: ResourceId) -> Option<ResourceKey> {
+        use crate::resolve::RefResolver as _;
+        let t = self.tasks.get(&task)?;
+        // The name must still be the slot's own, at its own generation: a stale
+        // name whose slot has been redeclared would otherwise be keyed onto the
+        // new occupant's storage.
+        if t.namespace.resource(resource.slot.0) != Some(resource) {
+            return None;
+        }
+        Some(match *t.resident.get(&resource)? {
+            Resident::Dedicated { backing, .. } => ResourceKey {
+                backing,
+                heap: None,
+            },
+            Resident::Placed(placement) => placement.key(t.heaps.membership(placement.heap).ok()?),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2232,6 +2295,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The owner answers both of the model's read doors, and answers them about
+    /// the same object.
+    ///
+    /// Two traits and one test, because the failure worth catching is not either
+    /// answer alone: it is the pair disagreeing about which object a reference
+    /// names. A `TaskNamespaces` that resolved a slot and a `ResourceStorage`
+    /// that keyed a *different* generation's bytes would build a hazard edge
+    /// against memory the packet did not name, and each door read on its own
+    /// would look right.
+    #[test]
+    fn the_owner_answers_a_reference_and_its_storage_about_one_object() {
+        use crate::resolve::{ResourceStorage as _, TaskNamespaces as _};
+
+        let (l, name) = with_one_resource(0x100);
+        assert_eq!(l.resource(TASK, name.slot.0), Some(name));
+        assert_eq!(
+            l.storage(TASK, name),
+            Some(ResourceKey {
+                backing: BackingId(10),
+                heap: None,
+            }),
+            "a dedicated allocation carries no heap term, because it is in no heap"
+        );
+
+        // A task nobody defined, and a slot nothing was declared into: both
+        // doors say nothing rather than defaulting.
+        assert_eq!(l.resource(TaskId(9), 0), None);
+        assert_eq!(l.storage(TaskId(9), name), None);
+        assert_eq!(l.resource(TASK, 5), None);
+    }
+
+    /// A name the slot no longer holds is keyed to nothing, not to its
+    /// successor.
+    ///
+    /// The redeclaration case `Namespace::declare` exists for. A guest that
+    /// writes over an object-list slot moves the name to a new generation, and a
+    /// storage door that keyed the *old* name would hand an access the new
+    /// occupant's bytes — the wrong surface, ordered against the wrong work.
+    #[test]
+    fn a_stale_name_is_keyed_to_nothing_rather_than_to_the_slots_new_occupant() {
+        use crate::resolve::ResourceStorage as _;
+
+        let (mut l, first) = with_one_resource(0x100);
+        let effects = l
+            .apply(&LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(0),
+                storage: dedicated(11, 0x200),
+            })
+            .expect("a live slot may be redeclared");
+        assert!(
+            !effects.teardowns.is_empty(),
+            "the displaced occupant's teardown is owed, or this test is not \
+             exercising a redeclaration"
+        );
+        assert_eq!(
+            l.storage(TASK, first),
+            None,
+            "the previous generation's name keys nothing"
+        );
     }
 
     /// A rebind changes what an unresolved reference will construct and ends
