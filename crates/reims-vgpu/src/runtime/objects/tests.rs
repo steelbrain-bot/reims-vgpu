@@ -308,6 +308,53 @@ fn sampler_construction_is_retained_until_its_own_explicit_delete() {
     assert_eq!(replacement.descriptor.lod_min_clamp, 7.5);
 }
 
+/// Constructing a sampler names its slot, because the destroy that ends its
+/// life arrives when nothing else can.
+///
+/// A sampler is built out of the guest's object list once and answered from
+/// `task_sampler_states` forever after, and the guest clears the list slot
+/// before it sends `CmdDeleteObject`. So the destroy resolves against neither a
+/// cached construction nor a live entry — a driven macos-15 boot found the
+/// semantic model holding a name for **zero of 1984** of them. A retirement the
+/// model cannot name is one it cannot be told about.
+///
+/// The name is taken at construction because that is the only moment the list
+/// entry and the model's namespace are both available.
+#[test]
+fn constructing_a_sampler_names_its_slot_so_its_destroy_can_still_be_resolved() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    put_sampler_object(&mut host, 2, 0x80, 1.25);
+
+    assert_eq!(
+        state.object_name(1, 2),
+        None,
+        "nothing has asked what this slot names yet"
+    );
+    let _ = resolve_sampler_state(&state, &host, 1, 2).expect("first sampler");
+    let named = state
+        .object_name(1, 2)
+        .expect("construction names the slot it constructed from");
+
+    // The guest clears the slot, which is what it does before the destroy. The
+    // name outlives the entry, which is the whole point.
+    let cleared = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let _ = host.write_gpa(data_gpa + 2 * OBJECT_LIST_ENTRY_LEN as u64, &cleared);
+    assert_eq!(
+        lookup_list_entry(&state, &host, 1, 2),
+        None,
+        "the fixture must really have cleared the entry, or this proves nothing"
+    );
+    assert_eq!(
+        super::name_resource(&state, &host, 1, 2),
+        Some(named),
+        "the production ref resolver still answers, so the destroy has a \
+         resource to name"
+    );
+}
+
 #[test]
 fn failed_sampler_construction_is_not_retained_and_can_retry() {
     use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_OBJECT;

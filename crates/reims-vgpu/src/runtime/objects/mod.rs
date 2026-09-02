@@ -1662,6 +1662,27 @@ pub fn resolve_sampler_state<M: HostMemory>(
             tag,
             declared_len,
         })?;
+    // The model's name for this slot, taken at the one moment it can be.
+    //
+    // A sampler is constructed out of the guest's object list once and then
+    // answered from `task_sampler_states` forever, so nothing asks the list
+    // about it again — and the guest clears the list slot before it sends the
+    // destroy. A driven macos-15 boot measured what that cost: of 1984 destroys
+    // this device retires something for, **the semantic model had a name for
+    // zero of them** (`delete_object_retained_ref_model_unnamed`), because the
+    // only paths that declare a name are the ones this construction bypasses.
+    // A retirement the model cannot name is a retirement it cannot be told
+    // about, which is the whole of why `CmdDeleteObject` could not cross the
+    // ingress bridge.
+    //
+    // `name_resource` is that door and not a second declaration site: it
+    // answers from `DeviceState::object_name` when a name exists and declares
+    // through `declare_object_name` when one does not, exactly as the
+    // production `RefResolver` does. Its answer is deliberately dropped — this
+    // function returns a sampler, and whether the slot could also be *named* is
+    // a separate fact whose absence must not fail a construction that
+    // succeeded.
+    let _ = name_resource(state, host, task_id, sampler_ref);
     let sampler = state.task_sampler_states.register(
         task_id,
         sampler_ref,
