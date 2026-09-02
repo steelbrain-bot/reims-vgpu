@@ -1369,6 +1369,92 @@ fn the_channel_transitions_the_model_would_refuse_are_counted_apart() {
     );
 }
 
+/// Every packet this device dispatches is counted under the class the model
+/// would read it as, and an unclassifiable one is counted apart.
+///
+/// The last group's denominator. `SessionModel::admit` refuses `UnknownCommand`
+/// and `UnestablishedContract`, and both are `classify` answering `None` — so a
+/// boot's reading on `packet_class_unclassified` is how many whole packets the
+/// ordering group would refuse where this device acts.
+#[test]
+fn every_dispatched_packet_is_counted_under_the_class_the_model_reads_it_as() {
+    use crate::model::{CHILD_OP_NOP, ROOT_OP_DEFINE_FIFO};
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+
+    let control = store_route_count("packet_class_control");
+    let unclassified = store_route_count("packet_class_unclassified");
+
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEFINE_FIFO,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 4,
+            completion_stamp: 0,
+            payload: 1u32.to_le_bytes().to_vec(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        (
+            store_route_count("packet_class_control"),
+            store_route_count("packet_class_unclassified"),
+        ),
+        (control + 1, unclassified),
+        "a channel definition is control, and the model reads it as such"
+    );
+
+    // An opcode the ledger has no row for. The model would refuse the whole
+    // packet; this device reaches its own unknown-opcode arm.
+    let _ = process_child_packet(
+        &mut state,
+        &mut host,
+        1,
+        &Packet {
+            opcode: 0x0fff,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN,
+            completion_stamp: 0,
+            payload: Vec::new(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        (
+            store_route_count("packet_class_control"),
+            store_route_count("packet_class_unclassified"),
+        ),
+        (control + 1, unclassified + 1),
+        "and an opcode with no row is counted apart rather than into a class"
+    );
+
+    // A no-op is classified, which is what makes the counter above a finding
+    // rather than the default for anything this test did not set up.
+    let nop = store_route_count("packet_class_control");
+    let _ = process_child_packet(
+        &mut state,
+        &mut host,
+        1,
+        &Packet {
+            opcode: CHILD_OP_NOP,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN,
+            completion_stamp: 0,
+            payload: Vec::new(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        store_route_count("packet_class_control"),
+        nop + 1,
+        "an acknowledged no-op is a control command and not an unknown one"
+    );
+}
+
 /// A lifetime command names a task, and the census tells a defined one from a
 /// task this device made up on the spot.
 ///

@@ -2452,6 +2452,53 @@ fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
     ));
 }
 
+/// Which payload class the semantic model would read this packet as.
+///
+/// **The ordering and publication group's denominator, taken before that group
+/// moves.** `reims_vgpu_core::session::SessionModel::admit` refuses a packet
+/// whose opcode names no command or whose contract is unestablished —
+/// `UnknownCommand` and `UnestablishedContract` — and both are the same answer
+/// from `reims_vgpu_core::transaction::classify`: `None`. A refusal there is the
+/// whole packet, so the question the last group has to answer with a guest and
+/// not with an argument is *how many packets a driven boot sends that the model
+/// would not classify at all*.
+///
+/// One route per class rather than one counter, because the classes are not
+/// interchangeable: a boot that is nine tenths exec and one that is nine tenths
+/// control need different work from the group that moves them, and a single
+/// "classified" count reads the same for both.
+///
+/// This asks `classify` and nothing else. It resolves no reference, reads no
+/// guest memory and names nothing — deliberately, because the obvious richer
+/// census is to run `crate::runtime::ingress::packet` in shadow, and that would
+/// name references on demand out of the guest's object list. Naming is a
+/// mutation of the namespace the model owns, so a census that did it would be
+/// changing what the device does in order to measure it.
+fn note_packet_class(channel: reims_vgpu_protocol::packets::Channel, opcode: u16) {
+    use reims_vgpu_core::transaction::{classify, PayloadClass};
+    match classify(channel, opcode) {
+        Some(PayloadClass::Exec) => note_store_route("packet_class_exec"),
+        Some(PayloadClass::ResourceLifecycle) => note_store_route("packet_class_lifecycle"),
+        Some(PayloadClass::Query) => note_store_route("packet_class_query"),
+        Some(PayloadClass::Present) => note_store_route("packet_class_present"),
+        Some(PayloadClass::Control) => note_store_route("packet_class_control"),
+        None => {
+            note_store_route("packet_class_unclassified");
+            if crate::observe::first_sight(
+                "packet_class_unclassified",
+                (u64::from(channel as u8) << 16) | u64::from(opcode),
+            ) {
+                crate::observe::fail(format!(
+                    "packet_class_unclassified channel={channel:?} op={opcode:#x} (the model \
+                     has no payload class for this command, so admitting it would promise \
+                     ordering and completion for work it cannot describe — the ordering group \
+                     refuses the whole packet where this device acts on it)"
+                ));
+            }
+        }
+    }
+}
+
 /// Whether a lifetime packet names a task the lifecycle owner would hold.
 ///
 /// **The resource-lifecycle group's remaining gate, and the last one it has.**
@@ -2527,6 +2574,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
     host: &mut H,
     packet: &Packet,
 ) {
+    note_packet_class(reims_vgpu_protocol::packets::Channel::Root, packet.opcode);
     note_lifetime_task_definition(state, reims_vgpu_protocol::packets::Channel::Root, packet);
     match packet.opcode {
         // The two device-info opcodes, one arm. They differ only in which form
@@ -4687,6 +4735,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
     packet: &Packet,
 ) -> ChildPacketDisposition {
     note_packet_domain_definition(state, channel_id, packet.opcode);
+    note_packet_class(reims_vgpu_protocol::packets::Channel::Child, packet.opcode);
     note_lifetime_task_definition(state, reims_vgpu_protocol::packets::Channel::Child, packet);
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
