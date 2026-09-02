@@ -2663,7 +2663,37 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     // changed, so it says so whether or not this device was holding anything to
     // invalidate — the announcement is about the guest's memory, not about our
     // caches. Ahead of the unreached arm's early return for that reason.
-    state.bump_storage_incarnation(task_id, object_id);
+    //
+    // The packet names a reference and the incarnation is kept on the window,
+    // so the reference is resolved to one first. Both are asked, cache before
+    // guest, because they answer different questions: the cache holds the
+    // window *accepted work was planned against*, which is the one that must
+    // stop comparing equal, while the guest's list holds whatever the
+    // reference names now. A reference this device never constructed has only
+    // the second.
+    match repointed_window(state, host, task_id, object_id) {
+        Some(base) => state.bump_storage_incarnation(task_id, base),
+        // No window, so no incarnation moved. That is a real loss — a later
+        // identity for these pages will compare equal to the one accepted work
+        // holds — and it is named rather than left to a counter that reads the
+        // same as a boot with no re-points at all.
+        None => {
+            crate::runtime::drain::note_store_route("replace_physical_window_unknown");
+            if crate::observe::first_sight(
+                "replace_physical_window_unknown",
+                u64::from(task_id) << 32 | u64::from(object_id),
+            ) {
+                crate::observe::fail(format!(
+                    "replace_physical_window_unknown task={task_id} object={object_id} \
+                     (neither this device's construction of this reference nor the \
+                     guest's own list gives it a guest-VA window, so the incarnation \
+                     of the pages the packet says have moved was not advanced and a \
+                     later identity for them will compare equal to the one accepted \
+                     work holds)"
+                ));
+            }
+        }
+    }
 
     let Some(target) = target else {
         note_replace_physical_unmapped_after_invalidation(
@@ -2893,6 +2923,30 @@ pub enum HeapReference {
         object_type: u8,
         descriptor_length: u32,
     },
+}
+
+/// The guest-VA window a re-point packet's reference names.
+///
+/// The construction cache first: it holds the descriptor the accepted work was
+/// planned against, and that is the window whose incarnation has to move.
+/// Falling back to the guest's own list covers a reference this device has
+/// never constructed, which is 96 of 103 re-points on a driven boot.
+fn repointed_window<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    object_id: u32,
+) -> Option<u64> {
+    if let Some(resource) = state.task_resources.get(task_id, object_id) {
+        if let Some((base, _)) =
+            backing_window(state.page_shift, &resource.entry, &resource.descriptor)
+        {
+            return Some(base);
+        }
+    }
+    let entry = probe_list_entry(state, host, task_id, object_id)?;
+    let descriptor = read_descriptor(state, host, task_id, &entry)?;
+    backing_window(state.page_shift, &entry, &descriptor).map(|(base, _)| base)
 }
 
 /// Report what a heap-placed texture's heap reference names.

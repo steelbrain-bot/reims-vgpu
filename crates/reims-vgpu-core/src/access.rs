@@ -113,13 +113,39 @@ use crate::identity::{ChannelId, ResourceId};
 /// each of the two ways it can reach storage. A mapping bumps a generation
 /// whenever its page list changes — a map, an unmap, a replacement, a reattach,
 /// or a page-table refresh that moves frames. Storage named by an address in a
-/// task carries a pair: a per-reference count advanced by a re-point packet or
-/// by the reference being released, and a per-task epoch advanced when the
-/// task's whole address space ends. Two scopes because the events have two
-/// scopes, and an epoch rather than a walk because most references are ones the
-/// guest published and this device never touched — they have no per-name entry
-/// for a walk to find, and the epoch covers them without having to have seen
-/// them.
+/// task carries a pair: a count advanced by a re-point packet, and a per-task
+/// epoch advanced when the task's whole address space ends. Two scopes because
+/// the events have two scopes, and an epoch rather than a walk because most
+/// references are ones the guest published and this device never touched — they
+/// have no per-name entry for a walk to find, and the epoch covers them without
+/// having to have seen them.
+///
+/// ## The count is on the window, and it was on the reference
+///
+/// It was on the reference, because a re-point packet names a reference and
+/// nothing else — which is canonical exactly as long as one window has one
+/// live name. **It does not.** A driven macos-15 boot examined 74 collisions
+/// on that claim and one of them was a genuine alias: two live references in
+/// one task naming a single 8 294 400-byte window, which is 1920×1080×4 — the
+/// compositor's own scanout allocation, and so the most hazard-critical
+/// backing on the device.
+///
+/// A per-reference count would give that framebuffer two identities. A
+/// re-point through one reference advances that reference's count and leaves
+/// the other naming the old incarnation, so a [`Claim`] held under the second
+/// name goes on claiming frames the first has already replaced, and the edge
+/// between the two names is never drawn. That is false distinctness, and it is
+/// on the one buffer where it matters most.
+///
+/// So the re-point resolves the reference it names to that reference's window
+/// and advances the count *there*, and both names move together. Releasing a
+/// name advances nothing: a name is not storage, and a reference reused for
+/// different storage names a different window and is distinct already.
+///
+/// The other 73 collisions were one name after another over a recycled
+/// allocation, which is not an alias — telling those apart needs the holder's
+/// *current* object-list record re-read out of guest memory, because the guest
+/// frees an object by writing over that record and sends no packet at all.
 ///
 /// [`Claim`]: crate::namespace::Claim
 ///

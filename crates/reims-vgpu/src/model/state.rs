@@ -2459,9 +2459,10 @@ pub struct DeviceState {
     rail: OnceLock<Box<dyn RailDeviceState>>,
     /// Mapper-ref-texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
-    /// Per-name half of [`StorageIncarnation`]. Reset for a task whenever its
-    /// epoch moves, which is what keeps it bounded by the live namespace.
-    storage_incarnations: BTreeMap<(u32, u32), u32>,
+    /// Per-window half of [`StorageIncarnation`], keyed `(task, window base)`.
+    /// Reset for a task whenever its epoch moves, which is what keeps it
+    /// bounded by the live namespace.
+    storage_incarnations: BTreeMap<(u32, u64), u32>,
     /// Per-task half of [`StorageIncarnation`].
     task_storage_epochs: BTreeMap<u32, u32>,
     /// The first object reference seen naming each guest-VA window, per task.
@@ -3457,9 +3458,11 @@ impl DeviceState {
         if removed || resource_removed {
             self.invalidate_object_host_copies(task_id, ref_);
             self.texture_to_mapping.remove(&(task_id, ref_));
-            // The name is released. Whatever the guest puts at this reference
-            // next is other storage, and must not compare equal to this.
-            self.bump_storage_incarnation(task_id, ref_);
+            // The incarnation is deliberately not advanced here. Releasing a
+            // *name* is not a statement about storage: other storage at this
+            // reference is a different window and is distinct already, and the
+            // same storage back under the same window is the same backing.
+            // See `storage_incarnation`.
         }
         removed || resource_removed
     }
@@ -3497,7 +3500,8 @@ impl DeviceState {
         (had_texture, had_linear)
     }
 
-    /// Which incarnation of the pages behind a task-local name this is.
+    /// Which incarnation of the pages behind a guest-VA window in this task
+    /// this is.
     ///
     /// The other half of [`MappingEntry::map_generation`]. Storage this device
     /// reaches through a mapping has that counter; storage named only by an
@@ -3511,18 +3515,40 @@ impl DeviceState {
     /// the new — handing the old frames back under a live reader. So the
     /// identity is a window *and* this value.
     ///
+    /// # It is keyed on the window, and it was keyed on the reference
+    ///
+    /// A re-point packet names a reference and nothing else, so counting per
+    /// reference was the shape the packet suggested. It is canonical only if
+    /// one window has one live name, and a driven macos-15 boot found that it
+    /// does not: two live references in one task named a single 8 294 400-byte
+    /// window — 1920×1080×4, the compositor's own scanout allocation. Counting
+    /// per reference would give that framebuffer two identities, and a re-point
+    /// through one name would leave a claim held under the other still naming
+    /// frames that had already been replaced.
+    ///
+    /// So the re-point resolves its reference to that reference's window and
+    /// advances the count there. Both names see it, because both names are the
+    /// window.
+    ///
     /// # What advances it, and why that list is complete
     ///
-    /// Two events at the name's own scope, and two at its task's:
+    /// One event at the window's own scope, and two at its task's:
     ///
     /// * `CmdReplacePhysical`, which by its own contract says the PFNs under
     ///   this window have already changed. It is the only announcement there
     ///   is — the address, geometry and length are all unchanged.
-    /// * [`Self::delete_object`], releasing the name, after which anything at
-    ///   that reference is other storage.
     /// * [`Self::delete_task`] and [`Self::define_task`] on a redefine, which
     ///   end the task's whole address space: the objects are dropped and a new
     ///   directory root puts different physical pages under the same addresses.
+    ///
+    /// **Releasing a name is not on the list, and used to be.** It advanced the
+    /// count on the reading that whatever the guest puts at that reference next
+    /// is other storage — which is true and is already answered by the other
+    /// half: other storage is a different window. The same storage back under
+    /// the same window is the same backing, and a bump there would have said it
+    /// was not. Under per-reference keying the distinction was invisible;
+    /// keyed on the window it is the difference between an identity and a
+    /// counter that only ever goes up.
     ///
     /// The remaining candidate is the guest overwriting its own object-list
     /// slot in place, which is how objects are replaced on this interface and
@@ -3532,23 +3558,23 @@ impl DeviceState {
     /// window alone names the same pages, which is the same backing — unless
     /// the guest also re-pointed them, and then it emitted the packet above.
     #[must_use]
-    pub fn storage_incarnation(&self, task_id: u32, ref_: u32) -> StorageIncarnation {
+    pub fn storage_incarnation(&self, task_id: u32, base: u64) -> StorageIncarnation {
         StorageIncarnation {
             epoch: self.task_storage_epochs.get(&task_id).copied().unwrap_or(0),
             count: self
                 .storage_incarnations
-                .get(&(task_id, ref_))
+                .get(&(task_id, base))
                 .copied()
                 .unwrap_or(0),
         }
     }
 
-    /// Say that the pages behind this task-local name may now be different
+    /// Say that the pages behind this guest-VA window may now be different
     /// pages. See [`Self::storage_incarnation`] for the closed list of callers.
-    pub fn bump_storage_incarnation(&mut self, task_id: u32, ref_: u32) {
+    pub fn bump_storage_incarnation(&mut self, task_id: u32, base: u64) {
         let slot = self
             .storage_incarnations
-            .entry((task_id, ref_))
+            .entry((task_id, base))
             .or_insert(0);
         *slot = slot.wrapping_add(1);
     }
