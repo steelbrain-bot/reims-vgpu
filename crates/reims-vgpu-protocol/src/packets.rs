@@ -315,7 +315,9 @@ pub const LEDGER: &[Packet] = &[
                        for three kinds and not the other eight. The kind is counted and the \
                        object is not retired; acting on the ref against the object-list namespace \
                        was measured and would only ever destroy an unrelated object that shared \
-                       the integer",
+                       the integer. It is also the *only* unresolved row a driven guest sends: a \
+                       macos-15 boot through three rounds of five applications classified 35 972 \
+                       packets and left 2080 unclassified, every one of them this opcode",
         },
     },
     Packet {

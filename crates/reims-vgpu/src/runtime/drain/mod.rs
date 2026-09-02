@@ -2474,6 +2474,28 @@ fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
 /// name references on demand out of the guest's object list. Naming is a
 /// mutation of the namespace the model owns, so a census that did it would be
 /// changing what the device does in order to measure it.
+///
+/// # What a driven boot answered
+///
+/// x86 Vulkan, macos-15, three rounds of five applications:
+/// **`packet_class_exec=20 394`, `packet_class_lifecycle=13 500`,
+/// `packet_class_present=2054`, `packet_class_query=13`,
+/// `packet_class_control=11` — 35 972 classified — and
+/// `packet_class_unclassified=2080`.**
+///
+/// The unclassified 2080 are **one opcode**: `CmdDeleteObject`, child `0x28`,
+/// whose ledger row is `Closure::Unresolved` because its ref lives in the
+/// serializer's per-kind space rather than in the object list. That is five and
+/// a half per cent of this guest's packet stream, and it is the whole of what
+/// the ordering group would refuse — every other command it sends has a class.
+/// So the last group's blocker is not a breadth of unknown commands; it is one
+/// row, and closing it is recovering one ref space.
+///
+/// The shape of the classified traffic is the other half of the reading. It is
+/// over half exec, which says the group's risk is concentrated in the class
+/// whose payload this bridge cannot yet build at all — see
+/// `crate::runtime::ingress::Gap::ExecResolution` and the third input named
+/// there.
 fn note_packet_class(channel: reims_vgpu_protocol::packets::Channel, opcode: u16) {
     use reims_vgpu_core::transaction::{classify, PayloadClass};
     match classify(channel, opcode) {
