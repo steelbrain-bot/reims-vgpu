@@ -335,6 +335,27 @@ fn apply_delete_object<H: HostMemory + HostOps>(
     };
     let object_ref = rec.object_ref.get();
     note_store_route(delete_object_kind_route(op.opcode()));
+    // The ordering group's question, asked of the kinds this device *does*
+    // retire. The untracked kinds were asked it at the bottom of this function
+    // and answered "no list entry at all", which settled that a retirement
+    // cannot be keyed there. The retained kinds decide something larger: if a
+    // sampler-state destroy's ref is an object-list name, the semantic model
+    // can express this command as an operation on a resource it already knows,
+    // and if it is not, the serializer's per-kind spaces are a namespace the
+    // model does not have and this opcode cannot cross the bridge as one.
+    //
+    // Asked before the retirement acts, so the reading is about the ref the
+    // guest sent and not about what dropping it did.
+    if is_retained_kind(op.opcode()) {
+        note_delete_object_ref_space(
+            state,
+            host,
+            task_id,
+            object_ref,
+            op.opcode(),
+            RefSpacePopulation::Retained,
+        );
+    }
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE {
         let retired = state.task_sampler_states.delete(task_id, object_ref);
         note_store_route(if retired {
@@ -402,7 +423,14 @@ fn apply_delete_object<H: HostMemory + HostOps>(
     //
     // Only eight packets a boot reach here, so the list read costs nothing that
     // matters, and it is the difference between "we do not know" and a number.
-    note_delete_object_ref_space(state, host, task_id, object_ref, op.opcode());
+    note_delete_object_ref_space(
+        state,
+        host,
+        task_id,
+        object_ref,
+        op.opcode(),
+        RefSpacePopulation::Untracked,
+    );
     note_unimplemented(
         state,
         channel_id,
@@ -411,8 +439,79 @@ fn apply_delete_object<H: HostMemory + HostOps>(
     );
 }
 
-/// What a destroy record's ref names in the guest's own object list, for the
-/// kinds this device retains nothing by ref for.
+/// The destroy kinds this device holds `(task, ref)`-keyed state for.
+///
+/// One list, asked by the census above and matched arm by arm below it. Two
+/// spellings of "which kinds are retained" would let a kind join the handler
+/// without joining the reading, and the reading is the denominator.
+const fn is_retained_kind(opcode: u32) -> bool {
+    use reims_vgpu_wire::ops::destroy as d;
+    matches!(
+        opcode,
+        d::OPCODE_DELETE_SAMPLER_STATE
+            | d::OPCODE_DELETE_FENCE
+            | d::OPCODE_DELETE_DEPTH_STENCIL_STATE
+            | d::OPCODE_DELETE_RENDER_PIPELINE_STATE
+    )
+}
+
+/// Which population of destroys a ref-space reading belongs to.
+///
+/// Two populations and two sets of routes, because they are two different
+/// questions with two different consequences and one bucket could answer
+/// neither. The **untracked** kinds ask whether a retirement could ever be
+/// keyed on the object list, and eight packets a boot reach it. The
+/// **retained** kinds ask something the ordering group needs instead: this
+/// device already drops a task-local registry entry for them, and whether that
+/// ref is an object-list name decides whether the semantic model can express
+/// the retirement as an operation on a resource it knows — or whether the
+/// serializer's per-kind spaces are a namespace the model does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefSpacePopulation {
+    /// The kinds this device retains nothing by ref for.
+    Untracked,
+    /// The kinds this device retires a `(task, ref)`-keyed registry entry for.
+    Retained,
+}
+
+/// What the guest's object list held at a destroy record's ref.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefSpaceAnswer {
+    /// Nothing at all — no collision and no identity.
+    NoListEntry,
+    /// An entry whose type is the one this destroy opcode names. The evidence
+    /// that the two spaces are one.
+    TypeAgrees,
+    /// An entry of some other type. A collision, which is what a resolving
+    /// integer is until the type agrees.
+    TypeDiffers,
+}
+
+impl RefSpacePopulation {
+    /// The census route for one population's answer.
+    ///
+    /// A table rather than a format string: six counters a reader greps, and
+    /// the pair that separates "one namespace" from "an integer collision" is
+    /// only readable if all six spellings are written in one place.
+    const fn route(self, answer: RefSpaceAnswer) -> &'static str {
+        match (self, answer) {
+            (Self::Untracked, RefSpaceAnswer::NoListEntry) => "delete_object_ref_no_list_entry",
+            (Self::Untracked, RefSpaceAnswer::TypeAgrees) => "delete_object_ref_type_agrees",
+            (Self::Untracked, RefSpaceAnswer::TypeDiffers) => "delete_object_ref_type_differs",
+            (Self::Retained, RefSpaceAnswer::NoListEntry) => {
+                "delete_object_retained_ref_no_list_entry"
+            }
+            (Self::Retained, RefSpaceAnswer::TypeAgrees) => {
+                "delete_object_retained_ref_type_agrees"
+            }
+            (Self::Retained, RefSpaceAnswer::TypeDiffers) => {
+                "delete_object_retained_ref_type_differs"
+            }
+        }
+    }
+}
+
+/// What a destroy record's ref names in the guest's own object list.
 ///
 /// The type a kind expects is the wire's, not a guess: a function is its own
 /// object type and every other retained kind — sampler, depth-stencil, both
@@ -425,6 +524,7 @@ fn note_delete_object_ref_space<M: HostMemory>(
     task_id: u32,
     object_ref: u32,
     opcode: u32,
+    retained: RefSpacePopulation,
 ) {
     use crate::runtime::decode::resource::{
         OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_SERIALIZER_OBJECT,
@@ -439,14 +539,14 @@ fn note_delete_object_ref_space<M: HostMemory>(
     };
     let Some(entry) = crate::runtime::objects::lookup_list_entry(state, host, task_id, object_ref)
     else {
-        note_store_route("delete_object_ref_no_list_entry");
+        note_store_route(retained.route(RefSpaceAnswer::NoListEntry));
         return;
     };
-    let route = if entry.object_type == expected {
-        "delete_object_ref_type_agrees"
+    let route = retained.route(if entry.object_type == expected {
+        RefSpaceAnswer::TypeAgrees
     } else {
-        "delete_object_ref_type_differs"
-    };
+        RefSpaceAnswer::TypeDiffers
+    });
     note_store_route(route);
     if crate::observe::first_sight(route, (u64::from(opcode) << 32) | u64::from(object_ref)) {
         crate::observe::fail(format!(
