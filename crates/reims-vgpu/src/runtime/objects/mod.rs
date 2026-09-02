@@ -1735,7 +1735,16 @@ fn note_stale_task_resource<M: HostMemory>(
     //     task_resource_descriptor_rewritten      0
     //     task_resource_unlisted                  0
     //
-    // Sixty-nine thousand comparisons and not one disagreement. On this rail the
+    // And again, on the boot where the namespace is the naming authority and a
+    // repoint would have to be answered rather than only counted:
+    //
+    //     task_resource_reexamined           137041
+    //     task_resource_slot_repointed            0
+    //     task_resource_descriptor_rewritten      0
+    //     task_resource_unlisted                  0
+    //
+    // Twice the comparisons, the same zero. Sixty-nine thousand comparisons and
+    // not one disagreement, then a hundred and thirty-seven thousand. On this rail the
     // guest never repoints a live slot and never rewrites a descriptor under
     // one, so declaring at first construction is sound here and the
     // redeclaration path is unexercised rather than unneeded — the model handles
@@ -2224,6 +2233,26 @@ fn mapper_ref_surface_extent(state: &DeviceState, descriptor: &[u8]) -> Option<(
 /// mapper-ref texture's plane derivation holding on a live guest: before it, that
 /// whole class had an identity the model could name and no content authority to
 /// go with it.
+///
+/// A third boot, this one with the object namespace as the device's naming
+/// authority rather than a shadow beside it:
+///
+/// ```text
+/// backing_identity_asked                 1638
+/// declared_storage_dedicated             1566
+/// declared_storage_no_bytes                72
+/// declared_storage_placed                   0
+/// storage_extent_unrecovered                0
+/// backing_id_unresolved                     0
+/// backing_id_heap_placed                    0
+/// ```
+///
+/// 1566 + 72 = 1638, exact for the third time, on the boot where the declaration
+/// is no longer only measured — the name every object carries is the one this
+/// walk issued. The split holds its shape across all three boots (95% owning an
+/// allocation, 5% owning nothing) on workloads differing by 13%, which is what
+/// says the partition is a property of what a macOS object list *is* rather than
+/// of one boot's timing.
 ///
 /// One arm is a fail line as well as a count.
 /// [`BackingIdRefusal::HeapPlaced`] is the one open contract term
