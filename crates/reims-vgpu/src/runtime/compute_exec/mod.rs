@@ -848,44 +848,11 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             }
             Some(crate::backend::selected().execute_dispatch(state, host, task_id, &seg.acc, cmd))
         }
-        // Five kinds the product answers by doing nothing, each counted
-        // separately. `None` here is also what every state-accumulating record
-        // above returns, so a no-op and a drop are the same silence — and these
-        // are the records where the difference matters, because unlike a
-        // `BufferBind` they carry ordering the guest expects us to honour.
-        //
-        // The barrier group is a deliberate no-op and the reason is structural:
-        // the product submits one dispatch at a time and waits, so every
-        // resource and scope barrier the guest asks for is already implied by
-        // the boundary between two records. `UseHeaps`/`UseResources` are
-        // residency hints for a driver that pages resources; we resolve every
-        // binding per dispatch, so there is nothing for them to keep resident.
-        // These counters exist to price that argument, not to doubt it — if
-        // they are large, the per-record submit is what they are the cost of.
-        //
-        // That argument is load-bearing in a way it did not look, and the
-        // capture now says how much traffic rests on it. Under
-        // `-setSupportsComputePassDescriptorDispatchType:` Apple's serializer
-        // emits a scope barrier — `0xd7`, `Buffers|Textures` — after **every**
-        // dispatch and every ICB execution of a serial pass, measured on all six
-        // selectors (`reims_vgpu_wire::ops::compute::OPCODE_MEMORY_BARRIER_SCOPE`, and
-        // `reims_vgpu_wire::ops::compute::MemoryBarrierScope` carries the
-        // derivation). So a guest that negotiates that flag doubles this rail's
-        // record count and every second record lands here. The no-op stays
-        // right, and on the Vulkan arm it is stronger than "pass granularity":
-        // `backend::vulkan::engine::exec_compute::execute_compute_inner` begins,
-        // ends and submits one command buffer per dispatch, so consecutive
-        // dispatches are separated by a queue submission rather than by a
-        // barrier inside one. `compute_noop_barrier` reading high is that
-        // capability being on, not a defect.
-        //
-        // The fence pair has no such argument and never had one; it sat in the
-        // barrier group's arm without sharing its comment. An `MTLFence` update
-        // or wait inside a compute encoder is ordering the guest stated
-        // explicitly, and nothing else in the crate handles these two kinds —
-        // `fence_exec` serves the event rail, not this one. If either counter
-        // is non-zero, that is guest-stated ordering we are discarding, and it
-        // wants a contract answer rather than another counter.
+        // The fence pair, which the ledger has not settled and this device
+        // therefore still decodes for itself. An `MTLFence` update or wait
+        // inside a compute encoder is ordering the guest stated explicitly;
+        // these two counters say how much of it reaches an encoder that does
+        // nothing with it.
         Kind::UpdateFence => {
             crate::runtime::drain::note_store_route("compute_noop_update_fence");
             None
@@ -894,22 +861,17 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             crate::runtime::drain::note_store_route("compute_noop_wait_fence");
             None
         }
-        Kind::BarrierResources | Kind::BarrierScope => {
-            crate::runtime::drain::note_store_route("compute_noop_barrier");
-            None
-        }
-        Kind::UseHeaps | Kind::UseResources => {
-            note_residency_declaration(
-                cmd.kind == Kind::UseHeaps,
-                cmd.opcode,
-                cmd.count,
-                cmd.resource_usage,
-            );
-            None
-        }
-        Kind::CompressedTextureFlush => {
-            crate::runtime::drain::note_store_route("compute_noop_compressed_flush");
-            None
+        // The barriers, the compressed-reinterpretation flush and the residency
+        // pair are answered by `runtime::exec::handle_compute_record` from the
+        // ledger's own class, before this decoder is reached. Arriving here is
+        // that routing disagreeing with itself rather than a guest case, so it
+        // is named instead of being answered a second time.
+        Kind::BarrierResources
+        | Kind::BarrierScope
+        | Kind::UseHeaps
+        | Kind::UseResources
+        | Kind::CompressedTextureFlush => {
+            Some(ComputeStatus::Unsupported("compute_record_misrouted"))
         }
         Kind::ControlStartDoWhile
         | Kind::ControlEndDoWhile
@@ -3490,74 +3452,3 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
 
 #[cfg(test)]
 mod tests;
-
-/// A compute residency declaration whose usage the no-op argument does not
-/// cover.
-///
-/// The reasoning and the vocabulary are the render rail's — see
-/// `runtime::exec::report::ResidencyWriteDeclared`, which carries it — with one
-/// difference this rail owns. The compute encoder inherits only the
-/// **unqualified** residency selectors, so no record here carries a stage
-/// argument and there is no stage half to report; the usage half is the whole
-/// declaration, and it is the half that decides whether answering by doing
-/// nothing is sound.
-struct ComputeResidencyDeclared {
-    opcode: u32,
-    count: u32,
-    usage: reims_vgpu_protocol::residency::ResourceUsage,
-}
-
-impl crate::observe::Decline for ComputeResidencyDeclared {
-    fn slug(&self) -> &'static str {
-        use reims_vgpu_protocol::residency::UsageClass;
-        match self.usage.classify() {
-            UsageClass::Undeclared => "compute_residency_usage_undeclared",
-            _ => "compute_residency_write_dropped",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![
-            ("op", format!("{:#x}", self.opcode)),
-            ("count", self.count.to_string()),
-            ("usage", format!("{:#x}", self.usage.0)),
-            (
-                "undeclared_usage",
-                format!("{:#x}", self.usage.undeclared_bits()),
-            ),
-        ]
-    }
-}
-
-/// Price one compute residency declaration by what it declared.
-fn note_residency_declaration(
-    is_heap: bool,
-    opcode: u32,
-    count: u32,
-    usage: reims_vgpu_protocol::residency::ResourceUsage,
-) {
-    use reims_vgpu_protocol::residency::UsageClass;
-    let class = usage.classify();
-    crate::runtime::drain::note_store_route(match (is_heap, class) {
-        // The heap form carries no usage argument, so there is no class to
-        // report — the route says only that a heap was declared.
-        (true, _) => "compute_residency_heap",
-        (false, UsageClass::Empty) => "compute_residency_empty",
-        (false, UsageClass::ReadOnly) => "compute_residency_read",
-        (false, UsageClass::Writes) => "compute_residency_write",
-        (false, UsageClass::Undeclared) => "compute_residency_undeclared",
-    });
-    if is_heap || matches!(class, UsageClass::Empty | UsageClass::ReadOnly) {
-        return;
-    }
-    // A dispatch writing through a path this rail did not bind loses content
-    // the guest expects to read back, which is not what a residency *hint*
-    // costs. Latched on the declaration: the same kernel asks for the same
-    // thing every frame, and a second shape is the event.
-    let decline = ComputeResidencyDeclared {
-        opcode,
-        count,
-        usage,
-    };
-    crate::observe::Emit::decline("compute_residency", &decline).fail_once(u64::from(usage.0));
-}

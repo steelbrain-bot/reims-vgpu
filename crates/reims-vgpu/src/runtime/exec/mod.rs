@@ -1357,6 +1357,47 @@ fn handle_compute_record<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) {
+    // **Which class of record this is, is the closure ledger's answer.** The
+    // compute *rail* carries six: the encoder's own records, the fence pair,
+    // the barriers, the content-representation flush, the sequencing SPI
+    // (control flow and indirect-command execution), and the residency
+    // declarations it inherits from the shared encoder base class. This device
+    // answered all six with one `Kind`, decoded in the same pass that read the
+    // fields — so a record's class and its layout were one verdict.
+    //
+    // Three of the six are answered here, and they are the three that own
+    // nothing: the barriers and the flush are proven no-ops, and the residency
+    // pair is declined. None of them touches `seg.acc`, `seg.session` or
+    // `seg.block`, which is what makes them separable from the rest of the rail
+    // rather than merely convenient to move first. The encoder's records, the
+    // fence pair and the sequencing SPI all still go through this device's own
+    // decoder below: the first because its executor takes the flat
+    // `compute::Command`, and the other two because the ledger has not settled
+    // them and the protocol crate will not lift a row it has not settled.
+    match reims_vgpu_protocol::closure::find(Rail::Compute, opcode)
+        .and_then(reims_vgpu_core::operation::classify)
+    {
+        // `memoryBarrierWithResources:` and `memoryBarrierWithScope:`.
+        Some(OperationHome::Stream(OperationClass::Barrier)) => {
+            return note_compute_barrier(task_id, opcode, cmd_bytes);
+        }
+        // `insertCompressedTextureReinterpretationFlush`, the compute rail's
+        // one content-representation directive.
+        Some(OperationHome::Stream(OperationClass::ResourceState)) => {
+            return note_compute_content_directive(task_id, opcode, cmd_bytes);
+        }
+        // `None` is a row the ledger has not settled, and the compute rail has
+        // thirteen. Two of them are the unqualified `useHeaps:count:` and
+        // `useResources:count:usage:` inherited from the serializer's encoder
+        // base class, and they are declined rather than executed — so their
+        // layout can come from `decode::residency::lift`, which answers what
+        // the guest wrote without claiming the row is settled. The other eleven
+        // feed live executors and stay below.
+        None if reims_vgpu_protocol::decode::residency::is_residency(Rail::Compute, opcode) => {
+            return note_compute_residency(task_id, opcode, cmd_bytes);
+        }
+        _ => {}
+    }
     let cmd = match compute::decode(cmd_bytes) {
         Ok(c) => c,
         // Same silent drop as the render path above.
@@ -1459,6 +1500,216 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         }
         _ => {}
     }
+}
+
+/// Frame one compute record for a protocol decoder, or say the frame disagreed
+/// with itself.
+///
+/// `walk_segment_records` framed this record to hand it over, so a header that
+/// does not frame here is two reads of one header disagreeing rather than a
+/// guest case — which is why it is a `fail` and not a decline.
+fn frame_compute_record<'a>(
+    task_id: u32,
+    opcode: u32,
+    cmd_bytes: &'a [u8],
+) -> Option<reims_vgpu_wire::op::Op<'a>> {
+    match reims_vgpu_protocol::decode::op(cmd_bytes, 0) {
+        Ok(framed) => Some(framed),
+        Err(_) => {
+            crate::observe::fail(format!(
+                "compute_record_unframed task={task_id} opcode={opcode:#x} len={} (the segment \
+                 walk framed this record and the op header did not)",
+                cmd_bytes.len()
+            ));
+            None
+        }
+    }
+}
+
+/// Count and report one compute record a protocol decoder refused.
+fn note_compute_record_refused(
+    task_id: u32,
+    opcode: u32,
+    len: usize,
+    refusal: &reims_vgpu_protocol::decode::DecodeRefusal,
+) {
+    crate::observe::Emit::decline("compute_record", refusal)
+        .field("task", task_id)
+        .field("opcode", format!("{opcode:#x}"))
+        .field("len", len)
+        .fail();
+}
+
+/// Price one compute-encoder barrier, which this device answers by doing
+/// nothing.
+///
+/// The no-op is sound at pass granularity and stronger than that on the Vulkan
+/// rail, where `backend::vulkan::engine::exec_compute::execute_compute_inner`
+/// begins, ends and submits one command buffer per dispatch — so consecutive
+/// dispatches are separated by a queue submission rather than by a barrier
+/// inside one. Under `-setSupportsComputePassDescriptorDispatchType:` Apple's
+/// serializer emits a scope barrier after **every** dispatch and every ICB
+/// execution of a serial pass, so this counter reading high is that capability
+/// being on rather than a defect.
+///
+/// It is still decoded rather than skipped on the opcode: the barrier's shape
+/// is what would have to be read the day the no-op stops being sound, and a
+/// record whose body does not frame is a different event from one that does.
+fn note_compute_barrier(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let Some(framed) = frame_compute_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    match reims_vgpu_protocol::decode::sync::decode(Rail::Compute, &framed) {
+        // One slug for both shapes, as before the ledger answered the class:
+        // the claim being priced is "this device ordered nothing here", and it
+        // is the same claim for a resource list and for a scope word.
+        Ok(SyncRecord::Barrier(_)) => {
+            crate::runtime::drain::note_store_route("compute_noop_barrier");
+        }
+        // `barrier_kind` answers for exactly the two barrier opcodes on this
+        // rail, so the class and the lift agreeing is the protocol crate's
+        // invariant. Unreachable, and named rather than ignored.
+        Ok(_) => crate::observe::fail(format!(
+            "compute_barrier_not_a_barrier task={task_id} opcode={opcode:#x} (the ledger calls \
+             this a barrier and the lift produced another ordering record)"
+        )),
+        Err(refusal) => note_compute_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
+/// Price the compute rail's one content-representation directive.
+///
+/// `insertCompressedTextureReinterpretationFlush` names no resource and takes
+/// no argument. It is a proven no-op here because this device never
+/// materialises Apple's lossless-compression metadata, so there is no second
+/// representation for the flush to make visible.
+fn note_compute_content_directive(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let Some(framed) = frame_compute_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    match reims_vgpu_protocol::decode::resource_state::decode(Rail::Compute, &framed) {
+        Ok(record) => crate::runtime::drain::note_store_route(match record.directive {
+            ContentDirective::FlushCompressedReinterpretation => {
+                "compute_noop_flush_compressed_reinterpretation"
+            }
+            // The four directives that name a resource; they are the blit
+            // rail's and do not arrive here. Healthy zeroes, kept apart from
+            // the flush so a reading cannot mistake one for the other.
+            ContentDirective::Synchronize => "compute_noop_synchronize",
+            ContentDirective::OptimizeForCpu => "compute_noop_optimize_for_cpu",
+            ContentDirective::OptimizeForGpu => "compute_noop_optimize_for_gpu",
+            ContentDirective::InvalidateCompressed => "compute_noop_invalidate_compressed",
+        }),
+        Err(refusal) => note_compute_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
+/// A compute residency declaration whose usage the no-op argument does not
+/// cover.
+///
+/// The reasoning and the vocabulary are the render rail's — see
+/// [`report::ResidencyWriteDeclared`], which carries it — with one difference
+/// this rail owns. The compute encoder inherits only the **unqualified** residency selectors,
+/// so no record here carries a stage argument and there is no stage half to
+/// report; the usage half is the whole declaration, and it is the half that
+/// decides whether answering by doing nothing is sound.
+struct ComputeResidencyDeclared {
+    opcode: u32,
+    count: usize,
+    usage: reims_vgpu_protocol::residency::ResourceUsage,
+}
+
+impl crate::observe::Decline for ComputeResidencyDeclared {
+    fn slug(&self) -> &'static str {
+        use reims_vgpu_protocol::residency::UsageClass;
+        match self.usage.classify() {
+            UsageClass::Undeclared => "compute_residency_usage_undeclared",
+            _ => "compute_residency_write_dropped",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("op", format!("{:#x}", self.opcode)),
+            ("count", self.count.to_string()),
+            ("usage", format!("{:#x}", self.usage.0)),
+            (
+                "undeclared_usage",
+                format!("{:#x}", self.usage.undeclared_bits()),
+            ),
+        ]
+    }
+}
+
+/// Price one compute residency declaration by what it declared.
+///
+/// This device resolves every binding per dispatch, so there is nothing for a
+/// residency hint to keep resident and the answer is to do nothing. That
+/// argument is load-bearing, and the census is what prices it: a declaration
+/// that only reads is free to drop, while a dispatch writing through a path
+/// this rail did not bind loses content the guest expects to read back, which
+/// is not what a *hint* costs.
+///
+/// **The heap form carries no usage and the resource form always does**, and
+/// that is now the record's own shape rather than a convention: the heap
+/// selector has no usage argument at all, so there is no class to report and
+/// nothing to weigh. It used to arrive as a zero in a `resource_usage` field
+/// the decoder filled in for it, which made "declared nothing" and "declared
+/// no usage" the same word.
+fn note_compute_residency(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    use reims_vgpu_protocol::decode::residency::ResidencySubject;
+    use reims_vgpu_protocol::residency::UsageClass;
+
+    let Some(framed) = frame_compute_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    // `lift` rather than `decode`: the row is unresolved, so `decode` refuses
+    // it on principle and is right to. What this arm wants is the layout
+    // question answered on its own — it is a census, not a claim that the
+    // contract is settled.
+    let record = match reims_vgpu_protocol::decode::residency::lift(Rail::Compute, &framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            note_compute_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+            return;
+        }
+    };
+    let usage = match (record.subject, record.usage) {
+        (ResidencySubject::Heaps, _) => {
+            crate::runtime::drain::note_store_route("compute_residency_heap");
+            return;
+        }
+        (ResidencySubject::Resources, Some(usage)) => usage,
+        // Unreachable on this rail: both of its residency selectors are
+        // unqualified, and the resource form of that pair carries a usage word.
+        // Named rather than folded onto an empty usage, which would report a
+        // declaration the guest did not make.
+        (ResidencySubject::Resources, None) => {
+            crate::observe::fail(format!(
+                "compute_residency_without_usage task={task_id} opcode={opcode:#x} (a resource \
+                 residency declaration on this rail carries a usage word and this one did not)"
+            ));
+            return;
+        }
+    };
+    let class = usage.classify();
+    crate::runtime::drain::note_store_route(match class {
+        UsageClass::Empty => "compute_residency_empty",
+        UsageClass::ReadOnly => "compute_residency_read",
+        UsageClass::Writes => "compute_residency_write",
+        UsageClass::Undeclared => "compute_residency_undeclared",
+    });
+    if matches!(class, UsageClass::Empty | UsageClass::ReadOnly) {
+        return;
+    }
+    // Latched on the declaration: the same kernel asks for the same thing every
+    // frame, and a second shape is the event.
+    let decline = ComputeResidencyDeclared {
+        opcode,
+        count: record.refs.len(),
+        usage,
+    };
+    crate::observe::Emit::decline("compute_residency", &decline).fail_once(u64::from(usage.0));
 }
 
 /// An indirect-command-buffer record this rail decoded and did not apply.

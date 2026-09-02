@@ -6155,3 +6155,175 @@ fn a_residency_write_declaration_is_named_rather_than_counted_with_the_reads() {
         "and it must not also count as one"
     );
 }
+
+/// The three compute-rail classes the closure ledger now routes each reach a
+/// counter that names them, and none of them reaches another's.
+///
+/// Before the ledger answered the class, all three were arms of this device's
+/// own `compute::Kind`, decoded in the same pass that read the fields — so a
+/// record's class and its layout were one verdict and a misclassification read
+/// fields at the wrong offsets. The routing is what this asserts, in both
+/// directions: a barrier must not be counted as a residency declaration and a
+/// residency declaration must not be counted as a barrier, because the first is
+/// ordering this device argues it already provides and the second is a hint it
+/// argues it does not need. One bucket for both would make a driven boot's
+/// reading unusable for checking either argument.
+#[test]
+fn each_ledger_routed_compute_class_reaches_a_counter_that_names_which_one_it_is() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::compute as wire_c;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    // `count` refs and nothing else — the shape of both the resource barrier
+    // and the unqualified heap declaration.
+    let counted = |op: u32, refs: &[u32]| {
+        let total = (OP_HEADER_LEN + 4 + refs.len() * 4) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        st32(&mut v[OP_HEADER_LEN..], refs.len() as u32);
+        for (i, r) in refs.iter().enumerate() {
+            st32(&mut v[OP_HEADER_LEN + 4 + i * 4..], *r);
+        }
+        v
+    };
+    // `useResources:count:usage:` puts its usage word between the count and the
+    // refs; the heap form has no such word at all.
+    let use_resources = |usage: u32, refs: &[u32]| {
+        let total = (OP_HEADER_LEN + 8 + refs.len() * 4) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], wire_r::OPCODE_USE_RESOURCES_NO_STAGES);
+        st32(&mut v[4..], total);
+        st32(&mut v[OP_HEADER_LEN..], refs.len() as u32);
+        st32(&mut v[OP_HEADER_LEN + 4..], usage);
+        for (i, r) in refs.iter().enumerate() {
+            st32(&mut v[OP_HEADER_LEN + 8 + i * 4..], *r);
+        }
+        v
+    };
+    let bare = |op: u32, payload_len: usize| {
+        let total = (OP_HEADER_LEN + payload_len) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v
+    };
+
+    let mut scope = bare(
+        wire_c::OPCODE_MEMORY_BARRIER_SCOPE,
+        wire_c::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize - OP_HEADER_LEN,
+    );
+    st16(&mut scope[OP_HEADER_LEN..], 3);
+
+    const BARRIER: &str = "compute_noop_barrier";
+    const FLUSH: &str = "compute_noop_flush_compressed_reinterpretation";
+    const HEAP: &str = "compute_residency_heap";
+    const READ: &str = "compute_residency_read";
+    const WRITE: &str = "compute_residency_write";
+    const ALL: [&str; 5] = [BARRIER, FLUSH, HEAP, READ, WRITE];
+
+    for (op, command, route) in [
+        (
+            wire_c::OPCODE_MEMORY_BARRIER_RESOURCES,
+            counted(wire_c::OPCODE_MEMORY_BARRIER_RESOURCES, &[5151, 4343]),
+            BARRIER,
+        ),
+        (wire_c::OPCODE_MEMORY_BARRIER_SCOPE, scope, BARRIER),
+        (
+            wire_c::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH,
+            bare(wire_c::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH, 0),
+            FLUSH,
+        ),
+        (
+            wire_r::OPCODE_USE_HEAPS_NO_STAGES,
+            counted(wire_r::OPCODE_USE_HEAPS_NO_STAGES, &[77]),
+            HEAP,
+        ),
+        (
+            wire_r::OPCODE_USE_RESOURCES_NO_STAGES,
+            use_resources(
+                reims_vgpu_protocol::residency::ResourceUsage::READ,
+                &[88, 99],
+            ),
+            READ,
+        ),
+        (
+            wire_r::OPCODE_USE_RESOURCES_NO_STAGES,
+            use_resources(reims_vgpu_protocol::residency::ResourceUsage::WRITE, &[88]),
+            WRITE,
+        ),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+        let before: Vec<u64> = ALL.iter().map(|r| store_route_count(r)).collect();
+        handle_compute_record(&mut state, &mut host, 1, op, &command, &mut out, &mut seg);
+        for (name, was) in ALL.iter().zip(before) {
+            let now = store_route_count(name);
+            let want = was + u64::from(*name == route);
+            assert_eq!(
+                now, want,
+                "{op:#x} should have been counted once as {route} and {name} moved from {was} to \
+                 {now}"
+            );
+        }
+        // None of the three owns anything: the accumulator, the session and the
+        // sequencing block are what separates them from the rest of the rail,
+        // and a record that touched one of them would not be separable.
+        assert!(
+            seg.session.is_none()
+                && seg.block.is_none()
+                && seg.acc.pipeline_ref == 0
+                && seg.acc.buffers.is_empty()
+                && seg.acc.textures.is_empty()
+                && seg.acc.samplers.is_empty()
+                && seg.acc.threadgroup_memory.is_empty()
+                && seg.acc.stage_in_region.is_none()
+                && seg.acc.stage_in_region_indirect.is_none()
+                && seg.acc.imageblock.is_none()
+                && seg.acc.dispatch_type == 0,
+            "{op:#x} moved segment state it does not own"
+        );
+    }
+}
+
+/// A ledger-routed compute record whose body does not frame is declined under
+/// its own name rather than silently doing nothing.
+///
+/// The three no-op classes are still decoded, and this is why: the day one of
+/// their no-op arguments stops holding, the shape is what has to be read, and a
+/// route that counted on the opcode alone would have been recording a decode
+/// that never happened.
+#[test]
+fn a_ledger_routed_compute_record_short_of_its_body_is_declined_and_not_counted() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    // `count` says two refs and the record carries none of them.
+    let total = (OP_HEADER_LEN + 4) as u32;
+    let mut command = vec![0u8; total as usize];
+    st32(&mut command[0..], wire_r::OPCODE_USE_HEAPS_NO_STAGES);
+    st32(&mut command[4..], total);
+    st32(&mut command[OP_HEADER_LEN..], 2);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+    let before = store_route_count("compute_residency_heap");
+    handle_compute_record(
+        &mut state,
+        &mut host,
+        1,
+        wire_r::OPCODE_USE_HEAPS_NO_STAGES,
+        &command,
+        &mut out,
+        &mut seg,
+    );
+    assert_eq!(
+        store_route_count("compute_residency_heap"),
+        before,
+        "a declaration whose refs are not there was priced as one that was"
+    );
+}
