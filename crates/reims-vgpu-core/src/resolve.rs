@@ -60,6 +60,7 @@ use reims_vgpu_protocol::decode::compute::{
     ComputeRecord, DispatchRecord, Extent as RecordExtent, IndirectRef as ComputeIndirect,
 };
 use reims_vgpu_protocol::decode::icb::IcbRecord;
+use reims_vgpu_protocol::decode::render as protocol_render;
 use reims_vgpu_protocol::decode::render::{
     DrawRecord, IndexRef as RecordIndexRef, IndirectRef as RenderIndirect,
     Instancing as RecordInstancing, RenderRecord,
@@ -893,64 +894,71 @@ pub fn render(
 ) -> Result<RenderOp, ResolveRefusal> {
     Ok(match *record {
         RenderRecord::Draw(d) => RenderOp::Draw(draw(&d, resolver)?),
-        RenderRecord::BindBuffers {
+        RenderRecord::BindBuffers(protocol_render::BindBuffers {
             stage,
             first,
             entries,
-        } => RenderOp::BindBuffers {
+        }) => RenderOp::BindBuffers {
             stage,
             first,
             entries: append_buffer_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::BindBuffersWithStride { first, entries } => RenderOp::BindBuffersWithStride {
+        RenderRecord::BindBuffersWithStride(protocol_render::BindBuffersWithStride {
+            first,
+            entries,
+        }) => RenderOp::BindBuffersWithStride {
             first,
             entries: append_stride_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::BindTextures {
+        RenderRecord::BindTextures(protocol_render::BindTextures {
             stage,
             first,
             entries,
-        } => RenderOp::BindTextures {
+        }) => RenderOp::BindTextures {
             stage,
             first,
             entries: append_object_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::BindSamplers {
+        RenderRecord::BindSamplers(protocol_render::BindSamplers {
             stage,
             first,
             entries,
-        } => RenderOp::BindSamplers {
+        }) => RenderOp::BindSamplers {
             stage,
             first,
             entries: append_object_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::BindSamplersWithLod {
+        RenderRecord::BindSamplersWithLod(protocol_render::BindSamplersWithLod {
             stage,
             first,
             entries,
-        } => RenderOp::BindSamplersWithLod {
+        }) => RenderOp::BindSamplersWithLod {
             stage,
             first,
             entries: append_sampler_lod_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::RebindBufferOffset {
+        RenderRecord::RebindBufferOffset(protocol_render::RebindBufferOffset {
             stage,
             index,
             offset,
             stride,
-        } => RenderOp::RebindBufferOffset {
+        }) => RenderOp::RebindBufferOffset {
             stage,
             index,
             offset,
             stride,
         },
-        RenderRecord::SetPipeline { pipeline_ref } => RenderOp::SetPipeline {
-            pipeline: one(resolver, pipeline_ref)?,
-        },
-        RenderRecord::SetDepthStencilState { state_ref } => RenderOp::SetDepthStencilState {
-            state: one(resolver, state_ref)?,
-        },
-        RenderRecord::WriteDescriptor { descriptor } => {
+        RenderRecord::SetPipeline(protocol_render::SetPipeline { pipeline_ref }) => {
+            RenderOp::SetPipeline {
+                pipeline: one(resolver, pipeline_ref)?,
+            }
+        }
+        RenderRecord::SetDepthStencilState(protocol_render::SetDepthStencilState { state_ref }) => {
+            RenderOp::SetDepthStencilState {
+                state: one(resolver, state_ref)?,
+            }
+        }
+        RenderRecord::WriteDescriptor(protocol_render::WriteDescriptor { descriptor }) => {
             let resolved = pass_descriptor(descriptor, resolver)?;
             let slot = u32::try_from(arenas.pass_descriptors.len())
                 .map_err(|_| ResolveRefusal::ArenaOverflow { wanted: 1 })?;
@@ -965,40 +973,43 @@ pub fn render(
         RenderRecord::SetScissorRects(rects) => {
             RenderOp::SetScissorRects(append_scissors(arenas, rects)?)
         }
-        RenderRecord::SetCullMode(mode) => RenderOp::SetCullMode(mode),
-        RenderRecord::SetFrontFacingWinding(mode) => RenderOp::SetFrontFacingWinding(mode),
-        RenderRecord::SetDepthClipMode(mode) => RenderOp::SetDepthClipMode(mode),
-        RenderRecord::SetTriangleFillMode(mode) => RenderOp::SetTriangleFillMode(mode),
-        RenderRecord::SetDepthBias {
+        RenderRecord::SetCullMode(r) => RenderOp::SetCullMode(r.mode),
+        RenderRecord::SetFrontFacingWinding(r) => RenderOp::SetFrontFacingWinding(r.winding),
+        RenderRecord::SetDepthClipMode(r) => RenderOp::SetDepthClipMode(r.mode),
+        RenderRecord::SetTriangleFillMode(r) => RenderOp::SetTriangleFillMode(r.mode),
+        RenderRecord::SetDepthBias(protocol_render::SetDepthBias {
             bias_bits,
             slope_scale_bits,
             clamp_bits,
-        } => RenderOp::SetDepthBias {
+        }) => RenderOp::SetDepthBias {
             bias: FloatBits(bias_bits),
             slope_scale: FloatBits(slope_scale_bits),
             clamp: FloatBits(clamp_bits),
         },
-        RenderRecord::SetLineWidth { width_bits } => RenderOp::SetLineWidth(FloatBits(width_bits)),
-        RenderRecord::SetBlendColor {
+        RenderRecord::SetLineWidth(protocol_render::SetLineWidth { width_bits }) => {
+            RenderOp::SetLineWidth(FloatBits(width_bits))
+        }
+        RenderRecord::SetBlendColor(protocol_render::SetBlendColor {
             red_bits,
             green_bits,
             blue_bits,
             alpha_bits,
-        } => RenderOp::SetBlendColor {
+        }) => RenderOp::SetBlendColor {
             red: FloatBits(red_bits),
             green: FloatBits(green_bits),
             blue: FloatBits(blue_bits),
             alpha: FloatBits(alpha_bits),
         },
-        RenderRecord::SetStencilReference { front, back } => {
+        RenderRecord::SetStencilReference(protocol_render::SetStencilReference { front, back }) => {
             RenderOp::SetStencilReference { front, back }
         }
-        RenderRecord::SetStoreAction { target, action } => {
+        RenderRecord::SetStoreAction(protocol_render::SetStoreAction { target, action }) => {
             RenderOp::SetStoreAction { target, action }
         }
-        RenderRecord::SetVisibilityResultMode { mode, offset } => {
-            RenderOp::SetVisibilityResultMode { mode, offset }
-        }
+        RenderRecord::SetVisibilityResultMode(protocol_render::SetVisibilityResultMode {
+            mode,
+            offset,
+        }) => RenderOp::SetVisibilityResultMode { mode, offset },
     })
 }
 
@@ -1033,42 +1044,42 @@ fn instancing(i: RecordInstancing) -> Instancing {
 /// Resolve a draw record.
 pub fn draw(record: &DrawRecord, resolver: &impl RefResolver) -> Result<DrawOp, ResolveRefusal> {
     Ok(match *record {
-        DrawRecord::Primitives {
+        DrawRecord::Primitives(protocol_render::Primitives {
             primitive,
             vertex_start,
             vertex_count,
             instances,
-        } => DrawOp::Primitives {
+        }) => DrawOp::Primitives {
             primitive: PrimitiveType(primitive),
             vertex_start,
             vertex_count,
             instances: instancing(instances),
         },
-        DrawRecord::Indexed {
+        DrawRecord::Indexed(protocol_render::Indexed {
             primitive,
             index,
             index_count,
             instances,
             base_vertex,
-        } => DrawOp::Indexed {
+        }) => DrawOp::Indexed {
             primitive: PrimitiveType(primitive),
             index: index_source(resolver, index)?,
             index_count,
             instances: instancing(instances),
             base_vertex,
         },
-        DrawRecord::PrimitivesIndirect {
+        DrawRecord::PrimitivesIndirect(protocol_render::PrimitivesIndirect {
             primitive,
             arguments,
-        } => DrawOp::PrimitivesIndirect {
+        }) => DrawOp::PrimitivesIndirect {
             primitive: PrimitiveType(primitive),
             arguments: draw_arguments(resolver, arguments)?,
         },
-        DrawRecord::IndexedIndirect {
+        DrawRecord::IndexedIndirect(protocol_render::IndexedIndirect {
             primitive,
             index,
             arguments,
-        } => DrawOp::IndexedIndirect {
+        }) => DrawOp::IndexedIndirect {
             primitive: PrimitiveType(primitive),
             index: index_source(resolver, index)?,
             arguments: draw_arguments(resolver, arguments)?,
@@ -1877,17 +1888,17 @@ mod tests {
     #[test]
     fn a_draw_resolves_exactly_the_buffers_its_record_names() {
         let live = Live(vec![5151, 5252]);
-        let plain = DrawRecord::Primitives {
+        let plain = DrawRecord::Primitives(protocol_render::Primitives {
             primitive: 3,
             vertex_start: 0,
             vertex_count: 3,
             instances: RecordInstancing::default(),
-        };
+        });
         let resolved = draw(&plain, &Live(Vec::new())).expect("resolved");
         assert_eq!(resolved.index_read(), None);
         assert_eq!(resolved.indirect_read(), None);
 
-        let indexed = DrawRecord::IndexedIndirect {
+        let indexed = DrawRecord::IndexedIndirect(protocol_render::IndexedIndirect {
             primitive: 3,
             index: RecordIndexRef {
                 buffer_ref: 5151,
@@ -1898,7 +1909,7 @@ mod tests {
                 buffer_ref: 5252,
                 offset: 0x200,
             },
-        };
+        });
         let resolved = draw(&indexed, &live).expect("resolved");
         let (source, range) = resolved.index_read().expect("indexed");
         assert_eq!(source.buffer, id(5151));
@@ -1922,11 +1933,11 @@ mod tests {
         }];
         let mut spans = Vec::new();
         for stage in [ShaderStage::Vertex, ShaderStage::Fragment] {
-            let record = RenderRecord::BindTextures {
+            let record = RenderRecord::BindTextures(protocol_render::BindTextures {
                 stage,
                 first: 0,
                 entries: &entries,
-            };
+            });
             let RenderOp::BindTextures {
                 stage: got,
                 entries: span,
@@ -1950,7 +1961,8 @@ mod tests {
         let live = Live(Vec::new());
         let mut arenas = ExecArenas::default();
         let body = pass_body();
-        let record = RenderRecord::WriteDescriptor { descriptor: &body };
+        let record =
+            RenderRecord::WriteDescriptor(protocol_render::WriteDescriptor { descriptor: &body });
         let RenderOp::WriteDescriptor { descriptor } =
             render(&record, &live, &mut arenas).expect("resolved")
         else {
@@ -2534,9 +2546,9 @@ mod tests {
                         named = vec![some_ref(&mut rng)];
                         binds = false;
                         let want = shadow_one(&live, named[0]).map(|_| Appended::Nothing);
-                        let record = RenderRecord::SetPipeline {
+                        let record = RenderRecord::SetPipeline(protocol_render::SetPipeline {
                             pipeline_ref: named[0],
-                        };
+                        });
                         let got = render(&record, &live, &mut arenas).map(|_| None);
                         (got, want)
                     }
@@ -2570,7 +2582,10 @@ mod tests {
                             shadow_bound(&live, named[1])
                                 .map(|depth| Appended::Descriptor { color0, depth })
                         });
-                        let record = RenderRecord::WriteDescriptor { descriptor: &body };
+                        let record =
+                            RenderRecord::WriteDescriptor(protocol_render::WriteDescriptor {
+                                descriptor: &body,
+                            });
                         let got = render(&record, &live, &mut arenas).map(|op| match op {
                             RenderOp::WriteDescriptor { descriptor } => Some(ResourceSpan {
                                 start: descriptor.0,

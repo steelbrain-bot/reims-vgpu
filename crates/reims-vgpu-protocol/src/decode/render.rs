@@ -71,136 +71,256 @@ pub struct Instancing {
     pub base: u64,
 }
 
+/// A draw whose vertices come from the record's own counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Primitives {
+    pub primitive: u32,
+    pub vertex_start: u64,
+    pub vertex_count: u64,
+    pub instances: Instancing,
+}
+
+/// A draw whose vertices come from an index buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Indexed {
+    pub primitive: u32,
+    pub index: IndexRef,
+    pub index_count: u64,
+    pub instances: Instancing,
+    pub base_vertex: i64,
+}
+
+/// A draw whose counts come from a buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrimitivesIndirect {
+    pub primitive: u32,
+    pub arguments: IndirectRef,
+}
+
+/// An indexed draw whose counts come from a buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexedIndirect {
+    pub primitive: u32,
+    pub index: IndexRef,
+    pub arguments: IndirectRef,
+}
+
 /// One lifted draw.
+///
+/// Each variant carries **one named payload** rather than inline fields, for
+/// the same reason [`RenderRecord`] does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DrawRecord {
-    Primitives {
-        primitive: u32,
-        vertex_start: u64,
-        vertex_count: u64,
-        instances: Instancing,
-    },
-    Indexed {
-        primitive: u32,
-        index: IndexRef,
-        index_count: u64,
-        instances: Instancing,
-        base_vertex: i64,
-    },
-    PrimitivesIndirect {
-        primitive: u32,
-        arguments: IndirectRef,
-    },
-    IndexedIndirect {
-        primitive: u32,
-        index: IndexRef,
-        arguments: IndirectRef,
-    },
+    Primitives(Primitives),
+    Indexed(Indexed),
+    PrimitivesIndirect(PrimitivesIndirect),
+    IndexedIndirect(IndexedIndirect),
+}
+
+/// A run of buffer bindings into one stage's argument table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindBuffers<'a> {
+    pub stage: ShaderStage,
+    /// The slot the first entry lands in.
+    pub first: u32,
+    pub entries: &'a [BufferBind],
+}
+
+/// The vertex stage's attribute-stride bind. There is no fragment form: the
+/// API has no fragment attribute stride, which is why this payload names no
+/// stage where the others do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindBuffersWithStride<'a> {
+    pub first: u32,
+    pub entries: &'a [BufferStrideBind],
+}
+
+/// A run of texture bindings into one stage's argument table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindTextures<'a> {
+    pub stage: ShaderStage,
+    pub first: u32,
+    pub entries: &'a [RefBind],
+}
+
+/// A run of sampler bindings into one stage's argument table.
+///
+/// The same wire entry as [`BindTextures`] and a different argument table, so
+/// they are two payloads rather than one — a run written into the wrong table
+/// binds nothing the shader asked for and refuses nothing either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSamplers<'a> {
+    pub stage: ShaderStage,
+    pub first: u32,
+    pub entries: &'a [RefBind],
+}
+
+/// A run of sampler bindings that also carry a LOD clamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSamplersWithLod<'a> {
+    pub stage: ShaderStage,
+    pub first: u32,
+    pub entries: &'a [SamplerLodBind],
+}
+
+/// Move an already-bound buffer's offset, and its stride when the record
+/// carries one. It names no buffer: the slot keeps whatever it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RebindBufferOffset {
+    pub stage: ShaderStage,
+    pub index: u32,
+    pub offset: u64,
+    /// `None` for the form that does not carry the field at all — not a stride
+    /// of zero, which is a stride the guest could state.
+    pub stride: Option<u64>,
+}
+
+/// The render pipeline state the following draws run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetPipeline {
+    pub pipeline_ref: u32,
+}
+
+/// The depth-stencil state the following draws test against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetDepthStencilState {
+    pub state_ref: u32,
+}
+
+/// The pass descriptor, borrowed rather than copied: it is 592 bytes, and a
+/// record that carried it by value would make every eight-byte variant that
+/// size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteDescriptor<'a> {
+    pub descriptor: &'a RenderPassBody,
+}
+
+/// `MTLCullMode`, as the record carries it.
+///
+/// A named payload for one `u64`, and the four rasterizer-state records are the
+/// reason the rule is worth the noise: cull mode, winding, depth-clip mode and
+/// fill mode are four wire-identical words, and a bare `u64` makes an executor
+/// that pairs the wrong one with the wrong state field type-correct. That is
+/// the exact defect the flat device command allowed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetCullMode {
+    pub mode: u64,
+}
+
+/// `MTLWinding`, as the record carries it. See [`SetCullMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetFrontFacingWinding {
+    pub winding: u64,
+}
+
+/// `MTLDepthClipMode`, as the record carries it. See [`SetCullMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetDepthClipMode {
+    pub mode: u64,
+}
+
+/// `MTLTriangleFillMode`, as the record carries it. See [`SetCullMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetTriangleFillMode {
+    pub mode: u64,
+}
+
+/// Three `float`s, as the guest's bits. Bits rather than `f32` because a state
+/// table has to compare, and float equality makes a NaN differ from itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetDepthBias {
+    pub bias_bits: u32,
+    pub slope_scale_bits: u32,
+    pub clamp_bits: u32,
+}
+
+/// One `float`, as the guest's bits, for the reason [`SetDepthBias`]'s three
+/// are. `setLineWidth:` shares its wire form with
+/// `setTessellationFactorScale:`, so the opcode is the only thing that
+/// separates a state this device carries from one it does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetLineWidth {
+    pub width_bits: u32,
+}
+
+/// Four `float`s, as the guest's bits. See [`SetDepthBias`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetBlendColor {
+    pub red_bits: u32,
+    pub green_bits: u32,
+    pub blue_bits: u32,
+    pub alpha_bits: u32,
+}
+
+/// The two stencil reference values, which one record sets together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetStencilReference {
+    pub front: u32,
+    pub back: u32,
+}
+
+/// A store action, and which attachment it is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetStoreAction {
+    pub target: StoreActionTarget,
+    pub action: u64,
+}
+
+/// The visibility-result mode and the buffer offset it writes at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetVisibilityResultMode {
+    pub mode: u64,
+    pub offset: u64,
 }
 
 /// One lifted render record.
+///
+/// Each variant carries **one named payload** rather than inline fields, so a
+/// consumer can take the record it handles by reference and cannot be handed a
+/// different one. The two exceptions carry a slice of a type nothing else on
+/// this rail carries — a `&[Viewport]` is not confusable with a
+/// `&[ScissorRect]` — so a wrapper around them would name what the element type
+/// already says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderRecord<'a> {
     Draw(DrawRecord),
 
-    BindBuffers {
-        stage: ShaderStage,
-        first: u32,
-        entries: &'a [BufferBind],
-    },
-    /// The vertex stage's attribute-stride bind. There is no fragment form:
-    /// the API has no fragment attribute stride.
-    BindBuffersWithStride {
-        first: u32,
-        entries: &'a [BufferStrideBind],
-    },
-    BindTextures {
-        stage: ShaderStage,
-        first: u32,
-        entries: &'a [RefBind],
-    },
-    BindSamplers {
-        stage: ShaderStage,
-        first: u32,
-        entries: &'a [RefBind],
-    },
-    BindSamplersWithLod {
-        stage: ShaderStage,
-        first: u32,
-        entries: &'a [SamplerLodBind],
-    },
-    RebindBufferOffset {
-        stage: ShaderStage,
-        index: u32,
-        offset: u64,
-        stride: Option<u64>,
-    },
+    BindBuffers(BindBuffers<'a>),
+    BindBuffersWithStride(BindBuffersWithStride<'a>),
+    BindTextures(BindTextures<'a>),
+    BindSamplers(BindSamplers<'a>),
+    BindSamplersWithLod(BindSamplersWithLod<'a>),
+    RebindBufferOffset(RebindBufferOffset),
 
-    SetPipeline {
-        pipeline_ref: u32,
-    },
-    SetDepthStencilState {
-        state_ref: u32,
-    },
-    /// The pass descriptor, borrowed rather than copied: it is 592 bytes, and a
-    /// record that carried it by value would make every eight-byte variant that
-    /// size.
-    WriteDescriptor {
-        descriptor: &'a RenderPassBody,
-    },
+    SetPipeline(SetPipeline),
+    SetDepthStencilState(SetDepthStencilState),
+    WriteDescriptor(WriteDescriptor<'a>),
 
     SetViewports(&'a [Viewport]),
     SetScissorRects(&'a [ScissorRect]),
-    SetCullMode(u64),
-    SetFrontFacingWinding(u64),
-    SetDepthClipMode(u64),
-    SetTriangleFillMode(u64),
-    /// Three `float`s, as the guest's bits. Bits rather than `f32` because a
-    /// state table has to compare, and float equality makes a NaN differ from
-    /// itself.
-    SetDepthBias {
-        bias_bits: u32,
-        slope_scale_bits: u32,
-        clamp_bits: u32,
-    },
-    /// One `float`, as the guest's bits, for the reason
-    /// [`Self::SetDepthBias`]'s three are. `setLineWidth:` shares its wire form
-    /// with `setTessellationFactorScale:`, so the opcode is the only thing that
-    /// separates a state this device carries from one it does not.
-    SetLineWidth {
-        width_bits: u32,
-    },
-    SetBlendColor {
-        red_bits: u32,
-        green_bits: u32,
-        blue_bits: u32,
-        alpha_bits: u32,
-    },
-    SetStencilReference {
-        front: u32,
-        back: u32,
-    },
-    SetStoreAction {
-        target: StoreActionTarget,
-        action: u64,
-    },
-    SetVisibilityResultMode {
-        mode: u64,
-        offset: u64,
-    },
+    SetCullMode(SetCullMode),
+    SetFrontFacingWinding(SetFrontFacingWinding),
+    SetDepthClipMode(SetDepthClipMode),
+    SetTriangleFillMode(SetTriangleFillMode),
+    SetDepthBias(SetDepthBias),
+    SetLineWidth(SetLineWidth),
+    SetBlendColor(SetBlendColor),
+    SetStencilReference(SetStencilReference),
+    SetStoreAction(SetStoreAction),
+    SetVisibilityResultMode(SetVisibilityResultMode),
 }
 
 impl RenderRecord<'_> {
     /// The stage a bind record wrote, if this is one.
     #[must_use]
     pub const fn stage(&self) -> Option<ShaderStage> {
-        match *self {
-            Self::BindBuffers { stage, .. }
-            | Self::BindTextures { stage, .. }
-            | Self::BindSamplers { stage, .. }
-            | Self::BindSamplersWithLod { stage, .. }
-            | Self::RebindBufferOffset { stage, .. } => Some(stage),
-            Self::BindBuffersWithStride { .. } => Some(ShaderStage::Vertex),
+        match self {
+            Self::BindBuffers(r) => Some(r.stage),
+            Self::BindTextures(r) => Some(r.stage),
+            Self::BindSamplers(r) => Some(r.stage),
+            Self::BindSamplersWithLod(r) => Some(r.stage),
+            Self::RebindBufferOffset(r) => Some(r.stage),
+            Self::BindBuffersWithStride(_) => Some(ShaderStage::Vertex),
             _ => None,
         }
     }
@@ -241,19 +361,19 @@ fn state<'a>(kind: RenderKind, op: &Op<'a>) -> Result<RenderRecord<'a>, DecodeRe
         RenderKind::SetVertexBuffers | RenderKind::SetFragmentBuffers => {
             let (head, slots) =
                 wire::buffer_binds(op).map_err(|_| entries(core::mem::size_of::<BufferBind>()))?;
-            RenderRecord::BindBuffers {
+            RenderRecord::BindBuffers(BindBuffers {
                 stage: bind_stage(kind, op)?,
                 first: head.first.get(),
                 entries: slots,
-            }
+            })
         }
         RenderKind::SetVertexBuffersWithStride => {
             let (head, slots) = wire::buffer_stride_binds(op)
                 .map_err(|_| entries(core::mem::size_of::<BufferStrideBind>()))?;
-            RenderRecord::BindBuffersWithStride {
+            RenderRecord::BindBuffersWithStride(BindBuffersWithStride {
                 first: head.first.get(),
                 entries: slots,
-            }
+            })
         }
         RenderKind::SetVertexTextures
         | RenderKind::SetFragmentTextures
@@ -267,64 +387,66 @@ fn state<'a>(kind: RenderKind, op: &Op<'a>) -> Result<RenderRecord<'a>, DecodeRe
                 kind,
                 RenderKind::SetVertexTextures | RenderKind::SetFragmentTextures
             ) {
-                RenderRecord::BindTextures {
+                RenderRecord::BindTextures(BindTextures {
                     stage,
                     first,
                     entries: slots,
-                }
+                })
             } else {
-                RenderRecord::BindSamplers {
+                RenderRecord::BindSamplers(BindSamplers {
                     stage,
                     first,
                     entries: slots,
-                }
+                })
             }
         }
         RenderKind::SetVertexSamplersWithLod | RenderKind::SetFragmentSamplersWithLod => {
             let (head, slots) = wire::sampler_lod_binds(op)
                 .map_err(|_| entries(core::mem::size_of::<SamplerLodBind>()))?;
-            RenderRecord::BindSamplersWithLod {
+            RenderRecord::BindSamplersWithLod(BindSamplersWithLod {
                 stage: bind_stage(kind, op)?,
                 first: head.first.get(),
                 entries: slots,
-            }
+            })
         }
         RenderKind::SetVertexBufferOffset | RenderKind::SetFragmentBufferOffset => {
             let r = wire::buffer_offset(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::BufferOffset>()))?;
-            RenderRecord::RebindBufferOffset {
+            RenderRecord::RebindBufferOffset(RebindBufferOffset {
                 stage: bind_stage(kind, op)?,
                 index: r.index.get(),
                 offset: r.offset.get(),
                 stride: None,
-            }
+            })
         }
         RenderKind::SetVertexBufferOffsetStride => {
             let r = wire::buffer_offset_stride(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::BufferOffsetStride>()))?;
-            RenderRecord::RebindBufferOffset {
+            RenderRecord::RebindBufferOffset(RebindBufferOffset {
                 stage: bind_stage(kind, op)?,
                 index: r.index.get(),
                 offset: r.offset.get(),
                 stride: Some(r.attribute_stride.get()),
-            }
+            })
         }
-        RenderKind::SetRenderPipelineState => RenderRecord::SetPipeline {
+        RenderKind::SetRenderPipelineState => RenderRecord::SetPipeline(SetPipeline {
             pipeline_ref: wire::state_ref(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::StateRef>()))?
                 .object_ref
                 .get(),
-        },
-        RenderKind::SetDepthStencilState => RenderRecord::SetDepthStencilState {
-            state_ref: wire::state_ref(op)
-                .map_err(|_| fail(core::mem::size_of::<wire::StateRef>()))?
-                .object_ref
-                .get(),
-        },
-        RenderKind::WriteDescriptor => RenderRecord::WriteDescriptor {
+        }),
+        RenderKind::SetDepthStencilState => {
+            RenderRecord::SetDepthStencilState(SetDepthStencilState {
+                state_ref: wire::state_ref(op)
+                    .map_err(|_| fail(core::mem::size_of::<wire::StateRef>()))?
+                    .object_ref
+                    .get(),
+            })
+        }
+        RenderKind::WriteDescriptor => RenderRecord::WriteDescriptor(WriteDescriptor {
             descriptor: render_pass::render_pass(op)
                 .map_err(|_| fail(core::mem::size_of::<RenderPassBody>()))?,
-        },
+        }),
         RenderKind::SetViewport => RenderRecord::SetViewports(
             reims_vgpu_wire::view_slice::<Viewport>(op.payload, 1)
                 .map_err(|_| fail(core::mem::size_of::<Viewport>()))?,
@@ -352,53 +474,57 @@ fn state<'a>(kind: RenderKind, op: &Op<'a>) -> Result<RenderRecord<'a>, DecodeRe
                 .mode
                 .get();
             match kind {
-                RenderKind::SetCullMode => RenderRecord::SetCullMode(mode),
-                RenderKind::SetFrontFacingWinding => RenderRecord::SetFrontFacingWinding(mode),
-                RenderKind::SetDepthClipMode => RenderRecord::SetDepthClipMode(mode),
-                _ => RenderRecord::SetTriangleFillMode(mode),
+                RenderKind::SetCullMode => RenderRecord::SetCullMode(SetCullMode { mode }),
+                RenderKind::SetFrontFacingWinding => {
+                    RenderRecord::SetFrontFacingWinding(SetFrontFacingWinding { winding: mode })
+                }
+                RenderKind::SetDepthClipMode => {
+                    RenderRecord::SetDepthClipMode(SetDepthClipMode { mode })
+                }
+                _ => RenderRecord::SetTriangleFillMode(SetTriangleFillMode { mode }),
             }
         }
         RenderKind::SetDepthBias => {
             let r = wire::set_depth_bias(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DepthBias>()))?;
-            RenderRecord::SetDepthBias {
+            RenderRecord::SetDepthBias(SetDepthBias {
                 bias_bits: r.bias.get().to_bits(),
                 slope_scale_bits: r.slope_scale.get().to_bits(),
                 clamp_bits: r.clamp.get().to_bits(),
-            }
+            })
         }
         RenderKind::SetLineWidth => {
             let r = wire::float_state(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::FloatState>()))?;
-            RenderRecord::SetLineWidth {
+            RenderRecord::SetLineWidth(SetLineWidth {
                 width_bits: r.value.get().to_bits(),
-            }
+            })
         }
         RenderKind::SetBlendColor => {
             let r = wire::set_blend_color(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::BlendColor>()))?;
-            RenderRecord::SetBlendColor {
+            RenderRecord::SetBlendColor(SetBlendColor {
                 red_bits: r.red.get().to_bits(),
                 green_bits: r.green.get().to_bits(),
                 blue_bits: r.blue.get().to_bits(),
                 alpha_bits: r.alpha.get().to_bits(),
-            }
+            })
         }
         RenderKind::SetStencilReference => {
             let r = wire::set_stencil_reference(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::StencilReference>()))?;
-            RenderRecord::SetStencilReference {
+            RenderRecord::SetStencilReference(SetStencilReference {
                 front: r.front.get(),
                 back: r.back.get(),
-            }
+            })
         }
         RenderKind::SetColorStoreAction => {
             let r = wire::set_color_store_action(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::ColorStoreAction>()))?;
-            RenderRecord::SetStoreAction {
+            RenderRecord::SetStoreAction(SetStoreAction {
                 target: StoreActionTarget::Color(r.index.get()),
                 action: u64::from(r.store_action.get()),
-            }
+            })
         }
         // The depth and stencil forms name their attachment by being
         // themselves, so they carry no index — and their action is 64 bits
@@ -408,22 +534,22 @@ fn state<'a>(kind: RenderKind, op: &Op<'a>) -> Result<RenderRecord<'a>, DecodeRe
                 .map_err(|_| fail(core::mem::size_of::<wire::ModeState>()))?
                 .mode
                 .get();
-            RenderRecord::SetStoreAction {
+            RenderRecord::SetStoreAction(SetStoreAction {
                 target: if matches!(kind, RenderKind::SetDepthStoreAction) {
                     StoreActionTarget::Depth
                 } else {
                     StoreActionTarget::Stencil
                 },
                 action,
-            }
+            })
         }
         RenderKind::SetVisibilityResultMode => {
             let r = wire::set_visibility_result_mode(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::VisibilityResult>()))?;
-            RenderRecord::SetVisibilityResultMode {
+            RenderRecord::SetVisibilityResultMode(SetVisibilityResultMode {
                 mode: r.mode.get(),
                 offset: r.offset.get(),
-            }
+            })
         }
         // Every draw kind was taken by `decode` before this function ran.
         _ => {
@@ -451,27 +577,27 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
     Ok(match kind {
         RenderKind::Draw => {
             let r = wire::draw(op).map_err(|_| fail(core::mem::size_of::<wire::Draw>()))?;
-            DrawRecord::Primitives {
+            DrawRecord::Primitives(Primitives {
                 primitive: r.primitive_type.get(),
                 vertex_start: u64::from(r.vertex_start.get()),
                 vertex_count: u64::from(r.vertex_count.get()),
                 instances: Instancing::default(),
-            }
+            })
         }
         RenderKind::DrawWide => {
             let r =
                 wire::draw_wide(op).map_err(|_| fail(core::mem::size_of::<wire::DrawWide>()))?;
-            DrawRecord::Primitives {
+            DrawRecord::Primitives(Primitives {
                 primitive: r.primitive_type.get(),
                 vertex_start: r.vertex_start.get(),
                 vertex_count: r.vertex_count.get(),
                 instances: Instancing::default(),
-            }
+            })
         }
         RenderKind::DrawInstanced => {
             let r = wire::draw_instanced(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawInstanced>()))?;
-            DrawRecord::Primitives {
+            DrawRecord::Primitives(Primitives {
                 primitive: u32::from(r.primitive_type.get()),
                 vertex_start: u64::from(r.vertex_start.get()),
                 vertex_count: u64::from(r.vertex_count.get()),
@@ -479,12 +605,12 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                     count: Some(u64::from(r.instance_count.get())),
                     base: 0,
                 },
-            }
+            })
         }
         RenderKind::DrawInstancedWide => {
             let r = wire::draw_instanced_wide(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawInstancedWide>()))?;
-            DrawRecord::Primitives {
+            DrawRecord::Primitives(Primitives {
                 primitive: u32::from(r.primitive_type.get()),
                 vertex_start: r.vertex_start.get(),
                 vertex_count: r.vertex_count.get(),
@@ -492,12 +618,12 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                     count: Some(r.instance_count.get()),
                     base: 0,
                 },
-            }
+            })
         }
         RenderKind::DrawInstancedBase => {
             let r = wire::draw_instanced_base(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawInstancedBase>()))?;
-            DrawRecord::Primitives {
+            DrawRecord::Primitives(Primitives {
                 primitive: u32::from(r.primitive_type.get()),
                 vertex_start: u64::from(r.vertex_start.get()),
                 vertex_count: u64::from(r.vertex_count.get()),
@@ -505,12 +631,12 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                     count: Some(u64::from(r.instance_count.get())),
                     base: u64::from(r.base_instance.get()),
                 },
-            }
+            })
         }
         RenderKind::DrawInstancedBaseWide => {
             let r = wire::draw_instanced_base_wide(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawInstancedBaseWide>()))?;
-            DrawRecord::Primitives {
+            DrawRecord::Primitives(Primitives {
                 primitive: u32::from(r.primitive_type.get()),
                 vertex_start: r.vertex_start.get(),
                 vertex_count: r.vertex_count.get(),
@@ -518,12 +644,12 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                     count: Some(r.instance_count.get()),
                     base: r.base_instance.get(),
                 },
-            }
+            })
         }
         RenderKind::DrawIndexed => {
             let r = wire::draw_indexed(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawIndexed>()))?;
-            DrawRecord::Indexed {
+            DrawRecord::Indexed(Indexed {
                 primitive: u32::from(r.primitive_type.get()),
                 index: IndexRef {
                     buffer_ref: r.index_buffer_ref.get(),
@@ -533,12 +659,12 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                 index_count: u64::from(r.index_count.get()),
                 instances: Instancing::default(),
                 base_vertex: 0,
-            }
+            })
         }
         RenderKind::DrawIndexedWide => {
             let r = wire::draw_indexed_wide(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawIndexedWide>()))?;
-            DrawRecord::Indexed {
+            DrawRecord::Indexed(Indexed {
                 primitive: u32::from(r.primitive_type.get()),
                 index: IndexRef {
                     buffer_ref: r.index_buffer_ref.get(),
@@ -548,12 +674,12 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                 index_count: r.index_count.get(),
                 instances: Instancing::default(),
                 base_vertex: 0,
-            }
+            })
         }
         RenderKind::DrawIndexedInstanced => {
             let r = wire::draw_indexed_instanced(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawIndexedInstanced>()))?;
-            DrawRecord::Indexed {
+            DrawRecord::Indexed(Indexed {
                 primitive: u32::from(r.primitive_type.get()),
                 index: IndexRef {
                     buffer_ref: r.index_buffer_ref.get(),
@@ -566,12 +692,12 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                     base: 0,
                 },
                 base_vertex: 0,
-            }
+            })
         }
         RenderKind::DrawIndexedInstancedWide => {
             let r = wire::draw_indexed_instanced_wide(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawIndexedInstancedWide>()))?;
-            DrawRecord::Indexed {
+            DrawRecord::Indexed(Indexed {
                 primitive: u32::from(r.primitive_type.get()),
                 index: IndexRef {
                     buffer_ref: r.index_buffer_ref.get(),
@@ -584,12 +710,12 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                     base: 0,
                 },
                 base_vertex: 0,
-            }
+            })
         }
         RenderKind::DrawIndexedInstancedBase => {
             let r = wire::draw_indexed_instanced_base(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawIndexedInstancedBase>()))?;
-            DrawRecord::Indexed {
+            DrawRecord::Indexed(Indexed {
                 primitive: u32::from(r.primitive_type.get()),
                 index: IndexRef {
                     buffer_ref: r.index_buffer_ref.get(),
@@ -602,12 +728,12 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                     base: u64::from(r.base_instance.get()),
                 },
                 base_vertex: i64::from(r.base_vertex.get()),
-            }
+            })
         }
         RenderKind::DrawIndexedInstancedBaseWide => {
             let r = wire::draw_indexed_instanced_base_wide(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawIndexedInstancedBaseWide>()))?;
-            DrawRecord::Indexed {
+            DrawRecord::Indexed(Indexed {
                 primitive: u32::from(r.primitive_type.get()),
                 index: IndexRef {
                     buffer_ref: r.index_buffer_ref.get(),
@@ -620,23 +746,23 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                     base: r.base_instance.get(),
                 },
                 base_vertex: r.base_vertex.get(),
-            }
+            })
         }
         RenderKind::DrawIndirect => {
             let r = wire::draw_indirect(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawIndirect>()))?;
-            DrawRecord::PrimitivesIndirect {
+            DrawRecord::PrimitivesIndirect(PrimitivesIndirect {
                 primitive: u32::from(r.primitive_type.get()),
                 arguments: IndirectRef {
                     buffer_ref: r.indirect_buffer_ref.get(),
                     offset: r.indirect_buffer_offset.get(),
                 },
-            }
+            })
         }
         RenderKind::DrawIndexedIndirect => {
             let r = wire::draw_indexed_indirect(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DrawIndexedIndirect>()))?;
-            DrawRecord::IndexedIndirect {
+            DrawRecord::IndexedIndirect(IndexedIndirect {
                 primitive: u32::from(r.primitive_type.get()),
                 index: IndexRef {
                     buffer_ref: r.index_buffer_ref.get(),
@@ -647,7 +773,7 @@ fn draw(kind: RenderKind, op: &Op<'_>) -> Result<DrawRecord, DecodeRefusal> {
                     buffer_ref: r.indirect_buffer_ref.get(),
                     offset: r.indirect_buffer_offset.get(),
                 },
-            }
+            })
         }
         // `decode` only calls this for a kind with a draw shape.
         _ => {
@@ -733,12 +859,12 @@ mod tests {
         wide.extend_from_slice(&7u64.to_le_bytes());
         wide.extend_from_slice(&9u64.to_le_bytes());
 
-        let expected = RenderRecord::Draw(DrawRecord::Primitives {
+        let expected = RenderRecord::Draw(DrawRecord::Primitives(Primitives {
             primitive: 3,
             vertex_start: 7,
             vertex_count: 9,
             instances: Instancing::default(),
-        });
+        }));
         assert_eq!(lift(&record(wire::OPCODE_DRAW, &compact)), Ok(expected));
         assert_eq!(lift(&record(wire::OPCODE_DRAW_WIDE, &wide)), Ok(expected));
     }
@@ -754,7 +880,7 @@ mod tests {
         instanced.extend_from_slice(&3u16.to_le_bytes());
         assert_eq!(
             lift(&record(wire::OPCODE_DRAW_INSTANCED, &instanced)),
-            Ok(RenderRecord::Draw(DrawRecord::Primitives {
+            Ok(RenderRecord::Draw(DrawRecord::Primitives(Primitives {
                 primitive: 3,
                 vertex_start: 7,
                 vertex_count: 9,
@@ -762,7 +888,7 @@ mod tests {
                     count: Some(2),
                     base: 0
                 },
-            }))
+            })))
         );
     }
 
@@ -774,7 +900,7 @@ mod tests {
         let mut plain = 3u32.to_le_bytes().to_vec();
         plain.extend_from_slice(&0u16.to_le_bytes());
         plain.extend_from_slice(&3u16.to_le_bytes());
-        let RenderRecord::Draw(DrawRecord::Primitives { instances, .. }) =
+        let RenderRecord::Draw(DrawRecord::Primitives(Primitives { instances, .. })) =
             lift(&record(wire::OPCODE_DRAW, &plain)).expect("lifted")
         else {
             panic!("not a plain draw");
@@ -795,7 +921,7 @@ mod tests {
         payload.extend_from_slice(&(-70_000i64).to_le_bytes());
         payload.extend_from_slice(&4u64.to_le_bytes());
         let bytes = record(wire::OPCODE_DRAW_INDEXED_INSTANCED_BASE_WIDE, &payload);
-        let RenderRecord::Draw(DrawRecord::Indexed { base_vertex, .. }) =
+        let RenderRecord::Draw(DrawRecord::Indexed(Indexed { base_vertex, .. })) =
             lift(&bytes).expect("lifted")
         else {
             panic!("not an indexed draw");
@@ -860,10 +986,10 @@ mod tests {
         colour.extend_from_slice(&3u32.to_le_bytes());
         assert_eq!(
             lift(&record(wire::OPCODE_SET_COLOR_STORE_ACTION, &colour)),
-            Ok(RenderRecord::SetStoreAction {
+            Ok(RenderRecord::SetStoreAction(SetStoreAction {
                 target: StoreActionTarget::Color(3),
                 action: 2,
-            })
+            }))
         );
         for (opcode, target) in [
             (
@@ -877,7 +1003,10 @@ mod tests {
         ] {
             assert_eq!(
                 lift(&record(opcode, &2u64.to_le_bytes())),
-                Ok(RenderRecord::SetStoreAction { target, action: 2 })
+                Ok(RenderRecord::SetStoreAction(SetStoreAction {
+                    target,
+                    action: 2
+                }))
             );
         }
     }
@@ -895,12 +1024,12 @@ mod tests {
         assert_eq!(lift(&bytes), lift(&bytes));
         assert_eq!(
             lift(&bytes),
-            Ok(RenderRecord::SetBlendColor {
+            Ok(RenderRecord::SetBlendColor(SetBlendColor {
                 red_bits: nan,
                 green_bits: nan,
                 blue_bits: nan,
                 alpha_bits: nan,
-            })
+            }))
         );
     }
 
@@ -973,6 +1102,57 @@ mod tests {
                 count: 200,
                 have: 8,
             })
+        );
+    }
+
+    /// A row the ledger settled *as a refusal* is refused by contract, not
+    /// reported as an opcode nothing claims.
+    ///
+    /// This rail has four: the three `set*StoreActionOptions:` forms and the
+    /// pass raster sample count. None of them has a `RenderKind`, because there
+    /// is no record to lift — the settlement *is* the answer. What matters is
+    /// which refusal comes back: `UnknownOpcode` would say this device has
+    /// never seen the selector, and `Unjudged` would put a decided question
+    /// back on the work queue. Both are the failure `no_record`'s doc names,
+    /// and this is the render rail's instance of it.
+    ///
+    /// The count is asserted too. If a fifth row is settled as a refusal and
+    /// someone gives it a `RenderKind` by reflex, that record would start
+    /// lifting and the refusal would disappear without a test failing anywhere.
+    #[test]
+    fn every_render_row_the_ledger_settled_as_a_refusal_is_refused_by_contract() {
+        use crate::closure::{Closure, LEDGER};
+
+        let mut refused = 0;
+        for row in LEDGER
+            .iter()
+            .filter(|o| o.rail == Rail::Render)
+            .filter(|o| matches!(o.closure, Closure::Refused { .. }))
+        {
+            let Some(opcode) = row.opcode else { continue };
+            refused += 1;
+            assert_eq!(
+                RenderKind::of_opcode(opcode),
+                None,
+                "render {opcode:#x} ({}) is settled as a refusal and has a record kind, so it \
+                 lifts instead of being refused",
+                row.selector
+            );
+            let bytes = record(opcode, &[0u8; 64]);
+            assert_eq!(
+                lift(&bytes),
+                Err(DecodeRefusal::RefusedByContract {
+                    rail: Rail::Render,
+                    opcode
+                }),
+                "render {opcode:#x} ({}) must be refused by contract",
+                row.selector
+            );
+        }
+        assert_eq!(
+            refused, 4,
+            "the render rail settles four rows as refusals; a change to that number is a \
+             contract change and not a test to update"
         );
     }
 }
