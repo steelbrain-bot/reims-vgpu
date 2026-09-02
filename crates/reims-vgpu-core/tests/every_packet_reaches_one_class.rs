@@ -33,7 +33,7 @@
 //!
 //! That the resolvers *succeed*. Most are handed a zero payload here, and a
 //! command whose operation is not in its own packet — see
-//! `ResolveRefusal::NeedsStorage` and `NeedsGuestTable` — names what is missing
+//! `ResolveRefusal::NeedsStorage` — names what is missing
 //! rather than producing one. Claiming the packet is the question; what the
 //! answer is belongs to each owner's own tests.
 

@@ -239,6 +239,32 @@ pub enum LifecycleOp {
     DeleteTask {
         task: TaskId,
     },
+    /// The guest has said where this task's object list is and how many slots
+    /// it has.
+    ///
+    /// **The operation is the binding, not the walk, and that is a correction a
+    /// measurement forced.** This command used to have no operation at all:
+    /// A refusal named `NeedsGuestTable` said the operation was "the
+    /// per-entry result of reading the table", which is a walk of guest memory
+    /// this crate cannot address. A driven boot then measured what such a walk
+    /// would cost — every `SetObjectList` in it declares **1 048 576** entries,
+    /// eighteen times over a boot, and about twelve hundred slots are ever
+    /// named. The count is the table's capacity and not its population, so the
+    /// walk was never the operation: it was a gigabyte of reads to find what a
+    /// resolution finds one slot at a time.
+    ///
+    /// So the binding is the operation, and [`Self::CreateResource`] stays what
+    /// it always was — one slot's declaration, produced when something names
+    /// that slot rather than when the table is bound.
+    ///
+    /// A rebind does **not** end the objects already declared in the task. That
+    /// is the contract this device implements and it is deliberate: a new table
+    /// changes what an *unresolved* reference will construct, and typed objects
+    /// already built keep their own delete and their task's lifetime.
+    BindObjectList {
+        task: TaskId,
+        list: ObjectList,
+    },
     /// The object-list walk's per-object result: this slot now holds a
     /// resource with this storage.
     CreateResource {
@@ -307,7 +333,9 @@ impl LifecycleOp {
         match self {
             Self::DefineTask { .. } => LifecycleKind::DefineTask,
             Self::DeleteTask { .. } => LifecycleKind::DeleteTask,
-            Self::CreateResource { .. } => LifecycleKind::SetObjectList,
+            Self::BindObjectList { .. } | Self::CreateResource { .. } => {
+                LifecycleKind::SetObjectList
+            }
             Self::DeleteResource { .. } => LifecycleKind::DeleteResource,
             Self::MapMemory { .. } => LifecycleKind::MapMemory,
             Self::UnmapMemory { .. } => LifecycleKind::UnmapMemory,
@@ -348,6 +376,7 @@ impl LifecycleOp {
             // resource id.
             Self::DefineTask { .. }
             | Self::DeleteTask { .. }
+            | Self::BindObjectList { .. }
             | Self::CreateResource { .. }
             | Self::MapMemory { .. }
             | Self::UnmapMemory { .. }
@@ -418,6 +447,7 @@ impl LifecycleOp {
             // per-resource claim for a mode to be about.
             Self::DefineTask { .. }
             | Self::DeleteTask { .. }
+            | Self::BindObjectList { .. }
             | Self::CreateResource { .. }
             | Self::MapMemory { .. }
             | Self::UnmapMemory { .. }
@@ -430,6 +460,7 @@ impl LifecycleOp {
         match self {
             Self::DefineTask { task, .. }
             | Self::DeleteTask { task }
+            | Self::BindObjectList { task, .. }
             | Self::CreateResource { task, .. }
             | Self::DeleteResource { task, .. }
             | Self::MapMemory { task, .. }
@@ -631,16 +662,6 @@ pub enum ResolveRefusal {
     NotATaskLifetime { kind: LifecycleKind },
     /// The notice's payload cannot hold its three fields.
     ShortNotice(fifo::ShortPayload),
-    /// The record resolved, and the operation is the result of walking a table
-    /// in guest memory this crate cannot address.
-    ///
-    /// `SetObjectList` is the case. Its packet says where a task's object list
-    /// is and how many entries it has; the operation is the per-entry result of
-    /// reading it, and every byte of it lives in pages the memory bound owns.
-    /// Named rather than approximated, for [`Self::NeedsStorage`]'s reason: an
-    /// operation built from the packet alone would rebind nothing while
-    /// reporting that it had.
-    NeedsGuestTable { kind: LifecycleKind },
     /// An `Invalidate` record asks for a content-authority transition this
     /// device has no established meaning for.
     ///
@@ -672,7 +693,6 @@ impl ResolveRefusal {
             Self::NotAMapNotice { .. } => "lifecycle_not_a_map_notice",
             Self::NotATaskLifetime { .. } => "lifecycle_not_a_task_lifetime",
             Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
-            Self::NeedsGuestTable { .. } => "lifecycle_needs_guest_table",
             Self::UnestablishedValidityOps { .. } => "lifecycle_unestablished_validity_ops",
         }
     }
@@ -848,10 +868,10 @@ pub fn exec_resource_table(
 ///
 /// # Errors
 ///
-/// [`ResolveRefusal`] from the join that owns the kind, or — for the two
-/// commands that resolve and still cannot become an operation —
-/// [`ResolveRefusal::NeedsStorage`] and [`ResolveRefusal::NeedsGuestTable`],
-/// which name what is missing rather than approximating it.
+/// [`ResolveRefusal`] from the join that owns the kind, or — for the one
+/// command that resolves and still cannot become an operation —
+/// [`ResolveRefusal::NeedsStorage`], which names what is missing rather than
+/// approximating it.
 pub fn operation(
     kind: LifecycleKind,
     payload: &[u8],
@@ -869,10 +889,44 @@ pub fn operation(
         | LifecycleKind::Synchronize
         | LifecycleKind::SynchronizeAndDiscard
         | LifecycleKind::Discard => resource_list(kind, payload, objects),
-        // The one command whose operation is not in its packet. See
-        // `ResolveRefusal::NeedsGuestTable`.
-        LifecycleKind::SetObjectList => Err(ResolveRefusal::NeedsGuestTable { kind }),
+        LifecycleKind::SetObjectList => object_list_bind(kind, payload),
     }
+}
+
+/// Turn a `SetObjectList` packet's payload into the binding it names.
+///
+/// Takes no resolver, as [`task_lifetime`] does not: the packet carries a task
+/// id, a page frame and a count, and nothing about any of the three is a name
+/// device state could answer differently.
+///
+/// **This used to be a `NeedsGuestTable` refusal**, on the reading that
+/// the operation was the per-entry result of walking the table. See
+/// [`LifecycleOp::BindObjectList`] for the measurement that overturned it: the
+/// count is the table's capacity, a driven boot declares 1 048 576 of them
+/// eighteen times, and about twelve hundred slots are ever named. The walk was
+/// never the operation.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a kind that is not `SetObjectList`, or a payload too
+/// short for the three words. A short one is refused rather than defaulted,
+/// because a zeroed page frame is a valid frame number and a zeroed task id is
+/// the kernel task.
+pub fn object_list_bind(
+    kind: LifecycleKind,
+    payload: &[u8],
+) -> Result<LifecycleOp, ResolveRefusal> {
+    if kind != LifecycleKind::SetObjectList {
+        return Err(ResolveRefusal::NotATaskLifetime { kind });
+    }
+    let command = fifo::decode_set_object_list(payload).map_err(ResolveRefusal::ShortNotice)?;
+    Ok(LifecycleOp::BindObjectList {
+        task: TaskId(command.task_id),
+        list: ObjectList {
+            page: DirectoryFrame(command.pfn),
+            capacity: command.count,
+        },
+    })
 }
 
 /// Turn a task-lifetime packet's payload into the operation it names.
@@ -1145,15 +1199,39 @@ struct Task {
     /// The page frame its page table is rooted at. See
     /// [`crate::identity::DirectoryFrame`].
     directory: DirectoryFrame,
+    /// Where this task's object list lives and how many slots it has, once a
+    /// `SetObjectList` has said so.
+    ///
+    /// `None` until then, which is a real state and not a default: a task whose
+    /// list is unbound has no table for a reference to be an index into, so
+    /// every ref in it names nothing — and that is different from a bound list
+    /// whose slot happens to be empty.
+    object_list: Option<ObjectList>,
     namespace: Namespace,
     heaps: Heaps,
     resident: HashMap<ResourceId, Resident>,
+}
+
+/// Where a task's object list is and how big the guest said it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectList {
+    /// The guest page frame the table starts at.
+    pub page: DirectoryFrame,
+    /// How many slots the table has room for.
+    ///
+    /// **Capacity, not population, and the difference is not academic.** A
+    /// driven boot's `SetObjectList` declares 1 048 576 entries eighteen times
+    /// over, and about twelve hundred of them are ever named. An owner that
+    /// treated this as the number of objects to walk would read a gigabyte of
+    /// guest memory per bind to find them.
+    pub capacity: u32,
 }
 
 impl Task {
     fn new(directory: DirectoryFrame) -> Self {
         Self {
             directory,
+            object_list: None,
             namespace: Namespace::new(),
             heaps: Heaps::default(),
             resident: HashMap::new(),
@@ -1425,6 +1503,7 @@ impl Lifecycle {
                 task, directory, ..
             } => self.define_task(*task, *directory),
             LifecycleOp::DeleteTask { task } => self.delete_task(*task),
+            LifecycleOp::BindObjectList { task, list } => self.bind_object_list(*task, *list),
             LifecycleOp::CreateResource {
                 task,
                 slot,
@@ -1592,6 +1671,29 @@ impl Lifecycle {
         };
         self.tasks.insert(task, Task::new(directory));
         Ok(effects)
+    }
+
+    /// Bind a task's object list.
+    ///
+    /// Nothing is retired here, and that is the contract rather than an
+    /// omission. A new table changes what an *unresolved* reference will
+    /// construct; the objects already declared in this task keep their own
+    /// deletes and their task's lifetime, which is what the device this models
+    /// does. Entries whose construction input is no longer valid are the
+    /// caller's to retire — they are host caches and resolved windows, neither
+    /// of which is a name.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NoSuchTask`] for a list bound into a task no definition
+    /// opened. Refused rather than creating the task, because a table with no
+    /// page directory has no address space its page frame means anything in.
+    fn bind_object_list(&mut self, task: TaskId, list: ObjectList) -> Result<Effects, Refusal> {
+        let Some(t) = self.tasks.get_mut(&task) else {
+            return Err(Refusal::NoSuchTask { task });
+        };
+        t.object_list = Some(list);
+        Ok(Effects::default())
     }
 
     fn delete_task(&mut self, task: TaskId) -> Result<Effects, Refusal> {
@@ -2130,6 +2232,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A rebind changes what an unresolved reference will construct and ends
+    /// nothing already declared.
+    ///
+    /// The half a walk-shaped operation could not have expressed. `SetObjectList`
+    /// arrives eighteen times a boot on this interface, each declaring a
+    /// million-entry capacity; if a bind retired the task's objects, every one
+    /// of those would tear down a namespace the guest still holds names in.
+    #[test]
+    fn rebinding_a_tasks_object_list_leaves_its_declared_names_alone() {
+        let (mut l, name) = with_one_resource(0x100);
+        let list = ObjectList {
+            page: DirectoryFrame(0x9000),
+            capacity: 1 << 20,
+        };
+        apply_inert(&mut l, &LifecycleOp::BindObjectList { task: TASK, list });
+        apply_inert(
+            &mut l,
+            &LifecycleOp::BindObjectList {
+                task: TASK,
+                list: ObjectList {
+                    page: DirectoryFrame(0xA000),
+                    capacity: 1 << 20,
+                },
+            },
+        );
+        assert_eq!(
+            l.tasks[&TASK].namespace.live_names(),
+            vec![name],
+            "two binds and the name declared before them both still answers"
+        );
+    }
+
+    /// A bind into a task no definition opened is refused rather than creating
+    /// one: a table's page frame means nothing without an address space.
+    #[test]
+    fn binding_an_object_list_into_an_undefined_task_is_refused() {
+        let mut l = Lifecycle::new();
+        assert_eq!(
+            l.apply(&LifecycleOp::BindObjectList {
+                task: TaskId(9),
+                list: ObjectList {
+                    page: DirectoryFrame(0x9000),
+                    capacity: 4,
+                },
+            }),
+            Err(Refusal::NoSuchTask { task: TaskId(9) })
+        );
+    }
+
+    /// The bind carries the packet's own three words, at the protocol's
+    /// offsets, and the count is carried as the capacity it is.
+    #[test]
+    fn an_object_list_bind_carries_the_packets_own_words() {
+        use reims_vgpu_protocol::fifo::{
+            SET_OBJECT_LIST_COUNT, SET_OBJECT_LIST_LEN, SET_OBJECT_LIST_PFN,
+            SET_OBJECT_LIST_TASK_ID,
+        };
+        let mut payload = vec![0u8; SET_OBJECT_LIST_LEN];
+        payload[SET_OBJECT_LIST_TASK_ID..SET_OBJECT_LIST_TASK_ID + 4]
+            .copy_from_slice(&7u32.to_le_bytes());
+        payload[SET_OBJECT_LIST_PFN..SET_OBJECT_LIST_PFN + 4]
+            .copy_from_slice(&0x1234u32.to_le_bytes());
+        payload[SET_OBJECT_LIST_COUNT..SET_OBJECT_LIST_COUNT + 4]
+            .copy_from_slice(&(1u32 << 20).to_le_bytes());
+        assert_eq!(
+            object_list_bind(LifecycleKind::SetObjectList, &payload),
+            Ok(LifecycleOp::BindObjectList {
+                task: TaskId(7),
+                list: ObjectList {
+                    page: DirectoryFrame(0x1234),
+                    capacity: 1 << 20,
+                },
+            })
+        );
+        // One byte short of the record is refused, not defaulted: a zeroed page
+        // frame is a valid frame and a zeroed task id is the kernel task.
+        payload.pop();
+        assert!(matches!(
+            object_list_bind(LifecycleKind::SetObjectList, &payload),
+            Err(ResolveRefusal::ShortNotice(_))
+        ));
     }
 
     /// The claim the module docs make and cannot check by being read: the
@@ -3201,6 +3386,7 @@ mod tests {
                 map_notice(kind, &payload).is_ok(),
                 backing_retirement(kind, &payload, &EveryMapping).is_ok(),
                 resource_list(kind, &payload, &Everything).is_ok(),
+                object_list_bind(kind, &payload).is_ok(),
             ];
             let reached = joins.iter().filter(|ok| **ok).count();
             assert!(
@@ -3215,12 +3401,14 @@ mod tests {
         assert_eq!(
             unjoined,
             vec![
-                // Its packet says where a task's object list is and how long;
-                // the operation is the per-entry walk's result, and the walk
-                // reads guest memory this crate does not address.
-                LifecycleKind::SetObjectList,
-                // Its record resolves and its operation still needs storage the
-                // wire does not carry — see `ResolveRefusal::NeedsStorage`.
+                // The last one. Its record resolves and its operation still
+                // needs storage the wire does not carry — see
+                // `ResolveRefusal::NeedsStorage`.
+                //
+                // `SetObjectList` left this list when its operation stopped
+                // being the table's walk and became the table's *binding*; see
+                // `LifecycleOp::BindObjectList` for the measurement that
+                // decided it.
                 LifecycleKind::ReplacePhysical,
             ],
             "the lifecycle commands that still cannot become an operation"
@@ -3260,20 +3448,17 @@ mod tests {
                 map_notice(kind, &payload),
                 backing_retirement(kind, &payload, &EveryMapping),
                 resource_list(kind, &payload, &Everything),
+                object_list_bind(kind, &payload),
             ]
             .into_iter()
             .find(Result::is_ok);
             let through = operation(kind, &payload, &Everything, &EveryMapping);
             match direct {
                 Some(op) => assert_eq!(through, op, "{}", kind.name()),
-                // The two with no join name what is missing rather than
+                // The one with no join names what is missing rather than
                 // reaching a join that would read another command's offsets.
                 None => assert!(
-                    matches!(
-                        through,
-                        Err(ResolveRefusal::NeedsStorage { .. }
-                            | ResolveRefusal::NeedsGuestTable { .. })
-                    ),
+                    matches!(through, Err(ResolveRefusal::NeedsStorage { .. })),
                     "{} became {through:?}",
                     kind.name()
                 ),
@@ -4697,7 +4882,13 @@ mod tests {
                     .or_default()
                     .retain(|_, (_, b)| b != backing);
             }
-            LifecycleOp::MapMemory { .. }
+            // A bind changes what an unresolved reference will construct and
+            // ends nothing already declared, so the shadow of live names does
+            // not move. Listed by name rather than swept into a wildcard: an
+            // operation that *did* move names and reached this arm silently
+            // would make the shadow agree with the model by not looking.
+            LifecycleOp::BindObjectList { .. }
+            | LifecycleOp::MapMemory { .. }
             | LifecycleOp::UnmapMemory { .. }
             | LifecycleOp::Invalidate { .. }
             | LifecycleOp::Synchronize { .. }

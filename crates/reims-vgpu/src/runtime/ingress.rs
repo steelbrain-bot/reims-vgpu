@@ -49,13 +49,13 @@
 //!
 //! - **Exec** needs the object-list resolver and the access source that
 //!   [`reims_vgpu_core::walk::exec`] walks a command stream with.
-//! - **Resource lifetime** is down to two. All twelve resolve their refs, and
-//!   ten of them now build a payload: five name no resource, and five name
-//!   resources and state what they do to them —
-//!   `reims_vgpu_core::lifecycle::LifecycleOp::declared_access` is the mode and
-//!   [`Resolvers::storage`] is the key. The last two are short of something
-//!   that is not in their packet at all: the guest's object-list table, and the
-//!   pages behind a re-pointed object.
+//! - **Resource lifetime** is down to one. Eleven of the twelve build a
+//!   payload: five name no resource, five name resources and state what they do
+//!   to them — `reims_vgpu_core::lifecycle::LifecycleOp::declared_access` is the
+//!   mode and [`Resolvers::storage`] is the key — and the object-list bind
+//!   joined them when its operation stopped being the table's *walk* and became
+//!   the table's *binding*. Only the re-point is left, short of pages that are
+//!   not in its packet at all.
 //! - **Query** needs its reply destination *resolved* — a backing and a window,
 //!   not the address the request names.
 //!
@@ -162,22 +162,6 @@ pub enum Gap {
     /// The object-list resolver and the access source an EXEC's command stream
     /// is walked with.
     ExecResolution,
-    /// The guest's object-list table, walked, which is what a rebind's operation
-    /// *is*.
-    ///
-    /// `SetObjectList` says where a task's list lives and how many entries it
-    /// has; the operation is the per-entry result of reading it, and every byte
-    /// of that lives in pages `crates/reims-vgpu-memory` owns. Named rather than
-    /// approximated, because a rebind built from the packet alone would rebind
-    /// nothing while reporting that it had — which is
-    /// `reims_vgpu_core::lifecycle::ResolveRefusal::NeedsGuestTable`, restated
-    /// here as this device's own incompleteness rather than as the guest's bytes
-    /// being wrong.
-    ///
-    /// Walking it eagerly is not the closure. A driven boot's `SetObjectList`
-    /// packets each declare **1 048 576** entries — the list's capacity, not its
-    /// population. See `crate::runtime::objects::name_resource`.
-    ObjectListTable,
     /// The pages behind a re-pointed object, which its packet does not carry.
     ///
     /// `ReplacePhysical` is a bare `{task, object}`: the guest re-points a
@@ -273,7 +257,6 @@ impl Gap {
         match self {
             Self::Unresolved => "ingress_row_unresolved",
             Self::ExecResolution => "ingress_needs_exec_resolution",
-            Self::ObjectListTable => "ingress_needs_object_list_table",
             Self::ReplacementStorage => "ingress_needs_replacement_storage",
             Self::ReplyDestination => "ingress_needs_reply_destination",
         }
@@ -574,15 +557,21 @@ fn present_payload(
 /// does not enumerate which kinds have a list. A thirteenth command, or a kind
 /// that gains a resource list, moves itself.
 ///
-/// # Two commands are short of neither a namespace nor an access
+/// # One command is short of neither a namespace nor an access
 ///
-/// `SetObjectList`'s operation is the result of *walking* the guest's table, and
-/// `ReplacePhysical`'s names pages that are not on the wire at all. Both resolve
-/// their refs and still cannot be built, which is why the core names them with
-/// their own refusals rather than with `UnknownRef` — and why they arrive here
-/// as [`Gap::ObjectListTable`] and [`Gap::ReplacementStorage`] rather than as one
-/// gap called "namespaces" that would have read as closed the day the namespaces
-/// landed.
+/// `ReplacePhysical`'s operation names pages that are not on the wire at all. It
+/// resolves its ref and still cannot be built, which is why the core names it
+/// with its own refusal rather than with `UnknownRef` — and why it arrives here
+/// as [`Gap::ReplacementStorage`] rather than as one gap called "namespaces"
+/// that would have read as closed the day the namespaces landed.
+///
+/// `SetObjectList` used to be beside it and is not any more. Its operation was
+/// held to be the per-entry result of walking the guest's table; a driven boot
+/// measured the walk at 1 048 576 declared entries per bind against about
+/// twelve hundred slots ever named, and the count turned out to be the table's
+/// capacity. So the operation is the *binding*, the per-slot declaration is
+/// produced by resolution as this device already produces it, and the command
+/// crosses.
 ///
 /// # A ref that names nothing is the guest's, not this device's
 ///
@@ -631,7 +620,6 @@ fn resource_lifetime(
             // of. The core states them as refusals because the core has no
             // vocabulary for "the caller could give me this later"; this bridge
             // does.
-            ResolveRefusal::NeedsGuestTable { .. } => gap(Gap::ObjectListTable),
             ResolveRefusal::NeedsStorage { .. } => gap(Gap::ReplacementStorage),
             other => Blocked::Refused(Refused::Lifecycle(other)),
         },
@@ -996,18 +984,17 @@ mod tests {
     ///
     /// Asked of the same kind table the bridge asks, so the test cannot drift
     /// into its own list of opcodes and then agree with itself. **The split is
-    /// down to two**: a rebind's operation is the result of walking the guest's
-    /// object-list table and a re-point's names pages that are not on the wire,
-    /// and neither is a thing this bridge can be handed. Everything else in the
-    /// class builds a payload — the five that name resources now state both
-    /// halves of the access each one takes, so naming a resource stopped being
-    /// what holds a lifetime command back.
+    /// down to one**: a re-point's operation names pages that are not on the
+    /// wire, and that is not a thing this bridge can be handed. Everything else
+    /// in the class builds a payload — the five that name resources state both
+    /// halves of the access each one takes, and the object-list bind states the
+    /// table it binds rather than the table's contents.
     fn lifetime_gap(channel: Channel, opcode: u16) -> Option<Gap> {
         use reims_vgpu_core::lifecycle::LifecycleKind as K;
         match K::of(channel, opcode)? {
-            K::SetObjectList => Some(Gap::ObjectListTable),
             K::ReplacePhysical => Some(Gap::ReplacementStorage),
-            K::DeleteResource
+            K::SetObjectList
+            | K::DeleteResource
             | K::Invalidate
             | K::Synchronize
             | K::SynchronizeAndDiscard
@@ -1021,14 +1008,14 @@ mod tests {
     }
 
     /// What crosses is exactly the whole control class, the whole present class,
-    /// and every resource-lifetime command except the two whose operation needs
-    /// something that is not in their packet — and nothing else.
+    /// and every resource-lifetime command except the re-point, whose operation
+    /// needs pages that are not in its packet — and nothing else.
     ///
     /// The counts are spelled out because this is the cutover's own scoreboard:
     /// a gap that closes moves a number here, and a row that quietly changed
     /// class moves one without anybody deciding to.
     #[test]
-    fn what_crosses_is_control_present_and_every_lifetime_command_but_two() {
+    fn what_crosses_is_control_present_and_every_lifetime_command_but_the_repoint() {
         let crossing: Vec<_> = LEDGER
             .iter()
             .filter(|row| {
@@ -1065,7 +1052,7 @@ mod tests {
             .count();
         assert_eq!(
             (control, present, crossing.len()),
-            (23, 3, 38),
+            (23, 3, 40),
             "the ledger's crossing rows changed; what reaches the model is not what the \
              module documentation says it is"
         );

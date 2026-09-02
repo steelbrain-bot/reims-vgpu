@@ -4329,6 +4329,19 @@ fn is_retired_control_slot(opcode: u16) -> bool {
 /// two the model refuses; `channel_transition_model_agrees` is the denominator,
 /// without which a boot that sent no channel commands reads like a clean one.
 ///
+/// # What a driven boot answered, and why five is the population
+///
+/// x86 Vulkan, macos-15, host-driven workload — three rounds of launching and
+/// quitting five applications over ssh, 2049 child packets against an idle
+/// boot's 1916: **`channel_transition_model_agrees=5`,
+/// `channel_open_of_open_domain=0`, `channel_free_of_undefined_domain=0`.**
+///
+/// The five did not move under the workload, and that is the finding rather
+/// than a thin sample. This guest establishes its FIFO set once, at accelerator
+/// start, and per-application GPU contexts share those channels — launching and
+/// quitting applications creates and destroys no domain. So five is what a boot
+/// *has*, and the model refuses none of them.
+///
 /// The `Owed` refusal is deliberately **not** modelled here. It is a question
 /// about unreleased publication positions, which is the publisher's state and
 /// not this device's, and a count derived from a mask would be an answer to a
@@ -4393,7 +4406,9 @@ fn note_channel_transition_verdict(
 /// # What a driven boot answered
 ///
 /// x86 Vulkan, macos-15, 391 s to the desktop with a guest frame presented:
-/// **`child_packet_domain_defined=1395`, `child_packet_domain_undefined=0`**.
+/// **`child_packet_domain_defined=1395`, `child_packet_domain_undefined=0`**,
+/// and **2049 / 0** on a later boot driven through three rounds of application
+/// launches and quits.
 /// Every child packet this guest sent was on a domain a `CmdDefineChannel` had
 /// opened, so the model's `ChannelNotOpen` gate would have refused none of
 /// them. The doorbell-only path is real in this device's code and this guest
