@@ -2927,7 +2927,9 @@ fn declare_object_name(
     // has no third answer and a name must still be issued, or the reference
     // resolves to nothing and every packet that mentions it is refused — and it
     // is *counted*, which is what makes it a known floor rather than a silent
-    // claim. Six driven boots have read zero.
+    // claim. A driven boot of 15 937 draws read **zero** on this counter
+    // directly, which is the reading `storage_extent_unrecovered` had already
+    // predicted on six boots by proxy.
     let declared = state.declare_object(
         task_id,
         obj_ref,
