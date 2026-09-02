@@ -2880,6 +2880,23 @@ pub fn resolve_resource<M: HostMemory>(
 /// `object_declared_into_a_defined_task` is the denominator's other half —
 /// without it, a boot where every declaration named a live task and a boot where
 /// this device constructed nothing read the same.
+///
+/// # What a driven boot answered
+///
+/// x86 Vulkan, macos-15, host-driven workload, 8914 draws:
+/// **`object_declared_into_a_defined_task=1301`,
+/// `object_declared_into_an_undefined_task=0`.** Every declaration this guest
+/// makes is into a task a `DefineTask` opened, so the lifecycle owner's
+/// `NoSuchTask` would refuse none of them, and the group's one identified
+/// refusal costs nothing.
+///
+/// The same boot re-confirmed the other term the group needs, for the sixth
+/// time: `declared_storage_dedicated=1279` + `declared_storage_no_bytes=22` =
+/// **1301**, exactly the declarations counted here, with
+/// `storage_extent_unrecovered` and `object_declared_over_a_live_name` both
+/// silent. Every object this guest constructs is expressible as a
+/// `reims_vgpu_core::lifecycle::Storage`, and none would reach the content
+/// ledger as a `NoBytes` that has bytes.
 fn declare_object_name(
     state: &DeviceState,
     task_id: u32,
