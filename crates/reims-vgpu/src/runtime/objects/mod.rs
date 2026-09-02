@@ -3149,6 +3149,9 @@ pub fn note_reference_shares_storage(
         return;
     };
     crate::runtime::drain::note_store_route("reference_storage_shared");
+    // Both names, so a hot path may ask about either in one lookup.
+    state.note_aliased_reference(task_id, obj_ref);
+    state.note_aliased_reference(task_id, peer);
     crate::observe::fail(format!(
         "{site} task={task_id} ref={obj_ref} peer={peer} (per-reference state is \
          standing for storage that has a second live name, so a statement made \

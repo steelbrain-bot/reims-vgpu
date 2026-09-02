@@ -2624,6 +2624,12 @@ pub struct DeviceState {
     /// possible — a deleted reference leaves its window behind — so the reader
     /// re-checks that the claimant is still live before calling it an alias.
     backing_window_refs: BackingWindowRefs,
+    /// References found to share their allocation with another live one.
+    ///
+    /// A lookup table for hot paths that must not pay for the scan that fills
+    /// it. See [`Self::note_aliased_reference`] for what its freshness is.
+    /// Cleared with the task, alongside every other per-window fact.
+    aliased_references: Mutex<BTreeSet<(u32, u32)>>,
     pub mappings: BTreeMap<u32, MappingEntry>,
     /// Host render-cache keyed by surface_id / mapping_id (Linux/Vulkan rail).
     /// See [`crate::runtime::surface_cache`] and kb tahoe-x86-host-reims_vgpu §8.5.
@@ -2984,6 +2990,7 @@ impl DeviceState {
             texture_to_mapping: BTreeMap::new(),
             storage_incarnations: BTreeMap::new(),
             backing_window_refs: BackingWindowRefs::default(),
+            aliased_references: Mutex::new(BTreeSet::new()),
             task_storage_epochs: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -3736,6 +3743,10 @@ impl DeviceState {
         *slot = slot.wrapping_add(1);
         self.storage_incarnations.retain(|&(t, _), _| t != task_id);
         self.backing_window_refs.delete_task(task_id);
+        self.aliased_references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(t, _)| t != task_id);
     }
 
     /// Claim `base` for `ref_` in `task_id`, or say who holds it already.
@@ -3778,6 +3789,31 @@ impl DeviceState {
             base,
             self.storage_incarnation(task_id, base),
         ))
+    }
+
+    /// Remember that this reference shares its allocation with another live
+    /// one, so a hot path can ask in one lookup instead of a scan.
+    ///
+    /// Written by [`crate::runtime::objects::note_reference_shares_storage`],
+    /// which does the scan once per reference. The set is therefore as fresh as
+    /// that sighting: a reference whose *peer* was constructed afterwards is
+    /// not in it. That is a floor on what the payment alarm can see and not a
+    /// ceiling on the hazard, which is the safe direction for an alarm to be
+    /// wrong in — it under-reports rather than crying wolf.
+    pub fn note_aliased_reference(&self, task_id: u32, ref_: u32) {
+        self.aliased_references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((task_id, ref_));
+    }
+
+    /// Whether this reference is known to share its allocation with another.
+    #[must_use]
+    pub fn reference_is_aliased(&self, task_id: u32, ref_: u32) -> bool {
+        self.aliased_references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(task_id, ref_))
     }
 
     /// Move a window's claim to `ref_`, for a holder the guest's own list no

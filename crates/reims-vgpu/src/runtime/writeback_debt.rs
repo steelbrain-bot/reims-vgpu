@@ -660,6 +660,11 @@ impl PendingWritebacks {
         all
     }
 
+    /// The resources owed a GVA frame, deduplicated across their planes.
+    fn owed_gva_resources(&self) -> std::collections::BTreeSet<GvaResourceKey> {
+        self.gva_debts.keys().map(|plane| plane.resource).collect()
+    }
+
     /// The guest pages every *owed* GVA plane covers, deduplicated.
     ///
     /// The debts and the backing state are two maps keyed alike: `gva_debts`
@@ -866,6 +871,78 @@ fn note_unnamed_reach(state: &DeviceState, pages: impl FnOnce() -> Option<Vec<u6
     }
 }
 
+/// Say when a payment named a reference that owes nothing while *another name
+/// for the same storage* is owed a frame.
+///
+/// # Why the sampled alarm cannot answer this
+///
+/// [`note_unnamed_reach`] compares a read's page walk against the owed pages,
+/// and it does so on one call in `REACH_SAMPLE` and only when it can walk the
+/// read at all — a driven macos-15 boot produced **one** sample in 420
+/// seconds. That is enough to price a policy and nowhere near enough to catch
+/// an event. This is the same question asked exactly, on every payment that
+/// finds nothing, and it costs one set lookup on the ones that cannot be it.
+///
+/// # The hazard, precisely
+///
+/// [`GvaResourceKey`] is `(task, reference)` and the frame it holds is owed by
+/// *storage*. `objects::note_reference_shares_storage` finds three references
+/// over the compositor's scanout allocation on an ordinary boot, all arming
+/// debts. So the device can owe a frame under one of them, the guest can
+/// synchronise another, this payment finds nothing under the name it was
+/// given, and the guest then CPU-reads pages the device still holds newer
+/// pixels for. An unserved frame with no refusal anywhere.
+///
+/// A firing is that, and the fix it points at is that the ledger's key has to
+/// become the storage rather than one of its names.
+///
+/// # What the counters mean apart
+///
+/// `wbdebt_gva_skipped_candidate` is every payment that found nothing under a
+/// reference *known to be aliased* — the population this can be true of.
+/// `wbdebt_gva_payment_skipped` is the ones where a peer really was owed. A
+/// zero candidate count says the alarm never had the chance, which is a
+/// different reading from a zero skip count and is why both are here.
+fn note_gva_payment_skipped_by_name(state: &DeviceState, task_id: u32, texture_ref: u32) {
+    // The overwhelming majority of payments are for references with one name,
+    // and they leave here on a set lookup. The scan below runs only for a
+    // reference already known to share its allocation.
+    if !state.reference_is_aliased(task_id, texture_ref) {
+        return;
+    }
+    crate::runtime::drain::note_store_route("wbdebt_gva_skipped_candidate");
+    let Some((base, _)) = crate::runtime::objects::cached_window(state, task_id, texture_ref)
+    else {
+        return;
+    };
+    let Some(peer) = state
+        .pending_writebacks
+        .owed_gva_resources()
+        .into_iter()
+        .filter(|owed| owed.task_id == task_id && owed.texture_ref != texture_ref)
+        .find(|owed| {
+            crate::runtime::objects::cached_window(state, owed.task_id, owed.texture_ref)
+                .is_some_and(|(owed_base, _)| owed_base == base)
+        })
+    else {
+        return;
+    };
+    crate::runtime::drain::note_store_route("wbdebt_gva_payment_skipped");
+    if crate::observe::first_sight(
+        "wbdebt_gva_payment_skipped",
+        u64::from(task_id) << 32 | u64::from(texture_ref),
+    ) {
+        crate::observe::fail(format!(
+            "wbdebt_gva_payment_skipped task={task_id} named={texture_ref} \
+             owed_under={} base={base:#x} (this payment found nothing under the \
+             name it was given while another name for the same allocation is \
+             owed a frame, so the guest is about to read pages the device still \
+             holds newer pixels for)",
+            peer.texture_ref
+        ));
+    }
+}
+
 /// Pay whatever a *texture* reference names, for a reader that reaches guest
 /// bytes through a task GVA but knows which resource it is reading.
 ///
@@ -969,6 +1046,7 @@ pub fn pay_for_texture<M: HostMemory + HostOps>(
             },
         );
         crate::runtime::drain::note_store_route("wbdebt_texture_owes_nothing");
+        note_gva_payment_skipped_by_name(state, task_id, texture_ref);
     }
 }
 
