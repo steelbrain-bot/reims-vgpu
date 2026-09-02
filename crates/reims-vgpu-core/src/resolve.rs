@@ -183,6 +183,41 @@ impl<R: RefResolver> TaskNamespaces for SameForEveryTask<R> {
     }
 }
 
+/// The storage a task's live resource name answers for, as an access is keyed
+/// on it.
+///
+/// # Why this is not a fourth method on [`TaskNamespaces`]
+///
+/// [`TaskNamespaces`] answers what a *ref* names, and its whole claim is that it
+/// mints nothing: the generation it hands back is the namespace's. This answers
+/// something else — where a named resource's bytes are — and the two have
+/// different holders on a real device. Folded together, the one implementor that
+/// can answer refs but not storage would have to return `None` from a method it
+/// has no term for, and a caller could not tell that from "this slot holds
+/// nothing".
+///
+/// It is also what stops [`SameForEveryTask`] from having to answer: a fixture
+/// wrapping one [`RefResolver`] has no storage term at all, and a trait it does
+/// not implement is a compile error rather than a `None` that reads as an empty
+/// slot.
+///
+/// # `None` is "no key", never "no ordering"
+///
+/// A caller that gets `None` still has an access to build. What it has lost is
+/// the *key*, so the honest access is [`crate::access::AccessKey::DomainOnly`] —
+/// ordering from the submission domain alone — and not a dropped access, which
+/// would order the operation against nothing at all.
+pub trait ResourceStorage {
+    /// The key an access to this resource is built on, or `None` when the task
+    /// has no namespace, the name is not live in it, or this holder has no
+    /// storage term for it.
+    fn storage(
+        &self,
+        task: crate::identity::TaskId,
+        resource: ResourceId,
+    ) -> Option<crate::access::ResourceKey>;
+}
+
 /// Which backing a guest mapping's surface currently occupies.
 ///
 /// **A separate trait from [`RefResolver`] because it answers about a separate

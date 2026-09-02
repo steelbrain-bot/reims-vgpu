@@ -49,12 +49,13 @@
 //!
 //! - **Exec** needs the object-list resolver and the access source that
 //!   [`reims_vgpu_core::walk::exec`] walks a command stream with.
-//! - **Resource lifetime** no longer needs a namespace: all twelve resolve
-//!   their refs, and the class splits three ways instead. Five name no resource
-//!   and cross. Five name resources and owe each one an access — a mode and a
-//!   backing — which the model does not yet state ([`Gap::LifecycleAccesses`]).
-//!   The last two are short of something that is not in their packet at all:
-//!   the guest's object-list table, and the pages behind a re-pointed object.
+//! - **Resource lifetime** is down to two. All twelve resolve their refs, and
+//!   ten of them now build a payload: five name no resource, and five name
+//!   resources and state what they do to them —
+//!   `reims_vgpu_core::lifecycle::LifecycleOp::declared_access` is the mode and
+//!   [`Resolvers::storage`] is the key. The last two are short of something
+//!   that is not in their packet at all: the guest's object-list table, and the
+//!   pages behind a re-pointed object.
 //! - **Query** needs its reply destination *resolved* — a backing and a window,
 //!   not the address the request names.
 //!
@@ -98,7 +99,7 @@ use reims_vgpu_core::control;
 use reims_vgpu_core::identity::{
     ChannelId, CompletionStamp, SessionGeneration, StampSlot, StampValue, StampWait,
 };
-use reims_vgpu_core::resolve::{MappingResolver, TaskNamespaces};
+use reims_vgpu_core::resolve::{MappingResolver, ResourceStorage, TaskNamespaces};
 use reims_vgpu_core::session::Packet;
 use reims_vgpu_core::transaction::{classify, Payload, PayloadClass};
 use reims_vgpu_protocol::packets::Channel;
@@ -177,55 +178,6 @@ pub enum Gap {
     /// packets each declare **1 048 576** entries — the list's capacity, not its
     /// population. See `crate::runtime::objects::name_resource`.
     ObjectListTable,
-    /// The access each of an operation's named resources takes.
-    ///
-    /// The operation resolves; the payload does not. Every resource a lifetime
-    /// operation names owes an `AccessIntent` — a mode, and a backing to key the
-    /// hazard edge on — and `reims_vgpu_core::transaction::LifecyclePayload`
-    /// refuses a payload whose access set disagrees with the operation's
-    /// resource set, which is what makes this a named gap rather than a silently
-    /// unordered packet.
-    ///
-    /// **The mode is the missing term, and it is missing from the model rather
-    /// than from this device.** Nothing in `reims_vgpu_core::lifecycle` says
-    /// what an `Invalidate`, a `Synchronize` or a `Discard` declares about the
-    /// resources it names: `Lifecycle::access` resolves a `Participation` a
-    /// caller supplies, and no caller supplies one for a lifecycle operation.
-    /// The candidate answers are not interchangeable, and each one modelled as
-    /// another drops exactly the edges that one needs. So it is named here and
-    /// not guessed at.
-    ///
-    /// # Where the answer will come from, so the next attempt does not re-derive
-    /// it
-    ///
-    /// Not from the wire: nothing on this interface says what a command declares
-    /// about hazards. From what this device already does to each resource, which
-    /// is validated against a real guest and is the only grounded statement of
-    /// the semantics there is. What that survey says so far, recorded as
-    /// evidence and **not** as a decision:
-    ///
-    /// * `Synchronize` and `SynchronizeAndDiscard` run
-    ///   `crate::runtime::writeback_debt::submit_for_resources`, which stores
-    ///   rendered frames **into the resource's guest pages**. That is a write of
-    ///   the resource's own backing, not a read of it.
-    /// * `Invalidate` applies the guest's validity quad through
-    ///   `crate::runtime::resource_validity::apply`, which is the guest saying
-    ///   it CPU-wrote those pages. Content authority moves and a version is
-    ///   produced outside the GPU timeline — also a write, and for a different
-    ///   reason.
-    /// * `Discard` releases a *transfer* backing while preserving the resource's
-    ///   identity and host texture. Which backing that access is over is the
-    ///   open question in this one: the resource's guest bytes are not what it
-    ///   touches.
-    /// * `DeleteResource`'s ordering may not be an access at all.
-    ///   `reims_vgpu_core::namespace` already owns "deletion stops resolution
-    ///   and teardown waits for the last accepted use", and an access declared
-    ///   here would be a second answer to a question that module answers.
-    ///
-    /// Two of the five are therefore reasoned and two are not, which is why this
-    /// is still a gap: a closure that got three right and two wrong would look
-    /// exactly like one that got five right.
-    LifecycleAccesses,
     /// The pages behind a re-pointed object, which its packet does not carry.
     ///
     /// `ReplacePhysical` is a bare `{task, object}`: the guest re-points a
@@ -262,7 +214,6 @@ impl Gap {
         match self {
             Self::Unresolved => "ingress_row_unresolved",
             Self::ExecResolution => "ingress_needs_exec_resolution",
-            Self::LifecycleAccesses => "ingress_needs_lifecycle_accesses",
             Self::ObjectListTable => "ingress_needs_object_list_table",
             Self::ReplacementStorage => "ingress_needs_replacement_storage",
             Self::ReplyDestination => "ingress_needs_reply_destination",
@@ -285,6 +236,16 @@ pub enum Refused {
     /// A present packet's bytes are not a present, or are too short for the
     /// trailer its form has.
     Present(reims_vgpu_core::present::ResolveRefusal),
+    /// The accesses built for a lifetime command do not describe the resources
+    /// its operation named.
+    ///
+    /// Unreachable by construction today — [`lifecycle_accesses`] walks
+    /// `LifecycleOp::resources` itself and pairs each entry with exactly one
+    /// access — and carried for [`Self::PresentAccesses`]'s reason: the
+    /// constructor is what holds an operation and its accesses together, and a
+    /// bridge that unwrapped it would be asserting a property it had stopped
+    /// letting anything check.
+    LifecycleAccesses(reims_vgpu_core::transaction::AccessMismatch),
     /// The accesses built for a present do not describe the frame its packet
     /// asked for.
     ///
@@ -304,6 +265,7 @@ impl Refused {
         match self {
             Self::Control(inner) => inner.slug(),
             Self::Lifecycle(inner) => inner.slug(),
+            Self::LifecycleAccesses(inner) => inner.slug(),
             Self::Present(inner) => inner.slug(),
             Self::PresentAccesses(inner) => inner.slug(),
         }
@@ -334,6 +296,13 @@ pub struct Resolvers<'a> {
     /// indices into is stated inside that packet, so only the join that decoded
     /// it can bind the namespace. See `reims_vgpu_core::resolve::TaskNamespaces`.
     pub objects: &'a dyn TaskNamespaces,
+    /// Where a named resource's bytes are, which is what an access is keyed on.
+    ///
+    /// Beside [`Self::objects`] rather than inside it: what a ref *names* and
+    /// where the named thing *lives* are two questions with two holders, and
+    /// `reims_vgpu_core::resolve::ResourceStorage`'s own doc says why folding
+    /// them would make "no such slot" and "no storage term" one answer.
+    pub storage: &'a dyn ResourceStorage,
 }
 
 /// Why a drained packet did not become a model packet.
@@ -405,6 +374,7 @@ pub fn packet(
         None => return Err(blocked(Gap::Unresolved)),
         Some(PayloadClass::Exec) => return Err(blocked(Gap::ExecResolution)),
         Some(PayloadClass::ResourceLifecycle) => Payload::ResourceLifecycle(resource_lifetime(
+            fifo,
             channel,
             opcode,
             &drained.payload,
@@ -535,14 +505,15 @@ fn present_payload(
 /// holds an operation together with the accesses its named resources take, and
 /// refuses a list that disagrees with the operation's own resource set. That
 /// refusal is what partitions the ten: four of them name no resource, so the
-/// empty list is not a shortfall but the correct statement, and they cross.
-/// The rest name resources and each named resource owes an access — a mode and
-/// a backing — which is [`Gap::LifecycleAccesses`].
+/// empty list is not a shortfall but the correct statement, and the rest name
+/// resources and owe each one an access. Both halves of that access are now
+/// answerable — the mode from the operation, the key from
+/// [`Resolvers::storage`] — so all ten cross.
 ///
-/// **The partition is the type's and not a list here.** This function offers the
-/// empty access list to the constructor and reads the answer; it does not
-/// enumerate which kinds name resources. A thirteenth command, or a kind that
-/// gains a resource list, moves itself.
+/// **The partition is the type's and not a list here.** [`lifecycle_accesses`]
+/// asks the operation which resources it names and what it declares of them; it
+/// does not enumerate which kinds have a list. A thirteenth command, or a kind
+/// that gains a resource list, moves itself.
 ///
 /// # Two commands are short of neither a namespace nor an access
 ///
@@ -572,6 +543,7 @@ fn present_payload(
 /// complete, and [`Blocked::Refused`] when a lifetime packet's bytes are not the
 /// command its opcode names.
 fn resource_lifetime(
+    fifo: Fifo,
     channel: Channel,
     opcode: u16,
     payload: &[u8],
@@ -609,7 +581,87 @@ fn resource_lifetime(
     // truth. It is, for an operation that names no resource; for one that does,
     // the constructor says which resource is unaccounted for and that is the
     // gap.
-    LifecyclePayload::new(op, Vec::new()).map_err(|_| gap(Gap::LifecycleAccesses))
+    let accesses = lifecycle_accesses(fifo, &op, resolvers);
+    LifecyclePayload::new(op, accesses)
+        .map_err(|mismatch| Blocked::Refused(Refused::LifecycleAccesses(mismatch)))
+}
+
+/// The access every resource a lifetime operation names is subject to.
+///
+/// # The mode is the operation's and the key is the device's
+///
+/// Two terms with two owners, joined here and derived in neither place. The
+/// direction — what the command does to the memory it names — is a property of
+/// the command, so `reims_vgpu_core::lifecycle::LifecycleOp::declared_access`
+/// states it once for the whole model; a table here would be that statement's
+/// second copy, and the copy a device kept would be the one that drifted. Where
+/// those bytes are is not the model's to know at all, so it arrives through
+/// `reims_vgpu_core::resolve::ResourceStorage`.
+///
+/// # An unresolvable target is `DomainOnly`, counted, and not dropped
+///
+/// A resource whose storage this device has no key for still takes part in the
+/// operation, and an access list missing it is a list
+/// `reims_vgpu_core::transaction::LifecyclePayload` refuses — which would lose
+/// the whole packet over one resource. `AccessKey::DomainOnly` is the
+/// vocabulary for exactly this: participation is real, the memory is not
+/// established, ordering comes from the submission domain alone. It is the same
+/// judgement [`present_payload`] makes for a mapping with no live surface, and
+/// it is counted for the same reason — so a boot says how many lifetime edges
+/// were bought at the coarse rung rather than leaving it to inference.
+///
+/// The whole backing, because the operation names no narrower extent: a
+/// synchronise names a resource, and even an invalidate's validity quad is not
+/// carried into the operation. Rung 2 is the finest answer the packet contains.
+fn lifecycle_accesses(
+    fifo: Fifo,
+    op: &reims_vgpu_core::lifecycle::LifecycleOp,
+    resolvers: Resolvers<'_>,
+) -> Vec<(
+    reims_vgpu_core::identity::ResourceId,
+    reims_vgpu_core::access::AccessIntent,
+)> {
+    use reims_vgpu_core::access::{AccessIntent, AccessKey};
+    // Asked of the operation rather than of the kind: an operation that names
+    // no resource declares no access, and the two answers are one match in one
+    // file so they cannot disagree about which commands those are.
+    let Some(mode) = op.declared_access() else {
+        return Vec::new();
+    };
+    let task = op.task();
+    op.resources()
+        .iter()
+        .map(|&resource| {
+            let key = match resolvers.storage.storage(task, resource) {
+                Some(key) => {
+                    crate::runtime::drain::note_store_route("ingress_lifecycle_target_resolved");
+                    AccessKey::Whole(key)
+                }
+                None => {
+                    crate::runtime::drain::note_store_route("ingress_lifecycle_target_unresolved");
+                    AccessKey::DomainOnly
+                }
+            };
+            (
+                resource,
+                AccessIntent {
+                    domain: fifo.domain(),
+                    key,
+                    mode,
+                    // A lifetime command names no shader stage. Zero always
+                    // means the record carried none, never that one was dropped.
+                    api_stages: 0,
+                    // No content version is established for a lifecycle access.
+                    // The content authority is `reims_vgpu_core::content`'s and
+                    // it is not consulted here; `None` says the term is absent,
+                    // which is what it is, rather than reserving a version this
+                    // bridge has no authority to hand out.
+                    input_content_version: None,
+                    output_content_version: None,
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -681,10 +733,48 @@ mod tests {
         }
     }
 
+    /// A storage source that answers for every resource, keyed on the name so
+    /// two different names never collide on one backing.
+    ///
+    /// Paired with [`EveryObject`] for the ledger sweep's reason: a row that
+    /// came out at the coarse rung because a fixture held no storage would be
+    /// reporting on the fixture.
+    struct EveryStorage;
+
+    impl reims_vgpu_core::resolve::ResourceStorage for EveryStorage {
+        fn storage(
+            &self,
+            task: reims_vgpu_core::identity::TaskId,
+            resource: reims_vgpu_core::identity::ResourceId,
+        ) -> Option<reims_vgpu_core::access::ResourceKey> {
+            Some(reims_vgpu_core::access::ResourceKey {
+                backing: reims_vgpu_core::access::BackingId(
+                    u64::from(task.0) << 32 | u64::from(resource.slot.0) | 1 << 42,
+                ),
+                heap: None,
+            })
+        }
+    }
+
+    /// A storage source with no term for anything, for the test that asserts
+    /// what a lifetime packet does when its target cannot be keyed.
+    struct NoStorage;
+
+    impl reims_vgpu_core::resolve::ResourceStorage for NoStorage {
+        fn storage(
+            &self,
+            _task: reims_vgpu_core::identity::TaskId,
+            _resource: reims_vgpu_core::identity::ResourceId,
+        ) -> Option<reims_vgpu_core::access::ResourceKey> {
+            None
+        }
+    }
+
     fn resolvers(mappings: &dyn MappingResolver) -> Resolvers<'_> {
         Resolvers {
             mappings,
             objects: &EveryObject,
+            storage: &EveryStorage,
         }
     }
 
@@ -846,10 +936,13 @@ mod tests {
     /// What a resource-lifetime row is still short of, or `None` if it crosses.
     ///
     /// Asked of the same kind table the bridge asks, so the test cannot drift
-    /// into its own list of opcodes and then agree with itself. The three-way
-    /// split is the claim: two commands need something that is not in their
-    /// packet, the ones naming resources owe those resources an access, and what
-    /// is left names nothing and crosses.
+    /// into its own list of opcodes and then agree with itself. **The split is
+    /// down to two**: a rebind's operation is the result of walking the guest's
+    /// object-list table and a re-point's names pages that are not on the wire,
+    /// and neither is a thing this bridge can be handed. Everything else in the
+    /// class builds a payload — the five that name resources now state both
+    /// halves of the access each one takes, so naming a resource stopped being
+    /// what holds a lifetime command back.
     fn lifetime_gap(channel: Channel, opcode: u16) -> Option<Gap> {
         use reims_vgpu_core::lifecycle::LifecycleKind as K;
         match K::of(channel, opcode)? {
@@ -859,33 +952,24 @@ mod tests {
             | K::Invalidate
             | K::Synchronize
             | K::SynchronizeAndDiscard
-            | K::Discard => Some(Gap::LifecycleAccesses),
-            // A task's definition and deletion name a task; a map notice names
-            // an address interval. None of the three names a resource, so the
-            // empty access list is the operation's own statement.
-            //
-            // A backing retirement is the fifth and it is the one worth a
-            // sentence: it names a *backing* and not a resource, so
-            // `LifecycleOp::resources` is empty and the operation makes no
-            // per-resource claim for an access to answer. That is the core's
-            // rule and it is followed here rather than second-guessed — a
-            // retirement this bridge invented an access for would be ordering
-            // against memory the operation did not name.
-            K::DeleteBacking | K::DefineTask | K::DeleteTask | K::MapMemory | K::UnmapMemory => {
-                None
-            }
+            | K::Discard
+            | K::DeleteBacking
+            | K::DefineTask
+            | K::DeleteTask
+            | K::MapMemory
+            | K::UnmapMemory => None,
         }
     }
 
     /// What crosses is exactly the whole control class, the whole present class,
-    /// and the five lifetime commands whose operation names no resource — and
-    /// nothing else.
+    /// and every resource-lifetime command except the two whose operation needs
+    /// something that is not in their packet — and nothing else.
     ///
     /// The counts are spelled out because this is the cutover's own scoreboard:
     /// a gap that closes moves a number here, and a row that quietly changed
     /// class moves one without anybody deciding to.
     #[test]
-    fn what_crosses_is_control_present_and_the_lifetime_commands_naming_no_resource() {
+    fn what_crosses_is_control_present_and_every_lifetime_command_but_two() {
         let crossing: Vec<_> = LEDGER
             .iter()
             .filter(|row| {
@@ -922,7 +1006,7 @@ mod tests {
             .count();
         assert_eq!(
             (control, present, crossing.len()),
-            (23, 3, 33),
+            (23, 3, 38),
             "the ledger's crossing rows changed; what reaches the model is not what the \
              module documentation says it is"
         );
@@ -1084,17 +1168,62 @@ mod tests {
         ));
         assert!(payload.accesses().is_empty());
 
-        // One record. The ref resolved — that is what says the namespace is no
-        // longer what is missing — and the packet is short of the access.
+        // One record. The ref resolves and the resource it names is keyed, so
+        // the packet crosses with exactly one access — over that resource, at
+        // the whole-backing rung, in a direction that orders against a reader.
         let named = put(&drained_with_list(row.channel, row.opcode))
-            .expect_err("a named resource owes an access");
+            .expect("a named resource's access is answerable");
+        let Payload::ResourceLifecycle(payload) = &named.payload else {
+            panic!("a lifetime command must not build another class's payload");
+        };
+        let LifecycleOp::Invalidate { task, resources } = payload.op() else {
+            panic!("the invalidate opcode built another operation");
+        };
+        assert_eq!(resources.len(), 1, "the list carried one record");
         assert_eq!(
-            named.gap(),
-            Some(Gap::LifecycleAccesses),
-            "an unresolved ref would have been a refusal about the guest's bytes; \
-             this is this device's own incompleteness and says which"
+            payload.accesses().len(),
+            1,
+            "one resource, one access — the envelope is what holds those together"
         );
-        assert_eq!(named.slug(), "ingress_needs_lifecycle_accesses");
+        let access = payload.accesses()[0];
+        assert_eq!(
+            access.key,
+            reims_vgpu_core::access::AccessKey::Whole(
+                EveryStorage
+                    .storage(*task, resources[0])
+                    .expect("the fixture keys every resource")
+            ),
+            "the access is keyed on the storage the resolver gave for the resource \
+             the operation named, not on a default or on another resource's"
+        );
+        assert_eq!(access.mode, reims_vgpu_core::access::AccessMode::Write);
+        assert_eq!(access.domain, fifo.domain());
+
+        // The same packet with nothing to key it on. The resource is still the
+        // operation's, so the access is still there — at the coarse rung rather
+        // than absent, because an access list one short of the operation's own
+        // resources is a packet the envelope refuses outright.
+        let unkeyed = packet(
+            fifo,
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &drained_with_list(row.channel, row.opcode),
+            Resolvers {
+                mappings: &EveryMapping,
+                objects: &EveryObject,
+                storage: &NoStorage,
+            },
+        )
+        .expect("an unkeyable target is not a lost packet");
+        let Payload::ResourceLifecycle(payload) = &unkeyed.payload else {
+            panic!("a lifetime command must not build another class's payload");
+        };
+        assert_eq!(
+            payload.accesses().iter().map(|a| a.key).collect::<Vec<_>>(),
+            vec![reims_vgpu_core::access::AccessKey::DomainOnly],
+            "with no storage term the ordering is the submission domain's, and the \
+             access is still declared"
+        );
     }
 
     /// [`packet`] over the ledger sweep's namespaces, so a test naming one

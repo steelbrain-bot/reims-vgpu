@@ -2292,6 +2292,61 @@ impl<M: HostMemory> reims_vgpu_core::resolve::TaskNamespaces for TaskNames<'_, M
     }
 }
 
+/// The device answering where a named resource's bytes are.
+///
+/// # Why the same holder answers both traits
+///
+/// [`TaskNames`] already carries the two things this needs — the namespaces that
+/// issued the name, and the guest memory the object list lives in — and the two
+/// questions are asked one after the other about one resource. A second holder
+/// would be a second `(state, host)` pair that a call site could pair with the
+/// wrong task.
+///
+/// # The generation is checked, and that is the whole of the guard
+///
+/// A [`reims_vgpu_core::identity::ResourceId`] is a slot *and* a generation, and
+/// the slot alone is what [`backing_id`] reads the guest's list with. So a name
+/// whose generation is no longer the slot's current one would resolve to the
+/// bytes of whatever occupies the slot **now** — the wrong storage, keyed onto
+/// an access the guest asked for over the old occupant. Asking
+/// `DeviceState::object_name` first makes that a `None` instead: no key, an
+/// access at the coarse rung, and no edge drawn against memory the packet did
+/// not name.
+///
+/// # `heap` is `None` because a heap placement never gets this far
+///
+/// [`ResourceKey`](reims_vgpu_core::access::ResourceKey) carries the heap so a
+/// heap-use record and a member access have something to compare. This device
+/// has no heap term to carry: a heap's extent is unrecovered, so [`backing_id`]
+/// refuses a placement by name as [`BackingIdRefusal::HeapPlaced`] rather than
+/// minting an identity that would make two placements over one heap look
+/// distinct. Every backing that reaches this line is therefore a dedicated
+/// allocation, for which `None` is the fact and not an omission — and the day
+/// the heap extent lands, the refusal is where the term arrives.
+impl<M: HostMemory> reims_vgpu_core::resolve::ResourceStorage for TaskNames<'_, M> {
+    fn storage(
+        &self,
+        task: reims_vgpu_core::identity::TaskId,
+        resource: reims_vgpu_core::identity::ResourceId,
+    ) -> Option<reims_vgpu_core::access::ResourceKey> {
+        let slot = resource.slot.0;
+        if self.state.object_name(task.0, slot) != Some(resource) {
+            crate::runtime::drain::note_store_route("lifecycle_storage_name_not_current");
+            return None;
+        }
+        match backing_id(self.state, self.host, task.0, slot) {
+            Ok(backing) => Some(reims_vgpu_core::access::ResourceKey {
+                backing,
+                heap: None,
+            }),
+            Err(refusal) => {
+                crate::runtime::drain::note_store_route(refusal.slug());
+                None
+            }
+        }
+    }
+}
+
 /// Whether a query's reply buffer lands inside an allocation this device
 /// already has an identity for.
 ///

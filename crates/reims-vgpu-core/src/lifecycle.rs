@@ -52,8 +52,8 @@
 //! been invalidated would have no way to describe the state it was left in.
 
 use crate::access::{
-    AccessIntent, AccessRefusal, AccessSource, BackingId, ByteRange, GuestSpan, Participation,
-    ParticipationExtent, ResourceKey,
+    AccessIntent, AccessMode, AccessRefusal, AccessSource, BackingId, ByteRange, GuestSpan,
+    Participation, ParticipationExtent, ResourceKey,
 };
 use crate::content::{ContentLedger, Replica, Transfer};
 use crate::heap::{self, HeapPlacement, Heaps, Retirement};
@@ -352,6 +352,76 @@ impl LifecycleOp {
             | Self::MapMemory { .. }
             | Self::UnmapMemory { .. }
             | Self::DeleteBacking { .. } => &[],
+        }
+    }
+
+    /// What every resource this operation names is subject to, or `None` when
+    /// it names none.
+    ///
+    /// # Why a mode per operation and not per resource
+    ///
+    /// A lifecycle command's resource list is a list of *operands of one verb*:
+    /// a synchronise synchronises all of them, a discard discards all of them.
+    /// Nothing on this wire distinguishes the operands from one another, so a
+    /// per-resource mode would be a field with one value repeated, and the first
+    /// caller to fill it differently would be inventing a distinction the packet
+    /// does not carry.
+    ///
+    /// # `Unknown` is the answer for three of them, deliberately
+    ///
+    /// [`AccessMode::Unknown`] exists so that "conservative because nobody
+    /// knows" is countable and therefore narrowable, and that is exactly what
+    /// three of these are. It orders identically to `ReadWrite`, so nothing is
+    /// under-ordered by saying it; what it buys is that a census can say how
+    /// many of this device's lifecycle edges are bought with imprecision, and a
+    /// later closure can show the number falling.
+    ///
+    /// The split, and what each side rests on:
+    ///
+    /// * `Invalidate`, `Synchronize` and `SynchronizeAndDiscard` are
+    ///   [`AccessMode::Write`], and that is established rather than assumed. A
+    ///   synchronise stores rendered content **into the resource's own guest
+    ///   pages**, and an invalidate is the guest declaring it CPU-authored those
+    ///   pages — content authority moving, outside the GPU timeline. Both
+    ///   produce content on the memory the operation names; neither reads it.
+    /// * `Discard` releases the transfer staging of the resources it names while
+    ///   preserving their identity and host texture. Which memory that is a
+    ///   statement about is *not* established: the resource's guest bytes are
+    ///   not what it touches, and the model has no key for a transfer staging.
+    ///   So the direction is unestablished over the memory the access is keyed
+    ///   on, which is what `Unknown` says.
+    /// * `DeleteResource` and `ReplacePhysical` end or re-point the storage the
+    ///   name answered for. [`crate::namespace`] already owns the *name* half —
+    ///   deletion stops resolution, teardown waits for the last accepted use —
+    ///   so what is left here is only the hazard edge against work still
+    ///   touching those bytes. That edge must exist in both directions and the
+    ///   operation reads nothing, so neither `Read` nor `Write` is the term;
+    ///   `Unknown` orders it and says the term is open.
+    ///
+    /// # It is `None` exactly when [`Self::resources`] is empty
+    ///
+    /// Same arms, same file, one screen apart, and
+    /// `an_operation_declares_an_access_exactly_when_it_names_resources` holds
+    /// them to it — because a mode without a resource orders against memory the
+    /// operation never named, and a resource without a mode is a packet
+    /// [`crate::transaction::LifecyclePayload`] refuses.
+    #[must_use]
+    pub const fn declared_access(&self) -> Option<AccessMode> {
+        match self {
+            Self::Invalidate { .. }
+            | Self::Synchronize { .. }
+            | Self::SynchronizeAndDiscard { .. } => Some(AccessMode::Write),
+            Self::Discard { .. } | Self::DeleteResource { .. } | Self::ReplacePhysical { .. } => {
+                Some(AccessMode::Unknown)
+            }
+            // Each names something that is not a resource, so there is no
+            // per-resource claim for a mode to be about.
+            Self::DefineTask { .. }
+            | Self::DeleteTask { .. }
+            | Self::CreateResource { .. }
+            | Self::MapMemory { .. }
+            | Self::UnmapMemory { .. }
+            | Self::DeleteBacking { .. } => None,
         }
     }
 
@@ -1938,6 +2008,127 @@ mod tests {
         ResourceId {
             slot: ObjectListRef(slot),
             generation: SlotGeneration::default().next(),
+        }
+    }
+
+    /// One operation of every kind, so a sweep over the vocabulary is a sweep
+    /// over values and not over a second list of kinds.
+    fn one_of_every_kind() -> Vec<LifecycleOp> {
+        let span = GuestSpan {
+            base: 0x1000,
+            length: 0x1000,
+        };
+        vec![
+            LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+                directory: DirectoryFrame(0x1000),
+            },
+            LifecycleOp::DeleteTask { task: TASK },
+            LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(0),
+                storage: dedicated(10, 0x100),
+            },
+            LifecycleOp::DeleteResource {
+                task: TASK,
+                resource: name(0),
+            },
+            LifecycleOp::MapMemory { task: TASK, span },
+            LifecycleOp::UnmapMemory { task: TASK, span },
+            LifecycleOp::ReplacePhysical {
+                task: TASK,
+                resource: name(0),
+                backing: BackingId(11),
+                extent: range(0, 0x100),
+            },
+            LifecycleOp::Invalidate {
+                task: TASK,
+                resources: vec![name(0)],
+            },
+            LifecycleOp::Synchronize {
+                task: TASK,
+                resources: vec![name(0)],
+            },
+            LifecycleOp::SynchronizeAndDiscard {
+                task: TASK,
+                resources: vec![name(0)],
+            },
+            LifecycleOp::Discard {
+                task: TASK,
+                resources: vec![name(0)],
+            },
+            LifecycleOp::DeleteBacking {
+                task: TASK,
+                backing: BackingId(10),
+            },
+        ]
+    }
+
+    /// The sweep is over kinds and not over the vector's length, so a
+    /// thirteenth operation added without a row here fails rather than being
+    /// silently absent from every assertion the vector feeds.
+    #[test]
+    fn the_kind_sweep_covers_the_whole_vocabulary() {
+        let mut kinds: Vec<LifecycleKind> =
+            one_of_every_kind().iter().map(LifecycleOp::kind).collect();
+        let total = kinds.len();
+        kinds.sort_by_key(|k| format!("{k:?}"));
+        kinds.dedup();
+        assert_eq!(
+            kinds.len(),
+            total,
+            "two operations in the sweep have the same kind, so one kind is unswept"
+        );
+        for p in LEDGER {
+            if let Some(kind) = LifecycleKind::of(p.channel, p.opcode) {
+                assert!(
+                    kinds.contains(&kind),
+                    "{kind:?} is a lifecycle command with no operation in the sweep"
+                );
+            }
+        }
+    }
+
+    /// `LifecycleOp::declared_access` and `LifecycleOp::resources` are two
+    /// matches over one enum, and this is what stops them drifting.
+    ///
+    /// Either direction is a defect and neither is caught by the compiler: a
+    /// mode with no resource orders the operation against memory it never
+    /// named, and a resource with no mode is a packet
+    /// `crate::transaction::LifecyclePayload` refuses outright — which is a
+    /// whole command class silently lost rather than a wrong edge.
+    #[test]
+    fn an_operation_declares_an_access_exactly_when_it_names_resources() {
+        for op in one_of_every_kind() {
+            assert_eq!(
+                op.declared_access().is_some(),
+                !op.resources().is_empty(),
+                "{:?} disagrees with itself about whether it names resources",
+                op.kind()
+            );
+        }
+    }
+
+    /// No lifecycle command may declare a pure read of the resources it names.
+    ///
+    /// Not a restatement of the table: it is the property the table has to have.
+    /// Every one of these either produces content on the memory it names or
+    /// ends it, so a mode that did not order against a concurrent reader would
+    /// let a synchronise publish over bytes a draw is still sampling. `Read` is
+    /// the one mode that would do that, and `AccessMode::writes` is the
+    /// question the dependency compiler actually asks.
+    #[test]
+    fn no_lifecycle_operation_declares_a_pure_read() {
+        for op in one_of_every_kind() {
+            if let Some(mode) = op.declared_access() {
+                assert!(
+                    mode.writes(),
+                    "{:?} declares {} of the resources it names, which orders against no reader",
+                    op.kind(),
+                    mode.name()
+                );
+            }
         }
     }
 
