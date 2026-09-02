@@ -20,7 +20,6 @@ use super::{ChainAbandonDecline, StreamAccum, StreamDrawDrop};
 use crate::runtime::compute_exec::ComputeStatus;
 use crate::runtime::decode::render::{AttachSubresource, ScissorRect};
 use crate::runtime::draw::EncodeStatus;
-use reims_vgpu_wire::ops::render as wire_render;
 
 /// Name a compute refusal at the rail boundary.
 ///
@@ -228,28 +227,18 @@ pub(super) fn note_unnamed_icb_execute(
     }
 }
 
-/// The draw opcodes whose records carry an index buffer.
-///
-/// `render::decode` collapses every draw form to `Kind::Draw`, so the decoded
-/// record cannot say which class it came from and the opcode is the only thing
-/// that can.
-pub(super) fn is_indexed_draw_opcode(opcode: u32) -> bool {
-    // wire opcodes via wire_render import
-
-    matches!(
-        opcode,
-        wire_render::OPCODE_DRAW_INDEXED
-            | wire_render::OPCODE_DRAW_INDEXED_INSTANCED
-            | wire_render::OPCODE_DRAW_INDEXED_WIDE
-    )
-}
-
 /// Name an indexed draw whose record carried no index buffer.
 ///
-/// Deduped on the opcode: the three indexed forms read `index_buffer_ref` from
-/// three different payload offsets, so which form fires is the whole diagnostic
-/// value — one form firing alone points at that form's offset, all three
-/// firing points at the guest.
+/// Deduped on the opcode: the six indexed forms read `index_buffer_ref` from six
+/// different payload offsets, so which form fires is the whole diagnostic value
+/// — one form firing alone points at that form's offset, all six firing points
+/// at the guest.
+///
+/// The predicate that used to guard this call site listed **three** of the six,
+/// because it had to name the opcodes itself: the decoder collapsed every draw
+/// form to one `Kind`, so a record could not say which class it came from. It is
+/// gone with that question — `DrawRecord::Indexed` is the guard now, and it is
+/// total over the six.
 pub(super) fn note_indexed_draw_without_buffer(task_id: u32, opcode: u32, index_count: u32) {
     crate::observe::fail(format!(
         "stream_draw reason=indexed_without_index_buffer task={task_id} op={opcode:#x} \
@@ -726,15 +715,19 @@ pub(super) fn note_clear_dropped(reason: &'static str, tex_ref: u32, detail: &st
 /// watch for whenever a dedup latch sits next to a decision.
 pub(super) fn note_indirect_draw_refused(
     task_id: u32,
-    cmd: &crate::runtime::decode::render::Command,
+    opcode: u32,
+    // The buffer window the counts were to be read from. Two numbers rather
+    // than the whole decoded command, so this cannot be handed a record of a
+    // different class.
+    arguments: reims_vgpu_protocol::decode::render::IndirectRef,
     status: crate::runtime::compute_exec::ComputeStatus,
 ) {
     if let Some(e) = crate::observe::Emit::refusal("render_draw_indirect", &status) {
         e.field("task", task_id)
-            .field("op", format!("{:#x}", cmd.opcode))
-            .field("args_ref", cmd.indirect_buffer_ref)
-            .field("args_off", cmd.indirect_buffer_offset)
-            .fail_once(u64::from(cmd.indirect_buffer_ref));
+            .field("op", format!("{opcode:#x}"))
+            .field("args_ref", arguments.buffer_ref)
+            .field("args_off", arguments.offset)
+            .fail_once(u64::from(arguments.buffer_ref));
     }
 }
 

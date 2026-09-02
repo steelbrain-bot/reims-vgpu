@@ -7349,3 +7349,144 @@ fn each_store_action_override_reaches_the_attachment_its_target_names() {
         "the stencil override did not reach the stencil attachment"
     );
 }
+
+/// A draw that carries no instance-count argument and one that carries zero are
+/// different draws.
+///
+/// **This is the reading W11d changed.** `drawPrimitives:vertexStart:vertexCount:`
+/// has no `instanceCount:` argument at all, and Metal's default for it is one
+/// instance — so one is what the guest asked for. `instanceCount:0` is a guest
+/// that wrote the argument and wrote zero, which draws nothing; that is also
+/// what it asked for, and it reaches the backend.
+///
+/// The `.max(1)` this replaces sat in the decoder and applied to both, so the
+/// two were one number by the time anything downstream saw them. Three arms of
+/// this device disagreed about the zero — `backend::metal::render` refuses it by
+/// name, a refusal the clamp made unreachable, and `runtime::icb` passed the
+/// same argument to Metal unclamped — so the clamp could not have been
+/// describing the contract. The census survives at the lift and is asserted
+/// here, because a zero reaching a backend is exactly the event worth a line.
+#[test]
+fn a_draw_with_no_instance_count_and_one_asking_for_zero_are_not_the_same_draw() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    acc.pipeline_ref = 7171;
+
+    // `drawPrimitives:vertexStart:vertexCount:` — primitive first at 32 bits,
+    // then two 16-bit counts. No instance count on the wire at all.
+    let mut plain = vec![0u8; wire_r::DRAW_TOTAL_LEN as usize];
+    st32(&mut plain[0..], wire_r::OPCODE_DRAW);
+    st32(&mut plain[4..], wire_r::DRAW_TOTAL_LEN);
+    st32(&mut plain[OP_HEADER_LEN..], 3);
+    st16(&mut plain[OP_HEADER_LEN + 4..], 0);
+    st16(&mut plain[OP_HEADER_LEN + 6..], 6);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_r::OPCODE_DRAW,
+        &plain,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(acc.draws.len(), 1, "the plain draw was not recorded");
+    assert_eq!(
+        acc.draws[0].draw.instance_count, 1,
+        "a selector with no instanceCount: argument draws one instance"
+    );
+
+    // `drawPrimitives:vertexStart:vertexCount:instanceCount:` with the argument
+    // written as zero.
+    let mut zero = vec![0u8; wire_r::DRAW_INSTANCED_TOTAL_LEN as usize];
+    st32(&mut zero[0..], wire_r::OPCODE_DRAW_INSTANCED);
+    st32(&mut zero[4..], wire_r::DRAW_INSTANCED_TOTAL_LEN);
+    st16(&mut zero[OP_HEADER_LEN..], 0);
+    st16(&mut zero[OP_HEADER_LEN + 2..], 6);
+    st16(&mut zero[OP_HEADER_LEN + 4..], 0);
+    st16(&mut zero[OP_HEADER_LEN + 6..], 3);
+    let before = store_route_count("draw_instance_count_zero");
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_r::OPCODE_DRAW_INSTANCED,
+        &zero,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(
+        store_route_count("draw_instance_count_zero"),
+        before + 1,
+        "a written zero instance count was not counted"
+    );
+    assert_eq!(
+        acc.draws.len(),
+        2,
+        "the zero-instance draw was not recorded"
+    );
+    assert_eq!(
+        acc.draws[1].draw.instance_count, 0,
+        "a guest that wrote instanceCount:0 had its argument overruled"
+    );
+}
+
+/// The compact and wide encodings of one draw shape reach the same record.
+///
+/// Six selectors arrive in two encodings — 16-bit counts and 64-bit ones — with
+/// different field orders, and that is an encoding rather than a meaning. Both
+/// must produce the same `PendingDraw`, or a guest whose count crossed 65535
+/// would draw different geometry than the same guest below it. The one field
+/// where they genuinely disagree, `base_vertex`, is not exercised here: the
+/// compact form's is truncated to sixteen bits by Apple's serializer upstream of
+/// this device, so equal inputs are not the right comparison for it.
+#[test]
+fn a_compact_draw_and_its_wide_encoding_record_the_same_draw() {
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let run = |command: &[u8]| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        acc.pipeline_ref = 7171;
+        let opcode = ld32(&command[0..]);
+        handle_render_record(&mut state, &host, 1, opcode, command, &mut out, &mut acc);
+        acc.draws.first().map(|d| d.draw)
+    };
+
+    // Compact: primitive at 32 bits, then `vertexStart` and `vertexCount` at 16.
+    let mut compact = vec![0u8; wire_r::DRAW_TOTAL_LEN as usize];
+    st32(&mut compact[0..], wire_r::OPCODE_DRAW);
+    st32(&mut compact[4..], wire_r::DRAW_TOTAL_LEN);
+    st32(&mut compact[OP_HEADER_LEN..], 3);
+    st16(&mut compact[OP_HEADER_LEN + 4..], 12);
+    st16(&mut compact[OP_HEADER_LEN + 6..], 900);
+
+    // Wide: the same three fields, the counts at 64 bits.
+    let mut wide = vec![0u8; wire_r::DRAW_WIDE_TOTAL_LEN as usize];
+    st32(&mut wide[0..], wire_r::OPCODE_DRAW_WIDE);
+    st32(&mut wide[4..], wire_r::DRAW_WIDE_TOTAL_LEN);
+    st32(&mut wide[OP_HEADER_LEN..], 3);
+    st64(&mut wide[OP_HEADER_LEN + 4..], 12);
+    st64(&mut wide[OP_HEADER_LEN + 12..], 900);
+
+    let a = run(&compact).expect("the compact draw was not recorded");
+    let b = run(&wide).expect("the wide draw was not recorded");
+    assert_eq!(
+        a, b,
+        "the two encodings of one draw shape produced different draws"
+    );
+    assert_eq!(
+        (a.primitive_type, a.first_vertex, a.vertex_count),
+        (3, 12, 900)
+    );
+    assert_eq!(
+        a.instance_count, 1,
+        "neither encoding carries an instance count, so both draw one"
+    );
+}

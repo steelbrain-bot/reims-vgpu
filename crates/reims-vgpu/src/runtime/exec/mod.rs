@@ -3250,6 +3250,217 @@ fn handle_render_pass_state<M: HostMemory + HostOps>(
     }
 }
 
+/// Whether this record is a draw.
+///
+/// The fourth and last of the render encoder's groups, and the one that decides
+/// pixels. Its fields are `draws`, `saw_draw`, `indexed`, `dropped_no_pipeline`
+/// and `dropped_zero_count`; it *reads* everything the other three groups
+/// wrote, through `bind_snapshot`, which is why it moves last — a reader can
+/// only be trusted once every writer it reads is settled.
+///
+/// Exhaustive over `RenderKind` for the reason [`is_render_stream_state`] is.
+const fn is_render_draw(kind: ProtoRenderKind) -> bool {
+    kind.draw_shape().is_some()
+}
+
+/// The count a draw record carries, at the width `DrawArgs` holds.
+///
+/// The wide encodings exist because the guest had a value above 16 bits, not
+/// above 32: a vertex or index count of four billion is not a draw any GPU
+/// completes. Truncating one would draw the wrong geometry in silence, so it is
+/// refused by name instead.
+fn draw_count(task_id: u32, opcode: u32, what: &str, value: u64) -> Option<u32> {
+    match u32::try_from(value) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            crate::runtime::drain::note_store_route("render_draw_count_out_of_range");
+            if crate::observe::first_sight("render_draw_count_out_of_range", u64::from(opcode)) {
+                crate::observe::fail(format!(
+                    "render_draw fail reason=render_draw_count_out_of_range \
+                     task={task_id} op={opcode:#x} field={what} value={value}"
+                ));
+            }
+            None
+        }
+    }
+}
+
+/// How many instances a draw record asked for.
+///
+/// **`None` and `Some(0)` are different answers and this is the single site that
+/// says so.** `None` is the plain selector, which carries no `instanceCount:`
+/// argument at all — Metal's own default is one instance, so one is what the
+/// guest asked for. `Some(0)` is a guest that wrote the argument and wrote zero,
+/// which draws nothing; that is the draw it asked for, and it is passed through.
+///
+/// The `.max(1)` this replaces did not distinguish them. It sat in the decoder,
+/// applied to both, and three arms of this device disagreed with it and with
+/// each other: `backend::metal::render` refuses a zero by name — a refusal the
+/// clamp made unreachable — and `runtime::icb` decodes the same argument out of
+/// an ICB slot and hands it straight to Metal with no clamp at all, so the
+/// device already shipped a zero instance count on the path that did not come
+/// through here.
+///
+/// **The clamp read zero.** Driven x86/Vulkan boots, Ventura desktop, Safari
+/// window drag: `draw_instance_count_zero` never fired in the thousands. So this
+/// changes nothing on a measured workload and stops the three arms disagreeing
+/// on an unmeasured one. The census survives, at the lift rather than in a
+/// decoder.
+fn draw_instances(instances: reims_vgpu_protocol::decode::render::Instancing) -> Option<u32> {
+    let Some(count) = instances.count else {
+        return Some(1);
+    };
+    if count == 0 {
+        crate::runtime::drain::note_store_route("draw_instance_count_zero");
+    }
+    u32::try_from(count).ok()
+}
+
+/// Record one draw, lifted by the protocol crate.
+fn handle_render_draw<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    kind: ProtoRenderKind,
+    opcode: u32,
+    cmd_bytes: &[u8],
+    out: &mut ExecResult,
+    acc: &mut StreamAccum,
+) {
+    use reims_vgpu_protocol::decode::render::{DrawRecord, RenderRecord};
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    let record = match reims_vgpu_protocol::decode::render::decode(&framed) {
+        Ok(RenderRecord::Draw(draw)) => draw,
+        Ok(other) => {
+            return crate::observe::fail(format!(
+                "render_draw_record_not_a_draw task={task_id} opcode={opcode:#x} \
+                 (the rail routed this row to the draw arm and the lift produced {other:?})"
+            ));
+        }
+        Err(refusal) => {
+            return note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+        }
+    };
+
+    // The wide-encoding census. `RenderKind` is what carries it — the record
+    // widens both encodings' counts to one width on purpose, so the encoding is
+    // a question only the kind can answer, and the kind is the same answer that
+    // said this row is a draw.
+    if kind.is_wide_encoding() {
+        if let DrawRecord::Indexed(d) = &record {
+            crate::observe::line(format!(
+                "render_wide_indexed task={task_id} target_refs={:?} pipeline={} prim={} \
+                 index_type={} index_ref={} count={} offset={:#x}",
+                acc.color_targets,
+                acc.pipeline_ref,
+                d.primitive,
+                d.index.index_type.ordinal(),
+                d.index.buffer_ref,
+                d.index_count,
+                d.index.offset
+            ));
+        }
+    }
+
+    match record {
+        DrawRecord::PrimitivesIndirect(_) | DrawRecord::IndexedIndirect(_) => {
+            return execute_indirect_draw(state, host, task_id, opcode, &record, acc);
+        }
+        _ => {}
+    }
+
+    acc.saw_draw = true;
+    out.saw_draw = true;
+
+    let (primitive, count, first_vertex, instances) = match &record {
+        DrawRecord::Primitives(d) => {
+            // Not `None`-by-omission: a non-indexed draw arriving after an
+            // indexed one in the same stream must not inherit its index buffer.
+            acc.indexed = None;
+            (d.primitive, d.vertex_count, d.vertex_start, d.instances)
+        }
+        DrawRecord::Indexed(d) => {
+            if d.index.buffer_ref == 0 {
+                // An indexed record naming no index buffer.
+                // `drawIndexedPrimitives:` takes its index buffer as an argument
+                // and there is no bound-index-buffer state for a zero ref to
+                // mean, so the record is malformed.
+                //
+                // Still named rather than declined, and the reason has changed:
+                // it used to be that `index_buffer_ref` was read at an offset
+                // this device computed per draw form, so a wrong offset would
+                // read 0 and declining would turn a decode fault into a blank
+                // frame. The offsets are the wire crate's now, fixture-derived
+                // and shared by both encodings, so that risk is gone — but the
+                // counter has never fired, and a decline is a frame this device
+                // stops drawing. The reading is what would argue for it.
+                // A zero count is not this case: an indexed draw of no indices
+                // names no buffer because it reads none.
+                if d.index_count != 0 {
+                    note_indexed_draw_without_buffer(
+                        task_id,
+                        opcode,
+                        u32::try_from(d.index_count).unwrap_or(u32::MAX),
+                    );
+                }
+                acc.indexed = None;
+            } else {
+                let Some(index_count) = draw_count(task_id, opcode, "index_count", d.index_count)
+                else {
+                    return;
+                };
+                acc.indexed = Some(IndexedDrawInfo {
+                    index_type: d.index.index_type.ordinal(),
+                    index_count,
+                    index_buffer_ref: d.index.buffer_ref,
+                    index_buffer_offset: d.index.offset,
+                    base_vertex: d.base_vertex,
+                });
+            }
+            (d.primitive, d.index_count, 0, d.instances)
+        }
+        // Taken above.
+        DrawRecord::PrimitivesIndirect(_) | DrawRecord::IndexedIndirect(_) => return,
+    };
+
+    let Some(count) = draw_count(task_id, opcode, "count", count) else {
+        return;
+    };
+    let Some(first_vertex) = draw_count(task_id, opcode, "vertex_start", first_vertex) else {
+        return;
+    };
+    let Some(instance_count) = draw_instances(instances) else {
+        return;
+    };
+    let Some(base_instance) = draw_count(task_id, opcode, "base_instance", instances.base) else {
+        return;
+    };
+
+    if acc.pipeline_ref == 0 {
+        acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
+    } else if count == 0 {
+        acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
+    } else {
+        match acc.bind_snapshot() {
+            Ok(snapshot) => acc.draws.push(PendingDraw {
+                pipeline_ref: acc.pipeline_ref,
+                draw: DrawArgs {
+                    vertex_count: count,
+                    instance_count,
+                    primitive_type: primitive,
+                    first_vertex,
+                    base_instance,
+                },
+                ..snapshot
+            }),
+            Err(over) => note_draw_refused(over, acc.pipeline_ref, "draw"),
+        }
+    }
+}
+
 fn handle_render_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
@@ -3323,6 +3534,11 @@ fn handle_render_record<M: HostMemory + HostOps>(
         if is_render_pass_state(kind) {
             return handle_render_pass_state(state, host, task_id, opcode, cmd_bytes, out, acc);
         }
+        // **The draws.** The group that reads what the other three wrote, which
+        // is why it moves last — see [`is_render_draw`].
+        if is_render_draw(kind) {
+            return handle_render_draw(state, host, task_id, kind, opcode, cmd_bytes, out, acc);
+        }
     }
     let cmd = match render::decode(cmd_bytes) {
         Ok(c) => c,
@@ -3342,77 +3558,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
     };
     match cmd.kind {
-        RenderKind::Draw => {
-            if cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_WIDE {
-                crate::observe::line(format!(
-                    "render_wide_indexed task={task_id} target_refs={:?} pipeline={} prim={} index_type={} index_ref={} count={} offset={:#x}",
-                    acc.color_targets,
-                    acc.pipeline_ref,
-                    cmd.primitive_type,
-                    cmd.index_type,
-                    cmd.index_buffer_ref,
-                    cmd.index_count,
-                    cmd.index_buffer_offset
-                ));
-            }
-            acc.saw_draw = true;
-            out.saw_draw = true;
-            let count = if cmd.index_count != 0 {
-                cmd.index_count
-            } else {
-                cmd.vertex_count
-            };
-            if cmd.index_count != 0 && cmd.index_buffer_ref != 0 {
-                acc.indexed = Some(IndexedDrawInfo {
-                    index_type: cmd.index_type,
-                    index_count: cmd.index_count,
-                    index_buffer_ref: cmd.index_buffer_ref,
-                    index_buffer_offset: cmd.index_buffer_offset,
-                    base_vertex: cmd.base_vertex,
-                });
-            } else {
-                // An indexed opcode whose record named no index buffer falls
-                // through to a *non-indexed* draw of `index_count` vertices,
-                // because `count` above took `index_count` and `indexed` is
-                // None. That is not a form Metal has:
-                // `drawIndexedPrimitives` takes its index buffer as an
-                // argument and there is no bound-index-buffer state for a zero
-                // ref to mean, so the record is malformed and this is the
-                // device inventing a different draw call from it.
-                //
-                // Named rather than declined, deliberately. Declining is the
-                // contract-faithful answer, but `index_buffer_ref` is read at a
-                // payload offset that differs per draw form, so if any of those
-                // offsets is wrong the ref reads 0 and declining would turn a
-                // decode fault into a blank frame. This counter says first
-                // whether the cell is reached at all.
-                if cmd.index_count != 0 && is_indexed_draw_opcode(opcode) {
-                    note_indexed_draw_without_buffer(task_id, opcode, cmd.index_count);
-                }
-                acc.indexed = None;
-            }
-            // Snapshot bind state for this draw (archive multi-draw job).
-            if acc.pipeline_ref == 0 {
-                acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
-            } else if count == 0 {
-                acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
-            } else {
-                match acc.bind_snapshot() {
-                    Ok(snapshot) => acc.draws.push(PendingDraw {
-                        pipeline_ref: acc.pipeline_ref,
-                        draw: DrawArgs {
-                            vertex_count: count,
-                            instance_count: cmd.instance_count,
-                            primitive_type: cmd.primitive_type,
-                            first_vertex: cmd.vertex_start,
-                            base_instance: cmd.base_instance,
-                        },
-                        ..snapshot
-                    }),
-                    Err(over) => note_draw_refused(over, acc.pipeline_ref, "draw"),
-                }
-            }
-        }
         RenderKind::ExecuteCommands => {
             if cmd.indirect_command_buffer_ref == 0 {
                 note_unnamed_icb_execute(task_id, &cmd);
@@ -3539,9 +3684,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 );
             }
         }
-        RenderKind::DrawIndirect => {
-            execute_indirect_draw(state, host, task_id, &cmd, acc);
-        }
         // The twelve bind rows moved to `handle_render_binds` and the fifteen
         // encoder-state rows to `handle_render_stream_state`,
         // beside the residency declarations, the barriers and the fence pair
@@ -3549,7 +3691,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // decoder is reached, so arriving here is that routing disagreeing with
         // itself rather than a guest case, and it is named instead of being
         // answered a second time.
-        RenderKind::RenderPass
+        RenderKind::Draw
+        | RenderKind::DrawIndirect
+        | RenderKind::RenderPass
         | RenderKind::SetStoreAction
         | RenderKind::SetBuffer
         | RenderKind::SetBufferOffset
@@ -5016,17 +5160,30 @@ fn retarget_render_pass_draw(
 /// before the render stream that follows them — but it is an ordering property
 /// of the device rather than of the Metal API, and a design that stopped
 /// completing compute before render would break this silently.
+/// Record one indirect draw, whose counts live in a guest buffer.
+///
+/// **Which form this is comes from the record's own variant**, not from the
+/// opcode read a second time: an `IndexedIndirect` carries an `IndexRef` and a
+/// `PrimitivesIndirect` does not, so "the indexed form with no index buffer"
+/// and "the unindexed form" stopped being one shape with a flag beside it.
 fn execute_indirect_draw<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    cmd: &render::Command,
+    opcode: u32,
+    record: &reims_vgpu_protocol::decode::render::DrawRecord,
     acc: &mut StreamAccum,
 ) {
     use crate::protocol::draw::indirect;
+    use reims_vgpu_protocol::decode::render::DrawRecord;
 
-    let indexed_form = cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_INDIRECT;
-    let block_len = if indexed_form {
+    let (primitive, arguments, index) = match record {
+        DrawRecord::PrimitivesIndirect(d) => (d.primitive, d.arguments, None),
+        DrawRecord::IndexedIndirect(d) => (d.primitive, d.arguments, Some(d.index)),
+        // Taken by the caller's direct arms.
+        _ => return,
+    };
+    let block_len = if index.is_some() {
         indirect::INDEXED_LEN
     } else {
         indirect::UNINDEXED_LEN
@@ -5035,8 +5192,8 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
         state,
         host,
         task_id,
-        cmd.indirect_buffer_ref,
-        cmd.indirect_buffer_offset,
+        arguments.buffer_ref,
+        arguments.offset,
         block_len,
     ) {
         Ok(block) => block,
@@ -5046,41 +5203,37 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
             // draw, and `read_buffer_window`'s status already names which rung
             // of the resolve refused. Latched per buffer ref because a guest
             // re-issues the same indirect draw every frame.
-            note_indirect_draw_refused(task_id, cmd, status);
+            note_indirect_draw_refused(task_id, opcode, arguments, status);
             return;
         }
     };
 
-    let (args, index_start, base_vertex) = if indexed_form {
-        match indirect::indexed(&block, cmd.primitive_type) {
+    let (args, index_start, base_vertex) = match index {
+        Some(_) => match indirect::indexed(&block, primitive) {
             Some(v) => (v.0, v.1, v.2),
             None => return,
-        }
-    } else {
-        match indirect::unindexed(&block, cmd.primitive_type) {
+        },
+        None => match indirect::unindexed(&block, primitive) {
             Some(args) => (args, 0, 0),
             None => return,
-        }
+        },
     };
 
     acc.saw_draw = true;
-    if indexed_form {
+    if let Some(index) = index {
         // `indexStart` counts indices, not bytes. The loader is given a byte
-        // offset, so it is scaled here by the width the record's own
-        // `index_type` declares — the same two widths `translate::raster::
-        // index_type` accepts, and an unknown one is left to the loader's
-        // typed refusal rather than being guessed at as 2.
-        let stride = match cmd.index_type {
-            1 => 4u64, // MTLIndexTypeUInt32
-            _ => 2,    // MTLIndexTypeUInt16, and Metal's default
-        };
+        // offset, so it is scaled here by the width the record's own index type
+        // declares — `IndexType::bytes`, which is the same table
+        // `translate::raster::index_type` reads, rather than a `1 => 4, _ => 2`
+        // restatement whose `_` arm answered for an ordinal the record can no
+        // longer carry.
         acc.indexed = Some(IndexedDrawInfo {
-            index_type: cmd.index_type,
+            index_type: index.index_type.ordinal(),
             index_count: args.vertex_count,
-            index_buffer_ref: cmd.index_buffer_ref,
-            index_buffer_offset: cmd
-                .index_buffer_offset
-                .saturating_add(u64::from(index_start).saturating_mul(stride)),
+            index_buffer_ref: index.buffer_ref,
+            index_buffer_offset: index
+                .offset
+                .saturating_add(u64::from(index_start).saturating_mul(index.index_type.bytes())),
             base_vertex: i64::from(base_vertex),
         });
     } else {
@@ -5525,13 +5678,12 @@ pub(crate) mod finish_phase;
 
 mod report;
 use report::{
-    is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
-    note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
-    note_empty_scissor, note_empty_viewport_or_scissor, note_indexed_draw_without_buffer,
-    note_indirect_draw_refused, note_info_record_unanswered, note_pass_array_length_unsupported,
-    note_pass_extent_for_slot, note_pass_raster_sample_count_unsupported, note_pass_target_extent,
-    note_residency_declaration, note_store_action_no_attachment,
-    note_store_action_options_unsupported, note_stream_draw_drops,
+    note_clear_dropped, note_color_subresource_unsupported, note_compute_refusal,
+    note_depth_stencil_unsupported, note_draw_encode_fail, note_empty_scissor,
+    note_empty_viewport_or_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
+    note_info_record_unanswered, note_pass_array_length_unsupported, note_pass_extent_for_slot,
+    note_pass_raster_sample_count_unsupported, note_pass_target_extent, note_residency_declaration,
+    note_store_action_no_attachment, note_store_action_options_unsupported, note_stream_draw_drops,
     note_unimplemented_render_opcode, note_unnamed_icb_execute,
 };
 // The unimplemented-opcode latch is test-only on both sides, so its import has

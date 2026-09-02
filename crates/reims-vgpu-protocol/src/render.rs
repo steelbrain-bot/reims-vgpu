@@ -129,6 +129,22 @@ impl IndexType {
             Self::Uint32 => 4,
         }
     }
+
+    /// The wire ordinal this width is spelled with.
+    ///
+    /// The inverse of [`IndexType::parse`], and it exists because the consumers
+    /// downstream of a lifted draw still carry `MTLIndexType` as a raw `u32` —
+    /// the Metal C ABI mirror declares it that way. Round-tripping through here
+    /// keeps the two spellings derived from one table rather than restated at
+    /// the boundary, which is where a `1` meaning `Uint32` and a `1` meaning
+    /// "the second variant" would otherwise be told apart by nothing.
+    #[must_use]
+    pub const fn ordinal(self) -> u32 {
+        match self {
+            Self::Uint16 => 0,
+            Self::Uint32 => 1,
+        }
+    }
 }
 
 /// Which attachment a store-action override names.
