@@ -45,63 +45,100 @@ pub struct TextureEndpoint {
     pub origin: Origin,
 }
 
+/// A buffer-to-buffer copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BufferToBuffer {
+    pub source_ref: u32,
+    pub source_offset: u64,
+    pub dest_ref: u32,
+    pub dest_offset: u64,
+    pub size: u64,
+}
+
+/// A buffer-to-texture copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BufferToTexture {
+    pub source_ref: u32,
+    pub source_offset: u64,
+    pub bytes_per_row: u64,
+    pub bytes_per_image: u64,
+    pub size: Size,
+    pub dest: TextureEndpoint,
+    pub options: u32,
+}
+
+/// A texture-to-buffer copy.
+///
+/// `options` is sixteen bits here and thirty-two on [`BufferToTexture`]; the
+/// widths are the records', not a choice made here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureToBuffer {
+    pub source: TextureEndpoint,
+    pub size: Size,
+    pub dest_ref: u32,
+    pub dest_offset: u64,
+    pub bytes_per_row: u64,
+    pub bytes_per_image: u64,
+    pub options: u16,
+}
+
+/// A texture-to-texture region copy, with or without an `options:` word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureRegion {
+    pub source: TextureEndpoint,
+    pub dest: TextureEndpoint,
+    pub size: Size,
+    /// Zero for the plain opcode, which does not carry the field at all.
+    pub options: u32,
+}
+
+/// A slice-and-level range copy between two textures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureSlices {
+    pub source_ref: u32,
+    pub source_slice: u16,
+    pub source_level: u16,
+    pub dest_ref: u32,
+    pub dest_slice: u16,
+    pub dest_level: u16,
+    pub slice_count: u16,
+    pub level_count: u16,
+}
+
+/// A buffer fill, in either of its two pattern widths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillBuffer {
+    pub buffer_ref: u32,
+    pub location: u64,
+    pub length: u64,
+    /// One byte for `value:`, four for `pattern4:`. Widened here and
+    /// distinguished by [`BlitRecord::kind`], because the two records are
+    /// byte-identical apart from the width of this field and its opcode.
+    pub pattern: FillPattern,
+}
+
+/// `generateMipmapsForTexture:`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenerateMipmaps {
+    pub texture_ref: u32,
+}
+
 /// One lifted transfer record.
+///
+/// Each variant carries **one named payload** rather than inline fields, so a
+/// consumer can take the record it handles by reference and cannot be handed a
+/// different one. The executor arms below the lift are functions of those
+/// payloads, which is what keeps a nine-record dispatch from becoming a flat
+/// struct with nine records' fields in it and a kind tag saying which are live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlitRecord {
-    BufferToBuffer {
-        source_ref: u32,
-        source_offset: u64,
-        dest_ref: u32,
-        dest_offset: u64,
-        size: u64,
-    },
-    BufferToTexture {
-        source_ref: u32,
-        source_offset: u64,
-        bytes_per_row: u64,
-        bytes_per_image: u64,
-        size: Size,
-        dest: TextureEndpoint,
-        options: u32,
-    },
-    TextureToBuffer {
-        source: TextureEndpoint,
-        size: Size,
-        dest_ref: u32,
-        dest_offset: u64,
-        bytes_per_row: u64,
-        bytes_per_image: u64,
-        options: u16,
-    },
-    TextureRegion {
-        source: TextureEndpoint,
-        dest: TextureEndpoint,
-        size: Size,
-        /// Zero for the plain opcode, which does not carry the field at all.
-        options: u32,
-    },
-    TextureSlices {
-        source_ref: u32,
-        source_slice: u16,
-        source_level: u16,
-        dest_ref: u32,
-        dest_slice: u16,
-        dest_level: u16,
-        slice_count: u16,
-        level_count: u16,
-    },
-    FillBuffer {
-        buffer_ref: u32,
-        location: u64,
-        length: u64,
-        /// One byte for `value:`, four for `pattern4:`. Widened here and
-        /// distinguished by [`BlitRecord::kind`], because the two records are
-        /// byte-identical apart from the width of this field and its opcode.
-        pattern: FillPattern,
-    },
-    GenerateMipmaps {
-        texture_ref: u32,
-    },
+    BufferToBuffer(BufferToBuffer),
+    BufferToTexture(BufferToTexture),
+    TextureToBuffer(TextureToBuffer),
+    TextureRegion(TextureRegion),
+    TextureSlices(TextureSlices),
+    FillBuffer(FillBuffer),
+    GenerateMipmaps(GenerateMipmaps),
 }
 
 /// What a fill writes.
@@ -116,26 +153,26 @@ impl BlitRecord {
     #[must_use]
     pub const fn kind(&self) -> BlitKind {
         match self {
-            Self::BufferToBuffer { .. } => BlitKind::BufferToBuffer,
-            Self::BufferToTexture { .. } => BlitKind::BufferToTexture,
-            Self::TextureToBuffer { .. } => BlitKind::TextureToBuffer,
-            Self::TextureRegion { options, .. } => {
-                if *options == 0 {
+            Self::BufferToBuffer(_) => BlitKind::BufferToBuffer,
+            Self::BufferToTexture(_) => BlitKind::BufferToTexture,
+            Self::TextureToBuffer(_) => BlitKind::TextureToBuffer,
+            Self::TextureRegion(r) => {
+                if r.options == 0 {
                     BlitKind::TextureRegion
                 } else {
                     BlitKind::TextureRegionOptions
                 }
             }
-            Self::TextureSlices { .. } => BlitKind::TextureSlices,
-            Self::FillBuffer {
+            Self::TextureSlices(_) => BlitKind::TextureSlices,
+            Self::FillBuffer(FillBuffer {
                 pattern: FillPattern::Byte(_),
                 ..
-            } => BlitKind::FillBuffer,
-            Self::FillBuffer {
+            }) => BlitKind::FillBuffer,
+            Self::FillBuffer(FillBuffer {
                 pattern: FillPattern::Pattern4(_),
                 ..
-            } => BlitKind::FillBufferPattern4,
-            Self::GenerateMipmaps { .. } => BlitKind::GenerateMipmaps,
+            }) => BlitKind::FillBufferPattern4,
+            Self::GenerateMipmaps(_) => BlitKind::GenerateMipmaps,
         }
     }
 }
@@ -158,18 +195,18 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
         BlitKind::BufferToBuffer => {
             let r = wire::copy_buffer_to_buffer(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::BufferToBuffer>()))?;
-            BlitRecord::BufferToBuffer {
+            BlitRecord::BufferToBuffer(BufferToBuffer {
                 source_ref: r.source_ref.get(),
                 source_offset: r.source_offset.get(),
                 dest_ref: r.dest_ref.get(),
                 dest_offset: r.dest_offset.get(),
                 size: r.size.get(),
-            }
+            })
         }
         BlitKind::BufferToTexture => {
             let r = wire::copy_buffer_to_texture(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::CopyBufferToTexture>()))?;
-            BlitRecord::BufferToTexture {
+            BlitRecord::BufferToTexture(BufferToTexture {
                 source_ref: r.source_ref.get(),
                 source_offset: r.source_offset.get(),
                 bytes_per_row: r.source_bytes_per_row.get(),
@@ -190,12 +227,12 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                     },
                 },
                 options: r.options.get(),
-            }
+            })
         }
         BlitKind::TextureToBuffer => {
             let r = wire::copy_texture_to_buffer(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::CopyTextureToBuffer>()))?;
-            BlitRecord::TextureToBuffer {
+            BlitRecord::TextureToBuffer(TextureToBuffer {
                 source: TextureEndpoint {
                     texture_ref: r.source_ref.get(),
                     slice: r.source_slice.get(),
@@ -216,7 +253,7 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                 bytes_per_row: r.dest_bytes_per_row.get(),
                 bytes_per_image: r.dest_bytes_per_image.get(),
                 options: r.options.get(),
-            }
+            })
         }
         BlitKind::TextureRegion | BlitKind::TextureRegionOptions => {
             let (region, options) = if kind == BlitKind::TextureRegionOptions {
@@ -228,7 +265,7 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                     .map_err(|_| fail(core::mem::size_of::<wire::CopyTextureRegion>()))?;
                 (r, 0)
             };
-            BlitRecord::TextureRegion {
+            BlitRecord::TextureRegion(TextureRegion {
                 source: TextureEndpoint {
                     texture_ref: region.source_ref.get(),
                     slice: region.source_slice.get(),
@@ -255,12 +292,12 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                     depth: region.size_depth.get(),
                 },
                 options,
-            }
+            })
         }
         BlitKind::TextureSlices => {
             let r = wire::copy_texture_slices(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::CopyTextureSlices>()))?;
-            BlitRecord::TextureSlices {
+            BlitRecord::TextureSlices(TextureSlices {
                 source_ref: r.source_ref.get(),
                 source_slice: r.source_slice.get(),
                 source_level: r.source_level.get(),
@@ -269,33 +306,33 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                 dest_level: r.dest_level.get(),
                 slice_count: r.slice_count.get(),
                 level_count: r.level_count.get(),
-            }
+            })
         }
         BlitKind::FillBuffer => {
             let r = wire::fill_buffer(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::FillBuffer>()))?;
-            BlitRecord::FillBuffer {
+            BlitRecord::FillBuffer(FillBuffer {
                 buffer_ref: r.buffer_ref.get(),
                 location: r.range_location.get(),
                 length: r.range_length.get(),
                 pattern: FillPattern::Byte(r.value),
-            }
+            })
         }
         BlitKind::FillBufferPattern4 => {
             let r = wire::fill_buffer_pattern4(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::FillBufferPattern4>()))?;
-            BlitRecord::FillBuffer {
+            BlitRecord::FillBuffer(FillBuffer {
                 buffer_ref: r.buffer_ref.get(),
                 location: r.range_location.get(),
                 length: r.range_length.get(),
                 pattern: FillPattern::Pattern4(r.pattern.get()),
-            }
+            })
         }
         BlitKind::GenerateMipmaps => {
             let r = wire::object_ref(op).map_err(|_| fail(core::mem::size_of::<wire::Ref>()))?;
-            BlitRecord::GenerateMipmaps {
+            BlitRecord::GenerateMipmaps(GenerateMipmaps {
                 texture_ref: r.object_ref.get(),
-            }
+            })
         }
     })
 }
@@ -339,13 +376,13 @@ mod tests {
         let bytes = record(wire::OPCODE_COPY_BUFFER_TO_BUFFER, &payload);
         assert_eq!(
             decode_bytes(&bytes),
-            Ok(BlitRecord::BufferToBuffer {
+            Ok(BlitRecord::BufferToBuffer(BufferToBuffer {
                 source_ref: 5151,
                 source_offset: 0x1111,
                 dest_ref: 5252,
                 dest_offset: 0x2222,
                 size: 0x3333,
-            })
+            }))
         );
     }
 
@@ -368,15 +405,15 @@ mod tests {
         assert_ne!(byte, word);
         match (byte, word) {
             (
-                BlitRecord::FillBuffer {
+                BlitRecord::FillBuffer(FillBuffer {
                     pattern: FillPattern::Byte(b),
                     location,
                     ..
-                },
-                BlitRecord::FillBuffer {
+                }),
+                BlitRecord::FillBuffer(FillBuffer {
                     pattern: FillPattern::Pattern4(w),
                     ..
-                },
+                }),
             ) => {
                 assert_eq!(b, 0x5a);
                 assert_eq!(w, 0x89ab_cdef);
@@ -414,10 +451,10 @@ mod tests {
 
         match (plain, lifted) {
             (
-                BlitRecord::TextureRegion {
+                BlitRecord::TextureRegion(TextureRegion {
                     source, options: a, ..
-                },
-                BlitRecord::TextureRegion { options: b, .. },
+                }),
+                BlitRecord::TextureRegion(TextureRegion { options: b, .. }),
             ) => {
                 assert_eq!(a, 0, "the plain form carries no options field");
                 assert_eq!(b, 4);

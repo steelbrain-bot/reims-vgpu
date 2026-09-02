@@ -50,6 +50,7 @@ use crate::render::{
 use crate::resource_state::{ResourceStateOp, ResourceStateTarget, SliceLevel};
 use crate::sync::{BarrierOp, BarrierTarget, EventOp, FenceOp, ResourceSpan};
 use reims_vgpu_protocol::closure::{self, Rail};
+use reims_vgpu_protocol::decode::blit as record;
 use reims_vgpu_protocol::decode::blit::{
     BlitRecord, FillPattern as RecordFill, Origin as RecordOrigin, Size as RecordSize,
     TextureEndpoint,
@@ -212,20 +213,20 @@ fn endpoint(
 /// Resolve a transfer record.
 pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, ResolveRefusal> {
     Ok(match *record {
-        BlitRecord::BufferToBuffer {
+        BlitRecord::BufferToBuffer(record::BufferToBuffer {
             source_ref,
             source_offset,
             dest_ref,
             dest_offset,
             size: bytes,
-        } => BlitOp::BufferToBuffer {
+        }) => BlitOp::BufferToBuffer {
             source: one(resolver, source_ref)?,
             source_offset,
             dest: one(resolver, dest_ref)?,
             dest_offset,
             size: bytes,
         },
-        BlitRecord::BufferToTexture {
+        BlitRecord::BufferToTexture(record::BufferToTexture {
             source_ref,
             source_offset,
             bytes_per_row,
@@ -233,7 +234,7 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             size: extent,
             dest,
             options,
-        } => BlitOp::BufferToTexture {
+        }) => BlitOp::BufferToTexture {
             source: one(resolver, source_ref)?,
             source_offset,
             source_pitch: ImagePitch {
@@ -244,7 +245,7 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             dest: endpoint(resolver, dest)?,
             options: BlitOptions(options),
         },
-        BlitRecord::TextureToBuffer {
+        BlitRecord::TextureToBuffer(record::TextureToBuffer {
             source,
             size: extent,
             dest_ref,
@@ -252,7 +253,7 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             bytes_per_row,
             bytes_per_image,
             options,
-        } => BlitOp::TextureToBuffer {
+        }) => BlitOp::TextureToBuffer {
             source: endpoint(resolver, source)?,
             size: size(extent),
             dest: one(resolver, dest_ref)?,
@@ -263,18 +264,18 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             },
             options: BlitOptions(u32::from(options)),
         },
-        BlitRecord::TextureRegion {
+        BlitRecord::TextureRegion(record::TextureRegion {
             source,
             dest,
             size: extent,
             options,
-        } => BlitOp::TextureRegion {
+        }) => BlitOp::TextureRegion {
             source: endpoint(resolver, source)?,
             dest: endpoint(resolver, dest)?,
             size: size(extent),
             options: BlitOptions(options),
         },
-        BlitRecord::TextureSlices {
+        BlitRecord::TextureSlices(record::TextureSlices {
             source_ref,
             source_slice,
             source_level,
@@ -283,7 +284,7 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             dest_level,
             slice_count,
             level_count,
-        } => BlitOp::TextureSlices {
+        }) => BlitOp::TextureSlices {
             source: SpanOrigin {
                 texture: one(resolver, source_ref)?,
                 base_slice: source_slice,
@@ -299,12 +300,12 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             slice_count,
             level_count,
         },
-        BlitRecord::FillBuffer {
+        BlitRecord::FillBuffer(record::FillBuffer {
             buffer_ref,
             location,
             length,
             pattern,
-        } => BlitOp::FillBuffer {
+        }) => BlitOp::FillBuffer {
             dest: BufferSpan {
                 buffer: one(resolver, buffer_ref)?,
                 offset: location,
@@ -315,9 +316,11 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
                 RecordFill::Pattern4(w) => FillPattern::Pattern4(w),
             },
         },
-        BlitRecord::GenerateMipmaps { texture_ref } => BlitOp::GenerateMipmaps {
-            texture: one(resolver, texture_ref)?,
-        },
+        BlitRecord::GenerateMipmaps(record::GenerateMipmaps { texture_ref }) => {
+            BlitOp::GenerateMipmaps {
+                texture: one(resolver, texture_ref)?,
+            }
+        }
     })
 }
 
@@ -1228,13 +1231,13 @@ mod tests {
     #[test]
     fn a_transfer_resolves_both_of_its_endpoints() {
         let live = Live(vec![5151, 5252]);
-        let record = BlitRecord::BufferToBuffer {
+        let record = BlitRecord::BufferToBuffer(record::BufferToBuffer {
             source_ref: 5151,
             source_offset: 0x10,
             dest_ref: 5252,
             dest_offset: 0x20,
             size: 0x30,
-        };
+        });
         assert_eq!(
             blit(&record, &live),
             Ok(BlitOp::BufferToBuffer {
@@ -1253,13 +1256,13 @@ mod tests {
     #[test]
     fn a_dead_ref_refuses_by_name_rather_than_resolving_to_nothing() {
         let live = Live(vec![5151]);
-        let record = BlitRecord::BufferToBuffer {
+        let record = BlitRecord::BufferToBuffer(record::BufferToBuffer {
             source_ref: 5151,
             source_offset: 0,
             dest_ref: 4242,
             dest_offset: 0,
             size: 1,
-        };
+        });
         assert_eq!(
             blit(&record, &live),
             Err(ResolveRefusal::UnknownRef { object_ref: 4242 })
@@ -2516,13 +2519,13 @@ mod tests {
                         let want = shadow_one(&live, named[0])
                             .and_then(|_| shadow_one(&live, named[1]))
                             .map(|_| Appended::Nothing);
-                        let record = BlitRecord::BufferToBuffer {
+                        let record = BlitRecord::BufferToBuffer(record::BufferToBuffer {
                             source_ref: named[0],
                             source_offset: 0,
                             dest_ref: named[1],
                             dest_offset: 0,
                             size: 64,
-                        };
+                        });
                         let got = blit(&record, &live).map(|_| None);
                         (got, want)
                     }
