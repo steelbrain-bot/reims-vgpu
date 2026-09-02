@@ -1727,6 +1727,20 @@ fn note_stale_task_resource<M: HostMemory>(
     // if that happens on a real guest, the replacement model needs the device to
     // notice it here and redeclare, or every later reference resolves to the
     // previous occupant's bytes. If it never happens, it does not.
+    //
+    // Read, on a driven macos-15 boot to the desktop:
+    //
+    //     task_resource_reexamined            68965
+    //     task_resource_slot_repointed            0
+    //     task_resource_descriptor_rewritten      0
+    //     task_resource_unlisted                  0
+    //
+    // Sixty-nine thousand comparisons and not one disagreement. On this rail the
+    // guest never repoints a live slot and never rewrites a descriptor under
+    // one, so declaring at first construction is sound here and the
+    // redeclaration path is unexercised rather than unneeded — the model handles
+    // the overwrite either way, and this is the number that says how often it
+    // would have to.
     crate::runtime::drain::note_store_route("task_resource_reexamined");
     if entry == cached.entry && !descriptor_moved {
         return;
@@ -2189,9 +2203,23 @@ fn mapper_ref_surface_extent(state: &DeviceState, descriptor: &[u8]) -> Option<(
 /// name no storage are the samplers, functions, pipeline states and views,
 /// which is a description of what they are rather than a shortfall.
 ///
-/// That boot predates the `declared_storage_*` counts, so what it establishes is
-/// the identity's coverage and not the declaration's. The extent half is owed a
-/// reading of its own.
+/// A second boot, once the census asked for the whole declaration:
+///
+/// ```text
+/// backing_identity_asked                 1462
+/// declared_storage_dedicated             1393
+/// declared_storage_no_bytes                69
+/// storage_extent_unrecovered                0
+/// backing_id_unresolved                     0
+/// backing_id_heap_placed                    0
+/// ```
+///
+/// 1393 + 69 = 1462, again exactly. **Every object a real guest constructs can be
+/// declared into the semantic model** — an allocation with the object's own byte
+/// window inside it, or no bytes at all. The zero on `extent_unrecovered` is the
+/// mapper-ref texture's plane derivation holding on a live guest: before it, that
+/// whole class had an identity the model could name and no content authority to
+/// go with it.
 ///
 /// One arm is a fail line as well as a count.
 /// [`BackingIdRefusal::HeapPlaced`] is the one open contract term
