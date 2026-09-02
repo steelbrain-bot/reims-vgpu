@@ -23,7 +23,8 @@ use crate::protocol::iosurface_pages::{
 };
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
-    OBJECT_TYPE_MAPPER_REF_TEXTURE,
+    OBJECT_TYPE_BUFFER, OBJECT_TYPE_MAPPER_REF_TEXTURE, OBJECT_TYPE_TEXTURE,
+    OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
@@ -1733,6 +1734,94 @@ fn note_stale_task_resource<M: HostMemory>(
     ));
 }
 
+/// The guest-VA window an object's own descriptor says its backing occupies.
+///
+/// `None` for every object type that does not name storage by an address in
+/// its task — a view, a function, a serializer object, a mapper-ref texture, a
+/// heap-placed texture. Those either name no storage or name it through
+/// something else, and a window invented for one would be a window over
+/// somebody else's bytes.
+///
+/// The two that do are the buffer and the texture, and both already state the
+/// arithmetic: `handle << page_shift` plus the allocation size. This reads it
+/// rather than repeating it.
+fn backing_window(
+    page_shift: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Option<(u64, u64)> {
+    use crate::runtime::decode::resource::{decode_buffer_descriptor, decode_texture_descriptor};
+    match entry.object_type {
+        OBJECT_TYPE_BUFFER => decode_buffer_descriptor(descriptor)
+            .ok()?
+            .backing_gva_size(page_shift),
+        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS => {
+            decode_texture_descriptor(descriptor)
+                .ok()?
+                .backing_gva_size(page_shift)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a second live reference in this task already names this window.
+///
+/// # The question this settles, and why it blocks a canonical backing identity
+///
+/// `reims_vgpu_core::access::BackingId` is the identity two resources sharing
+/// backing must share, and the derivation this device is committed to is the
+/// window plus an incarnation. The incarnation is counted *per reference*:
+/// `replace_physical` advances the count for the reference its packet names and
+/// for no other, because that is the only name the packet carries.
+///
+/// That is canonical exactly as long as one window has one live name. If two
+/// references in one task ever name one window, then re-pointing through one of
+/// them advances that reference's count and leaves the other where it was — and
+/// the same bytes then carry two ids. Two ids for one backing is a hazard edge
+/// the dependency compiler never draws, which is a data race, and it is the
+/// failure direction `BackingId`'s own doc calls false distinctness.
+///
+/// So this is not a diagnostic about tidiness. **A single sighting falsifies
+/// the derivation** and says the count has to move from the reference to the
+/// window. A boot that never sights one is the evidence that it does not.
+///
+/// # Why the first claimant is re-checked
+///
+/// A reference that has been deleted leaves its window in the claim table, and
+/// a later reference landing on the same window is then one name after another
+/// rather than two names at once. Only the second is an alias, so the claimant
+/// has to still be a live resource for the sighting to mean what it says.
+///
+/// One `first_sight` per distinct window, so a compositor recycling one
+/// allocation reports once and not once per frame.
+///
+/// The aliasing reference is returned as well as reported, so the reading can
+/// be asserted where a boot is not available — the same reason
+/// [`note_heap_reference`] returns one.
+fn note_backing_window_alias(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    base: u64,
+    size: u64,
+) -> Option<u32> {
+    let holder = state.claim_backing_window(task_id, obj_ref, base)?;
+    if !state.resource_is_live(task_id, holder) {
+        return None;
+    }
+    if !crate::observe::first_sight("backing_window_alias", (u64::from(task_id) << 40) ^ base) {
+        return Some(holder);
+    }
+    crate::observe::fail(format!(
+        "backing_window_alias task={task_id} base={base:#x} size={size} \
+         refs=[{holder},{obj_ref}] (two live references in one task name one \
+         guest-VA window, so a per-reference incarnation gives the same bytes \
+         two backing identities and a re-point through one leaves the other \
+         claiming the old frames; the count belongs on the window)"
+    ));
+    Some(holder)
+}
+
 /// Retrieve or construct the resource named by `task_id` / `obj_ref`.
 ///
 /// A successful construction snapshots the object-list entry and descriptor
@@ -1761,6 +1850,9 @@ pub fn resolve_resource<M: HostMemory>(
         declared_len: entry.descriptor_length,
     })?;
     let descriptor: Arc<[u8]> = Arc::from(bytes);
+    if let Some((base, size)) = backing_window(state.page_shift, &entry, &descriptor) {
+        let _ = note_backing_window_alias(state, task_id, obj_ref, base, size);
+    }
     let resource = Arc::new(TaskResource::new(entry, descriptor));
     Ok(state.task_resources.register(task_id, obj_ref, resource))
 }

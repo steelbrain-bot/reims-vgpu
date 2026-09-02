@@ -798,6 +798,49 @@ impl TaskResources {
     }
 }
 
+/// The first object reference seen at each guest-VA window, per task.
+///
+/// Behind a lock for the reason [`TaskResources`] is: the claim is made on the
+/// resolve path, which holds [`DeviceState`] shared.
+#[derive(Default)]
+pub struct BackingWindowRefs(Mutex<BTreeMap<(u32, u64), u32>>);
+
+impl std::fmt::Debug for BackingWindowRefs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let claims = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f.debug_struct("BackingWindowRefs")
+            .field("windows", &claims.len())
+            .finish()
+    }
+}
+
+impl BackingWindowRefs {
+    fn claim(&self, task_id: u32, ref_: u32, base: u64) -> Option<u32> {
+        match self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((task_id, base))
+        {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(ref_);
+                None
+            }
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                let holder = *slot.get();
+                (holder != ref_).then_some(holder)
+            }
+        }
+    }
+
+    fn delete_task(&self, task_id: u32) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(t, _), _| t != task_id);
+    }
+}
+
 /// One immutable sampler object constructed in a task's sampler-reference space.
 ///
 /// Sampler references are not resource-list ownership records. They have their
@@ -2414,6 +2457,27 @@ pub struct DeviceState {
     storage_incarnations: BTreeMap<(u32, u32), u32>,
     /// Per-task half of [`StorageIncarnation`].
     task_storage_epochs: BTreeMap<u32, u32>,
+    /// The first object reference seen naming each guest-VA window, per task.
+    ///
+    /// Keyed `(task, window base)`, holding the reference that got there first.
+    /// It answers one question and it is the question a canonical backing
+    /// identity is blocked on: **can two references in one task name one piece
+    /// of storage?**
+    ///
+    /// `BackingId`'s settled derivation is the window plus a *per-reference*
+    /// incarnation, and `replace_physical` advances that count for the
+    /// reference the packet names and no other. If two live references ever
+    /// share a window, the two would then carry different incarnations for the
+    /// same bytes — two ids for one backing, which is a hazard edge the
+    /// dependency compiler never draws, which is a data race. If no two ever
+    /// do, the per-reference count *is* canonical and the derivation stands.
+    ///
+    /// Reset with the task, alongside [`Self::storage_incarnations`], and for
+    /// the same reason: an entry outliving its namespace would answer for a
+    /// window nothing names any more. A stale entry inside a live task is
+    /// possible — a deleted reference leaves its window behind — so the reader
+    /// re-checks that the claimant is still live before calling it an alias.
+    backing_window_refs: BackingWindowRefs,
     pub mappings: BTreeMap<u32, MappingEntry>,
     /// Host render-cache keyed by surface_id / mapping_id (Linux/Vulkan rail).
     /// See [`crate::runtime::surface_cache`] and kb tahoe-x86-host-reims_vgpu §8.5.
@@ -2773,6 +2837,7 @@ impl DeviceState {
             rail: OnceLock::new(),
             texture_to_mapping: BTreeMap::new(),
             storage_incarnations: BTreeMap::new(),
+            backing_window_refs: BackingWindowRefs::default(),
             task_storage_epochs: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -3499,6 +3564,32 @@ impl DeviceState {
         let slot = self.task_storage_epochs.entry(task_id).or_insert(0);
         *slot = slot.wrapping_add(1);
         self.storage_incarnations.retain(|&(t, _), _| t != task_id);
+        self.backing_window_refs.delete_task(task_id);
+    }
+
+    /// Claim `base` for `ref_` in `task_id`, or say who holds it already.
+    ///
+    /// Returns the reference that got there first when one did and it is not
+    /// this one; `None` when this reference is the first, or is the same
+    /// reference re-resolving its own window. See
+    /// [`Self::backing_window_refs`] for what the answer decides.
+    ///
+    /// Takes `&self` because the one caller is a resolve, which holds the
+    /// device state shared — the same reason [`TaskResources`] is behind a
+    /// lock, and the claim is published under the same race the register there
+    /// resolves: first writer wins and every later reader sees that one.
+    pub fn claim_backing_window(&self, task_id: u32, ref_: u32, base: u64) -> Option<u32> {
+        self.backing_window_refs.claim(task_id, ref_, base)
+    }
+
+    /// Whether `task_id`/`ref_` is still a constructed resource.
+    ///
+    /// The alias reading asks this about the *other* reference before reporting
+    /// one: a window whose first claimant has since been deleted is not two
+    /// names over one backing, it is one name after another.
+    #[must_use]
+    pub fn resource_is_live(&self, task_id: u32, ref_: u32) -> bool {
+        self.task_resources.get(task_id, ref_).is_some()
     }
 
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).

@@ -2534,3 +2534,168 @@ fn a_freed_or_between_tenants_slot_never_answers_from_an_earlier_generation() {
         "a second empty tenancy gap cannot resurrect the first or second object"
     );
 }
+
+/// A guest-VA window is claimed by one reference, and the claim table says who
+/// got there first.
+///
+/// This is the state behind [`super::note_backing_window_alias`], and what it
+/// answers decides whether the incarnation `BackingId` mixes in may stay on the
+/// reference. Each assertion is one way the claim could stop meaning "these two
+/// names are over one piece of storage".
+#[test]
+fn one_guest_window_is_claimed_by_one_reference() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let (task, other_task, first, second) = (3u32, 4u32, 9u32, 10u32);
+    let window = 0x4_0000u64;
+    state.define_task(task, 0x1000, 0x40);
+    state.define_task(other_task, 0x2000, 0x40);
+
+    assert_eq!(
+        state.claim_backing_window(task, first, window),
+        None,
+        "nothing held this window, so the first reference takes it"
+    );
+    assert_eq!(
+        state.claim_backing_window(task, first, window),
+        None,
+        "the same reference re-resolving its own window is not two names"
+    );
+    assert_eq!(
+        state.claim_backing_window(task, second, window),
+        Some(first),
+        "a second reference over one window is the sighting the reading is for"
+    );
+    assert_eq!(
+        state.claim_backing_window(task, second, window),
+        Some(first),
+        "the holder does not change hands, so a repeat reports the same pair \
+         rather than the two references taking turns"
+    );
+
+    // The window is task-local. Two tasks name their own address spaces, and a
+    // number they happen to share is not one piece of storage -- the same
+    // reason an object ref in task B is never tried as task A's mapping id.
+    assert_eq!(
+        state.claim_backing_window(other_task, second, window),
+        None,
+        "one number in two address spaces is two windows"
+    );
+
+    // A task teardown ends every name in it, so the claims go with them. An
+    // entry outliving its namespace would answer for a window nothing names.
+    state.delete_task(task);
+    assert_eq!(
+        state.claim_backing_window(task, second, window),
+        None,
+        "the teardown released the window, so the next claimant is the first"
+    );
+}
+
+/// Only the two object types that name storage by an address in their own task
+/// produce a window.
+///
+/// A view, a function, a serializer object and a mapper-ref texture each name
+/// storage through something else or name none at all, and a window invented
+/// for one of them would be a window over another object's bytes -- which is
+/// the false-equality direction, the one that hands memory back under a live
+/// reader.
+#[test]
+fn only_address_named_object_types_have_a_window() {
+    use crate::runtime::decode::resource::{
+        OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_MAPPER_REF_TEXTURE,
+        OBJECT_TYPE_SERIALIZER_OBJECT, OBJECT_TYPE_TEXTURE_VIEW,
+    };
+
+    // A linear descriptor: size then handle, which is the whole of what the
+    // window is built from.
+    let mut buffer_desc = [0u8; 16];
+    buffer_desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    buffer_desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+
+    let entry = |object_type: u8| ListObjectEntry {
+        object_type,
+        descriptor_length: buffer_desc.len() as u32,
+        descriptor_gva: 0x1000,
+    };
+
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry(OBJECT_TYPE_BUFFER), &buffer_desc),
+        Some((0x20u64 << PAGE_SHIFT_X86, 0x3000)),
+        "a buffer names its backing by handle and size"
+    );
+    for named_elsewhere in [
+        OBJECT_TYPE_FUNCTION,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        OBJECT_TYPE_TEXTURE_VIEW,
+        OBJECT_TYPE_MAPPER_REF_TEXTURE,
+    ] {
+        assert_eq!(
+            super::backing_window(PAGE_SHIFT_X86, &entry(named_elsewhere), &buffer_desc),
+            None,
+            "type {named_elsewhere} does not name storage by an address in its task, \
+             so it has no window of its own however the bytes happen to read"
+        );
+    }
+
+    // A handle of zero is not a window at address zero. The descriptor's own
+    // arithmetic refuses it, and this is where that refusal is relied on.
+    let mut unpublished = buffer_desc;
+    unpublished[8..16].copy_from_slice(&0u64.to_le_bytes());
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry(OBJECT_TYPE_BUFFER), &unpublished),
+        None,
+        "a descriptor whose handle the guest has not written names no window"
+    );
+}
+
+/// One name after another over one window is not two names at once.
+///
+/// A deleted reference leaves its claim in the table, so a later reference
+/// landing on the same guest-VA window finds a holder. Reporting that as an
+/// alias would falsify the derivation from a sequence that is entirely lawful:
+/// the guest freed an allocation and allocated it again, and at no instant did
+/// two live names share the bytes. Only a claimant that is still a constructed
+/// resource makes the sighting mean what the line says.
+#[test]
+fn a_window_reclaimed_after_its_holder_died_is_not_an_alias() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let (task, first, second) = (3u32, 9u32, 10u32);
+    let window = 0x4_0000u64;
+    state.define_task(task, 0x1000, 0x40);
+
+    // The holder has to be a *constructed* resource, not merely a listed
+    // object: the claim table is written on construction, so that is the state
+    // the liveness re-check reads.
+    assert!(state.insert_object(task, first));
+    state.task_resources.register(
+        task,
+        first,
+        std::sync::Arc::new(crate::model::TaskResource::new(
+            ListObjectEntry {
+                object_type: crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
+                descriptor_length: 16,
+                descriptor_gva: 0x1000,
+            },
+            std::sync::Arc::from(&[0u8; 16][..]),
+        )),
+    );
+    assert_eq!(
+        super::note_backing_window_alias(&state, task, first, window, 0x3000),
+        None,
+        "the first claimant is not an alias of anything"
+    );
+    assert_eq!(
+        super::note_backing_window_alias(&state, task, second, window, 0x3000),
+        Some(first),
+        "two live references over one window is the sighting"
+    );
+
+    // The holder goes. The window is still claimed by its number, and the
+    // reading has to fall back to nothing rather than to a name that is gone.
+    assert!(state.delete_object(task, first));
+    assert_eq!(
+        super::note_backing_window_alias(&state, task, second, window, 0x3000),
+        None,
+        "a claim left behind by a deleted reference is not a live second name"
+    );
+}
