@@ -1839,7 +1839,15 @@ fn note_backing_window_alias<M: HostMemory>(
     size: u64,
 ) -> Option<u32> {
     let holder = state.claim_backing_window(task_id, obj_ref, base)?;
+    // Every collision is counted, whichever way it is adjudicated, because a
+    // zero on the sighting alone is not interpretable: a boot where no window
+    // was ever claimed twice and a boot where the guest-list re-read never
+    // succeeded read the same. `backing_window_reclaimed` is the denominator
+    // that tells them apart, and a null reading only means "no aliases" when
+    // it is non-zero.
+    crate::runtime::drain::note_store_route("backing_window_collision");
     if !holder_still_names(state, host, task_id, holder, base) {
+        crate::runtime::drain::note_store_route("backing_window_reclaimed");
         state.take_backing_window(task_id, obj_ref, base);
         return None;
     }

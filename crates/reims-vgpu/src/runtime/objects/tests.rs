@@ -2659,6 +2659,7 @@ fn only_address_named_object_types_have_a_window() {
 /// where the incarnation lives would be decided by a confound.
 #[test]
 fn a_window_whose_holder_the_guest_freed_is_not_an_alias() {
+    use crate::runtime::drain::census::store_route_count;
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
@@ -2693,11 +2694,22 @@ fn a_window_whose_holder_the_guest_freed_is_not_an_alias() {
         "the first reference constructs and claims the window"
     );
     write_slot(&mut host, second, true);
+    let collisions = store_route_count("backing_window_collision");
+    let reclaims = store_route_count("backing_window_reclaimed");
     assert_eq!(
         super::note_backing_window_alias(&state, &host, task, second, window, 0x3000),
         Some(first),
         "both references are in the guest's list naming one window, which is \
          the sighting this reading exists to make"
+    );
+    assert_eq!(
+        (
+            store_route_count("backing_window_collision") - collisions,
+            store_route_count("backing_window_reclaimed") - reclaims,
+        ),
+        (1, 0),
+        "the collision is counted and it was not a reclaim, which is what makes \
+         a boot's zero sightings mean no aliases rather than no collisions"
     );
 
     // The guest frees the first object the only way it can: it writes over its
@@ -2711,6 +2723,15 @@ fn a_window_whose_holder_the_guest_freed_is_not_an_alias() {
         super::note_backing_window_alias(&state, &host, task, second, window, 0x3000),
         None,
         "the guest's list no longer names the holder, so this is a reuse"
+    );
+    assert_eq!(
+        (
+            store_route_count("backing_window_collision") - collisions,
+            store_route_count("backing_window_reclaimed") - reclaims,
+        ),
+        (2, 1),
+        "the reuse is a second collision and the one reclaim, so the two \
+         counters separate what the sighting count alone cannot"
     );
 
     // And the window has changed hands, so a later claimant is compared
