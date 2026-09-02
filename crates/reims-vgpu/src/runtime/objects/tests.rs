@@ -3283,6 +3283,88 @@ fn a_constructed_object_becomes_the_storage_the_model_is_declared_with() {
     );
 }
 
+/// The stale-resolution witness says what it examined, not only what it found.
+///
+/// Its report is `first_sight`-gated, so a boot with no line is a boot where
+/// the guest never overwrote a slot **or** a boot where the witness never
+/// compared anything, and those are opposite facts about one silence. The
+/// denominator is what tells them apart — and it decides the cutover's
+/// declaration discipline, because a guest that replaces objects in place needs
+/// the device to redeclare and one that does not needs no such path.
+#[test]
+fn the_stale_resolution_witness_counts_what_it_compared() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+
+    let write_desc = |host: &mut FakeHost, at: u64, size: u64| {
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&size.to_le_bytes());
+        desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + at, &desc);
+    };
+    let write_entry = |host: &mut FakeHost, desc_gva: u64| {
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+    };
+    write_desc(&mut host, 0x100, 0x3000);
+    write_entry(&mut host, 0x100);
+    resolve_resource(&state, &host, task, buffer).expect("constructs");
+
+    // A steady retrieval: examined, and in agreement.
+    let examined = store_route_count("task_resource_reexamined");
+    let rewritten = store_route_count("task_resource_descriptor_rewritten");
+    let repointed = store_route_count("task_resource_slot_repointed");
+    resolve_resource(&state, &host, task, buffer).expect("retrieves");
+    assert_eq!(
+        store_route_count("task_resource_reexamined"),
+        examined + 1,
+        "a cache hit is a comparison, and the agreement rate is only readable \
+         against the number of them"
+    );
+    assert_eq!(
+        store_route_count("task_resource_descriptor_rewritten"),
+        rewritten,
+        "nothing disagreed"
+    );
+
+    // The serializer rewrites the descriptor in place: same entry, same
+    // address, different object.
+    write_desc(&mut host, 0x100, 0x9000);
+    resolve_resource(&state, &host, task, buffer).expect("retrieves");
+    assert_eq!(
+        store_route_count("task_resource_descriptor_rewritten"),
+        rewritten + 1,
+        "the bytes at the address the entry names changed, which the entry \
+         comparison alone would have called agreement"
+    );
+    assert_eq!(
+        store_route_count("task_resource_slot_repointed"),
+        repointed,
+        "and it is not the other disagreement: the slot still points where it did"
+    );
+
+    // The guest points the slot at a different descriptor.
+    write_desc(&mut host, 0x180, 0x9000);
+    write_entry(&mut host, 0x180);
+    resolve_resource(&state, &host, task, buffer).expect("retrieves");
+    assert_eq!(
+        store_route_count("task_resource_slot_repointed"),
+        repointed + 1,
+        "the guest replaced the object with no packet, which is the event the \
+         model's redeclaration exists for"
+    );
+}
+
 /// The peer question the hot per-reference state asks is answered from the
 /// construction cache, and answers nothing when the reference is the only name
 /// for its storage.

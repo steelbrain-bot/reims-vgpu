@@ -1697,6 +1697,12 @@ fn note_stale_task_resource<M: HostMemory>(
     cached: &TaskResource,
 ) {
     let Some(entry) = lookup_list_entry(state, host, task_id, obj_ref) else {
+        // The guest's list no longer answers for this reference at all. Counted
+        // apart from the comparisons: it is not a disagreement about what the
+        // slot holds, it is the list having moved or gone, and folding it into
+        // the denominator would make the agreement rate a function of task
+        // teardown.
+        crate::runtime::drain::note_store_route("task_resource_unlisted");
         return;
     };
     // The entry is half the snapshot. The other half is the descriptor bytes it
@@ -1708,9 +1714,32 @@ fn note_stale_task_resource<M: HostMemory>(
     let descriptor_moved = live_descriptor
         .as_ref()
         .is_some_and(|bytes| bytes.as_slice() != &*cached.descriptor);
+    // The denominator, and it decides something. The `task_resource_stale` line
+    // below is `first_sight`-gated, so a boot with no line is a boot where the
+    // guest never overwrote a slot **or** a boot where this witness never
+    // compared anything -- and those are opposite facts about the same silence.
+    //
+    // What it decides is the cutover's declaration discipline. This device
+    // declares an object when it first constructs it, and on this interface the
+    // guest replaces an object by writing over its own object-list record with
+    // no packet at all. `reims_vgpu_core::namespace::Namespace::declare` says a
+    // live slot may be redeclared and gives the new occupant a new generation;
+    // if that happens on a real guest, the replacement model needs the device to
+    // notice it here and redeclare, or every later reference resolves to the
+    // previous occupant's bytes. If it never happens, it does not.
+    crate::runtime::drain::note_store_route("task_resource_reexamined");
     if entry == cached.entry && !descriptor_moved {
         return;
     }
+    // Counted on every sighting rather than the first, and split, because the
+    // two disagreements are different events: the slot pointing somewhere else
+    // is the guest replacing the object, and the same bytes at the same address
+    // having changed is the serializer rewriting a descriptor in place.
+    crate::runtime::drain::note_store_route(if entry == cached.entry {
+        "task_resource_descriptor_rewritten"
+    } else {
+        "task_resource_slot_repointed"
+    });
     let disc = crate::backend::hash::hash_u64(
         u64::from(task_id) << 32 | u64::from(obj_ref),
         entry.descriptor_gva
