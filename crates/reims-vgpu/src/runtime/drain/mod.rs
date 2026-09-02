@@ -8,7 +8,6 @@ use crate::model::*;
 use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, UnimplementedCommand};
 use crate::observe::Emit;
 use crate::protocol::endian::{ld16, ld32, st16, st32};
-use crate::protocol::fifo::{decode_device_info, DeviceInfoForm};
 use crate::protocol::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
     DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
@@ -27,6 +26,7 @@ use crate::runtime::heap_query::QueryError;
 use crate::runtime::host::{HostAction, HostMemory, HostOps, MemError};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
 use reims_vgpu_core::control::ControlKind;
+use reims_vgpu_core::query::{self, QueryKind, RequestWords};
 
 pub(crate) mod census;
 pub use census::*;
@@ -2272,6 +2272,78 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
     true
 }
 
+/// Read a query packet's request at the layout its question uses.
+///
+/// **The one place this device turns a query opcode into a request.** The four
+/// query packets used to be four arms, each naming its own decoder and — for
+/// the two device-info opcodes — its own [`DeviceInfoForm`]. The two forms
+/// decode to one Rust type and their offsets collide, so reading either at the
+/// other's is a well-typed request whose pair count is a page frame and whose
+/// reply goes to whatever page that named. Nothing in the arms could compare
+/// them, because the choice was made inside each one.
+///
+/// [`reims_vgpu_core::query::QueryKind`] makes that unrepresentable: the form
+/// is an opcode question, the kind answers it, and
+/// [`reims_vgpu_core::query::request_words`] reads the layout the kind names.
+/// This function is the join, and the arms below name a question rather than a
+/// decoder.
+///
+/// `None` when the request is not one, with the reason already on the failure
+/// channel under the question's own name.
+fn query_request(
+    channel: WireChannel,
+    opcode: u16,
+    payload: &[u8],
+    channel_id: Option<u32>,
+) -> Option<RequestWords> {
+    let Some(kind) = QueryKind::of(channel, opcode) else {
+        // This dispatch table and the closure ledger disagree about which
+        // packets are queries. Not reachable while `ledger.rs` passes, and
+        // reported rather than dropped because the guest is blocked on the
+        // reply either way.
+        crate::observe::fail(format!(
+            "query_not_a_query_packet site={} op={opcode:#x} (the ledger does not classify this \
+             opcode as a query and the drain dispatched it as one)",
+            packet_site(channel_id)
+        ));
+        return None;
+    };
+    match query::request_words(kind, payload) {
+        Ok(words) => Some(words),
+        Err(query::WordsRefusal::Short(short)) => {
+            note_short_payload(kind.name(), channel_id, &short);
+            None
+        }
+        Err(query::WordsRefusal::HeapTexture(refusal)) => {
+            crate::observe::fail(format!(
+                "query_malformed_request reason={} site={} question={}",
+                refusal.slug(),
+                packet_site(channel_id),
+                kind.name()
+            ));
+            None
+        }
+    }
+}
+
+/// The reply this device cannot build, because the question and its request
+/// words came apart.
+///
+/// [`QueryKind::of`] maps an opcode to a question and
+/// [`reims_vgpu_core::query::request_words`] returns the variant that
+/// question's layout produces, so the two agreeing is
+/// `reims_vgpu_core`'s invariant and not this device's. Unreachable, reported
+/// rather than ignored: a packet that reached it would otherwise be answered
+/// from a request built at the wrong layout, which is the defect the join
+/// exists to remove.
+fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
+    crate::observe::fail(format!(
+        "query_layout_mismatch site={} question={question} (the request words are not the ones \
+         this question's layout produces)",
+        packet_site(channel_id)
+    ));
+}
+
 fn process_root_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2282,19 +2354,16 @@ fn process_root_packet<H: HostMemory + HostOps>(
         // their payload is — the newer one prepends a parse ceiling — and
         // reading either at the other's offsets would take the count for a page
         // frame and write the reply wherever that landed. Which form an opcode
-        // carries was the one thing the two arms did not share, so it is now
-        // the only thing that differs between them.
+        // carries is no longer this arm's answer at all: `query_request` asks
+        // `reims_vgpu_core::query::QueryKind`, so the two opcodes now differ
+        // here in nothing.
         ROOT_OP_DEVICE_INFO_TAHOE | ROOT_OP_DEVICE_INFO_MONTEREY => {
-            let (form, slug) = if packet.opcode == ROOT_OP_DEVICE_INFO_TAHOE {
-                (DeviceInfoForm::WithKeyLimit, "device_info_tahoe")
-            } else {
-                (DeviceInfoForm::WithoutKeyLimit, "device_info_monterey")
-            };
-            match decode_device_info(form, &packet.payload) {
-                Ok(request) => {
+            match query_request(WireChannel::Root, packet.opcode, &packet.payload, None) {
+                Some(RequestWords::DeviceInfo(request)) => {
                     let _ = reply_device_info(host, &request, state.page_shift, state.gfx.version);
                 }
-                Err(short) => note_short_payload(slug, None, &short),
+                Some(_) => note_query_layout_mismatch("device_info", None),
+                None => {}
             }
         }
         // The two ends of one channel lifetime. They share a payload because
@@ -4335,13 +4404,17 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // `reply_compute_info` each carried their own literal `24`, so
             // neither check could be wrong without the other being wrong too —
             // and no test built a request at all, so neither was exercised.
-            match crate::protocol::fifo::decode_compute_info(&packet.payload) {
-                Ok(request) => {
+            match query_request(
+                WireChannel::Child,
+                packet.opcode,
+                &packet.payload,
+                Some(channel_id),
+            ) {
+                Some(RequestWords::ComputeInfo(request)) => {
                     let _ = reply_compute_info(state, host, &request);
                 }
-                Err(short) => {
-                    note_short_payload("get_compute_info", Some(channel_id), &short);
-                }
+                Some(_) => note_query_layout_mismatch("compute_info", Some(channel_id)),
+                None => {}
             }
         }
         CHILD_OP_CURSOR_SHOW => match crate::protocol::fifo::decode_cursor_show(&packet.payload) {

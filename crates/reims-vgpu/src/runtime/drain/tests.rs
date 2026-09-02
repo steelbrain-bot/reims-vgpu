@@ -4573,7 +4573,7 @@ fn a_short_compute_info_request_is_reported_and_not_answered() {
     let lines = cap.lines();
     let line = lines
         .iter()
-        .find(|l| l.contains("reason=get_compute_info_short"))
+        .find(|l| l.contains("reason=compute_info_short"))
         .unwrap_or_else(|| panic!("a short compute-info said nothing: {lines:?}"));
     assert!(
         line.contains("need=24") && line.contains("plen=23"),
@@ -4970,8 +4970,11 @@ fn every_short_control_packet_names_itself() {
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     for reason in [
-        "reason=device_info_tahoe_short site=root",
-        "reason=device_info_monterey_short site=root",
+        // The question's name, not the opcode's: `reims_vgpu_core::query`
+        // names the two device-info questions, and the drain no longer has a
+        // slug of its own to disagree with it.
+        "reason=device_info_short site=root",
+        "reason=device_info_legacy_short site=root",
         "reason=define_fifo_short site=root",
         "reason=free_fifo_short site=root",
         "reason=set_object_list_short site=root",

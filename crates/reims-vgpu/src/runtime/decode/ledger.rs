@@ -300,6 +300,53 @@ mod packets {
         assert_eq!(CHILD_OP_MAX, OPCODE_CEILING);
     }
 
+    /// The four opcodes the drain answers as queries are the four the model
+    /// calls questions.
+    ///
+    /// `runtime::drain::query_request` asks
+    /// [`reims_vgpu_core::query::QueryKind::of`] which question a packet is,
+    /// and reports `query_not_a_query_packet` when the answer is `None` — a
+    /// reading that means this device's dispatch table and the closure ledger
+    /// disagree about what a query is, and one the drain cannot check for
+    /// itself because it only ever sees one opcode at a time. This is where it
+    /// is checked, in both directions: every query the ledger judges has an arm
+    /// here, and every arm has a question.
+    #[test]
+    fn the_query_arms_and_the_models_questions_are_the_same_four() {
+        use reims_vgpu_core::query::QueryKind;
+        // The opcodes `process_root_packet` and `process_child_packet` answer
+        // with a reply, written out because a test that derived them from the
+        // same source the drain does would agree with the drain by
+        // construction.
+        let arms = [
+            (Channel::Root, crate::model::ROOT_OP_DEVICE_INFO_TAHOE),
+            (Channel::Root, crate::model::ROOT_OP_DEVICE_INFO_MONTEREY),
+            (Channel::Child, crate::model::CHILD_OP_GET_COMPUTE_INFO),
+            (
+                Channel::Child,
+                crate::model::CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
+            ),
+        ];
+        for (channel, op) in arms {
+            assert!(
+                QueryKind::of(channel, op).is_some(),
+                "the drain answers {} {op:#04x} with a reply and the model does not call it a \
+                 question, so `query_request` would refuse a packet the guest is blocked on",
+                channel.name()
+            );
+        }
+        let judged: BTreeSet<(Channel, u16)> = LEDGER
+            .iter()
+            .filter(|p| QueryKind::of(p.channel, p.opcode).is_some())
+            .map(|p| (p.channel, p.opcode))
+            .collect();
+        assert_eq!(
+            judged,
+            arms.into_iter().collect::<BTreeSet<_>>(),
+            "the model's questions and the drain's query arms are not the same set"
+        );
+    }
+
     /// A slot cannot be both a live command and one the host retired, on either
     /// side of the join.
     #[test]
