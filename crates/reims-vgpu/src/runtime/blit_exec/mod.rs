@@ -59,7 +59,6 @@ use crate::runtime::mapper::RectStride;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
-use reims_vgpu_wire::ops::blit as wire_blit;
 
 /// Chunk size for fill/copy host staging (bounded guest IO).
 const CHUNK: usize = 64 * 1024;
@@ -4119,21 +4118,27 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
 /// Execute blit fence update (`0x13c`) or wait (`0x13d`) on the blit-fence domain.
 ///
 /// See [`fence_exec::execute_fence`].
-pub fn execute_blit_fence(state: &mut DeviceState, task_id: u32, cmd: &Command) -> BlitStatus {
+pub fn execute_blit_fence(
+    state: &mut DeviceState,
+    task_id: u32,
+    record: &reims_vgpu_protocol::decode::sync::FenceRecord,
+) -> BlitStatus {
+    use reims_vgpu_protocol::sync::FenceKind;
     clear_blit_fail_reason();
-    if cmd.kind != Kind::Fence {
-        return br(BlitStatus::Unsupported, "fence_wrong_kind");
-    }
-    let action = match cmd.opcode {
-        wire_blit::OPCODE_UPDATE_FENCE => FenceAction::Update,
-        wire_blit::OPCODE_WAIT_FOR_FENCE => FenceAction::Wait,
-        _ => return br(BlitStatus::Unsupported, "fence_bad_opcode"),
+    // Which side of the fence this is comes off the record, and the record only
+    // exists for the two opcodes that are fences. Both refusals this function
+    // used to have — "the caller handed me a non-fence" and "the opcode is not
+    // one of the two" — were about a `Command` that could carry any kind with
+    // any opcode, and neither is expressible now.
+    let action = match record.kind {
+        FenceKind::Update => FenceAction::Update,
+        FenceKind::Wait => FenceAction::Wait,
     };
     blit_status_from_fence(fence_exec::execute_fence(
         state,
         task_id,
         FenceDomain::BlitFence,
-        cmd.fence,
+        record.fence_ref,
         action,
     ))
 }
@@ -4197,7 +4202,6 @@ pub fn execute_blit<M: HostMemory + HostOps>(
             CopyKind::TextureToTextureSliceLevel => "blit_kind_t2t_sl_us",
             CopyKind::None => "blit_kind_none_us",
         },
-        Kind::Fence => "blit_kind_fence_us",
         _ => "blit_kind_other_us",
     };
     let status = match cmd.kind {
@@ -4213,10 +4217,15 @@ pub fn execute_blit<M: HostMemory + HostOps>(
             }
             CopyKind::None => br(BlitStatus::Unsupported, "copy_kind_none"),
         },
-        Kind::Fence => execute_blit_fence(state, task_id, cmd),
         Kind::Resource | Kind::Image | Kind::Unknown => {
             br(BlitStatus::Unsupported, "blit_kind_unsupported")
         }
+        // A fence never reaches here: `handle_blit_record` lifts the two fence
+        // opcodes through `reims_vgpu_protocol::decode::sync` and calls
+        // `execute_blit_fence` with the record, which is the only shape that
+        // function now takes. A sighting means this decoder called a transfer
+        // what the ledger calls a fence.
+        Kind::Fence => br(BlitStatus::Unsupported, "blit_kind_fence_misrouted"),
         // The three indirect-command-buffer records never reach here:
         // `handle_blit_record` answers them itself, counting the two that are
         // lost work and treating the optimize hint as the no-op it is. A
@@ -4239,6 +4248,9 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     );
     status
 }
+
+#[cfg(test)]
+use reims_vgpu_wire::ops::blit as wire_blit;
 
 #[cfg(test)]
 mod tests;

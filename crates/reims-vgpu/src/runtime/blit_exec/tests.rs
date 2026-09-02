@@ -2508,34 +2508,44 @@ fn whole_surface_0x13e_volume_rejects_nonzero_slice() {
     );
 }
 
+/// A fence record as `reims_vgpu_protocol::decode::sync` lifts one.
+///
+/// Built rather than encoded and decoded, for the reason the event tests give:
+/// these cases are about what `execute_blit_fence` does with a record, and the
+/// blit encoder's fence record carries no stages because its selector has
+/// none — `None` here is that absence and not a guest passing zero.
+fn fence_record(
+    kind: reims_vgpu_protocol::sync::FenceKind,
+    fence_ref: u32,
+) -> reims_vgpu_protocol::decode::sync::FenceRecord {
+    reims_vgpu_protocol::decode::sync::FenceRecord {
+        kind,
+        fence_ref,
+        stages: None,
+    }
+}
+
 #[test]
 fn blit_fence_update_then_wait() {
     use crate::model::FENCE_DOMAIN_BLIT;
+    use reims_vgpu_protocol::sync::FenceKind;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut upd = Command::default();
-    upd.kind = Kind::Fence;
-    upd.opcode = wire_blit::OPCODE_UPDATE_FENCE;
-    upd.fence = 7;
+    let upd = fence_record(FenceKind::Update, 7);
     assert_eq!(execute_blit_fence(&mut state, 1, &upd), BlitStatus::Ok);
     assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 7), Some(1));
     // Second update advances generation.
     assert_eq!(execute_blit_fence(&mut state, 1, &upd), BlitStatus::Ok);
     assert_eq!(state.fence_generation(1, FENCE_DOMAIN_BLIT, 7), Some(2));
-    let mut wait = Command::default();
-    wait.kind = Kind::Fence;
-    wait.opcode = wire_blit::OPCODE_WAIT_FOR_FENCE;
-    wait.fence = 7;
+    let wait = fence_record(FenceKind::Wait, 7);
     assert_eq!(execute_blit_fence(&mut state, 1, &wait), BlitStatus::Ok);
 }
 
 #[test]
 fn blit_fence_wait_pending_without_update() {
+    use reims_vgpu_protocol::sync::FenceKind;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut wait = Command::default();
-    wait.kind = Kind::Fence;
-    wait.opcode = wire_blit::OPCODE_WAIT_FOR_FENCE;
-    wait.fence = 3;
+    let wait = fence_record(FenceKind::Wait, 3);
     assert_eq!(
         execute_blit_fence(&mut state, 1, &wait),
         BlitStatus::FencePending
@@ -2545,11 +2555,9 @@ fn blit_fence_wait_pending_without_update() {
 
 #[test]
 fn blit_fence_zero_ref_fails() {
+    use reims_vgpu_protocol::sync::FenceKind;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut upd = Command::default();
-    upd.kind = Kind::Fence;
-    upd.opcode = wire_blit::OPCODE_UPDATE_FENCE;
-    upd.fence = 0;
+    let upd = fence_record(FenceKind::Update, 0);
     assert_eq!(
         execute_blit_fence(&mut state, 1, &upd),
         BlitStatus::MissingResource
