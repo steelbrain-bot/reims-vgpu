@@ -2799,7 +2799,19 @@ pub struct DeviceState {
     /// Behind a lock for [`TaskResources`]' reason: the resolve path holds
     /// [`DeviceState`] shared, and `reims_vgpu_core::namespace::Namespace`
     /// counts its own resolutions, so even a lookup takes `&mut`.
-    namespaces: Mutex<BTreeMap<u32, Namespace>>,
+    ///
+    /// **The semantic model's lifecycle owner, and not a map of namespaces.**
+    /// This field held `BTreeMap<u32, Namespace>` until the resource-lifecycle
+    /// group moved: one namespace per task and nothing that owned the events
+    /// that create or end them. `reims_vgpu_core::lifecycle::Lifecycle` owns the
+    /// namespaces, the heaps and the content authority together, because the
+    /// twelve lifetime commands move all three and a device that held only the
+    /// first would be keeping the second record of the other two.
+    ///
+    /// Reached only through the doors below. Nothing else in this crate names
+    /// this field, which is what makes "the legacy path cannot reach this
+    /// state" a property of the module rather than a claim about call sites.
+    lifecycle: Mutex<reims_vgpu_core::lifecycle::Lifecycle>,
     /// Immutable sampler objects in the sampler API's separate ref space.
     pub task_sampler_states: TaskSamplerStates,
     /// Immutable depth-stencil objects in that API's separate ref space.
@@ -3203,7 +3215,7 @@ impl DeviceState {
             node_guard: std::collections::BTreeMap::new(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
-            namespaces: Mutex::new(BTreeMap::new()),
+            lifecycle: Mutex::new(reims_vgpu_core::lifecycle::Lifecycle::new()),
             task_sampler_states: TaskSamplerStates::default(),
             task_depth_stencil_states: TaskDepthStencilStates::default(),
             rail: OnceLock::new(),
@@ -3909,12 +3921,16 @@ impl DeviceState {
     /// this device never pays off.
     #[must_use]
     pub fn object_name(&self, task_id: u32, obj_ref: u32) -> Option<ResourceId> {
-        use reims_vgpu_core::resolve::RefResolver as _;
-        self.namespaces
+        use reims_vgpu_core::resolve::TaskNamespaces as _;
+        // The owner's own routing door, so which task's namespace a reference is
+        // a slot in is decided in one place. A task this owner does not hold
+        // answers `None`, which is the same answer an empty slot gives and is
+        // correct for both: a reference into an address space that does not
+        // exist names nothing.
+        self.lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&task_id)?
-            .resource(obj_ref)
+            .resource(reims_vgpu_core::identity::TaskId(task_id), obj_ref)
     }
 
     /// The resource this device constructed for a guest reference, if it has
@@ -3952,32 +3968,38 @@ impl DeviceState {
         task_id: u32,
         obj_ref: u32,
         storage: reims_vgpu_core::lifecycle::Storage,
-    ) -> Declared {
-        use reims_vgpu_core::lifecycle::Storage;
-        // The one place a `Storage` is flattened to what a namespace slot holds,
-        // and it is here because the loss is the namespace's: a slot records
-        // *which* storage a name is over and not how much of it, so the extent
-        // has nowhere to go on this side of the move. A caller doing the
-        // flattening would be deciding that on the namespace's behalf, and both
-        // callers were doing it identically, which is one copy too many of a
-        // decision with one owner.
-        //
-        // `Placed` is unreachable from this device today —
-        // `crate::runtime::objects::declared_storage` refuses a heap placement
-        // by name, because a heap's extent is unrecovered — and it is answered
-        // with the heap's backing rather than with `None`, because a placed
-        // resource does have storage and saying otherwise would be the invented
-        // absence the refusal exists to avoid.
-        let backing = match storage {
-            Storage::Dedicated { backing, .. } => Some(backing),
-            Storage::Placed { .. } | Storage::NoBytes => None,
-        };
-        self.namespaces
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(task_id)
-            .or_default()
-            .declare(ObjectListRef(obj_ref), backing)
+    ) -> Result<Declaration, reims_vgpu_core::lifecycle::Refusal> {
+        use reims_vgpu_core::identity::TaskId;
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        use reims_vgpu_core::resolve::TaskNamespaces as _;
+        let slot = ObjectListRef(obj_ref);
+        let task = TaskId(task_id);
+        let mut owner = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        // The whole `Storage` reaches the owner, extent included. This door used
+        // to flatten it to the backing a namespace slot records, because a
+        // namespace is all this device held; the owner holds the content
+        // authority too, and that is what the extent is for — a dedicated
+        // resource's own pages are declared authoritative over exactly its
+        // bytes, and a flattened declaration would have claimed the whole
+        // backing on a resource that is a window of one.
+        let effects = owner.apply(&LifecycleOp::CreateResource {
+            task,
+            slot,
+            storage,
+        })?;
+        // Asked of the owner that just published it, under the same lock, so
+        // the name is the one this declaration minted and not one a concurrent
+        // redeclaration replaced it with. `apply` returns the operation's
+        // effects and not its name — every other operation names nothing — so
+        // the second read is the join, and the lock is what makes it one event.
+        let id = owner
+            .resource(task, obj_ref)
+            .expect("the declaration published this slot");
+        drop(owner);
+        Ok(Declaration {
+            id,
+            effects: LifecycleEffects(effects),
+        })
     }
 
     /// Retire a name: stop it resolving, and leave accepted work alone.
