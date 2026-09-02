@@ -511,6 +511,29 @@ impl SessionModel {
 
     /// Turn a packet into a transaction, or refuse it.
     ///
+    /// # A refused packet still owes its completion word, and the caller owes it
+    ///
+    /// Nothing is mutated on a refusal, which is what makes the orders readable
+    /// — and it is also why **nothing in this model will ever publish a refused
+    /// packet's stamp.** The publisher is not told about it, so it holds no
+    /// position for it; [`Self::complete`] and [`Self::withdraw`] both name an
+    /// ingress ordinal that was never issued.
+    ///
+    /// The guest does not know about admission. It wrote a completion word into
+    /// the packet header and it waits on that word, so a packet this model
+    /// declines is a packet whose caller must stamp
+    /// [`Packet::completion`] itself — exactly as it would for a packet the
+    /// model accepted and published. A caller that treats a refusal as "nothing
+    /// happened" hangs the channel on the first unestablished opcode a real
+    /// guest sends, and hangs it *silently*, because a fence that never advances
+    /// produces no event.
+    ///
+    /// This is what makes an honest ledger row affordable. A command the model
+    /// has no contract for is [`Refusal::UnestablishedContract`], the work does
+    /// not happen, and the guest's fence still moves — so refusing costs the
+    /// work and not the channel. It is the difference between a feature this
+    /// device does not implement and a device that stops.
+    ///
     /// # Errors
     ///
     /// Returns the one check that refused. Nothing is mutated on a refusal —
@@ -1022,6 +1045,78 @@ mod tests {
             completion: None,
             payload: empty_payload(Channel::Child, opcode),
         }
+    }
+
+    /// **A refused packet's completion word is never published by this model,
+    /// so its caller owes it.**
+    ///
+    /// The counterpart to [`Self::admit`]'s "nothing is mutated on a refusal".
+    /// Nothing mutated means the publisher was never told, which means no
+    /// position exists to publish and no ingress ordinal exists to name in
+    /// [`SessionModel::complete`] or [`SessionModel::withdraw`]. The stamp is
+    /// unreachable from inside the model — not withheld, absent.
+    ///
+    /// The guest is not party to admission. It wrote a completion word into the
+    /// packet header and it waits on that word, so a caller reading a refusal as
+    /// "nothing happened" hangs the channel on the first unestablished opcode a
+    /// real guest sends, and hangs it silently — a fence that never advances
+    /// produces no event. This test is the claim in a form a cutover cannot
+    /// quietly drop: two admitted packets on either side of a refused one, and
+    /// what the channel publishes is exactly their two stamps.
+    #[test]
+    fn a_refused_packet_publishes_no_stamp_and_the_channel_skips_its_value() {
+        let mut s = SessionModel::new(SessionId(1));
+        s.open_channel(ChannelId(2)).expect("fresh");
+
+        let stamped = |value: u32, opcode: u16| {
+            let mut p = packet(opcode);
+            p.completion = Some(CompletionStamp {
+                slot: StampSlot(2),
+                value: StampValue(value),
+            });
+            p
+        };
+
+        let first = s.admit(&stamped(1, 0x37)).expect("an established opcode");
+
+        // The guest's next packet: an opcode whose contract the ledger has not
+        // settled. It carries stamp 2, and the guest is waiting on 2.
+        let unestablished = stamped(2, 0xffff);
+        let refusal = s.admit(&unestablished).expect_err("no such command");
+        assert!(
+            matches!(
+                refusal,
+                Refusal::UnknownCommand { .. } | Refusal::UnestablishedContract { .. }
+            ),
+            "the refusal a ledger row that is not settled produces, got {refusal:?}"
+        );
+        assert_eq!(
+            s.publisher().outstanding(ChannelId(2)),
+            1,
+            "the refused packet took no position, so there is none to publish"
+        );
+
+        let third = s.admit(&stamped(3, 0x37)).expect("an established opcode");
+
+        let mut published = Vec::new();
+        for admitted in [first, third] {
+            for release in s
+                .complete(DeviceEpoch::FIRST, admitted.transaction.identity.ingress)
+                .expect("the live incarnation")
+            {
+                published.extend(release.stamp);
+            }
+        }
+        assert_eq!(
+            published
+                .iter()
+                .map(|stamp| stamp.value.0)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "value 2 is nowhere in what the channel published, and the guest is \
+             waiting on it — whoever holds the refusal is the only thing that \
+             can move that word"
+        );
     }
 
     /// **A refused admission takes nothing.**
