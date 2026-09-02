@@ -3225,6 +3225,64 @@ fn every_construction_is_counted_against_the_backing_identity() {
     );
 }
 
+/// The object-list walk's per-object translation: what the semantic model is
+/// told each constructed object's storage is.
+///
+/// Three answers, and the third is the one the model could not represent at all
+/// until the namespace learned that a name may own no memory. Most of a guest's
+/// list is that third answer.
+#[test]
+fn a_constructed_object_becomes_the_storage_the_model_is_declared_with() {
+    use reims_vgpu_core::access::ByteRange;
+    use reims_vgpu_core::lifecycle::Storage;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+
+    let list_entry = lookup_list_entry(&state, &host, task, buffer).expect("listed");
+    let bytes = read_descriptor(&state, &host, task, &list_entry).expect("descriptor");
+    assert_eq!(
+        super::declared_storage(&state, task, &list_entry, &bytes),
+        Ok(Storage::Dedicated {
+            backing: super::backing_id(&state, &host, task, buffer).expect("a buffer has one"),
+            extent: ByteRange {
+                offset: 0,
+                length: 0x3000,
+            },
+        }),
+        "a buffer is its allocation, and the declaration carries the identity \
+         of the storage and the object's own window of it"
+    );
+
+    // The fixture's reference 1 is a mapper-ref texture over mapping 9. Its
+    // storage is the mapping's and has an identity; which plane of that surface
+    // the texture is does not come from this record.
+    let t11 = lookup_list_entry(&state, &host, task, 1).expect("listed");
+    let t11_bytes = read_descriptor(&state, &host, task, &t11).expect("descriptor");
+    assert!(state.map_surface(9));
+    assert_eq!(
+        super::declared_storage(&state, task, &t11, &t11_bytes),
+        Err(super::StorageRefusal::ExtentUnrecovered { object_type: 11 }),
+        "the identity is there and the extent is not, which is a different \
+         thing from having no identity and must not read as one"
+    );
+}
+
 /// The peer question the hot per-reference state asks is answered from the
 /// construction cache, and answers nothing when the reference is the only name
 /// for its storage.

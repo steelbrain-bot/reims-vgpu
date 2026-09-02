@@ -1871,6 +1871,96 @@ fn note_backing_window_alias<M: HostMemory>(
     Some(holder)
 }
 
+/// Why an object this device constructed cannot be declared into the semantic
+/// model.
+///
+/// Both arms are gaps rather than guest errors, and both are counted, because
+/// the number that matters before the cutover is what fraction of a real
+/// guest's object list the model can describe at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageRefusal {
+    /// The storage has no canonical identity. Carries the identity's own
+    /// refusal, so the reason is the one [`backing_id`] names rather than a
+    /// second vocabulary for the same facts.
+    Backing(BackingIdRefusal),
+    /// The identity is known and the object's own byte window inside it is not.
+    ///
+    /// The mapper-ref texture is the case: its storage is a mapping's surface,
+    /// which has an identity, and which *plane* of that surface the texture is
+    /// comes from the surface descriptor rather than from this record. An
+    /// extent guessed at would declare content authority over a neighbouring
+    /// plane's bytes.
+    ExtentUnrecovered { object_type: u8 },
+}
+
+impl StorageRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Backing(inner) => inner.slug(),
+            Self::ExtentUnrecovered { .. } => "storage_extent_unrecovered",
+        }
+    }
+}
+
+/// What the semantic model would be told this object's storage is.
+///
+/// The object-list walk's per-object translation, and a pure function of the
+/// entry, the descriptor and the identity interning:
+/// `reims_vgpu_core::lifecycle::LifecycleOp::CreateResource` carries exactly
+/// this value, and it is the last thing between a constructed guest object and
+/// a declaration the model admits.
+///
+/// # The three answers, and why the third is not a fourth
+///
+/// An object that owns an allocation is `Dedicated`, with the *identity* of the
+/// allocation and this object's own byte window inside it — two different
+/// questions, answered by two different methods, because two textures at
+/// different offsets in one allocation are one storage with two extents.
+///
+/// An object that owns no bytes at all is `NoBytes`, which is most of a list:
+/// samplers, functions, pipeline states, depth-stencil states, views over
+/// another object's bytes. That is a description and not a refusal — the model
+/// holds the name, the generation and the deletion, and holds no memory because
+/// there is none.
+///
+/// A heap placement would be `Placed`, and is not produced here. The identity
+/// half is settled but a heap's *extent* is not, so a placement cannot be
+/// bounded and two placements sharing bytes would come out distinct; it arrives
+/// as [`BackingIdRefusal::HeapPlaced`] and is refused by name. No driven boot
+/// has yet placed a heap texture, which is why the term is still open.
+///
+/// # Errors
+///
+/// [`StorageRefusal`], one arm per half of the answer that is missing.
+pub fn declared_storage(
+    state: &DeviceState,
+    task_id: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Result<reims_vgpu_core::lifecycle::Storage, StorageRefusal> {
+    use reims_vgpu_core::access::ByteRange;
+    use reims_vgpu_core::lifecycle::Storage;
+    let backing = match backing_id_of(state, task_id, entry, descriptor) {
+        Ok(backing) => backing,
+        // The object names no storage, which is the whole answer rather than a
+        // failure to find one.
+        Err(BackingIdRefusal::NamesNoStorage { .. }) => return Ok(Storage::NoBytes),
+        Err(other) => return Err(StorageRefusal::Backing(other)),
+    };
+    let (offset, length) =
+        crate::runtime::decode::resource::decode_descriptor(entry.object_type, descriptor)
+            .ok()
+            .and_then(|decoded| decoded.allocation_extent())
+            .ok_or(StorageRefusal::ExtentUnrecovered {
+                object_type: entry.object_type,
+            })?;
+    Ok(Storage::Dedicated {
+        backing,
+        extent: ByteRange { offset, length },
+    })
+}
+
 /// Census the canonical backing identity of every object this device
 /// constructs.
 ///
@@ -1891,6 +1981,14 @@ fn note_backing_window_alias<M: HostMemory>(
 /// constructions read the same — and each refusal arm is counted under its own
 /// slug.
 ///
+/// What is asked for is the whole *declaration*, not the identity alone, because
+/// the declaration is what the cutover needs. An object with an identity and no
+/// extent is one the model can name and cannot hold content authority for, and a
+/// census that stopped at the identity would score it as an answer. So the
+/// `declared_storage_*` counts partition the objects the model can describe —
+/// an allocation with an extent, or no bytes at all — and the refusals partition
+/// the ones it cannot.
+///
 /// One arm is a fail line as well as a count.
 /// [`BackingIdRefusal::HeapPlaced`] is the one open contract term
 /// `BackingId`'s own doc still names: a heap's extent is unrecovered, so two
@@ -1903,12 +2001,39 @@ fn note_backing_identity(
     entry: &ListObjectEntry,
     descriptor: &[u8],
 ) {
+    use reims_vgpu_core::lifecycle::Storage;
     crate::runtime::drain::note_store_route("backing_identity_asked");
-    let Err(refusal) = backing_id_of(state, task_id, entry, descriptor) else {
+    // The declaration is asked for rather than the identity, because it is the
+    // declaration the cutover needs: an identity with no extent describes an
+    // object the model can name and cannot hold content authority for, and a
+    // census that stopped at the identity would score that as an answer.
+    let refusal = match declared_storage(state, task_id, entry, descriptor) {
+        Ok(Storage::Dedicated { .. }) => {
+            crate::runtime::drain::note_store_route("backing_identity_minted");
+            crate::runtime::drain::note_store_route("declared_storage_dedicated");
+            return;
+        }
+        // Not a refusal: the object owns no bytes and the model is told so.
+        Ok(Storage::NoBytes) => {
+            crate::runtime::drain::note_store_route("declared_storage_no_bytes");
+            return;
+        }
+        // Never produced here — a heap placement arrives as an identity refusal
+        // because a heap's extent is unrecovered. Counted so that the day it
+        // does, the reading says so rather than the arm being unreachable
+        // forever by assumption.
+        Ok(Storage::Placed { .. }) => {
+            crate::runtime::drain::note_store_route("declared_storage_placed");
+            return;
+        }
+        Err(refusal) => refusal,
+    };
+    crate::runtime::drain::note_store_route(refusal.slug());
+    let StorageRefusal::Backing(refusal) = refusal else {
+        // The identity was mintable; only the extent was not.
         crate::runtime::drain::note_store_route("backing_identity_minted");
         return;
     };
-    crate::runtime::drain::note_store_route(refusal.slug());
     if !matches!(refusal, BackingIdRefusal::HeapPlaced) {
         return;
     }

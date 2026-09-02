@@ -2027,9 +2027,86 @@ impl Descriptor {
             | Self::IndirectCommandBuffer(_) => None,
         }
     }
+
+    /// The resource's own byte window inside the allocation
+    /// [`Self::backing_window`] names, as an offset and a length.
+    ///
+    /// # Why this is not the window
+    ///
+    /// The window is *storage* — what two resources must share an identity for
+    /// — and it is deliberately the whole allocation, because two textures at
+    /// different offsets in one allocation are one piece of storage. This is the
+    /// other half: which bytes of it are **this** object's. A model that
+    /// declared content authority over the window would claim its neighbours'
+    /// bytes and discard their content; one that had no extent at all could not
+    /// tell a write to this texture from a write to the one beside it.
+    ///
+    /// # Where the numbers come from
+    ///
+    /// The guest's own declarations, never a re-derivation. A buffer is its
+    /// allocation, so its window is the whole of it. A texture is the union of
+    /// its level records' `[offset, offset + size)`, and `size` there is the
+    /// level's *allocated* span — the padded one the wire carries at
+    /// `TEXTURE_LEVEL_SIZE` and the decoder computes level 0's from
+    /// `used_size`. That is the right one: this is how much of the allocation
+    /// the object occupies, not how much of it a row-by-row reader touches,
+    /// which is [`TextureLevelLayout::read_span`]'s different question.
+    ///
+    /// A dual-plane texture unions both planes, because both are cut from the
+    /// one allocation its shared object header names.
+    ///
+    /// `None` for every object with no window at all, and for one whose levels
+    /// the guest has not written — an extent guessed at is a claim over bytes
+    /// nothing said were this object's.
+    #[must_use]
+    pub fn allocation_extent(&self) -> Option<(u64, u64)> {
+        fn union(levels: &[TextureLevelLayout]) -> Option<(u64, u64)> {
+            let mut lo = u64::MAX;
+            let mut hi = 0u64;
+            for level in levels.iter().filter(|l| l.size != 0) {
+                lo = lo.min(level.offset);
+                hi = hi.max(level.offset.checked_add(level.size)?);
+            }
+            // `then`, not `then_some`: a descriptor whose levels all declare a
+            // zero size leaves the sentinels untouched, and `then_some` would
+            // evaluate the subtraction under them before deciding not to use
+            // it. That is `u64::MAX` from zero, which is a panic in debug and a
+            // 4-exabyte extent in release.
+            (hi > lo).then(|| (lo, hi - lo))
+        }
+        match self {
+            // A buffer is its allocation: there is nothing else in it, and the
+            // descriptor carries no offset for there to be.
+            Self::Buffer(buffer) => {
+                (buffer.allocation_size != 0).then_some((0, buffer.allocation_size))
+            }
+            Self::Texture(texture) => union(&texture.levels),
+            Self::DualPlaneTexture(dual) => {
+                let (a, b) = (union(&dual.planes[0].levels), union(&dual.planes[1].levels));
+                match (a, b) {
+                    (Some((ao, al)), Some((bo, bl))) => {
+                        let lo = ao.min(bo);
+                        Some((lo, ao.checked_add(al)?.max(bo.checked_add(bl)?) - lo))
+                    }
+                    (one, None) | (None, one) => one,
+                }
+            }
+            // No window, so no window of a window. The mapper-ref texture is
+            // the one that is a gap rather than a category error — its bytes
+            // are a plane of the mapping's surface, and which plane is the
+            // surface descriptor's question rather than this record's.
+            Self::Sampler(_)
+            | Self::Function(_)
+            | Self::RenderPipeline(_)
+            | Self::ComputePipeline(_)
+            | Self::DepthStencil(_)
+            | Self::TextureView(_)
+            | Self::IOSurfaceTexture { .. }
+            | Self::IndirectCommandBuffer(_) => None,
+        }
+    }
 }
 
-/// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
 pub const OBJECT_LIST_ENTRY_LEN: usize = 12;
 pub const OBJECT_LIST_ENTRY_HEADER: usize = 0;
 pub const OBJECT_LIST_ENTRY_DESC_GVA: usize = 4;
