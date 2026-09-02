@@ -2064,6 +2064,29 @@ fn mapper_ref_surface_extent(state: &DeviceState, descriptor: &[u8]) -> Option<(
 /// an allocation with an extent, or no bytes at all — and the refusals partition
 /// the ones it cannot.
 ///
+/// # Read, on a driven macos-15 boot to the desktop
+///
+/// ```text
+/// backing_identity_asked                 1447
+/// backing_identity_minted                1371
+/// backing_id_names_no_storage              76
+/// backing_id_unresolved                     0
+/// backing_id_heap_placed                    0
+/// backing_id_mapping_names_no_surface       0
+/// ```
+///
+/// 1371 + 76 = 1447 exactly: **every object this guest constructed got an
+/// answer**, and none of them fell to a missing contract term. Both halves of
+/// the identity answered — the zero on `mapping_names_no_surface` is the
+/// mapper-ref delegation landing identities rather than refusals, and before it
+/// every object of that type was unidentifiable by construction. The 5% that
+/// name no storage are the samplers, functions, pipeline states and views,
+/// which is a description of what they are rather than a shortfall.
+///
+/// That boot predates the `declared_storage_*` counts, so what it establishes is
+/// the identity's coverage and not the declaration's. The extent half is owed a
+/// reading of its own.
+///
 /// One arm is a fail line as well as a count.
 /// [`BackingIdRefusal::HeapPlaced`] is the one open contract term
 /// `BackingId`'s own doc still names: a heap's extent is unrecovered, so two
