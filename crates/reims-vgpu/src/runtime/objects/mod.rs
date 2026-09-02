@@ -1587,6 +1587,23 @@ pub enum LadderRung {
     /// rung — "the entry said this many bytes at that GVA and they could not be
     /// read" — and the entry it came from is gone by the time a caller reports.
     DescRead { declared_len: u32 },
+    /// The task's address space does not exist, so the reference is a slot in
+    /// no namespace.
+    ///
+    /// **The rung below [`Self::NoListEntry`]**, and it is a different
+    /// statement: an empty slot is a live task that has published nothing
+    /// there, and this is a reference into a task that was never defined or has
+    /// been deleted. The two used to be one answer because this device created a
+    /// task's namespace on demand; `reims_vgpu_core::lifecycle::Lifecycle`
+    /// refuses instead, and a name minted into a space with no page directory is
+    /// a name whose every address resolves through nothing.
+    ///
+    /// Unreachable through the two callers that can produce it — both ask
+    /// `lookup_list_entry` first, which requires `DeviceState::tasks` to hold an
+    /// active task, and that table and the owner's are written by the same pair
+    /// of functions. Named rather than assumed away, because the coupling is a
+    /// property of two functions and a reader of either one cannot see it.
+    NoTaskSpace,
 }
 
 /// Why construction of a retained sampler object did not complete.
@@ -2839,7 +2856,7 @@ pub fn resolve_resource<M: HostMemory>(
             crate::runtime::drain::note_store_route("object_named_before_constructed");
             existing
         }
-        None => declare_object_name(state, task_id, obj_ref, storage),
+        None => declare_object_name(state, task_id, obj_ref, storage)?,
     };
     let resource = Arc::new(TaskResource::new(entry, descriptor));
     Ok(state.task_resources.register(task_id, name, resource))
@@ -2854,25 +2871,22 @@ pub fn resolve_resource<M: HostMemory>(
 /// displacement here an event rather than the ordinary redeclaration the
 /// namespace also supports.
 ///
-/// # It is also where the next group's one refusal is measured
+/// # The refusal is the owner's now, and it is the one this group was gated on
 ///
-/// `reims_vgpu_core::lifecycle::Lifecycle` is the owner these namespaces move
-/// to, and its `create_resource` **refuses** `NoSuchTask` for a declaration into
-/// a task no `DefineTask` opened. This device does not: `declare_object` reaches
-/// for the task's namespace with `entry(task_id).or_default()`, so a declaration
-/// creates the namespace it needs. That difference is the resource-lifecycle
-/// group's equivalent of the channel gate G1 had to answer before it could move,
-/// and it is answered the same way — by counting it on a driven guest rather
-/// than by reasoning about when the guest sends what.
+/// `reims_vgpu_core::lifecycle::Lifecycle::create_resource` **refuses**
+/// `NoSuchTask` for a declaration into a task no `DefineTask` opened. This
+/// device used to create the namespace it needed —
+/// `entry(task_id).or_default()` — so the declaration always succeeded, and the
+/// difference was counted here against `DeviceState::tasks` as a proxy before
+/// the group moved.
 ///
-/// `DeviceState::tasks` is the exact proxy and not an approximation: its entries
-/// come from `CmdDefineTask2`, which is the same packet
-/// `LifecycleOp::DefineTask` is resolved from, so a task active here is a task
-/// the model would hold.
-///
-/// `object_declared_into_a_defined_task` is the denominator's other half —
-/// without it, a boot where every declaration named a live task and a boot where
-/// this device constructed nothing read the same.
+/// It is not a proxy any more and it is not reachable either. Both callers ask
+/// `lookup_list_entry` first, which requires an active `DeviceState::tasks`
+/// entry, and that table and the owner's tasks are written by the same pair of
+/// functions — `DeviceState::define_task` and `DeviceState::delete_task`. So a
+/// refusal here means those two tables have come apart, which is why it is a
+/// [`LadderRung::NoTaskSpace`] on the always-on channel rather than a silent
+/// `None`.
 ///
 /// # What a driven boot answered
 ///
@@ -2895,23 +2909,7 @@ fn declare_object_name(
     task_id: u32,
     obj_ref: u32,
     storage: Option<reims_vgpu_core::lifecycle::Storage>,
-) -> reims_vgpu_core::identity::ResourceId {
-    if state.tasks.is_active(task_id) {
-        crate::runtime::drain::note_store_route("object_declared_into_a_defined_task");
-    } else {
-        crate::runtime::drain::note_store_route("object_declared_into_an_undefined_task");
-        if crate::observe::first_sight(
-            "object_declared_into_an_undefined_task",
-            (u64::from(task_id) << 32) | u64::from(obj_ref),
-        ) {
-            crate::observe::fail(format!(
-                "object_declared_into_an_undefined_task task={task_id} ref={obj_ref} (this \
-                 device creates the namespace on demand and the lifecycle owner these \
-                 namespaces move to refuses the declaration, so the object would not be \
-                 named there at all)"
-            ));
-        }
-    }
+) -> Result<reims_vgpu_core::identity::ResourceId, LadderRung> {
     // **`None` is not `NoBytes`, and collapsing them is the lie this argument
     // exists to stop.** `NoBytes` is a claim — the object owns no memory, which
     // is true of most of a list — and `None` is this device failing to describe
@@ -2938,12 +2936,54 @@ fn declare_object_name(
             reims_vgpu_core::lifecycle::Storage::NoBytes
         }),
     );
+    let declared = match declared {
+        Ok(declared) => declared,
+        Err(refusal) => {
+            crate::runtime::drain::note_store_route("object_declared_into_an_undefined_task");
+            if crate::observe::first_sight(
+                "object_declared_into_an_undefined_task",
+                (u64::from(task_id) << 32) | u64::from(obj_ref),
+            ) {
+                crate::observe::fail(format!(
+                    "object_declared_into_an_undefined_task task={task_id} ref={obj_ref} \
+                     refusal={} (this reference reached a declaration through an object-list \
+                     entry, so DeviceState::tasks holds the task and the lifecycle owner does \
+                     not — the two tables are written by one pair of functions and have come \
+                     apart)",
+                    refusal.slug()
+                ));
+            }
+            return Err(LadderRung::NoTaskSpace);
+        }
+    };
+    crate::runtime::drain::note_store_route("object_declared_into_a_defined_task");
+    // Opened once, by name. A declaration names one resource, so the three
+    // fields below cannot be filled by it — an address interval, a deferred
+    // discard and a task redefinition all belong to other commands — and
+    // naming them here is what makes an arm that starts filling one a change at
+    // this site rather than a silent loss.
+    let crate::model::Acted {
+        teardowns,
+        remapped,
+        at_completion,
+        redefined,
+    } = declared.acted;
+    debug_assert!(
+        remapped.is_empty() && at_completion.is_empty() && redefined.is_empty(),
+        "a declaration obliges nothing but its displaced occupant's teardown"
+    );
     // A declaration over a slot that still held a live object owes that
     // occupant's teardown. It should be unreachable: every caller asked the
     // namespace first and found nothing. Reported rather than assumed away,
     // because if it ever fires the previous occupant's storage is one nothing
     // else will free.
-    if let Some(displaced) = declared.displaced {
+    //
+    // The owner carries the displaced occupant's teardown out through the
+    // effects rather than handing back the displacement for a caller to
+    // discharge — `Lifecycle::create_resource` retires the resident, the heap
+    // window and the content authority together, which is exactly what this
+    // site could not do when all it held was a namespace.
+    for teardown in teardowns {
         crate::runtime::drain::note_store_route("object_declared_over_a_live_name");
         if crate::observe::first_sight(
             "object_declared_over_a_live_name",
@@ -2951,15 +2991,13 @@ fn declare_object_name(
         ) {
             crate::observe::fail(format!(
                 "object_declared_over_a_live_name task={task_id} ref={obj_ref} \
-                 displaced_generation={:?} teardown={:?} (a declaration displaced a live \
-                 occupant after its caller had asked the namespace and been told the slot \
-                 was empty, so the two reads were not of one namespace and the displaced \
-                 occupant's storage is owed to nobody)",
-                displaced.id.generation, displaced.teardown,
+                 teardown={teardown:?} (a declaration displaced a live occupant after its \
+                 caller had asked the namespace and been told the slot was empty, so the two \
+                 reads were not of one namespace)"
             ));
         }
     }
-    declared.id
+    Ok(declared.id)
 }
 
 /// The name a guest reference has in its task, reading the guest's object list
@@ -3014,7 +3052,7 @@ pub fn name_resource<M: HostMemory>(
     let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
     let descriptor: Arc<[u8]> = Arc::from(read_descriptor(state, host, task_id, &entry)?);
     let storage = declared_storage(state, task_id, &entry, &descriptor).ok();
-    Some(declare_object_name(state, task_id, obj_ref, storage))
+    declare_object_name(state, task_id, obj_ref, storage).ok()
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
@@ -3730,6 +3768,48 @@ fn record_backing_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) 
 /// those, and it exists
 /// because a bare "reached nothing" cannot: an announcement with nothing to
 /// apply it to and an announcement that missed a live host copy read the same.
+/// The storage a re-pointed reference names *now*, in the lifecycle owner's
+/// vocabulary.
+///
+/// **Asked after the re-point, and that is the whole reason it is a function
+/// and not a resolver.** `reims_vgpu_core::lifecycle::ResolveRefusal::NeedsStorage`
+/// says a re-point's operation names pages that are not on the wire: the guest
+/// wired them itself and re-committed at the same GPU-VA, so the packet carries
+/// a task and a ref and nothing about the new memory. A resolver consulted while
+/// the operation was being built would answer with the *old* identity, because
+/// the storage incarnation has not moved yet — and one that moved it would be a
+/// mutation from the one function in the join that performs none.
+///
+/// So the caller applies this device's re-point first, and then asks what the
+/// reference names. That is the moment the answer is the new one.
+///
+/// `None` where the reference names no storage at all, or names storage this
+/// device cannot describe — both of which are a re-point the model is not told
+/// about, and the caller counts them.
+pub fn repointed_storage<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+) -> Option<(
+    reims_vgpu_core::identity::ResourceId,
+    reims_vgpu_core::access::BackingId,
+    reims_vgpu_core::access::ByteRange,
+)> {
+    let name = name_resource(state, host, task_id, obj_ref)?;
+    let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
+    let descriptor = read_descriptor(state, host, task_id, &entry)?;
+    match declared_storage(state, task_id, &entry, &descriptor) {
+        Ok(reims_vgpu_core::lifecycle::Storage::Dedicated { backing, extent }) => {
+            Some((name, backing, extent))
+        }
+        // A placement has no physical of its own to re-point — the owner
+        // refuses that by name — and `NoBytes` is a reference with nothing to
+        // move. Neither is an operation.
+        Ok(_) | Err(_) => None,
+    }
+}
+
 pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut H,

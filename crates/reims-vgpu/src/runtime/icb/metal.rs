@@ -419,9 +419,9 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
         .map_err(|rung| {
             let slug = crate::observe::ladder_slugs!("icb_frc_pipeline")(rung);
             match rung {
-                objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                    IcbStatus::Missing(slug)
-                }
+                objects::LadderRung::NoListEntry
+                | objects::LadderRung::DescRead { .. }
+                | objects::LadderRung::NoTaskSpace => IcbStatus::Missing(slug),
                 objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
             }
         })?;
@@ -442,9 +442,9 @@ pub fn fill_render_command<M: HostMemory + HostOps>(
             .map_err(|rung| {
                 let slug = crate::observe::ladder_slugs!("icb_frc_function")(rung);
                 match rung {
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        IcbStatus::Missing(slug)
-                    }
+                    objects::LadderRung::NoListEntry
+                    | objects::LadderRung::DescRead { .. }
+                    | objects::LadderRung::NoTaskSpace => IcbStatus::Missing(slug),
                     objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
                 }
             })?;

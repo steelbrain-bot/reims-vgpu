@@ -180,9 +180,15 @@ pub enum Gap {
     /// there is *exactly one* implementation with the terms, and it is
     /// `Lifecycle` — which owns names, heaps and content authority together, and
     /// which this device does not hold. So this gap does not close by adding a
-    /// resolver, a door or a translation. It closes when `Lifecycle` becomes
-    /// production state, which is the resource-lifecycle group's cutover, and
-    /// not before it.
+    /// resolver, a door or a translation.
+    ///
+    /// **Amended by the resource-lifecycle group's cutover: `Lifecycle` *is*
+    /// production state**, held by `DeviceState` and reached through its
+    /// lifetime doors. What is left is not a missing owner any more — it is that
+    /// this bridge is given namespaces and no `AccessSource`, and the source is
+    /// a `&mut` borrow of that owner for one task and one domain. It closes when
+    /// this bridge is handed one, which is the ordering and publication group's
+    /// work and not this one's.
     ExecResolution,
     /// The pages behind a re-pointed object, which its packet does not carry.
     ///
@@ -213,6 +219,16 @@ pub enum Gap {
     /// So the re-point's storage arrives when the *handler* becomes the model's
     /// operation, not before: it belongs to the resource-lifecycle group's
     /// cutover and not to a resolver added ahead of it.
+    ///
+    /// **That cutover has happened and this gap is still here, exactly as this
+    /// doc predicted.** `crate::runtime::drain`'s re-point arm now applies
+    /// `LifecycleOp::ReplacePhysical` — and it does so *after*
+    /// `crate::runtime::objects::replace_physical` has moved the incarnation,
+    /// reading the new storage through `objects::repointed_storage`. That
+    /// ordering is what a resolver consulted here cannot have: this function
+    /// runs before the handler, so the only identity available to it is the old
+    /// one. The gap therefore belongs to the bridge and not to the model, and it
+    /// closes if and when the handler's ordering is expressible through it.
     ReplacementStorage,
 }
 

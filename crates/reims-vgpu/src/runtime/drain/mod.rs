@@ -498,6 +498,82 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
 /// Emitted on the `OFF` channel and deduped per `(task, pfn, count)`: this is a
 /// lifecycle packet the guest re-sends, and the reading wanted is which distinct
 /// triples a boot produces, not how often.
+/// Build the model's operation for a lifetime packet, in this device's own
+/// namespaces.
+///
+/// **One join, not one per arm.** `reims_vgpu_core::lifecycle::operation` is the
+/// single place a kind picks which of the five record layouts its payload is,
+/// and it is exhaustive over the twelve kinds — so an arm that decoded its own
+/// record and built its own operation would be the second copy of that choice,
+/// and the copy that reads one command's offsets out of another's payload.
+///
+/// Both resolvers are this device's, and they are different namespaces: an
+/// object-list ref and a mapping id arrive as `u32`s that overlap numerically
+/// and name unrelated things. `crate::runtime::objects::TaskNames` answers the
+/// first, `DeviceState` the second.
+///
+/// `None` where the packet's bytes are not the command its opcode names, or a
+/// ref names nothing live — both reported here, because an arm that acted on a
+/// packet the model could not read is an arm the model has no record of.
+fn lifetime_operation<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    channel: reims_vgpu_protocol::packets::Channel,
+    opcode: u16,
+    payload: &[u8],
+) -> Option<reims_vgpu_core::lifecycle::LifecycleOp> {
+    let kind = reims_vgpu_core::lifecycle::LifecycleKind::of(channel, opcode)?;
+    let names = crate::runtime::objects::TaskNames::new(state, host);
+    match reims_vgpu_core::lifecycle::operation(kind, payload, &names, state) {
+        Ok(op) => Some(op),
+        Err(refusal) => {
+            note_store_route(refusal.slug());
+            if crate::observe::first_sight(
+                "lifetime_operation_unresolved",
+                (u64::from(opcode) << 32) | u64::from(kind as u16),
+            ) {
+                crate::observe::fail(format!(
+                    "lifetime_operation_unresolved kind={} op={opcode:#x} refusal={} (the \
+                     semantic model cannot read this packet as the command its opcode names, \
+                     so it has no record of what this device is about to do)",
+                    kind.name(),
+                    refusal.slug()
+                ));
+            }
+            None
+        }
+    }
+}
+
+/// Report anything a lifetime command obliged that its arm does not act on.
+///
+/// **Not a discard.** Each caller has already taken the obligations its command
+/// can produce; what reaches here is what the command's own contract says it
+/// cannot produce, and a non-empty one means the model has started saying
+/// something the device is not listening to. That is a line on the always-on
+/// channel, not a silence — the failure it prevents is exactly the one
+/// `Effects`' `#[must_use]` exists for, one step further out.
+fn note_inert_lifetime_effects(site: &'static str, acted: &crate::model::Acted) {
+    let counts = [
+        ("teardowns", acted.teardowns.len()),
+        ("remapped", acted.remapped.len()),
+        ("at_completion", acted.at_completion.len()),
+        ("redefined", acted.redefined.len()),
+    ];
+    for (field, n) in counts {
+        if n == 0 {
+            continue;
+        }
+        note_store_route_n("lifetime_effect_unacted", n as u64);
+        if crate::observe::first_sight("lifetime_effect_unacted", 0) {
+            crate::observe::fail(format!(
+                "lifetime_effect_unacted site={site} field={field} n={n} (the model obliged \
+                 work this command's arm does not perform, so it is owed to nobody)"
+            ));
+        }
+    }
+}
+
 fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
     let crate::protocol::fifo::SetObjectListCommand {
         task_id,
@@ -522,6 +598,24 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
         state.retire_bound_buffers_for_task(task_id),
     );
     let applied = state.set_object_list(task_id, pfn, count);
+    // The binding, in the model that owns what a reference resolves to. It
+    // retires nothing — a new table changes what an *unresolved* reference
+    // constructs, and the objects already declared keep their own deletes —
+    // which is the same contract the two retirements above implement on this
+    // device's caches. See `LifecycleOp::BindObjectList` for why the operation
+    // is the binding rather than the table's walk.
+    if let Some(acted) = state.apply_lifetime(
+        &reims_vgpu_core::lifecycle::LifecycleOp::BindObjectList {
+            task: reims_vgpu_core::identity::TaskId(task_id),
+            list: reims_vgpu_core::lifecycle::ObjectList {
+                page: reims_vgpu_core::identity::DirectoryFrame(pfn),
+                capacity: count,
+            },
+        },
+        "set_object_list",
+    ) {
+        note_inert_lifetime_effects("set_object_list", &acted);
+    }
     if crate::observe::first_sight(
         "set_object_list",
         (u64::from(task_id) << 48) ^ (u64::from(pfn) << 24) ^ u64::from(count),
@@ -3925,10 +4019,44 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // both. So these intervals are the page-table ranges and not merely
         // consistent with themselves. Observation only; nothing reads the
         // verdict. See `runtime::map_audit`.
+        // The notice, in the model that owns the address space it is about.
+        // `Lifecycle` holds nothing keyed by a guest address — deliberately, so
+        // that no resolution it hands out can go stale behind its back — so it
+        // performs nothing here and states the obligation instead: every
+        // resolution held over this interval was computed against pages the
+        // guest has since moved. The audit and the retirements below are this
+        // device discharging exactly that, and the direction they discharge it
+        // in is the model's `Remap::established` rather than a second reading of
+        // the opcode.
+        let remapped = state
+            .apply_lifetime(
+                &if matches!(family, MapFamily::MapMemory2) {
+                    reims_vgpu_core::lifecycle::LifecycleOp::MapMemory {
+                        task: reims_vgpu_core::identity::TaskId(task_id),
+                        span: reims_vgpu_core::access::GuestSpan { base: gva, length },
+                    }
+                } else {
+                    reims_vgpu_core::lifecycle::LifecycleOp::UnmapMemory {
+                        task: reims_vgpu_core::identity::TaskId(task_id),
+                        span: reims_vgpu_core::access::GuestSpan { base: gva, length },
+                    }
+                },
+                family.slug(),
+            )
+            .and_then(|acted| acted.remapped.into_iter().next());
         {
             let page_size = 1u64 << state.page_shift;
+            // The model's answer where there is one. A refusal is reported by
+            // the door and the audit still runs off the packet's own opcode:
+            // this device's caches alias pages whether or not the model kept a
+            // task for them, and an invalidation it skipped would leave a host
+            // view over memory the guest has taken back.
+            let established = remapped.map_or_else(
+                || matches!(family, MapFamily::MapMemory2),
+                |r| r.established,
+            );
             let intervals = state.map_audit.entry(task_id).or_default();
-            let verdict = if matches!(family, MapFamily::MapMemory2) {
+            let verdict = if established {
                 intervals.map(gva, length, page_size)
             } else {
                 intervals.unmap(gva, length)
@@ -4066,6 +4194,23 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // bookkeeping. Keeping page_entries after it lets later id reuse/clear
         // write pixels into pages the guest has recycled.
         let crate::protocol::fifo::DeleteBackingCommand { object_id, task_id } = retire;
+        // The retirement, in the model that owns the names over these bytes.
+        // The contract retires the backing *and* the resources that named it,
+        // so the teardowns below are the model's per-name answers rather than a
+        // second walk of anything here — and they are counted rather than acted
+        // on, because the host-side condemnation this arm performs is keyed by
+        // the mapping id and covers the same storage whichever names were on it.
+        if let Some(acted) = lifetime_operation(
+            state,
+            host,
+            reims_vgpu_protocol::packets::Channel::Child,
+            packet.opcode,
+            &packet.payload,
+        )
+        .and_then(|op| state.apply_lifetime(&op, family.slug()))
+        {
+            note_store_route_n("backing_retire_teardowns", acted.teardowns.len() as u64);
+        }
         // Never write guest pages here — the delete trails the guest's
         // CPU-side release asynchronously and the pages may already be
         // recycled (boot-16 PTE-corruption panic: a 14.7 MB delete-time
@@ -4138,6 +4283,25 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 // table names task object refs, most of which have no
                 // surface state by construction.
                 note_store_route_n("validity_miss_inv", miss as u64);
+                // The same statement, in the model that owns content authority
+                // — after the loop above, because that loop is what names the
+                // refs on this device and the model's list join resolves every
+                // ref or refuses the whole packet. The guest is declaring it
+                // CPU-authored these resources' pages: authority moves to the
+                // guest replica, outside the GPU timeline, and the device's own
+                // validity quads above are the host-cache half of the same
+                // event.
+                if let Some(acted) = lifetime_operation(
+                    state,
+                    host,
+                    reims_vgpu_protocol::packets::Channel::Child,
+                    packet.opcode,
+                    &packet.payload,
+                )
+                .and_then(|op| state.apply_lifetime(&op, family.slug()))
+                {
+                    note_inert_lifetime_effects(family.slug(), &acted);
+                }
                 let rec0 = cmd.records.first();
                 let oid = rec0.map(|r| r.object_id).unwrap_or(0);
                 let flags = rec0.map(|r| r.flags).unwrap_or(0);
@@ -4224,6 +4388,30 @@ fn apply_map_family<H: HostMemory + HostOps>(
                     cmd.task_id,
                     &cmd.object_ids,
                 );
+                // The command, in the model that owns content authority — after
+                // the naming above, because every ref resolves or the whole
+                // packet refuses, and this device names a reference the first
+                // time anything asks what it names. The model's answer is the
+                // deferred discards: a synchronise-and-discard offers each
+                // resource's copy for release, and the offer is taken only where
+                // nothing else still answers for those bytes.
+                //
+                // The transfers it can also owe are structurally none here —
+                // see `crate::model::state`'s effects door — and the
+                // resource-scoped submit below is this device's own deferred
+                // Store obligation, which is a different fact from content
+                // authority and stays where it is.
+                let deferred = lifetime_operation(
+                    state,
+                    host,
+                    reims_vgpu_protocol::packets::Channel::Child,
+                    packet.opcode,
+                    &packet.payload,
+                )
+                .and_then(|op| state.apply_lifetime(&op, family.slug()))
+                .map(|acted| acted.at_completion.len())
+                .unwrap_or(0);
+                note_store_route_n("lifetime_discard_offered", deferred as u64);
                 // Synchronization is resource-scoped. Apple batches the named
                 // resources into transfer encoders; synchronizing one object
                 // does not publish every other host-valid texture in the task.
@@ -4893,6 +5081,39 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         cmd.task_id,
                         cmd.object_id,
                     );
+                    // And then the model, in that order. The re-point's
+                    // operation names pages the packet does not carry, so the
+                    // storage is asked for *after* this device has moved the
+                    // incarnation — see `objects::repointed_storage` for why an
+                    // earlier answer is the old one.
+                    match crate::runtime::objects::repointed_storage(
+                        state,
+                        host,
+                        cmd.task_id,
+                        cmd.object_id,
+                    ) {
+                        Some((resource, backing, extent)) => {
+                            if let Some(acted) = state.apply_lifetime(
+                                &reims_vgpu_core::lifecycle::LifecycleOp::ReplacePhysical {
+                                    task: reims_vgpu_core::identity::TaskId(cmd.task_id),
+                                    resource,
+                                    backing,
+                                    extent,
+                                },
+                                "replace_physical",
+                            ) {
+                                note_store_route_n(
+                                    "replace_physical_teardowns",
+                                    acted.teardowns.len() as u64,
+                                );
+                            }
+                        }
+                        // The reference names no describable storage, so there
+                        // is no operation to state — counted, because a re-point
+                        // the model never hears about leaves its content
+                        // authority on the old pages.
+                        None => note_store_route("replace_physical_storage_undescribable"),
+                    }
                 }
                 Err(short) => {
                     note_short_payload("replace_physical", Some(channel_id), &short);
@@ -4979,6 +5200,22 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         cmd.task_id,
                         &cmd.object_ids,
                     );
+                    // The model's half of the same release, after the naming
+                    // above for the reason the list join gives: every ref
+                    // resolves or the whole packet refuses. It offers each
+                    // resource's copy at completion; this arm's own release is
+                    // of the transfer staging, which the model has no key for.
+                    let deferred = lifetime_operation(
+                        state,
+                        host,
+                        reims_vgpu_protocol::packets::Channel::Child,
+                        packet.opcode,
+                        &packet.payload,
+                    )
+                    .and_then(|op| state.apply_lifetime(&op, "discard_resources"))
+                    .map(|acted| acted.at_completion.len())
+                    .unwrap_or(0);
+                    note_store_route_n("lifetime_discard_offered", deferred as u64);
                     let discarded = crate::runtime::writeback_debt::discard_gva_resources(
                         state,
                         cmd.task_id,

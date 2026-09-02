@@ -13950,7 +13950,10 @@ pub(crate) fn load_vulkan_sampler<M: HostMemory + HostOps>(
         objects::resolve_sampler_state(state, host, task_id, sampler_ref).map_err(|failure| {
             match failure {
                 objects::SamplerResolveError::Rung(rung) => match rung {
-                    objects::LadderRung::NoListEntry => {
+                    // The task's space is gone or the slot is empty. One
+                    // decline for both: the sampler this binding names is not
+                    // there, and the binding is refused the same way.
+                    objects::LadderRung::NoListEntry | objects::LadderRung::NoTaskSpace => {
                         DrawPreparationDecline::SamplerEntryMissing {
                             sampler_ref,
                             binding,

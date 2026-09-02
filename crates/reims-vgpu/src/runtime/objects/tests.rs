@@ -3510,15 +3510,14 @@ fn a_query_reply_destination_is_measured_against_the_allocations_this_device_hol
     );
 }
 
-/// A declaration into a task no definition opened is told apart from one into a
-/// live task.
+/// A declaration into a task no definition opened is refused, and one into a
+/// live task is not.
 ///
 /// The resource-lifecycle group's equivalent of the channel gate G1 had to
-/// answer. `Lifecycle::create_resource` refuses `NoSuchTask`; this device
-/// creates the namespace on demand with `entry(task_id).or_default()`. If a
-/// driven guest ever declares into an undefined task, the object would not be
-/// named in the new owner at all — so the difference is counted before the move
-/// rather than discovered after it.
+/// answer, and it is no longer a census: `Lifecycle::create_resource` refuses
+/// `NoSuchTask`, this device holds no namespace of its own to create on demand,
+/// and the refusal is the answer the declaration door returns. A driven boot of
+/// 3902 declarations read zero of them before the move.
 #[test]
 fn a_declaration_into_an_undefined_task_is_told_apart_from_one_into_a_live_task() {
     use crate::runtime::drain::store_route_count;
@@ -3553,17 +3552,20 @@ fn a_declaration_into_an_undefined_task_is_told_apart_from_one_into_a_live_task(
         "a live task is the case the lifecycle owner also admits"
     );
 
-    // The same declaration in a task nothing defined. It succeeds here — the
-    // namespace is created on demand — and that is exactly what the new owner
-    // would refuse.
+    // The same declaration in a task nothing defined. The owner refuses it,
+    // and the door says so with the rung below `no_list_entry`: the reference is
+    // a slot in no namespace at all.
     let undescribable = store_route_count("object_declared_with_undescribable_storage");
-    let name = super::declare_object_name(&state, 99, 7, None);
-    assert_eq!(name.slot.0, 7, "this device names it anyway");
+    assert_eq!(
+        super::declare_object_name(&state, 99, 7, None),
+        Err(super::LadderRung::NoTaskSpace),
+        "a task nothing defined has no address space for a name to live in"
+    );
     assert_eq!(
         store_route_count("object_declared_with_undescribable_storage"),
         undescribable + 1,
-        "and storage it could not describe is counted rather than claimed as \
-         `NoBytes` without a word"
+        "and storage it could not describe is still counted rather than claimed as \
+         `NoBytes` without a word — the refusal is about the task, not the bytes"
     );
     assert_eq!(
         (
@@ -3571,8 +3573,128 @@ fn a_declaration_into_an_undefined_task_is_told_apart_from_one_into_a_live_task(
             store_route_count("object_declared_into_an_undefined_task"),
         ),
         (defined + 1, undefined + 1),
-        "and the counter says the new owner would not have"
+        "and the refusal is on the same counter the census read zero on"
     );
+    assert_eq!(
+        state.object_name(99, 7),
+        None,
+        "nothing was named, which is the difference the census was measuring"
+    );
+}
+
+/// A task redefinition reads whether its root moved from the model, not from a
+/// second copy of the previous directory.
+///
+/// The two routes decide how bad a redefinition is: at the same root the task
+/// re-declares the space it already had, and at a different one everything the
+/// guest published into the old space reads back as whatever the new pages
+/// hold. `DeviceState::define_task` used to answer that from
+/// `TaskEntry::directory_pfn` — its own record, beside the owner's — and this
+/// asserts it now answers from `Redefinition::root_moved`.
+#[test]
+fn a_task_redefinition_reads_its_root_move_from_the_model() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let same = store_route_count("define_task_redefined_live_same_root");
+    let moved = store_route_count("define_task_redefined_live_new_root");
+
+    // A first definition is not a redefinition: there is no previous space for
+    // a root to have moved from.
+    state.define_task(4, 0x1000, 0x20);
+    assert_eq!(
+        (
+            store_route_count("define_task_redefined_live_same_root"),
+            store_route_count("define_task_redefined_live_new_root"),
+        ),
+        (same, moved),
+        "a first definition replaces nothing"
+    );
+
+    state.define_task(4, 0x1000, 0x20);
+    assert_eq!(
+        (
+            store_route_count("define_task_redefined_live_same_root"),
+            store_route_count("define_task_redefined_live_new_root"),
+        ),
+        (same + 1, moved),
+        "the same root re-declares the space the task already had"
+    );
+
+    state.define_task(4, 0x1000, 0x21);
+    assert_eq!(
+        (
+            store_route_count("define_task_redefined_live_same_root"),
+            store_route_count("define_task_redefined_live_new_root"),
+        ),
+        (same + 1, moved + 1),
+        "and a different root is a different address space under one id"
+    );
+}
+
+/// A name is retired by the model, and the teardown the device routes on is the
+/// model's answer.
+///
+/// Two facts in one test because they are one event. `DeviceState::delete_object`
+/// asks the owner what the departing name owed, and the owner is also what
+/// stops the reference resolving — so a device that kept its own namespace
+/// beside it could route on one answer while resolving against the other.
+#[test]
+fn a_deleted_name_stops_resolving_and_its_teardown_is_the_models() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::lifecycle::Storage;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.define_task(6, 0x1000, 0x30);
+
+    // An object that owns no memory: the owner answers `NoStorage`, which is
+    // its own teardown variant and not a `Now` over a placeholder backing.
+    let no_bytes = state
+        .declare_object(6, 3, Storage::NoBytes)
+        .expect("task 6 is defined")
+        .id;
+    assert_eq!(state.object_name(6, 3), Some(no_bytes));
+    let none = store_route_count("object_teardown_no_storage");
+    // The return value is "did a memo or a decoded object go with it", and a
+    // name with neither answers `false`. What moved is the name, which is what
+    // the two assertions below are about.
+    let _ = state.delete_object(6, 3);
+    assert_eq!(
+        store_route_count("object_teardown_no_storage"),
+        none + 1,
+        "a name over no bytes owes no teardown, and says so in its own variant"
+    );
+    assert_eq!(
+        state.object_name(6, 3),
+        None,
+        "and the reference resolves to nothing afterwards"
+    );
+
+    // One that owns its own pages: nothing else names them, so the teardown is
+    // `Now` and the storage is the caller's to free.
+    let dedicated = state
+        .declare_object(
+            6,
+            4,
+            Storage::Dedicated {
+                backing: reims_vgpu_core::access::BackingId(0x55),
+                extent: reims_vgpu_core::access::ByteRange {
+                    offset: 0,
+                    length: 0x1000,
+                },
+            },
+        )
+        .expect("task 6 is defined")
+        .id;
+    let now = store_route_count("object_teardown_now");
+    let _ = state.delete_object(6, 4);
+    assert_eq!(
+        store_route_count("object_teardown_now"),
+        now + 1,
+        "its own pages, named by nothing else, are free the moment the name goes"
+    );
+    assert_eq!(state.object_name(6, 4), None);
+    let _ = dedicated;
 }
 
 /// A reply destination is identified in the space its own question uses, and

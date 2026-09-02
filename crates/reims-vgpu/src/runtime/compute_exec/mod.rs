@@ -1124,9 +1124,9 @@ pub(crate) fn stage_buffer_with_extent<M: HostMemory + HostOps>(
                 )),
                 match rung {
                     objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        String::new()
-                    }
+                    objects::LadderRung::NoListEntry
+                    | objects::LadderRung::DescRead { .. }
+                    | objects::LadderRung::NoTaskSpace => String::new(),
                 },
             )
         }
@@ -2370,9 +2370,9 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 )),
                 match rung {
                     objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        String::new()
-                    }
+                    objects::LadderRung::NoListEntry
+                    | objects::LadderRung::DescRead { .. }
+                    | objects::LadderRung::NoTaskSpace => String::new(),
                 },
             );
         }

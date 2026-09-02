@@ -1554,9 +1554,11 @@ fn load_depth_stencil_state<M: HostMemory + HostOps>(
         &[OBJECT_TYPE_SERIALIZER_OBJECT],
     )
     .map_err(|rung| match rung {
-        objects::LadderRung::NoListEntry => MetalStateDecline::DepthStencilEntryMissing {
-            depth_stencil_ref: ds_ref,
-        },
+        objects::LadderRung::NoListEntry | objects::LadderRung::NoTaskSpace => {
+            MetalStateDecline::DepthStencilEntryMissing {
+                depth_stencil_ref: ds_ref,
+            }
+        }
         objects::LadderRung::WrongType { got } => MetalStateDecline::DepthStencilObjectType {
             depth_stencil_ref: ds_ref,
             object_type: got,
@@ -2043,10 +2045,12 @@ fn load_sampler<M: HostMemory + HostOps>(
         objects::resolve_sampler_state(state, host, task_id, sampler_ref).map_err(|failure| {
             match failure {
                 objects::SamplerResolveError::Rung(rung) => match rung {
-                    objects::LadderRung::NoListEntry => MetalStateDecline::SamplerEntryMissing {
-                        sampler_ref,
-                        index: slot,
-                    },
+                    objects::LadderRung::NoListEntry | objects::LadderRung::NoTaskSpace => {
+                        MetalStateDecline::SamplerEntryMissing {
+                            sampler_ref,
+                            index: slot,
+                        }
+                    }
                     objects::LadderRung::WrongType { got } => {
                         MetalStateDecline::SamplerObjectType {
                             sampler_ref,

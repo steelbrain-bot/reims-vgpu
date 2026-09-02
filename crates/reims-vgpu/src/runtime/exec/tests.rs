@@ -1924,8 +1924,10 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
     let host = FakeHost::new();
     // Published through the namespace, because that is the only issuer of the
     // name the memo is keyed by.
+    state.define_task(1, 0x1000, 1);
     let name = state
         .declare_object(1, 9, reims_vgpu_core::lifecycle::Storage::NoBytes)
+        .expect("task 1 is defined")
         .id;
     let first = state.task_resources.register(
         1,
@@ -1959,6 +1961,7 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
     // generation is what tells the replacement from what it replaced.
     let replacement_name = state
         .declare_object(1, 9, reims_vgpu_core::lifecycle::Storage::NoBytes)
+        .expect("task 1 is defined")
         .id;
     assert_ne!(replacement_name, name);
     let replacement = state.task_resources.register(

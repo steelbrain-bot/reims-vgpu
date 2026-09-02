@@ -6,7 +6,7 @@ use crate::runtime::decode::resource::{
 };
 use reims_vgpu_core::access::BackingId;
 use reims_vgpu_core::identity::{ObjectListRef, ResourceId};
-use reims_vgpu_core::namespace::{Declared, Namespace, Teardown};
+use reims_vgpu_core::namespace::Teardown;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -2671,6 +2671,105 @@ impl NamedMappings {
     }
 }
 
+/// A name the lifecycle owner published, and what publishing it obliged.
+///
+/// Two things because a declaration is two things. The name is what the caller
+/// asked for; the effects are the previous occupant's — a guest that writes
+/// over a live object-list slot ends the object that was there with no delete
+/// packet at all, and the teardown that owes is carried out here or by nobody.
+#[must_use = "a declaration's effects are the displaced occupant's teardown"]
+pub struct Declaration {
+    pub id: ResourceId,
+    pub acted: Acted,
+}
+
+/// The obligations of a lifecycle operation that this device *acts on* rather
+/// than counts.
+///
+/// [`note_lifecycle_effects`] is the one place `reims_vgpu_core::lifecycle::Effects`
+/// is opened, and it splits the six into two kinds. Four of them name work only
+/// this device can do — it holds the host textures a teardown frees, the
+/// resolution caches a remap invalidates, the transfer stagings a discard
+/// releases, and the per-task caches a redefinition ends — so they arrive here
+/// as values. The other two are counted there and are not in this type, because
+/// there is nothing on this device for them to drive; see that function.
+#[must_use = "every field here is work the model has already decided and nothing else will do"]
+pub struct Acted {
+    pub teardowns: Vec<reims_vgpu_core::namespace::Teardown>,
+    pub remapped: Vec<reims_vgpu_core::lifecycle::Remap>,
+    pub at_completion: Vec<reims_vgpu_core::lifecycle::DeferredDiscard>,
+    pub redefined: Vec<reims_vgpu_core::lifecycle::Redefinition>,
+}
+
+/// Open one lifecycle operation's effects, count what this device does not act
+/// on, and hand back what it does.
+///
+/// **The one destructure, so a seventh obligation is a compile error.** Every
+/// door and every lifetime arm reaches the owner's `Effects` through here; a
+/// caller that named three fields by hand would be correct only for as long as
+/// the operation it calls fills exactly those three, which is not a fact a call
+/// site can see, and the failure is an obligation that was owed and then
+/// dropped on the way out.
+///
+/// # The two that are counted here and not returned
+///
+/// * **`storage_freed`** is heap storage whose last allocation went with the
+///   operation. This device declares no heap placement at all —
+///   `crate::runtime::objects::declared_storage` refuses one by name, because a
+///   heap's extent is unrecovered — so the owner's per-task `Heaps` is empty and
+///   this list cannot be non-empty. Counted rather than asserted: a reading
+///   above zero is the day the heap extent landed and this became work.
+/// * **`transfers`** are copies owed before a completion stamp may publish, and
+///   they are produced only where a replica is behind. Nothing in this device
+///   calls `Lifecycle::record_write`, so `Replica::DeviceOwned` never becomes
+///   authoritative over any byte, so no read of the guest's pages is ever
+///   behind and no transfer can be owed. The device's own deferred-Store
+///   obligation is `crate::runtime::writeback_debt`'s and is a different fact —
+///   it is about a render pass that has already run, not about content
+///   authority the model tracks. A reading above zero here means the content
+///   ledger has started deciding something, and that is a change worth a line
+///   on the always-on channel rather than a silent one.
+fn note_lifecycle_effects(
+    effects: reims_vgpu_core::lifecycle::Effects,
+    site: &'static str,
+) -> Acted {
+    let reims_vgpu_core::lifecycle::Effects {
+        transfers,
+        teardowns,
+        storage_freed,
+        at_completion,
+        remapped,
+        redefined,
+    } = effects;
+    if !storage_freed.is_empty() {
+        crate::runtime::drain::note_store_route_n(
+            "lifecycle_storage_freed",
+            storage_freed.len() as u64,
+        );
+        crate::observe::fail(format!(
+            "lifecycle_storage_freed site={site} n={} (this device places nothing in a heap, so \
+             the owner's heaps hold no storage to free — a heap extent has been recovered \
+             somewhere and this is now work)",
+            storage_freed.len()
+        ));
+    }
+    if !transfers.is_empty() {
+        crate::runtime::drain::note_store_route_n("lifecycle_transfers", transfers.len() as u64);
+        crate::observe::fail(format!(
+            "lifecycle_transfers site={site} n={} (nothing calls Lifecycle::record_write, so no \
+             replica can be behind — the content ledger has started deciding transfers and \
+             nothing here executes them)",
+            transfers.len()
+        ));
+    }
+    Acted {
+        teardowns,
+        remapped,
+        at_completion,
+        redefined,
+    }
+}
+
 /// Full device model state (backend-independent).
 #[derive(Debug)]
 pub struct DeviceState {
@@ -2799,7 +2898,23 @@ pub struct DeviceState {
     /// Behind a lock for [`TaskResources`]' reason: the resolve path holds
     /// [`DeviceState`] shared, and `reims_vgpu_core::namespace::Namespace`
     /// counts its own resolutions, so even a lookup takes `&mut`.
-    namespaces: Mutex<BTreeMap<u32, Namespace>>,
+    ///
+    /// **The semantic model's lifecycle owner, not a map of namespaces.** This
+    /// field held `BTreeMap<u32, Namespace>` until the resource-lifecycle group
+    /// moved: one namespace per task, and nothing owning the events that begin
+    /// or end them. `reims_vgpu_core::lifecycle::Lifecycle` owns the
+    /// namespaces, the per-task heaps and the session's content authority
+    /// together, because the twelve lifetime commands move all three — a device
+    /// that took only the first would be keeping the second record of the other
+    /// two, which is the thing the replacement plan forbids.
+    ///
+    /// **Nothing outside the doors below names this field**, and that is the
+    /// group's disjointness claim in its structural form: the legacy path
+    /// cannot reach this state except through
+    /// [`Self::object_name`], [`Self::declare_object`],
+    /// [`Self::retire_object_name`], [`Self::delete_task_namespace`] and the
+    /// two task-lifetime entry points, all of which moved in one commit.
+    lifecycle: Mutex<reims_vgpu_core::lifecycle::Lifecycle>,
     /// Immutable sampler objects in the sampler API's separate ref space.
     pub task_sampler_states: TaskSamplerStates,
     /// Immutable depth-stencil objects in that API's separate ref space.
@@ -3203,7 +3318,7 @@ impl DeviceState {
             node_guard: std::collections::BTreeMap::new(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
-            namespaces: Mutex::new(BTreeMap::new()),
+            lifecycle: Mutex::new(reims_vgpu_core::lifecycle::Lifecycle::new()),
             task_sampler_states: TaskSamplerStates::default(),
             task_depth_stencil_states: TaskDepthStencilStates::default(),
             rail: OnceLock::new(),
@@ -3631,15 +3746,17 @@ impl DeviceState {
         // the guest published into the old one reads back as zero. macOS 13 does
         // not do this and macOS 26 does, which is why it is counted separately
         // from a first definition rather than folded into one route.
-        if self.tasks.is_active(task_id) {
-            let same_root = self
-                .tasks
-                .get(task_id)
-                .is_some_and(|t| t.directory_pfn == directory_pfn);
-            crate::runtime::drain::note_store_route(if same_root {
-                "define_task_redefined_live_same_root"
-            } else {
+        // The owner's answer, not a second derivation of it beside the owner.
+        // `Lifecycle::define_task` ends the previous address space and reports
+        // the pair of page-table roots; `Redefinition::root_moved` is the
+        // question this route used to ask of `TaskEntry::directory_pfn`, and two
+        // records of one fact are what this group moved to stop.
+        let redefined = self.define_task_namespace(task_id, directory_pfn);
+        if let Some(redefinition) = redefined {
+            crate::runtime::drain::note_store_route(if redefinition.root_moved() {
                 "define_task_redefined_live_new_root"
+            } else {
+                "define_task_redefined_live_same_root"
             });
         }
         // Drop objects for this task on redefine.
@@ -3653,7 +3770,6 @@ impl DeviceState {
         }
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
-        self.delete_task_namespace(task_id);
         self.task_sampler_states.delete_task(task_id);
         crate::runtime::drain::note_store_route_n(
             "ds_state_task_deleted",
@@ -3903,18 +4019,22 @@ impl DeviceState {
     /// has a *name*, and only a name can key [`TaskResources`].
     ///
     /// Takes `&self`, because resolution happens on the shared-borrow path and
-    /// this asks the namespace's non-consuming door
-    /// (`reims_vgpu_core::resolve::RefResolver`) rather than the one that hands
-    /// out leases: a lookup that minted a lease nobody acquired would be a claim
-    /// this device never pays off.
+    /// this asks the owner's non-consuming door
+    /// (`reims_vgpu_core::resolve::TaskNamespaces`) rather than the one that
+    /// hands out leases: a lookup that minted a lease nobody acquired would be a
+    /// claim this device never pays off.
+    ///
+    /// Routing through the owner rather than through one task's namespace is
+    /// what makes "which task's slots is this reference in" a question with one
+    /// answer. A task the owner does not hold answers `None`, which is the same
+    /// answer an empty slot gives and is right for both.
     #[must_use]
     pub fn object_name(&self, task_id: u32, obj_ref: u32) -> Option<ResourceId> {
-        use reims_vgpu_core::resolve::RefResolver as _;
-        self.namespaces
+        use reims_vgpu_core::resolve::TaskNamespaces as _;
+        self.lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&task_id)?
-            .resource(obj_ref)
+            .resource(reims_vgpu_core::identity::TaskId(task_id), obj_ref)
     }
 
     /// The resource this device constructed for a guest reference, if it has
@@ -3934,77 +4054,206 @@ impl DeviceState {
     /// Publish an object into a task's namespace and take its name.
     ///
     /// `storage` is the whole of what this device could establish about the
-    /// object's bytes, in the vocabulary
-    /// `reims_vgpu_core::lifecycle::Lifecycle` will take when these namespaces
-    /// move to it. `Storage::NoBytes` is an object that owns no memory, which is
-    /// most of a list — see `crate::runtime::objects::declared_storage`. An
-    /// object whose storage this device *cannot describe* is not expressible
-    /// here at all and never reaches this door: that distinction is the caller's
-    /// to make and to count, because `NoBytes` is a claim and "I could not tell"
-    /// is not.
+    /// object's bytes, in the lifecycle owner's own vocabulary.
+    /// `Storage::NoBytes` is an object that owns no memory, which is most of a
+    /// list — see `crate::runtime::objects::declared_storage`. An object whose
+    /// storage this device *cannot describe* is not expressible here at all and
+    /// never reaches this door: that distinction is the caller's to make and to
+    /// count, because `NoBytes` is a claim and "I could not tell" is not.
     ///
-    /// Returns the whole [`Declared`], displacement included, because a
-    /// declaration over a slot that still held a live object is an event with an
-    /// owed teardown and dropping it would leak the previous occupant's storage.
-    /// `Declared` carries the `#[must_use]` itself, so it is not restated here.
+    /// # Errors
+    ///
+    /// The owner's refusal, unchanged. `NoSuchTask` is the reachable one — a
+    /// declaration into a task no `CmdDefineTask2` opened — and a driven boot
+    /// of 3902 declarations read zero of them before this door moved.
     pub fn declare_object(
         &self,
         task_id: u32,
         obj_ref: u32,
         storage: reims_vgpu_core::lifecycle::Storage,
-    ) -> Declared {
-        use reims_vgpu_core::lifecycle::Storage;
-        // The one place a `Storage` is flattened to what a namespace slot holds,
-        // and it is here because the loss is the namespace's: a slot records
-        // *which* storage a name is over and not how much of it, so the extent
-        // has nowhere to go on this side of the move. A caller doing the
-        // flattening would be deciding that on the namespace's behalf, and both
-        // callers were doing it identically, which is one copy too many of a
-        // decision with one owner.
-        //
-        // `Placed` is unreachable from this device today —
-        // `crate::runtime::objects::declared_storage` refuses a heap placement
-        // by name, because a heap's extent is unrecovered — and it is answered
-        // with the heap's backing rather than with `None`, because a placed
-        // resource does have storage and saying otherwise would be the invented
-        // absence the refusal exists to avoid.
-        let backing = match storage {
-            Storage::Dedicated { backing, .. } => Some(backing),
-            Storage::Placed { .. } | Storage::NoBytes => None,
-        };
-        self.namespaces
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(task_id)
-            .or_default()
-            .declare(ObjectListRef(obj_ref), backing)
+    ) -> Result<Declaration, reims_vgpu_core::lifecycle::Refusal> {
+        use reims_vgpu_core::identity::TaskId;
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        use reims_vgpu_core::resolve::TaskNamespaces as _;
+        let task = TaskId(task_id);
+        let mut owner = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        // The whole `Storage` reaches the owner, extent included. This door used
+        // to flatten it to the backing a namespace slot records, because a
+        // namespace was all this device held; the owner holds the content
+        // authority too, and the extent is what that needs — a dedicated
+        // resource's own pages are authoritative over exactly its bytes, and a
+        // flattened declaration would claim the whole backing for a resource
+        // that is a window of one.
+        let effects = owner.apply(&LifecycleOp::CreateResource {
+            task,
+            slot: ObjectListRef(obj_ref),
+            storage,
+        })?;
+        // Asked of the owner that just published it, under the same lock, so
+        // this is the name this declaration minted rather than one a later
+        // redeclaration replaced it with. `apply` returns the operation's
+        // effects and not its name — no other operation has one — so the second
+        // read is the join, and the lock is what makes the pair one event.
+        let id = owner
+            .resource(task, obj_ref)
+            .expect("the declaration published this slot");
+        drop(owner);
+        Ok(Declaration {
+            id,
+            acted: note_lifecycle_effects(effects, "declare_object"),
+        })
     }
 
     /// Retire a name: stop it resolving, and leave accepted work alone.
     ///
     /// `None` when the slot held nothing this device had named — the guest
     /// deleting an object it never made this device construct, which is
-    /// ordinary and not a refusal worth a type here.
+    /// ordinary and not a refusal worth a type here. The owner's `NoSuchTask`
+    /// collapses into the same `None` for the same reason: a name in a task
+    /// that does not exist is a name that resolves to nothing.
     #[must_use]
     pub fn retire_object_name(&self, task_id: u32, name: ResourceId) -> Option<Teardown> {
-        self.namespaces
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        let effects = self
+            .lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&task_id)?
-            .delete(name)
-            .ok()
+            .apply(&LifecycleOp::DeleteResource {
+                task: reims_vgpu_core::identity::TaskId(task_id),
+                resource: name,
+            })
+            .ok()?;
+        // Exactly one, because a delete names one resource. Taken as the
+        // caller's answer rather than counted away: `delete_object` routes on
+        // which teardown it is, and that answer has one source now.
+        note_lifecycle_effects(effects, "retire_object_name")
+            .teardowns
+            .into_iter()
+            .next()
     }
 
     /// Drop a task's whole object namespace.
     ///
     /// Every name in it ends with the address space, which is the same event
     /// that ends the storage those names resolved to — see
-    /// [`Self::bump_task_storage_incarnations`].
+    /// [`Self::bump_task_storage_incarnations`]. The owner performs both: the
+    /// per-name teardowns arrive as effects, and this device's own per-name
+    /// caches are dropped by the two callers around it.
+    ///
+    /// A task the owner does not hold is not an error here. It is the ordinary
+    /// case at a first definition, where there is no previous address space to
+    /// end.
     fn delete_task_namespace(&self, task_id: u32) {
-        self.namespaces
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        let applied = self
+            .lifecycle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&task_id);
+            .apply(&LifecycleOp::DeleteTask {
+                task: reims_vgpu_core::identity::TaskId(task_id),
+            });
+        if let Ok(effects) = applied {
+            let acted = note_lifecycle_effects(effects, "delete_task_namespace");
+            crate::runtime::drain::note_store_route_n(
+                "task_namespace_teardowns",
+                acted.teardowns.len() as u64,
+            );
+        }
+    }
+
+    /// Apply one lifetime command to the semantic model and take the work it
+    /// obliged.
+    ///
+    /// **The door the nine wire-borne lifetime commands go through**, beside the
+    /// three that have doors of their own because this device reaches them from
+    /// somewhere other than a packet — a declaration is produced by resolution,
+    /// and a task definition and deletion are reached from the device's own
+    /// task table as well as from the wire.
+    ///
+    /// `None` is a refusal, reported on the always-on channel and named. Every
+    /// one of the four the owner can make is either measured at zero on a driven
+    /// guest or unreachable by construction:
+    ///
+    /// * `NoSuchTask` — 14 644 lifetime commands on a driven boot, none of them
+    ///   into a task no `CmdDefineTask2` opened. See the register's live
+    ///   validation table.
+    /// * `Namespace` — every command that names a resource resolved that name
+    ///   through this same owner a moment earlier, and
+    ///   `resolve::TaskNamespaces::resource` answers `Some` only for a slot live
+    ///   at its own generation, which is exactly what `Namespace::resolve`
+    ///   accepts.
+    /// * `Heap` and `PlacedResourceHasNoPhysical` — this device declares no heap
+    ///   placement at all, so the owner's per-task heaps are empty and no
+    ///   resident is `Placed`.
+    ///
+    /// A refusal is therefore a statement that one of those three arguments has
+    /// stopped holding, which is worth a line rather than a dropped packet.
+    #[must_use = "the work a lifetime command obliged is work nothing else does"]
+    pub fn apply_lifetime(
+        &self,
+        op: &reims_vgpu_core::lifecycle::LifecycleOp,
+        site: &'static str,
+    ) -> Option<Acted> {
+        match self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(op)
+        {
+            Ok(effects) => Some(note_lifecycle_effects(effects, site)),
+            Err(refusal) => {
+                crate::runtime::drain::note_store_route(refusal.slug());
+                if crate::observe::first_sight(
+                    "lifetime_command_refused",
+                    (u64::from(op.task().0) << 16) | u64::from(op.kind() as u16),
+                ) {
+                    crate::observe::fail(format!(
+                        "lifetime_command_refused kind={} task={} refusal={} (the semantic \
+                         model refused a lifetime packet this device would have acted on)",
+                        op.kind().name(),
+                        op.task().0,
+                        refusal.slug()
+                    ));
+                }
+                None
+            }
+        }
+    }
+
+    /// Open a task's address space in the lifecycle owner, and say what the
+    /// definition replaced.
+    ///
+    /// `None` at a first definition. `Some` when a live task was redefined
+    /// under the same id, carrying the owner's own answer about whether the
+    /// page-table root moved — which is the question that decides whether what
+    /// the guest published into the old space is still there, and it is read
+    /// from the owner rather than re-derived beside it.
+    fn define_task_namespace(
+        &self,
+        task_id: u32,
+        directory_pfn: u32,
+    ) -> Option<reims_vgpu_core::lifecycle::Redefinition> {
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        let effects = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(&LifecycleOp::DefineTask {
+                task: reims_vgpu_core::identity::TaskId(task_id),
+                // The class bit is not this device's to carry: it holds no
+                // registry keyed by it, and the owner's own `kernel` field
+                // exists so the kernel task and user task zero are two
+                // registrations of slot zero rather than one.
+                kernel: task_id == 0,
+                directory: reims_vgpu_core::identity::DirectoryFrame(directory_pfn),
+            })
+            .expect("a definition opens the task it names");
+        let mut acted = note_lifecycle_effects(effects, "define_task_namespace");
+        crate::runtime::drain::note_store_route_n(
+            "task_namespace_teardowns",
+            acted.teardowns.len() as u64,
+        );
+        acted.redefined.pop()
     }
 
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {

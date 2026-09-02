@@ -1428,7 +1428,9 @@ fn resolve_index_window_reason<M: HostMemory>(
     }
     let (gva, size) = objects::resolve_buffer_span(state, host, task_id, info.index_buffer_ref)
         .map_err(|refusal| match refusal {
-            objects::BufferSpanRefusal::Rung(objects::LadderRung::NoListEntry) => R::EntryMissing,
+            objects::BufferSpanRefusal::Rung(
+                objects::LadderRung::NoListEntry | objects::LadderRung::NoTaskSpace,
+            ) => R::EntryMissing,
             objects::BufferSpanRefusal::Rung(objects::LadderRung::WrongType { .. }) => {
                 R::ObjectType
             }
