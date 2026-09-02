@@ -3647,6 +3647,47 @@ fn a_dual_plane_descriptor_decodes_both_planes_and_the_shared_trailer() {
     );
 }
 
+/// A dual-plane texture names the one allocation its two planes share, and it
+/// is the same window a single-plane texture over that handle names.
+///
+/// It answered `None` here, listed beside the mapper-ref texture as reaching
+/// its pages through a mapping. It does not reach a mapping at all: it is built
+/// from paging info in its own task, and the handle and allocation size the
+/// planes are cut from sit in the one object header both share — which the
+/// decoder above asserts by reading `0x51` out of each plane.
+///
+/// The consequence of the `None` was not a missing convenience. A window is
+/// what carries a storage incarnation and what claims a first reference, so
+/// with none of these objects would ever be sighted as an alias of anything,
+/// and a `CmdReplacePhysical` naming one would advance no incarnation at all.
+#[test]
+fn a_dual_plane_texture_names_the_one_allocation_its_planes_share() {
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let b = dual_plane_body([1, 1], (1920, 1080), MTL_FORMAT_BGRA8_UNORM);
+    let window = decode_descriptor(OBJECT_TYPE_DUAL_PLANE_TEXTURE, &b)
+        .expect("a well-formed body decodes")
+        .backing_window(PAGE_SHIFT_ARM64E);
+    assert_eq!(
+        window,
+        Some((0x51u64 << PAGE_SHIFT_ARM64E, 0x40_0000)),
+        "the allocation base and size out of the shared object header"
+    );
+
+    // The same allocation described as one plane. Two objects over one piece of
+    // storage have to arrive at one window, or the identity built from it tells
+    // them apart and the hazard edge between them is never drawn.
+    let mut single = vec![0u8; TEXTURE_DESC_BASE_LEN];
+    crate::protocol::endian::st64(&mut single[LINEAR_DESC_SIZE..], 0x40_0000);
+    crate::protocol::endian::st32(&mut single[LINEAR_DESC_HANDLE..], 0x51);
+    assert_eq!(
+        decode_descriptor(OBJECT_TYPE_TEXTURE, &single)
+            .expect("decodes")
+            .backing_window(PAGE_SHIFT_ARM64E),
+        window,
+        "one allocation, whether the guest cut one plane out of it or two"
+    );
+}
+
 /// The tag cannot be folded into the single-plane arm, and this is why.
 ///
 /// Plane 1's dimension block begins at exactly the offset a single-plane body

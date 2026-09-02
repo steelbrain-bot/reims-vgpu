@@ -3082,6 +3082,71 @@ fn a_mapping_has_one_identity_and_a_replaced_page_list_gives_it_another() {
     }
 }
 
+/// A dual-plane texture and a buffer over one allocation are one backing.
+///
+/// The consequence, at the identity, of the window the decoder now answers for
+/// a two-plane object. While `Descriptor::backing_window` said `None` for it
+/// this reference had no identity at all — `backing_id` classified it as
+/// storage reached through a mapping, which it never was — so nothing could
+/// order a read of it against a write of the buffer sharing its bytes.
+#[test]
+fn a_dual_plane_texture_shares_one_identity_with_a_buffer_over_its_allocation() {
+    use crate::runtime::decode::resource::tests::dual_plane_body;
+    use crate::runtime::decode::resource::OBJECT_TYPE_DUAL_PLANE_TEXTURE;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, planes, buffer) = (1u32, 2u32, 3u32);
+    // `dual_plane_body` writes this handle into the object header both planes
+    // are cut from.
+    const SHARED_HANDLE: u64 = 0x51;
+
+    let write_entry = |host: &mut FakeHost, ref_: u32, ty: u8, len: usize, desc_gva: u64| {
+        let mut entry = [0u8; 12];
+        st32(&mut entry[0..], u32::from(ty) | ((len as u32) << 8));
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+
+    let body = dual_plane_body([1, 1], (1920, 1080), 0x50);
+    let _ = host.write_gpa(data_gpa + 0x400, &body);
+    write_entry(
+        &mut host,
+        planes,
+        OBJECT_TYPE_DUAL_PLANE_TEXTURE,
+        body.len(),
+        0x400,
+    );
+
+    let mut buffer_desc = [0u8; 16];
+    buffer_desc[0..8].copy_from_slice(&0x40_0000u64.to_le_bytes());
+    buffer_desc[8..16].copy_from_slice(&SHARED_HANDLE.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x500, &buffer_desc);
+    write_entry(
+        &mut host,
+        buffer,
+        OBJECT_TYPE_BUFFER,
+        buffer_desc.len(),
+        0x500,
+    );
+
+    let id = |ref_: u32| super::backing_id(&state, &host, task, ref_);
+    assert_eq!(
+        id(planes),
+        id(buffer),
+        "two names for one allocation are one backing, whether the guest cut \
+         two planes out of it or a flat buffer"
+    );
+    assert!(
+        id(planes).is_ok(),
+        "and both of them have an identity: a two-plane texture is address-named \
+         like any other normal texture, so refusing it as mapping-named withheld \
+         one the device had"
+    );
+}
+
 /// The peer question the hot per-reference state asks is answered from the
 /// construction cache, and answers nothing when the reference is the only name
 /// for its storage.

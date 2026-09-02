@@ -1966,9 +1966,27 @@ impl Descriptor {
     /// The guest-VA **allocation** this descriptor names, and its size.
     ///
     /// `None` for every object that reaches storage through something else — a
-    /// view over another object's bytes, a mapper-ref or dual-plane texture
-    /// whose pages are a mapping's, a function, a serializer object — and for
-    /// one whose handle or allocation size the guest has not written yet.
+    /// view over another object's bytes, a mapper-ref texture whose pages are a
+    /// mapping's, a function, a serializer object — and for one whose handle or
+    /// allocation size the guest has not written yet.
+    ///
+    /// # A dual-plane texture is one allocation, and it used to answer `None`
+    ///
+    /// It was listed above as reaching its pages through a mapping, next to the
+    /// mapper-ref texture it is decoded beside. It does not: it is built by the
+    /// same `createNormalTexture` path a single-plane texture is, from paging
+    /// info in its own task, and its descriptor carries no mapping id at all —
+    /// the field that would hold one is the object header's allocation size.
+    ///
+    /// The two planes share that header, so they share one handle and one
+    /// allocation size and differ only in the geometry each dimension block
+    /// states — `DualPlaneTextureDescriptor` says so at the type. One
+    /// allocation, two extents, which is exactly what this method already means
+    /// by a window. Answering `None` withheld an identity the device had, and
+    /// on the identity's own terms that is the *dangerous* direction: with no
+    /// window a `CmdReplacePhysical` naming one of these advances no
+    /// incarnation, and it names no first-claimant either, so a plane sharing an
+    /// allocation with another object would never be sighted as the alias it is.
     ///
     /// # The allocation base, not a texture's texel base
     ///
@@ -1992,8 +2010,14 @@ impl Descriptor {
                 let (_, size) = texture.backing_gva_size(page_shift)?;
                 Some((texture.allocation_base_gva(page_shift)?, size))
             }
-            Self::DualPlaneTexture(_)
-            | Self::Sampler(_)
+            // Plane 0's, and plane 1's would be the same numbers: both read
+            // the handle and the allocation size out of the one object header
+            // the decoder splices into each plane.
+            Self::DualPlaneTexture(dual) => {
+                let (_, size) = dual.planes[0].backing_gva_size(page_shift)?;
+                Some((dual.planes[0].allocation_base_gva(page_shift)?, size))
+            }
+            Self::Sampler(_)
             | Self::Function(_)
             | Self::RenderPipeline(_)
             | Self::ComputePipeline(_)

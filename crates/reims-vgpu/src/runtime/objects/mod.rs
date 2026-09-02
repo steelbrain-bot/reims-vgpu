@@ -2931,14 +2931,22 @@ pub enum BackingIdRefusal {
     /// descriptor did not read.
     Unresolved(LadderRung),
     /// The object reaches its storage through a mapping rather than by an
-    /// address in its task — a mapper-ref texture, a dual-plane texture, an
-    /// IOSurface backing.
+    /// address in its task — a mapper-ref texture.
     ///
     /// Not a gap: that storage has an identity, and it is the mapping's, which
-    /// `reims_vgpu_core::resolve::MappingResolver` asks for and this function
-    /// deliberately does not answer. A resolver that answered both from one
+    /// [`mapping_backing_id`] mints and
+    /// `reims_vgpu_core::resolve::MappingResolver` asks for. This function
+    /// deliberately does not answer it. A resolver that answered both from one
     /// method would let a caller ask the wrong question and get a plausible
-    /// number, which is the same reason the two traits are separate.
+    /// number, which is the same reason the two traits are separate — the
+    /// mapping id and the object reference are `u32`s that overlap numerically
+    /// and name unrelated things.
+    ///
+    /// **A dual-plane texture is not one of these and used to be.** It is built
+    /// from paging info in its own task like any normal texture, its two planes
+    /// share the one object header's handle and allocation size, and
+    /// `Descriptor::backing_window` now answers for it — one allocation, two
+    /// extents.
     NamedByMapping { object_type: u8 },
     /// The object is placed inside a heap, and a heap's extent is unrecovered.
     ///
@@ -3081,11 +3089,9 @@ fn backing_id_refusal(entry: &ListObjectEntry, descriptor: &[u8]) -> BackingIdRe
         OBJECT_TYPE_DUAL_PLANE_TEXTURE,
     };
     match entry.object_type {
-        OBJECT_TYPE_MAPPER_REF_TEXTURE | OBJECT_TYPE_DUAL_PLANE_TEXTURE => {
-            BackingIdRefusal::NamedByMapping {
-                object_type: entry.object_type,
-            }
-        }
+        OBJECT_TYPE_MAPPER_REF_TEXTURE => BackingIdRefusal::NamedByMapping {
+            object_type: entry.object_type,
+        },
         // A texture whose descriptor is a heap placement, which is a record at
         // its own opcode rather than an object type of its own -- the placement
         // is how a texture is made, not what kind of object it is.
@@ -3101,11 +3107,12 @@ fn backing_id_refusal(entry: &ListObjectEntry, descriptor: &[u8]) -> BackingIdRe
         // guest has not finished writing -- a zero handle or a zero allocation
         // size. That is the ladder's `DescRead` in substance: the bytes are
         // there and they do not yet name an allocation.
-        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS | OBJECT_TYPE_BUFFER => {
-            BackingIdRefusal::Unresolved(LadderRung::DescRead {
-                declared_len: entry.descriptor_length,
-            })
-        }
+        OBJECT_TYPE_TEXTURE
+        | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
+        | OBJECT_TYPE_BUFFER
+        | OBJECT_TYPE_DUAL_PLANE_TEXTURE => BackingIdRefusal::Unresolved(LadderRung::DescRead {
+            declared_len: entry.descriptor_length,
+        }),
         other => BackingIdRefusal::NamesNoStorage { object_type: other },
     }
 }
