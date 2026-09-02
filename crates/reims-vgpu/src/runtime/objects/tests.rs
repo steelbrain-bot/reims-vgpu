@@ -2989,3 +2989,82 @@ fn one_allocation_has_one_identity_and_a_repoint_gives_it_another() {
         "storage reached through a mapping is refused by name, not guessed at"
     );
 }
+
+/// The peer question the hot per-reference state asks is answered from the
+/// construction cache, and answers nothing when the reference is the only name
+/// for its storage.
+///
+/// `cached_window_peer` decides whether a `(task, reference)` key may go on
+/// standing for storage. Getting it wrong in the quiet direction would say a
+/// keying is sound when it is not, so each assertion is one way it could go
+/// quiet: a reference with no construction, a construction with no window, and
+/// a genuine neighbour over a different allocation.
+#[test]
+fn the_peer_question_answers_only_for_a_shared_allocation() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, named, peer, elsewhere, unbuilt) = (1u32, 2u32, 3u32, 4u32, 5u32);
+
+    let write_object = |host: &mut FakeHost, ref_: u32, desc_gva: u64, handle: u64| {
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+        desc[8..16].copy_from_slice(&handle.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + desc_gva, &desc);
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+    write_object(&mut host, named, 0x100, 0x20);
+    write_object(&mut host, elsewhere, 0x140, 0x30);
+    write_object(&mut host, unbuilt, 0x160, 0x20);
+
+    // Only the constructed references count. `unbuilt` is listed over the very
+    // same allocation as `named` and is deliberately never resolved, because
+    // the caches this question is asked on behalf of hold nothing for a
+    // reference the device has not constructed.
+    for ref_ in [named, elsewhere] {
+        assert!(resolve_resource(&state, &host, task, ref_).is_ok());
+    }
+    assert_eq!(
+        super::cached_window_peer(&state, task, named),
+        None,
+        "a listed-but-unconstructed reference over the same allocation is not a \
+         second name for anything this device is keeping state under"
+    );
+
+    // Now a second constructed reference over the same allocation.
+    write_object(&mut host, peer, 0x120, 0x20);
+    assert!(resolve_resource(&state, &host, task, peer).is_ok());
+    assert_eq!(
+        super::cached_window_peer(&state, task, named),
+        Some(peer),
+        "two constructed references over one allocation is the reading that says \
+         a per-reference key has stopped standing for storage"
+    );
+    assert_eq!(
+        super::cached_window_peer(&state, task, peer),
+        Some(named),
+        "the question is symmetric, so neither name is privileged"
+    );
+    assert_eq!(
+        super::cached_window_peer(&state, task, elsewhere),
+        None,
+        "a reference over its own allocation is the only name for it"
+    );
+
+    // The fixture's mapper-ref texture at reference 1 reaches its storage
+    // through a mapping and has no window at all, so it is nobody's peer and
+    // has none -- rather than matching every other windowless object.
+    assert!(resolve_resource(&state, &host, task, 1).is_ok());
+    assert_eq!(
+        super::cached_window_peer(&state, task, 1),
+        None,
+        "an object with no window of its own must not pair off with another"
+    );
+}

@@ -788,6 +788,19 @@ impl TaskResources {
             .is_some()
     }
 
+    /// Every constructed resource in one task, as `(reference, resource)`.
+    ///
+    /// Collected rather than iterated under the lock, so a caller may decode
+    /// descriptors -- which is what every caller does -- without holding it.
+    pub fn in_task(&self, task_id: u32) -> Vec<(u32, Arc<TaskResource>)> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .range((task_id, 0)..=(task_id, u32::MAX))
+            .map(|(&(_, ref_), resource)| (ref_, Arc::clone(resource)))
+            .collect()
+    }
+
     pub fn delete_task(&self, task_id: u32) -> usize {
         let mut resources = self
             .0

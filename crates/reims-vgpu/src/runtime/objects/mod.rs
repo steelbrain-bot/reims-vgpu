@@ -3071,6 +3071,79 @@ fn backing_id_refusal(entry: &ListObjectEntry, descriptor: &[u8]) -> BackingIdRe
     }
 }
 
+/// Whether another constructed reference in this task names the same
+/// allocation, asked without touching guest memory.
+///
+/// The construction cache alone, because the callers are on hot paths and
+/// because the cache is the right question for them: it holds the window each
+/// reference was *resolved* against, which is the window the device's own
+/// per-reference state was built for.
+///
+/// `None` when this reference has no cached construction, no window, or no
+/// company. It is a reading and not a decision — see
+/// [`note_reference_shares_storage`] for what a caller does with it.
+pub fn cached_window_peer(state: &DeviceState, task_id: u32, obj_ref: u32) -> Option<u32> {
+    let mine = state.task_resources.get(task_id, obj_ref)?;
+    let (base, _) = backing_window(state.page_shift, &mine.entry, &mine.descriptor)?;
+    state
+        .task_resources
+        .in_task(task_id)
+        .into_iter()
+        .filter(|&(ref_, _)| ref_ != obj_ref)
+        .find(|(_, other)| {
+            backing_window(state.page_shift, &other.entry, &other.descriptor)
+                .is_some_and(|(other_base, _)| other_base == base)
+        })
+        .map(|(ref_, _)| ref_)
+}
+
+/// Report that per-reference state is being kept for a reference that shares
+/// its storage with another.
+///
+/// # What this is asking
+///
+/// Several of this device's caches and generations are keyed
+/// `(task, reference)` and stand for *storage*: the guest-write generation a
+/// GVA writeback debt compares against, and the two host-copy caches. A
+/// reference is a lawful key for those only if one allocation has one live
+/// reference — and it does not. `note_backing_window_alias` found the
+/// compositor holding its scanout allocation under two, so a guest write
+/// declared through one reference leaves the other's generation unchanged and
+/// its stale image authoritative.
+///
+/// The host-copy caches are fixed: a re-point now sweeps the window's peers.
+/// The guest-write generation is **not**, and this says whether it needs to be
+/// — it is bumped some six thousand times per census window, far too hot to
+/// resolve a window on, so the question is asked once per distinct reference
+/// and the answer decides whether the re-key is worth its cost.
+///
+/// A reading of nothing means every reference on that path is the only name for
+/// its storage and the keying is sound where it is used. A reading of something
+/// names the pair that has to move.
+pub fn note_reference_shares_storage(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    site: &'static str,
+) {
+    // Once per reference, not per write. The scan is over one task's
+    // constructed resources and the hot path cannot afford it per call; the
+    // contract question it answers is about the reference, so once is enough.
+    if !crate::observe::first_sight(site, u64::from(task_id) << 32 | u64::from(obj_ref)) {
+        return;
+    }
+    crate::runtime::drain::note_store_route("reference_storage_asked");
+    let Some(peer) = cached_window_peer(state, task_id, obj_ref) else {
+        return;
+    };
+    crate::runtime::drain::note_store_route("reference_storage_shared");
+    crate::observe::fail(format!(
+        "{site} task={task_id} ref={obj_ref} peer={peer} (per-reference state is \
+         standing for storage that has a second live name, so a statement made \
+         through this reference leaves the other one's copy of it unchanged)"
+    ));
+}
+
 /// Drop the host copies held under *every other* reference over the re-pointed
 /// window.
 ///
