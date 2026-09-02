@@ -3510,22 +3510,26 @@ fn a_query_reply_destination_is_measured_against_the_allocations_this_device_hol
     );
 }
 
-/// The device-info reply census tells "before any storage existed" from "with
-/// storage live", and moves its denominator either way.
+/// The device-info reply census tells "before any identity was minted" from
+/// "after one was", and moves its denominator either way.
 ///
 /// The distinction is the whole instrument. `CmdGetDeviceInfo`'s destination is
 /// a guest page frame that can only be given a minted identity, and whether
-/// that is sound turns on there being nothing for the mint to collide with. A
-/// census that recorded only the safe case would read identically on a boot
-/// where the guest never asked at all, and the term would look closed by
-/// silence.
+/// that is sound turns on the identity being equal to nothing else. A census
+/// that recorded only the safe case would read identically on a boot where the
+/// guest never asked at all, and the term would look closed by silence.
+///
+/// The population it counts is deliberately the mint counter and not the task
+/// or resource tables: a driven boot found one live task and zero resources at
+/// reply time, and a census keyed on either would have called that the open
+/// case. A task is a namespace and has interned nothing.
 #[test]
-fn the_device_info_reply_census_separates_an_empty_device_from_a_populated_one() {
+fn the_device_info_reply_census_separates_a_mint_free_device_from_one_that_has_minted() {
     use crate::runtime::drain::store_route_count;
 
     let scanned = store_route_count("device_info_reply_scanned");
-    let before = store_route_count("device_info_reply_before_any_storage");
-    let with = store_route_count("device_info_reply_with_live_storage");
+    let before = store_route_count("device_info_reply_before_any_identity");
+    let after = store_route_count("device_info_reply_after_an_identity");
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -3533,17 +3537,30 @@ fn the_device_info_reply_census_separates_an_empty_device_from_a_populated_one()
     assert_eq!(
         (
             store_route_count("device_info_reply_scanned"),
-            store_route_count("device_info_reply_before_any_storage"),
-            store_route_count("device_info_reply_with_live_storage"),
+            store_route_count("device_info_reply_before_any_identity"),
+            store_route_count("device_info_reply_after_an_identity"),
         ),
-        (scanned + 1, before + 1, with),
-        "a device holding no task and no resource has nothing the minted identity \
-         could collide with, and says so"
+        (scanned + 1, before + 1, after),
+        "a device that has minted nothing has nothing a fresh identity could \
+         equal, and says so"
     );
 
-    // One task defined and one resource constructed in it, which is the
-    // population the safe reading claims is absent.
+    // A task on its own interns nothing, so the answer must not move. This is
+    // the reading a driven boot falsified for the population census that came
+    // before this one.
     setup_task_with_list(&mut host, &mut state);
+    super::note_device_info_reply_destination(&state, 0x21);
+    assert_eq!(
+        (
+            store_route_count("device_info_reply_before_any_identity"),
+            store_route_count("device_info_reply_after_an_identity"),
+        ),
+        (before + 2, after),
+        "a live task is a namespace, not storage: nothing has been interned and \
+         the closing answer still holds"
+    );
+
+    // One constructed resource, which is what actually mints.
     let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
     let (task, buffer) = (1u32, 2u32);
     let mut desc = [0u8; 16];
@@ -3558,17 +3575,21 @@ fn the_device_info_reply_census_separates_an_empty_device_from_a_populated_one()
     entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
     let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
     resolve_resource(&state, &host, task, buffer).expect("constructs");
+    assert!(
+        state.backing_identities_minted() > 0,
+        "the fixture must actually mint, or the arm below asserts nothing"
+    );
 
-    super::note_device_info_reply_destination(&state, 0x21);
+    super::note_device_info_reply_destination(&state, 0x22);
     assert_eq!(
         (
             store_route_count("device_info_reply_scanned"),
-            store_route_count("device_info_reply_before_any_storage"),
-            store_route_count("device_info_reply_with_live_storage"),
+            store_route_count("device_info_reply_before_any_identity"),
+            store_route_count("device_info_reply_after_an_identity"),
         ),
-        (scanned + 2, before + 1, with + 1),
-        "with storage live the answer is the open one, and the denominator moved \
-         for both asks"
+        (scanned + 3, before + 2, after + 1),
+        "with an identity handed out the answer is the open one, and the \
+         denominator moved for all three asks"
     );
 }
 

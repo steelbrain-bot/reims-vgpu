@@ -999,6 +999,25 @@ impl BackingWindowRefs {
         id
     }
 
+    /// How many identities this device has handed out.
+    ///
+    /// The counter is monotone and shared by both key spaces, so this is the
+    /// whole of "what storage could a newly minted identity be equal to" — and
+    /// zero is the answer that says *nothing*, which is a claim about the
+    /// identity space rather than about any one table's contents.
+    ///
+    /// It is the counter minus one, because the counter starts at one: zero is
+    /// never handed out, so a fresh device holds `next_id == 1` and has minted
+    /// nothing. Reading the raw counter here would report every device as
+    /// having handed out an identity, which is the answer that keeps a term
+    /// open forever.
+    fn minted(&self) -> u64 {
+        self.next_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .saturating_sub(1)
+    }
+
     fn claim(
         &self,
         task_id: u32,
@@ -3749,6 +3768,17 @@ impl DeviceState {
     /// out leases: a lookup that minted a lease nobody acquired would be a claim
     /// this device never pays off.
     #[must_use]
+    /// How many backing identities this device has minted.
+    ///
+    /// The one reader is the device-info reply census, whose question is
+    /// whether a freshly minted identity could equal one already in use. It is
+    /// deliberately the *counter* and not a table size: the counter is what
+    /// both key spaces draw from, so it is the only number that answers for the
+    /// identity space as a whole.
+    pub fn backing_identities_minted(&self) -> u64 {
+        self.backing_window_refs.minted()
+    }
+
     pub fn object_name(&self, task_id: u32, obj_ref: u32) -> Option<ResourceId> {
         use reims_vgpu_core::resolve::RefResolver as _;
         self.namespaces

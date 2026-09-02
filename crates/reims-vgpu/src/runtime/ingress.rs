@@ -215,18 +215,21 @@ pub enum Gap {
     /// `crate::runtime::objects::note_device_info_reply_destination` asks the
     /// page-frame half the only question that can be asked of it. A page frame
     /// cannot be compared against a table of task windows, so the instrument
-    /// asks about *population* instead: a minted identity is sound exactly when
-    /// there is no identified storage for it to collide with, and this device
-    /// holding no task and no resource at the moment of the reply is that
-    /// condition. The reply path documents the contract that would make it hold
-    /// — the guest asks once, at accelerator start, and frees the buffer after
-    /// the single parse — and whether "at accelerator start" precedes this
-    /// device's first construction is a fact about a driven guest and not
-    /// something a reading settles.
+    /// asks about the **identity space**: this device interns every key space
+    /// on one monotone counter, so a freshly minted identity is sound exactly
+    /// when that counter has handed nothing out, and no page arithmetic is
+    /// needed to say so. The reply path documents the contract that would make
+    /// it hold — the guest asks once, at accelerator start, and frees the
+    /// buffer after the single parse — and whether "at accelerator start"
+    /// precedes this device's first mint is a fact about a driven guest.
     ///
-    /// Neither denominator is large enough to conclude from yet. That is
-    /// recorded here so the next attempt spends its boot rather than its
-    /// reasoning.
+    /// A driven boot has already corrected one reading of that instrument. Its
+    /// first form counted live tasks and resources and reported `tasks=1
+    /// resources=0`, which reads as the open case and is not one: a task is a
+    /// namespace and has interned nothing, and the number the dependency
+    /// compiler compares is the mint counter. Neither denominator is large
+    /// enough to conclude from yet, and that is recorded here so the next
+    /// attempt spends its boot rather than its reasoning.
     ReplyDestination,
 }
 
