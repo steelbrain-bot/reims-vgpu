@@ -4992,6 +4992,105 @@ fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
     );
 }
 
+/// The command-stream reader returns the buffers it could read and drops the
+/// ones it could not, so its length is the loaded count and not the declared
+/// one.
+///
+/// The two are different numbers and the difference is guest-visible draws:
+/// a descriptor the reader skips is a command buffer whose records never run,
+/// and a caller that took `cmdbuf_count` for the answer would report a full
+/// submission. Every other test of this loop drives it through
+/// `process_exec_indirect2` with nothing readable behind the GVAs, so the
+/// **successful** read is what this adds.
+#[test]
+fn the_command_stream_reader_returns_what_it_read_and_not_what_was_declared() {
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+
+    // A one-level page table for task 3: GVA page 0 resolves to data pfn 4.
+    let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+    let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    state.define_task(3, 0x1_0000, 2);
+    let _ = host.write_gpa(data_gpa, &[0xa5u8; 16]);
+
+    // Three descriptors: one readable, one declaring zero bytes, one whose GVA
+    // does not walk. The first is the case no other test reaches.
+    const N_CB: u32 = 3;
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + N_CB as usize * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(
+        &mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..],
+        N_CB,
+    );
+    let desc = |i: usize| {
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize + i * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    };
+    st64(
+        &mut payload[desc(0) + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+        0,
+    );
+    st64(
+        &mut payload[desc(0) + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+        16,
+    );
+    // Descriptor 1 keeps length 0.
+    st64(
+        &mut payload[desc(2) + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+        0xdead_0000,
+    );
+    st64(
+        &mut payload[desc(2) + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+        32,
+    );
+
+    let cap = crate::observe::sink::FailCapture::start();
+    let streams = super::load_command_streams(
+        &state,
+        &host,
+        3,
+        &payload,
+        u64::from(CHILD_EXEC_INDIRECT_HEADER_LEN),
+        N_CB,
+    );
+    assert_eq!(
+        streams.len(),
+        1,
+        "three declared, one readable — the result is the loaded count"
+    );
+    assert_eq!(
+        streams[0],
+        vec![0xa5u8; 16],
+        "and it is the guest's bytes, at the length the descriptor declared"
+    );
+    // Each loss says which it was, rather than one merged line: a zero-length
+    // descriptor and a GVA that does not walk are different guest problems.
+    let lines: Vec<String> = cap
+        .lines()
+        .into_iter()
+        .filter(|l| l.split_whitespace().next() == Some("exec_cmdbuf"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("len=0")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("gva_fail")), "{lines:?}");
+}
+
 /// A bind the stream's tables could not hold refuses the draws that read it,
 /// and leaves the ones recorded before it alone.
 ///

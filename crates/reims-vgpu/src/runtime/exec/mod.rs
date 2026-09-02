@@ -610,6 +610,91 @@ pub struct ExecResult {
     pub total_us: u64,
 }
 
+/// Read every command buffer an `EXEC_INDIRECT2` payload's descriptor table
+/// names out of the task's address space.
+///
+/// **The exec class's third input, as a value.** The payload carries a header, a
+/// resource table and `cmdbuf_count` descriptors of `{gva, length}`; the streams
+/// themselves live in the guest's own address space, so producing them is a page
+/// table walk per buffer and not a slice of the packet. That is the input
+/// [`crate::runtime::ingress::Gap::ExecResolution`] names, and the reason the
+/// exec class cannot cross that bridge as a function of the drained packet the
+/// way the other four do. Named here so that whoever hands the bridge the
+/// streams calls one function rather than restating this loop, and so the loop
+/// has a test of its own.
+///
+/// `cbufs_off` and `cmdbuf_count` are the caller's because the caller has
+/// already proved the table fits — `need = cbufs_off + count * DESC_LEN` against
+/// `payload.len()`. Re-deriving them here would be a second bound that could
+/// disagree with the one the caller returned on.
+///
+/// A buffer that cannot be read is **skipped and reported**, never fatal: a
+/// zero-length descriptor, a length the host process cannot address, and a GVA
+/// that does not walk are three different guest-visible losses and each says
+/// which. The result is therefore shorter than the table whenever one happens,
+/// and the caller's `streams_loaded` against `cmdbuf_count` is where that shows.
+fn load_command_streams<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    payload: &[u8],
+    cbufs_off: u64,
+    cmdbuf_count: u32,
+) -> Vec<Vec<u8>> {
+    // Every command buffer the header declares, because the caller's `need`
+    // already bounded how many there can be: the guest cannot claim a table
+    // longer than the descriptors it actually supplied, so `cmdbuf_count` is
+    // capped by `payload.len() / CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN` and
+    // `with_capacity` cannot be talked into an allocation the payload does not
+    // back.
+    //
+    // A fixed ceiling used to sit here and truncate with `.min()`, above the
+    // check that already bounded the same number. Nothing derived it — a
+    // submission of 17 lost its last command buffer entirely, before the loop,
+    // with no fail line, which is a whole packet of guest draws vanishing into a
+    // silently shorter table.
+    let n_cb = cmdbuf_count as usize;
+    let page_shift = state.page_shift;
+    let mut streams = Vec::with_capacity(n_cb);
+    for i in 0..n_cb {
+        // The caller's `need` already pinned the whole table: i < n_cb <=
+        // cmdbuf_count, so off + DESC_LEN = cbufs_off + (i + 1) * DESC_LEN <=
+        // need <= payload.len(). The bounds check that stood here could not
+        // fire, and its `break` would have dropped every remaining command
+        // buffer with no line if it ever had.
+        let off = (cbufs_off + i as u64 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as u64) as usize;
+        let gva = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..]);
+        let length = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..]);
+        if length == 0 {
+            crate::observe::fail(format!(
+                "exec_cmdbuf skip task={task_id} i={i} gva={gva:#x} len=0"
+            ));
+            continue;
+        }
+        // Guest length is authoritative — no product MiB budget. Fail only if
+        // the host process cannot address the allocation.
+        let Some(stream_len) = crate::runtime::draw::host_alloc_len(length) else {
+            crate::observe::fail(format!(
+                "exec_cmdbuf skip task={task_id} i={i} gva={gva:#x} len={length} (host_len)"
+            ));
+            continue;
+        };
+        let mut stream = vec![0u8; stream_len];
+        // Product x86 uses page_shift=12; the unshifted helper defaults to arm14
+        // and silently fails every stream load on Ventura/Tahoe x86.
+        if gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, &mut stream, page_shift)
+            .is_err()
+        {
+            crate::observe::fail(format!(
+                "exec_cmdbuf gva_fail task={task_id} i={i} gva={gva:#x} len={length} shift={page_shift}"
+            ));
+            continue;
+        }
+        streams.push(stream);
+    }
+    streams
+}
+
 pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -681,50 +766,12 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // submission of 17 lost its last command buffer entirely, before the loop,
     // with no fail line, which is a whole packet of guest draws vanishing into a
     // silently shorter table.
-    let n_cb = cmdbuf_count as usize;
-    let page_shift = state.page_shift;
-    let mut streams = Vec::with_capacity(n_cb);
     // This call's measured spans, summed, so `Header` can be the leftover. The
     // census's own totals cover the whole window and cannot answer for one call.
     let mut measured_ns = 0u64;
     let load_started = std::time::Instant::now();
-    for i in 0..n_cb {
-        // `need` already pinned the whole table: i < n_cb <= cmdbuf_count, so
-        // off + DESC_LEN = cbufs_off + (i + 1) * DESC_LEN <= need <=
-        // payload.len(). The bounds check that stood here could not fire, and
-        // its `break` would have dropped every remaining command buffer with no
-        // line if it ever had.
-        let off = (cbufs_off + i as u64 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as u64) as usize;
-        let gva = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..]);
-        let length = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..]);
-        if length == 0 {
-            crate::observe::fail(format!(
-                "exec_cmdbuf skip task={task_id} i={i} gva={gva:#x} len=0"
-            ));
-            continue;
-        }
-        // Guest length is authoritative — no product MiB budget. Fail only if
-        // the host process cannot address the allocation.
-        let Some(stream_len) = crate::runtime::draw::host_alloc_len(length) else {
-            crate::observe::fail(format!(
-                "exec_cmdbuf skip task={task_id} i={i} gva={gva:#x} len={length} (host_len)"
-            ));
-            continue;
-        };
-        let mut stream = vec![0u8; stream_len];
-        // Product x86 uses page_shift=12; the unshifted helper defaults to arm14
-        // and silently fails every stream load on Ventura/Tahoe x86.
-        if gva_mem::read_task_gva_by_id(host, &state.tasks, task_id, gva, &mut stream, page_shift)
-            .is_err()
-        {
-            crate::observe::fail(format!(
-                "exec_cmdbuf gva_fail task={task_id} i={i} gva={gva:#x} len={length} shift={page_shift}"
-            ));
-            continue;
-        }
-        out.streams_loaded += 1;
-        streams.push(stream);
-    }
+    let streams = load_command_streams(state, host, task_id, payload, cbufs_off, cmdbuf_count);
+    out.streams_loaded += u32::try_from(streams.len()).unwrap_or(u32::MAX);
     let load_ns = load_started.elapsed().as_nanos() as u64;
     measured_ns += load_ns;
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Load, load_ns);
