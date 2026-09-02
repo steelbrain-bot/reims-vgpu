@@ -1999,6 +1999,42 @@ pub fn declared_storage(
     })
 }
 
+/// The device answering the semantic model's mapping-namespace resolver.
+///
+/// # The first of the model's two resolvers this device satisfies
+///
+/// `reims_vgpu_core::resolve` splits resolution in two because it splits two
+/// namespaces: a mapping id and an object-list ref arrive as `u32`s that overlap
+/// numerically and name unrelated things. This is the mapping half, and the
+/// device can answer it in full today — [`mapping_backing_id`] mints the
+/// identity of a mapping's surface storage, and that is the whole of what this
+/// trait asks.
+///
+/// The object half is not implementable yet and its absence is not an oversight:
+/// `RefResolver` answers a `ResourceId`, which carries a slot *generation*, and
+/// generations are `reims_vgpu_core::namespace::Namespace`'s to issue. This
+/// device has no namespace yet; it has a construction cache keyed by
+/// `(task, reference)` with no generation in it. Implementing the trait over
+/// that cache would mint generations from nothing, which is the second lifetime
+/// model the replacement plan forbids.
+///
+/// # A refusal is `None`, and that is the trait's own shape
+///
+/// The trait answers "the backing a mapping's surface is resolved to, or `None`
+/// when the mapping names no live surface". Both of [`MappingBackingRefusal`]'s
+/// arms are exactly that — a mapping id nothing is listed for, and an entry the
+/// guest has never mapped a surface into — so nothing is lost by flattening
+/// them here. The typed arms stay available to callers that want to say which,
+/// and `reims_vgpu_core::query`'s present path wants only whether.
+impl reims_vgpu_core::resolve::MappingResolver for DeviceState {
+    fn backing(
+        &self,
+        mapping: reims_vgpu_core::identity::MappingId,
+    ) -> Option<reims_vgpu_core::access::BackingId> {
+        mapping_backing_id(self, mapping.0).ok()
+    }
+}
+
 /// Whether a query's reply buffer lands inside an allocation this device
 /// already has an identity for.
 ///

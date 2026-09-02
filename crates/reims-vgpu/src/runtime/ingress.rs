@@ -169,6 +169,19 @@ pub enum Gap {
     /// is actually short of.
     ReplyDestination,
     /// The accesses the presented mapping resolves to.
+    ///
+    /// The identity half is no longer missing: the device answers
+    /// `reims_vgpu_core::resolve::MappingResolver` in full, over
+    /// `crate::runtime::objects::mapping_backing_id`. What this bridge is not
+    /// given is the resolver itself — it takes no device state, which is what
+    /// makes it a pure function of the drained packet — so closing this is a
+    /// signature change and not a missing derivation.
+    ///
+    /// It is deliberately not closed by handing every present an
+    /// `AccessKey::DomainOnly`. That vocabulary exists for a target that could
+    /// not be resolved and buys submission-domain ordering only; using it where
+    /// the target *can* be resolved would under-order every present on the
+    /// device while reading, from the outside, as a gap that had closed.
     MappingAccesses,
 }
 

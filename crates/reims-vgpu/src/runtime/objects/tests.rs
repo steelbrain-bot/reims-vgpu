@@ -3510,6 +3510,51 @@ fn a_query_reply_destination_is_measured_against_the_allocations_this_device_hol
     );
 }
 
+/// The device answers the model's mapping resolver, and it answers with the
+/// same identity the mapping route mints.
+///
+/// Two facts, and the second is the one worth a test: the trait is the model's
+/// door into the mapping namespace, and a door that answered with a *different*
+/// number from the one the device's own callers get would give the dependency
+/// compiler a backing nothing else in the device shares.
+#[test]
+fn the_device_answers_the_models_mapping_resolver_with_the_identity_it_mints() {
+    use reims_vgpu_core::identity::MappingId;
+    use reims_vgpu_core::resolve::MappingResolver as _;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    assert_eq!(
+        state.backing(MappingId(9)),
+        None,
+        "a mapping id this device lists nothing for names no live surface"
+    );
+
+    assert!(state.set_mapping_geom(9, 64, 32, 0x50));
+    assert_eq!(
+        state.backing(MappingId(9)),
+        None,
+        "and an entry a geometry declaration created, with no surface mapped \
+         into it, still names none"
+    );
+
+    assert!(state.map_surface(9));
+    let minted = super::mapping_backing_id(&state, 9).expect("a mapped surface is storage");
+    assert_eq!(
+        state.backing(MappingId(9)),
+        Some(minted),
+        "the model gets the identity the device's own callers get, not a \
+         second number for one piece of storage"
+    );
+
+    let e = state.mappings.get_mut(&9).expect("mapped");
+    DeviceState::bump_map_generation(e);
+    assert_ne!(
+        state.backing(MappingId(9)),
+        Some(minted),
+        "and it moves with the page list, because that is what the identity is"
+    );
+}
+
 /// The peer question the hot per-reference state asks is answered from the
 /// construction cache, and answers nothing when the reference is the only name
 /// for its storage.
