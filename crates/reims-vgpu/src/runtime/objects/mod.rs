@@ -1764,6 +1764,28 @@ fn backing_window(
     }
 }
 
+/// Whether the guest's object list still says `holder` occupies `base`.
+///
+/// Read out of guest memory rather than out of this device's construction
+/// cache, because the cache cannot see a free: see
+/// [`note_backing_window_alias`] for what that costs and why this is the only
+/// test that separates an alias from a reuse.
+fn holder_still_names<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    holder: u32,
+    base: u64,
+) -> bool {
+    let Some(entry) = probe_list_entry(state, host, task_id, holder) else {
+        return false;
+    };
+    let Some(descriptor) = read_descriptor(state, host, task_id, &entry) else {
+        return false;
+    };
+    backing_window(state.page_shift, &entry, &descriptor).is_some_and(|(held, _)| held == base)
+}
+
 /// Whether a second live reference in this task already names this window.
 ///
 /// # The question this settles, and why it blocks a canonical backing identity
@@ -1785,12 +1807,22 @@ fn backing_window(
 /// the derivation** and says the count has to move from the reference to the
 /// window. A boot that never sights one is the evidence that it does not.
 ///
-/// # Why the first claimant is re-checked
+/// # The confound this has to exclude, and how
 ///
-/// A reference that has been deleted leaves its window in the claim table, and
-/// a later reference landing on the same window is then one name after another
-/// rather than two names at once. Only the second is an alias, so the claimant
-/// has to still be a live resource for the sighting to mean what it says.
+/// One name *after* another over one allocation is not two names at once, and
+/// it is the common case: the guest frees an object by writing over its own
+/// object-list record, with no packet, and then reuses the pages. This device
+/// is not told, so [`crate::model::TaskResources`] goes on holding the freed
+/// reference's construction and a liveness test against it would call a
+/// sequence an alias.
+///
+/// So liveness is asked of the guest's own list, not of this device's cache:
+/// the holder's *current* object-list entry is re-read and its window
+/// re-derived, and the sighting stands only if that still names the very same
+/// window. A holder whose slot has been overwritten, cleared, or re-pointed
+/// answers with a different window or none, and the claim quietly moves to the
+/// new reference. That is the same technique — and the same reason —
+/// [`note_stale_task_resource`] uses to tell a recycled slot from a steady one.
 ///
 /// One `first_sight` per distinct window, so a compositor recycling one
 /// allocation reports once and not once per frame.
@@ -1798,15 +1830,17 @@ fn backing_window(
 /// The aliasing reference is returned as well as reported, so the reading can
 /// be asserted where a boot is not available — the same reason
 /// [`note_heap_reference`] returns one.
-fn note_backing_window_alias(
+fn note_backing_window_alias<M: HostMemory>(
     state: &DeviceState,
+    host: &M,
     task_id: u32,
     obj_ref: u32,
     base: u64,
     size: u64,
 ) -> Option<u32> {
     let holder = state.claim_backing_window(task_id, obj_ref, base)?;
-    if !state.resource_is_live(task_id, holder) {
+    if !holder_still_names(state, host, task_id, holder, base) {
+        state.take_backing_window(task_id, obj_ref, base);
         return None;
     }
     if !crate::observe::first_sight("backing_window_alias", (u64::from(task_id) << 40) ^ base) {
@@ -1851,7 +1885,7 @@ pub fn resolve_resource<M: HostMemory>(
     })?;
     let descriptor: Arc<[u8]> = Arc::from(bytes);
     if let Some((base, size)) = backing_window(state.page_shift, &entry, &descriptor) {
-        let _ = note_backing_window_alias(state, task_id, obj_ref, base, size);
+        let _ = note_backing_window_alias(state, host, task_id, obj_ref, base, size);
     }
     let resource = Arc::new(TaskResource::new(entry, descriptor));
     Ok(state.task_resources.register(task_id, obj_ref, resource))

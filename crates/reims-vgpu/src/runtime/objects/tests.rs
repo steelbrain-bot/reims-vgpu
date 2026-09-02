@@ -2650,52 +2650,74 @@ fn only_address_named_object_types_have_a_window() {
 
 /// One name after another over one window is not two names at once.
 ///
-/// A deleted reference leaves its claim in the table, so a later reference
-/// landing on the same guest-VA window finds a holder. Reporting that as an
-/// alias would falsify the derivation from a sequence that is entirely lawful:
-/// the guest freed an allocation and allocated it again, and at no instant did
-/// two live names share the bytes. Only a claimant that is still a constructed
-/// resource makes the sighting mean what the line says.
+/// The guest frees an object by writing over its own object-list record, with
+/// no packet at all, and then reuses the pages. This device is never told, so
+/// its construction cache goes on holding the freed reference — which is why
+/// the alias reading asks the *guest's* list whether the holder is still there
+/// and not its own cache. Without that, every recycled allocation on a busy
+/// guest reads as two names over one backing, and the reading that decides
+/// where the incarnation lives would be decided by a confound.
 #[test]
-fn a_window_reclaimed_after_its_holder_died_is_not_an_alias() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let (task, first, second) = (3u32, 9u32, 10u32);
-    let window = 0x4_0000u64;
-    state.define_task(task, 0x1000, 0x40);
+fn a_window_whose_holder_the_guest_freed_is_not_an_alias() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, first, second) = (1u32, 2u32, 3u32);
 
-    // The holder has to be a *constructed* resource, not merely a listed
-    // object: the claim table is written on construction, so that is the state
-    // the liveness re-check reads.
-    assert!(state.insert_object(task, first));
-    state.task_resources.register(
-        task,
-        first,
-        std::sync::Arc::new(crate::model::TaskResource::new(
-            ListObjectEntry {
-                object_type: crate::runtime::decode::resource::OBJECT_TYPE_BUFFER,
-                descriptor_length: 16,
-                descriptor_gva: 0x1000,
-            },
-            std::sync::Arc::from(&[0u8; 16][..]),
-        )),
+    // One linear descriptor, past the eight list entries, named by both
+    // references in turn.
+    let desc_gva = 0x100u64;
+    let handle = 0x20u64;
+    let window = handle << PAGE_SHIFT_ARM64E;
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&handle.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + desc_gva, &desc);
+
+    let write_slot = |host: &mut FakeHost, ref_: u32, present: bool| {
+        let mut entry = [0u8; 12];
+        if present {
+            st32(
+                &mut entry[0..],
+                u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+            );
+            entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        }
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+    write_slot(&mut host, first, true);
+
+    assert!(
+        resolve_resource(&state, &host, task, first).is_ok(),
+        "the first reference constructs and claims the window"
     );
+    write_slot(&mut host, second, true);
     assert_eq!(
-        super::note_backing_window_alias(&state, task, first, window, 0x3000),
-        None,
-        "the first claimant is not an alias of anything"
-    );
-    assert_eq!(
-        super::note_backing_window_alias(&state, task, second, window, 0x3000),
+        super::note_backing_window_alias(&state, &host, task, second, window, 0x3000),
         Some(first),
-        "two live references over one window is the sighting"
+        "both references are in the guest's list naming one window, which is \
+         the sighting this reading exists to make"
     );
 
-    // The holder goes. The window is still claimed by its number, and the
-    // reading has to fall back to nothing rather than to a name that is gone.
-    assert!(state.delete_object(task, first));
+    // The guest frees the first object the only way it can: it writes over its
+    // own record. No packet arrives, so the construction cache still holds it.
+    write_slot(&mut host, first, false);
+    assert!(
+        state.task_resources.get(task, first).is_some(),
+        "the cache cannot see a free, which is the whole difficulty"
+    );
     assert_eq!(
-        super::note_backing_window_alias(&state, task, second, window, 0x3000),
+        super::note_backing_window_alias(&state, &host, task, second, window, 0x3000),
         None,
-        "a claim left behind by a deleted reference is not a live second name"
+        "the guest's list no longer names the holder, so this is a reuse"
+    );
+
+    // And the window has changed hands, so a later claimant is compared
+    // against the reference that actually holds it.
+    assert_eq!(
+        state.claim_backing_window(task, second, window),
+        None,
+        "the live reference took the window when the dead holder lost it"
     );
 }

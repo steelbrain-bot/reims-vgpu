@@ -833,6 +833,13 @@ impl BackingWindowRefs {
         }
     }
 
+    fn take(&self, task_id: u32, ref_: u32, base: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((task_id, base), ref_);
+    }
+
     fn delete_task(&self, task_id: u32) {
         self.0
             .lock()
@@ -3582,14 +3589,17 @@ impl DeviceState {
         self.backing_window_refs.claim(task_id, ref_, base)
     }
 
-    /// Whether `task_id`/`ref_` is still a constructed resource.
+    /// Move a window's claim to `ref_`, for a holder the guest's own list no
+    /// longer says is there.
     ///
-    /// The alias reading asks this about the *other* reference before reporting
-    /// one: a window whose first claimant has since been deleted is not two
-    /// names over one backing, it is one name after another.
-    #[must_use]
-    pub fn resource_is_live(&self, task_id: u32, ref_: u32) -> bool {
-        self.task_resources.get(task_id, ref_).is_some()
+    /// The claim table remembers whoever constructed first, and the guest can
+    /// free an object without telling this device — so a holder can stop
+    /// naming its window with nothing to notice. Handing the window to the
+    /// reference that does name it keeps the table's meaning ("who holds this
+    /// window") true, and stops the next claimant being compared against a
+    /// reference that has been gone for a thousand frames.
+    pub fn take_backing_window(&self, task_id: u32, ref_: u32, base: u64) {
+        self.backing_window_refs.take(task_id, ref_, base);
     }
 
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).
