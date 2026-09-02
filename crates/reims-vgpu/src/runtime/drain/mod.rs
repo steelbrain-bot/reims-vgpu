@@ -25,7 +25,7 @@ use crate::runtime::gpa_map;
 use crate::runtime::heap_query::QueryError;
 use crate::runtime::host::{HostAction, HostMemory, HostOps, MemError};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
-use reims_vgpu_core::control::ControlKind;
+use reims_vgpu_core::control::{self, ControlKind};
 use reims_vgpu_core::query::{self, QueryKind, RequestWords};
 
 pub(crate) mod census;
@@ -2371,25 +2371,73 @@ fn process_root_packet<H: HostMemory + HostOps>(
         // reading it here with a length check and an `ld32` at a named offset
         // was a second reading of one record.
         ROOT_OP_DEFINE_FIFO | ROOT_OP_FREE_FIFO => {
-            let opening = packet.opcode == ROOT_OP_DEFINE_FIFO;
-            let slug = if opening { "define_fifo" } else { "free_fifo" };
-            match crate::protocol::fifo::decode_channel_lifetime(&packet.payload) {
-                Ok(ch) if is_child_channel(ch) => {
-                    let bit = 1u32 << ch;
-                    if opening {
-                        state.active_child_mask |= bit;
-                    } else {
-                        state.active_child_mask &= !bit;
-                        // Only a free clears it: an open is not a claim that
-                        // nothing is pending on the channel, and clearing it
-                        // there would drop a drain the guest is owed.
-                        state.pending.child_mask &= !bit;
-                    }
-                    forget_child_channel(state, ch, bit);
+            // Which end of the lifetime this is used to be
+            // `packet.opcode == ROOT_OP_DEFINE_FIFO` — a direction decided from
+            // a constant inside the arm, in the shape the device-info form had.
+            // `reims_vgpu_core::control` reads it off the ledger instead, so
+            // the two opcodes differ here in nothing and the transition is a
+            // value rather than a comparison.
+            let op = match control::resolve(WireChannel::Root, packet.opcode, &packet.payload) {
+                Ok(op) => op,
+                Err(control::ResolveRefusal::Payload(short)) => {
+                    // The kind names the slug, so the reason a reader greps for
+                    // and the command it names cannot drift apart.
+                    let kind = ControlKind::of(WireChannel::Root, packet.opcode);
+                    note_short_payload(
+                        kind.map_or("channel_lifetime", ControlKind::name),
+                        None,
+                        &short,
+                    );
+                    return;
                 }
-                Ok(_) => {}
-                Err(short) => note_short_payload(slug, None, &short),
+                Err(refusal @ control::ResolveRefusal::NotControl { .. }) => {
+                    // This dispatch table and the ledger disagree about what a
+                    // control packet is. Unreachable while `ledger.rs` passes.
+                    crate::observe::fail(format!(
+                        "channel_lifetime_refused reason={} site=root op={:#x}",
+                        refusal.slug(),
+                        packet.opcode
+                    ));
+                    return;
+                }
+            };
+            let control::ControlOp::Channel { transition, domain } = op else {
+                // `ControlKind::channel_transition` answers `Some` for exactly
+                // these two opcodes, so another operation here would mean the
+                // ledger and this arm name different commands.
+                crate::observe::fail(format!(
+                    "channel_lifetime_not_a_channel_op site=root op={:#x} kind={}",
+                    packet.opcode,
+                    op.kind().name()
+                ));
+                return;
+            };
+            let ch = domain.0;
+            if !is_child_channel(ch) {
+                // Dropped in silence before this. A guest opening a domain this
+                // device has no FIFO for gets no ring drained and no completion
+                // published on it, which is a hang with nothing in the log.
+                crate::observe::fail(format!(
+                    "channel_lifetime_out_of_range site=root op={:#x} kind={} channel={ch} \
+                     max={MAX_CHANNELS} (this device drains no such FIFO, so every packet the \
+                     guest puts on it is a completion word nothing will publish)",
+                    packet.opcode,
+                    op.kind().name()
+                ));
+                return;
             }
+            let bit = 1u32 << ch;
+            match transition {
+                control::ChannelTransition::Open => state.active_child_mask |= bit,
+                control::ChannelTransition::Free => {
+                    state.active_child_mask &= !bit;
+                    // Only a free clears it: an open is not a claim that
+                    // nothing is pending on the channel, and clearing it
+                    // there would drop a drain the guest is owed.
+                    state.pending.child_mask &= !bit;
+                }
+            }
+            forget_child_channel(state, ch, bit);
         }
         ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, None),
         ROOT_OP_SET_OBJECT_LIST => apply_set_object_list(state, &packet.payload, None),

@@ -1182,6 +1182,55 @@ fn define_fifo_forgets_the_previous_occupants_translation_state() {
     );
 }
 
+/// A channel-lifetime command naming a domain this device has no FIFO for says
+/// so.
+///
+/// Dropped in silence before: the arm gated on [`is_child_channel`] with an
+/// `Ok(_) => {}` beside it, so a guest opening channel 0 or channel 32 set no
+/// mask bit, got no ring drained, and was never told. Every packet it then
+/// queued there carries a completion word nothing will publish, which is a hang
+/// the log had nothing in it about — the same defect
+/// `channel_id_or_refusal` was written to close at the doorbell handlers, on the
+/// one path that still had it.
+#[test]
+fn a_channel_lifetime_outside_the_channel_range_is_reported() {
+    // The root FIFO's own number and the first above the bound: `0` is not a
+    // child and `MAX_CHANNELS` is one past the last, so both are ids the guest
+    // can write and this device cannot drain.
+    for channel in [0u32, crate::model::MAX_CHANNELS as u32] {
+        for opcode in [ROOT_OP_DEFINE_FIFO, ROOT_OP_FREE_FIFO] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let mut host = FakeHost::new();
+            let before = state.active_child_mask;
+            let cap = crate::observe::FailCapture::start();
+            process_root_packet(
+                &mut state,
+                &mut host,
+                &Packet {
+                    opcode,
+                    stamp_waits: Vec::new(),
+                    total_size: PACKET_HEADER_LEN + 4,
+                    completion_stamp: 0,
+                    payload: channel.to_le_bytes().to_vec(),
+                    next_head: 0,
+                },
+            );
+            let lines = cap.lines();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("channel_lifetime_out_of_range")
+                        && l.contains(&format!("channel={channel}"))),
+                "channel {channel} on {opcode:#x} said nothing: {lines:?}"
+            );
+            assert_eq!(
+                state.active_child_mask, before,
+                "an out-of-range id must move no mask bit"
+            );
+        }
+    }
+}
+
 /// FIFO redefine/free retires scheduler ownership so a removed producer
 /// cannot strand later display transactions behind a stale bit.
 #[test]
@@ -4975,8 +5024,11 @@ fn every_short_control_packet_names_itself() {
         // slug of its own to disagree with it.
         "reason=device_info_short site=root",
         "reason=device_info_legacy_short site=root",
-        "reason=define_fifo_short site=root",
-        "reason=free_fifo_short site=root",
+        // The kind's name, as with the two device-info questions above: the
+        // slug is `reims_vgpu_core::control::ControlKind`'s and the drain has
+        // none of its own to disagree with it.
+        "reason=define_channel_short site=root",
+        "reason=free_channel_short site=root",
         "reason=set_object_list_short site=root",
         "reason=define_task2_short site=root",
         "reason=set_object_list_short site=ch4",
