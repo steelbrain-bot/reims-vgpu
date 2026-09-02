@@ -60,6 +60,12 @@ pub use context::MAX_DEVICE_RECREATES;
 pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
+// Read only under `host-window`, which is what the boot harness builds. Its
+// absence there is a build failure and not a warning, so the `expect` says the
+// unused warning off `host-window` is the expected state rather than an
+// oversight nobody looked at.
+#[cfg_attr(not(feature = "host-window"), expect(unused_imports))]
+pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
 pub use types::{
