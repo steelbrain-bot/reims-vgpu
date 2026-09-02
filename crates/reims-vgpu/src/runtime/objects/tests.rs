@@ -3510,6 +3510,64 @@ fn a_query_reply_destination_is_measured_against_the_allocations_this_device_hol
     );
 }
 
+/// A declaration into a task no definition opened is told apart from one into a
+/// live task.
+///
+/// The resource-lifecycle group's equivalent of the channel gate G1 had to
+/// answer. `Lifecycle::create_resource` refuses `NoSuchTask`; this device
+/// creates the namespace on demand with `entry(task_id).or_default()`. If a
+/// driven guest ever declares into an undefined task, the object would not be
+/// named in the new owner at all — so the difference is counted before the move
+/// rather than discovered after it.
+#[test]
+fn a_declaration_into_an_undefined_task_is_told_apart_from_one_into_a_live_task() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    // `setup_task_with_list` defines task 1 and binds its object list.
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x1000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+
+    let defined = store_route_count("object_declared_into_a_defined_task");
+    let undefined = store_route_count("object_declared_into_an_undefined_task");
+    resolve_resource(&state, &host, task, buffer).expect("constructs");
+    assert_eq!(
+        (
+            store_route_count("object_declared_into_a_defined_task"),
+            store_route_count("object_declared_into_an_undefined_task"),
+        ),
+        (defined + 1, undefined),
+        "a live task is the case the lifecycle owner also admits"
+    );
+
+    // The same declaration in a task nothing defined. It succeeds here — the
+    // namespace is created on demand — and that is exactly what the new owner
+    // would refuse.
+    let name = super::declare_object_name(&state, 99, 7, None);
+    assert_eq!(name.slot.0, 7, "this device names it anyway");
+    assert_eq!(
+        (
+            store_route_count("object_declared_into_a_defined_task"),
+            store_route_count("object_declared_into_an_undefined_task"),
+        ),
+        (defined + 1, undefined + 1),
+        "and the counter says the new owner would not have"
+    );
+}
+
 /// A reply destination is identified in the space its own question uses, and
 /// the three spaces cannot collide.
 ///

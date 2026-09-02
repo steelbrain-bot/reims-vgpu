@@ -2860,12 +2860,48 @@ pub fn resolve_resource<M: HostMemory>(
 /// established that the slot holds no live name — which is what makes a
 /// displacement here an event rather than the ordinary redeclaration the
 /// namespace also supports.
+///
+/// # It is also where the next group's one refusal is measured
+///
+/// `reims_vgpu_core::lifecycle::Lifecycle` is the owner these namespaces move
+/// to, and its `create_resource` **refuses** `NoSuchTask` for a declaration into
+/// a task no `DefineTask` opened. This device does not: `declare_object` reaches
+/// for the task's namespace with `entry(task_id).or_default()`, so a declaration
+/// creates the namespace it needs. That difference is the resource-lifecycle
+/// group's equivalent of the channel gate G1 had to answer before it could move,
+/// and it is answered the same way — by counting it on a driven guest rather
+/// than by reasoning about when the guest sends what.
+///
+/// `DeviceState::tasks` is the exact proxy and not an approximation: its entries
+/// come from `CmdDefineTask2`, which is the same packet
+/// `LifecycleOp::DefineTask` is resolved from, so a task active here is a task
+/// the model would hold.
+///
+/// `object_declared_into_a_defined_task` is the denominator's other half —
+/// without it, a boot where every declaration named a live task and a boot where
+/// this device constructed nothing read the same.
 fn declare_object_name(
     state: &DeviceState,
     task_id: u32,
     obj_ref: u32,
     backing: Option<reims_vgpu_core::access::BackingId>,
 ) -> reims_vgpu_core::identity::ResourceId {
+    if state.tasks.is_active(task_id) {
+        crate::runtime::drain::note_store_route("object_declared_into_a_defined_task");
+    } else {
+        crate::runtime::drain::note_store_route("object_declared_into_an_undefined_task");
+        if crate::observe::first_sight(
+            "object_declared_into_an_undefined_task",
+            (u64::from(task_id) << 32) | u64::from(obj_ref),
+        ) {
+            crate::observe::fail(format!(
+                "object_declared_into_an_undefined_task task={task_id} ref={obj_ref} (this \
+                 device creates the namespace on demand and the lifecycle owner these \
+                 namespaces move to refuses the declaration, so the object would not be \
+                 named there at all)"
+            ));
+        }
+    }
     let declared = state.declare_object(task_id, obj_ref, backing);
     // A declaration over a slot that still held a live object owes that
     // occupant's teardown. It should be unreachable: every caller asked the
