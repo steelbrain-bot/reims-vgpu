@@ -629,6 +629,21 @@ pub struct ExecResult {
 /// Counted after the load, so the bucket is buffers this device could read
 /// rather than buffers the header declared. The two differ exactly when a
 /// descriptor was skipped, and `exec_cmdbuf` says which.
+///
+/// # What a driven boot answered
+///
+/// x86 Vulkan, macos-15, three rounds of five applications:
+/// **`exec_cmdbufs_1=20 006` and every other bucket silent**, against
+/// `packet_class_exec=20 006`. Every exec packet this guest sends carries
+/// exactly one command buffer.
+///
+/// So `reims_vgpu_core::walk::exec`'s one-buffer signature is adequate for the
+/// guest the cutover is being measured against, and the bridge that eventually
+/// builds a `Payload::Exec` has one stream to hand it. That is a reading and not
+/// a contract: the seventeen-buffer submission this loop's removed ceiling
+/// truncated is in this repository's history, so the multi-buffer path is real
+/// and `walk::command_buffer` is what it walks through. A bucket above `_1`
+/// appearing is the day a caller must use it.
 fn note_command_stream_count(loaded: usize) {
     crate::runtime::drain::note_store_route(match loaded {
         0 => "exec_cmdbufs_0",
