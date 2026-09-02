@@ -2478,18 +2478,31 @@ fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
 /// # What a driven boot answered
 ///
 /// x86 Vulkan, macos-15, three rounds of five applications:
-/// **`packet_class_exec=20 394`, `packet_class_lifecycle=13 500`,
-/// `packet_class_present=2054`, `packet_class_query=13`,
-/// `packet_class_control=11` — 35 972 classified — and
-/// `packet_class_unclassified=2080`.**
+/// **`packet_class_exec=20 802`, `packet_class_lifecycle=13 505`,
+/// `packet_class_present=2140`, `packet_class_query=13`,
+/// `packet_class_control=11` — 36 471 classified — and
+/// `packet_class_unclassified=2166`.**
 ///
-/// The unclassified 2080 are **one opcode**: `CmdDeleteObject`, child `0x28`,
+/// The unclassified 2166 are **one opcode**: `CmdDeleteObject`, child `0x28`,
 /// whose ledger row is `Closure::Unresolved` because its ref lives in the
 /// serializer's per-kind space rather than in the object list. That is five and
 /// a half per cent of this guest's packet stream, and it is the whole of what
 /// the ordering group would refuse — every other command it sends has a class.
-/// So the last group's blocker is not a breadth of unknown commands; it is one
-/// row, and closing it is recovering one ref space.
+///
+/// **And the kind census says the open question is 10 packets wide.** Of the
+/// 2166, `child_delete_object_sampler_state=2148`,
+/// `child_delete_object_depth_stencil_state=4` and
+/// `child_delete_object_render_pipeline_state=4` are the three kinds
+/// [`apply_delete_object`] tracks and retires — 2156 of them, and they retire:
+/// `sampler_state_deleted=2143`, `ds_state_deleted=4`,
+/// `pipeline_state_deleted=4`. The eight untracked kinds are **10 packets**: 5
+/// functions, 3 compute pipeline states, 2 fences, which is exactly
+/// `cmd_delete_object_unimplemented=10`.
+///
+/// So the last group's blocker is not a breadth of unknown commands, and it is
+/// not 2166 packets of unrecovered contract either. It is one row whose
+/// unresolved half a driven guest exercises ten times a boot, holding back the
+/// 2156 whose per-kind space this device already resolves.
 ///
 /// The shape of the classified traffic is the other half of the reading. It is
 /// over half exec, which says the group's risk is concentrated in the class

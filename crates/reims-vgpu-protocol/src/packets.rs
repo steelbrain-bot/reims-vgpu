@@ -315,9 +315,15 @@ pub const LEDGER: &[Packet] = &[
                        for three kinds and not the other eight. The kind is counted and the \
                        object is not retired; acting on the ref against the object-list namespace \
                        was measured and would only ever destroy an unrelated object that shared \
-                       the integer. It is also the *only* unresolved row a driven guest sends: a \
-                       macos-15 boot through three rounds of five applications classified 35 972 \
-                       packets and left 2080 unclassified, every one of them this opcode",
+                       the integer. It is also the *only* unresolved row a driven guest sends, \
+                       and the kind census says what closing it is worth: a macos-15 boot \
+                       through three rounds of five applications classified 36 471 packets and \
+                       left 2166 unclassified, every one of them this opcode --- of which 2148 \
+                       delete a sampler state, 4 a depth-stencil state and 4 a render pipeline \
+                       state, the three kinds this device does track and does retire. The eight \
+                       untracked kinds are 10 packets: 5 functions, 3 compute pipeline states \
+                       and 2 fences. So the open question is 10 packets wide and the row blocks \
+                       2166, which is the ratio whoever closes it should know",
         },
     },
     Packet {
