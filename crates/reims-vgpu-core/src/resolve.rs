@@ -55,6 +55,7 @@ use reims_vgpu_protocol::decode::blit::{
     BlitRecord, FillPattern as RecordFill, Origin as RecordOrigin, Size as RecordSize,
     TextureEndpoint,
 };
+use reims_vgpu_protocol::decode::compute as protocol_compute;
 use reims_vgpu_protocol::decode::compute::{
     ComputeRecord, DispatchRecord, Extent as RecordExtent, IndirectRef as ComputeIndirect,
 };
@@ -621,85 +622,104 @@ pub fn compute(
     arenas: &mut ExecArenas,
 ) -> Result<ComputeOp, ResolveRefusal> {
     Ok(match *record {
-        ComputeRecord::BindBuffers { first, entries } => ComputeOp::BindBuffers {
-            first,
-            entries: append_buffer_binds(arenas, resolver, entries)?,
-        },
-        ComputeRecord::BindBuffersWithStride { first, entries } => {
-            ComputeOp::BindBuffersWithStride {
+        ComputeRecord::BindBuffers(protocol_compute::BindBuffers { first, entries }) => {
+            ComputeOp::BindBuffers {
                 first,
-                entries: append_stride_binds(arenas, resolver, entries)?,
+                entries: append_buffer_binds(arenas, resolver, entries)?,
             }
         }
-        ComputeRecord::BindTextures { first, entries } => ComputeOp::BindTextures {
+        ComputeRecord::BindBuffersWithStride(protocol_compute::BindBuffersWithStride {
             first,
-            entries: append_object_binds(arenas, resolver, entries)?,
-        },
-        ComputeRecord::BindSamplers { first, entries } => ComputeOp::BindSamplers {
+            entries,
+        }) => ComputeOp::BindBuffersWithStride {
             first,
-            entries: append_object_binds(arenas, resolver, entries)?,
+            entries: append_stride_binds(arenas, resolver, entries)?,
         },
-        ComputeRecord::BindSamplersWithLod { first, entries } => ComputeOp::BindSamplersWithLod {
+        ComputeRecord::BindTextures(protocol_compute::BindTextures { first, entries }) => {
+            ComputeOp::BindTextures {
+                first,
+                entries: append_object_binds(arenas, resolver, entries)?,
+            }
+        }
+        ComputeRecord::BindSamplers(protocol_compute::BindSamplers { first, entries }) => {
+            ComputeOp::BindSamplers {
+                first,
+                entries: append_object_binds(arenas, resolver, entries)?,
+            }
+        }
+        ComputeRecord::BindSamplersWithLod(protocol_compute::BindSamplersWithLod {
+            first,
+            entries,
+        }) => ComputeOp::BindSamplersWithLod {
             first,
             entries: append_sampler_lod_binds(arenas, resolver, entries)?,
         },
-        ComputeRecord::RebindBufferOffset {
+        ComputeRecord::RebindBufferOffset(protocol_compute::RebindBufferOffset {
             index,
             offset,
             stride,
-        } => ComputeOp::RebindBufferOffset {
+        }) => ComputeOp::RebindBufferOffset {
             index,
             offset,
             stride,
         },
-        ComputeRecord::SetPipeline { pipeline_ref } => ComputeOp::SetPipeline {
-            pipeline: one(resolver, pipeline_ref)?,
-        },
-        ComputeRecord::SetStageInRegion { origin, size } => ComputeOp::SetStageInRegion {
-            origin: ComputeOrigin {
-                x: origin.x,
-                y: origin.y,
-                z: origin.z,
-            },
-            size: compute_extent(size),
-        },
-        ComputeRecord::SetStageInRegionIndirect { source } => ComputeOp::SetStageInRegionIndirect {
+        ComputeRecord::SetPipeline(protocol_compute::SetPipeline { pipeline_ref }) => {
+            ComputeOp::SetPipeline {
+                pipeline: one(resolver, pipeline_ref)?,
+            }
+        }
+        ComputeRecord::SetStageInRegion(protocol_compute::SetStageInRegion { origin, size }) => {
+            ComputeOp::SetStageInRegion {
+                origin: ComputeOrigin {
+                    x: origin.x,
+                    y: origin.y,
+                    z: origin.z,
+                },
+                size: compute_extent(size),
+            }
+        }
+        ComputeRecord::SetStageInRegionIndirect(protocol_compute::SetStageInRegionIndirect {
+            source,
+        }) => ComputeOp::SetStageInRegionIndirect {
             source: indirect(resolver, source)?,
         },
-        ComputeRecord::SetThreadgroupMemory { index, length } => {
-            ComputeOp::SetThreadgroupMemory { index, length }
-        }
-        ComputeRecord::SetImageblockSize { width, height } => {
+        ComputeRecord::SetThreadgroupMemory(protocol_compute::SetThreadgroupMemory {
+            index,
+            length,
+        }) => ComputeOp::SetThreadgroupMemory { index, length },
+        ComputeRecord::SetImageblockSize(protocol_compute::SetImageblockSize { width, height }) => {
             ComputeOp::SetImageblockSize { width, height }
         }
-        ComputeRecord::WriteDescriptor { dispatch_type } => {
+        ComputeRecord::WriteDescriptor(protocol_compute::WriteDescriptor { dispatch_type }) => {
             ComputeOp::WriteDescriptor { dispatch_type }
         }
         ComputeRecord::Dispatch(d) => ComputeOp::Dispatch(match d {
-            DispatchRecord::Threadgroups {
+            DispatchRecord::Threadgroups(protocol_compute::Threadgroups {
                 groups,
                 threads_per_group,
-            } => DispatchOp::Threadgroups {
+            }) => DispatchOp::Threadgroups {
                 groups: compute_extent(groups),
                 threads_per_group: compute_extent(threads_per_group),
             },
-            DispatchRecord::Threads {
+            DispatchRecord::Threads(protocol_compute::Threads {
                 threads,
                 threads_per_group,
-            } => DispatchOp::Threads {
+            }) => DispatchOp::Threads {
                 threads: compute_extent(threads),
                 threads_per_group: compute_extent(threads_per_group),
             },
-            DispatchRecord::ThreadgroupsIndirect {
+            DispatchRecord::ThreadgroupsIndirect(protocol_compute::ThreadgroupsIndirect {
                 source,
                 threads_per_group,
-            } => DispatchOp::ThreadgroupsIndirect {
+            }) => DispatchOp::ThreadgroupsIndirect {
                 source: indirect(resolver, source)?,
                 threads_per_group: compute_extent(threads_per_group),
             },
-            DispatchRecord::ThreadsIndirect { source } => DispatchOp::ThreadsIndirect {
-                source: indirect(resolver, source)?,
-            },
+            DispatchRecord::ThreadsIndirect(protocol_compute::ThreadsIndirect { source }) => {
+                DispatchOp::ThreadsIndirect {
+                    source: indirect(resolver, source)?,
+                }
+            }
         }),
     })
 }
@@ -1417,10 +1437,10 @@ mod tests {
         let live = Live(vec![5151]);
         let mut arenas = ExecArenas::default();
         let entries = [buffer_entry(5151, 0x10), buffer_entry(0, 0)];
-        let record = ComputeRecord::BindBuffers {
+        let record = ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
             first: 2,
             entries: &entries,
-        };
+        });
         let ComputeOp::BindBuffers { first, entries } =
             compute(&record, &live, &mut arenas).expect("resolved")
         else {
@@ -1451,10 +1471,10 @@ mod tests {
         let live = Live(Vec::new());
         let mut arenas = ExecArenas::default();
         let entries = [buffer_entry(5151, 0)];
-        let record = ComputeRecord::BindBuffers {
+        let record = ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
             first: 0,
             entries: &entries,
-        };
+        });
         assert_eq!(
             compute(&record, &live, &mut arenas),
             Err(ResolveRefusal::UnknownRef { object_ref: 5151 })
@@ -1474,10 +1494,11 @@ mod tests {
             offset: reims_vgpu_protocol::decode::U64le::new(0x10),
             attribute_stride: reims_vgpu_protocol::decode::U64le::new(0x20),
         });
-        let record = ComputeRecord::BindBuffersWithStride {
-            first: 0,
-            entries: &entries,
-        };
+        let record =
+            ComputeRecord::BindBuffersWithStride(protocol_compute::BindBuffersWithStride {
+                first: 0,
+                entries: &entries,
+            });
         let ComputeOp::BindBuffersWithStride { entries, .. } =
             compute(&record, &live, &mut arenas).expect("resolved")
         else {
@@ -1500,10 +1521,10 @@ mod tests {
                 lod_min_clamp: reims_vgpu_protocol::decode::F32le::new(lo),
                 lod_max_clamp: reims_vgpu_protocol::decode::F32le::new(hi),
             });
-        let record = ComputeRecord::BindSamplersWithLod {
+        let record = ComputeRecord::BindSamplersWithLod(protocol_compute::BindSamplersWithLod {
             first: 0,
             entries: &entries,
-        };
+        });
         let ComputeOp::BindSamplersWithLod { entries, .. } =
             compute(&record, &live, &mut arenas).expect("resolved")
         else {
@@ -1531,19 +1552,19 @@ mod tests {
             object_ref: reims_vgpu_protocol::decode::U32le::new(1),
         }];
         let a = compute(
-            &ComputeRecord::BindBuffers {
+            &ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
                 first: 0,
                 entries: &buffers,
-            },
+            }),
             &live,
             &mut arenas,
         )
         .expect("resolved");
         let b = compute(
-            &ComputeRecord::BindTextures {
+            &ComputeRecord::BindTextures(protocol_compute::BindTextures {
                 first: 0,
                 entries: &objects,
-            },
+            }),
             &live,
             &mut arenas,
         )
@@ -1566,11 +1587,11 @@ mod tests {
     fn a_rebind_resolves_nothing_because_it_names_nothing() {
         let live = Live(Vec::new());
         let mut arenas = ExecArenas::default();
-        let record = ComputeRecord::RebindBufferOffset {
+        let record = ComputeRecord::RebindBufferOffset(protocol_compute::RebindBufferOffset {
             index: 6,
             offset: 0x5678,
             stride: Some(0x20),
-        };
+        });
         assert_eq!(
             compute(&record, &live, &mut arenas),
             Ok(ComputeOp::RebindBufferOffset {
@@ -1587,30 +1608,34 @@ mod tests {
     fn only_an_indirect_dispatch_resolves_a_buffer() {
         let live = Live(vec![5151]);
         let mut arenas = ExecArenas::default();
-        let direct = ComputeRecord::Dispatch(DispatchRecord::Threadgroups {
-            groups: RecordExtent {
-                width: 1,
-                height: 2,
-                depth: 3,
+        let direct = ComputeRecord::Dispatch(DispatchRecord::Threadgroups(
+            protocol_compute::Threadgroups {
+                groups: RecordExtent {
+                    width: 1,
+                    height: 2,
+                    depth: 3,
+                },
+                threads_per_group: RecordExtent {
+                    width: 4,
+                    height: 5,
+                    depth: 6,
+                },
             },
-            threads_per_group: RecordExtent {
-                width: 4,
-                height: 5,
-                depth: 6,
-            },
-        });
+        ));
         let ComputeOp::Dispatch(op) = compute(&direct, &live, &mut arenas).expect("resolved")
         else {
             panic!("not a dispatch");
         };
         assert_eq!(op.indirect_read(), None);
 
-        let indirect_record = ComputeRecord::Dispatch(DispatchRecord::ThreadsIndirect {
-            source: ComputeIndirect {
-                buffer_ref: 5151,
-                offset: 0x1111,
+        let indirect_record = ComputeRecord::Dispatch(DispatchRecord::ThreadsIndirect(
+            protocol_compute::ThreadsIndirect {
+                source: ComputeIndirect {
+                    buffer_ref: 5151,
+                    offset: 0x1111,
+                },
             },
-        });
+        ));
         let ComputeOp::Dispatch(op) =
             compute(&indirect_record, &live, &mut arenas).expect("resolved")
         else {
@@ -2332,10 +2357,10 @@ mod tests {
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map(Appended::Buffers);
-                        let record = ComputeRecord::BindBuffers {
+                        let record = ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
                             first: 0,
                             entries: &entries,
-                        };
+                        });
                         let got = compute(&record, &live, &mut arenas).map(|op| match op {
                             ComputeOp::BindBuffers { entries, .. } => Some(entries),
                             other => panic!("a buffer bind resolved to {other:?}"),
@@ -2366,10 +2391,12 @@ mod tests {
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map(Appended::Buffers);
-                        let record = ComputeRecord::BindBuffersWithStride {
-                            first: 0,
-                            entries: &entries,
-                        };
+                        let record = ComputeRecord::BindBuffersWithStride(
+                            protocol_compute::BindBuffersWithStride {
+                                first: 0,
+                                entries: &entries,
+                            },
+                        );
                         let got = compute(&record, &live, &mut arenas).map(|op| match op {
                             ComputeOp::BindBuffersWithStride { entries, .. } => Some(entries),
                             other => panic!("a strided bind resolved to {other:?}"),
@@ -2397,10 +2424,10 @@ mod tests {
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map(Appended::Objects);
-                        let record = ComputeRecord::BindTextures {
+                        let record = ComputeRecord::BindTextures(protocol_compute::BindTextures {
                             first: 0,
                             entries: &entries,
-                        };
+                        });
                         let got = compute(&record, &live, &mut arenas).map(|op| match op {
                             ComputeOp::BindTextures { entries, .. } => Some(entries),
                             other => panic!("a texture bind resolved to {other:?}"),
@@ -2433,10 +2460,12 @@ mod tests {
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map(Appended::Objects);
-                        let record = ComputeRecord::BindSamplersWithLod {
-                            first: 0,
-                            entries: &entries,
-                        };
+                        let record = ComputeRecord::BindSamplersWithLod(
+                            protocol_compute::BindSamplersWithLod {
+                                first: 0,
+                                entries: &entries,
+                            },
+                        );
                         let got = compute(&record, &live, &mut arenas).map(|op| match op {
                             ComputeOp::BindSamplersWithLod { entries, .. } => Some(entries),
                             other => panic!("a sampler bind resolved to {other:?}"),

@@ -64,77 +64,161 @@ pub struct IndirectRef {
     pub offset: u64,
 }
 
+/// A dispatch whose grid the record states in threadgroups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Threadgroups {
+    pub groups: Extent,
+    pub threads_per_group: Extent,
+}
+
+/// A dispatch whose grid the record states in threads.
+///
+/// Byte-identical to [`Threadgroups`] and a different statement: the field name
+/// is the whole difference, and a caller that read the wrong one dispatches a
+/// grid of the wrong size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Threads {
+    pub threads: Extent,
+    pub threads_per_group: Extent,
+}
+
+/// A dispatch whose threadgroup count comes from a buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadgroupsIndirect {
+    pub source: IndirectRef,
+    pub threads_per_group: Extent,
+}
+
+/// A dispatch whose thread count *and* threadgroup size both come from a
+/// buffer, which is why it carries no extent of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadsIndirect {
+    pub source: IndirectRef,
+}
+
 /// One lifted dispatch.
+///
+/// Each variant carries **one named payload** rather than inline fields, for
+/// the same reason [`ComputeRecord`] does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DispatchRecord {
-    Threadgroups {
-        groups: Extent,
-        threads_per_group: Extent,
-    },
-    Threads {
-        threads: Extent,
-        threads_per_group: Extent,
-    },
-    ThreadgroupsIndirect {
-        source: IndirectRef,
-        threads_per_group: Extent,
-    },
-    ThreadsIndirect {
-        source: IndirectRef,
-    },
+    Threadgroups(Threadgroups),
+    Threads(Threads),
+    ThreadgroupsIndirect(ThreadgroupsIndirect),
+    ThreadsIndirect(ThreadsIndirect),
+}
+
+/// A run of buffer bindings starting at one argument-table slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindBuffers<'a> {
+    /// The slot the first entry lands in.
+    pub first: u32,
+    pub entries: &'a [BufferBind],
+}
+
+/// A run of buffer bindings that also carry a vertex-attribute stride.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindBuffersWithStride<'a> {
+    pub first: u32,
+    pub entries: &'a [BufferStrideBind],
+}
+
+/// A run of texture bindings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindTextures<'a> {
+    pub first: u32,
+    pub entries: &'a [RefBind],
+}
+
+/// A run of sampler bindings.
+///
+/// The same wire entry as [`BindTextures`] and a different argument table, so
+/// they are two payloads rather than one — a run written into the wrong table
+/// binds nothing the kernel asked for and refuses nothing either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSamplers<'a> {
+    pub first: u32,
+    pub entries: &'a [RefBind],
+}
+
+/// A run of sampler bindings that also carry a LOD clamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSamplersWithLod<'a> {
+    pub first: u32,
+    pub entries: &'a [SamplerLodBind],
+}
+
+/// Move an already-bound buffer's offset, and its stride when the record
+/// carries one. It names no buffer: the slot keeps whatever it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RebindBufferOffset {
+    pub index: u32,
+    pub offset: u64,
+    /// `None` for `setBufferOffset:atIndex:`, which does not carry the field at
+    /// all — not a stride of zero, which is a stride the guest could state.
+    pub stride: Option<u64>,
+}
+
+/// The compute pipeline state the following dispatches run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetPipeline {
+    pub pipeline_ref: u32,
+}
+
+/// The stage-in region, as the record states it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetStageInRegion {
+    pub origin: Origin,
+    pub size: Extent,
+}
+
+/// The stage-in region, read from a buffer instead of stated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetStageInRegionIndirect {
+    pub source: IndirectRef,
+}
+
+/// Threadgroup memory reserved at one slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetThreadgroupMemory {
+    pub index: u32,
+    pub length: u64,
+}
+
+/// The imageblock dimensions the pass tiles with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetImageblockSize {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The pass's dispatch type, the one enumerated field on this encoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteDescriptor {
+    pub dispatch_type: DispatchType,
 }
 
 /// One lifted compute record.
+///
+/// Each variant carries **one named payload** rather than inline fields, so a
+/// consumer can take the record it handles by reference and cannot be handed a
+/// different one. Without that, the only thing an executor could be given is
+/// the whole enum, and every arm would re-match to find out which record it was
+/// already dispatched on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComputeRecord<'a> {
-    BindBuffers {
-        first: u32,
-        entries: &'a [BufferBind],
-    },
-    BindBuffersWithStride {
-        first: u32,
-        entries: &'a [BufferStrideBind],
-    },
-    BindTextures {
-        first: u32,
-        entries: &'a [RefBind],
-    },
-    BindSamplers {
-        first: u32,
-        entries: &'a [RefBind],
-    },
-    BindSamplersWithLod {
-        first: u32,
-        entries: &'a [SamplerLodBind],
-    },
-    /// Move an already-bound buffer's offset, and its stride when the record
-    /// carries one. It names no buffer: the slot keeps whatever it holds.
-    RebindBufferOffset {
-        index: u32,
-        offset: u64,
-        stride: Option<u64>,
-    },
-    SetPipeline {
-        pipeline_ref: u32,
-    },
-    SetStageInRegion {
-        origin: Origin,
-        size: Extent,
-    },
-    SetStageInRegionIndirect {
-        source: IndirectRef,
-    },
-    SetThreadgroupMemory {
-        index: u32,
-        length: u64,
-    },
-    SetImageblockSize {
-        width: u32,
-        height: u32,
-    },
-    WriteDescriptor {
-        dispatch_type: DispatchType,
-    },
+    BindBuffers(BindBuffers<'a>),
+    BindBuffersWithStride(BindBuffersWithStride<'a>),
+    BindTextures(BindTextures<'a>),
+    BindSamplers(BindSamplers<'a>),
+    BindSamplersWithLod(BindSamplersWithLod<'a>),
+    RebindBufferOffset(RebindBufferOffset),
+    SetPipeline(SetPipeline),
+    SetStageInRegion(SetStageInRegion),
+    SetStageInRegionIndirect(SetStageInRegionIndirect),
+    SetThreadgroupMemory(SetThreadgroupMemory),
+    SetImageblockSize(SetImageblockSize),
+    WriteDescriptor(WriteDescriptor),
     Dispatch(DispatchRecord),
 }
 
@@ -143,29 +227,29 @@ impl ComputeRecord<'_> {
     #[must_use]
     pub const fn kind(&self) -> ComputeKind {
         match self {
-            Self::BindBuffers { .. } => ComputeKind::SetBuffers,
-            Self::BindBuffersWithStride { .. } => ComputeKind::SetBuffersWithStride,
-            Self::BindTextures { .. } => ComputeKind::SetTextures,
-            Self::BindSamplers { .. } => ComputeKind::SetSamplers,
-            Self::BindSamplersWithLod { .. } => ComputeKind::SetSamplersWithLod,
-            Self::RebindBufferOffset { stride: None, .. } => ComputeKind::SetBufferOffset,
-            Self::RebindBufferOffset {
-                stride: Some(_), ..
-            } => ComputeKind::SetBufferOffsetStride,
-            Self::SetPipeline { .. } => ComputeKind::SetPipelineState,
-            Self::SetStageInRegion { .. } => ComputeKind::SetStageInRegion,
-            Self::SetStageInRegionIndirect { .. } => ComputeKind::SetStageInRegionIndirect,
-            Self::SetThreadgroupMemory { .. } => ComputeKind::SetThreadgroupMemoryLength,
-            Self::SetImageblockSize { .. } => ComputeKind::SetImageblockSize,
-            Self::WriteDescriptor { .. } => ComputeKind::WriteDescriptor,
-            Self::Dispatch(DispatchRecord::Threadgroups { .. }) => {
-                ComputeKind::DispatchThreadgroups
+            Self::BindBuffers(_) => ComputeKind::SetBuffers,
+            Self::BindBuffersWithStride(_) => ComputeKind::SetBuffersWithStride,
+            Self::BindTextures(_) => ComputeKind::SetTextures,
+            Self::BindSamplers(_) => ComputeKind::SetSamplers,
+            Self::BindSamplersWithLod(_) => ComputeKind::SetSamplersWithLod,
+            Self::RebindBufferOffset(RebindBufferOffset { stride: None, .. }) => {
+                ComputeKind::SetBufferOffset
             }
-            Self::Dispatch(DispatchRecord::Threads { .. }) => ComputeKind::DispatchThreads,
-            Self::Dispatch(DispatchRecord::ThreadgroupsIndirect { .. }) => {
+            Self::RebindBufferOffset(RebindBufferOffset {
+                stride: Some(_), ..
+            }) => ComputeKind::SetBufferOffsetStride,
+            Self::SetPipeline(_) => ComputeKind::SetPipelineState,
+            Self::SetStageInRegion(_) => ComputeKind::SetStageInRegion,
+            Self::SetStageInRegionIndirect(_) => ComputeKind::SetStageInRegionIndirect,
+            Self::SetThreadgroupMemory(_) => ComputeKind::SetThreadgroupMemoryLength,
+            Self::SetImageblockSize(_) => ComputeKind::SetImageblockSize,
+            Self::WriteDescriptor(_) => ComputeKind::WriteDescriptor,
+            Self::Dispatch(DispatchRecord::Threadgroups(_)) => ComputeKind::DispatchThreadgroups,
+            Self::Dispatch(DispatchRecord::Threads(_)) => ComputeKind::DispatchThreads,
+            Self::Dispatch(DispatchRecord::ThreadgroupsIndirect(_)) => {
                 ComputeKind::DispatchThreadgroupsIndirect
             }
-            Self::Dispatch(DispatchRecord::ThreadsIndirect { .. }) => {
+            Self::Dispatch(DispatchRecord::ThreadsIndirect(_)) => {
                 ComputeKind::DispatchThreadsIndirect
             }
         }
@@ -196,21 +280,21 @@ pub fn decode<'a>(op: &Op<'a>) -> Result<ComputeRecord<'a>, DecodeRefusal> {
                 depth: r.threads_depth.get(),
             };
             ComputeRecord::Dispatch(if matches!(kind, ComputeKind::DispatchThreadgroups) {
-                DispatchRecord::Threadgroups {
+                DispatchRecord::Threadgroups(Threadgroups {
                     groups: first,
                     threads_per_group,
-                }
+                })
             } else {
-                DispatchRecord::Threads {
+                DispatchRecord::Threads(Threads {
                     threads: first,
                     threads_per_group,
-                }
+                })
             })
         }
         ComputeKind::DispatchThreadgroupsIndirect => {
             let r = wire::dispatch_indirect(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DispatchIndirect>()))?;
-            ComputeRecord::Dispatch(DispatchRecord::ThreadgroupsIndirect {
+            ComputeRecord::Dispatch(DispatchRecord::ThreadgroupsIndirect(ThreadgroupsIndirect {
                 source: IndirectRef {
                     buffer_ref: r.indirect_buffer_ref.get(),
                     offset: r.indirect_buffer_offset.get(),
@@ -220,87 +304,87 @@ pub fn decode<'a>(op: &Op<'a>) -> Result<ComputeRecord<'a>, DecodeRefusal> {
                     height: r.threads_height.get(),
                     depth: r.threads_depth.get(),
                 },
-            })
+            }))
         }
         ComputeKind::DispatchThreadsIndirect => {
             let r = wire::dispatch_threads_indirect(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::DispatchThreadsIndirect>()))?;
-            ComputeRecord::Dispatch(DispatchRecord::ThreadsIndirect {
+            ComputeRecord::Dispatch(DispatchRecord::ThreadsIndirect(ThreadsIndirect {
                 source: IndirectRef {
                     buffer_ref: r.indirect_buffer_ref.get(),
                     offset: r.indirect_buffer_offset.get(),
                 },
-            })
+            }))
         }
         ComputeKind::SetBuffers => {
             let (head, entries_slice) =
                 wire::buffer_binds(op).map_err(|_| entries(core::mem::size_of::<BufferBind>()))?;
-            ComputeRecord::BindBuffers {
+            ComputeRecord::BindBuffers(BindBuffers {
                 first: head.first.get(),
                 entries: entries_slice,
-            }
+            })
         }
         ComputeKind::SetBuffersWithStride => {
             let (head, entries_slice) = wire::buffer_stride_binds(op)
                 .map_err(|_| entries(core::mem::size_of::<BufferStrideBind>()))?;
-            ComputeRecord::BindBuffersWithStride {
+            ComputeRecord::BindBuffersWithStride(BindBuffersWithStride {
                 first: head.first.get(),
                 entries: entries_slice,
-            }
+            })
         }
         ComputeKind::SetTextures | ComputeKind::SetSamplers => {
             let (head, entries_slice) =
                 wire::ref_binds(op).map_err(|_| entries(core::mem::size_of::<RefBind>()))?;
             let first = head.first.get();
             if matches!(kind, ComputeKind::SetTextures) {
-                ComputeRecord::BindTextures {
+                ComputeRecord::BindTextures(BindTextures {
                     first,
                     entries: entries_slice,
-                }
+                })
             } else {
-                ComputeRecord::BindSamplers {
+                ComputeRecord::BindSamplers(BindSamplers {
                     first,
                     entries: entries_slice,
-                }
+                })
             }
         }
         ComputeKind::SetSamplersWithLod => {
             let (head, entries_slice) = wire::sampler_lod_binds(op)
                 .map_err(|_| entries(core::mem::size_of::<SamplerLodBind>()))?;
-            ComputeRecord::BindSamplersWithLod {
+            ComputeRecord::BindSamplersWithLod(BindSamplersWithLod {
                 first: head.first.get(),
                 entries: entries_slice,
-            }
+            })
         }
         ComputeKind::SetBufferOffset => {
             let r = wire::set_buffer_offset(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::BufferOffset>()))?;
-            ComputeRecord::RebindBufferOffset {
+            ComputeRecord::RebindBufferOffset(RebindBufferOffset {
                 index: r.index.get(),
                 offset: r.offset.get(),
                 stride: None,
-            }
+            })
         }
         ComputeKind::SetBufferOffsetStride => {
             let r = wire::buffer_offset_stride(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::BufferOffsetStride>()))?;
-            ComputeRecord::RebindBufferOffset {
+            ComputeRecord::RebindBufferOffset(RebindBufferOffset {
                 index: r.index.get(),
                 offset: r.offset.get(),
                 stride: Some(r.attribute_stride.get()),
-            }
+            })
         }
         ComputeKind::SetPipelineState => {
             let r = wire::set_pipeline_state(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::Ref>()))?;
-            ComputeRecord::SetPipeline {
+            ComputeRecord::SetPipeline(SetPipeline {
                 pipeline_ref: r.object_ref.get(),
-            }
+            })
         }
         ComputeKind::SetStageInRegion => {
             let r = wire::set_stage_in_region(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::StageInRegion>()))?;
-            ComputeRecord::SetStageInRegion {
+            ComputeRecord::SetStageInRegion(SetStageInRegion {
                 origin: Origin {
                     x: r.origin_x.get(),
                     y: r.origin_y.get(),
@@ -311,33 +395,33 @@ pub fn decode<'a>(op: &Op<'a>) -> Result<ComputeRecord<'a>, DecodeRefusal> {
                     height: r.size_height.get(),
                     depth: r.size_depth.get(),
                 },
-            }
+            })
         }
         ComputeKind::SetStageInRegionIndirect => {
             let r = wire::set_stage_in_region_indirect(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::StageInRegionIndirect>()))?;
-            ComputeRecord::SetStageInRegionIndirect {
+            ComputeRecord::SetStageInRegionIndirect(SetStageInRegionIndirect {
                 source: IndirectRef {
                     buffer_ref: r.indirect_buffer_ref.get(),
                     offset: r.indirect_buffer_offset.get(),
                 },
-            }
+            })
         }
         ComputeKind::SetThreadgroupMemoryLength => {
             let r = wire::set_threadgroup_memory_length(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::ThreadgroupMemoryLength>()))?;
-            ComputeRecord::SetThreadgroupMemory {
+            ComputeRecord::SetThreadgroupMemory(SetThreadgroupMemory {
                 index: r.index.get(),
                 length: r.length.get(),
-            }
+            })
         }
         ComputeKind::SetImageblockSize => {
             let r = wire::set_imageblock_size(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::ImageblockSize>()))?;
-            ComputeRecord::SetImageblockSize {
+            ComputeRecord::SetImageblockSize(SetImageblockSize {
                 width: r.width.get(),
                 height: r.height.get(),
-            }
+            })
         }
         ComputeKind::WriteDescriptor => {
             let r = wire::write_descriptor(op)
@@ -351,7 +435,7 @@ pub fn decode<'a>(op: &Op<'a>) -> Result<ComputeRecord<'a>, DecodeRefusal> {
                     value: word,
                 });
             };
-            ComputeRecord::WriteDescriptor { dispatch_type }
+            ComputeRecord::WriteDescriptor(WriteDescriptor { dispatch_type })
         }
     })
 }
@@ -428,17 +512,19 @@ mod tests {
         };
         assert_eq!(
             lift(&record(wire::OPCODE_DISPATCH_THREADGROUPS, &payload)),
-            Ok(ComputeRecord::Dispatch(DispatchRecord::Threadgroups {
-                groups,
-                threads_per_group,
-            }))
+            Ok(ComputeRecord::Dispatch(DispatchRecord::Threadgroups(
+                Threadgroups {
+                    groups,
+                    threads_per_group,
+                }
+            )))
         );
         assert_eq!(
             lift(&record(wire::OPCODE_DISPATCH_THREADS, &payload)),
-            Ok(ComputeRecord::Dispatch(DispatchRecord::Threads {
+            Ok(ComputeRecord::Dispatch(DispatchRecord::Threads(Threads {
                 threads: groups,
                 threads_per_group,
-            }))
+            })))
         );
     }
 
@@ -455,7 +541,7 @@ mod tests {
                 &dispatch
             )),
             Ok(ComputeRecord::Dispatch(
-                DispatchRecord::ThreadgroupsIndirect {
+                DispatchRecord::ThreadgroupsIndirect(ThreadgroupsIndirect {
                     source: IndirectRef {
                         buffer_ref: 5151,
                         offset: 0x1111,
@@ -465,7 +551,7 @@ mod tests {
                         height: 0x55,
                         depth: 0x66,
                     },
-                }
+                })
             ))
         );
 
@@ -473,12 +559,14 @@ mod tests {
         region.extend_from_slice(&0x1111u64.to_le_bytes());
         assert_eq!(
             lift(&record(wire::OPCODE_SET_STAGE_IN_REGION_INDIRECT, &region)),
-            Ok(ComputeRecord::SetStageInRegionIndirect {
-                source: IndirectRef {
-                    buffer_ref: 5151,
-                    offset: 0x1111,
-                },
-            })
+            Ok(ComputeRecord::SetStageInRegionIndirect(
+                SetStageInRegionIndirect {
+                    source: IndirectRef {
+                        buffer_ref: 5151,
+                        offset: 0x1111,
+                    },
+                }
+            ))
         );
     }
 
@@ -489,7 +577,7 @@ mod tests {
         let payload = u64s(&[0x44, 0x55, 0x66, 0x11, 0x22, 0x33]);
         assert_eq!(
             lift(&record(wire::OPCODE_SET_STAGE_IN_REGION, &payload)),
-            Ok(ComputeRecord::SetStageInRegion {
+            Ok(ComputeRecord::SetStageInRegion(SetStageInRegion {
                 origin: Origin {
                     x: 0x11,
                     y: 0x22,
@@ -500,7 +588,7 @@ mod tests {
                     height: 0x55,
                     depth: 0x66
                 },
-            })
+            }))
         );
     }
 
@@ -513,7 +601,9 @@ mod tests {
         payload.extend_from_slice(&4242u32.to_le_bytes());
         payload.extend_from_slice(&4343u32.to_le_bytes());
         let bytes = record(wire::OPCODE_SET_TEXTURE, &payload);
-        let ComputeRecord::BindTextures { first, entries } = lift(&bytes).expect("lifted") else {
+        let ComputeRecord::BindTextures(BindTextures { first, entries }) =
+            lift(&bytes).expect("lifted")
+        else {
             panic!("not a texture bind");
         };
         assert_eq!(first, 5);
@@ -534,19 +624,19 @@ mod tests {
         strided.extend_from_slice(&0x3456u64.to_le_bytes());
         assert_eq!(
             lift(&record(wire::OPCODE_SET_BUFFER_OFFSET, &plain)),
-            Ok(ComputeRecord::RebindBufferOffset {
+            Ok(ComputeRecord::RebindBufferOffset(RebindBufferOffset {
                 index: 6,
                 offset: 0x5678,
                 stride: None,
-            })
+            }))
         );
         assert_eq!(
             lift(&record(wire::OPCODE_SET_BUFFER_OFFSET_STRIDE, &strided)),
-            Ok(ComputeRecord::RebindBufferOffset {
+            Ok(ComputeRecord::RebindBufferOffset(RebindBufferOffset {
                 index: 6,
                 offset: 0x5678,
                 stride: Some(0x3456),
-            })
+            }))
         );
     }
 
@@ -565,9 +655,9 @@ mod tests {
         );
         assert_eq!(
             lift(&record(wire::OPCODE_WRITE_DESCRIPTOR, &1u32.to_le_bytes())),
-            Ok(ComputeRecord::WriteDescriptor {
+            Ok(ComputeRecord::WriteDescriptor(WriteDescriptor {
                 dispatch_type: DispatchType::Concurrent,
-            })
+            }))
         );
     }
 
