@@ -1369,6 +1369,100 @@ fn the_channel_transitions_the_model_would_refuse_are_counted_apart() {
     );
 }
 
+/// A lifetime command names a task, and the census tells a defined one from a
+/// task this device made up on the spot.
+///
+/// The group's remaining gate. `Lifecycle::apply` refuses `NoSuchTask` for
+/// eleven of the twelve commands, and the refusal loses the whole packet — so
+/// what a driven boot has to say is that the guest never sends one. The unmap
+/// below is the case that has no ref to resolve, which is why it is the one that
+/// can reach the refusal at all: the eight commands that resolve something do it
+/// through the same namespace the apply reads.
+#[test]
+fn a_lifetime_command_on_an_undefined_task_is_told_apart_from_one_on_a_defined_task() {
+    use crate::model::{CHILD_OP_UNMAP_MEMORY, ROOT_OP_DEFINE_TASK2};
+    use crate::protocol::fifo;
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    const TASK: u32 = 3;
+
+    let mut notice = vec![0u8; fifo::MAP_MEMORY_LEN];
+    notice[fifo::MAP_MEMORY_TASK_ID..fifo::MAP_MEMORY_TASK_ID + 4]
+        .copy_from_slice(&TASK.to_le_bytes());
+    notice[fifo::MAP_MEMORY_GVA..fifo::MAP_MEMORY_GVA + 8]
+        .copy_from_slice(&0x0000_7f12_3456_1000u64.to_le_bytes());
+    notice[fifo::MAP_MEMORY_LENGTH..fifo::MAP_MEMORY_LENGTH + 8]
+        .copy_from_slice(&0x1000u64.to_le_bytes());
+    let unmap = Packet {
+        opcode: CHILD_OP_UNMAP_MEMORY,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + u32::try_from(notice.len()).expect("small"),
+        completion_stamp: 0,
+        payload: notice,
+        next_head: 0,
+    };
+
+    let defined = store_route_count("lifetime_command_in_a_defined_task");
+    let undefined = store_route_count("lifetime_command_in_an_undefined_task");
+    let _ = process_child_packet(&mut state, &mut host, 1, &unmap);
+    assert_eq!(
+        (
+            store_route_count("lifetime_command_in_a_defined_task"),
+            store_route_count("lifetime_command_in_an_undefined_task"),
+        ),
+        (defined, undefined + 1),
+        "no definition opened this task, so the lifecycle owner would refuse the packet"
+    );
+
+    let mut define = vec![0u8; fifo::DEFINE_TASK_LEN];
+    define[..4].copy_from_slice(
+        &fifo::DefineTaskId {
+            task_id: TASK,
+            kernel: false,
+        }
+        .to_raw()
+        .to_le_bytes(),
+    );
+    define[fifo::DEFINE_TASK_DIRECTORY_PFN..fifo::DEFINE_TASK_DIRECTORY_PFN + 4]
+        .copy_from_slice(&0x1000u32.to_le_bytes());
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEFINE_TASK2,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + u32::try_from(define.len()).expect("small"),
+            completion_stamp: 0,
+            payload: define,
+            next_head: 0,
+        },
+    );
+    assert!(state.tasks.is_active(TASK), "the definition opened it");
+    // The definition itself is not counted: it is the event that makes the task
+    // hold, so asking whether it already held would count every first
+    // definition as a refusal of a packet the model accepts.
+    assert_eq!(
+        (
+            store_route_count("lifetime_command_in_a_defined_task"),
+            store_route_count("lifetime_command_in_an_undefined_task"),
+        ),
+        (defined, undefined + 1),
+        "a task definition is not a command against a task"
+    );
+
+    let _ = process_child_packet(&mut state, &mut host, 1, &unmap);
+    assert_eq!(
+        (
+            store_route_count("lifetime_command_in_a_defined_task"),
+            store_route_count("lifetime_command_in_an_undefined_task"),
+        ),
+        (defined + 1, undefined + 1),
+        "and now the same packet names a task the model holds"
+    );
+}
+
 /// A doorbell makes a domain live and a definition makes it *defined*, and the
 /// census tells the two apart on a device where one mask holds both.
 ///

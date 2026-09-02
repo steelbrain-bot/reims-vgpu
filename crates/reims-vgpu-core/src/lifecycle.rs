@@ -893,6 +893,80 @@ pub fn operation(
     }
 }
 
+/// Which task a lifecycle packet names, without resolving anything in it.
+///
+/// **The half of [`operation`] that needs no namespace, and the term
+/// [`Refusal::NoSuchTask`] is decided on.** Every one of the twelve commands
+/// carries its task in its own record, and eight of them carry nothing else
+/// that has to resolve — so "would the lifecycle owner hold this task" is
+/// answerable from the packet's bytes alone, before the owner is production
+/// state and before any ref is looked up. That is what a device measuring the
+/// group's cutover floor needs: an operation it cannot build yet still names a
+/// task, and a task the model does not hold is a refusal of the whole packet
+/// whatever the refs do.
+///
+/// It is not a second decode table. Each arm calls the same
+/// [`reims_vgpu_protocol::fifo`] decoder [`operation`]'s join for that kind
+/// calls, so the offsets have one owner; what is dropped is the resolution, not
+/// the layout. `task_named_agrees_with_the_operation_it_would_build` holds the
+/// two to the same answer over every kind.
+///
+/// # Errors
+///
+/// [`ResolveRefusal::ShortNotice`] or [`ResolveRefusal::Payload`] when the
+/// payload is too short to hold the record its kind names. There is no
+/// resolver-shaped refusal here, which is the point.
+pub fn task_named(kind: LifecycleKind, payload: &[u8]) -> Result<TaskId, ResolveRefusal> {
+    let id = match kind {
+        LifecycleKind::DefineTask => {
+            fifo::decode_define_task(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .id
+                .task_id
+        }
+        LifecycleKind::DeleteTask => {
+            fifo::decode_delete_task(payload).map_err(ResolveRefusal::ShortNotice)?
+        }
+        LifecycleKind::DeleteResource | LifecycleKind::ReplacePhysical => {
+            fifo::decode_task_object(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .task_id
+        }
+        LifecycleKind::MapMemory | LifecycleKind::UnmapMemory => {
+            fifo::decode_map_memory(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .task_id
+        }
+        LifecycleKind::DeleteBacking => {
+            fifo::decode_delete_backing(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .task_id
+        }
+        LifecycleKind::SetObjectList => {
+            fifo::decode_set_object_list(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .task_id
+        }
+        // The two record lengths, told apart by the same question
+        // [`resource_list`] asks: the eight-byte record is the validity quad's
+        // and the four-byte one is refs alone, and the task word is not at the
+        // same place in the two headers.
+        LifecycleKind::Invalidate => {
+            fifo::decode_invalidate_resources(payload)
+                .map_err(ResolveRefusal::Payload)?
+                .task_id
+        }
+        LifecycleKind::Synchronize
+        | LifecycleKind::SynchronizeAndDiscard
+        | LifecycleKind::Discard => {
+            fifo::decode_synchronize_resources(payload)
+                .map_err(ResolveRefusal::Payload)?
+                .task_id
+        }
+    };
+    Ok(TaskId(id))
+}
+
 /// Turn a `SetObjectList` packet's payload into the binding it names.
 ///
 /// Takes no resolver, as [`task_lifetime`] does not: the packet carries a task
@@ -3867,6 +3941,109 @@ mod tests {
         LifecycleKind::Discard,
         LifecycleKind::DeleteBacking,
     ];
+
+    /// One well-formed payload per kind, each naming task [`TASK_UNDER_TEST`].
+    ///
+    /// Written per kind rather than once, because the task word is not at one
+    /// offset: a definition doubles it and puts a class bit under it, and a
+    /// backing retirement carries `{object, task}` while a delete carries
+    /// `{task, object}` in the same two `u32`s. A single builder would be the
+    /// second decode table `task_named` exists not to be.
+    fn one_payload_per_kind(kind: LifecycleKind) -> Vec<u8> {
+        let task = TASK_UNDER_TEST;
+        match kind {
+            LifecycleKind::DefineTask => {
+                let mut out = vec![0u8; fifo::DEFINE_TASK_LEN];
+                out[..4].copy_from_slice(
+                    &fifo::DefineTaskId {
+                        task_id: task,
+                        kernel: false,
+                    }
+                    .to_raw()
+                    .to_le_bytes(),
+                );
+                out
+            }
+            LifecycleKind::DeleteTask => task.to_le_bytes().to_vec(),
+            LifecycleKind::SetObjectList => {
+                let mut out = vec![0u8; fifo::SET_OBJECT_LIST_LEN];
+                out[fifo::SET_OBJECT_LIST_TASK_ID..fifo::SET_OBJECT_LIST_TASK_ID + 4]
+                    .copy_from_slice(&task.to_le_bytes());
+                out
+            }
+            LifecycleKind::DeleteResource | LifecycleKind::ReplacePhysical => {
+                let mut out = Vec::new();
+                out.extend_from_slice(&task.to_le_bytes());
+                out.extend_from_slice(&7u32.to_le_bytes());
+                out
+            }
+            LifecycleKind::MapMemory | LifecycleKind::UnmapMemory => {
+                let mut out = vec![0u8; fifo::MAP_MEMORY_LEN];
+                out[fifo::MAP_MEMORY_TASK_ID..fifo::MAP_MEMORY_TASK_ID + 4]
+                    .copy_from_slice(&task.to_le_bytes());
+                out
+            }
+            LifecycleKind::DeleteBacking => {
+                let mut out = vec![0u8; fifo::DELETE_BACKING_LEN];
+                out[fifo::DELETE_BACKING_TASK_ID..fifo::DELETE_BACKING_TASK_ID + 4]
+                    .copy_from_slice(&task.to_le_bytes());
+                out
+            }
+            LifecycleKind::Invalidate => list_bytes(task, &[7], fifo::CHILD_INVALIDATE_RECORD_LEN),
+            LifecycleKind::Synchronize
+            | LifecycleKind::SynchronizeAndDiscard
+            | LifecycleKind::Discard => list_bytes(task, &[7], 4),
+        }
+    }
+
+    /// The task a packet names is the task the operation it would build names.
+    ///
+    /// `task_named` drops the resolution and keeps the layout, and the failure
+    /// that matters is it keeping the *wrong* layout — a retirement read at the
+    /// delete's offsets answers the object id as a task, and every arm of the
+    /// census built on it would then ask whether a task numbered like a surface
+    /// was defined. One task id, every kind, both readers.
+    ///
+    /// `ReplacePhysical` is here too, and it is the reason this function exists
+    /// separately at all: its operation refuses for want of storage the wire
+    /// does not carry, and its *task* is on the wire like everyone else's.
+    #[test]
+    fn task_named_agrees_with_the_operation_it_would_build() {
+        for kind in ALL_KINDS {
+            let payload = one_payload_per_kind(kind);
+            let named = task_named(kind, &payload)
+                .unwrap_or_else(|refusal| panic!("{} names a task: {refusal:?}", kind.name()));
+            assert_eq!(
+                named,
+                TaskId(TASK_UNDER_TEST),
+                "{} read its task word from the wrong offset",
+                kind.name()
+            );
+            match operation(kind, &payload, &Everything, &EveryMapping) {
+                Ok(op) => assert_eq!(
+                    op.task(),
+                    named,
+                    "{} builds an operation about a different task than it names",
+                    kind.name()
+                ),
+                // The one kind with no operation. Its task is still answered
+                // above, which is the whole point.
+                Err(refusal) => assert_eq!(
+                    (kind, refusal),
+                    (
+                        LifecycleKind::ReplacePhysical,
+                        ResolveRefusal::NeedsStorage {
+                            kind: LifecycleKind::ReplacePhysical
+                        }
+                    )
+                ),
+            }
+        }
+    }
+
+    /// A number no kind's other field carries, so an arm reading the wrong
+    /// offset answers something else and the test above sees it.
+    const TASK_UNDER_TEST: u32 = 5;
 
     /// A resolver that answers every ref, so a resolution test is about the
     /// list and not about whether the objects exist.

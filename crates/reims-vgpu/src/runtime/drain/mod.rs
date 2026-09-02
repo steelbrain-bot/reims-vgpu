@@ -2358,11 +2358,82 @@ fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
     ));
 }
 
+/// Whether a lifetime packet names a task the lifecycle owner would hold.
+///
+/// **The resource-lifecycle group's remaining gate, and the last one it has.**
+/// `reims_vgpu_core::lifecycle::Lifecycle` refuses `NoSuchTask` for every one of
+/// the twelve commands except the definition itself, and the refusal is of the
+/// *whole packet* — so a guest that maps memory, retires a backing or deletes a
+/// task it never defined would lose that packet the day the group moves. This
+/// device refuses none of them: its task table is created on demand and its map
+/// family acts on whatever the record names.
+///
+/// `declare_object_name` already counts the same question for the declaration
+/// door, and this is the other eleven commands' half of it. The two are separate
+/// counters because they are separate events: a declaration is produced by
+/// resolution and can happen with no packet of its own, and these are packets.
+///
+/// # Why the refusals a namespace would make are not counted here
+///
+/// Eight of the twelve resolve a ref or a mapping before they reach
+/// `Lifecycle::apply`, and after the group moves that resolution goes through
+/// the same `Lifecycle` the apply does — `TaskNamespaces::resource` answers
+/// `Some` only for a slot that is live at its own generation, which is exactly
+/// what `Namespace::resolve` then accepts. So `Refusal::Namespace` cannot arrive
+/// from a packet whose operation was built a moment earlier out of that
+/// namespace: it is unreachable by construction rather than merely unobserved,
+/// and a counter for it would read zero for a reason a boot does not establish.
+/// The task term has no such argument — nothing resolves it — which is why it is
+/// the one that gets a census.
+///
+/// `LifecycleKind::of` is the same table `classify` reads, so a thirteenth
+/// command joins this census by existing.
+fn note_lifetime_task_definition(
+    state: &DeviceState,
+    channel: reims_vgpu_protocol::packets::Channel,
+    packet: &Packet,
+) {
+    use reims_vgpu_core::lifecycle::{task_named, LifecycleKind};
+    let Some(kind) = LifecycleKind::of(channel, packet.opcode) else {
+        return;
+    };
+    // A definition *is* the event that makes the task hold, so asking whether it
+    // already does would count every first definition as a refusal of a packet
+    // the model accepts.
+    if kind == LifecycleKind::DefineTask {
+        return;
+    }
+    let task = match task_named(kind, &packet.payload) {
+        Ok(task) => task,
+        // Short of its own record. Already reported by the arm that decodes it,
+        // and not this census's question: a packet whose task word is not there
+        // is refused before the task is asked about.
+        Err(_) => return,
+    };
+    if state.tasks.is_active(task.0) {
+        note_store_route("lifetime_command_in_a_defined_task");
+        return;
+    }
+    note_store_route("lifetime_command_in_an_undefined_task");
+    if crate::observe::first_sight(
+        "lifetime_command_in_an_undefined_task",
+        (u64::from(task.0) << 16) | u64::from(packet.opcode),
+    ) {
+        crate::observe::fail(format!(
+            "lifetime_command_in_an_undefined_task kind={} task={} op={:#x} (no CmdDefineTask2              opened this task, so the lifecycle owner these commands move to would refuse the              whole packet with NoSuchTask — this device acts on it)",
+            kind.name(),
+            task.0,
+            packet.opcode
+        ));
+    }
+}
+
 fn process_root_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     packet: &Packet,
 ) {
+    note_lifetime_task_definition(state, reims_vgpu_protocol::packets::Channel::Root, packet);
     match packet.opcode {
         // The two device-info opcodes, one arm. They differ only in which form
         // their payload is — the newer one prepends a parse ceiling — and
@@ -4428,6 +4499,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
     packet: &Packet,
 ) -> ChildPacketDisposition {
     note_packet_domain_definition(state, channel_id, packet.opcode);
+    note_lifetime_task_definition(state, reims_vgpu_protocol::packets::Channel::Child, packet);
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
             apply_define_task2(state, host, &packet.payload, Some(channel_id));
