@@ -5282,7 +5282,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         cmd.task_id,
                         cmd.object_id,
                     ) {
-                        Some((resource, backing, extent)) => {
+                        Ok((resource, backing, extent)) => {
                             if let Some(acted) = state.apply_lifetime(
                                 &reims_vgpu_core::lifecycle::LifecycleOp::ReplacePhysical {
                                     task: reims_vgpu_core::identity::TaskId(cmd.task_id),
@@ -5299,10 +5299,31 @@ fn process_child_packet<H: HostMemory + HostOps>(
                             }
                         }
                         // The reference names no describable storage, so there
-                        // is no operation to state — counted, because a re-point
-                        // the model never hears about leaves its content
-                        // authority on the old pages.
-                        None => note_store_route("replace_physical_storage_undescribable"),
+                        // is no operation to state. Counted by reason rather
+                        // than as one bucket: a reference that owns no bytes is
+                        // a non-event, while storage this device cannot
+                        // describe is a re-point the model never hears about,
+                        // which leaves its content authority on the old pages.
+                        Err(refusal) => {
+                            note_store_route(refusal.route());
+                            if refusal.leaves_authority_stale()
+                                && crate::observe::first_sight(
+                                    "replace_physical_storage_undescribable",
+                                    u64::from(cmd.task_id) << 32 | u64::from(cmd.object_id),
+                                )
+                            {
+                                crate::observe::fail(format!(
+                                    "replace_physical_storage_undescribable \
+                                     task={} object={} reason={} (the guest re-pointed \
+                                     storage this device cannot describe to the semantic \
+                                     model, so the model's content authority for it stays \
+                                     on the pages the guest has already rewired)",
+                                    cmd.task_id,
+                                    cmd.object_id,
+                                    refusal.route(),
+                                ));
+                            }
+                        }
                     }
                 }
                 Err(short) => {

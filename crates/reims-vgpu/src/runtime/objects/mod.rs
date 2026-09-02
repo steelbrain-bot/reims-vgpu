@@ -3783,30 +3783,115 @@ fn record_backing_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) 
 /// So the caller applies this device's re-point first, and then asks what the
 /// reference names. That is the moment the answer is the new one.
 ///
-/// `None` where the reference names no storage at all, or names storage this
-/// device cannot describe — both of which are a re-point the model is not told
-/// about, and the caller counts them.
+/// # Why the failure is an enum and not a `None`
+///
+/// It used to be one `None` covering six unrelated facts, and the caller
+/// counted it as `replace_physical_storage_undescribable`. A driven macos-15
+/// boot put 34 of 204 re-points in that bucket, and the bucket could not say
+/// whether they were re-points of references that name no bytes at all — for
+/// which telling the model nothing is correct — or re-points of real storage
+/// the model was never told had moved, which is content authority left on the
+/// old pages. Those are a non-event and a defect, and one counter cannot be
+/// read as either. [`RepointStorageRefusal`] is the split.
 pub fn repointed_storage<M: HostMemory>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     obj_ref: u32,
-) -> Option<(
-    reims_vgpu_core::identity::ResourceId,
-    reims_vgpu_core::access::BackingId,
-    reims_vgpu_core::access::ByteRange,
-)> {
-    let name = name_resource(state, host, task_id, obj_ref)?;
-    let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
-    let descriptor = read_descriptor(state, host, task_id, &entry)?;
+) -> Result<
+    (
+        reims_vgpu_core::identity::ResourceId,
+        reims_vgpu_core::access::BackingId,
+        reims_vgpu_core::access::ByteRange,
+    ),
+    RepointStorageRefusal,
+> {
+    let name =
+        name_resource(state, host, task_id, obj_ref).ok_or(RepointStorageRefusal::Unnamed)?;
+    let entry = lookup_list_entry(state, host, task_id, obj_ref)
+        .ok_or(RepointStorageRefusal::NoListEntry)?;
+    let descriptor = read_descriptor(state, host, task_id, &entry)
+        .ok_or(RepointStorageRefusal::DescriptorUnread)?;
     match declared_storage(state, task_id, &entry, &descriptor) {
         Ok(reims_vgpu_core::lifecycle::Storage::Dedicated { backing, extent }) => {
-            Some((name, backing, extent))
+            Ok((name, backing, extent))
         }
         // A placement has no physical of its own to re-point — the owner
         // refuses that by name — and `NoBytes` is a reference with nothing to
-        // move. Neither is an operation.
-        Ok(_) | Err(_) => None,
+        // move. Neither is an operation, and both are named so that a boot can
+        // tell them from storage that moved unheard.
+        Ok(reims_vgpu_core::lifecycle::Storage::Placed { .. }) => {
+            Err(RepointStorageRefusal::Placed)
+        }
+        Ok(reims_vgpu_core::lifecycle::Storage::NoBytes) => Err(RepointStorageRefusal::NoBytes),
+        Err(refusal) => Err(RepointStorageRefusal::Refused(refusal)),
+    }
+}
+
+/// Why a re-pointed reference names no storage operation the model can be told
+/// about.
+///
+/// Each variant carries its own census route, because the whole point of the
+/// enum is that the routes are read separately: a boot where every one is
+/// `NoBytes` has lost nothing, and a boot where they are `Refused` has one
+/// silent stale-content hazard per count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepointStorageRefusal {
+    /// The reference resolves to no resource name — no task space, or no live
+    /// slot. There is nothing for an operation to be about.
+    Unnamed,
+    /// The name exists and the guest's object list holds no entry at it.
+    NoListEntry,
+    /// The entry exists and its descriptor did not read out of guest memory.
+    DescriptorUnread,
+    /// The reference names a heap window. A placement owns no physical of its
+    /// own, so a re-point of one is the heap's event, not this reference's.
+    Placed,
+    /// The reference names an object with no bytes at all — a sampler, a
+    /// function, a view. A re-point announcement against one is a no-op.
+    NoBytes,
+    /// The reference names storage this device could not describe. This is the
+    /// one that costs: the pages moved and the model was not told.
+    Refused(StorageRefusal),
+}
+
+impl RepointStorageRefusal {
+    /// The census route this refusal is counted on.
+    #[must_use]
+    pub const fn route(self) -> &'static str {
+        match self {
+            Self::Unnamed => "replace_physical_storage_unnamed",
+            Self::NoListEntry => "replace_physical_storage_no_list_entry",
+            Self::DescriptorUnread => "replace_physical_storage_descriptor_unread",
+            Self::Placed => "replace_physical_storage_placed",
+            Self::NoBytes => "replace_physical_storage_no_bytes",
+            Self::Refused(StorageRefusal::ExtentUnrecovered { .. }) => {
+                "replace_physical_storage_extent_unrecovered"
+            }
+            Self::Refused(StorageRefusal::Backing(BackingIdRefusal::Unresolved(_))) => {
+                "replace_physical_storage_backing_unresolved"
+            }
+            Self::Refused(StorageRefusal::Backing(BackingIdRefusal::ThroughMapping { .. })) => {
+                "replace_physical_storage_mapping_names_no_surface"
+            }
+            Self::Refused(StorageRefusal::Backing(BackingIdRefusal::HeapPlaced)) => {
+                "replace_physical_storage_heap_placed"
+            }
+            Self::Refused(StorageRefusal::Backing(BackingIdRefusal::NamesNoStorage { .. })) => {
+                "replace_physical_storage_names_no_storage"
+            }
+        }
+    }
+
+    /// Whether this refusal leaves the model's content authority on pages the
+    /// guest has already re-pointed.
+    ///
+    /// The four resolution and no-bytes arms do not: there is no storage for
+    /// the model to hold authority over. [`Self::Refused`] does — the storage
+    /// is real and only this device's vocabulary for it is missing.
+    #[must_use]
+    pub const fn leaves_authority_stale(self) -> bool {
+        matches!(self, Self::Refused(_))
     }
 }
 

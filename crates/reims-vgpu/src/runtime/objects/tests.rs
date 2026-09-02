@@ -3225,6 +3225,85 @@ fn every_construction_is_counted_against_the_backing_identity() {
     );
 }
 
+/// A re-point that the semantic model is not told about says which of six
+/// facts stopped it, because only one of them costs anything.
+///
+/// The caller used to count one `replace_physical_storage_undescribable`, and a
+/// driven boot put 34 of 204 re-points in it. A reference that owns no bytes
+/// and a reference whose real storage this device has no vocabulary for read
+/// identically there, and they are a non-event and a stale-content hazard.
+#[test]
+fn a_repoint_the_model_is_not_told_about_names_which_fact_stopped_it() {
+    use super::RepointStorageRefusal;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+
+    let (name, backing, extent) = super::repointed_storage(&state, &host, task, buffer)
+        .expect("a buffer names storage the model can be told moved");
+    assert_eq!(
+        (name, backing),
+        (
+            super::name_resource(&state, &host, task, buffer).expect("named"),
+            super::backing_id(&state, &host, task, buffer).expect("a buffer has one"),
+        ),
+        "and the operation carries the reference's own name and identity"
+    );
+    assert_eq!(extent.length, 0x3000);
+
+    // Reference 1 is a mapper-ref texture over mapping 9. Its surface has an
+    // identity and its plane within that surface does not, so this device holds
+    // real storage it cannot describe: the one refusal that costs.
+    assert!(state.map_surface(9));
+    let refusal = super::repointed_storage(&state, &host, task, 1)
+        .expect_err("the plane of the surface is unrecovered");
+    assert_eq!(
+        refusal,
+        RepointStorageRefusal::Refused(super::StorageRefusal::ExtentUnrecovered {
+            object_type: 11
+        }),
+        "carried whole from the owner that has the term, not re-worded"
+    );
+    assert_eq!(
+        refusal.route(),
+        "replace_physical_storage_extent_unrecovered"
+    );
+    assert!(
+        refusal.leaves_authority_stale(),
+        "the pages moved and the model was not told, so its content authority \
+         for them stays on the pages the guest has already rewired"
+    );
+
+    // A reference the guest's list has no entry at stops one step earlier, and
+    // that is a re-point with nothing behind it rather than a lost one.
+    let unlisted = super::repointed_storage(&state, &host, task, 4000)
+        .expect_err("nothing is listed at that reference");
+    assert!(
+        !unlisted.leaves_authority_stale(),
+        "there is no storage for authority to be stale about"
+    );
+    assert_ne!(
+        unlisted.route(),
+        refusal.route(),
+        "and the two are counted apart, which is the whole reason for the enum"
+    );
+}
+
 /// The object-list walk's per-object translation: what the semantic model is
 /// told each constructed object's storage is.
 ///
