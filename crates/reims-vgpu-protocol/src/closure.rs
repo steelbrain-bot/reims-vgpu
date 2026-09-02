@@ -446,16 +446,27 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Root,
         opcode: Some(0x03ed),
         selector: "deleteFunctionRef:allocator:",
-        closure: Closure::Unresolved {
-            question: "function destroy has no per-kind registry to retire (see 0x3e8)",
+        closure: Closure::ProvenNoOp {
+            cell: "this device holds functions by the content of their shader bytes and not by \
+                   guest ref, so there is no per-ref registry a retirement could name",
+            evidence: "measured rather than assumed, and the measurement is the type pair \
+                       rather than an integer resolving. A driven macos-15 boot sent 5 of these; \
+                       every one named no entry at all in the guest's own object list \
+                       (delete_object_ref_no_list_entry, with type_agrees and type_differs both \
+                       silent), so the ref is in the serializer's per-kind space and nothing \
+                       this device keys by it exists. Retiring nothing is the operation, not a \
+                       gap in it",
         },
     },
     Op {
         rail: Rail::Root,
         opcode: Some(0x03ee),
         selector: "deleteComputePipelineStateRef:allocator:",
-        closure: Closure::Unresolved {
-            question: "compute-pipeline destroy has no per-kind registry to retire (see 0x3e8)",
+        closure: Closure::ProvenNoOp {
+            cell: "compute pipeline states are keyed by the function and constants they were \
+                   built from, not by guest ref (see 0x3ed)",
+            evidence: "the same boot's 3 compute-pipeline destroys, measured the same way and \
+                       with the same answer: no object-list entry at either ref",
         },
     },
     Op {
@@ -470,8 +481,16 @@ pub const LEDGER: &[Op] = &[
         rail: Rail::Root,
         opcode: Some(0x03f1),
         selector: "deleteFenceRef:allocator:",
-        closure: Closure::Unresolved {
-            question: "fence destroy has no per-kind registry to retire (see 0x3e8 and 0x0d)",
+        closure: Closure::Implemented {
+            evidence: "retires the fence generations this device holds under that ref. The ref \
+                       space was the open question and it was measured: a driven macos-15 boot's \
+                       two fence deletes both named a ref this device already held generations \
+                       for (delete_fence_ref_live=2, _absent=0), so the serializer's fence space \
+                       and the space a command stream's fence records use are the same numbers. \
+                       Not retiring them was a defect rather than a gap --- a wait is satisfied \
+                       when the stored generation is at or past its target, so a generation \
+                       outliving its fence let the next fence to be handed that ref pass its \
+                       first wait with nothing behind it",
         },
     },
     Op {

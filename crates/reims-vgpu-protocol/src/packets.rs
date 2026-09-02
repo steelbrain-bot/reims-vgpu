@@ -336,7 +336,13 @@ pub const LEDGER: &[Packet] = &[
                        therefore not any kind a driven guest sends: it is the five kinds one \
                        never sent --- buffer, texture, heap, rasterization rate map and \
                        indirect command buffer --- for which there is no evidence either way. \
-                       The row blocks 2166 packets a boot on that residue",
+                       The six kinds a driven guest does send are settled on their own rows in \
+                       the serializer ledger: the depth-stencil, sampler and render-pipeline \
+                       destroys retire their task-local registries, the fence destroy retires \
+                       its generations, and the function and compute-pipeline destroys are \
+                       ProvenNoOp on the cell that this device keys those two by content rather \
+                       than by ref. The row blocks 2166 packets a boot on the five-kind residue \
+                       alone",
         },
     },
     Packet {
