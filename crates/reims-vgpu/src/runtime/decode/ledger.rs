@@ -506,3 +506,80 @@ mod packets {
         }
     }
 }
+
+/// Every render-rail row reaches exactly one decoder, and the ledger is what
+/// says which.
+///
+/// The rail no longer has *a* decoder. Forty-five rows are lifted by
+/// `reims_vgpu_protocol::decode::render`, the fence pair and the three barriers
+/// by `decode::sync`, the four residency declarations by `decode::residency`,
+/// and the thirty-one rows the ledger has **not settled** by
+/// [`super::render_spi`] — which refuses every settled opcode by name, so the
+/// two halves cannot both claim a record.
+///
+/// Replaces `the_render_opcode_table_is_exactly_apples_render_manifest` and
+/// `the_accepted_window_ends_where_apples_render_manifest_does`, and is
+/// strictly stronger than either: those asked whether one decoder recognised
+/// every row, which cannot see a row claimed twice. This asks both questions —
+/// no row is dropped by all of them, and no row is claimed by two.
+#[test]
+fn every_render_row_reaches_exactly_one_decoder_and_the_ledger_picks_it() {
+    use reims_vgpu_protocol::decode::{render, residency, sync, DecodeRefusal};
+    for op in LEDGER.iter().filter(|o| o.rail == Rail::Render) {
+        let Some(opcode) = op.opcode else { continue };
+        let bytes = zero_record(opcode, GENEROUS_PAYLOAD);
+        let framed = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+        // "Claims this record" means: does not refuse it for being an opcode
+        // this decoder does not own. A refusal for a payload of zeroes is a
+        // statement about the bytes, not about ownership.
+        //
+        // `RefusedByContract` is a disowning here and it is the render rail
+        // that makes the distinction matter: this rail has four `Refused` rows
+        // and the other two have none, so this is the first test to ask what a
+        // contract refusal claims. It claims nothing. Every protocol decoder
+        // answers `RefusedByContract` for such a row — that is what the ledger
+        // told it to answer — so counting it as ownership would make all of
+        // them claim the same record, which says nothing about which one owns
+        // its layout. `render_spi` owns those four, because for a refusal the
+        // *value* is the evidence: which options word, or which sample count.
+        fn disowned<T>(r: &Result<T, DecodeRefusal>) -> bool {
+            matches!(
+                r,
+                Err(DecodeRefusal::UnknownOpcode { .. })
+                    | Err(DecodeRefusal::Unjudged { .. })
+                    | Err(DecodeRefusal::RefusedByContract { .. })
+            )
+        }
+        let claimants: Vec<&str> = [
+            ("record", !disowned(&render::decode(&framed))),
+            ("sync", !disowned(&sync::decode(Rail::Render, &framed))),
+            // `lift` rather than `decode`: all four residency rows are
+            // unsettled, so `decode` refuses them on principle, and the
+            // question here is which decoder owns the *layout*.
+            (
+                "residency",
+                !disowned(&residency::lift(Rail::Render, &framed)),
+            ),
+            (
+                "unsettled",
+                !matches!(
+                    super::render_spi::decode(&bytes),
+                    Err(super::render_spi::DecodeStatus::ErrUnknownOpcode)
+                        | Err(super::render_spi::DecodeStatus::ErrSettledElsewhere)
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, claimed)| claimed.then_some(name))
+        .collect();
+        assert_eq!(
+            claimants.len(),
+            1,
+            "the closure ledger records render {opcode:#x} ({}) and {} decoder(s) claim it: \
+             {claimants:?} — a row with none is work this device drops in silence, and a row \
+             with two is the second reading of one record's bytes the cutover exists to remove",
+            op.selector,
+            claimants.len(),
+        );
+    }
+}

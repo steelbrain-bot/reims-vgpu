@@ -6,4 +6,5 @@ pub mod compute_spi;
 #[cfg(test)]
 mod ledger;
 pub mod render;
+pub mod render_spi;
 pub mod resource;

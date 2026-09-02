@@ -29,9 +29,9 @@ use crate::runtime::decode::blit_spi;
 use crate::runtime::decode::compute_spi::{self, Kind as ComputeKind};
 use crate::runtime::decode::render::{
     self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
-    ColorAttachment, DepthAttachment, Kind as RenderKind, LevelSupport, ScissorRect,
-    StencilAttachment,
+    ColorAttachment, DepthAttachment, LevelSupport, ScissorRect, StencilAttachment,
 };
+use crate::runtime::decode::render_spi::{self, Kind as SpiKind};
 use crate::runtime::draw::{
     self, BindTable, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
     MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
@@ -3540,16 +3540,21 @@ fn handle_render_record<M: HostMemory + HostOps>(
             return handle_render_draw(state, host, task_id, kind, opcode, cmd_bytes, out, acc);
         }
     }
-    let cmd = match render::decode(cmd_bytes) {
+    let cmd = match render_spi::decode(cmd_bytes) {
         Ok(c) => c,
-        // Was `Err(_) => return`: a malformed render command dropped with no
-        // line, on the hottest path in the crate. Indistinguishable from a
-        // segment that simply carried no render work.
+        // `ErrUnknownOpcode` keeps the deduped fail-visible line *and the wire
+        // capture* the legacy decoder's `OtherAccepted` catch-all gave it: an
+        // opcode no render row names is the one case where the bytes are the
+        // whole diagnostic, and a typed refusal alone would say a record
+        // arrived and nothing about its layout.
+        Err(render_spi::DecodeStatus::ErrUnknownOpcode) => {
+            note_unimplemented_render_opcode(opcode, cmd_bytes, task_id, acc);
+            return;
+        }
         Err(status) => {
             if let Some(e) = crate::observe::Emit::refusal("render_decode", &status) {
                 // Latched per (reason, opcode): the guest re-encodes the same
-                // stream every frame, so an unclassified opcode would arrive
-                // once per draw. Magnitude is the encoder's fail counter's job.
+                // stream every frame, and this is the hottest rail in the crate.
                 e.field("opcode", format!("{:#x}", opcode))
                     .field("len", cmd_bytes.len())
                     .fail_once(opcode as u64);
@@ -3558,7 +3563,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
     };
     match cmd.kind {
-        RenderKind::ExecuteCommands => {
+        SpiKind::ExecuteCommands => {
             if cmd.indirect_command_buffer_ref == 0 {
                 note_unnamed_icb_execute(task_id, &cmd);
                 return;
@@ -3571,18 +3576,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 args_buffer_ref: cmd.icb_args_buffer_ref,
                 args_buffer_offset: cmd.icb_args_buffer_offset,
             });
-        }
-        RenderKind::OtherAccepted => {
-            // An undecoded render opcode: the decoder accepts it (catch-all)
-            // but no executor exists, so the guest command is effectively
-            // dropped. That MUST stay fail-visible — but a per-draw op such as
-            // 0x7c fires thousands of times per app render, so emitting per
-            // record floods /tmp/reims-vgpu-fail.log (measured ~2620 lines from six
-            // app launches). Dedup to ONE line per distinct opcode (the set is
-            // tiny and boot-stable) and capture the raw wire on first sighting
-            // so the layout can be decoded offline. Unknown wire stays unknown;
-            // we never invent semantics for it.
-            note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
         }
         // Two kinds the product answers by doing nothing, counted separately.
         // They used to fall into the catch-all below, which made them
@@ -3619,41 +3612,24 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // it raised are what argued for plumbing it, both halves now reach a
         // backend, and the row itself has since moved to
         // `handle_render_stream_state`.
-        RenderKind::SetFloatState => {
-            // Two selectors share the one-`float` record; the opcode says
-            // which.
-            //
-            // `setLineWidth:` is latched whatever the value, including the
-            // Metal default — a stream that widens a line and then narrows it
-            // again is asking for the narrow one, and dropping the second
-            // record would leave the rest of the pass thick. Latched unparsed
-            // for the reason the four raster ordinals beside it are: only the
-            // running rail knows whether it can spell the width, and only the
-            // Vulkan rail additionally knows whether *this draw* rasterizes
-            // any lines to apply it to.
+        SpiKind::SetTessellationFactorScale => {
+            // `setLineWidth:` shared this wire form and does not share its
+            // settlement: the line width has a `RenderKind` and reaches
+            // `handle_render_stream_state`, and this does not and reaches here.
+            // The two selectors are two modules now, which is the whole reason
+            // the opcode no longer has to be read a second time to tell them
+            // apart.
             //
             // The tessellation factor scale has no carrier on either rail. Its
-            // loss is still counted here, and only where the value is not the
-            // 1.0 default — compared exactly rather than with a tolerance,
-            // because the guest wrote a literal and the question is whether it
-            // wrote *the* literal.
-            if cmd.opcode == wire_render::OPCODE_SET_LINE_WIDTH {
-                // Routed to `handle_render_stream_state` before this decoder is
-                // reached, so this branch is that routing disagreeing with
-                // itself. The two selectors share a wire form and not a
-                // settlement: `setLineWidth:` has a `RenderKind` and this one
-                // does not, which is why only half of this arm moved.
-                crate::observe::fail(format!(
-                    "render_record_misrouted task={task_id} opcode={opcode:#x} kind={:?} \
-                     (the ledger settled this row and it reached the rail's own decoder)",
-                    cmd.kind
-                ));
-            } else if cmd.float_value != 1.0 {
+            // loss is counted only where the value is not the 1.0 default —
+            // compared exactly rather than with a tolerance, because the guest
+            // wrote a literal and the question is whether it wrote *the*
+            // literal.
+            if cmd.float_value != 1.0 {
                 crate::runtime::drain::note_store_route("render_tessellation_scale_dropped");
             }
         }
-
-        RenderKind::SetVertexAmplification => {
+        SpiKind::SetVertexAmplification => {
             // Amplification makes one vertex invocation produce several views,
             // so a dropped record renders one view where the guest asked for
             // many. Both forms have an API default that means "no
@@ -3684,47 +3660,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 );
             }
         }
-        // The twelve bind rows moved to `handle_render_binds` and the fifteen
-        // encoder-state rows to `handle_render_stream_state`,
-        // beside the residency declarations, the barriers and the fence pair
-        // the ledger's own class answers. All of them are routed before this
-        // decoder is reached, so arriving here is that routing disagreeing with
-        // itself rather than a guest case, and it is named instead of being
-        // answered a second time.
-        RenderKind::Draw
-        | RenderKind::DrawIndirect
-        | RenderKind::RenderPass
-        | RenderKind::SetStoreAction
-        | RenderKind::SetBuffer
-        | RenderKind::SetBufferOffset
-        | RenderKind::SetTexture
-        | RenderKind::SetSampler
-        | RenderKind::SetPipeline
-        | RenderKind::SetViewport
-        | RenderKind::SetScissor
-        | RenderKind::SetBlendColor
-        | RenderKind::SetCullMode
-        | RenderKind::SetFrontFacing
-        | RenderKind::SetDepthBias
-        | RenderKind::SetDepthStencil
-        | RenderKind::SetStencilReference
-        | RenderKind::SetRasterState
-        | RenderKind::SetVisibilityResultMode
-        | RenderKind::UseResource
-        | RenderKind::UseHeap
-        | RenderKind::Barrier
-        | RenderKind::Fence => {
-            crate::observe::fail(format!(
-                "render_record_misrouted task={task_id} opcode={opcode:#x} kind={:?} (the ledger \
-                 classed this row and it reached the rail's own decoder)",
-                cmd.kind
-            ));
-        }
-        // The tile-shader family. Nine opcodes that used to reach
-        // `OtherAccepted` together, split here into the three different things
-        // they actually are — because "a tile record arrived" is not a
-        // measurement anyone can act on.
-        RenderKind::TileBind => {
+        SpiKind::TileBind => {
             // A bind against the tile argument tables. There is no default a
             // bind could be sitting at, so this counts unconditionally: it is
             // an upper bound on tile resources the guest attached and this rail
@@ -3753,7 +3689,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 _ => "render_tile_sampler_bind_dropped",
             });
         }
-        RenderKind::TileDispatch => {
+        SpiKind::TileDispatch => {
             // A tile shader the guest asked to run. Like an indirect draw and
             // unlike the unapplied states, this is work rather than state, so
             // it keeps the deduped fail-visible line as well as the count.
@@ -3767,7 +3703,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
             }
         }
-        RenderKind::SetStoreActionOptions => {
+        SpiKind::SetStoreActionOptions => {
             // The options sibling of the store action beside it, which *is*
             // applied. `MTLStoreActionOptions` declares exactly one flag,
             // `CustomSamplePositions`, asking that a multisample resolve use
@@ -3806,7 +3742,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
             }
         }
-        RenderKind::DrawPatches => {
+        SpiKind::DrawPatches => {
             // A tessellated draw. Geometry the guest asked for and did not get,
             // so it counts unconditionally and keeps the deduped fail-visible
             // line, on the same footing as the indirect draws — there is no
@@ -3825,14 +3761,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
             });
             note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
         }
-        RenderKind::SetTessellationFactorBuffer => {
+        SpiKind::SetTessellationFactorBuffer => {
             // The state half of a tessellated draw. Unapplied like the draws
             // themselves, so this should track `render_draw_patches_dropped`;
             // the two being far apart would mean one of the two arms is wrong
             // rather than that the guest is doing something unusual.
             crate::runtime::drain::note_store_route("render_tessellation_factor_buffer_dropped");
         }
-        RenderKind::RenderPassProperty => {
+        SpiKind::RenderPassProperty => {
             // One of the six records `writeDescriptor` emits beside the pass
             // descriptor. Every one is behind a serializer capability that
             // defaults off, so these are healthy zeros: a non-zero reading is
@@ -3883,7 +3819,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
             }
         }
-        RenderKind::TileDimensionsQuery => {
+        SpiKind::TileDimensionsQuery => {
             // Not a dropped command — a *wrong answer*. The guest handed over a
             // buffer for this device to write the tile width and height into
             // and will read it back regardless of whether anything was written,
@@ -3899,7 +3835,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 cmd.buffer_ref, cmd.buffer_offset
             ));
         }
-        _ => {}
+        // `decode` never produces it — it is the `Default` a caller builds a
+        // command from — so this arm is the type's shape rather than a record.
+        SpiKind::Unknown => {}
     }
 }
 

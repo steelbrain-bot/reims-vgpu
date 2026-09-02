@@ -210,7 +210,7 @@ pub(super) fn note_empty_scissor(task_id: u32, rect: ScissorRect) {
 /// resource the stream lost.
 pub(super) fn note_unnamed_icb_execute(
     task_id: u32,
-    cmd: &crate::runtime::decode::render::Command,
+    cmd: &crate::runtime::decode::render_spi::Command,
 ) {
     crate::runtime::drain::note_store_route("render_icb_execute_unnamed");
     if crate::observe::first_sight("render_icb_execute_unnamed", u64::from(task_id)) {

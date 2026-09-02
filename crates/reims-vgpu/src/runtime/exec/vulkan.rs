@@ -108,12 +108,17 @@ pub(crate) fn render_pipeline_refs(stream: &[u8]) -> Vec<u32> {
         for op in reims_vgpu_wire::op::OpStream::new(commands) {
             let Ok(op) = op else { break };
             let bytes = &commands[op.offset..op.offset + op.length() as usize];
-            if let Ok(cmd) = render::decode(bytes) {
-                if cmd.kind == RenderKind::SetPipeline
-                    && cmd.pipeline_ref != 0
-                    && !pipelines.contains(&cmd.pipeline_ref)
-                {
-                    pipelines.push(cmd.pipeline_ref);
+            let Ok(framed_op) = reims_vgpu_protocol::decode::op(bytes, 0) else {
+                continue;
+            };
+            // The lift in production, not a second decoder over the same
+            // bytes: a pre-scan that disagreed with the walk about which
+            // records set a pipeline would translate the wrong ones.
+            if let Ok(reims_vgpu_protocol::decode::render::RenderRecord::SetPipeline(r)) =
+                reims_vgpu_protocol::decode::render::decode(&framed_op)
+            {
+                if r.pipeline_ref != 0 && !pipelines.contains(&r.pipeline_ref) {
+                    pipelines.push(r.pipeline_ref);
                 }
             }
         }

@@ -606,7 +606,7 @@ fn multi_attachment_decode_in_pass() {
     st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
     cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
     let c = render::decode(&cmd).unwrap();
-    assert_eq!(c.kind, RenderKind::RenderPass);
+    assert_eq!(c.kind, render::Kind::RenderPass);
     assert_eq!(c.color0.texture_ref, 41);
 }
 
