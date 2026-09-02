@@ -2154,6 +2154,14 @@ fn reply_compute_info<H: HostMemory + HostOps>(
             "get_compute_info truncated reason=reply_pairs_exhausted task={task_id} pipe={pipeline_ref} key_table_len={key_table_len} count={count} wrote={wrote} dropped={dropped:?}"
         ));
     }
+    // Asked before the write, of the address the request named and the span the
+    // encoder produced, so the reading is about the bytes that actually move.
+    let _ = crate::runtime::objects::note_query_reply_destination(
+        state,
+        task_id,
+        reply_gva,
+        written.bytes as u64,
+    );
     if crate::runtime::gva_mem::write_task_gva_product_within(
         state,
         host,
@@ -2231,6 +2239,12 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
             }
         };
     let reply = requirement.encode();
+    let _ = crate::runtime::objects::note_query_reply_destination(
+        state,
+        task_id,
+        request.reply_gva,
+        reply.len() as u64,
+    );
     if crate::runtime::gva_mem::write_task_gva_product_within(
         state,
         host,

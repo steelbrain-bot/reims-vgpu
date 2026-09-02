@@ -1999,6 +1999,76 @@ pub fn declared_storage(
     })
 }
 
+/// Whether a query's reply buffer lands inside an allocation this device
+/// already has an identity for.
+///
+/// # The question, and why it is asked before anything needs the answer
+///
+/// `reims_vgpu_core::query::ReplyDestination` is a backing and a window of it,
+/// not an address: a query writes into guest memory and the model orders that
+/// write like any other. So the reply buffer needs a `BackingId`, and there are
+/// only two ways to give it one — resolve it to the allocation it lies in, or
+/// mint it one of its own.
+///
+/// Those are not interchangeable. If a reply buffer is a page of an object's
+/// allocation and it gets an identity of its own, the reply write and every
+/// access to that object come out over different backings and the hazard edge
+/// between them is never drawn. If it lies in no allocation and is resolved to
+/// one anyway, the write is ordered against memory it does not touch. Which
+/// error is available is a question about a real guest, and this is the
+/// instrument that answers it.
+///
+/// Only the two queries whose destination is a **task GVA** can be asked at all:
+/// a device-info reply names a page frame, which is in no task's address space,
+/// so no window in this table could contain it. `Gap::ReplyDestination` records
+/// that split.
+///
+/// # What it looks at
+///
+/// Every constructed resource in the task, from the construction cache, which
+/// is the same set `cached_window_peer` scans and is affordable here for the
+/// reason it is not everywhere: a query is a handful of packets a boot, not a
+/// per-draw path.
+///
+/// `query_reply_scanned` is the denominator. Without it a boot where no reply
+/// overlapped anything and a boot where no query resolved a task read the same.
+pub fn note_query_reply_destination(
+    state: &DeviceState,
+    task_id: u32,
+    reply_gva: u64,
+    reply_len: u64,
+) -> Option<u32> {
+    crate::runtime::drain::note_store_route("query_reply_scanned");
+    let end = reply_gva.saturating_add(reply_len.max(1));
+    let containing =
+        state
+            .task_resources
+            .in_task(task_id)
+            .into_iter()
+            .find_map(|(ref_, resource)| {
+                let (base, size) = resource.backing_window(state.page_shift)?;
+                (base < end && reply_gva < base.saturating_add(size)).then_some((ref_, base, size))
+            });
+    let Some((ref_, base, size)) = containing else {
+        crate::runtime::drain::note_store_route("query_reply_outside_every_allocation");
+        return None;
+    };
+    crate::runtime::drain::note_store_route("query_reply_inside_an_allocation");
+    if crate::observe::first_sight(
+        "query_reply_inside_an_allocation",
+        (u64::from(task_id) << 40) ^ base,
+    ) {
+        crate::observe::fail(format!(
+            "query_reply_inside_an_allocation task={task_id} gva={reply_gva:#x} len={reply_len} \
+             holder={ref_} base={base:#x} size={size} (the reply buffer is part of an \
+             allocation this device already identifies, so a reply destination given a \
+             backing of its own would leave the write unordered against every access to \
+             that object)"
+        ));
+    }
+    Some(ref_)
+}
+
 /// Which bytes of a mapping's surface a mapper-ref texture occupies.
 ///
 /// The texture's storage is the mapping's, so its extent is measured in the

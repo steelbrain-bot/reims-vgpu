@@ -3433,6 +3433,83 @@ fn the_stale_resolution_witness_counts_what_it_compared() {
     );
 }
 
+/// A query's reply buffer is either part of an allocation this device
+/// identifies or it is not, and the instrument says which — with the number it
+/// examined.
+///
+/// The two answers demand different things of the cutover. A reply inside an
+/// allocation that got a backing of its own would leave the reply write
+/// unordered against every access to that object; one outside every allocation
+/// that was resolved to one anyway would be ordered against memory it does not
+/// touch. Only a driven guest can say which error is available, and only if the
+/// instrument can tell "nothing overlapped" from "nothing was examined".
+#[test]
+fn a_query_reply_destination_is_measured_against_the_allocations_this_device_holds() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+    // Allocation base 0x20 << 14, one page long.
+    const BASE: u64 = 0x20u64 << PAGE_SHIFT_ARM64E;
+    const SIZE: u64 = 0x1000;
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&SIZE.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+    resolve_resource(&state, &host, task, buffer).expect("constructs");
+
+    let scanned = store_route_count("query_reply_scanned");
+    let outside = store_route_count("query_reply_outside_every_allocation");
+    assert_eq!(
+        super::note_query_reply_destination(&state, task, BASE + 0x10, 64),
+        Some(buffer),
+        "a reply buffer inside the allocation names the reference that holds it"
+    );
+    assert_eq!(
+        store_route_count("query_reply_scanned"),
+        scanned + 1,
+        "the denominator moves whatever the answer is"
+    );
+
+    assert_eq!(
+        super::note_query_reply_destination(&state, task, BASE + SIZE, 64),
+        None,
+        "one byte past the end is outside, because the window is half open"
+    );
+    assert_eq!(
+        store_route_count("query_reply_outside_every_allocation"),
+        outside + 1
+    );
+    assert_eq!(
+        super::note_query_reply_destination(&state, task, BASE - 8, 8),
+        None,
+        "and a buffer that ends exactly where the allocation starts is outside too"
+    );
+    assert_eq!(
+        super::note_query_reply_destination(&state, task, BASE - 8, 16),
+        Some(buffer),
+        "but one that straddles the boundary is inside: it writes bytes the \
+         allocation owns, and an identity of its own would leave those bytes \
+         unordered"
+    );
+    assert_eq!(
+        store_route_count("query_reply_scanned"),
+        scanned + 4,
+        "every ask is counted, including the ones that found nothing"
+    );
+}
+
 /// The peer question the hot per-reference state asks is answered from the
 /// construction cache, and answers nothing when the reference is the only name
 /// for its storage.

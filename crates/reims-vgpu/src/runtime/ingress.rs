@@ -152,6 +152,21 @@ pub enum Gap {
     /// that over-claims is a gap nobody thinks to close.
     Namespaces,
     /// The reply destination, resolved to a backing and a window of it.
+    ///
+    /// **The four questions do not share a destination space, and whoever
+    /// closes this has to resolve two things and not one.** `CmdGetComputeInfo`
+    /// and the heap-texture size query carry a `reply_gva` — an address in the
+    /// task, in the same space every object-list object's window is in, so a
+    /// reply buffer *can* fall inside an allocation this device already has an
+    /// identity for and must then resolve to that identity rather than to one of
+    /// its own. `CmdGetDeviceInfo` carries a `reply_pfn` instead: a guest page
+    /// frame, in no task's address space at all.
+    ///
+    /// `reims_vgpu_core::query::ReplyDestination` wants one `BackingId` for
+    /// both, which is right — a destination is storage like any other — but the
+    /// device mints identities from `(task, allocation base, incarnation)` and a
+    /// page frame has no task and no allocation base. That is the term this gap
+    /// is actually short of.
     ReplyDestination,
     /// The accesses the presented mapping resolves to.
     MappingAccesses,
