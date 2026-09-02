@@ -23,8 +23,9 @@ use crate::protocol::iosurface_pages::{
 };
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
-    OBJECT_TYPE_BUFFER, OBJECT_TYPE_MAPPER_REF_TEXTURE, OBJECT_TYPE_TEXTURE,
-    OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
+    OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_MAPPER_REF_TEXTURE,
+    OBJECT_TYPE_SERIALIZER_OBJECT, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
+    OBJECT_TYPE_TEXTURE_VIEW,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
@@ -3823,7 +3824,20 @@ pub fn repointed_storage<M: HostMemory>(
         Ok(reims_vgpu_core::lifecycle::Storage::Placed { .. }) => {
             Err(RepointStorageRefusal::Placed)
         }
-        Ok(reims_vgpu_core::lifecycle::Storage::NoBytes) => Err(RepointStorageRefusal::NoBytes),
+        Ok(reims_vgpu_core::lifecycle::Storage::NoBytes) => {
+            Err(RepointStorageRefusal::NoBytes {
+                object_type: entry.object_type,
+                // Asked because a re-point whose reference names no bytes in
+                // the object list, while the *same integer* names a live
+                // mapping surface in this task, is not a no-op: it is storage
+                // reached through the other namespace, and the object list
+                // cannot describe it. The two namespaces overlap numerically,
+                // so this is recorded as a reading and not acted on — what
+                // makes it one fact rather than a collision is the type at the
+                // list entry, which travels with it.
+                mapping_names_a_surface: mapping_backing_id(state, obj_ref).is_ok(),
+            })
+        }
         Err(refusal) => Err(RepointStorageRefusal::Refused(refusal)),
     }
 }
@@ -3848,8 +3862,18 @@ pub enum RepointStorageRefusal {
     /// own, so a re-point of one is the heap's event, not this reference's.
     Placed,
     /// The reference names an object with no bytes at all — a sampler, a
-    /// function, a view. A re-point announcement against one is a no-op.
-    NoBytes,
+    /// function, a view. A re-point announcement against one is a no-op, and
+    /// the type is carried so that a boot can say which kinds this guest
+    /// re-points and whether the answer is plausible for them.
+    NoBytes {
+        object_type: u8,
+        /// Whether the same integer names a live mapping surface in this task.
+        ///
+        /// If it does, the announcement is about storage the mapping namespace
+        /// has and the object list does not, and "no bytes" is the object
+        /// list's answer rather than the resource's.
+        mapping_names_a_surface: bool,
+    },
     /// The reference names storage this device could not describe. This is the
     /// one that costs: the pages moved and the model was not told.
     Refused(StorageRefusal),
@@ -3864,7 +3888,35 @@ impl RepointStorageRefusal {
             Self::NoListEntry => "replace_physical_storage_no_list_entry",
             Self::DescriptorUnread => "replace_physical_storage_descriptor_unread",
             Self::Placed => "replace_physical_storage_placed",
-            Self::NoBytes => "replace_physical_storage_no_bytes",
+            Self::NoBytes {
+                mapping_names_a_surface: true,
+                ..
+            } => "replace_physical_storage_no_bytes_but_mapping_names_a_surface",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_FUNCTION,
+                ..
+            } => "replace_physical_storage_no_bytes_function",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_SERIALIZER_OBJECT,
+                ..
+            } => "replace_physical_storage_no_bytes_serializer",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_TEXTURE_VIEW,
+                ..
+            } => "replace_physical_storage_no_bytes_texture_view",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_REF_TEXTURE,
+                ..
+            } => "replace_physical_storage_no_bytes_ref_texture",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_BACKING,
+                ..
+            } => "replace_physical_storage_no_bytes_backing",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_MAPPER_REF_TEXTURE,
+                ..
+            } => "replace_physical_storage_no_bytes_mapper_ref_texture",
+            Self::NoBytes { .. } => "replace_physical_storage_no_bytes_other",
             Self::Refused(StorageRefusal::ExtentUnrecovered { .. }) => {
                 "replace_physical_storage_extent_unrecovered"
             }
