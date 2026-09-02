@@ -3818,10 +3818,34 @@ fn the_device_answers_the_models_object_resolver_from_the_bound_tasks_namespace(
         "and the binding says which task it is, so a caller can check"
     );
 
+    // The device is also the *source* of namespaces, in the shape the lifecycle
+    // joins want — and it must answer the same thing, or a lifetime packet and a
+    // command-stream walk would resolve one ref two ways.
+    {
+        use reims_vgpu_core::identity::TaskId;
+        use reims_vgpu_core::resolve::TaskNamespaces;
+        assert_eq!(
+            TaskNamespaces::resource(&state, TaskId(task), ref_),
+            Some(name),
+            "both doors into one namespace answer with one name"
+        );
+        assert_eq!(
+            TaskNamespaces::resource(&state, TaskId(task + 1), ref_),
+            None,
+            "and the source routes by task rather than resolving in whichever \
+             namespace it reached first"
+        );
+    }
+
     // The name stops resolving when the object does, through the trait as
     // through every other door.
     assert!(state.delete_object(task, ref_));
     assert_eq!(TaskRefResolver::new(&state, task).resource(ref_), None);
+    {
+        use reims_vgpu_core::identity::TaskId;
+        use reims_vgpu_core::resolve::TaskNamespaces;
+        assert_eq!(TaskNamespaces::resource(&state, TaskId(task), ref_), None);
+    }
 }
 
 /// The lifetime-ref census counts what it asked as well as what it found, and

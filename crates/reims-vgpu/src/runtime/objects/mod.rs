@@ -2176,6 +2176,31 @@ impl reims_vgpu_core::resolve::RefResolver for TaskRefResolver<'_> {
     }
 }
 
+/// The device as the source of every task's object namespace.
+///
+/// # Why the device implements this and not [`TaskRefResolver`]'s trait
+///
+/// A byte-to-operation join in `reims_vgpu_core::lifecycle` learns which task a
+/// packet is about by decoding the packet, so it cannot be handed a namespace
+/// that is already bound — the binding is the answer it is computing. It is
+/// handed this instead, and binds the task itself. That is the whole difference
+/// between the two traits and it is not stylistic: a ref is an index into the
+/// naming task's own object list, so another task's namespace does not refuse
+/// it, it resolves it, to another task's resource.
+///
+/// [`TaskRefResolver`] stays for the callers that legitimately are inside one
+/// task already — a command-stream walk, which was given its task by the header
+/// it is walking under.
+impl reims_vgpu_core::resolve::TaskNamespaces for DeviceState {
+    fn resource(
+        &self,
+        task: reims_vgpu_core::identity::TaskId,
+        object_ref: u32,
+    ) -> Option<reims_vgpu_core::identity::ResourceId> {
+        self.object_name(task.0, object_ref)
+    }
+}
+
 /// Whether a query's reply buffer lands inside an allocation this device
 /// already has an identity for.
 ///
