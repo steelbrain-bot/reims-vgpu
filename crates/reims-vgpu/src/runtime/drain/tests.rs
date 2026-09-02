@@ -6020,12 +6020,26 @@ fn a_delete_object_counts_the_kind_its_record_names() {
 /// something this device cannot decode — and the two used to produce the same
 /// record.
 ///
-/// Driven off [`CHILD_DEPRECATED_OPS`] rather than a second list, so a slot
-/// added there cannot be left without an arm.
+/// Driven off the closure ledger — the rows `reims_vgpu_core::control` calls
+/// [`ControlKind::RetiredSlot`] — rather than a list beside the arm, so a slot
+/// the ledger judges retired cannot be left without one. This device used to
+/// keep its own transcription of the fifteen and drive this test off that, so
+/// the test and the arm shared a source and neither could catch the other being
+/// wrong about which numbers they are.
 #[test]
 fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
     let mut host = FakeHost::new();
-    for opcode in CHILD_DEPRECATED_OPS {
+    let retired: Vec<u16> = reims_vgpu_protocol::packets::LEDGER
+        .iter()
+        .filter(|p| p.channel == crate::protocol::packets::Channel::Child)
+        .filter(|p| {
+            reims_vgpu_core::control::ControlKind::of(p.channel, p.opcode)
+                == Some(reims_vgpu_core::control::ControlKind::RetiredSlot)
+        })
+        .map(|p| p.opcode)
+        .collect();
+    assert_eq!(retired.len(), 15, "the reference host's retired slots");
+    for opcode in retired {
         let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         let pkt = Packet {
             opcode,

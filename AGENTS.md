@@ -128,8 +128,26 @@ disjoint class back buys no safety while costing the bisect it could have provid
 State the disjointness before moving a group and make it hold structurally — named owners, not an
 argument that the current call sites happen not to overlap. If it cannot be made to hold, the group
 is larger than it looked: enlarge it rather than move anyway. Within a group the switch is atomic
-and the legacy counterpart is deleted in the same commit. Order the groups by how little state they
-move; the ordering and publication core is last, and carries the scheduler's deletion.
+and the legacy counterpart is disconnected in the same commit. Order the groups by how little state
+they move; the ordering and publication core is last, and carries the scheduler's deletion.
+
+**Disconnect, do not delete — amending "the legacy counterpart is deleted in the same commit"
+above, and the plan's Seam 6.** In the commit that wires a group, move its legacy files to
+`crates/<crate>/src/dead/` and remove every `mod` declaration that reaches them. `dead/` does not
+compile, is not feature-gated, and is not linkable; it is source to read. Unreachability by
+construction is what the prohibition on two semantic models needs, and it is what a removed `mod`
+gives — a flag or a `cfg` would give the prohibition's opposite.
+
+Each move appends a row to `crates/<crate>/src/dead/README.md` naming what moved, which commit
+replaced it, and which new owner-level tests replaced the legacy tests that moved with it. Those
+tests stop running the moment they move, so a group that ships without that replacement coverage
+has silently lost it and the row is where that is caught.
+
+Nothing is resurrected from `dead/`, and no build-time or run-time switch may reach it. When a live
+boot regresses, `dead/` is read to learn what the old code did and the fix lands in the new owner.
+`dead/` is deleted wholesale, in one commit, once every group has moved and the plan's gates are
+green — never pruned incrementally, because a half-emptied `dead/` reads as "these were the ones
+worth keeping".
 
 ## Working and verification
 

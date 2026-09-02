@@ -26,6 +26,7 @@ use crate::runtime::gpa_map;
 use crate::runtime::heap_query::QueryError;
 use crate::runtime::host::{HostAction, HostMemory, HostOps, MemError};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use reims_vgpu_core::control::ControlKind;
 
 pub(crate) mod census;
 pub use census::*;
@@ -4107,6 +4108,27 @@ fn sync_exec_stalled(total_us: u64) -> bool {
     total_us >= SYNC_EXEC_STALL_US
 }
 
+/// The control kind of a child opcode whose payload is inert, or `None` for
+/// every other opcode.
+///
+/// **The one place this device asks what a retired slot is.** The fifteen
+/// numbers the reference host routes to its shared deprecated handler used to
+/// be transcribed into `model::regs` beside this crate's own command
+/// constants, so the closure ledger and the drain each carried a list and a
+/// slot that went live had to be remembered in both. The ledger is the
+/// authority now: a row it judges `ProvenNoOp` is what
+/// [`reims_vgpu_core::control::ControlKind::of`] calls a
+/// [`RetiredSlot`](reims_vgpu_core::control::ControlKind::RetiredSlot), and
+/// `CmdNOP` — the command whose entire obligation is its own envelope — is the
+/// other kind with an inert payload.
+///
+/// "Inert" is about the payload and never about the packet. The stamp waits,
+/// the ordering position and the completion word are owed identically, and the
+/// drain discharges them for every accepted packet whatever this returns.
+fn inert_control_kind(opcode: u16) -> Option<ControlKind> {
+    ControlKind::of(WireChannel::Child, opcode).filter(|kind| kind.payload_is_inert())
+}
+
 fn process_child_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -4605,7 +4627,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // channel flush the display pipe happens to want is how the constant
         // itself came to be misnamed, and it leaves a reader grepping the log
         // for the command with nothing under it.
-        CHILD_OP_NOP => {
+        //
+        // Which opcode this is, is `reims_vgpu_core::control`'s answer and not
+        // a constant here: `CmdNOP` is the inert kind that is *not* a retired
+        // slot, and the two arms below are the two values
+        // [`ControlKind::payload_is_inert`] is true for.
+        op if inert_control_kind(op) == Some(ControlKind::Nop) => {
             crate::runtime::drain::note_store_route("child_nop");
             // The command allocates no bytes, so payload is the one thing that
             // can falsify this reading. Bytes here would mean the command grew a
@@ -4626,7 +4653,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // packet, does nothing with the payload and retires the stamps, which is
         // exactly what this arm does — so matching them is fidelity, and the
         // record exists only to say a guest is still emitting one.
-        op if is_deprecated_child_opcode(op) => {
+        //
+        // Which numbers those are is the closure ledger's judgement, read
+        // through [`inert_control_kind`]. This device used to carry its own
+        // fifteen-entry transcription of them, which is one list too many for a
+        // set whose whole content is "the ledger proved these do nothing".
+        op if inert_control_kind(op) == Some(ControlKind::RetiredSlot) => {
             note_unimplemented(state, channel_id, UnimplementedCommand::Deprecated, packet);
         }
         // Everything left is an opcode with no handler at all. Two different

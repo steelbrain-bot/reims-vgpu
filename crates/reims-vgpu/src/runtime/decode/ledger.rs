@@ -214,12 +214,43 @@ fn no_ledger_operation_sits_outside_the_render_encoder_window() {
 /// class nobody has judged, and a row naming an opcode no constant declares is a
 /// judgement about a command this device cannot receive.
 mod packets {
-    use crate::model::{
-        is_deprecated_child_opcode, CHILD_COMMANDS, CHILD_DEPRECATED_OPS, CHILD_OP_MAX,
-        ROOT_COMMANDS,
-    };
+    use crate::model::{CHILD_COMMANDS, CHILD_OP_MAX, ROOT_COMMANDS};
+    use reims_vgpu_core::control::ControlKind;
     use reims_vgpu_protocol::packets::{find, Channel, LEDGER, OPCODE_CEILING};
     use std::collections::BTreeSet;
+
+    /// The child opcodes the ledger judges retired, read the one way this
+    /// device reads them.
+    ///
+    /// The set used to be a constant beside the command constants, and the test
+    /// below that walked it was asking the ledger whether it agreed with a copy
+    /// of itself. It is the ledger's now, so the question these tests can still
+    /// ask is the one that was always the point: whether the *commands* this
+    /// device dispatches and the retired set are disjoint, and whether every
+    /// judged row is a packet this device can receive at all.
+    fn retired_slots() -> BTreeSet<u16> {
+        LEDGER
+            .iter()
+            .filter(|p| p.channel == Channel::Child)
+            .filter(|p| ControlKind::of(p.channel, p.opcode) == Some(ControlKind::RetiredSlot))
+            .map(|p| p.opcode)
+            .collect()
+    }
+
+    /// The retired set is not empty and not everything.
+    ///
+    /// Without this a `ControlKind` change that stopped calling anything a
+    /// retired slot would leave the two tests below trivially true: an empty
+    /// set is disjoint from every command list and adds no receivable opcode.
+    #[test]
+    fn the_ledger_judges_a_retired_set_at_all() {
+        assert_eq!(
+            retired_slots().len(),
+            15,
+            "the reference host routes fifteen child slots to its shared \
+             deprecated handler"
+        );
+    }
 
     #[test]
     fn every_declared_command_has_a_ledger_row() {
@@ -239,33 +270,12 @@ mod packets {
         }
     }
 
-    /// The retired slots are commands too — the reference host has one handler
-    /// for all fifteen — so each is a row, and a row that says the shared
-    /// handler's behavior *is* the contract rather than a gap.
-    #[test]
-    fn every_retired_slot_has_a_ledger_row() {
-        for op in CHILD_DEPRECATED_OPS {
-            let row = find(Channel::Child, op)
-                .unwrap_or_else(|| panic!("retired slot {op:#04x} is unjudged"));
-            assert!(
-                matches!(
-                    row.closure,
-                    reims_vgpu_protocol::closure::Closure::ProvenNoOp { .. }
-                ),
-                "retired slot {op:#04x} reads as {} — the reference host's shared handler is the \
-                 whole contract, so anything else claims this device owes more or less than the \
-                 host it is imitating",
-                row.closure.name()
-            );
-        }
-    }
-
     #[test]
     fn no_ledger_row_names_a_command_this_device_cannot_receive() {
         let child: BTreeSet<u16> = CHILD_COMMANDS
             .iter()
             .map(|(_, op)| *op)
-            .chain(CHILD_DEPRECATED_OPS)
+            .chain(retired_slots())
             .collect();
         let root: BTreeSet<u16> = ROOT_COMMANDS.iter().map(|(_, op)| *op).collect();
         for p in LEDGER {
@@ -294,9 +304,10 @@ mod packets {
     /// side of the join.
     #[test]
     fn no_live_command_is_also_a_retired_slot() {
+        let retired = retired_slots();
         for (name, op) in CHILD_COMMANDS {
             assert!(
-                !is_deprecated_child_opcode(*op),
+                !retired.contains(op),
                 "CHILD_OP_{name} is also listed as a retired slot, so the drain would give one \
                  number two arms and the retired one would swallow a live command"
             );
