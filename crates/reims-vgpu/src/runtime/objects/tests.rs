@@ -2980,13 +2980,30 @@ fn one_allocation_has_one_identity_and_a_repoint_gives_it_another() {
     );
 
     // The mapper-ref texture the fixture lists at reference 1 reaches its
-    // storage through a mapping, which has its own counter and its own
-    // resolver. Answering it here with an address-derived number would be a
-    // plausible answer to a question this function is not asked.
+    // storage through a mapping, which has its own counter. The reference is
+    // followed to the mapping its descriptor names — 9 — and what comes back is
+    // that mapping's refusal, not a number derived from an address it never had.
     assert_eq!(
         super::backing_id(&state, &host, task, 1),
-        Err(super::BackingIdRefusal::NamedByMapping { object_type: 11 }),
-        "storage reached through a mapping is refused by name, not guessed at"
+        Err(super::BackingIdRefusal::ThroughMapping {
+            mapping_id: 9,
+            refusal: super::MappingBackingRefusal::Unlisted,
+        }),
+        "the refusal names which mapping was asked, so a reading says what is \
+         missing rather than that this type is not answered for"
+    );
+    assert!(state.map_surface(9));
+    let through_ref = super::backing_id(&state, &host, task, 1)
+        .expect("the mapping the descriptor names has a surface now");
+    assert_eq!(
+        through_ref,
+        super::mapping_backing_id(&state, 9).expect("and it is mintable directly"),
+        "the reference has the identity that mapping's storage has — one number, \
+         reached the two ways a caller can hold the question"
+    );
+    assert_ne!(
+        through_ref, after,
+        "which is still not an address-named window's"
     );
 }
 

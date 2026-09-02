@@ -2919,8 +2919,9 @@ pub enum HeapReference {
 
 /// Why a guest object reference has no canonical backing identity.
 ///
-/// Every variant is a contract term this device does not have, named rather
-/// than guessed. `reims_vgpu_core::access::BackingId`'s own doc says why the
+/// Three of the four are a contract term this device does not have, named
+/// rather than guessed; the fourth is a mapping that names no surface yet,
+/// carried whole from the resolver that does have the term. `reims_vgpu_core::access::BackingId`'s own doc says why the
 /// guess is not available: an identity that is wrong in the equal direction
 /// hands storage back under a live reader, and one that is wrong in the
 /// distinct direction drops a hazard edge. Neither failure has a symptom at
@@ -2930,24 +2931,32 @@ pub enum BackingIdRefusal {
     /// The reference names nothing in the task's object list, or its
     /// descriptor did not read.
     Unresolved(LadderRung),
-    /// The object reaches its storage through a mapping rather than by an
-    /// address in its task — a mapper-ref texture.
+    /// The object reaches its storage through a mapping — a mapper-ref texture
+    /// — and that mapping names no live surface.
     ///
-    /// Not a gap: that storage has an identity, and it is the mapping's, which
-    /// [`mapping_backing_id`] mints and
-    /// `reims_vgpu_core::resolve::MappingResolver` asks for. This function
-    /// deliberately does not answer it. A resolver that answered both from one
-    /// method would let a caller ask the wrong question and get a plausible
-    /// number, which is the same reason the two traits are separate — the
-    /// mapping id and the object reference are `u32`s that overlap numerically
-    /// and name unrelated things.
+    /// The refusal is the *mapping's*, carried whole, and it is no longer this
+    /// one's own: the descriptor names a mapping id, so the reference is
+    /// followed to it and [`mapping_backing_id`] answers. It used to stop here
+    /// on the type alone, which read as "this device does not have the term"
+    /// when the term was one decode away.
+    ///
+    /// Following a decoded field is not one resolver answering two namespaces.
+    /// The two entry points stay separate, keyed by the two `u32`s that overlap
+    /// numerically and name unrelated things — a caller holding a mapping id
+    /// asks [`mapping_backing_id`], a caller holding an object reference asks
+    /// [`backing_id`] — and a caller that could pass either to one method would
+    /// get a plausible number for the wrong question. That is what the split is
+    /// for, and it survives the delegation.
     ///
     /// **A dual-plane texture is not one of these and used to be.** It is built
     /// from paging info in its own task like any normal texture, its two planes
     /// share the one object header's handle and allocation size, and
     /// `Descriptor::backing_window` now answers for it — one allocation, two
     /// extents.
-    NamedByMapping { object_type: u8 },
+    ThroughMapping {
+        mapping_id: u32,
+        refusal: MappingBackingRefusal,
+    },
     /// The object is placed inside a heap, and a heap's extent is unrecovered.
     ///
     /// A placement names a heap reference and an offset. The heap's identity is
@@ -2966,7 +2975,7 @@ impl BackingIdRefusal {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Unresolved(_) => "backing_id_unresolved",
-            Self::NamedByMapping { .. } => "backing_id_named_by_mapping",
+            Self::ThroughMapping { .. } => "backing_id_mapping_names_no_surface",
             Self::HeapPlaced => "backing_id_heap_placed",
             Self::NamesNoStorage { .. } => "backing_id_names_no_storage",
         }
@@ -3009,11 +3018,11 @@ pub fn backing_id<M: HostMemory>(
     )?;
     match backing_window(state.page_shift, &entry, &descriptor) {
         Some((base, _)) => Ok(state.backing_identity(task_id, base)),
-        // The two address-named types are the only ones `backing_window`
-        // answers for, so everything else is one of the three refusals — and
-        // which one it is says what would have to land for it to stop being a
-        // refusal, which is the reason they are not one variant.
-        None => Err(backing_id_refusal(&entry, &descriptor)),
+        // One type's storage is somewhere else rather than not yet named, and
+        // the rest are refusals whose variant says what would have to land for
+        // them to stop being one. Both live in the classifier below, so the
+        // answer is exhaustive over the types rather than a fallthrough.
+        None => backing_id_without_window(state, &entry, &descriptor),
     }
 }
 
@@ -3078,20 +3087,48 @@ pub fn mapping_backing_id(
     Ok(state.mapping_backing_identity(mapping_id, entry.map_generation))
 }
 
-/// Which of the three "no window" answers this object is.
+/// What an object that named no guest-VA window is, when it is not a window.
 ///
-/// Split from [`backing_id`] so the classification is exhaustive over the
-/// object types the resource constructor accepts, rather than a fallthrough
-/// from a decode that happened not to produce a window.
-fn backing_id_refusal(entry: &ListObjectEntry, descriptor: &[u8]) -> BackingIdRefusal {
+/// Split from [`backing_id`] so the answer is exhaustive over the object types
+/// the resource constructor accepts, rather than a fallthrough from a decode
+/// that happened not to produce a window.
+///
+/// One arm is not a refusal at all. A mapper-ref texture's storage is a
+/// mapping's, and the descriptor in hand names which mapping — so the reference
+/// is followed to [`mapping_backing_id`] and only the mapping's own refusal can
+/// come back. A zero mapping id, and a descriptor that does not decode, are the
+/// descriptor rung rather than a mapping refusal: the bytes are there and they
+/// do not yet name a mapping, which is what an unwritten handle is on the
+/// address-named types.
+fn backing_id_without_window(
+    state: &DeviceState,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Result<reims_vgpu_core::access::BackingId, BackingIdRefusal> {
     use crate::runtime::decode::resource::{
-        texture_view_opcode, HEAP_TEXTURE_OPCODE, HEAP_TEXTURE_WIDE_OPCODE,
-        OBJECT_TYPE_DUAL_PLANE_TEXTURE,
+        decode_iosurface_texture_descriptor, texture_view_opcode, Descriptor, HEAP_TEXTURE_OPCODE,
+        HEAP_TEXTURE_WIDE_OPCODE, OBJECT_TYPE_DUAL_PLANE_TEXTURE,
     };
-    match entry.object_type {
-        OBJECT_TYPE_MAPPER_REF_TEXTURE => BackingIdRefusal::NamedByMapping {
-            object_type: entry.object_type,
-        },
+    let unresolved = BackingIdRefusal::Unresolved(LadderRung::DescRead {
+        declared_len: entry.descriptor_length,
+    });
+    Err(match entry.object_type {
+        OBJECT_TYPE_MAPPER_REF_TEXTURE => {
+            let Ok(Descriptor::IOSurfaceTexture { mapping_id, .. }) =
+                decode_iosurface_texture_descriptor(descriptor)
+            else {
+                return Err(unresolved);
+            };
+            if mapping_id == 0 {
+                return Err(unresolved);
+            }
+            return mapping_backing_id(state, mapping_id).map_err(|refusal| {
+                BackingIdRefusal::ThroughMapping {
+                    mapping_id,
+                    refusal,
+                }
+            });
+        }
         // A texture whose descriptor is a heap placement, which is a record at
         // its own opcode rather than an object type of its own -- the placement
         // is how a texture is made, not what kind of object it is.
@@ -3110,11 +3147,9 @@ fn backing_id_refusal(entry: &ListObjectEntry, descriptor: &[u8]) -> BackingIdRe
         OBJECT_TYPE_TEXTURE
         | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
         | OBJECT_TYPE_BUFFER
-        | OBJECT_TYPE_DUAL_PLANE_TEXTURE => BackingIdRefusal::Unresolved(LadderRung::DescRead {
-            declared_len: entry.descriptor_length,
-        }),
+        | OBJECT_TYPE_DUAL_PLANE_TEXTURE => unresolved,
         other => BackingIdRefusal::NamesNoStorage { object_type: other },
-    }
+    })
 }
 
 /// Whether another constructed reference in this task names the same
