@@ -84,6 +84,105 @@ pub trait RefResolver {
     fn resource(&self, object_ref: u32) -> Option<ResourceId>;
 }
 
+/// Every task's object namespace, asked for by the task that owns it.
+///
+/// # Why this exists beside [`RefResolver`] rather than replacing it
+///
+/// A `RefResolver` **is** one namespace. An interpreter holding one is already
+/// inside the task whose refs it is resolving, so "which task" is not a question
+/// it can get wrong, and giving it a task parameter would be a field nothing
+/// could disagree about.
+///
+/// A byte-to-operation join is not in that position. It is handed a payload; the
+/// task id is *inside* that payload; and it learns which task only by decoding.
+/// A join taking a `RefResolver` therefore takes the **caller's guess** about
+/// which namespace the packet meant — on exactly the packets whose own contract
+/// is that the task is the header's and not a guess. Object-list refs are
+/// per-task slot numbers, so the wrong namespace does not refuse: it resolves,
+/// to another task's resource, and the operation retires or invalidates storage
+/// the packet never named.
+///
+/// So [`crate::lifecycle`]'s joins take this instead and bind the task from the
+/// bytes they just decoded, with [`InTask`]. A caller cannot pass the wrong
+/// namespace because it no longer picks one.
+///
+/// # It is not a second lifetime model
+///
+/// One method, and it answers exactly what `RefResolver` answers, for a stated
+/// task. Nothing here mints, leases, retires or generates: the generation in the
+/// returned [`ResourceId`] is the namespace's, and this trait is the routing to
+/// the namespace and nothing else.
+pub trait TaskNamespaces {
+    /// The live resource a ref names in one task's object namespace, or `None`
+    /// when that task has no namespace or the slot holds nothing.
+    fn resource(&self, task: crate::identity::TaskId, object_ref: u32) -> Option<ResourceId>;
+}
+
+/// One task's namespace out of a source of many, in the shape [`RefResolver`]
+/// wants.
+///
+/// The binder, and the only way a [`TaskNamespaces`] becomes a `RefResolver`.
+/// Constructed where a task id has just been decoded from a packet, so the
+/// namespace and the packet's own task cannot come apart.
+#[derive(Clone, Copy)]
+pub struct InTask<'a, S: ?Sized> {
+    source: &'a S,
+    task: crate::identity::TaskId,
+}
+
+impl<'a, S: TaskNamespaces + ?Sized> InTask<'a, S> {
+    /// Bind a namespace source to one task.
+    pub const fn new(source: &'a S, task: crate::identity::TaskId) -> Self {
+        Self { source, task }
+    }
+
+    /// The task this resolves in.
+    #[must_use]
+    pub const fn task(&self) -> crate::identity::TaskId {
+        self.task
+    }
+}
+
+impl<S: TaskNamespaces + ?Sized> RefResolver for InTask<'_, S> {
+    fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+        self.source.resource(self.task, object_ref)
+    }
+}
+
+/// A borrow of a resolver resolves the same as the resolver.
+///
+/// Stated so a caller holding `&Namespace` can hand it to a wrapper that takes
+/// one by value without an owned copy of a namespace being created to satisfy a
+/// type.
+impl<R: RefResolver + ?Sized> RefResolver for &R {
+    fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+        (**self).resource(object_ref)
+    }
+}
+
+/// One namespace standing in for every task's.
+///
+/// **For a holder of exactly one namespace, and it says so in its name.** A
+/// bench, a fixture, or a model whose packets all name one task has one
+/// namespace and no routing question to get wrong; making it satisfy
+/// [`TaskNamespaces`] should not cost it a map keyed by a task id it does not
+/// have.
+///
+/// It is the shape [`TaskNamespaces`] exists to stop a *device* from taking. A
+/// device with more than one task that wrapped one namespace this way would
+/// resolve every packet's refs in whichever namespace it wrapped, which is the
+/// wrong-namespace resolution described above — so this is deliberately not
+/// something the device can arrive at by accident: it has to be written, by
+/// name, at the call site.
+#[derive(Clone, Copy, Debug)]
+pub struct SameForEveryTask<R>(pub R);
+
+impl<R: RefResolver> TaskNamespaces for SameForEveryTask<R> {
+    fn resource(&self, _task: crate::identity::TaskId, object_ref: u32) -> Option<ResourceId> {
+        self.0.resource(object_ref)
+    }
+}
+
 /// Which backing a guest mapping's surface currently occupies.
 ///
 /// **A separate trait from [`RefResolver`] because it answers about a separate

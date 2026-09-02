@@ -225,6 +225,18 @@ impl reims_vgpu_core::resolve::RefResolver for Everything {
     }
 }
 
+// One namespace for every task, which this suite is entitled to: it asks which
+// join a kind reaches, not which task's slots a ref is in.
+impl reims_vgpu_core::resolve::TaskNamespaces for Everything {
+    fn resource(
+        &self,
+        _task: reims_vgpu_core::identity::TaskId,
+        object_ref: u32,
+    ) -> Option<reims_vgpu_core::identity::ResourceId> {
+        reims_vgpu_core::resolve::RefResolver::resource(self, object_ref)
+    }
+}
+
 struct EveryMapping;
 
 impl reims_vgpu_core::resolve::MappingResolver for EveryMapping {

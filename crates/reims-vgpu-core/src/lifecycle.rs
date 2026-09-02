@@ -628,7 +628,7 @@ impl ResolveRefusal {
 pub fn resource_list(
     kind: LifecycleKind,
     payload: &[u8],
-    resolver: &impl crate::resolve::RefResolver,
+    namespaces: &impl crate::resolve::TaskNamespaces,
 ) -> Result<LifecycleOp, ResolveRefusal> {
     let Some(record_len) = kind.resource_list_record_len() else {
         return Err(ResolveRefusal::NotAResourceList { kind });
@@ -659,15 +659,19 @@ pub fn resource_list(
         (cmd.task_id, cmd.object_ids)
     };
 
+    // The namespace is bound to the task this packet just named, not to one a
+    // caller chose. Refs are per-task slot numbers, so another task's namespace
+    // would not refuse — it would resolve, and the operation would name
+    // somebody else's resources.
+    let task = TaskId(task);
+    let resolver = crate::resolve::InTask::new(namespaces, task);
     let mut resources = Vec::with_capacity(refs.len());
     for object_ref in refs {
-        let resolved = resolver
-            .resource(object_ref)
+        let resolved = crate::resolve::RefResolver::resource(&resolver, object_ref)
             .ok_or(ResolveRefusal::UnknownRef { object_ref })?;
         resources.push(resolved);
     }
 
-    let task = TaskId(task);
     Ok(match kind {
         LifecycleKind::Invalidate => LifecycleOp::Invalidate { task, resources },
         LifecycleKind::Synchronize => LifecycleOp::Synchronize { task, resources },
@@ -716,10 +720,15 @@ pub fn resource_list(
 /// naming nothing live.
 pub fn exec_resource_table(
     payload: &[u8],
-    resolver: &impl crate::resolve::RefResolver,
+    namespaces: &impl crate::resolve::TaskNamespaces,
 ) -> Result<LifecycleOp, ResolveRefusal> {
     let header = fifo::decode_exec_header(payload).map_err(ResolveRefusal::ShortNotice)?;
     let table = fifo::decode_exec_resource_table(payload).map_err(ResolveRefusal::Payload)?;
+    // The header's task, bound here rather than chosen by the caller — which is
+    // what this function's own contract says and what its signature used to
+    // leave to discipline.
+    let task = TaskId(header.task_id);
+    let resolver = crate::resolve::InTask::new(namespaces, task);
     let mut resources = Vec::new();
     for record in &table {
         if record.ops == fifo::InvalidateValidityOps::default() {
@@ -732,17 +741,14 @@ pub fn exec_resource_table(
             });
         }
         resources.push(
-            resolver
-                .resource(record.object_id)
-                .ok_or(ResolveRefusal::UnknownRef {
+            crate::resolve::RefResolver::resource(&resolver, record.object_id).ok_or(
+                ResolveRefusal::UnknownRef {
                     object_ref: record.object_id,
-                })?,
+                },
+            )?,
         );
     }
-    Ok(LifecycleOp::Invalidate {
-        task: TaskId(header.task_id),
-        resources,
-    })
+    Ok(LifecycleOp::Invalidate { task, resources })
 }
 
 /// Turn any lifecycle packet's payload into the operation it names.
@@ -765,6 +771,11 @@ pub fn exec_resource_table(
 /// why [`crate::resolve::RefResolver`] and
 /// [`crate::resolve::MappingResolver`] are two traits.
 ///
+/// The object side is a [`crate::resolve::TaskNamespaces`] and not one
+/// namespace: which task's namespace a lifecycle packet resolves in is stated in
+/// the packet, and only the join that decoded it knows. See that trait for why a
+/// caller-chosen namespace is a wrong answer rather than a refusal.
+///
 /// # Errors
 ///
 /// [`ResolveRefusal`] from the join that owns the kind, or — for the two
@@ -774,7 +785,7 @@ pub fn exec_resource_table(
 pub fn operation(
     kind: LifecycleKind,
     payload: &[u8],
-    objects: &impl crate::resolve::RefResolver,
+    objects: &impl crate::resolve::TaskNamespaces,
     mappings: &impl crate::resolve::MappingResolver,
 ) -> Result<LifecycleOp, ResolveRefusal> {
     match kind {
@@ -851,7 +862,7 @@ pub fn task_lifetime(kind: LifecycleKind, payload: &[u8]) -> Result<LifecycleOp,
 pub fn object_reference(
     kind: LifecycleKind,
     payload: &[u8],
-    resolver: &impl crate::resolve::RefResolver,
+    namespaces: &impl crate::resolve::TaskNamespaces,
 ) -> Result<LifecycleOp, ResolveRefusal> {
     if !matches!(
         kind,
@@ -860,14 +871,16 @@ pub fn object_reference(
         return Err(ResolveRefusal::NotAnObjectReference { kind });
     }
     let command = fifo::decode_task_object(payload).map_err(ResolveRefusal::ShortNotice)?;
+    // The record's own task names the namespace its object ref is a slot in.
+    let task = TaskId(command.task_id);
+    let resolver = crate::resolve::InTask::new(namespaces, task);
     // The ref is resolved before the kind is judged, so a re-point naming a
     // dead object refuses as a dead object rather than as unfinished work here.
-    let resource = resolver
-        .resource(command.object_id)
-        .ok_or(ResolveRefusal::UnknownRef {
+    let resource = crate::resolve::RefResolver::resource(&resolver, command.object_id).ok_or(
+        ResolveRefusal::UnknownRef {
             object_ref: command.object_id,
-        })?;
-    let task = TaskId(command.task_id);
+        },
+    )?;
     match kind {
         LifecycleKind::DeleteResource => Ok(LifecycleOp::DeleteResource { task, resource }),
         // `ReplacePhysical`, and nothing else reaches here.
@@ -2896,7 +2909,7 @@ mod tests {
             operation(
                 LifecycleKind::DeleteResource,
                 &payload,
-                &names,
+                &crate::resolve::SameForEveryTask(&names),
                 &EveryMapping
             ),
             Ok(LifecycleOp::DeleteResource {
@@ -2919,7 +2932,7 @@ mod tests {
             operation(
                 LifecycleKind::DeleteResource,
                 &payload,
-                &names,
+                &crate::resolve::SameForEveryTask(&names),
                 &EveryMapping
             ),
             Err(ResolveRefusal::UnknownRef { object_ref: 7 }),
@@ -2936,7 +2949,7 @@ mod tests {
             operation(
                 LifecycleKind::DeleteResource,
                 &payload,
-                &names,
+                &crate::resolve::SameForEveryTask(&names),
                 &EveryMapping
             ),
             Ok(LifecycleOp::DeleteResource {
@@ -3395,6 +3408,105 @@ mod tests {
         fn resource(&self, _object_ref: u32) -> Option<ResourceId> {
             None
         }
+    }
+
+    // These two stand for every task, and say so: a suite about list framing or
+    // record stride has one namespace and no routing question in it.
+    impl crate::resolve::TaskNamespaces for Nothing {
+        fn resource(&self, _task: TaskId, _object_ref: u32) -> Option<ResourceId> {
+            None
+        }
+    }
+
+    impl crate::resolve::TaskNamespaces for Everything {
+        fn resource(&self, _task: TaskId, object_ref: u32) -> Option<ResourceId> {
+            crate::resolve::RefResolver::resource(self, object_ref)
+        }
+    }
+
+    /// Two tasks' namespaces, in which one ref number names a different
+    /// resource in each — which is the ordinary case, since a ref is an index
+    /// into the naming task's own object list.
+    ///
+    /// The generation carries the task that answered, so a test can say *which*
+    /// namespace resolved a ref rather than only that one did.
+    struct PerTask;
+
+    impl crate::resolve::TaskNamespaces for PerTask {
+        fn resource(&self, task: TaskId, object_ref: u32) -> Option<ResourceId> {
+            Some(ResourceId {
+                slot: ObjectListRef(object_ref),
+                generation: SlotGeneration(u64::from(task.0) + 1),
+            })
+        }
+    }
+
+    /// A lifecycle packet's refs resolve in the namespace of the task the packet
+    /// names, and the caller does not get to choose.
+    ///
+    /// **The wrong namespace does not refuse.** Object-list refs are per-task
+    /// slot numbers, so resolving ref 7 in another task's list succeeds and
+    /// returns another task's resource — and the operation then retires,
+    /// invalidates or synchronizes storage the packet never named. Nothing
+    /// downstream can catch that: by then it is a well-formed operation over a
+    /// live resource.
+    ///
+    /// So the binding is not a caller's discipline. The join decodes the task
+    /// and binds the namespace itself, and this asserts that the answer moves
+    /// with the packet's task word.
+    #[test]
+    fn a_lifecycle_packets_refs_resolve_in_the_task_the_packet_names() {
+        const REF: u32 = 7;
+        let named = |task: u32| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&task.to_le_bytes());
+            payload.extend_from_slice(&REF.to_le_bytes());
+            object_reference(LifecycleKind::DeleteResource, &payload, &PerTask)
+                .expect("well formed")
+        };
+
+        assert_eq!(
+            named(5),
+            LifecycleOp::DeleteResource {
+                task: TaskId(5),
+                resource: ResourceId {
+                    slot: ObjectListRef(REF),
+                    generation: SlotGeneration(6),
+                },
+            }
+        );
+        assert_eq!(
+            named(9),
+            LifecycleOp::DeleteResource {
+                task: TaskId(9),
+                resource: ResourceId {
+                    slot: ObjectListRef(REF),
+                    generation: SlotGeneration(10),
+                },
+            },
+            "the same ref number, a different packet task, a different resource \u{2014}              which is what makes a caller-chosen namespace a wrong answer rather              than a refusal"
+        );
+
+        // The same, through the counted-list join, whose task word is in a
+        // different place in a different record.
+        let mut list = Vec::new();
+        list.extend_from_slice(&11u32.to_le_bytes());
+        list.extend_from_slice(&1u32.to_le_bytes());
+        list.extend_from_slice(&REF.to_le_bytes());
+        let LifecycleOp::Synchronize { task, resources } =
+            resource_list(LifecycleKind::Synchronize, &list, &PerTask).expect("well formed")
+        else {
+            panic!("a synchronize builds a synchronize");
+        };
+        assert_eq!(task, TaskId(11));
+        assert_eq!(
+            resources,
+            vec![ResourceId {
+                slot: ObjectListRef(REF),
+                generation: SlotGeneration(12),
+            }],
+            "the list's refs resolve in the list's own task"
+        );
     }
 
     /// A payload too short to hold even a resource-list header.
