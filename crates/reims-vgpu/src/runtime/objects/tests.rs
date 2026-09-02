@@ -3164,6 +3164,67 @@ fn a_dual_plane_texture_shares_one_identity_with_a_buffer_over_its_allocation() 
     );
 }
 
+/// Every constructed object is counted against the identity, and each refusal
+/// is counted under its own name.
+///
+/// The census has no consumer to fail if it stops working — the identity it
+/// measures has none yet either — so this is what says it is still measuring.
+/// The denominator is the point: a boot with no refusals and a boot with no
+/// constructions read the same without it.
+#[test]
+fn every_construction_is_counted_against_the_backing_identity() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+
+    let asked = store_route_count("backing_identity_asked");
+    let minted = store_route_count("backing_identity_minted");
+    resolve_resource(&state, &host, task, buffer).expect("a buffer constructs");
+    assert_eq!(
+        store_route_count("backing_identity_asked"),
+        asked + 1,
+        "the denominator moves for every construction, whatever the answer"
+    );
+    assert_eq!(
+        store_route_count("backing_identity_minted"),
+        minted + 1,
+        "a buffer names an allocation, so it has an identity"
+    );
+
+    // The fixture's reference 1 is a mapper-ref texture over a mapping this
+    // state has never mapped a surface into, which is the mapping's refusal
+    // rather than this object's.
+    let through = store_route_count("backing_id_mapping_names_no_surface");
+    resolve_resource(&state, &host, task, 1).expect("a mapper-ref texture constructs");
+    assert_eq!(
+        store_route_count("backing_id_mapping_names_no_surface"),
+        through + 1,
+        "and a refusal is counted under the arm it took, not as one number that \
+         cannot say which term is missing"
+    );
+    assert_eq!(
+        store_route_count("backing_identity_asked"),
+        asked + 2,
+        "an object with no identity is still in the denominator"
+    );
+}
+
 /// The peer question the hot per-reference state asks is answered from the
 /// construction cache, and answers nothing when the reference is the only name
 /// for its storage.

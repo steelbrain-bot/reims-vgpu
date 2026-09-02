@@ -1871,6 +1871,62 @@ fn note_backing_window_alias<M: HostMemory>(
     Some(holder)
 }
 
+/// Census the canonical backing identity of every object this device
+/// constructs.
+///
+/// # Why an identity nothing consumes is measured
+///
+/// `reims_vgpu_core::access::BackingId` is what the replacement model's
+/// dependency compiler draws every hazard edge on, and no packet class has
+/// moved to that model yet — so [`backing_id_of`] has no production consumer.
+/// It will have exactly one, all at once, and the question a cutover cannot ask
+/// afterwards is *what fraction of a real guest's objects the identity actually
+/// answers for*. A rail where a tenth of constructions land on a refusal is a
+/// rail where a tenth of the hazard graph is missing, and it would show up as
+/// an intermittently wrong frame rather than as a refusal.
+///
+/// So the reading is taken now, at the one site every constructed object passes
+/// through, against an unmodified guest. `backing_identity_asked` is the
+/// denominator — without it a boot with no refusals and a boot with no
+/// constructions read the same — and each refusal arm is counted under its own
+/// slug.
+///
+/// One arm is a fail line as well as a count.
+/// [`BackingIdRefusal::HeapPlaced`] is the one open contract term
+/// `BackingId`'s own doc still names: a heap's extent is unrecovered, so two
+/// placements sharing bytes would come out distinct. No driven boot has yet
+/// placed a heap texture, and the *sighting* is what would turn that from a
+/// term nobody can look for into a descriptor at a known address.
+fn note_backing_identity(
+    state: &DeviceState,
+    task_id: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) {
+    crate::runtime::drain::note_store_route("backing_identity_asked");
+    let Err(refusal) = backing_id_of(state, task_id, entry, descriptor) else {
+        crate::runtime::drain::note_store_route("backing_identity_minted");
+        return;
+    };
+    crate::runtime::drain::note_store_route(refusal.slug());
+    if !matches!(refusal, BackingIdRefusal::HeapPlaced) {
+        return;
+    }
+    if crate::observe::first_sight(
+        "backing_id_heap_placed",
+        (u64::from(task_id) << 32) | u64::from(entry.descriptor_length),
+    ) {
+        crate::observe::fail(format!(
+            "backing_id_heap_placed task={task_id} type={} desc_len={} desc_gva={:#x} \
+             (a heap placement, and a heap's extent is the one identity term still \
+             unrecovered — two placements sharing bytes come out distinct, which is a \
+             hazard edge the dependency compiler would never draw; the length and \
+             address here are where the extent would be read from)",
+            entry.object_type, entry.descriptor_length, entry.descriptor_gva,
+        ));
+    }
+}
+
 /// Retrieve or construct the resource named by `task_id` / `obj_ref`.
 ///
 /// A successful construction snapshots the object-list entry and descriptor
@@ -1902,6 +1958,7 @@ pub fn resolve_resource<M: HostMemory>(
     if let Some((base, size)) = backing_window(state.page_shift, &entry, &descriptor) {
         let _ = note_backing_window_alias(state, host, task_id, obj_ref, base, size);
     }
+    note_backing_identity(state, task_id, &entry, &descriptor);
     let resource = Arc::new(TaskResource::new(entry, descriptor));
     Ok(state.task_resources.register(task_id, obj_ref, resource))
 }
@@ -3025,13 +3082,33 @@ pub fn backing_id<M: HostMemory>(
             declared_len: entry.descriptor_length,
         }),
     )?;
-    match backing_window(state.page_shift, &entry, &descriptor) {
+    backing_id_of(state, task_id, &entry, &descriptor)
+}
+
+/// [`backing_id`] for a caller that has already read the list entry and the
+/// descriptor.
+///
+/// The construction path holds both — it decodes the descriptor to build the
+/// resource — so making it go back to guest memory for them would be two reads
+/// of the same bytes and, worse, two chances for the identity and the resource
+/// to describe different versions of the object.
+///
+/// # Errors
+///
+/// [`BackingIdRefusal`], exactly as [`backing_id`].
+pub fn backing_id_of(
+    state: &DeviceState,
+    task_id: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Result<reims_vgpu_core::access::BackingId, BackingIdRefusal> {
+    match backing_window(state.page_shift, entry, descriptor) {
         Some((base, _)) => Ok(state.backing_identity(task_id, base)),
         // One type's storage is somewhere else rather than not yet named, and
         // the rest are refusals whose variant says what would have to land for
         // them to stop being one. Both live in the classifier below, so the
         // answer is exhaustive over the types rather than a fallthrough.
-        None => backing_id_without_window(state, &entry, &descriptor),
+        None => backing_id_without_window(state, entry, descriptor),
     }
 }
 
