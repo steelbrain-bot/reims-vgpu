@@ -2611,10 +2611,10 @@ fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
 /// 2156 whose per-kind space this device already resolves.
 ///
 /// The shape of the classified traffic is the other half of the reading. It is
-/// over half exec, which says the group's risk is concentrated in the class
-/// whose payload this bridge cannot yet build at all — see
-/// `crate::runtime::ingress::Gap::ExecResolution` and the third input named
-/// there.
+/// over half exec, which is why the class whose payload the bridge could not
+/// build at all was the one that had to close first. It has:
+/// `crate::runtime::ingress::ExecStreams` carries the three inputs an exec
+/// packet costs, and the gap that named them is gone.
 fn note_packet_class(channel: reims_vgpu_protocol::packets::Channel, opcode: u16) {
     use reims_vgpu_core::transaction::{classify, PayloadClass};
     match classify(channel, opcode) {

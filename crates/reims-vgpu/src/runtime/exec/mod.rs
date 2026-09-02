@@ -662,11 +662,12 @@ fn note_command_stream_count(loaded: usize) {
 /// resource table and `cmdbuf_count` descriptors of `{gva, length}`; the streams
 /// themselves live in the guest's own address space, so producing them is a page
 /// table walk per buffer and not a slice of the packet. That is the input
-/// [`crate::runtime::ingress::Gap::ExecResolution`] names, and the reason the
+/// [`crate::runtime::ingress::ExecStreams::streams`] takes, and the reason the
 /// exec class cannot cross that bridge as a function of the drained packet the
-/// way the other four do. Named here so that whoever hands the bridge the
-/// streams calls one function rather than restating this loop, and so the loop
-/// has a test of its own.
+/// way the other four do — it is a function of the drained packet *and these
+/// bytes*. Named here so that whoever hands the bridge the streams calls one
+/// function rather than restating this loop, and so the loop has a test of its
+/// own.
 ///
 /// `cbufs_off` and `cmdbuf_count` are the caller's because the caller has
 /// already proved the table fits — `need = cbufs_off + count * DESC_LEN` against

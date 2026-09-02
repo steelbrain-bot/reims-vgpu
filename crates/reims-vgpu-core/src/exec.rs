@@ -664,7 +664,7 @@ impl ExecBuilder {
     pub fn record(
         &mut self,
         op: ResolvedOperation,
-        source: &mut impl AccessSource,
+        source: &mut (impl AccessSource + ?Sized),
     ) -> Result<StreamPosition, StreamRefusal> {
         // Taken out and put back, so the walk costs no allocation after the
         // first record of the first transaction. It also releases the borrow

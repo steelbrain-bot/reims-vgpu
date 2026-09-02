@@ -171,7 +171,7 @@ impl From<FramingRefusal> for WalkRefusal {
 pub fn command_buffer(
     bytes: &[u8],
     resolver: &impl RefResolver,
-    source: &mut impl crate::access::AccessSource,
+    source: &mut (impl crate::access::AccessSource + ?Sized),
     builder: &mut ExecBuilder,
 ) -> Result<(), WalkRefusal> {
     for framed in SegmentStream::new(bytes)? {
@@ -196,7 +196,7 @@ pub fn command_buffer(
 pub fn exec(
     bytes: &[u8],
     resolver: &impl RefResolver,
-    source: &mut impl crate::access::AccessSource,
+    source: &mut (impl crate::access::AccessSource + ?Sized),
     mut builder: ExecBuilder,
 ) -> Result<ExecWork, WalkRefusal> {
     command_buffer(bytes, resolver, source, &mut builder)?;
@@ -209,7 +209,7 @@ pub fn exec(
 fn segment(
     framed: &FramedSegment<'_>,
     resolver: &impl RefResolver,
-    source: &mut impl crate::access::AccessSource,
+    source: &mut (impl crate::access::AccessSource + ?Sized),
     builder: &mut ExecBuilder,
 ) -> Result<(), WalkRefusal> {
     let at = StreamSite {

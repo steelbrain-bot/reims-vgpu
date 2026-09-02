@@ -47,11 +47,14 @@
 //! What remains, each naming one input the model needs and this function is not
 //! given:
 //!
-//! - **Exec** needs the object-list resolver and the access source that
-//!   [`reims_vgpu_core::walk::exec`] walks a command stream with. Both exist in
-//!   the model; neither exists in this device, because both are
-//!   `reims_vgpu_core::lifecycle::Lifecycle`'s and it is not production state
-//!   yet. See [`Gap::ExecResolution`].
+//! Exec is no longer among them, and it was the last class to join. It needed
+//! three inputs and not the two its walk's signature shows: an object-list
+//! resolver, an access source, and the command stream *bytes*, which live at
+//! guest addresses the payload names rather than in the payload. The first two
+//! are `reims_vgpu_core::lifecycle::Lifecycle`'s and became production state
+//! with the resource-lifecycle group's cutover; the third is a page-table walk
+//! and stays the caller's, because it is guest-memory work and not translation.
+//! They arrive together as [`ExecStreams`].
 //! - **Resource lifetime** is down to one. Eleven of the twelve build a
 //!   payload: five name no resource, five name resources and state what they do
 //!   to them — `reims_vgpu_core::lifecycle::LifecycleOp::declared_access` is the
@@ -165,56 +168,6 @@ pub enum Gap {
     /// The ledger has not closed this row, so [`classify`] gives it no class
     /// and the model may not claim it. Production answers it alone.
     Unresolved,
-    /// The object-list resolver and the access source an EXEC's command stream
-    /// is walked with.
-    ///
-    /// # Nothing is missing on the model's side, and that is worth stating
-    ///
-    /// `reims_vgpu_core::walk::exec` needs two things and both exist:
-    /// a `RefResolver`, which `resolve::InTask` binds out of the
-    /// `TaskNamespaces` `reims_vgpu_core::lifecycle::Lifecycle` now implements,
-    /// and an `AccessSource`, which is `Lifecycle::task_access` for the packet's
-    /// own task and domain.
-    ///
-    /// The word in `AccessSource`'s own doc is the whole of what is left:
-    /// there is *exactly one* implementation with the terms, and it is
-    /// `Lifecycle` — which owns names, heaps and content authority together, and
-    /// which this device does not hold. So this gap does not close by adding a
-    /// resolver, a door or a translation.
-    ///
-    /// **Amended by the resource-lifecycle group's cutover: `Lifecycle` *is*
-    /// production state**, held by `DeviceState` and reached through its
-    /// lifetime doors. What is left is not a missing owner any more.
-    ///
-    /// # There are three inputs, not two, and the third is guest memory
-    ///
-    /// The sentence above this — "`walk::exec` needs two things and both exist"
-    /// — was counting what `walk::exec`'s *signature* takes. It is not what an
-    /// exec packet costs, and the difference is a whole subsystem:
-    ///
-    /// 1. A `RefResolver`. It exists. `resolve::InTask` binds one out of
-    ///    [`Resolvers::objects`], and in production that resolver names a
-    ///    reference on demand out of the guest's object list, which the model's
-    ///    own `TaskNamespaces` cannot do because it holds no guest memory.
-    /// 2. An `AccessSource`. It exists — `Lifecycle::access` for the packet's
-    ///    task and domain — and it is a `&mut` borrow, which is why it cannot
-    ///    join [`Resolvers`]: that bundle is `Copy` and holds shared references
-    ///    on purpose. It arrives as its own argument, or through a device door
-    ///    that takes the lock per participation.
-    /// 3. **The command stream bytes, which are not in the packet.** An
-    ///    `EXEC_INDIRECT2` payload carries a header, a resource table and
-    ///    `cmdbuf_count` descriptors of `{gva, length}` — the streams themselves
-    ///    live in the task's *address space*, and reading them is a page-table
-    ///    walk per buffer. `drain::Packet` has no records field and never had
-    ///    one; `crate::runtime::exec` does that walk itself. So this bridge
-    ///    cannot become a pure function of the drained packet for this class the
-    ///    way it is for the other four, and giving it two resolvers would leave
-    ///    it holding descriptors it cannot follow.
-    ///
-    /// That third input is what makes this gap the ordering and publication
-    /// group's and not a resolver away: whoever hands this bridge the streams is
-    /// also whoever owns the executor that runs them.
-    ExecResolution,
     /// The pages behind a re-pointed object, which its packet does not carry.
     ///
     /// `ReplacePhysical` is a bare `{task, object}`: the guest re-points a
@@ -263,7 +216,6 @@ impl Gap {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Unresolved => "ingress_row_unresolved",
-            Self::ExecResolution => "ingress_needs_exec_resolution",
             Self::ReplacementStorage => "ingress_needs_replacement_storage",
         }
     }
@@ -322,6 +274,15 @@ pub enum Refused {
     /// bridge that unwrapped it would be asserting a property it had stopped
     /// letting anything check.
     PresentAccesses(reims_vgpu_core::transaction::PresentMismatch),
+    /// A command stream did not become a transaction.
+    ///
+    /// The one refusal here that is not about a *packet's* bytes: an exec
+    /// packet's payload is a table of addresses, and what refuses is the stream
+    /// at one of them. Carried whole from
+    /// [`reims_vgpu_core::walk::WalkRefusal`] — which already names the segment
+    /// and offset — because a bridge-level re-wording would lose the site and
+    /// the owner that judged it.
+    Exec(reims_vgpu_core::walk::WalkRefusal),
 }
 
 impl Refused {
@@ -338,6 +299,7 @@ impl Refused {
             Self::LifecycleAccesses(inner) => inner.slug(),
             Self::Present(inner) => inner.slug(),
             Self::PresentAccesses(inner) => inner.slug(),
+            Self::Exec(inner) => inner.reason(),
         }
     }
 }
@@ -382,6 +344,56 @@ pub struct Resolvers<'a> {
     pub replies: &'a dyn reims_vgpu_core::query::Destinations,
 }
 
+/// The three inputs an EXEC packet costs beyond its own bytes.
+///
+/// # Why this is a separate argument and not a fifth resolver
+///
+/// [`Resolvers`] is `Copy` and holds shared references on purpose, and two of
+/// the three here cannot live in it. The access source is a `&mut` borrow —
+/// turning a record's participation claim into an access *records* the
+/// participation — and the command streams are not references into anything
+/// this bridge can see.
+///
+/// # The third input is guest memory, and it is why exec was the last class
+///
+/// An `EXEC_INDIRECT2` payload carries a header, a resource table and
+/// `cmdbuf_count` descriptors of `{gva, length}`. The streams themselves live
+/// in the task's *address space*, so reading them is a page-table walk per
+/// buffer — which is guest-memory work, not translation, and belongs to the
+/// caller. `crate::runtime::exec::load_command_streams` is that walk. This
+/// bridge therefore cannot be a pure function of the drained packet for this
+/// class the way it is for the other four; it is a pure function of the drained
+/// packet *and the streams it names*, which is the honest shape.
+///
+/// A driven macos-15 boot measured what a caller actually has to supply:
+/// `exec_cmdbufs_1 = 20 006` with every other bucket silent, so this guest
+/// sends exactly one command buffer per exec packet. [`Self::streams`] is a
+/// slice regardless — the 17-buffer submission is in this repository's history,
+/// and a table walked into one transaction is the contract whatever this rail's
+/// count happens to be.
+pub struct ExecStreams<'a> {
+    /// The task whose object list the refs inside those streams index.
+    ///
+    /// From the exec header, not from the FIFO: a channel carries packets for
+    /// whichever task submitted them, and resolving a ref in the wrong task
+    /// finds whatever shared the integer.
+    pub task: reims_vgpu_core::identity::TaskId,
+    /// One entry per command buffer the packet's table names, in table order,
+    /// already read out of the task's address space.
+    ///
+    /// All of them walk into **one** transaction: a packet is one ordering
+    /// position, one completion word and one access list, whatever its buffer
+    /// count. See `reims_vgpu_core::walk::command_buffer`.
+    pub streams: &'a [Vec<u8>],
+    /// Where each record's participation claim becomes an access.
+    ///
+    /// `reims_vgpu_core::lifecycle::Lifecycle::task_access` is the one
+    /// implementation with the terms — it owns names, heaps and content
+    /// authority together — and since the resource-lifecycle group's cutover it
+    /// is production state, held by `DeviceState`.
+    pub accesses: &'a mut dyn reims_vgpu_core::access::AccessSource,
+}
+
 /// Why a drained packet did not become a model packet.
 ///
 /// The two arms are different obligations and are deliberately not one type. A
@@ -418,6 +430,42 @@ impl Blocked {
     }
 }
 
+/// Walk one exec packet's command buffers into the one transaction they are.
+///
+/// Split out of [`packet`] so the buffer-count contract lives in a named place:
+/// every buffer the table declares walks into a **single** [`ExecBuilder`],
+/// which is finished once. A packet is one ordering position, one completion
+/// word and one access list — a builder per buffer would give a two-buffer
+/// packet two of each and order them against each other, which no field on the
+/// wire asks for.
+///
+/// # Errors
+///
+/// [`Refused::Exec`], carrying the walk's own refusal with its stream site. The
+/// transaction is all-or-nothing: a single unresolvable record refuses the whole
+/// packet rather than yielding a transaction missing a hazard edge.
+fn exec_payload(
+    objects: &dyn TaskNamespaces,
+    exec: ExecStreams<'_>,
+) -> Result<reims_vgpu_core::exec::ExecWork, Blocked> {
+    let ExecStreams {
+        task,
+        streams,
+        accesses,
+    } = exec;
+    let resolver = reims_vgpu_core::resolve::InTask::new(objects, task);
+    let mut builder = reims_vgpu_core::exec::ExecBuilder::new();
+    for stream in streams {
+        reims_vgpu_core::walk::command_buffer(stream, &resolver, accesses, &mut builder)
+            .map_err(|refusal| Blocked::Refused(Refused::Exec(refusal)))?;
+    }
+    builder.finish().map_err(|refusal| {
+        Blocked::Refused(Refused::Exec(
+            reims_vgpu_core::walk::WalkRefusal::Unfinished { refusal },
+        ))
+    })
+}
+
 /// Build the model packet one drained packet describes.
 ///
 /// `session` is the semantic lifetime the packet was **read under**, which is
@@ -435,6 +483,7 @@ pub fn packet(
     completion_slot: StampSlot,
     drained: &drain::Packet,
     resolvers: Resolvers<'_>,
+    exec: ExecStreams<'_>,
 ) -> Result<Packet, Blocked> {
     let channel = fifo.channel();
     let opcode = drained.opcode;
@@ -449,7 +498,7 @@ pub fn packet(
     // gap each class names is stated once, in this match, and nowhere else.
     let payload = match classify(channel, opcode) {
         None => return Err(blocked(Gap::Unresolved)),
-        Some(PayloadClass::Exec) => return Err(blocked(Gap::ExecResolution)),
+        Some(PayloadClass::Exec) => Payload::Exec(exec_payload(resolvers.objects, exec)?),
         Some(PayloadClass::ResourceLifecycle) => Payload::ResourceLifecycle(resource_lifetime(
             fifo,
             channel,
@@ -1044,6 +1093,32 @@ mod tests {
         }
     }
 
+    /// An access source for the call sites whose packet is not an exec.
+    ///
+    /// It refuses by panicking rather than by answering, so a fixture that
+    /// silently started carrying a command stream would fail here instead of
+    /// building a transaction out of a stub's answers.
+    struct NoAccesses;
+
+    impl reims_vgpu_core::access::AccessSource for NoAccesses {
+        fn access(
+            &mut self,
+            _: &reims_vgpu_core::access::Participation,
+        ) -> Result<reims_vgpu_core::access::AccessIntent, reims_vgpu_core::access::AccessRefusal>
+        {
+            unreachable!("this fixture's packet names no command stream")
+        }
+    }
+
+    /// The exec inputs for a packet that carries no command buffers.
+    fn no_streams(accesses: &mut NoAccesses) -> ExecStreams<'_> {
+        ExecStreams {
+            task: reims_vgpu_core::identity::TaskId(0),
+            streams: &[],
+            accesses,
+        }
+    }
+
     fn fifo_for(channel: Channel) -> Fifo {
         match channel {
             Channel::Root => Fifo::ROOT,
@@ -1069,10 +1144,11 @@ mod tests {
                 StampSlot(0),
                 &drained_with_list(row.channel, row.opcode),
                 resolvers(&EveryMapping),
+                no_streams(&mut NoAccesses),
             );
             let expected = match classify(row.channel, row.opcode) {
                 Some(PayloadClass::Control) => None,
-                Some(PayloadClass::Exec) => Some(Gap::ExecResolution),
+                Some(PayloadClass::Exec) => None,
                 // The class is not the unit here, and this is the one place
                 // that says so. Two of its members — a task definition and a
                 // task deletion — name a task and nothing inside it, so they
@@ -1107,10 +1183,10 @@ mod tests {
                         }
                         Some(PayloadClass::Present) => matches!(built.payload, Payload::Present(_)),
                         Some(PayloadClass::Query) => matches!(built.payload, Payload::Query(_)),
-                        // Exec is the one class that still gaps, so nothing
-                        // reaches here with it; `None` is a row the ledger has
-                        // not judged and gaps too.
-                        Some(PayloadClass::Exec) | None => false,
+                        Some(PayloadClass::Exec) => matches!(built.payload, Payload::Exec(_)),
+                        // A row the ledger has not judged has no class and
+                        // gaps, so nothing reaches here with `None`.
+                        None => false,
                     };
                     assert!(
                         right_class,
@@ -1186,19 +1262,20 @@ mod tests {
         }
     }
 
-    /// What crosses is the whole control class, the whole present class, the
-    /// whole query class, and every resource-lifetime command except the
-    /// re-point — and nothing else.
+    /// What crosses is every class the ledger has judged, except the re-point
+    /// — and nothing else.
     ///
-    /// The complement is the claim: what is left is EXEC, whose access source
-    /// is the model's own lifecycle owner and arrives with that owner's
-    /// cutover, and the re-point, whose pages are not on its wire.
+    /// The complement is the claim, and it is down to one: the re-point, whose
+    /// pages are not on its wire. EXEC left this list when [`ExecStreams`]
+    /// landed; it crosses here on a packet that names no command buffer, which
+    /// is the envelope claim. That a stream's *records* cross is asserted
+    /// separately, because an empty transaction would satisfy this one.
     ///
     /// The counts are spelled out because this is the cutover's own scoreboard:
     /// a gap that closes moves a number here, and a row that quietly changed
     /// class moves one without anybody deciding to.
     #[test]
-    fn what_crosses_is_everything_but_exec_and_the_repoint() {
+    fn what_crosses_is_everything_but_the_repoint() {
         let crossing: Vec<_> = LEDGER
             .iter()
             .filter(|row| {
@@ -1208,6 +1285,7 @@ mod tests {
                     StampSlot(0),
                     &drained_with_list(row.channel, row.opcode),
                     resolvers(&EveryMapping),
+                    no_streams(&mut NoAccesses),
                 )
                 .is_ok()
             })
@@ -1218,7 +1296,12 @@ mod tests {
             .filter(|row| {
                 matches!(
                     classify(row.channel, row.opcode),
-                    Some(PayloadClass::Control | PayloadClass::Present | PayloadClass::Query)
+                    Some(
+                        PayloadClass::Control
+                            | PayloadClass::Present
+                            | PayloadClass::Query
+                            | PayloadClass::Exec
+                    )
                 ) || (classify(row.channel, row.opcode) == Some(PayloadClass::ResourceLifecycle)
                     && lifetime_gap(row.channel, row.opcode).is_none())
             })
@@ -1235,9 +1318,51 @@ mod tests {
             .count();
         assert_eq!(
             (control, present, crossing.len()),
-            (23, 3, 44),
+            (23, 3, 45),
             "the ledger's crossing rows changed; what reaches the model is not what the \
              module documentation says it is"
+        );
+    }
+
+    /// An exec packet's command stream refuses as the *walk's* refusal, with
+    /// its site, and not as a gap.
+    ///
+    /// The distinction is the one [`Blocked`]'s two arms exist for. A gap is
+    /// this device's incompleteness and closes when its owner lands; a stream
+    /// that does not frame is the guest's bytes not being what its opcode says,
+    /// and no owner landing will change it. Exec spent the whole cutover on the
+    /// first side of that line, so the assertion that it is now on the second is
+    /// worth making explicitly.
+    #[test]
+    fn an_exec_whose_stream_does_not_frame_is_refused_and_not_gapped() {
+        let mut accesses = NoAccesses;
+        let streams = vec![vec![0xffu8; 2]];
+        let refusal = packet(
+            fifo_for(Channel::Child),
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &drained_with_list(Channel::Child, 0x37),
+            resolvers(&EveryMapping),
+            ExecStreams {
+                task: reims_vgpu_core::identity::TaskId(1),
+                streams: &streams,
+                accesses: &mut accesses,
+            },
+        )
+        .expect_err("two bytes are not a command stream");
+        assert_eq!(
+            refusal.gap(),
+            None,
+            "a stream that does not frame is not an input this bridge is \
+             missing; it is bytes that are not a stream"
+        );
+        let Blocked::Refused(Refused::Exec(walk)) = refusal else {
+            panic!("an exec's stream must refuse under the walk's own vocabulary");
+        };
+        assert_eq!(
+            refusal.slug(),
+            walk.reason(),
+            "carried whole from the layer that judged it, not re-worded here"
         );
     }
 
@@ -1269,6 +1394,7 @@ mod tests {
             StampSlot(0),
             &drained,
             resolvers(&NOTHING_MAPPED),
+            no_streams(&mut NoAccesses),
         )
         .expect("a task definition needs no namespace");
         let Payload::ResourceLifecycle(payload) = &built.payload else {
@@ -1303,6 +1429,7 @@ mod tests {
             StampSlot(0),
             &short,
             resolvers(&NOTHING_MAPPED),
+            no_streams(&mut NoAccesses),
         )
         .expect_err("no domain, no transition");
         assert!(matches!(refusal, Blocked::Refused(_)));
@@ -1337,6 +1464,7 @@ mod tests {
             StampSlot(3),
             &nop,
             resolvers(&NOTHING_MAPPED),
+            no_streams(&mut NoAccesses),
         )
         .expect("CmdNOP is control");
         assert_eq!(
@@ -1443,6 +1571,7 @@ mod tests {
                 storage: &NoStorage,
                 replies: &EveryReply,
             },
+            no_streams(&mut NoAccesses),
         )
         .expect("an unkeyable target is not a lost packet");
         let Payload::ResourceLifecycle(payload) = &unkeyed.payload else {
@@ -1465,6 +1594,7 @@ mod tests {
             StampSlot(0),
             drained,
             resolvers(&EveryMapping),
+            no_streams(&mut NoAccesses),
         )
     }
 
@@ -1502,6 +1632,7 @@ mod tests {
             StampSlot(0),
             &shown,
             resolvers(&live),
+            no_streams(&mut NoAccesses),
         )
         .expect("a present resolves in the mapping namespace");
         let Payload::Present(payload) = &built.payload else {
@@ -1542,6 +1673,7 @@ mod tests {
             StampSlot(0),
             &shown,
             resolvers(&NOTHING_MAPPED),
+            no_streams(&mut NoAccesses),
         )
         .expect("an unresolvable target is not a missing input");
         let Payload::Present(payload) = &unresolved.payload else {
@@ -1579,6 +1711,7 @@ mod tests {
             StampSlot(0),
             &short,
             resolvers(&NOTHING_MAPPED),
+            no_streams(&mut NoAccesses),
         )
         .expect_err("no trailer, no frame");
         assert_eq!(
