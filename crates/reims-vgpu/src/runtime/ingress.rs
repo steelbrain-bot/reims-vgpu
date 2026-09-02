@@ -191,11 +191,40 @@ pub enum Gap {
     /// what an `Invalidate`, a `Synchronize` or a `Discard` declares about the
     /// resources it names: `Lifecycle::access` resolves a `Participation` a
     /// caller supplies, and no caller supplies one for a lifecycle operation.
-    /// The two candidate answers are not interchangeable — an invalidate that
-    /// moves content authority to the guest reads as a write and a synchronize
-    /// that publishes host bytes reads as a read, and each one modelled as the
-    /// other drops exactly the edges the other needs. So it is named here and
+    /// The candidate answers are not interchangeable, and each one modelled as
+    /// another drops exactly the edges that one needs. So it is named here and
     /// not guessed at.
+    ///
+    /// # Where the answer will come from, so the next attempt does not re-derive
+    /// it
+    ///
+    /// Not from the wire: nothing on this interface says what a command declares
+    /// about hazards. From what this device already does to each resource, which
+    /// is validated against a real guest and is the only grounded statement of
+    /// the semantics there is. What that survey says so far, recorded as
+    /// evidence and **not** as a decision:
+    ///
+    /// * `Synchronize` and `SynchronizeAndDiscard` run
+    ///   `crate::runtime::writeback_debt::submit_for_resources`, which stores
+    ///   rendered frames **into the resource's guest pages**. That is a write of
+    ///   the resource's own backing, not a read of it.
+    /// * `Invalidate` applies the guest's validity quad through
+    ///   `crate::runtime::resource_validity::apply`, which is the guest saying
+    ///   it CPU-wrote those pages. Content authority moves and a version is
+    ///   produced outside the GPU timeline — also a write, and for a different
+    ///   reason.
+    /// * `Discard` releases a *transfer* backing while preserving the resource's
+    ///   identity and host texture. Which backing that access is over is the
+    ///   open question in this one: the resource's guest bytes are not what it
+    ///   touches.
+    /// * `DeleteResource`'s ordering may not be an access at all.
+    ///   `reims_vgpu_core::namespace` already owns "deletion stops resolution
+    ///   and teardown waits for the last accepted use", and an access declared
+    ///   here would be a second answer to a question that module answers.
+    ///
+    /// Two of the five are therefore reasoned and two are not, which is why this
+    /// is still a gap: a closure that got three right and two wrong would look
+    /// exactly like one that got five right.
     LifecycleAccesses,
     /// The pages behind a re-pointed object, which its packet does not carry.
     ///
