@@ -660,6 +660,22 @@ impl PendingWritebacks {
         all
     }
 
+    /// The guest pages every *owed* GVA plane covers, deduplicated.
+    ///
+    /// The debts and the backing state are two maps keyed alike: `gva_debts`
+    /// says a frame is owed for a plane and `gva_resources` says which pages
+    /// that plane occupies. A plane with no page list contributes nothing,
+    /// which is the honest answer -- its pages were not walkable when it was
+    /// armed and inventing them would report an overlap that may not exist.
+    fn owed_gva_pages(&self) -> std::collections::BTreeSet<u64> {
+        self.gva_debts
+            .keys()
+            .filter_map(|plane| self.gva_resources.get(plane))
+            .filter_map(|resource| resource.pages.as_ref())
+            .flat_map(|pages| pages.iter().copied())
+            .collect()
+    }
+
     /// The plane owed a frame at these guest coordinates, if any.
     ///
     /// A scan and not a lookup because the ledger is keyed by
@@ -821,9 +837,32 @@ fn note_unnamed_reach(state: &DeviceState, pages: impl FnOnce() -> Option<Vec<u6
                 .mapping_reach_pages(mapping_id)
                 .is_some_and(|owed| owed.iter().any(|page| read.contains(page)))
         });
+    // The GVA resource debts, which this alarm did not look at.
+    //
+    // Its own doc has always claimed to sample the read against "every owed
+    // surface's pages", and the walk above is over the *mapping* ledger alone
+    // -- so a frame owed by a task-local GVA resource could be read straight
+    // through and the alarm would report `disjoint`. That is a blind zero, and
+    // the class it was blind to is the live one: `gva_debt_shared_storage`
+    // finds three references over the compositor's scanout allocation, all of
+    // them arming GVA debts, so a payment named through one of them skips the
+    // other two's.
+    //
+    // Counted apart from the mapping answer rather than folded into it,
+    // because they are two ledgers and a merged reading could not say which
+    // one a payment skipped.
+    let gva_overlap = state
+        .pending_writebacks
+        .owed_gva_pages()
+        .iter()
+        .any(|page| read.contains(page));
     match overlap {
         true => crate::runtime::drain::note_store_route("wbdebt_reach_overlap"),
         false => crate::runtime::drain::note_store_route("wbdebt_reach_disjoint"),
+    }
+    match gva_overlap {
+        true => crate::runtime::drain::note_store_route("wbdebt_reach_gva_overlap"),
+        false => crate::runtime::drain::note_store_route("wbdebt_reach_gva_disjoint"),
     }
 }
 
@@ -858,6 +897,14 @@ fn note_unnamed_reach(state: &DeviceState, pages: impl FnOnce() -> Option<Vec<u6
 /// standing alarm for exactly that: it samples the read's own page walk against
 /// every owed surface's pages, and `wbdebt_reach_overlap` above zero is a
 /// payment this naming skipped and should not have.
+///
+/// It samples the *GVA resource* ledger too, and did not always —
+/// `wbdebt_reach_gva_overlap` is that half. The omission mattered: a reference
+/// is a lawful key for a GVA debt only if one allocation has one live name, and
+/// [`crate::runtime::objects::note_reference_shares_storage`] finds three
+/// references over the compositor's scanout allocation on an ordinary boot. A
+/// payment named through one of them leaves the other two's frames owed, and
+/// until that counter existed the alarm answered `disjoint` for it.
 pub fn pay_for_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1952,6 +1999,59 @@ mod tests {
         assert_eq!(previous.map(|debt| debt.generation), Some(7));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending.get_gva(key).map(|debt| debt.generation), Some(8));
+    }
+
+    /// The pages an owed GVA plane covers are what the reach alarm compares a
+    /// read against, and an unowed or unbacked plane contributes none.
+    ///
+    /// The alarm's whole job is to catch a payment that a *name* skipped, so
+    /// what it must not do is report an overlap that is not one: a plane whose
+    /// frame has been paid is not owed, and a plane whose pages were not
+    /// walkable when it was armed has no page list to compare. Both would turn
+    /// a healthy boot into a standing alarm, which is how an alarm stops being
+    /// read.
+    #[test]
+    fn only_owed_and_backed_gva_planes_reach_any_pages() {
+        let mut pending = PendingWritebacks::default();
+        let key = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 19,
+        };
+        let generation = pending.ensure_gva_resource(key, 0x4000, 0x2000, Some(vec![0x11, 0x12]));
+        assert_ne!(generation, 0, "a declared plane carries a generation");
+        assert!(
+            pending.owed_gva_pages().is_empty(),
+            "a backed plane that owes no frame is not something a read can skip"
+        );
+
+        assert_eq!(pending.arm_gva(key, gva_debt(7)), None);
+        assert_eq!(
+            pending.owed_gva_pages(),
+            [0x11u64, 0x12].into_iter().collect(),
+            "an owed plane reaches exactly the pages its backing occupies"
+        );
+
+        // A plane armed with no walkable page list contributes nothing rather
+        // than a guess. Inventing pages for it would report a payment as
+        // skipped on evidence the device does not have.
+        let unbacked = GvaResourceKey {
+            task_id: 3,
+            texture_ref: 20,
+        };
+        let _ = pending.ensure_gva_resource(unbacked, 0x9000, 0x1000, None);
+        assert_eq!(
+            pending.owed_gva_pages(),
+            [0x11u64, 0x12].into_iter().collect(),
+            "a plane whose pages were not walkable adds none"
+        );
+
+        // And paying the frame ends the reach: the alarm asks about frames
+        // still owed, not about every resource the device has ever rendered.
+        let _ = pending.take_gva(key);
+        assert!(
+            pending.owed_gva_pages().is_empty(),
+            "a paid plane is no longer a payment anything can skip"
+        );
     }
 
     /// GVA resources have protocol lifetime, not an arbitrary ledger capacity.
