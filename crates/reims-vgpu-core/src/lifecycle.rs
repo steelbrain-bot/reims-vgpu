@@ -632,10 +632,24 @@ pub enum ResolveRefusal {
     /// the guest re-points a resource at host frames it has already wired, at
     /// the *same* GPU-VA — so the new backing and extent are not on the wire at
     /// all. They come from whatever holds the object's storage, which is a
-    /// registry this crate does not yet have. Named rather than approximated,
+    /// registry this crate does not have. Named rather than approximated,
     /// because an operation carrying the *old* backing would re-point nothing
     /// while reporting success.
-    NeedsStorage { kind: LifecycleKind },
+    ///
+    /// **It carries the half that did resolve.** The task and the resource were
+    /// settled before this refusal was reached — the ref is looked up in its own
+    /// task's namespace and a dead one refuses as [`Self::UnknownRef`] — so a
+    /// caller that can supply the storage has everything else already, and does
+    /// not have to re-decode the packet or resolve the ref a second time to use
+    /// it. That matters because the second resolution is the one that could
+    /// disagree: a caller pairing *its* idea of which resource the packet names
+    /// with the model's storage would build an operation about a resource the
+    /// packet does not name, and nothing downstream could tell.
+    NeedsStorage {
+        kind: LifecycleKind,
+        task: TaskId,
+        resource: ResourceId,
+    },
     /// The command is not a backing retirement, so there is nothing for
     /// [`backing_retirement`] to read.
     NotABackingRetirement { kind: LifecycleKind },
@@ -1081,8 +1095,13 @@ pub fn object_reference(
     )?;
     match kind {
         LifecycleKind::DeleteResource => Ok(LifecycleOp::DeleteResource { task, resource }),
-        // `ReplacePhysical`, and nothing else reaches here.
-        other => Err(ResolveRefusal::NeedsStorage { kind: other }),
+        // `ReplacePhysical`, and nothing else reaches here. The two terms it
+        // did resolve travel with the refusal; see `NeedsStorage`.
+        other => Err(ResolveRefusal::NeedsStorage {
+            kind: other,
+            task,
+            resource,
+        }),
     }
 }
 
@@ -3458,6 +3477,8 @@ mod tests {
             object_reference(LifecycleKind::ReplacePhysical, &payload, &Everything),
             Err(ResolveRefusal::NeedsStorage {
                 kind: LifecycleKind::ReplacePhysical,
+                task: TASK,
+                resource,
             })
         );
     }
@@ -4027,16 +4048,27 @@ mod tests {
                     kind.name()
                 ),
                 // The one kind with no operation. Its task is still answered
-                // above, which is the whole point.
-                Err(refusal) => assert_eq!(
-                    (kind, refusal),
-                    (
-                        LifecycleKind::ReplacePhysical,
-                        ResolveRefusal::NeedsStorage {
-                            kind: LifecycleKind::ReplacePhysical
-                        }
-                    )
-                ),
+                // above, which is the whole point — and the refusal now carries
+                // that same task, so the caller that supplies the storage never
+                // has to resolve it a second time.
+                Err(ResolveRefusal::NeedsStorage {
+                    kind: refused_kind,
+                    task,
+                    ..
+                }) => {
+                    assert_eq!(
+                        (kind, refused_kind),
+                        (
+                            LifecycleKind::ReplacePhysical,
+                            LifecycleKind::ReplacePhysical
+                        )
+                    );
+                    assert_eq!(
+                        task, named,
+                        "the refusal carries a different task than the packet names"
+                    );
+                }
+                Err(other) => panic!("{} refused as {other:?}", kind.name()),
             }
         }
     }

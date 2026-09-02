@@ -24,63 +24,53 @@
 //! remaining gap closes by *adding a resolver*, and a bundle makes that a field
 //! rather than another signature change rippling through every caller.
 //!
-//! # The gaps are the cutover's remaining work, stated
+//! # The gaps are closed, and what closed them is worth keeping
 //!
-//! What crosses is what resolves from the packet's own bytes.
-//! [`reims_vgpu_core::control::resolve`] is such a function, so the whole
-//! control class needs nothing this device has not already put in the
-//! `drain::Packet` — and so is
-//! [`reims_vgpu_core::lifecycle::task_lifetime`], which is why two members of
-//! the resource-lifetime class cross with it.
+//! What crosses used to be "what resolves from the packet's own bytes", and
+//! [`Gap`] was the list of classes that did not. That list is now empty of
+//! everything but an unsettled ledger row.
 //!
-//! **The class is not the unit, and that is the point of naming the gaps at
-//! all.** The resource-lifetime class has been three different partitions in
-//! three commits, and each time the coarser name was hiding a member that did
-//! not belong to it. "Lifetime commands need a namespace" was false of the two
-//! that name a task and nothing inside it. Once the namespaces landed it was
-//! false of all twelve — what the remaining ones are short of is the *access*
-//! each named resource takes, which is a different missing thing with a
-//! different owner, and two of them are short of neither. A gap that
+//! **The class was never the unit, and that is what naming the gaps bought.**
+//! The resource-lifetime class was three different partitions in three commits,
+//! and each coarser name was hiding a member that did not belong to it.
+//! "Lifetime commands need a namespace" was false of the two that name a task
+//! and nothing inside it; once the namespaces landed it was false of all
+//! twelve, and what the rest were short of was the *access* each named resource
+//! takes — a different missing thing with a different owner. A gap that
 //! over-claims is one nobody thinks to close; a gap that closes and leaves its
 //! name behind is one everybody thinks is closed.
 //!
-//! What remains, each naming one input the model needs and this function is not
-//! given:
+//! The four that closed, and what each of them turned out to need:
 //!
-//! Exec is no longer among them, and it was the last class to join. It needed
-//! three inputs and not the two its walk's signature shows: an object-list
-//! resolver, an access source, and the command stream *bytes*, which live at
-//! guest addresses the payload names rather than in the payload. The first two
-//! are `reims_vgpu_core::lifecycle::Lifecycle`'s and became production state
-//! with the resource-lifecycle group's cutover; the third is a page-table walk
-//! and stays the caller's, because it is guest-memory work and not translation.
-//! They arrive together as [`ExecStreams`].
-//! - **Resource lifetime** is down to one. Eleven of the twelve build a
-//!   payload: five name no resource, five name resources and state what they do
-//!   to them — `reims_vgpu_core::lifecycle::LifecycleOp::declared_access` is the
-//!   mode and [`Resolvers::storage`] is the key — and the object-list bind
-//!   joined them when its operation stopped being the table's *walk* and became
-//!   the table's *binding*. Only the re-point is left, short of pages that are
-//!   not in its packet at all.
-//! Query is no longer among them either. Its reply destination is resolved
-//! through [`Resolvers::replies`], in whichever address space its own question
-//! uses, and every route this device interns on draws from one monotone
-//! counter — so a page frame identified as a page frame can equal no window and
-//! no mapping by construction. See [`query_payload`].
+//! - **Query** resolves its reply destination through [`Resolvers::replies`],
+//!   in whichever address space its own question uses. Every route this device
+//!   interns on draws from one monotone counter, so a page frame identified as
+//!   a page frame can equal no window and no mapping by construction. See
+//!   [`query_payload`].
+//! - **Present** resolves its target as a mapping, and the frame it shows is
+//!   the whole of that mapping's surface — so the access is an
+//!   `AccessKey::Whole` over the resolved backing and nothing about it is
+//!   approximated. See [`present_payload`] for the one case that is still
+//!   imprecise and why the imprecision is the honest answer there.
+//! - **Exec** needed three inputs and not the two its walk's signature shows:
+//!   an object-list resolver, an access source, and the command stream *bytes*,
+//!   which live at guest addresses the payload names rather than in the
+//!   payload. The first two are `reims_vgpu_core::lifecycle::Lifecycle`'s and
+//!   became production state with the resource-lifecycle group's cutover; the
+//!   third is a page-table walk and stays the caller's, because it is
+//!   guest-memory work and not translation. See [`ExecStreams`].
+//! - **The re-point** — the twelfth lifetime command, and the last of all — is
+//!   short of pages that are not in its packet at all. Its identity resolves in
+//!   the model and its storage arrives from the device that has just moved the
+//!   storage incarnation, which is why those two halves come from two places.
+//!   See [`ReplacementStorage`].
 //!
-//! Present is no longer among them. Its target is a mapping, the device answers
-//! `reims_vgpu_core::resolve::MappingResolver` over that namespace, and the
-//! frame it shows is the whole of that mapping's surface — so the access is an
-//! `AccessKey::Whole` over the resolved backing and nothing about it is
-//! approximated. See [`present_payload`] for the one case that is still
-//! imprecise and why the imprecision is the honest answer there.
-//!
-//! None of the remaining three is missing decode work: this device resolves
-//! them all today. What it does not have is a *generation-stamped* namespace to
-//! resolve them into, which is the model's, and giving this function a
-//! half-resolved answer would be the adapter between two semantic models that
-//! the replacement plan forbids. So they are gaps, they are named, and they
-//! close when their owner lands — not here.
+//! Both of the last two arrive as [`DeviceInputs`], which is the shape the
+//! remaining work has: not a namespace this bridge could consult, but a value
+//! whose *ordering* against this device's own state is the caller's to get
+//! right. What is left in [`Gap`] is [`Gap::Unresolved`] alone — a ledger row
+//! whose contract is not settled — which is a question about the guest's
+//! interface and not about this join.
 //!
 //! # Every packet carries a completion word
 //!
@@ -168,46 +158,6 @@ pub enum Gap {
     /// The ledger has not closed this row, so [`classify`] gives it no class
     /// and the model may not claim it. Production answers it alone.
     Unresolved,
-    /// The pages behind a re-pointed object, which its packet does not carry.
-    ///
-    /// `ReplacePhysical` is a bare `{task, object}`: the guest re-points a
-    /// resource at host frames it has already wired, at the same GPU-VA, so the
-    /// new backing and extent are nowhere on the wire. The ref resolves — that
-    /// half is done — and the operation still cannot be built, which is
-    /// `reims_vgpu_core::lifecycle::ResolveRefusal::NeedsStorage`. An operation
-    /// carrying the *old* backing would re-point nothing while reporting
-    /// success.
-    ///
-    /// # It does not close with a resolver, and that is worth stating
-    ///
-    /// The new pages *are* obtainable: `crate::runtime::objects::replace_physical`
-    /// drops the cached translation and bumps the storage incarnation, and the
-    /// next resolve re-walks the page table the guest has already rewritten. So
-    /// a reader reaches for a third resolver beside [`Resolvers::objects`] and
-    /// [`Resolvers::storage`], and it does not work.
-    ///
-    /// The identity of the new storage is `(task, base, incarnation)` at the
-    /// **next** incarnation, and nothing has bumped it yet when this bridge
-    /// runs. A resolver that answered would therefore have to perform the bump
-    /// — a mutation, from a function whose whole claim is that it makes none,
-    /// and a second writer of the incarnation beside the handler that owns it.
-    /// One that did not bump would answer with the old identity, which is the
-    /// failure above wearing a resolver's clothes.
-    ///
-    /// So the re-point's storage arrives when the *handler* becomes the model's
-    /// operation, not before: it belongs to the resource-lifecycle group's
-    /// cutover and not to a resolver added ahead of it.
-    ///
-    /// **That cutover has happened and this gap is still here, exactly as this
-    /// doc predicted.** `crate::runtime::drain`'s re-point arm now applies
-    /// `LifecycleOp::ReplacePhysical` — and it does so *after*
-    /// `crate::runtime::objects::replace_physical` has moved the incarnation,
-    /// reading the new storage through `objects::repointed_storage`. That
-    /// ordering is what a resolver consulted here cannot have: this function
-    /// runs before the handler, so the only identity available to it is the old
-    /// one. The gap therefore belongs to the bridge and not to the model, and it
-    /// closes if and when the handler's ordering is expressible through it.
-    ReplacementStorage,
 }
 
 impl Gap {
@@ -216,7 +166,6 @@ impl Gap {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Unresolved => "ingress_row_unresolved",
-            Self::ReplacementStorage => "ingress_needs_replacement_storage",
         }
     }
 }
@@ -283,6 +232,16 @@ pub enum Refused {
     /// and offset — because a bridge-level re-wording would lose the site and
     /// the owner that judged it.
     Exec(reims_vgpu_core::walk::WalkRefusal),
+    /// A re-pointed reference names no storage this device can describe.
+    ///
+    /// The device's own answer, carried whole. `ReplacePhysical` is the one
+    /// command whose operation needs a term that is nowhere on its wire — the
+    /// guest re-points a resource at frames it has already wired, at the same
+    /// GPU-VA — so the storage arrives from the caller and this is what it says
+    /// when it has none. A driven macos-15 boot puts every route of it at zero:
+    /// all 242 of that boot's re-points named describable storage once a
+    /// surface-backing object stopped being read as owning no bytes.
+    Repoint(crate::runtime::objects::RepointStorageRefusal),
 }
 
 impl Refused {
@@ -300,6 +259,7 @@ impl Refused {
             Self::Present(inner) => inner.slug(),
             Self::PresentAccesses(inner) => inner.slug(),
             Self::Exec(inner) => inner.reason(),
+            Self::Repoint(inner) => inner.route(),
         }
     }
 }
@@ -394,6 +354,51 @@ pub struct ExecStreams<'a> {
     pub accesses: &'a mut dyn reims_vgpu_core::access::AccessSource,
 }
 
+/// The storage a re-pointed reference names *now*.
+///
+/// The identity half is not here on purpose. `ReplacePhysical`'s task and
+/// resource are resolved by the model — they are on the wire and the ref is
+/// looked up in its own task's namespace — and they travel back on
+/// `reims_vgpu_core::lifecycle::ResolveRefusal::NeedsStorage`. Only the bytes
+/// come from the device. A caller that supplied its own idea of which resource
+/// the packet named would be offering a second resolution of the same ref, and
+/// the operation built from the pair would be about whichever of the two was
+/// wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplacementStorage {
+    pub backing: reims_vgpu_core::access::BackingId,
+    pub extent: reims_vgpu_core::access::ByteRange,
+}
+
+/// What this bridge cannot compute from the drained packet, supplied by the
+/// device that can.
+///
+/// # Two classes, one argument, and why it is not more resolvers
+///
+/// [`Resolvers`] answers *namespace* questions: what does this number name.
+/// Both members here are something else — work the device performed or memory
+/// it read — and neither fits a `Copy` bundle of shared references. Bundled
+/// together for [`Resolvers`]'s own reason: a third such input should become a
+/// field rather than another signature change through every caller.
+///
+/// Both are ordered facts, and that is the substance rather than the plumbing.
+/// The command streams are read out of the task's address space *before* the
+/// packet is admitted; the replacement storage is read *after* this device has
+/// moved the storage incarnation, because the identity of the new pages is the
+/// next incarnation and nothing has bumped it before the handler runs. Each is
+/// a value by the time it arrives here, which is what keeps this bridge a
+/// function that mutates nothing.
+pub struct DeviceInputs<'a> {
+    /// The exec class's command buffers and the task their refs index.
+    pub exec: ExecStreams<'a>,
+    /// What a re-pointed reference names now, or why the device cannot say.
+    ///
+    /// `Err` refuses the packet under the device's own reason rather than
+    /// building an operation carrying the *old* backing, which would re-point
+    /// nothing while reporting success.
+    pub repointed: Result<ReplacementStorage, crate::runtime::objects::RepointStorageRefusal>,
+}
+
 /// Why a drained packet did not become a model packet.
 ///
 /// The two arms are different obligations and are deliberately not one type. A
@@ -483,7 +488,7 @@ pub fn packet(
     completion_slot: StampSlot,
     drained: &drain::Packet,
     resolvers: Resolvers<'_>,
-    exec: ExecStreams<'_>,
+    inputs: DeviceInputs<'_>,
 ) -> Result<Packet, Blocked> {
     let channel = fifo.channel();
     let opcode = drained.opcode;
@@ -496,6 +501,7 @@ pub fn packet(
     // Exhaustive over `PayloadClass`, so a sixth class is a compile error here
     // rather than a packet that quietly reaches whichever arm came last. The
     // gap each class names is stated once, in this match, and nowhere else.
+    let DeviceInputs { exec, repointed } = inputs;
     let payload = match classify(channel, opcode) {
         None => return Err(blocked(Gap::Unresolved)),
         Some(PayloadClass::Exec) => Payload::Exec(exec_payload(resolvers.objects, exec)?),
@@ -505,6 +511,7 @@ pub fn packet(
             opcode,
             &drained.payload,
             resolvers,
+            repointed,
         )?),
         Some(PayloadClass::Query) => Payload::Query(query_payload(
             fifo,
@@ -714,9 +721,10 @@ fn query_payload(
 ///
 /// `ReplacePhysical`'s operation names pages that are not on the wire at all. It
 /// resolves its ref and still cannot be built, which is why the core names it
-/// with its own refusal rather than with `UnknownRef` — and why it arrives here
-/// as [`Gap::ReplacementStorage`] rather than as one gap called "namespaces"
-/// that would have read as closed the day the namespaces landed.
+/// with its own refusal rather than with `UnknownRef` — and why it was named
+/// separately rather than folded into one gap called "namespaces", which would
+/// have read as closed the day the namespaces landed. It closes on
+/// [`ReplacementStorage`], which is the caller's half of that refusal.
 ///
 /// `SetObjectList` used to be beside it and is not any more. Its operation was
 /// held to be the per-entry result of walking the guest's table; a driven boot
@@ -749,6 +757,7 @@ fn resource_lifetime(
     opcode: u16,
     payload: &[u8],
     resolvers: Resolvers<'_>,
+    repointed: Result<ReplacementStorage, crate::runtime::objects::RepointStorageRefusal>,
 ) -> Result<reims_vgpu_core::transaction::LifecyclePayload, Blocked> {
     use reims_vgpu_core::lifecycle::{self, LifecycleKind, ResolveRefusal};
     use reims_vgpu_core::transaction::LifecyclePayload;
@@ -767,16 +776,23 @@ fn resource_lifetime(
         // reader can find in a log.
         return Err(gap(Gap::Unresolved));
     };
-    let op = lifecycle::operation(kind, payload, resolvers.objects, resolvers.mappings).map_err(
-        |refusal| match refusal {
-            // This device's own incompleteness, each named for what it is short
-            // of. The core states them as refusals because the core has no
-            // vocabulary for "the caller could give me this later"; this bridge
-            // does.
-            ResolveRefusal::NeedsStorage { .. } => gap(Gap::ReplacementStorage),
-            other => Blocked::Refused(Refused::Lifecycle(other)),
+    let op = match lifecycle::operation(kind, payload, resolvers.objects, resolvers.mappings) {
+        Ok(op) => op,
+        // The one command whose operation the wire cannot complete. The model
+        // resolved its task and its resource and stopped there, so the identity
+        // is the model's and only the bytes are the caller's — see
+        // [`ReplacementStorage`] for why the halves are split that way.
+        Err(ResolveRefusal::NeedsStorage { task, resource, .. }) => match repointed {
+            Ok(ReplacementStorage { backing, extent }) => lifecycle::LifecycleOp::ReplacePhysical {
+                task,
+                resource,
+                backing,
+                extent,
+            },
+            Err(refusal) => return Err(Blocked::Refused(Refused::Repoint(refusal))),
         },
-    )?;
+        Err(other) => return Err(Blocked::Refused(Refused::Lifecycle(other))),
+    };
     // The empty access list, offered to the type that knows whether it is the
     // truth. It is, for an operation that names no resource; for one that does,
     // the constructor says which resource is unaccounted for and that is the
@@ -1110,12 +1126,31 @@ mod tests {
         }
     }
 
-    /// The exec inputs for a packet that carries no command buffers.
-    fn no_streams(accesses: &mut NoAccesses) -> ExecStreams<'_> {
-        ExecStreams {
-            task: reims_vgpu_core::identity::TaskId(0),
-            streams: &[],
-            accesses,
+    /// The storage a fixture's re-point names, so the one command whose
+    /// operation the wire cannot complete has the half that is not on it.
+    ///
+    /// A value the test states rather than one the bridge invents: the point of
+    /// [`ReplacementStorage`] is that these bytes come from a device that has
+    /// just moved the storage incarnation, and a fixture standing in for that
+    /// device has to say so out loud.
+    const REPLACEMENT: ReplacementStorage = ReplacementStorage {
+        backing: reims_vgpu_core::access::BackingId(0x5eed),
+        extent: reims_vgpu_core::access::ByteRange {
+            offset: 0,
+            length: 0x4000,
+        },
+    };
+
+    /// The device inputs for a packet that carries no command buffers, with a
+    /// re-point's storage available.
+    fn device_inputs(accesses: &mut NoAccesses) -> DeviceInputs<'_> {
+        DeviceInputs {
+            exec: ExecStreams {
+                task: reims_vgpu_core::identity::TaskId(0),
+                streams: &[],
+                accesses,
+            },
+            repointed: Ok(REPLACEMENT),
         }
     }
 
@@ -1144,7 +1179,7 @@ mod tests {
                 StampSlot(0),
                 &drained_with_list(row.channel, row.opcode),
                 resolvers(&EveryMapping),
-                no_streams(&mut NoAccesses),
+                device_inputs(&mut NoAccesses),
             );
             let expected = match classify(row.channel, row.opcode) {
                 Some(PayloadClass::Control) => None,
@@ -1158,7 +1193,10 @@ mod tests {
                 // says how it splits. Asked of the kind table rather than of a
                 // list of opcodes written here, so the test cannot drift into
                 // agreeing with itself.
-                Some(PayloadClass::ResourceLifecycle) => lifetime_gap(row.channel, row.opcode),
+                // Every member of the class crosses. The re-point was the last
+                // holdout and it crosses on the storage the caller supplies —
+                // see `ReplacementStorage`.
+                Some(PayloadClass::ResourceLifecycle) => None,
                 // Crosses. Its reply destination is resolved in whichever
                 // address space its own question uses; see `query_payload`.
                 Some(PayloadClass::Query) => None,
@@ -1235,47 +1273,25 @@ mod tests {
         );
     }
 
-    /// What a resource-lifetime row is still short of, or `None` if it crosses.
+    /// **What crosses is every row the ledger has judged, and nothing else.**
     ///
-    /// Asked of the same kind table the bridge asks, so the test cannot drift
-    /// into its own list of opcodes and then agree with itself. **The split is
-    /// down to one**: a re-point's operation names pages that are not on the
-    /// wire, and that is not a thing this bridge can be handed. Everything else
-    /// in the class builds a payload — the five that name resources state both
-    /// halves of the access each one takes, and the object-list bind states the
-    /// table it binds rather than the table's contents.
-    fn lifetime_gap(channel: Channel, opcode: u16) -> Option<Gap> {
-        use reims_vgpu_core::lifecycle::LifecycleKind as K;
-        match K::of(channel, opcode)? {
-            K::ReplacePhysical => Some(Gap::ReplacementStorage),
-            K::SetObjectList
-            | K::DeleteResource
-            | K::Invalidate
-            | K::Synchronize
-            | K::SynchronizeAndDiscard
-            | K::Discard
-            | K::DeleteBacking
-            | K::DefineTask
-            | K::DeleteTask
-            | K::MapMemory
-            | K::UnmapMemory => None,
-        }
-    }
-
-    /// What crosses is every class the ledger has judged, except the re-point
-    /// — and nothing else.
+    /// The complement used to be the claim and there is no longer one to state:
+    /// the last two gaps closed together, EXEC on [`ExecStreams`] and the
+    /// re-point on [`ReplacementStorage`], so what a row needs is now exactly
+    /// what its own closure says. A gap here means a ledger row that is not
+    /// settled, which is a contract question and not a missing input.
     ///
-    /// The complement is the claim, and it is down to one: the re-point, whose
-    /// pages are not on its wire. EXEC left this list when [`ExecStreams`]
-    /// landed; it crosses here on a packet that names no command buffer, which
-    /// is the envelope claim. That a stream's *records* cross is asserted
-    /// separately, because an empty transaction would satisfy this one.
+    /// Both of those cross on inputs a *fixture* supplies, and this test says
+    /// only that the envelope is built. That the streams' records and the
+    /// re-point's operation carry the right contents is asserted separately,
+    /// because an empty transaction and a defaulted operation would satisfy
+    /// this one.
     ///
     /// The counts are spelled out because this is the cutover's own scoreboard:
     /// a gap that closes moves a number here, and a row that quietly changed
     /// class moves one without anybody deciding to.
     #[test]
-    fn what_crosses_is_everything_but_the_repoint() {
+    fn what_crosses_is_every_row_the_ledger_has_judged() {
         let crossing: Vec<_> = LEDGER
             .iter()
             .filter(|row| {
@@ -1285,7 +1301,7 @@ mod tests {
                     StampSlot(0),
                     &drained_with_list(row.channel, row.opcode),
                     resolvers(&EveryMapping),
-                    no_streams(&mut NoAccesses),
+                    device_inputs(&mut NoAccesses),
                 )
                 .is_ok()
             })
@@ -1293,18 +1309,7 @@ mod tests {
             .collect();
         let expected: Vec<_> = LEDGER
             .iter()
-            .filter(|row| {
-                matches!(
-                    classify(row.channel, row.opcode),
-                    Some(
-                        PayloadClass::Control
-                            | PayloadClass::Present
-                            | PayloadClass::Query
-                            | PayloadClass::Exec
-                    )
-                ) || (classify(row.channel, row.opcode) == Some(PayloadClass::ResourceLifecycle)
-                    && lifetime_gap(row.channel, row.opcode).is_none())
-            })
+            .filter(|row| classify(row.channel, row.opcode).is_some())
             .map(|row| (row.channel, row.opcode))
             .collect();
         assert_eq!(crossing, expected);
@@ -1318,9 +1323,110 @@ mod tests {
             .count();
         assert_eq!(
             (control, present, crossing.len()),
-            (23, 3, 45),
+            (23, 3, 46),
             "the ledger's crossing rows changed; what reaches the model is not what the \
              module documentation says it is"
+        );
+    }
+
+    /// A re-point crosses carrying the model's identity and the device's bytes,
+    /// and the two halves come from the two places that own them.
+    ///
+    /// The failure this guards is specific and silent. `ReplacePhysical`'s
+    /// packet is a bare `{task, object}` and its new pages are nowhere on the
+    /// wire, so the storage has to arrive from outside. If the caller supplied
+    /// the *resource* as well, that would be a second resolution of the same
+    /// ref, and an operation built from the pair would re-point whichever of
+    /// the two was wrong while reporting success. So the task and the resource
+    /// here are the model's own resolution, carried back on
+    /// `ResolveRefusal::NeedsStorage`, and only the backing and extent are the
+    /// caller's.
+    #[test]
+    fn a_repoint_crosses_with_the_models_identity_and_the_devices_storage() {
+        use reims_vgpu_core::identity::TaskId;
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        use reims_vgpu_core::resolve::TaskNamespaces as _;
+
+        // `{u32 task, u32 object}`, at the offsets the protocol states.
+        let mut drained = drained(0x3c);
+        use reims_vgpu_protocol::fifo::{TASK_OBJECT_OBJECT_ID, TASK_OBJECT_TASK_ID};
+        drained.payload[TASK_OBJECT_TASK_ID..TASK_OBJECT_TASK_ID + 4]
+            .copy_from_slice(&5u32.to_le_bytes());
+        drained.payload[TASK_OBJECT_OBJECT_ID..TASK_OBJECT_OBJECT_ID + 4]
+            .copy_from_slice(&11u32.to_le_bytes());
+
+        let built = packet(
+            fifo_for(Channel::Child),
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &drained,
+            resolvers(&EveryMapping),
+            device_inputs(&mut NoAccesses),
+        )
+        .expect("the caller supplied the storage the wire does not carry");
+        let Payload::ResourceLifecycle(payload) = &built.payload else {
+            panic!("a re-point must not build another class's payload");
+        };
+        assert_eq!(
+            payload.op(),
+            &LifecycleOp::ReplacePhysical {
+                task: TaskId(5),
+                resource: EveryObject
+                    .resource(TaskId(5), 11)
+                    .expect("the fixture resolves every ref"),
+                backing: REPLACEMENT.backing,
+                extent: REPLACEMENT.extent,
+            },
+            "the identity is the packet's own words resolved in the packet's own \
+             task, and the bytes are the ones the caller handed in"
+        );
+    }
+
+    /// A re-point whose storage the device cannot describe is refused under the
+    /// device's own reason, and is not a gap.
+    ///
+    /// The alternative was an operation carrying the *old* backing, which
+    /// re-points nothing and reports success — a resource whose content
+    /// authority stays on pages the guest has already rewired, with nothing to
+    /// read. Measured at zero on a driven macos-15 boot once a surface-backing
+    /// object stopped being read as owning no bytes, which is what makes
+    /// refusing affordable rather than a wall.
+    #[test]
+    fn a_repoint_the_device_cannot_describe_is_refused_under_the_devices_reason() {
+        use crate::runtime::objects::RepointStorageRefusal;
+
+        let mut accesses = NoAccesses;
+        let undescribable = RepointStorageRefusal::NoBytes {
+            object_type: 6,
+            mapping_names_a_surface: false,
+        };
+        let refusal = packet(
+            fifo_for(Channel::Child),
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &drained_with_list(Channel::Child, 0x3c),
+            resolvers(&EveryMapping),
+            DeviceInputs {
+                exec: ExecStreams {
+                    task: reims_vgpu_core::identity::TaskId(0),
+                    streams: &[],
+                    accesses: &mut accesses,
+                },
+                repointed: Err(undescribable),
+            },
+        )
+        .expect_err("the device has no storage for this reference");
+        assert_eq!(
+            refusal.gap(),
+            None,
+            "the input is not missing from this bridge; the device looked and \
+             there was nothing to name"
+        );
+        assert_eq!(refusal, Blocked::Refused(Refused::Repoint(undescribable)));
+        assert_eq!(
+            refusal.slug(),
+            undescribable.route(),
+            "reported under the route the device already counts it on"
         );
     }
 
@@ -1343,10 +1449,13 @@ mod tests {
             StampSlot(0),
             &drained_with_list(Channel::Child, 0x37),
             resolvers(&EveryMapping),
-            ExecStreams {
-                task: reims_vgpu_core::identity::TaskId(1),
-                streams: &streams,
-                accesses: &mut accesses,
+            DeviceInputs {
+                exec: ExecStreams {
+                    task: reims_vgpu_core::identity::TaskId(1),
+                    streams: &streams,
+                    accesses: &mut accesses,
+                },
+                repointed: Ok(REPLACEMENT),
             },
         )
         .expect_err("two bytes are not a command stream");
@@ -1394,7 +1503,7 @@ mod tests {
             StampSlot(0),
             &drained,
             resolvers(&NOTHING_MAPPED),
-            no_streams(&mut NoAccesses),
+            device_inputs(&mut NoAccesses),
         )
         .expect("a task definition needs no namespace");
         let Payload::ResourceLifecycle(payload) = &built.payload else {
@@ -1429,7 +1538,7 @@ mod tests {
             StampSlot(0),
             &short,
             resolvers(&NOTHING_MAPPED),
-            no_streams(&mut NoAccesses),
+            device_inputs(&mut NoAccesses),
         )
         .expect_err("no domain, no transition");
         assert!(matches!(refusal, Blocked::Refused(_)));
@@ -1464,7 +1573,7 @@ mod tests {
             StampSlot(3),
             &nop,
             resolvers(&NOTHING_MAPPED),
-            no_streams(&mut NoAccesses),
+            device_inputs(&mut NoAccesses),
         )
         .expect("CmdNOP is control");
         assert_eq!(
@@ -1571,7 +1680,7 @@ mod tests {
                 storage: &NoStorage,
                 replies: &EveryReply,
             },
-            no_streams(&mut NoAccesses),
+            device_inputs(&mut NoAccesses),
         )
         .expect("an unkeyable target is not a lost packet");
         let Payload::ResourceLifecycle(payload) = &unkeyed.payload else {
@@ -1594,7 +1703,7 @@ mod tests {
             StampSlot(0),
             drained,
             resolvers(&EveryMapping),
-            no_streams(&mut NoAccesses),
+            device_inputs(&mut NoAccesses),
         )
     }
 
@@ -1632,7 +1741,7 @@ mod tests {
             StampSlot(0),
             &shown,
             resolvers(&live),
-            no_streams(&mut NoAccesses),
+            device_inputs(&mut NoAccesses),
         )
         .expect("a present resolves in the mapping namespace");
         let Payload::Present(payload) = &built.payload else {
@@ -1673,7 +1782,7 @@ mod tests {
             StampSlot(0),
             &shown,
             resolvers(&NOTHING_MAPPED),
-            no_streams(&mut NoAccesses),
+            device_inputs(&mut NoAccesses),
         )
         .expect("an unresolvable target is not a missing input");
         let Payload::Present(payload) = &unresolved.payload else {
@@ -1711,7 +1820,7 @@ mod tests {
             StampSlot(0),
             &short,
             resolvers(&NOTHING_MAPPED),
-            no_streams(&mut NoAccesses),
+            device_inputs(&mut NoAccesses),
         )
         .expect_err("no trailer, no frame");
         assert_eq!(
