@@ -186,6 +186,109 @@ impl crate::observe::Decline for ComputeBindOverflow {
     }
 }
 
+/// One buffer bind entry, whichever record carried it.
+///
+/// Five records bind into this encoder's argument tables and only two shapes of
+/// buffer entry reach them: `setBuffers:offsets:withRange:` writes a ref and an
+/// offset, and `setBuffers:offsets:attributeStrides:withRange:` writes a stride
+/// beside them. What turns an entry into a slot is the same either way, so it
+/// is stated once and the entry types answer for their own layout.
+///
+/// **A stride is `Option`, and that is the point.** The device decoder used to
+/// hand the accumulator a flat entry with an `attribute_stride` and a
+/// `has_attribute_stride` beside it, so "the record carried no stride field"
+/// and "the record carried a stride of zero" were two spellings of the same
+/// bytes and only the flag told them apart. Here the record with no stride
+/// field cannot produce a `Some`.
+pub(crate) trait BufferBindEntry {
+    fn buffer_ref(&self) -> u32;
+    fn offset(&self) -> u64;
+    fn stride(&self) -> Option<u64>;
+}
+
+/// One texture or sampler bind entry, whichever record carried it.
+///
+/// The plain form is a bare ref; `setSamplers:lodMinClamps:lodMaxClamps:` adds
+/// a clamp pair. The clamps are carried as bit patterns because that is what
+/// this device binds with — the wire's `f32` becomes bits once, here, rather
+/// than at each of the two producers.
+pub(crate) trait ObjectBindEntry {
+    fn object_ref(&self) -> u32;
+    fn lod_clamp(&self) -> Option<(u32, u32)> {
+        None
+    }
+}
+
+impl BufferBindEntry for reims_vgpu_wire::ops::render::BufferBind {
+    fn buffer_ref(&self) -> u32 {
+        self.buffer_ref.get()
+    }
+    fn offset(&self) -> u64 {
+        self.offset.get()
+    }
+    fn stride(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl BufferBindEntry for reims_vgpu_wire::ops::render::BufferStrideBind {
+    fn buffer_ref(&self) -> u32 {
+        self.buffer_ref.get()
+    }
+    fn offset(&self) -> u64 {
+        self.offset.get()
+    }
+    fn stride(&self) -> Option<u64> {
+        Some(self.attribute_stride.get())
+    }
+}
+
+impl BufferBindEntry for BufferBinding {
+    fn buffer_ref(&self) -> u32 {
+        self.ref_
+    }
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+    fn stride(&self) -> Option<u64> {
+        self.has_attribute_stride.then_some(self.attribute_stride)
+    }
+}
+
+impl ObjectBindEntry for reims_vgpu_wire::ops::render::RefBind {
+    fn object_ref(&self) -> u32 {
+        self.object_ref.get()
+    }
+}
+
+impl ObjectBindEntry for reims_vgpu_wire::ops::render::SamplerLodBind {
+    fn object_ref(&self) -> u32 {
+        self.sampler_ref.get()
+    }
+    fn lod_clamp(&self) -> Option<(u32, u32)> {
+        Some((
+            self.lod_min_clamp.get().to_bits(),
+            self.lod_max_clamp.get().to_bits(),
+        ))
+    }
+}
+
+impl ObjectBindEntry for RefBinding {
+    fn object_ref(&self) -> u32 {
+        self.ref_
+    }
+}
+
+impl ObjectBindEntry for SamplerBinding {
+    fn object_ref(&self) -> u32 {
+        self.ref_
+    }
+    fn lod_clamp(&self) -> Option<(u32, u32)> {
+        self.has_lod_clamp
+            .then_some((self.lod_min_bits, self.lod_max_bits))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ComputeBufferBind {
     pub index: u32,
@@ -299,10 +402,11 @@ impl ComputeAccum {
         }
     }
 
-    pub fn bind_buffers(&mut self, first: u32, entries: &[BufferBinding]) {
+    pub fn bind_buffers<E: BufferBindEntry>(&mut self, first: u32, entries: &[E]) {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
-            if e.ref_ == 0 {
+            let entry_ref = e.buffer_ref();
+            if entry_ref == 0 {
                 // A nil entry clears the slot. Retaining the previous bind
                 // instead is not a stale read but a write: the retained buffer
                 // is staged again on the next dispatch, and reflection calling
@@ -318,19 +422,20 @@ impl ComputeAccum {
             if index >= MAX_COMPUTE_BUFFER_SLOTS {
                 let over = ComputeBindOverflow::Buffer {
                     index,
-                    arg: e.ref_,
+                    arg: entry_ref,
                     cap: MAX_COMPUTE_BUFFER_SLOTS,
                 };
                 over.emit();
                 self.refused_bind.get_or_insert(over);
                 continue;
             }
+            let stride = e.stride();
             let bind = ComputeBufferBind {
                 index,
-                buffer_ref: e.ref_,
-                offset: e.offset,
-                attribute_stride: e.attribute_stride,
-                has_attribute_stride: e.has_attribute_stride,
+                buffer_ref: entry_ref,
+                offset: e.offset(),
+                attribute_stride: stride.unwrap_or_default(),
+                has_attribute_stride: stride.is_some(),
             };
             if let Some(slot) = self.buffers.iter_mut().find(|b| b.index == index) {
                 *slot = bind;
@@ -350,10 +455,11 @@ impl ComputeAccum {
         }
     }
 
-    pub fn bind_textures(&mut self, first: u32, entries: &[RefBinding]) {
+    pub fn bind_textures<E: ObjectBindEntry>(&mut self, first: u32, entries: &[E]) {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
-            if e.ref_ == 0 {
+            let entry_ref = e.object_ref();
+            if entry_ref == 0 {
                 // Clears the slot; see `bind_buffers`. A retained texture is
                 // the sharper case of the two, because `writeback_texture`
                 // lands the dispatch's result in the guest surface behind it.
@@ -365,7 +471,7 @@ impl ComputeAccum {
             if index >= MAX_COMPUTE_TEXTURE_SLOTS {
                 let over = ComputeBindOverflow::Texture {
                     index,
-                    arg: e.ref_,
+                    arg: entry_ref,
                     cap: MAX_COMPUTE_TEXTURE_SLOTS,
                 };
                 over.emit();
@@ -374,7 +480,7 @@ impl ComputeAccum {
             }
             let bind = ComputeTextureBind {
                 index,
-                texture_ref: e.ref_,
+                texture_ref: entry_ref,
             };
             if let Some(slot) = self.textures.iter_mut().find(|t| t.index == index) {
                 *slot = bind;
@@ -384,10 +490,11 @@ impl ComputeAccum {
         }
     }
 
-    pub fn bind_samplers(&mut self, first: u32, entries: &[SamplerBinding]) {
+    pub fn bind_samplers<E: ObjectBindEntry>(&mut self, first: u32, entries: &[E]) {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
-            if e.ref_ == 0 {
+            let entry_ref = e.object_ref();
+            if entry_ref == 0 {
                 // Clears the slot; see `bind_buffers`.
                 self.samplers.retain(|s| s.index != index);
                 self.clear_refusal_at(index);
@@ -397,19 +504,20 @@ impl ComputeAccum {
             if index >= MAX_COMPUTE_SAMPLER_SLOTS {
                 let over = ComputeBindOverflow::Sampler {
                     index,
-                    arg: e.ref_,
+                    arg: entry_ref,
                     cap: MAX_COMPUTE_SAMPLER_SLOTS,
                 };
                 over.emit();
                 self.refused_bind.get_or_insert(over);
                 continue;
             }
+            let clamp = e.lod_clamp();
             let bind = ComputeSamplerBind {
                 index,
-                sampler_ref: e.ref_,
-                lod_min_bits: e.lod_min_bits,
-                lod_max_bits: e.lod_max_bits,
-                has_lod_clamp: e.has_lod_clamp,
+                sampler_ref: entry_ref,
+                lod_min_bits: clamp.map_or(0, |(min, _)| min),
+                lod_max_bits: clamp.map_or(0, |(_, max)| max),
+                has_lod_clamp: clamp.is_some(),
             };
             if let Some(slot) = self.samplers.iter_mut().find(|s| s.index == index) {
                 *slot = bind;

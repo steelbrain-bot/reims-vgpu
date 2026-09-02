@@ -3546,3 +3546,160 @@ fn the_declared_push_range_is_the_reflected_offset_and_the_pushed_payload() {
         "the declared range is exactly the bytes a region pushes",
     );
 }
+
+/// A record that carries no stride field and one that carries a stride of zero
+/// are different binds, and the accumulator says so whichever record fed it.
+///
+/// This is the compute rail's `has_options`. The device decoder used to flatten
+/// both plural buffer binds into one entry with an `attribute_stride` and a
+/// `has_attribute_stride` beside it, so the two states were the same bytes told
+/// apart by a flag a decoder had to remember to set. `BufferBindEntry::stride`
+/// is an `Option` and `setBuffers:offsets:withRange:` cannot produce a `Some`,
+/// so the confusion is not expressible on the wire path at all.
+///
+/// Both producers are checked against the same slot because that is what makes
+/// the cutover safe to make: the accumulator is the owner, and it must not care
+/// which of the two records reached it.
+#[test]
+fn a_bind_with_no_stride_field_and_one_with_a_zero_stride_are_not_the_same_slot() {
+    use reims_vgpu_wire::le::{U32le, U64le};
+    use reims_vgpu_wire::ops::render::{BufferBind, BufferStrideBind};
+
+    let slot = |acc: &ComputeAccum| {
+        let b = acc.buffers.first().expect("one slot bound");
+        (
+            b.index,
+            b.buffer_ref,
+            b.offset,
+            b.attribute_stride,
+            b.has_attribute_stride,
+        )
+    };
+
+    let mut plain = ComputeAccum::default();
+    plain.bind_buffers(
+        3,
+        &[BufferBind {
+            buffer_ref: U32le::new(4242),
+            offset: U64le::new(0x5678),
+        }],
+    );
+    let mut zero_stride = ComputeAccum::default();
+    zero_stride.bind_buffers(
+        3,
+        &[BufferStrideBind {
+            buffer_ref: U32le::new(4242),
+            offset: U64le::new(0x5678),
+            attribute_stride: U64le::new(0),
+        }],
+    );
+    assert_eq!(slot(&plain), (3, 4242, 0x5678, 0, false));
+    assert_eq!(slot(&zero_stride), (3, 4242, 0x5678, 0, true));
+    assert_ne!(slot(&plain), slot(&zero_stride));
+
+    // The record still in production feeds the same owner and lands the same
+    // slot, which is what lets the call site move on its own.
+    let mut legacy = ComputeAccum::default();
+    legacy.bind_buffers(
+        3,
+        &[compute::BufferBinding {
+            ref_: 4242,
+            offset: 0x5678,
+            attribute_stride: 0,
+            has_attribute_stride: false,
+        }],
+    );
+    assert_eq!(slot(&legacy), slot(&plain));
+}
+
+/// A sampler bound without a LOD clamp and one bound with a clamp of zero are
+/// different binds, and the clamp crosses as bits exactly once.
+///
+/// `setSamplers:withRange:` has no clamp fields at all, so its entry cannot
+/// produce a clamp; `setSamplers:lodMinClamps:lodMaxClamps:` carries two `f32`,
+/// and `0.0` is a clamp the guest can state. The `to_bits` that used to sit in
+/// the device decoder is now in the accumulator's own entry contract, so both
+/// producers convert the same way or neither does.
+#[test]
+fn a_sampler_bound_without_a_clamp_and_one_clamped_to_zero_are_not_the_same_slot() {
+    use reims_vgpu_wire::le::{F32le, U32le};
+    use reims_vgpu_wire::ops::render::{RefBind, SamplerLodBind};
+
+    let slot = |acc: &ComputeAccum| {
+        let s = acc.samplers.first().expect("one slot bound");
+        (
+            s.index,
+            s.sampler_ref,
+            s.lod_min_bits,
+            s.lod_max_bits,
+            s.has_lod_clamp,
+        )
+    };
+
+    let mut plain = ComputeAccum::default();
+    plain.bind_samplers(
+        1,
+        &[RefBind {
+            object_ref: U32le::new(77),
+        }],
+    );
+    let mut zero_clamp = ComputeAccum::default();
+    zero_clamp.bind_samplers(
+        1,
+        &[SamplerLodBind {
+            sampler_ref: U32le::new(77),
+            lod_min_clamp: F32le::new(0.0),
+            lod_max_clamp: F32le::new(0.0),
+        }],
+    );
+    assert_eq!(slot(&plain), (1, 77, 0, 0, false));
+    assert_eq!(slot(&zero_clamp), (1, 77, 0, 0, true));
+
+    let mut clamped = ComputeAccum::default();
+    clamped.bind_samplers(
+        1,
+        &[SamplerLodBind {
+            sampler_ref: U32le::new(77),
+            lod_min_clamp: F32le::new(0.25),
+            lod_max_clamp: F32le::new(4.0),
+        }],
+    );
+    assert_eq!(
+        slot(&clamped),
+        (1, 77, 0.25f32.to_bits(), 4.0f32.to_bits(), true),
+        "the clamp must reach the slot as the bit pattern this device binds with"
+    );
+}
+
+/// A nil ref clears the slot whichever record shape carried it.
+///
+/// The unbind is the sharpest thing the three setters do — a retained bind is a
+/// *write* through a resource the guest unbound, not a stale read — so it is
+/// the claim that most needs to be the accumulator's rather than a decoder's.
+#[test]
+fn a_nil_entry_clears_the_slot_on_the_wire_path_too() {
+    use reims_vgpu_wire::le::U32le;
+    use reims_vgpu_wire::ops::render::RefBind;
+
+    let mut acc = ComputeAccum::default();
+    acc.bind_textures(
+        0,
+        &[
+            RefBind {
+                object_ref: U32le::new(4242),
+            },
+            RefBind {
+                object_ref: U32le::new(4343),
+            },
+        ],
+    );
+    assert_eq!(acc.textures.len(), 2);
+    acc.bind_textures(
+        1,
+        &[RefBind {
+            object_ref: U32le::new(0),
+        }],
+    );
+    assert_eq!(acc.textures.len(), 1);
+    assert_eq!(acc.textures[0].index, 0);
+}
