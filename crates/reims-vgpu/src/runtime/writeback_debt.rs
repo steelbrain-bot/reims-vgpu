@@ -1004,6 +1004,18 @@ pub fn gva_resource_generation<M: HostMemory>(
     );
     let want = reims_vgpu_paging::span::pages_spanned(gva, span, page_size);
     let pages = (ordered.len() as u64 == want).then_some(ordered);
+    // Whether this debt's key may stay the reference. `GvaResourceKey` is the
+    // resource because that is what `CmdSynchronizeResources` names -- and the
+    // debt it stands for is owed by *storage*, so a second live name over the
+    // same allocation could be synchronised while this one's frame stays owed,
+    // and the guest would CPU-read pages the device still has newer pixels
+    // for. See `objects::note_reference_shares_storage`.
+    crate::runtime::objects::note_reference_shares_storage(
+        state,
+        key.task_id,
+        key.texture_ref,
+        "gva_debt_shared_storage",
+    );
     state
         .pending_writebacks
         .ensure_gva_resource(key, gva, span, pages)

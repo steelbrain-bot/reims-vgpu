@@ -3136,6 +3136,21 @@ pub fn cached_window_peer(state: &DeviceState, task_id: u32, obj_ref: u32) -> Op
 /// about a workload and not about the code: a guest that does bind two names
 /// over one buffer would make the re-key necessary, and this is what would say
 /// so rather than a wrong frame.
+///
+/// # More than one site asks it
+///
+/// The GVA writeback debt asks it too. `GvaResourceKey` is the resource
+/// because that is what `CmdSynchronizeResources` names, and the debt it holds
+/// is owed by *storage* — so a second live name over one allocation could be
+/// synchronised while this one's frame stays owed, and the guest would CPU-read
+/// pages the device still holds newer pixels for.
+///
+/// `reference_storage_asked` and `reference_storage_shared` are shared across
+/// the sites on purpose: the question they answer is "does any per-reference
+/// key that stands for storage alias", which is one question. Which site saw it
+/// is on the failure line, and that is where it matters — a non-zero
+/// `reference_storage_shared` is read by finding the line, not by reading the
+/// counter.
 pub fn note_reference_shares_storage(
     state: &DeviceState,
     task_id: u32,
