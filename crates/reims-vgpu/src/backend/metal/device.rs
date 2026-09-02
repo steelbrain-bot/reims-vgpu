@@ -15,10 +15,11 @@ use crate::model::{DeviceInfoLimits, DeviceState};
 use crate::protocol::mipmap::MetalMipmapError;
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus};
 use crate::runtime::compute_session;
-use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus};
 use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::mipmap::MipmapStatus;
+use reims_vgpu_protocol::compute::DispatchType;
+use reims_vgpu_protocol::decode::compute::DispatchRecord;
 
 /// The Metal rail's [`Backend`] handle.
 ///
@@ -125,13 +126,16 @@ impl Backend for MetalBackend {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
     ) -> ComputeStatus {
-        compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, cmd, None)
+        compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, dispatch, None)
     }
 
     #[allow(clippy::result_large_err, reason = "see the `Backend` declaration")]
-    fn open_compute_session(&self, dispatch_type: u32) -> Result<ComputeSession, ComputeStatus> {
+    fn open_compute_session(
+        &self,
+        dispatch_type: DispatchType,
+    ) -> Result<ComputeSession, ComputeStatus> {
         compute_session::metal::MetalSession::open(dispatch_type).map(ComputeSession::from_metal)
     }
 
@@ -141,7 +145,7 @@ impl Backend for MetalBackend {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
         session: &mut ComputeSession,
     ) -> ComputeStatus {
         // `None` cannot happen: `backend::selected()` is latched, so every
@@ -150,7 +154,7 @@ impl Backend for MetalBackend {
         let Some(rail) = session.metal_mut() else {
             return ComputeStatus::NoMetal("compute_nested_session_not_metal");
         };
-        compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, cmd, Some(rail))
+        compute_exec::metal::execute_dispatch_metal(state, host, task_id, acc, dispatch, Some(rail))
     }
 
     fn encode_icb_execute_and_writeback<M: HostMemory + HostOps>(

@@ -6282,7 +6282,7 @@ fn each_ledger_routed_compute_class_reaches_a_counter_that_names_which_one_it_is
                 && seg.acc.stage_in_region.is_none()
                 && seg.acc.stage_in_region_indirect.is_none()
                 && seg.acc.imageblock.is_none()
-                && seg.acc.dispatch_type == 0,
+                && seg.acc.dispatch_type == reims_vgpu_protocol::compute::DispatchType::Serial,
             "{op:#x} moved segment state it does not own"
         );
     }
@@ -6325,5 +6325,101 @@ fn a_ledger_routed_compute_record_short_of_its_body_is_declined_and_not_counted(
         store_route_count("compute_residency_heap"),
         before,
         "a declaration whose refs are not there was priced as one that was"
+    );
+}
+
+/// An `MTLDispatchType` the contract does not declare refuses its record, is
+/// counted, and leaves the pass's type where it was.
+///
+/// This is the one place the compute cutover changed what a guest gets, and it
+/// is the ordinal rule moving to the crate that owns closed ordinals. The
+/// device used to store `writeDescriptor`'s word unbounded and narrow it at the
+/// far end of the rail — `if x == CONCURRENT { CONCURRENT } else { SERIAL }`,
+/// inside `execute_dispatch_metal`, on the one arm that read the field at all —
+/// so an unrecognised ordinal silently became `Serial` and, on the Vulkan arm,
+/// was stored and read by nobody. `reims_vgpu_protocol` refuses it at the lift
+/// instead, which is what makes `ComputeAccum::dispatch_type` a total type.
+///
+/// The census the old substitution raised is kept, because what it was for —
+/// deciding whether an unrecognised ordinal is a guest asking for something new
+/// or this device reading the wrong offset — is still exactly what a firing
+/// would mean.
+///
+/// The three claims are separate on purpose. That the record is refused is not
+/// the same as that the counter moved, and neither says the pass kept the type
+/// a *previous* record set — which is the half the substitution used to get
+/// wrong in the other direction, by overwriting `Concurrent` with `Serial`.
+#[test]
+fn an_undeclared_dispatch_type_refuses_its_record_and_leaves_the_pass_type_alone() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::compute::DispatchType;
+    use reims_vgpu_wire::ops::compute as wire_c;
+
+    let descriptor = |word: u32| {
+        let total = (OP_HEADER_LEN + 4) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], wire_c::OPCODE_WRITE_DESCRIPTOR);
+        st32(&mut v[4..], total);
+        st32(&mut v[OP_HEADER_LEN..], word);
+        v
+    };
+    let run = |seg: &mut crate::runtime::compute_session::ComputeSegment, word: u32| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let mut out = ExecResult::default();
+        handle_compute_record(
+            &mut state,
+            &mut host,
+            7,
+            wire_c::OPCODE_WRITE_DESCRIPTOR,
+            &descriptor(word),
+            &mut out,
+            seg,
+        );
+    };
+
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+    let before = store_route_count("compute_dispatch_type_unknown");
+
+    // The two the contract declares cross untouched and spend no line.
+    let cap = crate::observe::FailCapture::start();
+    run(&mut seg, 1);
+    assert_eq!(seg.acc.dispatch_type, DispatchType::Concurrent);
+    run(&mut seg, 0);
+    assert_eq!(seg.acc.dispatch_type, DispatchType::Serial);
+    assert!(
+        cap.lines().is_empty(),
+        "a declared dispatch type must spend no line: {:?}",
+        cap.lines()
+    );
+    assert_eq!(
+        store_route_count("compute_dispatch_type_unknown"),
+        before,
+        "a declared dispatch type is not an unknown one"
+    );
+    drop(cap);
+
+    // An ordinal outside the pair: refused by name, counted every time, and the
+    // pass keeps the type the guest last actually stated.
+    run(&mut seg, 1);
+    assert_eq!(seg.acc.dispatch_type, DispatchType::Concurrent);
+    let cap = crate::observe::FailCapture::start();
+    for _ in 0..3 {
+        run(&mut seg, 0x5e01);
+    }
+    assert_eq!(
+        seg.acc.dispatch_type,
+        DispatchType::Concurrent,
+        "a refused descriptor must not quietly reset the pass to Serial"
+    );
+    let line = cap.one("compute_record");
+    assert!(
+        line.contains("undefined_ordinal") || line.contains("dispatch_type"),
+        "the refusal must name the field the ordinal was in: {line}"
+    );
+    assert_eq!(
+        store_route_count("compute_dispatch_type_unknown"),
+        before + 3,
+        "the line is deduped; the count is not"
     );
 }

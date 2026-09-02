@@ -129,7 +129,6 @@ pub mod refusal;
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus, ResidentServe};
-use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::{GuestRamImport, ImportId};
 use crate::runtime::gva_store_witness::GvaTargetKey;
@@ -137,7 +136,9 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::resident_target::ResidentTarget;
 use crate::runtime::writeback_debt::GvaWritebackDebt;
 pub(crate) use compute_session::ComputeSession;
+use reims_vgpu_protocol::compute::DispatchType;
 use reims_vgpu_protocol::decode::blit::TextureSlices as BlitSliceCopy;
+use reims_vgpu_protocol::decode::compute::DispatchRecord;
 use std::sync::Arc;
 
 /// How a rail's own completion thread announces a finished stamp back to the
@@ -333,7 +334,7 @@ pub(crate) trait Backend: Copy {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
     ) -> ComputeStatus;
 
     /// Open a multi-record encoder for one compute segment.
@@ -350,7 +351,10 @@ pub(crate) trait Backend: Copy {
                   refusal names the check that refused; see this module's note \
                   on the same exemption for `backend::metal`"
     )]
-    fn open_compute_session(&self, dispatch_type: u32) -> Result<ComputeSession, ComputeStatus>;
+    fn open_compute_session(
+        &self,
+        dispatch_type: DispatchType,
+    ) -> Result<ComputeSession, ComputeStatus>;
 
     /// Execute a dispatch onto an already-open session's encoder.
     ///
@@ -362,7 +366,7 @@ pub(crate) trait Backend: Copy {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
         session: &mut ComputeSession,
     ) -> ComputeStatus;
 
@@ -1332,18 +1336,21 @@ impl Backend for SelectedBackend {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
     ) -> ComputeStatus {
         match self {
             #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.execute_dispatch(state, host, task_id, acc, cmd),
+            Self::Metal(b) => b.execute_dispatch(state, host, task_id, acc, dispatch),
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.execute_dispatch(state, host, task_id, acc, cmd),
+            Self::Vulkan(b) => b.execute_dispatch(state, host, task_id, acc, dispatch),
         }
     }
 
     #[allow(clippy::result_large_err, reason = "see the trait declaration")]
-    fn open_compute_session(&self, dispatch_type: u32) -> Result<ComputeSession, ComputeStatus> {
+    fn open_compute_session(
+        &self,
+        dispatch_type: DispatchType,
+    ) -> Result<ComputeSession, ComputeStatus> {
         match self {
             #[cfg(feature = "backend-metal")]
             Self::Metal(b) => b.open_compute_session(dispatch_type),
@@ -1358,14 +1365,18 @@ impl Backend for SelectedBackend {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
         session: &mut ComputeSession,
     ) -> ComputeStatus {
         match self {
             #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
+            Self::Metal(b) => {
+                b.execute_dispatch_nested(state, host, task_id, acc, dispatch, session)
+            }
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
+            Self::Vulkan(b) => {
+                b.execute_dispatch_nested(state, host, task_id, acc, dispatch, session)
+            }
         }
     }
 

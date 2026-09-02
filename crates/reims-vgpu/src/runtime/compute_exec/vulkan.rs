@@ -486,7 +486,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     acc: &ComputeAccum,
-    cmd: &ComputeCommand,
+    dispatch: &DispatchRecord,
 ) -> ComputeStatus {
     use crate::backend::vulkan::engine::{
         self as vk_engine, ComputeBufferResource, ComputeImageResult, ComputeRequest,
@@ -536,7 +536,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         grid,
         threadgroup: tg,
         dispatch_threads,
-    } = match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
+    } = match resolve_dispatch_dims_reported(state, host, task_id, dispatch, acc) {
         Ok(v) => v,
         Err(e) => return e,
     };

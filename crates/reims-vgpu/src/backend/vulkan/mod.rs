@@ -38,7 +38,6 @@ use crate::backend::{
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{self, BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{self, ComputeAccum, ComputeStatus, ResidentServe};
-use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::drain;
 use crate::runtime::draw::{self, DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::ImportId;
@@ -47,7 +46,9 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::render_writeback::SettleSite;
 use crate::runtime::scanout;
 use crate::runtime::writeback_debt::{GvaWindow, GvaWritebackDebt};
+use reims_vgpu_protocol::compute::DispatchType;
 use reims_vgpu_protocol::decode::blit::TextureSlices as BlitSliceCopy;
+use reims_vgpu_protocol::decode::compute::DispatchRecord;
 
 /// The Vulkan rail's [`Backend`] handle.
 ///
@@ -191,13 +192,16 @@ impl Backend for VulkanBackend {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
     ) -> ComputeStatus {
-        compute_exec::vulkan::execute_dispatch_linux(state, host, task_id, acc, cmd)
+        compute_exec::vulkan::execute_dispatch_linux(state, host, task_id, acc, dispatch)
     }
 
     #[allow(clippy::result_large_err, reason = "see the `Backend` declaration")]
-    fn open_compute_session(&self, _dispatch_type: u32) -> Result<ComputeSession, ComputeStatus> {
+    fn open_compute_session(
+        &self,
+        _dispatch_type: DispatchType,
+    ) -> Result<ComputeSession, ComputeStatus> {
         // One-shot per dispatch: there is no encoder to hold open across a
         // segment's records, and no `SessionRail` variant for one.
         Err(ComputeStatus::NoMetal("compute_session_no_vulkan_path"))
@@ -209,7 +213,7 @@ impl Backend for VulkanBackend {
         _host: &mut M,
         _task_id: u32,
         _acc: &ComputeAccum,
-        _cmd: &ComputeCommand,
+        _dispatch: &DispatchRecord,
         _session: &mut ComputeSession,
     ) -> ComputeStatus {
         // Unreachable while `open_compute_session` refuses: a nested dispatch

@@ -34,6 +34,7 @@ use crate::model::DeviceState;
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
 use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
 use crate::runtime::host::{HostMemory, HostOps};
+use reims_vgpu_protocol::compute::DispatchType;
 
 /// Latched reason that blocks later dispatches in the same compute segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,7 +67,7 @@ pub struct ComputeSegment {
 
 pub fn ensure_session(
     session: &mut Option<ComputeSession>,
-    dispatch_type: u32,
+    dispatch_type: DispatchType,
 ) -> Result<&mut ComputeSession, ComputeStatus> {
     if session.is_none() {
         *session = Some(crate::backend::selected().open_compute_session(dispatch_type)?);
@@ -158,6 +159,25 @@ mod tests {
 
     use crate::runtime::host::FakeHost;
 
+    /// A `dispatchThreadgroups:threadsPerThreadgroup:` record, as the lift
+    /// makes it.
+    #[cfg(all(feature = "backend-metal", target_os = "macos"))]
+    fn threadgroups(
+        groups: [u64; 3],
+        threads_per_group: [u64; 3],
+    ) -> reims_vgpu_protocol::decode::compute::DispatchRecord {
+        use reims_vgpu_protocol::decode::compute::{DispatchRecord, Extent, Threadgroups};
+        let extent = |[width, height, depth]: [u64; 3]| Extent {
+            width,
+            height,
+            depth,
+        };
+        DispatchRecord::Threadgroups(Threadgroups {
+            groups: extent(groups),
+            threads_per_group: extent(threads_per_group),
+        })
+    }
+
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     #[test]
     fn metal_reflection_status_survives_the_session_handoff() {
@@ -207,7 +227,9 @@ mod tests {
             write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
         }
 
-        let mut session = MetalBackend.open_compute_session(0).expect("metal session");
+        let mut session = MetalBackend
+            .open_compute_session(DispatchType::Serial)
+            .expect("metal session");
         let start = ComputeCommand {
             kind: Kind::ControlStartIf,
             condition_buffer_ref: 7,
@@ -247,7 +269,6 @@ mod tests {
     #[cfg(all(feature = "backend-metal", target_os = "macos"))]
     fn nested_dispatch_under_if_writeback() {
         use crate::runtime::compute_exec::ComputeBufferBind;
-        use crate::runtime::decode::compute::Size3;
         use crate::runtime::decode::resource::{
             OBJECT_TYPE_FUNCTION, OBJECT_TYPE_SERIALIZER_OBJECT, PIPELINE_TAG_KERNEL_FUNC,
             SERIALIZER_OBJECT_COMPUTE_PIPELINE, SERIALIZER_OBJECT_FIRST_TLVS,
@@ -338,7 +359,9 @@ mod tests {
 
         // Phase A: nested dispatch alone on a session (no control SPI).
         {
-            let mut session = MetalBackend.open_compute_session(0).expect("session");
+            let mut session = MetalBackend
+                .open_compute_session(DispatchType::Serial)
+                .expect("session");
             let mut acc = ComputeAccum::default();
             acc.set_pipeline(6);
             acc.buffers.push(ComputeBufferBind {
@@ -348,12 +371,7 @@ mod tests {
                 attribute_stride: 0,
                 has_attribute_stride: false,
             });
-            let dcmd = ComputeCommand {
-                kind: Kind::DispatchThreadgroups,
-                grid: Size3 { x: 1, y: 1, z: 1 },
-                threads_per_threadgroup: Size3 { x: 4, y: 1, z: 1 },
-                ..Default::default()
-            };
+            let dcmd = threadgroups([1, 1, 1], [4, 1, 1]);
             assert_eq!(
                 MetalBackend.execute_dispatch_nested(
                     &mut state,
@@ -391,7 +409,9 @@ mod tests {
         // Phase B: if wraps nested dispatch. Concurrent encoder is the intended
         // SPI host for encodeStartIf. Wire comparison is the Reims VGPU encoder's enum
         // (not MTLCompareFunction): Equal=0 for buffer==reference (probed).
-        let mut session = MetalBackend.open_compute_session(1).expect("session");
+        let mut session = MetalBackend
+            .open_compute_session(DispatchType::Concurrent)
+            .expect("session");
         let start = ComputeCommand {
             kind: Kind::ControlStartIf,
             condition_buffer_ref: 8,
@@ -412,12 +432,7 @@ mod tests {
             attribute_stride: 0,
             has_attribute_stride: false,
         });
-        let dcmd = ComputeCommand {
-            kind: Kind::DispatchThreadgroups,
-            grid: Size3 { x: 1, y: 1, z: 1 },
-            threads_per_threadgroup: Size3 { x: 4, y: 1, z: 1 },
-            ..Default::default()
-        };
+        let dcmd = threadgroups([1, 1, 1], [4, 1, 1]);
         assert_eq!(
             MetalBackend.execute_dispatch_nested(
                 &mut state,

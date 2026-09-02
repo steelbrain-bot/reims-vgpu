@@ -5,6 +5,28 @@
 
 use super::*;
 
+use reims_vgpu_protocol::decode::compute as protocol_compute;
+
+/// A `dispatchThreadgroups:threadsPerThreadgroup:` record, as the lift makes it.
+fn threadgroups(grid: [u64; 3], tg: [u64; 3]) -> DispatchRecord {
+    DispatchRecord::Threadgroups(protocol_compute::Threadgroups {
+        groups: extent(grid),
+        threads_per_group: extent(tg),
+    })
+}
+
+fn extent([width, height, depth]: [u64; 3]) -> protocol_compute::Extent {
+    protocol_compute::Extent {
+        width,
+        height,
+        depth,
+    }
+}
+
+fn indirect(buffer_ref: u32, offset: u64) -> protocol_compute::IndirectRef {
+    protocol_compute::IndirectRef { buffer_ref, offset }
+}
+
 /// A rail payload for the tests below that are about what the neutral staging
 /// rails *produce* — geometry, format, bytes, writeback destination — rather
 /// than about what either rail keeps of it.
@@ -496,27 +518,27 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
         session: None,
         block: None,
     };
+    // The sequencing records are the ledger's unsettled rows, so they keep this
+    // device's decoder and its own entry point.
     let mut cmd = ComputeCommand::default();
     // Empty start-do-while encodes without a condition buffer.
-    cmd.kind = Kind::ControlStartDoWhile;
-    let st = apply_record(&mut state, &mut host, 1, &cmd, &mut seg);
+    cmd.kind = compute::Kind::ControlStartDoWhile;
+    let st = apply_sequencing_record(&mut state, &mut host, 1, &cmd, &mut seg);
     assert!(
         matches!(
             st,
-            Some(ComputeStatus::Ok)
-                | Some(ComputeStatus::NoMetal(_))
-                | Some(ComputeStatus::MetalFailed(_))
+            ComputeStatus::Ok | ComputeStatus::NoMetal(_) | ComputeStatus::MetalFailed(_)
         ),
         "unexpected {st:?}"
     );
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.kind = compute::Kind::ExecuteCommandsInBuffer;
     cmd.indirect_command_buffer_ref = 99;
-    let st = apply_record(&mut state, &mut host, 1, &cmd, &mut seg);
+    let st = apply_sequencing_record(&mut state, &mut host, 1, &cmd, &mut seg);
     // Missing object-list entry → MissingBuffer; still latches sequencing.
     assert!(
         matches!(
             st,
-            Some(ComputeStatus::MissingBuffer(_)) | Some(ComputeStatus::Unsupported(_))
+            ComputeStatus::MissingBuffer(_) | ComputeStatus::Unsupported(_)
         ),
         "unexpected {st:?}"
     );
@@ -584,12 +606,11 @@ fn resolve_indirect_threadgroups_from_buffer() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroupsIndirect;
-    cmd.indirect_buffer_ref = 7;
-    cmd.indirect_buffer_offset = 0;
-    cmd.threads_per_threadgroup = compute::Size3 { x: 8, y: 1, z: 1 };
-    let dims = resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
+    let record = DispatchRecord::ThreadgroupsIndirect(protocol_compute::ThreadgroupsIndirect {
+        source: indirect(7, 0),
+        threads_per_group: extent([8, 1, 1]),
+    });
+    let dims = resolve_dispatch_dims(&mut state, &host, 1, &record).unwrap();
     // The grid comes from the indirect buffer and the threadgroup from the
     // wire, which is the whole point of this arm — asserting them as one flat
     // septuple could not say which source each half came from.
@@ -634,17 +655,14 @@ fn dispatch_threads_indirect_reads_both_extents_from_the_buffer() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadsIndirect;
-    cmd.indirect_buffer_ref = 7;
-    cmd.indirect_buffer_offset = 0;
-    cmd.threads_per_threadgroup = compute::Size3 {
-        x: 99,
-        y: 99,
-        z: 99,
-    };
+    // The fully indirect dispatch states no threadgroup extent at all, so
+    // there is no field here to fill with a decoy — the record's shape is the
+    // claim that both halves come from the buffer.
+    let record = DispatchRecord::ThreadsIndirect(protocol_compute::ThreadsIndirect {
+        source: indirect(7, 0),
+    });
 
-    let dims = resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
+    let dims = resolve_dispatch_dims(&mut state, &host, 1, &record).unwrap();
     assert_eq!(
         dims.grid,
         Extent3 {
@@ -684,29 +702,26 @@ fn the_zero_threadgroup_wire_shape_is_refused_by_name() {
     assert!(state.map_surface(3));
     assert!(state.set_mapping_geom(3, 1440, 1080, 0x73));
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 {
-        x: 45,
-        y: u64::MAX,
-        z: 1,
-    };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
     assert_eq!(
-        resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap_err(),
+        resolve_dispatch_dims(
+            &mut state,
+            &host,
+            1,
+            &threadgroups([45, u64::MAX, 1], [32, 0, 1])
+        )
+        .unwrap_err(),
         ComputeStatus::BadGrid("compute_grid_dim_range"),
     );
     // Each garbage component refuses on its own account: `u64::MAX` overflows
     // `u32` and `0` is not a dispatchable extent.
-    cmd.grid.y = 3;
     assert_eq!(
-        resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap_err(),
+        resolve_dispatch_dims(&mut state, &host, 1, &threadgroups([45, 3, 1], [32, 0, 1]))
+            .unwrap_err(),
         ComputeStatus::BadGrid("compute_grid_dim_range"),
         "tg.y == 0 must still refuse"
     );
-    cmd.threads_per_threadgroup.y = 32;
     assert!(
-        resolve_dispatch_dims(&mut state, &host, 1, &cmd).is_ok(),
+        resolve_dispatch_dims(&mut state, &host, 1, &threadgroups([45, 3, 1], [32, 32, 1])).is_ok(),
         "a wholly sane grid must pass"
     );
 }
@@ -866,11 +881,8 @@ fn dispatch_missing_pipeline() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     let acc = ComputeAccum::default();
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let record = threadgroups([1, 1, 1], [1, 1, 1]);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     // The slug names *which* pipeline check refused, and it differs by rail:
     // both open with `pipeline_ref == 0`, and before the status carried a
     // reason the two were indistinguishable in the log.
@@ -915,15 +927,8 @@ fn dispatch_nometal_with_texture_binds() {
             has_attribute_stride: false,
         }],
     );
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 {
-        x: 60,
-        y: u64::MAX,
-        z: 1,
-    };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
-    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let record = threadgroups([60, u64::MAX, 1], [32, 0, 1]);
+    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     assert!(
         matches!(
             st,
@@ -941,7 +946,9 @@ fn dispatch_nometal_with_texture_binds() {
     // through it — `ComputeSession` has no rail variant for this backend, so
     // there is no such value to build.
     assert_eq!(
-        VulkanBackend::new().open_compute_session(0).err(),
+        VulkanBackend::new()
+            .open_compute_session(DispatchType::Serial)
+            .err(),
         Some(ComputeStatus::NoMetal("compute_session_no_vulkan_path"))
     );
 }
@@ -959,11 +966,8 @@ fn dispatch_missing_pipeline_not_nometal() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     let acc = ComputeAccum::default();
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let record = threadgroups([1, 1, 1], [1, 1, 1]);
+    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     assert_eq!(
         st,
         ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
@@ -1144,11 +1148,8 @@ fn dispatch_buffer_kernel_mul3add1() {
     }
     acc.bind_buffers(0, &bindings);
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 4, y: 1, z: 1 };
-    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let record = threadgroups([1, 1, 1], [4, 1, 1]);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     assert!(
         matches!(
             st,
@@ -1187,13 +1188,10 @@ fn dispatch_missing_texture_fails() {
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(1);
     acc.bind_textures(0, &[RefBinding { ref_: 99 }]);
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
+    let record = threadgroups([1, 1, 1], [1, 1, 1]);
     // Missing pipeline object → MissingPipeline before texture stage.
     // Non-Apple metal stubs short-circuit to NoMetal (Linux product).
-    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     assert!(matches!(
         st,
         ComputeStatus::MissingPipeline(_)
@@ -2733,71 +2731,6 @@ fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
     assert!(none.and_then(ResidentServe::sample_source).is_none());
 }
 
-/// An `MTLDispatchType` the contract does not declare is named, counted, and
-/// substituted — and the two it does declare cross untouched and unremarked.
-///
-/// `WRITE_DESCRIPTOR` puts this ordinal on the wire unbounded: the decoder
-/// stores `d.dispatch_type.get()` with no range check, so whatever the guest
-/// wrote reaches the accumulator. What used to happen next was
-/// `if x == CONCURRENT { CONCURRENT } else { SERIAL }`, at the far end of the
-/// rail inside `execute_dispatch_metal` — so a guest asking for a dispatch type
-/// this device has no contract for got a *serial* encoder, silently, on the one
-/// arm that read the field at all.
-///
-/// Both halves are the test. A substitution nobody can see is the failure this
-/// commit exists to end; a line spent on the ordinary `Serial` and `Concurrent`
-/// records would be a flood on a per-segment path and would bury the one line
-/// that means something.
-#[test]
-fn an_undeclared_dispatch_type_is_named_and_counted_before_it_becomes_serial() {
-    use crate::protocol::dispatch::{MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL};
-    use crate::runtime::drain::store_route_count;
-
-    let before = store_route_count("compute_dispatch_type_unknown");
-
-    let cap = crate::observe::FailCapture::start();
-    assert_eq!(
-        accepted_dispatch_type(3, MTL_DISPATCH_TYPE_SERIAL),
-        MTL_DISPATCH_TYPE_SERIAL
-    );
-    assert_eq!(
-        accepted_dispatch_type(3, MTL_DISPATCH_TYPE_CONCURRENT),
-        MTL_DISPATCH_TYPE_CONCURRENT
-    );
-    assert!(
-        cap.lines().is_empty(),
-        "a declared dispatch type must spend no line: {:?}",
-        cap.lines()
-    );
-    assert_eq!(
-        store_route_count("compute_dispatch_type_unknown"),
-        before,
-        "a declared dispatch type is not a substitution"
-    );
-    drop(cap);
-
-    // An ordinal outside the pair: substituted, named once, counted every time.
-    let cap = crate::observe::FailCapture::start();
-    for _ in 0..3 {
-        assert_eq!(
-            accepted_dispatch_type(3, 0x5e01),
-            MTL_DISPATCH_TYPE_SERIAL,
-            "an unrecognised dispatch type encodes Serial"
-        );
-    }
-    let line = cap.one("compute_dispatch_type");
-    assert!(
-        line.contains("reason=compute_dispatch_type_unknown")
-            && line.contains(" task=3 declared=24065"),
-        "the substitution must name the value that caused it: {line}"
-    );
-    assert_eq!(
-        store_route_count("compute_dispatch_type_unknown"),
-        before + 3,
-        "the line is deduped per value; the count is not"
-    );
-}
-
 /// A stage-input the decoder had to truncate must refuse its pipeline, not
 /// arrive as "this kernel declares no stage-input".
 ///
@@ -2946,14 +2879,11 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
     let host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 4, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 8, y: 1, z: 1 };
+    let record = threadgroups([4, 1, 1], [8, 1, 1]);
 
     let mut acc = ComputeAccum::default();
     assert!(
-        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_ok(),
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc).is_ok(),
         "the dispatch resolves before any bind, so a later refusal is the bind's"
     );
 
@@ -2962,7 +2892,7 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
         acc.textures.is_empty(),
         "the slot is past the table, so there was nowhere to record it"
     );
-    let refused = resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc)
+    let refused = resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc)
         .expect_err("a dispatch missing a binding the guest asked for is refused");
     assert_eq!(
         refused,
@@ -2972,7 +2902,7 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
     // Sticky: the binding stays unrepresentable, so the next dispatch is
     // refused too rather than quietly running without it.
     assert!(
-        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_err(),
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc).is_err(),
         "one refused bind refuses every dispatch that would have used it"
     );
 
@@ -2980,7 +2910,7 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
     // holds equal to what the guest asked for again.
     acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 3, &[RefBinding { ref_: 0 }]);
     assert!(
-        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_ok(),
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc).is_ok(),
         "a nil bind at the refused slot retires the refusal with it"
     );
 
@@ -2988,7 +2918,7 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
     acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 5, &[RefBinding { ref_: 9 }]);
     acc.bind_textures(2, &[RefBinding { ref_: 0 }]);
     assert!(
-        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_err(),
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc).is_err(),
         "clearing an unrelated slot leaves the refused one refused"
     );
 }

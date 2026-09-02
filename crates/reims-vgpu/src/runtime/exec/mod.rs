@@ -1398,6 +1398,59 @@ fn handle_compute_record<M: HostMemory + HostOps>(
         }
         _ => {}
     }
+    // The seventeen records the ledger has settled. `classify` put them here
+    // and `protocol::decode::compute` owns their layout, so the class and the
+    // fields are two answers from two owners instead of one `Kind` assigned
+    // while the fields were being read.
+    if matches!(
+        reims_vgpu_protocol::closure::find(Rail::Compute, opcode)
+            .and_then(reims_vgpu_core::operation::classify),
+        Some(OperationHome::Stream(OperationClass::Compute))
+    ) {
+        let Some(framed) = frame_compute_record(task_id, opcode, cmd_bytes) else {
+            return;
+        };
+        match reims_vgpu_protocol::decode::compute::decode(&framed) {
+            Ok(record) => {
+                let pipeline_ref = seg.acc.pipeline_ref;
+                match compute_exec::apply_record(state, host, task_id, &record, seg) {
+                    // `None` is an accumulator-only record, not a loss: the
+                    // record was applied, `apply_record` simply had no
+                    // execution status to report for it.
+                    None | Some(ComputeStatus::Ok) => {}
+                    Some(st) => note_compute_refusal(st, task_id, pipeline_ref, &record.kind()),
+                }
+            }
+            Err(refusal) => {
+                // The pass's dispatch type is the one enumerated field on this
+                // encoder, and a word outside `MTLDispatchType` is refused at
+                // the lift rather than folded onto its nearest neighbour. The
+                // census slug the device used to raise when it substituted
+                // `Serial` is kept, because what that counter was for — the
+                // evidence that decides whether an unrecognised ordinal is a
+                // guest asking for something new or this device reading the
+                // wrong offset — is still exactly what a firing would mean.
+                if matches!(
+                    refusal,
+                    reims_vgpu_protocol::decode::DecodeRefusal::UndefinedOrdinal {
+                        field: "dispatch_type",
+                        ..
+                    }
+                ) {
+                    crate::runtime::drain::note_store_route("compute_dispatch_type_unknown");
+                }
+                note_compute_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+            }
+        }
+        return;
+    }
+    // What is left is the eleven rows the ledger has **not** settled — the
+    // fence pair, the seven control-flow records and the two indirect-command
+    // executions — and this device decodes them itself. They are not declines
+    // like the blit rail's unsettled four: each one drives real work, on
+    // evidence this project gathered outside the ledger, and holding them back
+    // is what keeps a settled record and an unsettled one from sharing a
+    // decoder.
     let cmd = match compute::decode(cmd_bytes) {
         Ok(c) => c,
         // Same silent drop as the render path above.
@@ -1428,43 +1481,6 @@ fn handle_compute_record<M: HostMemory + HostOps>(
                 action,
             );
         }
-        ComputeKind::BufferBind | ComputeKind::BufferBindAttributeStride => {
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-        }
-        ComputeKind::TextureBind => {
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-        }
-        ComputeKind::SamplerBind | ComputeKind::SamplerLod => {
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-        }
-        ComputeKind::Pipeline
-        | ComputeKind::BufferOffset
-        | ComputeKind::BufferOffsetAttributeStride
-        | ComputeKind::DispatchType
-        | ComputeKind::StageInRegion
-        | ComputeKind::StageInRegionIndirect
-        | ComputeKind::ThreadgroupMemory
-        | ComputeKind::ImageblockDimensions
-        | ComputeKind::BarrierResources
-        | ComputeKind::BarrierScope
-        | ComputeKind::UseHeaps
-        | ComputeKind::UseResources
-        | ComputeKind::CompressedTextureFlush => {
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-        }
-        ComputeKind::DispatchThreadgroups
-        | ComputeKind::DispatchThreads
-        | ComputeKind::DispatchThreadgroupsIndirect
-        | ComputeKind::DispatchThreadsIndirect => {
-            let pipeline_ref = seg.acc.pipeline_ref;
-            match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
-                // `None` is an accumulator-only record kind, not a loss: the
-                // record was applied, `apply_record` simply had no execution
-                // status to report for it.
-                None | Some(ComputeStatus::Ok) => {}
-                Some(st) => note_compute_refusal(st, task_id, pipeline_ref, cmd.kind),
-            }
-        }
         ComputeKind::ControlStartDoWhile
         | ComputeKind::ControlEndDoWhile
         | ComputeKind::ControlStartWhile
@@ -1479,26 +1495,31 @@ fn handle_compute_record<M: HostMemory + HostOps>(
             // whether it is dead or perfect.
             crate::runtime::drain::note_store_route("compute_ctrl_seen");
             let pipeline_ref = seg.acc.pipeline_ref;
-            match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
-                None | Some(ComputeStatus::Ok) => {}
-                Some(st) => {
+            match compute_exec::apply_sequencing_record(state, host, task_id, &cmd, seg) {
+                ComputeStatus::Ok => {}
+                st => {
                     out.compute_control_fail += 1;
-                    note_compute_refusal(st, task_id, pipeline_ref, cmd.kind);
+                    note_compute_refusal(st, task_id, pipeline_ref, &cmd.kind);
                 }
             }
         }
         ComputeKind::ExecuteCommandsInBuffer | ComputeKind::ExecuteCommandsInBufferIndirect => {
             crate::runtime::drain::note_store_route("compute_icb_seen");
             let pipeline_ref = seg.acc.pipeline_ref;
-            match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
-                None | Some(ComputeStatus::Ok) => {}
-                Some(st) => {
+            match compute_exec::apply_sequencing_record(state, host, task_id, &cmd, seg) {
+                ComputeStatus::Ok => {}
+                st => {
                     out.compute_icb_fail += 1;
-                    note_compute_refusal(st, task_id, pipeline_ref, cmd.kind);
+                    note_compute_refusal(st, task_id, pipeline_ref, &cmd.kind);
                 }
             }
         }
-        _ => {}
+        // A settled row reaching this decoder is the routing above disagreeing
+        // with the ledger, not a guest case.
+        other => crate::observe::fail(format!(
+            "compute_record_misrouted task={task_id} opcode={opcode:#x} kind={other:?} (the \
+             ledger settled this row and it reached the unsettled decoder)"
+        )),
     }
 }
 
@@ -1527,17 +1548,31 @@ fn frame_compute_record<'a>(
 }
 
 /// Count and report one compute record a protocol decoder refused.
+///
+/// Latched, because the guest re-encodes the same stream every frame and an
+/// unliftable record would otherwise be one line per segment. The token is the
+/// opcode, widened by the offending value when the refusal names one: two
+/// different undeclared dispatch types are two different questions about the
+/// contract, and collapsing them onto the opcode would answer only the first.
+///
+/// The refusal renders its own rail and opcode, so neither is repeated here.
 fn note_compute_record_refused(
     task_id: u32,
     opcode: u32,
     len: usize,
     refusal: &reims_vgpu_protocol::decode::DecodeRefusal,
 ) {
+    use reims_vgpu_protocol::decode::DecodeRefusal;
+    let token = match refusal {
+        DecodeRefusal::UndefinedOrdinal { value, .. } => {
+            u64::from(opcode) | (u64::from(*value) << 32)
+        }
+        _ => u64::from(opcode),
+    };
     crate::observe::Emit::decline("compute_record", refusal)
         .field("task", task_id)
-        .field("opcode", format!("{opcode:#x}"))
         .field("len", len)
-        .fail();
+        .fail_once(token);
 }
 
 /// Price one compute-encoder barrier, which this device answers by doing

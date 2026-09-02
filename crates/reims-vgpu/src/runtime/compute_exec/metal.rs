@@ -312,7 +312,7 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     acc: &ComputeAccum,
-    cmd: &ComputeCommand,
+    dispatch: &DispatchRecord,
     session: Option<&mut crate::runtime::compute_session::metal::MetalSession>,
 ) -> ComputeStatus {
     use crate::backend::metal::abi::texture_binds_as_storage;
@@ -345,16 +345,16 @@ pub(crate) fn execute_dispatch_metal<M: HostMemory + HostOps>(
         grid,
         threadgroup: tg,
         dispatch_threads,
-    } = match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
+    } = match resolve_dispatch_dims_reported(state, host, task_id, dispatch, acc) {
         Ok(v) => v,
         Err(e) => return e,
     };
 
-    // No narrowing here: `accepted_dispatch_type` scored this ordinal when the
-    // record was applied, on both arms, and named the substitution if it made
-    // one. Re-deciding it at the encode would be the same rule in a second
-    // place, and the second place is the one that could not report.
-    let dispatch_type = acc.dispatch_type;
+    // No narrowing here, and none possible: the accumulator holds a
+    // `DispatchType`, which `reims_vgpu_protocol` refused to build from a word
+    // outside the enumeration. The ordinal is spelled once, by the type, on its
+    // way across the ABI boundary.
+    let dispatch_type = acc.dispatch_type.word();
 
     // Stage-input descriptor from pipeline (optional).
     let reims_vgpu_stage_input = pipeline.stage_input.as_ref().map(stage_input_to_apv);

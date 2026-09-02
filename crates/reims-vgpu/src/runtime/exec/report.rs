@@ -18,7 +18,6 @@
 
 use super::{ChainAbandonDecline, StreamAccum, StreamDrawDrop};
 use crate::runtime::compute_exec::ComputeStatus;
-use crate::runtime::decode::compute::Kind as ComputeKind;
 use crate::runtime::decode::render::{AttachSubresource, ScissorRect};
 use crate::runtime::draw::EncodeStatus;
 use reims_vgpu_wire::ops::render as wire_render;
@@ -35,11 +34,18 @@ use reims_vgpu_wire::ops::render as wire_render;
 /// every frame, so a persistent refusal would otherwise be a per-frame flood —
 /// while a *different* pipeline failing the same check is a distinct event and
 /// still gets its line.
+///
+/// `kind` is taken as a `Debug` rather than as one enum because the three arms
+/// no longer share a vocabulary: a dispatch names a
+/// `reims_vgpu_protocol::compute::ComputeKind`, while the control-flow and
+/// indirect-command records the ledger has not settled name this device's own.
+/// Widening one of those two to cover the other would put settled and unsettled
+/// rows in one type, which is the confusion the ledger's class exists to end.
 pub(super) fn note_compute_refusal(
     status: ComputeStatus,
     task_id: u32,
     pipeline_ref: u32,
-    kind: ComputeKind,
+    kind: &dyn std::fmt::Debug,
 ) {
     // One event token for the whole rail, with `kind=` separating dispatch
     // from control-flow from ICB: the emission gate reads the *literal* first
