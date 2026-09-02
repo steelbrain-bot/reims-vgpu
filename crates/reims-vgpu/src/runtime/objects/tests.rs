@@ -2990,6 +2990,98 @@ fn one_allocation_has_one_identity_and_a_repoint_gives_it_another() {
     );
 }
 
+/// A guest mapping's surface becomes a canonical backing identity, and it is
+/// the mapping's generation that separates its incarnations.
+///
+/// The other half of the identity from
+/// `one_allocation_has_one_identity_and_a_repoint_gives_it_another`, and the
+/// half whose incarnation counter is not the window's. A re-point of an object
+/// that owns a mapping never advances the window counter — it drops the page
+/// list and bumps `map_generation` — so an identity that read the window would
+/// sit still across the one packet that says the pages have moved.
+///
+/// The last assertion is the one that makes the two halves one identity space:
+/// a mapping-reached and an address-reached piece of storage must never arrive
+/// at the same number, because the dependency compiler compares the number with
+/// no idea which route minted it.
+#[test]
+fn a_mapping_has_one_identity_and_a_replaced_page_list_gives_it_another() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (mid, other) = (7u32, 8u32);
+    // Taken first so the disjointness check at the end has a window identity
+    // that predates every mapping mint.
+    let first_window = state.backing_identity(1, 0x2_0000);
+
+    assert_eq!(
+        super::mapping_backing_id(&state, mid),
+        Err(super::MappingBackingRefusal::Unlisted),
+        "a mapping id this device holds nothing for names no storage, and a \
+         number minted for it would be a number for the id itself"
+    );
+
+    // A geometry declaration creates the entry without mapping a surface into
+    // it. The slot exists; the storage does not.
+    assert!(state.set_mapping_geom(mid, 1920, 1080, 0));
+    assert_eq!(
+        super::mapping_backing_id(&state, mid),
+        Err(super::MappingBackingRefusal::Unmapped),
+        "an entry the guest has never mapped a surface into is still a slot \
+         number rather than storage"
+    );
+
+    assert!(state.map_surface(mid));
+    assert!(state.map_surface(other));
+    let before = super::mapping_backing_id(&state, mid).expect("a mapped surface is storage");
+    assert_eq!(
+        super::mapping_backing_id(&state, mid),
+        Ok(before),
+        "asking twice is not an event, and an identity that moved when it was \
+         read would never compare equal to itself"
+    );
+    let second = super::mapping_backing_id(&state, other).expect("also mapped");
+    assert_ne!(second, before, "a different mapping is different storage");
+
+    let e = state.mappings.get_mut(&mid).expect("just mapped");
+    DeviceState::bump_map_generation(e);
+    let after = super::mapping_backing_id(&state, mid).expect("still mapped");
+    assert_ne!(
+        after, before,
+        "the page list under this mapping has been replaced, and an equal \
+         identity would let a claim on the old pages be satisfied by the new"
+    );
+    assert_eq!(
+        super::mapping_backing_id(&state, mid),
+        Ok(after),
+        "the new incarnation is an identity too, not a value that moves every \
+         time it is asked for"
+    );
+
+    // Every identity either route has minted, pairwise distinct — the whole
+    // reason one is a `u64` both routes may produce. `first_window` was taken
+    // before any mapping was asked about, so a mapping table with its own
+    // counter would have handed its first mint that very number.
+    let mut minted = vec![
+        ("the window asked for before any mapping", first_window),
+        ("the mapping's first incarnation", before),
+        ("a second mapping", second),
+        ("the first mapping's replaced page list", after),
+        (
+            "a window asked for after the mapping mints",
+            state.backing_identity(1, 0x3_0000),
+        ),
+    ];
+    minted.sort_by_key(|&(_, id)| id);
+    for pair in minted.windows(2) {
+        assert_ne!(
+            pair[0].1, pair[1].1,
+            "{} and {} are unrelated storage, and storage reached by address and \
+             storage reached through a mapping share one identity space — two \
+             counters would make them alias",
+            pair[0].0, pair[1].0
+        );
+    }
+}
+
 /// The peer question the hot per-reference state asks is answered from the
 /// construction cache, and answers nothing when the reference is the only name
 /// for its storage.

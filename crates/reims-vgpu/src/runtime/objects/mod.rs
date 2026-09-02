@@ -3009,6 +3009,67 @@ pub fn backing_id<M: HostMemory>(
     }
 }
 
+/// Why a guest mapping's surface has no canonical backing identity.
+///
+/// Both arms are "the guest has not said there is a surface here yet", never
+/// "this device could not work it out". Storage reached through a mapping needs
+/// no descriptor read and no page walk to be *identified* — the mapping id and
+/// its generation are the identity — so there is no ladder of ways to fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingBackingRefusal {
+    /// This device holds no entry at that mapping id.
+    Unlisted,
+    /// An entry exists but the guest has never mapped a surface into it.
+    ///
+    /// Entries are created by any of several statements about a slot — a
+    /// geometry declaration, a validity quad — and one that has never carried a
+    /// MAP or an attach names no storage to identify. Minting for it would hand
+    /// an identity to a slot number rather than to storage, which is the
+    /// name-derived id `reims_vgpu_core::access::BackingId` rules out.
+    Unmapped,
+}
+
+impl MappingBackingRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Unlisted => "mapping_backing_id_unlisted",
+            Self::Unmapped => "mapping_backing_id_unmapped",
+        }
+    }
+}
+
+/// The canonical backing identity of the storage a guest mapping's surface
+/// occupies.
+///
+/// [`backing_id`]'s other half, and the answer to
+/// `reims_vgpu_core::resolve::MappingResolver`. The two are separate functions
+/// over separate namespaces — a mapping id and an object-list reference arrive
+/// as `u32`s that overlap numerically and name unrelated things — but they mint
+/// into one identity space, so a mapping-reached and an address-reached piece of
+/// storage can never collide. `crate::model::BackingWindowRefs` states how.
+///
+/// The incarnation is the mapping's own `map_generation` rather than the window
+/// counter, and `DeviceState::mapping_backing_identity` says why that is forced
+/// rather than chosen.
+///
+/// # Errors
+///
+/// [`MappingBackingRefusal`], for the two ways a mapping id names no surface.
+pub fn mapping_backing_id(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> Result<reims_vgpu_core::access::BackingId, MappingBackingRefusal> {
+    let entry = state
+        .mappings
+        .get(&mapping_id)
+        .ok_or(MappingBackingRefusal::Unlisted)?;
+    if !entry.mapped {
+        return Err(MappingBackingRefusal::Unmapped);
+    }
+    Ok(state.mapping_backing_identity(mapping_id, entry.map_generation))
+}
+
 /// Which of the three "no window" answers this object is.
 ///
 /// Split from [`backing_id`] so the classification is exhaustive over the

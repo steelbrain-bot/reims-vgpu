@@ -836,12 +836,43 @@ impl TaskResources {
     }
 }
 
-/// The first object reference seen at each guest-VA window, per task.
+/// The first object reference seen at each guest-VA window, per task, and the
+/// canonical backing identity of every piece of storage this device can name.
 ///
 /// Behind a lock for the reason [`TaskResources`] is: the claim is made on the
 /// resolve path, which holds [`DeviceState`] shared.
+///
+/// # Two tables, one counter
+///
+/// Storage is reached two ways on this interface and they are not two answers
+/// about one thing: an object names pages *by address* in its own task, or it
+/// reaches them *through a mapping*, and `crate::runtime::objects::replace_physical`
+/// already treats the two as separate counters because a re-point advances
+/// exactly one of them. So each route interns on its own key — a window on
+/// `(task, base)` with [`DeviceState::storage_incarnation`], a mapping on its id
+/// with [`MappingEntry::map_generation`].
+///
+/// **They share [`Self::next_id`], and that is the load-bearing part.** The
+/// identity is a bare `u64` that the dependency compiler compares for equality
+/// with no idea which route minted it, so two tables with two counters would
+/// hand a window and a mapping the same number and make unrelated storage alias
+/// — false equality, which hands storage back under a live reader. One monotone
+/// counter makes the two key spaces one identity space by construction.
+///
+/// Nothing needs the reverse guarantee — that one piece of storage cannot be
+/// reached by both routes and so get two numbers — because the routes are
+/// disjoint by object type rather than by convention:
+/// `crate::runtime::objects::backing_id` answers by address only for buffers and
+/// address-named textures, and refuses the two mapping-named texture types to
+/// the mapping route; the surface-backing object a mapping's pages are walked
+/// from is `OBJECT_TYPE_BACKING`, which the address route names no storage for
+/// at all.
 pub struct BackingWindowRefs {
     windows: Mutex<BTreeMap<(u32, u64), WindowFacts>>,
+    /// The identity of each mapping's surface storage, at the incarnation it
+    /// was minted for. See the type doc for why this is a second table and not
+    /// a second counter.
+    mappings: Mutex<BTreeMap<u32, MappingFacts>>,
     /// The next dense backing identity to hand out.
     ///
     /// Monotone and never reused, which is the whole of what makes an id an
@@ -875,10 +906,26 @@ struct WindowFacts {
     id: u64,
 }
 
+/// What this device knows about the identity of one mapping's surface storage.
+///
+/// The mapping analogue of [`WindowFacts`], minus the claim: a mapping has no
+/// "first reference" because it is not reached by a reference at all. It holds
+/// one identity rather than a history for the same reason — nothing mints an
+/// identity it already holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MappingFacts {
+    /// The [`MappingEntry::map_generation`] [`Self::id`] was minted for.
+    map_generation: u32,
+    /// The canonical backing identity of this mapping's surface at that
+    /// generation.
+    id: u64,
+}
+
 impl Default for BackingWindowRefs {
     fn default() -> Self {
         Self {
             windows: Mutex::new(BTreeMap::new()),
+            mappings: Mutex::new(BTreeMap::new()),
             // Zero is never handed out, so a zeroed structure cannot read as a
             // valid identity -- the same rule `SlotGeneration` follows.
             next_id: Mutex::new(1),
@@ -889,8 +936,10 @@ impl Default for BackingWindowRefs {
 impl std::fmt::Debug for BackingWindowRefs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let claims = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let mappings = self.mappings.lock().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("BackingWindowRefs")
             .field("windows", &claims.len())
+            .field("mappings", &mappings.len())
             .finish()
     }
 }
@@ -973,6 +1022,34 @@ impl BackingWindowRefs {
         });
         if facts.id == 0 || facts.incarnation != incarnation {
             facts.incarnation = incarnation;
+            facts.id = candidate;
+        }
+        facts.id
+    }
+
+    /// The identity of this mapping's surface storage at this generation,
+    /// minting one if the mapping is new or its page list has been replaced
+    /// since it was last asked.
+    ///
+    /// The window route's [`Self::identity`] with the other key, including the
+    /// mint-outside-the-lock and the discard-unspent: an identity is never
+    /// reused, so an unspent one is a gap in the sequence and not a hazard.
+    ///
+    /// The table is bounded by the mapping namespace because a mapping slot is
+    /// never removed from [`DeviceState::mappings`] — it is re-generationed in
+    /// place — which is also what makes one entry per id sound. A recycled slot
+    /// carries a bumped `map_generation` (every writer of the page list bumps
+    /// it), so `(mapping, generation)` never repeats and a later surface at the
+    /// same id cannot inherit the previous one's number.
+    fn mapping_identity(&self, mapping_id: u32, map_generation: u32) -> u64 {
+        let candidate = self.mint();
+        let mut mappings = self.mappings.lock().unwrap_or_else(|e| e.into_inner());
+        let facts = mappings.entry(mapping_id).or_insert(MappingFacts {
+            map_generation,
+            id: 0,
+        });
+        if facts.id == 0 || facts.map_generation != map_generation {
+            facts.map_generation = map_generation;
             facts.id = candidate;
         }
         facts.id
@@ -3789,6 +3866,32 @@ impl DeviceState {
             base,
             self.storage_incarnation(task_id, base),
         ))
+    }
+
+    /// The canonical identity of the storage behind a guest mapping's surface,
+    /// right now.
+    ///
+    /// [`Self::backing_identity`]'s other half, for the storage this device
+    /// reaches through a mapping rather than by an address in a task. Same
+    /// identity space, same interning, same reason it is interned; the
+    /// difference is which incarnation counter it mixes in, and that difference
+    /// is not a choice. A `CmdReplacePhysical` naming an object that owns a
+    /// mapping does not advance the window counter at all — it drops the page
+    /// list and bumps [`MappingEntry::map_generation`], which is the announcement
+    /// that these are different pages. An identity derived from the window
+    /// would sit still across it, and false equality here hands the old frames
+    /// back under a live reader.
+    ///
+    /// Takes the generation from the caller rather than reading the mapping,
+    /// because the caller has already had to find the entry to know there is
+    /// one; `crate::runtime::objects::mapping_backing_id` is that caller and is
+    /// where a missing mapping is named.
+    #[must_use]
+    pub fn mapping_backing_identity(&self, mapping_id: u32, map_generation: u32) -> BackingId {
+        BackingId(
+            self.backing_window_refs
+                .mapping_identity(mapping_id, map_generation),
+        )
     }
 
     /// Remember that this reference shares its allocation with another live
