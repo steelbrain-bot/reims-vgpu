@@ -10,11 +10,19 @@
 //! the cutover and **nothing joined them** — the model could describe every
 //! packet this device receives and could be handed none of them.
 //!
-//! This is that join, and it is a pure function: no device state is read, no
-//! guest memory is touched, nothing is mutated. Everything it cannot answer
-//! from its arguments it returns as a named [`Gap`] rather than approximating,
-//! so the set of classes that can cross today is a value a test can assert
-//! rather than a claim a reader has to believe.
+//! This is that join. It touches no guest memory and mutates nothing;
+//! everything it cannot answer it returns as a named [`Gap`] rather than
+//! approximating, so the set of classes that can cross today is a value a test
+//! can assert rather than a claim a reader has to believe.
+//!
+//! It is **not** a pure function of the drained packet, and stopped being one
+//! the moment the first namespace gap closed. A ref, a mapping id and a page
+//! frame are numbers whose meaning lives in a namespace, and a bridge that
+//! could not consult one could only ever carry the classes that name nothing —
+//! which is what [`Gap`] was a list of. So the namespaces arrive as
+//! [`Resolvers`]: a bundle rather than a parameter each, because every
+//! remaining gap closes by *adding a resolver*, and a bundle makes that a field
+//! rather than another signature change rippling through every caller.
 //!
 //! # The gaps are the cutover's remaining work, stated
 //!
@@ -43,14 +51,20 @@
 //!   guest table itself.
 //! - **Query** needs its reply destination *resolved* — a backing and a window,
 //!   not the address the request names.
-//! - **Present** needs the accesses its target mapping resolves to.
 //!
-//! None of those is missing decode work: this device resolves all four today.
-//! What it does not have is a *generation-stamped* namespace to resolve them
-//! into, which is the model's, and giving this function a half-resolved answer
-//! would be the adapter between two semantic models that the replacement plan
-//! forbids. So they are gaps, they are named, and they close when their owner
-//! lands — not here.
+//! Present is no longer among them. Its target is a mapping, the device answers
+//! `reims_vgpu_core::resolve::MappingResolver` over that namespace, and the
+//! frame it shows is the whole of that mapping's surface — so the access is an
+//! `AccessKey::Whole` over the resolved backing and nothing about it is
+//! approximated. See [`present_payload`] for the one case that is still
+//! imprecise and why the imprecision is the honest answer there.
+//!
+//! None of the remaining three is missing decode work: this device resolves
+//! them all today. What it does not have is a *generation-stamped* namespace to
+//! resolve them into, which is the model's, and giving this function a
+//! half-resolved answer would be the adapter between two semantic models that
+//! the replacement plan forbids. So they are gaps, they are named, and they
+//! close when their owner lands — not here.
 //!
 //! # Every packet carries a completion word
 //!
@@ -78,6 +92,7 @@ use reims_vgpu_core::control;
 use reims_vgpu_core::identity::{
     ChannelId, CompletionStamp, SessionGeneration, StampSlot, StampValue, StampWait,
 };
+use reims_vgpu_core::resolve::MappingResolver;
 use reims_vgpu_core::session::Packet;
 use reims_vgpu_core::transaction::{classify, Payload, PayloadClass};
 use reims_vgpu_protocol::packets::Channel;
@@ -168,21 +183,6 @@ pub enum Gap {
     /// page frame has no task and no allocation base. That is the term this gap
     /// is actually short of.
     ReplyDestination,
-    /// The accesses the presented mapping resolves to.
-    ///
-    /// The identity half is no longer missing: the device answers
-    /// `reims_vgpu_core::resolve::MappingResolver` in full, over
-    /// `crate::runtime::objects::mapping_backing_id`. What this bridge is not
-    /// given is the resolver itself — it takes no device state, which is what
-    /// makes it a pure function of the drained packet — so closing this is a
-    /// signature change and not a missing derivation.
-    ///
-    /// It is deliberately not closed by handing every present an
-    /// `AccessKey::DomainOnly`. That vocabulary exists for a target that could
-    /// not be resolved and buys submission-domain ordering only; using it where
-    /// the target *can* be resolved would under-order every present on the
-    /// device while reading, from the outside, as a gap that had closed.
-    MappingAccesses,
 }
 
 impl Gap {
@@ -194,7 +194,6 @@ impl Gap {
             Self::ExecResolution => "ingress_needs_exec_resolution",
             Self::Namespaces => "ingress_needs_namespaces",
             Self::ReplyDestination => "ingress_needs_reply_destination",
-            Self::MappingAccesses => "ingress_needs_mapping_accesses",
         }
     }
 }
@@ -211,6 +210,18 @@ impl Gap {
 pub enum Refused {
     Control(control::ResolveRefusal),
     Lifecycle(reims_vgpu_core::lifecycle::ResolveRefusal),
+    /// A present packet's bytes are not a present, or are too short for the
+    /// trailer its form has.
+    Present(reims_vgpu_core::present::ResolveRefusal),
+    /// The accesses built for a present do not describe the frame its packet
+    /// asked for.
+    ///
+    /// Unreachable by construction today — [`present_payload`] builds exactly
+    /// one read of the packet's own target — and carried anyway, because the
+    /// constructor is what holds the packet and its accesses together and a
+    /// bridge that unwrapped it would be asserting a property it had stopped
+    /// letting anything check.
+    PresentAccesses(reims_vgpu_core::transaction::PresentMismatch),
 }
 
 impl Refused {
@@ -221,8 +232,30 @@ impl Refused {
         match self {
             Self::Control(inner) => inner.slug(),
             Self::Lifecycle(inner) => inner.slug(),
+            Self::Present(inner) => inner.slug(),
+            Self::PresentAccesses(inner) => inner.slug(),
         }
     }
+}
+
+/// The namespaces this bridge resolves the guest's numbers in.
+///
+/// **A bundle and not a parameter each.** Three of the model's inputs are still
+/// gaps and every one of them closes by giving this bridge another namespace to
+/// consult; carried as separate arguments, each closure would be a signature
+/// change at every call site, and a call site would be free to pass the mapping
+/// namespace where the object namespace was wanted. Carried as one value with
+/// named fields, a closure adds a field and the compiler names every caller that
+/// has to answer for it.
+///
+/// Borrowed rather than owned, and `dyn` rather than generic: the device is the
+/// only implementor there will ever be, the call is once per packet against a
+/// `BTreeMap` lookup, and a generic here would put a type parameter on
+/// [`packet`] that every caller and every test would have to spell.
+#[derive(Clone, Copy)]
+pub struct Resolvers<'a> {
+    /// Which backing a mapping's surface currently occupies.
+    pub mappings: &'a dyn MappingResolver,
 }
 
 /// Why a drained packet did not become a model packet.
@@ -277,6 +310,7 @@ pub fn packet(
     session: SessionGeneration,
     completion_slot: StampSlot,
     drained: &drain::Packet,
+    resolvers: Resolvers<'_>,
 ) -> Result<Packet, Blocked> {
     let channel = fifo.channel();
     let opcode = drained.opcode;
@@ -296,7 +330,13 @@ pub fn packet(
             Payload::ResourceLifecycle(task_lifetime(channel, opcode, &drained.payload)?)
         }
         Some(PayloadClass::Query) => return Err(blocked(Gap::ReplyDestination)),
-        Some(PayloadClass::Present) => return Err(blocked(Gap::MappingAccesses)),
+        Some(PayloadClass::Present) => Payload::Present(present_payload(
+            fifo,
+            channel,
+            opcode,
+            &drained.payload,
+            resolvers,
+        )?),
         Some(PayloadClass::Control) => Payload::Control(
             control::resolve(channel, opcode, &drained.payload)
                 .map_err(|refusal| Blocked::Refused(Refused::Control(refusal)))?,
@@ -322,6 +362,81 @@ pub fn packet(
         }),
         payload,
     })
+}
+
+/// What a present asks to show, and the one access that orders it.
+///
+/// # A present reads the whole of one surface
+///
+/// The packet names a mapping and a form; it names no byte range, no level and
+/// no slice, because showing a frame is not a subresource operation — the
+/// display reads the surface. So the access is `AccessKey::Whole` over the
+/// backing the mapping resolves to, which is the precision ladder's rung 2 and
+/// is *exact* here rather than approximate: there is no finer answer the packet
+/// contains and none that would order differently, since anything writing any
+/// part of that backing must be ordered before the frame is shown.
+///
+/// It is a read. `reims_vgpu_core::transaction::PresentPayload` enforces that,
+/// and its doc says why: modelled as a writer, a present would reserve a
+/// content version, beat the real writer's, and publish bytes nothing produced.
+///
+/// # The one imprecise case, and why it is not the `DomainOnly` this bridge
+/// refused to use
+///
+/// A mapping the device has no live surface for resolves to no backing. There
+/// is then nothing to name, and `AccessKey::DomainOnly` — "participation is
+/// incomplete, ordering comes from the submission domain alone" — is the
+/// vocabulary for precisely that. That is a different act from handing *every*
+/// present a `DomainOnly`, which is what this gap was deliberately not closed
+/// with: that would have under-ordered every frame on the device while reading,
+/// from outside, as a gap that had closed. Here the imprecision is the target's
+/// and it is counted, so a boot says how many frames were shown against a
+/// mapping this device could not resolve rather than leaving it to inference.
+///
+/// # Errors
+///
+/// [`Blocked::Refused`] when the payload is not a present or is too short for
+/// its own trailer.
+fn present_payload(
+    fifo: Fifo,
+    channel: Channel,
+    opcode: u16,
+    payload: &[u8],
+    resolvers: Resolvers<'_>,
+) -> Result<reims_vgpu_core::transaction::PresentPayload, Blocked> {
+    use reims_vgpu_core::access::{AccessIntent, AccessKey, AccessMode, ResourceKey};
+    use reims_vgpu_core::transaction::PresentPayload;
+
+    let packet = reims_vgpu_core::present::resolve(channel, opcode, payload)
+        .map_err(|refusal| Blocked::Refused(Refused::Present(refusal)))?;
+    let key = match resolvers.mappings.backing(packet.mapping) {
+        Some(backing) => {
+            crate::runtime::drain::note_store_route("ingress_present_target_resolved");
+            AccessKey::Whole(ResourceKey {
+                backing,
+                heap: None,
+            })
+        }
+        None => {
+            // Counted, and counted here rather than left to the rung census, so
+            // the reading distinguishes "this rail shows frames the device
+            // cannot resolve" from "this rail shows no frames".
+            crate::runtime::drain::note_store_route("ingress_present_target_unresolved");
+            AccessKey::DomainOnly
+        }
+    };
+    let access = AccessIntent {
+        domain: fifo.domain(),
+        key,
+        mode: AccessMode::Read,
+        // A present names no shader stage. Zero always means the record carried
+        // none, never that one was dropped.
+        api_stages: 0,
+        input_content_version: None,
+        output_content_version: None,
+    };
+    PresentPayload::new(packet, vec![(packet.mapping, access)])
+        .map_err(|mismatch| Blocked::Refused(Refused::PresentAccesses(mismatch)))
 }
 
 /// The two lifetime commands that name no resource, and the gap for the ten
@@ -379,9 +494,32 @@ mod tests {
     use crate::model::MAX_CHANNELS;
     use reims_vgpu_protocol::packets::LEDGER;
 
-    /// A payload long enough for every control command's own layout. Only the
-    /// two channel-lifetime commands read one at all.
+    /// A payload long enough for every control command's own layout and every
+    /// present trailer. Only the two channel-lifetime commands and the three
+    /// present forms read one at all.
     const ROOMY: usize = 64;
+
+    /// A mapping namespace a test states outright, so what a present resolves
+    /// to is the test's choice and not a device's state.
+    struct Mappings(Vec<u32>);
+
+    impl reims_vgpu_core::resolve::MappingResolver for Mappings {
+        fn backing(
+            &self,
+            mapping: reims_vgpu_core::identity::MappingId,
+        ) -> Option<reims_vgpu_core::access::BackingId> {
+            self.0
+                .contains(&mapping.0)
+                .then(|| reims_vgpu_core::access::BackingId(u64::from(mapping.0) | 1 << 40))
+        }
+    }
+
+    /// A namespace nothing is live in, for the rows whose class never asks.
+    const NOTHING_MAPPED: Mappings = Mappings(Vec::new());
+
+    fn resolvers(mappings: &Mappings) -> Resolvers<'_> {
+        Resolvers { mappings }
+    }
 
     fn drained(opcode: u16) -> drain::Packet {
         drain::Packet {
@@ -418,6 +556,7 @@ mod tests {
                 SessionGeneration::FIRST,
                 StampSlot(0),
                 &drained(row.opcode),
+                resolvers(&NOTHING_MAPPED),
             );
             let expected = match classify(row.channel, row.opcode) {
                 Some(PayloadClass::Control) => None,
@@ -431,7 +570,12 @@ mod tests {
                     .then_some(())
                     .map_or(Some(Gap::Namespaces), |()| None),
                 Some(PayloadClass::Query) => Some(Gap::ReplyDestination),
-                Some(PayloadClass::Present) => Some(Gap::MappingAccesses),
+                // Crosses, and crosses on a namespace nothing is live in: the
+                // target resolves to no backing and the access says so. That
+                // the *unresolved* case still crosses is the assertion — a
+                // bridge that gapped when it could not resolve a mapping would
+                // stop presenting the moment a surface was reconfigured.
+                Some(PayloadClass::Present) => None,
                 None => Some(Gap::Unresolved),
             };
             match (expected, outcome) {
@@ -445,6 +589,7 @@ mod tests {
                         Some(PayloadClass::ResourceLifecycle) => {
                             matches!(built.payload, Payload::ResourceLifecycle(_))
                         }
+                        Some(PayloadClass::Present) => matches!(built.payload, Payload::Present(_)),
                         _ => false,
                     };
                     assert!(
@@ -507,14 +652,15 @@ mod tests {
         )
     }
 
-    /// What crosses is exactly the whole control class plus the two lifetime
-    /// commands that resolve from their own bytes — and nothing else.
+    /// What crosses is exactly the whole control class, the whole present class,
+    /// and the two lifetime commands that resolve from their own bytes — and
+    /// nothing else.
     ///
     /// The counts are spelled out because this is the cutover's own scoreboard:
     /// a gap that closes moves a number here, and a row that quietly changed
     /// class moves one without anybody deciding to.
     #[test]
-    fn what_crosses_is_control_and_the_two_task_lifetime_commands() {
+    fn what_crosses_is_control_present_and_the_two_task_lifetime_commands() {
         let crossing: Vec<_> = LEDGER
             .iter()
             .filter(|row| {
@@ -523,6 +669,7 @@ mod tests {
                     SessionGeneration::FIRST,
                     StampSlot(0),
                     &drained(row.opcode),
+                    resolvers(&NOTHING_MAPPED),
                 )
                 .is_ok()
             })
@@ -531,8 +678,10 @@ mod tests {
         let expected: Vec<_> = LEDGER
             .iter()
             .filter(|row| {
-                classify(row.channel, row.opcode) == Some(PayloadClass::Control)
-                    || is_task_lifetime(row.channel, row.opcode)
+                matches!(
+                    classify(row.channel, row.opcode),
+                    Some(PayloadClass::Control | PayloadClass::Present)
+                ) || is_task_lifetime(row.channel, row.opcode)
             })
             .map(|row| (row.channel, row.opcode))
             .collect();
@@ -541,9 +690,13 @@ mod tests {
             .iter()
             .filter(|row| classify(row.channel, row.opcode) == Some(PayloadClass::Control))
             .count();
+        let present = LEDGER
+            .iter()
+            .filter(|row| classify(row.channel, row.opcode) == Some(PayloadClass::Present))
+            .count();
         assert_eq!(
-            (control, crossing.len()),
-            (23, 27),
+            (control, present, crossing.len()),
+            (23, 3, 30),
             "the ledger's crossing rows changed; what reaches the model is not what the \
              module documentation says it is"
         );
@@ -571,8 +724,14 @@ mod tests {
         drained.payload[DEFINE_TASK_DIRECTORY_PFN..DEFINE_TASK_DIRECTORY_PFN + 4]
             .copy_from_slice(&0x1234u32.to_le_bytes());
 
-        let built = packet(Fifo::ROOT, SessionGeneration::FIRST, StampSlot(0), &drained)
-            .expect("a task definition needs no namespace");
+        let built = packet(
+            Fifo::ROOT,
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &drained,
+            resolvers(&NOTHING_MAPPED),
+        )
+        .expect("a task definition needs no namespace");
         let Payload::ResourceLifecycle(payload) = &built.payload else {
             panic!("a lifetime command must not build another class's payload");
         };
@@ -599,8 +758,14 @@ mod tests {
     fn a_channel_command_too_short_to_name_a_domain_is_refused() {
         let mut short = drained(0x30);
         short.payload.clear();
-        let refusal = packet(Fifo::ROOT, SessionGeneration::FIRST, StampSlot(0), &short)
-            .expect_err("no domain, no transition");
+        let refusal = packet(
+            Fifo::ROOT,
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &short,
+            resolvers(&NOTHING_MAPPED),
+        )
+        .expect_err("no domain, no transition");
         assert!(matches!(refusal, Blocked::Refused(_)));
         assert_eq!(
             refusal.gap(),
@@ -632,6 +797,7 @@ mod tests {
             SessionGeneration::FIRST,
             StampSlot(3),
             &nop,
+            resolvers(&NOTHING_MAPPED),
         )
         .expect("CmdNOP is control");
         assert_eq!(
@@ -654,6 +820,132 @@ mod tests {
             "the raw index used above is not masked by anything, so the assertion that it was \
              masked would hold for a bridge that carried it through untouched"
         );
+    }
+
+    /// A present crosses carrying one read of the backing its target resolves
+    /// to, and the frame's target is the packet's own word rather than a
+    /// default.
+    ///
+    /// Two things a well-formed envelope would pass without: the access is over
+    /// the backing *this* mapping resolved to, and it is a read. A present
+    /// modelled as a writer would reserve a content version, beat the real
+    /// writer's, and publish bytes nothing produced.
+    #[test]
+    fn a_present_crosses_carrying_one_read_of_its_targets_backing() {
+        use reims_vgpu_core::access::{AccessKey, AccessMode, ResourceKey};
+        use reims_vgpu_core::identity::MappingId;
+        use reims_vgpu_core::present::PresentForm;
+        use reims_vgpu_protocol::packets::LEDGER;
+
+        let row = LEDGER
+            .iter()
+            .find(|row| classify(row.channel, row.opcode) == Some(PayloadClass::Present))
+            .expect("the ledger has a present row");
+        let form = PresentForm::of(row.channel, row.opcode).expect("a present row has a form");
+
+        let mut shown = drained(row.opcode);
+        let target = 9u32;
+        let at = form.target_offset();
+        shown.payload[at..at + 4].copy_from_slice(&target.to_le_bytes());
+
+        let live = Mappings(vec![target]);
+        let fifo = fifo_for(row.channel);
+        let built = packet(
+            fifo,
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &shown,
+            resolvers(&live),
+        )
+        .expect("a present resolves in the mapping namespace");
+        let Payload::Present(payload) = &built.payload else {
+            panic!("a present must not build another class's payload");
+        };
+        assert_eq!(
+            payload.packet().mapping,
+            MappingId(target),
+            "the target is the packet's own word, not a default"
+        );
+        let backing = {
+            use reims_vgpu_core::resolve::MappingResolver as _;
+            live.backing(MappingId(target)).expect("live")
+        };
+        assert_eq!(
+            payload.accesses(),
+            &[reims_vgpu_core::access::AccessIntent {
+                domain: fifo.domain(),
+                key: AccessKey::Whole(ResourceKey {
+                    backing,
+                    heap: None,
+                }),
+                mode: AccessMode::Read,
+                api_stages: 0,
+                input_content_version: None,
+                output_content_version: None,
+            }],
+            "one read of the whole of the backing the target resolved to"
+        );
+
+        // The same packet against a namespace the target is not live in. It
+        // still crosses — a frame the device cannot resolve is still a frame the
+        // guest is waiting on — and it says outright that it does not know what
+        // it touches.
+        let unresolved = packet(
+            fifo,
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &shown,
+            resolvers(&NOTHING_MAPPED),
+        )
+        .expect("an unresolvable target is not a missing input");
+        let Payload::Present(payload) = &unresolved.payload else {
+            panic!("still a present");
+        };
+        assert_eq!(
+            payload.accesses()[0].key,
+            AccessKey::DomainOnly,
+            "no backing to name, and the vocabulary for that is not a guess"
+        );
+        assert_eq!(
+            payload.accesses()[0].key.rung(),
+            3,
+            "and it prices itself on the precision ladder as the coarsest rung"
+        );
+    }
+
+    /// A present too short for its own trailer is refused, not shown.
+    ///
+    /// Clamping would present mapping zero and complete the packet in silence,
+    /// which is a frame the guest believes it showed.
+    #[test]
+    fn a_present_too_short_for_its_trailer_is_refused_rather_than_shown() {
+        use reims_vgpu_protocol::packets::LEDGER;
+
+        let row = LEDGER
+            .iter()
+            .find(|row| classify(row.channel, row.opcode) == Some(PayloadClass::Present))
+            .expect("the ledger has a present row");
+        let mut short = drained(row.opcode);
+        short.payload.clear();
+        let refusal = packet(
+            fifo_for(row.channel),
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &short,
+            resolvers(&NOTHING_MAPPED),
+        )
+        .expect_err("no trailer, no frame");
+        assert_eq!(
+            refusal.gap(),
+            None,
+            "a short payload is this guest's bytes, not this device's incompleteness"
+        );
+        assert!(matches!(
+            refusal,
+            Blocked::Refused(Refused::Present(
+                reims_vgpu_core::present::ResolveRefusal::Payload(_)
+            ))
+        ));
     }
 
     /// The device's channel numbering, which is what makes the channel and the
