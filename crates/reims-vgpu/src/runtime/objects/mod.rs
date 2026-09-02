@@ -2084,8 +2084,28 @@ impl reims_vgpu_core::resolve::MappingResolver for DeviceState {
 /// So the reading is taken before the switch is cut, at the two arms that
 /// already decode these lists, against an unmodified guest.
 /// `lifetime_ref_asked` is the denominator — without it a boot where every ref
-/// resolved and a boot where no list packet arrived read the same — and
-/// `lifetime_ref_unnamed` is the number that decides.
+/// resolved and a boot where no list packet arrived read the same.
+///
+/// # It reads twice, because the first reading answered the wrong half
+///
+/// The first driven reading of this census was **49 unnamed of 1339**, which
+/// said lazy declaration leaves a residue and said nothing about what closes it.
+/// Read early in that same boot it was 16 of 17 — which is why a census is
+/// summed over a whole run and never sampled: the cold start had the ratio
+/// inverted, and stopping there would have concluded that lazy declaration was
+/// useless rather than nearly sufficient. So the
+/// census now asks the second question too, at the same site: for a ref
+/// construction has not named, can [`name_resource`] name it from the guest's
+/// own object list? That is what the bridge will do, and
+/// `lifetime_ref_named_on_demand` is the count of refs it works for.
+/// `lifetime_ref_unnameable` is the residue — an empty slot, an unreadable
+/// descriptor — which no namespace could have answered for either and which the
+/// cutover would still refuse.
+///
+/// Asking is not free of consequence and is not meant to be: `name_resource`
+/// declares. That is the behaviour the reading is *of*, not an observation
+/// perturbing it — the census is the first caller of the door the bridge will
+/// use, and the numbers are what that door does on a real guest.
 ///
 /// # What it deliberately does not cover
 ///
@@ -2095,7 +2115,12 @@ impl reims_vgpu_core::resolve::MappingResolver for DeviceState {
 /// twice or none. These two arms are where the model's own list join reads, and
 /// they are the ones whose all-or-nothing rule makes an unnamed ref cost the
 /// whole packet.
-pub fn note_lifetime_refs_named(state: &DeviceState, task_id: u32, refs: &[u32]) {
+pub fn note_lifetime_refs_named<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    refs: &[u32],
+) {
     // Counted per packet as well as per ref, because the refusal is per packet:
     // one unnamed ref in a list of forty costs all forty.
     crate::runtime::drain::note_store_route("lifetime_ref_list_asked");
@@ -2103,9 +2128,19 @@ pub fn note_lifetime_refs_named(state: &DeviceState, task_id: u32, refs: &[u32])
     for &object_ref in refs {
         crate::runtime::drain::note_store_route("lifetime_ref_asked");
         if state.object_name(task_id, object_ref).is_some() {
-            crate::runtime::drain::note_store_route("lifetime_ref_named");
+            crate::runtime::drain::note_store_route("lifetime_ref_already_named");
+            continue;
+        }
+        // The second half of the reading, and the one that decides. The first
+        // half said construction had not named this ref; this asks whether the
+        // guest's own object list can, which is what the bridge will do. A ref
+        // this cannot name is one no populated namespace would have either — an
+        // empty slot or an unreadable descriptor — and is the residue the
+        // cutover would still have to refuse.
+        if name_resource(state, host, task_id, object_ref).is_some() {
+            crate::runtime::drain::note_store_route("lifetime_ref_named_on_demand");
         } else {
-            crate::runtime::drain::note_store_route("lifetime_ref_unnamed");
+            crate::runtime::drain::note_store_route("lifetime_ref_unnameable");
             unnamed += 1;
         }
     }
@@ -2509,13 +2544,42 @@ pub fn resolve_resource<M: HostMemory>(
             reims_vgpu_core::lifecycle::Storage::Placed { .. }
             | reims_vgpu_core::lifecycle::Storage::NoBytes => None,
         });
+    // Naming is idempotent, and a name may already exist without a memo: a
+    // reference is named the first time *anything* asks what it names, and a
+    // lifetime packet asks without constructing. Declaring again here would give
+    // the slot a second generation and displace the first — retiring an object
+    // the guest never deleted — so the existing name is taken when there is one.
+    let name = match state.object_name(task_id, obj_ref) {
+        Some(existing) => {
+            crate::runtime::drain::note_store_route("object_named_before_constructed");
+            existing
+        }
+        None => declare_object_name(state, task_id, obj_ref, backing),
+    };
+    let resource = Arc::new(TaskResource::new(entry, descriptor));
+    Ok(state.task_resources.register(task_id, name, resource))
+}
+
+/// Declare a reference into its task's namespace and take the name issued.
+///
+/// The one call to `DeviceState::declare_object` in this crate, so the
+/// displacement it can report is judged once. Callers reach it through
+/// [`name_resource`] or through the construction path, both of which have
+/// established that the slot holds no live name — which is what makes a
+/// displacement here an event rather than the ordinary redeclaration the
+/// namespace also supports.
+fn declare_object_name(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    backing: Option<reims_vgpu_core::access::BackingId>,
+) -> reims_vgpu_core::identity::ResourceId {
     let declared = state.declare_object(task_id, obj_ref, backing);
     // A declaration over a slot that still held a live object owes that
-    // occupant's teardown. It should be unreachable: this arm runs only on a
-    // memo miss, and a live name always has its memo — the two are written
-    // together and retired together. Reported rather than assumed away, because
-    // if it ever fires the previous occupant's storage is one nothing else will
-    // free.
+    // occupant's teardown. It should be unreachable: every caller asked the
+    // namespace first and found nothing. Reported rather than assumed away,
+    // because if it ever fires the previous occupant's storage is one nothing
+    // else will free.
     if let Some(displaced) = declared.displaced {
         crate::runtime::drain::note_store_route("object_declared_over_a_live_name");
         if crate::observe::first_sight(
@@ -2524,17 +2588,76 @@ pub fn resolve_resource<M: HostMemory>(
         ) {
             crate::observe::fail(format!(
                 "object_declared_over_a_live_name task={task_id} ref={obj_ref} \
-                 displaced_generation={:?} teardown={:?} (a construction found no memo for a \
-                 name the namespace still says is live, so the two were written apart \
-                 somewhere and the displaced occupant's storage is owed to nobody)",
+                 displaced_generation={:?} teardown={:?} (a declaration displaced a live \
+                 occupant after its caller had asked the namespace and been told the slot \
+                 was empty, so the two reads were not of one namespace and the displaced \
+                 occupant's storage is owed to nobody)",
                 displaced.id.generation, displaced.teardown,
             ));
         }
     }
-    let resource = Arc::new(TaskResource::new(entry, descriptor));
-    Ok(state
-        .task_resources
-        .register(task_id, declared.id, resource))
+    declared.id
+}
+
+/// The name a guest reference has in its task, reading the guest's object list
+/// to give it one if this is the first sighting.
+///
+/// # Why naming is separate from constructing
+///
+/// A driven boot measured it. Of the object refs a real guest names in its
+/// resource-lifetime lists — synchronize, invalidate, discard — a namespace
+/// populated only by construction answers for **1290 of 1339**, and the
+/// remaining **49** are objects this device had never had a reason to construct.
+/// Those commands are the guest saying "I am about to touch these with the CPU",
+/// and nothing on this interface says a resource must be drawn before it is
+/// named.
+///
+/// 49 is small and it is not a rounding error, because the model's list join
+/// resolves every ref in a list or refuses the whole packet — deliberately,
+/// since a partial `Invalidate` claims the resources that happened to resolve
+/// are the only ones that went stale. This guest's lists carry **one ref each**
+/// (1339 lists, 1339 refs), so 49 unnamed refs are 49 refused packets: 49
+/// content-authority moves the model would never hear about, spread across the
+/// boot rather than clustered at its start.
+///
+/// Eager declaration is not the alternative. The same boot's
+/// `CmdSetObjectList` packets each declare a table of **1 048 576** entries,
+/// eighteen times — that number is the list's *capacity* and not its
+/// population, and walking it would read twelve megabytes of guest memory per
+/// bind to declare a few thousand live objects.
+///
+/// So a reference is named the first time anything asks what it names, and
+/// naming is the cheap half: one list entry and one descriptor read, no host
+/// texture, no buffer, no pipeline. [`resolve_resource`] adds the expensive half
+/// on top of the same name.
+///
+/// # It names every object type, not only the resource types
+///
+/// `resolve_resource` refuses a ref whose entry is not a resource constructor,
+/// which is right for construction and wrong for naming: a sampler, a function
+/// and a pipeline state are named by their slots exactly as a texture is, they
+/// resolve, and they stop resolving when the guest deletes them. See
+/// `reims_vgpu_core::namespace`. Their storage is `Storage::NoBytes`, which the
+/// declaration carries as `None`.
+pub fn name_resource<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+) -> Option<reims_vgpu_core::identity::ResourceId> {
+    if let Some(name) = state.object_name(task_id, obj_ref) {
+        return Some(name);
+    }
+    let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
+    let descriptor: Arc<[u8]> = Arc::from(read_descriptor(state, host, task_id, &entry)?);
+    let backing = declared_storage(state, task_id, &entry, &descriptor)
+        .ok()
+        .and_then(|storage| match storage {
+            reims_vgpu_core::lifecycle::Storage::Dedicated { backing, .. } => Some(backing),
+            reims_vgpu_core::lifecycle::Storage::Placed { .. }
+            | reims_vgpu_core::lifecycle::Storage::NoBytes => None,
+        });
+    Some(declare_object_name(state, task_id, obj_ref, backing))
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,

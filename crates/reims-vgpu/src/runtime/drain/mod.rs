@@ -4029,6 +4029,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 // `objects::note_lifetime_refs_named`.
                 crate::runtime::objects::note_lifetime_refs_named(
                     state,
+                    host,
                     cmd.task_id,
                     &cmd.records
                         .iter()
@@ -4138,6 +4139,7 @@ fn apply_map_family<H: HostMemory + HostOps>(
             Ok(cmd) => {
                 crate::runtime::objects::note_lifetime_refs_named(
                     state,
+                    host,
                     cmd.task_id,
                     &cmd.object_ids,
                 );
@@ -4763,6 +4765,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 Ok(cmd) => {
                     crate::runtime::objects::note_lifetime_refs_named(
                         state,
+                        host,
                         cmd.task_id,
                         &cmd.object_ids,
                     );

@@ -3864,42 +3864,81 @@ fn the_lifetime_ref_census_counts_what_it_asked_and_prices_the_packet() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let (task, ref_) = (1u32, 1u32);
+    // One past the list's declared count, so the guest's own table cannot name
+    // it and no populated namespace could have either.
+    const EMPTY_SLOT: u32 = 8;
 
     let asked = store_route_count("lifetime_ref_asked");
-    let named = store_route_count("lifetime_ref_named");
-    let unnamed = store_route_count("lifetime_ref_unnamed");
+    let named = store_route_count("lifetime_ref_already_named");
+    let unnamed = store_route_count("lifetime_ref_unnameable");
+    let on_demand = store_route_count("lifetime_ref_named_on_demand");
     let lists = store_route_count("lifetime_ref_list_asked");
     let refusing = store_route_count("lifetime_ref_list_would_refuse");
 
-    // Nothing constructed yet: the namespace has no name for the ref, which is
-    // the lazy-declaration case this census exists to measure.
-    super::note_lifetime_refs_named(&state, task, &[ref_, ref_ + 1]);
+    // Nothing constructed yet. Ref 1 is a live slot in the guest's list, so the
+    // on-demand door names it; the slot above it is empty, and no populated
+    // namespace could have answered for it either.
+    super::note_lifetime_refs_named(&state, &host, task, &[ref_, EMPTY_SLOT]);
     assert_eq!(store_route_count("lifetime_ref_asked"), asked + 2);
-    assert_eq!(store_route_count("lifetime_ref_named"), named);
-    assert_eq!(store_route_count("lifetime_ref_unnamed"), unnamed + 2);
+    assert_eq!(
+        store_route_count("lifetime_ref_already_named"),
+        named,
+        "neither had been constructed, so neither was already named"
+    );
+    assert_eq!(
+        store_route_count("lifetime_ref_named_on_demand"),
+        on_demand + 1,
+        "the guest's own object list is what names it, without constructing it"
+    );
+    assert_eq!(store_route_count("lifetime_ref_unnameable"), unnamed + 1);
     assert_eq!(store_route_count("lifetime_ref_list_asked"), lists + 1);
     assert_eq!(
         store_route_count("lifetime_ref_list_would_refuse"),
         refusing + 1,
-        "one packet, priced once, however many of its refs were unnamed"
+        "one packet, priced once, however many of its refs were unnameable"
     );
 
-    // Constructing it is what gives the slot a name, and the census follows the
-    // namespace rather than the object list.
-    resolve_resource(&state, &host, task, ref_).expect("construction");
-    super::note_lifetime_refs_named(&state, task, &[ref_]);
-    assert_eq!(store_route_count("lifetime_ref_asked"), asked + 3);
-    assert_eq!(store_route_count("lifetime_ref_named"), named + 1);
-    assert_eq!(store_route_count("lifetime_ref_unnamed"), unnamed + 2);
+    // Naming did not construct: the memo is still empty, and the name is the one
+    // a later construction takes rather than a second generation.
+    let name = state.object_name(task, ref_).expect("named on demand");
+    assert!(
+        state.constructed_object(task, ref_).is_none(),
+        "naming is the cheap half — no descriptor snapshot, no host object"
+    );
+    let built = resolve_resource(&state, &host, task, ref_).expect("construction");
     assert_eq!(
-        store_route_count("lifetime_ref_list_would_refuse"),
-        refusing + 1,
-        "a list whose refs all resolve is a packet the model's join would accept"
+        state.object_name(task, ref_),
+        Some(name),
+        "constructing an already-named reference keeps its name, or the slot \
+         would get a second generation and displace an object the guest never \
+         deleted"
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &state.constructed_object(task, ref_).expect("memo"),
+        &built
+    ));
+    assert_eq!(store_route_count("object_declared_over_a_live_name"), 0);
+
+    // A second sighting of a named ref is the cheap arm.
+    super::note_lifetime_refs_named(&state, &host, task, &[ref_]);
+    assert_eq!(store_route_count("lifetime_ref_already_named"), named + 1);
+    assert_eq!(
+        store_route_count("lifetime_ref_named_on_demand"),
+        on_demand + 1
     );
 
-    // Deleting the object takes the name back, and the census says so — which is
-    // what makes it a reading about the namespace and not about the guest's list.
+    // Deleting the object takes the name back — and the guest's list still holds
+    // the entry, so the door names it again. That is the namespace's rule, not a
+    // leak: a reused slot is a new generation.
     assert!(state.delete_object(task, ref_));
-    super::note_lifetime_refs_named(&state, task, &[ref_]);
-    assert_eq!(store_route_count("lifetime_ref_unnamed"), unnamed + 3);
+    super::note_lifetime_refs_named(&state, &host, task, &[ref_]);
+    assert_eq!(
+        store_route_count("lifetime_ref_named_on_demand"),
+        on_demand + 2
+    );
+    assert_ne!(
+        state.object_name(task, ref_),
+        Some(name),
+        "the second occupant of the slot is a different name"
+    );
 }
