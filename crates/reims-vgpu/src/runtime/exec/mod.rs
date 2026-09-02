@@ -2534,7 +2534,7 @@ fn handle_render_stream_state(task_id: u32, opcode: u32, cmd_bytes: &[u8], acc: 
             }
             acc.viewports.clear();
             acc.viewports
-                .extend(ports.iter().map(|v| render_pass::viewport_from_wire(v)));
+                .extend(ports.iter().map(render_pass::viewport_from_wire));
         }
         RenderRecord::SetScissorRects(rects) => {
             if rects.is_empty() {

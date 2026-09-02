@@ -3077,16 +3077,14 @@ fn a_mapping_has_one_identity_and_a_replaced_page_list_gives_it_another() {
     // reason one is a `u64` both routes may produce. `first_window` was taken
     // before any mapping was asked about, so a mapping table with its own
     // counter would have handed its first mint that very number.
-    let mut minted = vec![
-        ("the window asked for before any mapping", first_window),
+    let mut minted = [("the window asked for before any mapping", first_window),
         ("the mapping's first incarnation", before),
         ("a second mapping", second),
         ("the first mapping's replaced page list", after),
         (
             "a window asked for after the mapping mints",
             state.backing_identity(1, 0x3_0000),
-        ),
-    ];
+        )];
     minted.sort_by_key(|&(_, id)| id);
     for pair in minted.windows(2) {
         assert_ne!(
