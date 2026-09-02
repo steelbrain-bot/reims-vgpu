@@ -3112,14 +3112,30 @@ pub fn cached_window_peer(state: &DeviceState, task_id: u32, obj_ref: u32) -> Op
 /// its stale image authoritative.
 ///
 /// The host-copy caches are fixed: a re-point now sweeps the window's peers.
-/// The guest-write generation is **not**, and this says whether it needs to be
-/// — it is bumped some six thousand times per census window, far too hot to
-/// resolve a window on, so the question is asked once per distinct reference
-/// and the answer decides whether the re-key is worth its cost.
+/// The guest-write generation is **not**, and this is what says whether it
+/// needs to be — it is bumped some six thousand times per census window, far
+/// too hot to resolve a window on, so the question is asked once per distinct
+/// reference.
 ///
-/// A reading of nothing means every reference on that path is the only name for
-/// its storage and the keying is sound where it is used. A reading of something
-/// names the pair that has to move.
+/// # The reading, and why the re-key did not happen
+///
+/// A driven macos-15 boot asked it of **1285** distinct references and every
+/// one of them was the only constructed name for its allocation
+/// (`reference_storage_asked=1285`, `reference_storage_shared=0`). So the
+/// `(task, reference)` key stands for storage everywhere this path uses it,
+/// and re-keying it on the window would have bought nothing at a cost the hot
+/// path cannot carry.
+///
+/// That is not the same as saying the alias does not exist — it does, and
+/// `note_backing_window_alias` finds it on the compositor's scanout allocation
+/// on every boot. It says the two sets do not overlap: the references that
+/// share an allocation are not the references this generation is kept for.
+/// Two facts, and only the measurement distinguishes them.
+///
+/// This stays on, at one scan per distinct reference, because the claim is
+/// about a workload and not about the code: a guest that does bind two names
+/// over one buffer would make the re-key necessary, and this is what would say
+/// so rather than a wrong frame.
 pub fn note_reference_shares_storage(
     state: &DeviceState,
     task_id: u32,
