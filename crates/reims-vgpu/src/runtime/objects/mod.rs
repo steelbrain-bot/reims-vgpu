@@ -1734,54 +1734,25 @@ fn note_stale_task_resource<M: HostMemory>(
     ));
 }
 
-/// The guest-VA **allocation** an object's own descriptor says it lives in.
+/// The guest-VA allocation an object's own descriptor names, from bytes.
 ///
-/// `None` for every object type that does not name storage by an address in
-/// its task — a view, a function, a serializer object, a mapper-ref texture, a
-/// heap-placed texture. Those either name no storage or name it through
-/// something else, and a window invented for one would be a window over
-/// somebody else's bytes.
-///
-/// # The allocation base, not the texel base
-///
-/// A texture states two addresses: `handle << page_shift`, which is where its
-/// allocation begins, and that plus `data_offset`, which is where its level-0
-/// texels begin. `TextureDescriptor::backing_gva_size` answers the second,
-/// because its callers are loaders and a loader wants the texels.
-///
-/// This wants the first, and the difference is the whole point of the reading
-/// it feeds. Two textures placed at different offsets in one allocation are
-/// *one piece of storage* — that is what makes them alias — and keyed on the
-/// texel base they would never compare equal and the alias would be invisible.
-/// A backing identity built that way would give one allocation as many ids as
-/// it has tenants, which is false distinctness: the hazard edge between them is
-/// never drawn and the two write over each other. The offset is the extent's,
-/// and the extent is `reims_vgpu_core::access::ByteRange`'s to carry.
-///
-/// A buffer has no such offset, so its two addresses are one and
-/// `backing_gva_size` already answers it.
+/// For the callers that hold descriptor *bytes* rather than a constructed
+/// resource — a re-read of the guest's own list, where the whole point is not
+/// to trust this device's cache. It decodes and then asks
+/// [`Descriptor::backing_window`], which is the one implementation of the
+/// arithmetic; a caller holding a `TaskResource` should use
+/// [`cached_window`] and pay for no decode at all.
 fn backing_window(
     page_shift: u32,
     entry: &ListObjectEntry,
     descriptor: &[u8],
 ) -> Option<(u64, u64)> {
-    use crate::runtime::decode::resource::{decode_buffer_descriptor, decode_texture_descriptor};
-    match entry.object_type {
-        OBJECT_TYPE_BUFFER => decode_buffer_descriptor(descriptor)
-            .ok()?
-            .backing_gva_size(page_shift),
-        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS => {
-            let texture = decode_texture_descriptor(descriptor).ok()?;
-            // Both halves are required, and the size is asked through
-            // `backing_gva_size` so the two readers refuse the same
-            // descriptors: a zero allocation size or a zero handle is a
-            // descriptor the guest has not finished writing, and it names no
-            // allocation on either reading.
-            let (_, size) = texture.backing_gva_size(page_shift)?;
-            Some((texture.allocation_base_gva(page_shift)?, size))
-        }
-        _ => None,
+    if crate::runtime::decode::resource::descriptor_is_heap_placement(descriptor) {
+        return None;
     }
+    crate::runtime::decode::resource::decode_descriptor(entry.object_type, descriptor)
+        .ok()?
+        .backing_window(page_shift)
 }
 
 /// Whether the guest's object list still says `holder` occupies `base`.
@@ -3083,18 +3054,28 @@ fn backing_id_refusal(entry: &ListObjectEntry, descriptor: &[u8]) -> BackingIdRe
 /// company. It is a reading and not a decision — see
 /// [`note_reference_shares_storage`] for what a caller does with it.
 pub fn cached_window_peer(state: &DeviceState, task_id: u32, obj_ref: u32) -> Option<u32> {
-    let mine = state.task_resources.get(task_id, obj_ref)?;
-    let (base, _) = backing_window(state.page_shift, &mine.entry, &mine.descriptor)?;
+    let base = cached_window(state, task_id, obj_ref)?;
     state
         .task_resources
         .in_task(task_id)
         .into_iter()
         .filter(|&(ref_, _)| ref_ != obj_ref)
-        .find(|(_, other)| {
-            backing_window(state.page_shift, &other.entry, &other.descriptor)
-                .is_some_and(|(other_base, _)| other_base == base)
-        })
+        .find(|(_, other)| other.backing_window(state.page_shift) == Some((base.0, base.1)))
         .map(|(ref_, _)| ref_)
+}
+
+/// The allocation a constructed reference names, from its own decode.
+///
+/// The construction cache alone and no guest read, which is what makes it
+/// affordable on the payment path. A reference this device has not constructed
+/// has no cached window and is not one this device is keeping per-reference
+/// state for either, so the two absences agree.
+#[must_use]
+pub fn cached_window(state: &DeviceState, task_id: u32, obj_ref: u32) -> Option<(u64, u64)> {
+    state
+        .task_resources
+        .get(task_id, obj_ref)?
+        .backing_window(state.page_shift)
 }
 
 /// Report that per-reference state is being kept for a reference that shares
@@ -3259,12 +3240,8 @@ fn repointed_window<M: HostMemory>(
     task_id: u32,
     object_id: u32,
 ) -> Option<u64> {
-    if let Some(resource) = state.task_resources.get(task_id, object_id) {
-        if let Some((base, _)) =
-            backing_window(state.page_shift, &resource.entry, &resource.descriptor)
-        {
-            return Some(base);
-        }
+    if let Some((base, _)) = cached_window(state, task_id, object_id) {
+        return Some(base);
     }
     let entry = probe_list_entry(state, host, task_id, object_id)?;
     let descriptor = read_descriptor(state, host, task_id, &entry)?;

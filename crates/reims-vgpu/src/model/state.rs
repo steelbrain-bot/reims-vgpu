@@ -619,6 +619,30 @@ impl TaskResource {
         })
     }
 
+    /// The guest-VA allocation this resource's construction descriptor names,
+    /// through the decode this resource already did.
+    ///
+    /// `None` for every object that does not name storage by an address in its
+    /// own task, and for one that names it with a handle or a size the guest
+    /// has not written yet.
+    ///
+    /// See [`Descriptor::backing_window`] for why it is the allocation base and
+    /// not a texture's texel base, and
+    /// [`crate::runtime::decode::resource::descriptor_is_heap_placement`] for
+    /// why the bytes are consulted before the decode: a placement arrives under
+    /// the ordinary texture type and the typed form cannot tell.
+    ///
+    /// Taken off [`Self::decoded`] rather than re-parsing the bytes, because
+    /// the callers are hot: a payment asks it per read and a re-point asks it
+    /// per cached copy in the task.
+    #[must_use]
+    pub fn backing_window(&self, page_shift: u32) -> Option<(u64, u64)> {
+        if crate::runtime::decode::resource::descriptor_is_heap_placement(&self.descriptor) {
+            return None;
+        }
+        self.decoded().as_ref().ok()?.backing_window(page_shift)
+    }
+
     pub fn lifetime_ref(&self) -> TaskResourceLifetimeRef {
         TaskResourceLifetimeRef {
             id: self.lifetime.id,

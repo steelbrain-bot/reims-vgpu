@@ -1941,6 +1941,70 @@ pub enum Descriptor {
     IndirectCommandBuffer(IndirectCommandBufferDescriptor),
 }
 
+/// Whether these descriptor bytes are a heap **placement** rather than an
+/// allocation of the object's own.
+///
+/// A heap-placed texture arrives under the ordinary texture object type and is
+/// told apart by the opcode inside its record, so a caller that asks for its
+/// storage must ask this first. [`decode_texture_descriptor`] does not: it
+/// reads the allocation size and handle at fixed offsets, and on a placement
+/// those offsets hold the record's own opcode and length. The window it would
+/// return is a number, not an address.
+///
+/// That matters because the answer feeds a backing identity. A bogus window
+/// would be a plausible-looking identity for storage nothing knows the location
+/// of — false equality with whatever else landed on the same number.
+#[must_use]
+pub fn descriptor_is_heap_placement(bytes: &[u8]) -> bool {
+    matches!(
+        texture_view_opcode(bytes),
+        Some(HEAP_TEXTURE_OPCODE | HEAP_TEXTURE_WIDE_OPCODE)
+    )
+}
+
+impl Descriptor {
+    /// The guest-VA **allocation** this descriptor names, and its size.
+    ///
+    /// `None` for every object that reaches storage through something else — a
+    /// view over another object's bytes, a mapper-ref or dual-plane texture
+    /// whose pages are a mapping's, a function, a serializer object — and for
+    /// one whose handle or allocation size the guest has not written yet.
+    ///
+    /// # The allocation base, not a texture's texel base
+    ///
+    /// [`TextureDescriptor::backing_gva_size`] answers `handle << page_shift`
+    /// **plus `data_offset`**, because its callers are loaders and a loader
+    /// wants the texels. This answers the allocation, because its callers ask
+    /// about *storage*: two textures placed at different offsets in one
+    /// allocation are one piece of storage, and telling them apart here is the
+    /// false distinctness `reims_vgpu_core::access::BackingId` names as a
+    /// dropped hazard edge. The offset is the extent's, and the extent is
+    /// `reims_vgpu_core::access::ByteRange`'s to carry.
+    ///
+    /// One implementation for both ways a caller arrives — from a
+    /// `TaskResource`'s decode-once form, or from descriptor bytes read out of
+    /// the guest — so the two cannot answer differently about one object.
+    #[must_use]
+    pub fn backing_window(&self, page_shift: u32) -> Option<(u64, u64)> {
+        match self {
+            Self::Buffer(buffer) => buffer.backing_gva_size(page_shift),
+            Self::Texture(texture) => {
+                let (_, size) = texture.backing_gva_size(page_shift)?;
+                Some((texture.allocation_base_gva(page_shift)?, size))
+            }
+            Self::DualPlaneTexture(_)
+            | Self::Sampler(_)
+            | Self::Function(_)
+            | Self::RenderPipeline(_)
+            | Self::ComputePipeline(_)
+            | Self::DepthStencil(_)
+            | Self::TextureView(_)
+            | Self::IOSurfaceTexture { .. }
+            | Self::IndirectCommandBuffer(_) => None,
+        }
+    }
+}
+
 /// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
 pub const OBJECT_LIST_ENTRY_LEN: usize = 12;
 pub const OBJECT_LIST_ENTRY_HEADER: usize = 0;

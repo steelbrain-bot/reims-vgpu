@@ -3068,3 +3068,60 @@ fn the_peer_question_answers_only_for_a_shared_allocation() {
         "an object with no window of its own must not pair off with another"
     );
 }
+
+/// A heap-placed texture has no window of its own, and its record must be
+/// recognised before its bytes are decoded as an allocation.
+///
+/// A placement arrives under the ordinary texture object type. The texture
+/// decoder reads the allocation size and handle at fixed offsets, and on a
+/// placement record those offsets hold the record's own opcode, length and heap
+/// reference — so it answers with a window that is a number and not an address.
+/// A backing identity built on it would be false equality with whatever else
+/// landed on the same number, which is the direction that hands storage back
+/// under a live reader.
+///
+/// **The wide form is the one that gets through**, and it is why the check is
+/// on the bytes rather than on the length: at 68 bytes it is exactly the
+/// texture decoder's minimum, so nothing about its size refuses it. The narrow
+/// form is 60 and would be refused by length alone — testing only that would
+/// have passed with the guard deleted.
+#[test]
+fn a_heap_placement_is_refused_an_identity_rather_than_given_a_number() {
+    use crate::runtime::decode::resource::{
+        descriptor_is_heap_placement, HEAP_TEXTURE_WIDE_LEN, HEAP_TEXTURE_WIDE_OPCODE,
+        OBJECT_TYPE_TEXTURE,
+    };
+
+    // A wide placement record: its own opcode, length and heap reference where
+    // a plain texture descriptor keeps its allocation size and handle.
+    let mut placement = vec![0u8; HEAP_TEXTURE_WIDE_LEN];
+    st32(&mut placement[0..], HEAP_TEXTURE_WIDE_OPCODE);
+    st32(&mut placement[4..], HEAP_TEXTURE_WIDE_LEN as u32);
+    st32(&mut placement[8..], 6565);
+    assert!(
+        descriptor_is_heap_placement(&placement),
+        "the record names itself, and that is the only thing that can tell it \
+         apart from an allocation of its own"
+    );
+
+    let entry = ListObjectEntry {
+        object_type: OBJECT_TYPE_TEXTURE,
+        descriptor_length: HEAP_TEXTURE_WIDE_LEN as u32,
+        descriptor_gva: 0x1000,
+    };
+    // The bogus answer this refuses, stated so the test is about the guard and
+    // not about the decoder happening to fail: without the check the decode
+    // succeeds and the heap reference becomes a page handle.
+    assert!(
+        crate::runtime::decode::resource::decode_descriptor(entry.object_type, &placement)
+            .is_ok_and(|decoded| decoded.backing_window(PAGE_SHIFT_X86).is_some()),
+        "the wide placement decodes as a texture, which is exactly why the \
+         record has to be recognised before the decode is trusted"
+    );
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry, &placement),
+        None,
+        "a placement names storage inside a heap, and the bytes at the offsets \
+         an allocation would use are its own header"
+    );
+}
