@@ -4024,6 +4024,17 @@ fn apply_map_family<H: HostMemory + HostOps>(
         use crate::runtime::resource_validity::{apply, ValiditySite};
         match decode_invalidate_resources(&packet.payload) {
             Ok(cmd) => {
+                // Read-only, and taken before anything is applied: whether the
+                // model's list join could have resolved this packet at all. See
+                // `objects::note_lifetime_refs_named`.
+                crate::runtime::objects::note_lifetime_refs_named(
+                    state,
+                    cmd.task_id,
+                    &cmd.records
+                        .iter()
+                        .map(|rec| rec.object_id)
+                        .collect::<Vec<_>>(),
+                );
                 let mut bumped = 0u32;
                 let mut miss = 0u32;
                 for rec in &cmd.records {
@@ -4125,6 +4136,11 @@ fn apply_map_family<H: HostMemory + HostOps>(
         use crate::protocol::fifo::decode_synchronize_resources;
         match decode_synchronize_resources(&packet.payload) {
             Ok(cmd) => {
+                crate::runtime::objects::note_lifetime_refs_named(
+                    state,
+                    cmd.task_id,
+                    &cmd.object_ids,
+                );
                 // Synchronization is resource-scoped. Apple batches the named
                 // resources into transfer encoders; synchronizing one object
                 // does not publish every other host-valid texture in the task.
@@ -4745,6 +4761,11 @@ fn process_child_packet<H: HostMemory + HostOps>(
             use crate::protocol::fifo::decode_synchronize_resources;
             match decode_synchronize_resources(&packet.payload) {
                 Ok(cmd) => {
+                    crate::runtime::objects::note_lifetime_refs_named(
+                        state,
+                        cmd.task_id,
+                        &cmd.object_ids,
+                    );
                     let discarded = crate::runtime::writeback_debt::discard_gva_resources(
                         state,
                         cmd.task_id,

@@ -2059,6 +2059,73 @@ impl reims_vgpu_core::resolve::MappingResolver for DeviceState {
     }
 }
 
+/// Census whether the refs a resource-lifetime packet names already have names
+/// in the task's object namespace.
+///
+/// # The question the cutover cannot ask afterwards
+///
+/// `reims_vgpu_core::lifecycle::resource_list` resolves every ref in a counted
+/// list or refuses the whole packet — deliberately, since a partial
+/// `Invalidate` claims the resources that happened to resolve are the only ones
+/// that went stale. So the four list commands cross to the model exactly when
+/// every ref they name resolves, and this device's namespace is populated
+/// **lazily**: [`resolve_resource`] declares an object the first time something
+/// reads it, not when the guest publishes its object list.
+///
+/// Those two facts have a collision in them. A guest may legally synchronize,
+/// invalidate or discard a resource this device has never had a reason to
+/// construct — nothing in the interface says a resource must be drawn before it
+/// is named — and every such packet would refuse at the bridge while being
+/// perfectly well formed. Whether that is a corner or the common case is not
+/// something the code says; it is a property of a real driver's ordering, and it
+/// decides whether the lazy declaration can stand or whether the namespace has
+/// to be populated from the guest's table at `SetObjectList` time.
+///
+/// So the reading is taken before the switch is cut, at the two arms that
+/// already decode these lists, against an unmodified guest.
+/// `lifetime_ref_asked` is the denominator — without it a boot where every ref
+/// resolved and a boot where no list packet arrived read the same — and
+/// `lifetime_ref_unnamed` is the number that decides.
+///
+/// # What it deliberately does not cover
+///
+/// The two single-ref commands (`DeleteResource`, `ReplacePhysical`) and the
+/// EXEC resource table are not counted here. Each decodes elsewhere, and a
+/// census spread across four decoders would be four chances to count one packet
+/// twice or none. These two arms are where the model's own list join reads, and
+/// they are the ones whose all-or-nothing rule makes an unnamed ref cost the
+/// whole packet.
+pub fn note_lifetime_refs_named(state: &DeviceState, task_id: u32, refs: &[u32]) {
+    // Counted per packet as well as per ref, because the refusal is per packet:
+    // one unnamed ref in a list of forty costs all forty.
+    crate::runtime::drain::note_store_route("lifetime_ref_list_asked");
+    let mut unnamed = 0usize;
+    for &object_ref in refs {
+        crate::runtime::drain::note_store_route("lifetime_ref_asked");
+        if state.object_name(task_id, object_ref).is_some() {
+            crate::runtime::drain::note_store_route("lifetime_ref_named");
+        } else {
+            crate::runtime::drain::note_store_route("lifetime_ref_unnamed");
+            unnamed += 1;
+        }
+    }
+    if unnamed == 0 {
+        return;
+    }
+    // The packet-level count is what the bridge's all-or-nothing rule prices.
+    crate::runtime::drain::note_store_route("lifetime_ref_list_would_refuse");
+    if crate::observe::first_sight(
+        "lifetime_ref_unnamed",
+        (u64::from(task_id) << 32) | refs.first().copied().map_or(0, u64::from),
+    ) {
+        crate::observe::fail(format!(
+            "lifetime_ref_unnamed task={task_id} unnamed={unnamed} of={} first_ref={:?}              (the guest named a resource in a lifetime list that this device has never              constructed, so the namespace has no name for it; the model's list join              resolves every ref or refuses the packet, which makes this the count that              decides whether lazy declaration can stand)",
+            refs.len(),
+            refs.first(),
+        ));
+    }
+}
+
 /// The device answering the semantic model's object-namespace resolver, for one
 /// task.
 ///

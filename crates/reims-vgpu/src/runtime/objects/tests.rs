@@ -3823,3 +3823,59 @@ fn the_device_answers_the_models_object_resolver_from_the_bound_tasks_namespace(
     assert!(state.delete_object(task, ref_));
     assert_eq!(TaskRefResolver::new(&state, task).resource(ref_), None);
 }
+
+/// The lifetime-ref census counts what it asked as well as what it found, and
+/// prices the refusal per packet rather than per ref.
+///
+/// The denominator is the point of the test. A boot in which every list packet
+/// resolved and a boot in which no list packet arrived produce the same zero on
+/// `lifetime_ref_unnamed`, and those are opposite facts about the same silence —
+/// the first says lazy declaration holds on this rail, the second says nothing
+/// at all.
+#[test]
+fn the_lifetime_ref_census_counts_what_it_asked_and_prices_the_packet() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let (task, ref_) = (1u32, 1u32);
+
+    let asked = store_route_count("lifetime_ref_asked");
+    let named = store_route_count("lifetime_ref_named");
+    let unnamed = store_route_count("lifetime_ref_unnamed");
+    let lists = store_route_count("lifetime_ref_list_asked");
+    let refusing = store_route_count("lifetime_ref_list_would_refuse");
+
+    // Nothing constructed yet: the namespace has no name for the ref, which is
+    // the lazy-declaration case this census exists to measure.
+    super::note_lifetime_refs_named(&state, task, &[ref_, ref_ + 1]);
+    assert_eq!(store_route_count("lifetime_ref_asked"), asked + 2);
+    assert_eq!(store_route_count("lifetime_ref_named"), named);
+    assert_eq!(store_route_count("lifetime_ref_unnamed"), unnamed + 2);
+    assert_eq!(store_route_count("lifetime_ref_list_asked"), lists + 1);
+    assert_eq!(
+        store_route_count("lifetime_ref_list_would_refuse"),
+        refusing + 1,
+        "one packet, priced once, however many of its refs were unnamed"
+    );
+
+    // Constructing it is what gives the slot a name, and the census follows the
+    // namespace rather than the object list.
+    resolve_resource(&state, &host, task, ref_).expect("construction");
+    super::note_lifetime_refs_named(&state, task, &[ref_]);
+    assert_eq!(store_route_count("lifetime_ref_asked"), asked + 3);
+    assert_eq!(store_route_count("lifetime_ref_named"), named + 1);
+    assert_eq!(store_route_count("lifetime_ref_unnamed"), unnamed + 2);
+    assert_eq!(
+        store_route_count("lifetime_ref_list_would_refuse"),
+        refusing + 1,
+        "a list whose refs all resolve is a packet the model's join would accept"
+    );
+
+    // Deleting the object takes the name back, and the census says so — which is
+    // what makes it a reading about the namespace and not about the guest's list.
+    assert!(state.delete_object(task, ref_));
+    super::note_lifetime_refs_named(&state, task, &[ref_]);
+    assert_eq!(store_route_count("lifetime_ref_unnamed"), unnamed + 3);
+}
