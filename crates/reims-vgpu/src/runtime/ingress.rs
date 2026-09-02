@@ -187,6 +187,26 @@ pub enum Gap {
     /// `reims_vgpu_core::lifecycle::ResolveRefusal::NeedsStorage`. An operation
     /// carrying the *old* backing would re-point nothing while reporting
     /// success.
+    ///
+    /// # It does not close with a resolver, and that is worth stating
+    ///
+    /// The new pages *are* obtainable: `crate::runtime::objects::replace_physical`
+    /// drops the cached translation and bumps the storage incarnation, and the
+    /// next resolve re-walks the page table the guest has already rewritten. So
+    /// a reader reaches for a third resolver beside [`Resolvers::objects`] and
+    /// [`Resolvers::storage`], and it does not work.
+    ///
+    /// The identity of the new storage is `(task, base, incarnation)` at the
+    /// **next** incarnation, and nothing has bumped it yet when this bridge
+    /// runs. A resolver that answered would therefore have to perform the bump
+    /// — a mutation, from a function whose whole claim is that it makes none,
+    /// and a second writer of the incarnation beside the handler that owns it.
+    /// One that did not bump would answer with the old identity, which is the
+    /// failure above wearing a resolver's clothes.
+    ///
+    /// So the re-point's storage arrives when the *handler* becomes the model's
+    /// operation, not before: it belongs to the resource-lifecycle group's
+    /// cutover and not to a resolver added ahead of it.
     ReplacementStorage,
     /// The reply destination, resolved to a backing and a window of it.
     ///
