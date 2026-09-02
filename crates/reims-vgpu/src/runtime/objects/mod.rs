@@ -3111,6 +3111,15 @@ fn invalidate_window_peers<M: HostMemory>(
         .filter(|&&(task, ref_)| task == task_id && ref_ != named)
         .map(|&(_, ref_)| ref_)
         .collect();
+    // Counted whether or not anything is dropped, for the reason
+    // `backing_window_collision` is: a boot where no reference over the
+    // re-pointed window held a copy and a boot where the sweep never ran read
+    // the same on the drop counter alone, and only the first says the guard
+    // cost nothing.
+    crate::runtime::drain::note_store_route_n(
+        "replace_physical_window_peers_examined",
+        peers.len() as u64,
+    );
     for peer in peers {
         if repointed_window(state, host, task_id, peer) != Some(base) {
             continue;
