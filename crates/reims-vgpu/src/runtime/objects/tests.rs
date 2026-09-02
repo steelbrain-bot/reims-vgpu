@@ -3225,6 +3225,86 @@ fn every_construction_is_counted_against_the_backing_identity() {
     );
 }
 
+/// A surface-backing object declares the mapping's storage, because its
+/// object-list slot *is* the mapping id.
+///
+/// It used to declare `NoBytes`, on the grounds that the address route names no
+/// storage for `OBJECT_TYPE_BACKING` — which is true and is not the whole
+/// answer, because the mapping route does. A driven macos-15 boot measured the
+/// cost: every one of 36 re-points the semantic model was never told about was
+/// a backing object whose slot also named a live mapping surface.
+///
+/// The type is what makes the shared integer one namespace rather than two.
+/// `backing_claimant_tasks` already finds a surface's owner by probing exactly
+/// this slot for exactly this type.
+#[test]
+fn a_surface_backing_object_declares_the_storage_of_the_mapping_at_its_own_slot() {
+    use reims_vgpu_core::access::ByteRange;
+    use reims_vgpu_core::lifecycle::Storage;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, surface) = (1u32, 3u32);
+
+    // The backing's own record: length and first page frame, no planes.
+    let mut desc = [0u8; 0x20];
+    desc[0..8].copy_from_slice(&0x8000u64.to_le_bytes());
+    st32(&mut desc[8..], 0x1234);
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BACKING) | (0x20u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(surface) * 12, &entry);
+
+    let listed = lookup_list_entry(&state, &host, task, surface).expect("listed");
+    let bytes = read_descriptor(&state, &host, task, &listed).expect("descriptor");
+
+    // Before the guest maps a surface into that slot there is storage to name
+    // and no identity for it, and the refusal is the mapping's own, carried.
+    assert_eq!(
+        super::declared_storage(&state, task, surface, &listed, &bytes),
+        Err(super::StorageRefusal::Backing(
+            super::BackingIdRefusal::ThroughMapping {
+                mapping_id: surface,
+                refusal: super::MappingBackingRefusal::Unlisted,
+            }
+        )),
+        "not `NoBytes` — the object owns bytes and the mapper has not been told \
+         about them yet, which are different facts"
+    );
+
+    assert!(state.map_surface(surface));
+    assert_eq!(
+        super::declared_storage(&state, task, surface, &listed, &bytes),
+        Ok(Storage::Dedicated {
+            backing: super::mapping_backing_id(&state, surface).expect("mapped"),
+            extent: ByteRange {
+                offset: 0,
+                length: 0x8000,
+            },
+        }),
+        "the identity is the mapping's, so a mapper-ref texture over the same \
+         surface aliases it by construction; the extent is the whole backing, \
+         because a backing has no window of anything larger"
+    );
+
+    // And that is what a re-point of it now hands the model.
+    let (_, backing, extent) =
+        super::repointed_storage(&state, &host, task, surface).expect("a backing names storage");
+    assert_eq!(
+        (backing, extent.length),
+        (
+            super::mapping_backing_id(&state, surface).expect("mapped"),
+            0x8000
+        ),
+    );
+}
+
 /// A re-point that the semantic model is not told about says which of six
 /// facts stopped it, because only one of them costs anything.
 ///
@@ -3336,7 +3416,7 @@ fn a_constructed_object_becomes_the_storage_the_model_is_declared_with() {
     let list_entry = lookup_list_entry(&state, &host, task, buffer).expect("listed");
     let bytes = read_descriptor(&state, &host, task, &list_entry).expect("descriptor");
     assert_eq!(
-        super::declared_storage(&state, task, &list_entry, &bytes),
+        super::declared_storage(&state, task, buffer, &list_entry, &bytes),
         Ok(Storage::Dedicated {
             backing: super::backing_id(&state, &host, task, buffer).expect("a buffer has one"),
             extent: ByteRange {
@@ -3355,7 +3435,7 @@ fn a_constructed_object_becomes_the_storage_the_model_is_declared_with() {
     let t11_bytes = read_descriptor(&state, &host, task, &t11).expect("descriptor");
     assert!(state.map_surface(9));
     assert_eq!(
-        super::declared_storage(&state, task, &t11, &t11_bytes),
+        super::declared_storage(&state, task, 1, &t11, &t11_bytes),
         Err(super::StorageRefusal::ExtentUnrecovered { object_type: 11 }),
         "until the mapping publishes a device descriptor, nothing says which \
          part of its surface this texture is — and the identity being there is \
@@ -3377,7 +3457,7 @@ fn a_constructed_object_becomes_the_storage_the_model_is_declared_with() {
     );
     assert!(state.set_mapping_device_desc(9, &device_desc));
     assert_eq!(
-        super::declared_storage(&state, task, &t11, &t11_bytes),
+        super::declared_storage(&state, task, 1, &t11, &t11_bytes),
         Ok(Storage::Dedicated {
             backing: super::mapping_backing_id(&state, 9).expect("a mapped surface"),
             extent: ByteRange {
@@ -3417,7 +3497,7 @@ fn a_constructed_object_becomes_the_storage_the_model_is_declared_with() {
     }
     assert!(state.set_mapping_device_desc(9, &device_desc));
     assert_eq!(
-        super::declared_storage(&state, task, &t11, &t11_bytes),
+        super::declared_storage(&state, task, 1, &t11, &t11_bytes),
         Ok(Storage::Dedicated {
             backing: super::mapping_backing_id(&state, 9).expect("a mapped surface"),
             extent: ByteRange {

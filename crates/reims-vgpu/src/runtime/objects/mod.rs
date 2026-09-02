@@ -2006,12 +2006,13 @@ impl StorageRefusal {
 pub fn declared_storage(
     state: &DeviceState,
     task_id: u32,
+    obj_ref: u32,
     entry: &ListObjectEntry,
     descriptor: &[u8],
 ) -> Result<reims_vgpu_core::lifecycle::Storage, StorageRefusal> {
     use reims_vgpu_core::access::ByteRange;
     use reims_vgpu_core::lifecycle::Storage;
-    let backing = match backing_id_of(state, task_id, entry, descriptor) {
+    let backing = match backing_id_of(state, task_id, obj_ref, entry, descriptor) {
         Ok(backing) => backing,
         // The object names no storage, which is the whole answer rather than a
         // failure to find one.
@@ -2026,6 +2027,15 @@ pub fn declared_storage(
     // mapping's published device descriptor.
     let extent = if entry.object_type == OBJECT_TYPE_MAPPER_REF_TEXTURE {
         mapper_ref_surface_extent(state, descriptor)
+    } else if entry.object_type == OBJECT_TYPE_BACKING {
+        // A surface-backing object *is* the whole surface, and its own record
+        // says how long that is. There is no plane to pick out and no
+        // allocation to be a window of: the mapper-ref textures over this
+        // mapping are the ones with offsets, and they take them from the
+        // published device descriptor.
+        reims_vgpu_wire::device_desc::backing_header(descriptor)
+            .ok()
+            .map(|header| (0u64, header.length.get()))
     } else {
         crate::runtime::decode::resource::decode_descriptor(entry.object_type, descriptor)
             .ok()
@@ -2751,6 +2761,7 @@ fn mapper_ref_surface_extent(state: &DeviceState, descriptor: &[u8]) -> Option<(
 fn note_backing_identity(
     state: &DeviceState,
     task_id: u32,
+    obj_ref: u32,
     entry: &ListObjectEntry,
     descriptor: &[u8],
 ) {
@@ -2760,7 +2771,7 @@ fn note_backing_identity(
     // declaration the cutover needs: an identity with no extent describes an
     // object the model can name and cannot hold content authority for, and a
     // census that stopped at the identity would score that as an answer.
-    let refusal = match declared_storage(state, task_id, entry, descriptor) {
+    let refusal = match declared_storage(state, task_id, obj_ref, entry, descriptor) {
         Ok(Storage::Dedicated { .. }) => {
             crate::runtime::drain::note_store_route("backing_identity_minted");
             crate::runtime::drain::note_store_route("declared_storage_dedicated");
@@ -2842,11 +2853,11 @@ pub fn resolve_resource<M: HostMemory>(
     if let Some((base, size)) = backing_window(state.page_shift, &entry, &descriptor) {
         let _ = note_backing_window_alias(state, host, task_id, obj_ref, base, size);
     }
-    note_backing_identity(state, task_id, &entry, &descriptor);
+    note_backing_identity(state, task_id, obj_ref, &entry, &descriptor);
     // The one declaration site, carrying what this device established about the
     // object's bytes rather than a flattening of it. See `declare_object_name`
     // for why an undescribable storage is `None` here and not `NoBytes`.
-    let storage = declared_storage(state, task_id, &entry, &descriptor).ok();
+    let storage = declared_storage(state, task_id, obj_ref, &entry, &descriptor).ok();
     // Naming is idempotent, and a name may already exist without a memo: a
     // reference is named the first time *anything* asks what it names, and a
     // lifetime packet asks without constructing. Declaring again here would give
@@ -3052,7 +3063,7 @@ pub fn name_resource<M: HostMemory>(
     }
     let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
     let descriptor: Arc<[u8]> = Arc::from(read_descriptor(state, host, task_id, &entry)?);
-    let storage = declared_storage(state, task_id, &entry, &descriptor).ok();
+    let storage = declared_storage(state, task_id, obj_ref, &entry, &descriptor).ok();
     declare_object_name(state, task_id, obj_ref, storage).ok()
 }
 
@@ -3813,7 +3824,7 @@ pub fn repointed_storage<M: HostMemory>(
         .ok_or(RepointStorageRefusal::NoListEntry)?;
     let descriptor = read_descriptor(state, host, task_id, &entry)
         .ok_or(RepointStorageRefusal::DescriptorUnread)?;
-    match declared_storage(state, task_id, &entry, &descriptor) {
+    match declared_storage(state, task_id, obj_ref, &entry, &descriptor) {
         Ok(reims_vgpu_core::lifecycle::Storage::Dedicated { backing, extent }) => {
             Ok((name, backing, extent))
         }
@@ -4377,7 +4388,7 @@ pub fn backing_id<M: HostMemory>(
             declared_len: entry.descriptor_length,
         }),
     )?;
-    backing_id_of(state, task_id, &entry, &descriptor)
+    backing_id_of(state, task_id, obj_ref, &entry, &descriptor)
 }
 
 /// [`backing_id`] for a caller that has already read the list entry and the
@@ -4394,6 +4405,7 @@ pub fn backing_id<M: HostMemory>(
 pub fn backing_id_of(
     state: &DeviceState,
     task_id: u32,
+    obj_ref: u32,
     entry: &ListObjectEntry,
     descriptor: &[u8],
 ) -> Result<reims_vgpu_core::access::BackingId, BackingIdRefusal> {
@@ -4403,7 +4415,7 @@ pub fn backing_id_of(
         // the rest are refusals whose variant says what would have to land for
         // them to stop being one. Both live in the classifier below, so the
         // answer is exhaustive over the types rather than a fallthrough.
-        None => backing_id_without_window(state, entry, descriptor),
+        None => backing_id_without_window(state, obj_ref, entry, descriptor),
     }
 }
 
@@ -4483,6 +4495,7 @@ pub fn mapping_backing_id(
 /// address-named types.
 fn backing_id_without_window(
     state: &DeviceState,
+    obj_ref: u32,
     entry: &ListObjectEntry,
     descriptor: &[u8],
 ) -> Result<reims_vgpu_core::access::BackingId, BackingIdRefusal> {
@@ -4494,6 +4507,31 @@ fn backing_id_without_window(
         declared_len: entry.descriptor_length,
     });
     Err(match entry.object_type {
+        // The surface-backing object, whose storage is the mapping's and whose
+        // mapping id is its own object-list slot.
+        //
+        // This is not the numeric coincidence the two namespaces are otherwise
+        // kept apart for. A backing is registered at slot `surface_id` *because*
+        // that is what a surface id is here — `backing_claimant_tasks` finds a
+        // surface's owner by probing exactly this slot for exactly this type,
+        // and `crate::model::BackingWindowRefs` says the address route names no
+        // storage for `OBJECT_TYPE_BACKING` precisely because the mapping route
+        // owns it. The type is what makes the integer one namespace rather than
+        // two, which is why the arm is keyed on the type and not on the id
+        // resolving.
+        //
+        // It answered `NamesNoStorage` before, and a driven macos-15 boot said
+        // what that cost: every one of 36 re-points the semantic model was not
+        // told about was a backing object whose slot also named a live mapping
+        // surface.
+        OBJECT_TYPE_BACKING => {
+            return mapping_backing_id(state, obj_ref).map_err(|refusal| {
+                BackingIdRefusal::ThroughMapping {
+                    mapping_id: obj_ref,
+                    refusal,
+                }
+            });
+        }
         OBJECT_TYPE_MAPPER_REF_TEXTURE => {
             let Ok(Descriptor::IOSurfaceTexture { mapping_id, .. }) =
                 decode_iosurface_texture_descriptor(descriptor)
