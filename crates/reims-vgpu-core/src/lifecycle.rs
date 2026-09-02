@@ -1557,7 +1557,12 @@ impl Lifecycle {
                     .map_err(|refusal| Refusal::Heap { task, refusal })?
             }
         };
-        let crate::namespace::Declared { id, displaced } = t.namespace.declare(slot, backing);
+        // `Some`, always, and that is this operation's own claim rather than the
+        // namespace's: a `DeclareResource` carries a `Storage`, so the object it
+        // declares owns memory by construction. A slot may hold a name with no
+        // storage — a sampler, a function, a pipeline state — and such a name
+        // does not arrive through here.
+        let crate::namespace::Declared { id, displaced } = t.namespace.declare(slot, Some(backing));
         // The guest wrote over a slot that still held an object. There is no
         // delete packet for that — see `Namespace::declare` — so the delete's
         // obligations are this declaration's, and they are exactly the ones
@@ -1667,7 +1672,15 @@ impl Lifecycle {
                 // Someone else still answers for these bytes. Forgetting here
                 // would drop the content authority out from under a reader or
                 // a live name.
-                Teardown::WhenUsesRetire { .. } | Teardown::HeldByAnotherName { .. } => {}
+                // `NoStorage` cannot arrive on this arm — a dedicated resident
+                // is a name the namespace holds a backing for — and it is
+                // grouped here rather than asserted, because the two ways of
+                // being wrong are not equal: an unreachable arm that fires
+                // does nothing, and a panic in the model's own teardown path
+                // takes the session down over a name that owns nothing.
+                Teardown::WhenUsesRetire { .. }
+                | Teardown::HeldByAnotherName { .. }
+                | Teardown::NoStorage => {}
             },
             None => {}
         }
@@ -1729,8 +1742,11 @@ impl Lifecycle {
                 let _ = self.forget_backing(old);
             }
             // The old bytes are still read by accepted work, or still named by
-            // another slot. Either way their authority is not ours to drop.
-            Teardown::WhenUsesRetire { .. } | Teardown::HeldByAnotherName { .. } => {}
+            // another slot, or there were no old bytes at all. In none of the
+            // three is there an authority here to drop.
+            Teardown::WhenUsesRetire { .. }
+            | Teardown::HeldByAnotherName { .. }
+            | Teardown::NoStorage => {}
         }
         Ok(Effects {
             teardowns: vec![teardown],
@@ -2846,7 +2862,7 @@ mod tests {
     #[test]
     fn a_delete_resolves_against_the_namespace_that_declared_the_object() {
         let mut names = crate::namespace::Namespace::new();
-        let declared = names.declare(ObjectListRef(7), crate::access::BackingId(10));
+        let declared = names.declare(ObjectListRef(7), Some(crate::access::BackingId(10)));
         assert_eq!(declared.displaced, None, "a free slot");
         let id = declared.id;
         let mut payload = Vec::new();
@@ -2886,7 +2902,7 @@ mod tests {
             Err(ResolveRefusal::UnknownRef { object_ref: 7 }),
             "a deleted slot stops resolving"
         );
-        let redeclared = names.declare(ObjectListRef(7), crate::access::BackingId(11));
+        let redeclared = names.declare(ObjectListRef(7), Some(crate::access::BackingId(11)));
         assert_eq!(
             redeclared.displaced, None,
             "the slot's occupant was deleted above, so this declaration displaces nothing"
