@@ -56,8 +56,11 @@
 //!   joined them when its operation stopped being the table's *walk* and became
 //!   the table's *binding*. Only the re-point is left, short of pages that are
 //!   not in its packet at all.
-//! - **Query** needs its reply destination *resolved* — a backing and a window,
-//!   not the address the request names.
+//! Query is no longer among them either. Its reply destination is resolved
+//! through [`Resolvers::replies`], in whichever address space its own question
+//! uses, and every route this device interns on draws from one monotone
+//! counter — so a page frame identified as a page frame can equal no window and
+//! no mapping by construction. See [`query_payload`].
 //!
 //! Present is no longer among them. Its target is a mapping, the device answers
 //! `reims_vgpu_core::resolve::MappingResolver` over that namespace, and the
@@ -192,62 +195,6 @@ pub enum Gap {
     /// operation, not before: it belongs to the resource-lifecycle group's
     /// cutover and not to a resolver added ahead of it.
     ReplacementStorage,
-    /// The reply destination, resolved to a backing and a window of it.
-    ///
-    /// **The four questions do not share a destination space, and whoever
-    /// closes this has to resolve two things and not one.** `CmdGetComputeInfo`
-    /// and the heap-texture size query carry a `reply_gva` — an address in the
-    /// task, in the same space every object-list object's window is in, so a
-    /// reply buffer *can* fall inside an allocation this device already has an
-    /// identity for and must then resolve to that identity rather than to one of
-    /// its own. `CmdGetDeviceInfo` carries a `reply_pfn` instead: a guest page
-    /// frame, in no task's address space at all.
-    ///
-    /// `reims_vgpu_core::query::ReplyDestination` wants one `BackingId` for
-    /// both, which is right — a destination is storage like any other — but the
-    /// device mints identities from `(task, allocation base, incarnation)` and a
-    /// page frame has no task and no allocation base. That is the term this gap
-    /// is actually short of.
-    ///
-    /// # Both halves are now instrumented, and neither is closed by a reading
-    ///
-    /// `crate::runtime::objects::note_query_reply_destination` asks the GVA half
-    /// whether a reply buffer lies inside an allocation this device already
-    /// identifies — the case where a destination given an identity of its own
-    /// leaves the reply write unordered against every access to that object.
-    ///
-    /// `crate::runtime::objects::note_device_info_reply_destination` asks the
-    /// page-frame half the only question that can be asked of it. A page frame
-    /// cannot be compared against a table of task windows, so the instrument
-    /// asks about the **identity space**: this device interns every key space
-    /// on one monotone counter, so a freshly minted identity is sound exactly
-    /// when that counter has handed nothing out, and no page arithmetic is
-    /// needed to say so. The reply path documents the contract that would make
-    /// it hold — the guest asks once, at accelerator start, and frees the
-    /// buffer after the single parse — and whether "at accelerator start"
-    /// precedes this device's first mint is a fact about a driven guest.
-    ///
-    /// A driven boot has already corrected one reading of that instrument. Its
-    /// first form counted live tasks and resources and reported `tasks=1
-    /// resources=0`, which reads as the open case and is not one: a task is a
-    /// namespace and has interned nothing, and the number the dependency
-    /// compiler compares is the mint counter.
-    ///
-    /// The corrected form's first driven boot — x86 Vulkan, macos-15, 391 s to
-    /// the desktop — answered `device_info_reply_scanned=1`,
-    /// `device_info_reply_before_any_identity=1`,
-    /// `device_info_reply_after_an_identity=0`. **One sample is what a boot can
-    /// contribute**, because the guest asks device-info once at accelerator
-    /// start and never again, which the reply path documents and this
-    /// denominator confirms rather than assumes. So the population grows with
-    /// boots and not with runtime, and "the denominator is small" is a
-    /// statement about how many boots have been run, not about instrumentation
-    /// that is missing.
-    ///
-    /// The GVA half's denominator is the one that is still thin:
-    /// `query_reply_scanned=5` with `query_reply_inside_an_allocation=0` across
-    /// two earlier boots.
-    ReplyDestination,
 }
 
 impl Gap {
@@ -258,7 +205,6 @@ impl Gap {
             Self::Unresolved => "ingress_row_unresolved",
             Self::ExecResolution => "ingress_needs_exec_resolution",
             Self::ReplacementStorage => "ingress_needs_replacement_storage",
-            Self::ReplyDestination => "ingress_needs_reply_destination",
         }
     }
 }
@@ -278,6 +224,25 @@ pub enum Refused {
     /// A present packet's bytes are not a present, or are too short for the
     /// trailer its form has.
     Present(reims_vgpu_core::present::ResolveRefusal),
+    /// A query packet's request words are not the layout its question uses, or
+    /// are too short for it.
+    Query(reims_vgpu_core::query::WordsRefusal),
+    /// A query packet's request resolved and its reply shape did not agree with
+    /// the words it was read from.
+    ///
+    /// Unreachable by construction today — [`query_payload`] reads the words at
+    /// the kind's own layout and hands the same kind to the resolver — and
+    /// carried for [`Self::PresentAccesses`]'s reason.
+    QueryShape(reims_vgpu_core::query::ResolveRefusal),
+    /// A query packet does not carry the reply address its own layout puts
+    /// there.
+    ///
+    /// The resolver's `None`, and it is the guest's bytes rather than this
+    /// device's incompleteness: an implementor reaching the same decoders
+    /// `request_words` reaches answers `None` only for a payload too short to
+    /// hold the address. An address it *did* find always resolves — storage
+    /// with no allocation is still storage.
+    QueryDestination,
     /// The accesses built for a lifetime command do not describe the resources
     /// its operation named.
     ///
@@ -307,6 +272,9 @@ impl Refused {
         match self {
             Self::Control(inner) => inner.slug(),
             Self::Lifecycle(inner) => inner.slug(),
+            Self::Query(inner) => inner.slug(),
+            Self::QueryShape(inner) => inner.slug(),
+            Self::QueryDestination => "ingress_query_carries_no_reply_address",
             Self::LifecycleAccesses(inner) => inner.slug(),
             Self::Present(inner) => inner.slug(),
             Self::PresentAccesses(inner) => inner.slug(),
@@ -345,6 +313,13 @@ pub struct Resolvers<'a> {
     /// `reims_vgpu_core::resolve::ResourceStorage`'s own doc says why folding
     /// them would make "no such slot" and "no storage term" one answer.
     pub storage: &'a dyn ResourceStorage,
+    /// Where each question's answer goes, resolved to a backing and a window.
+    ///
+    /// A third door rather than a field on either of the others, because a
+    /// reply destination is resolved in whichever address space its own
+    /// question uses — and one of the four uses none of the spaces the other
+    /// resolvers answer for. See `reims_vgpu_core::query::Destinations`.
+    pub replies: &'a dyn reims_vgpu_core::query::Destinations,
 }
 
 /// Why a drained packet did not become a model packet.
@@ -422,7 +397,13 @@ pub fn packet(
             &drained.payload,
             resolvers,
         )?),
-        Some(PayloadClass::Query) => return Err(blocked(Gap::ReplyDestination)),
+        Some(PayloadClass::Query) => Payload::Query(query_payload(
+            fifo,
+            channel,
+            opcode,
+            &drained.payload,
+            resolvers,
+        )?),
         Some(PayloadClass::Present) => Payload::Present(present_payload(
             fifo,
             channel,
@@ -530,6 +511,69 @@ fn present_payload(
     };
     PresentPayload::new(packet, vec![(packet.mapping, access)])
         .map_err(|mismatch| Blocked::Refused(Refused::PresentAccesses(mismatch)))
+}
+
+/// A question, resolved to the write its answer will make.
+///
+/// # Three terms, and the one that was missing was the destination
+///
+/// A query payload is a request and one access. The request's words are the
+/// packet's own, at the layout its question uses — `reims_vgpu_core::query`
+/// owns that and this bridge could always ask it. The access is derived from
+/// the destination by `QueryPayload::new`. What was missing between them was
+/// the destination itself: a `BackingId` and a window, neither on the wire, and
+/// the four questions do not share an address space to derive one from.
+///
+/// [`Resolvers::replies`] is that door, and the reason it closed is that a page
+/// frame turned out to need no comparison against the other key spaces. This
+/// device interns every route on one monotone counter, so a frame identified as
+/// a frame can equal no window and no mapping by construction — the property
+/// that had to hold, holding structurally rather than by measurement. Two
+/// driven boots agree with it: `device_info_reply_before_any_identity` on both,
+/// and `query_reply_inside_an_allocation` zero across every boot measured.
+///
+/// # No content version is reserved here
+///
+/// `QueryPayload::new`'s `output` is `None`. The reply is a write and the
+/// content authority is `reims_vgpu_core::content`'s; this bridge holds no
+/// authority to reserve a version with, and `None` says the term is absent
+/// rather than claiming one. It is the same answer [`lifecycle_accesses`]
+/// gives, for the same reason.
+///
+/// # Errors
+///
+/// [`Blocked::Refused`] for a payload that is not the request its opcode names,
+/// or that does not carry the reply address its layout puts there.
+fn query_payload(
+    fifo: Fifo,
+    channel: Channel,
+    opcode: u16,
+    payload: &[u8],
+    resolvers: Resolvers<'_>,
+) -> Result<reims_vgpu_core::transaction::QueryPayload, Blocked> {
+    use reims_vgpu_core::query::{self, QueryKind};
+    use reims_vgpu_core::transaction::QueryPayload;
+
+    let Some(kind) = QueryKind::of(channel, opcode) else {
+        // Unreachable through [`packet`]: `classify` said `Query` and
+        // `QueryKind::of` asks that same table. Answered rather than unwrapped,
+        // for `resource_lifetime`'s reason — a disagreement between two
+        // functions must be a value a reader can find in a log.
+        return Err(Blocked::Gap {
+            channel,
+            opcode,
+            gap: Gap::Unresolved,
+        });
+    };
+    let words = query::request_words(kind, payload)
+        .map_err(|refusal| Blocked::Refused(Refused::Query(refusal)))?;
+    let destination = resolvers
+        .replies
+        .destination(kind, payload)
+        .ok_or(Blocked::Refused(Refused::QueryDestination))?;
+    let request = query::resolve(kind, words, destination)
+        .map_err(|refusal| Blocked::Refused(Refused::QueryShape(refusal)))?;
+    Ok(QueryPayload::new(request, fifo.domain(), None))
 }
 
 /// Every resource-lifetime command, resolved in the namespaces the packet names.
@@ -817,11 +861,36 @@ mod tests {
         }
     }
 
+    /// A reply-destination source that answers for every question, keyed on the
+    /// kind so two questions never share a destination.
+    ///
+    /// The window is a fixed page, which no assertion here reads: what the
+    /// ledger sweep asks is which rows cross, and a row that gapped because a
+    /// fixture had no destination would be reporting on the fixture.
+    struct EveryReply;
+
+    impl reims_vgpu_core::query::Destinations for EveryReply {
+        fn destination(
+            &self,
+            kind: reims_vgpu_core::query::QueryKind,
+            _payload: &[u8],
+        ) -> Option<reims_vgpu_core::query::ReplyDestination> {
+            Some(reims_vgpu_core::query::ReplyDestination {
+                backing: reims_vgpu_core::access::BackingId(kind as u64 | 1 << 43),
+                bytes: reims_vgpu_core::access::ByteRange {
+                    offset: 0,
+                    length: 0x1000,
+                },
+            })
+        }
+    }
+
     fn resolvers(mappings: &dyn MappingResolver) -> Resolvers<'_> {
         Resolvers {
             mappings,
             objects: &EveryObject,
             storage: &EveryStorage,
+            replies: &EveryReply,
         }
     }
 
@@ -852,6 +921,10 @@ mod tests {
             InvalidateValidityOps, CHILD_INVALIDATE_RECORD_LEN, CHILD_SYNCHRONIZE_RECORD_LEN,
         };
         let mut packet = drained(opcode);
+        if let Some(kind) = reims_vgpu_core::query::QueryKind::of(channel, opcode) {
+            fill_query_request(&mut packet, kind);
+            return packet;
+        }
         let Some(record_len) =
             LifecycleKind::of(channel, opcode).and_then(LifecycleKind::resource_list_record_len)
         else {
@@ -869,6 +942,46 @@ mod tests {
                 .copy_from_slice(&InvalidateValidityOps::PAGEON.to_le_dword().to_le_bytes());
         }
         packet
+    }
+
+    /// Make a query row's payload a request its own layout accepts.
+    ///
+    /// The zeroed fixture is not one for every question: the heap-texture
+    /// request refuses a null reply address and a window too small for an
+    /// `MTLSizeAndAlign`, and it frames an embedded record whose declared
+    /// length must match the payload's. A sweep run on the bare fixture would
+    /// report that row as refused and never reach the destination resolver at
+    /// all, which is the half this class was gapped on.
+    fn fill_query_request(packet: &mut drain::Packet, kind: reims_vgpu_core::query::QueryKind) {
+        use reims_vgpu_core::query::QueryKind;
+        use reims_vgpu_protocol::fifo::{
+            HEAP_TEXTURE_REPLY_GVA, HEAP_TEXTURE_REPLY_LEN, HEAP_TEXTURE_REPLY_LENGTH,
+            HEAP_TEXTURE_REQUEST_HEADER_LEN, HEAP_TEXTURE_SERIALIZED_LEN,
+            HEAP_TEXTURE_SERIALIZED_TAG, HEAP_TEXTURE_SERIALIZER_LENGTH,
+        };
+        match kind {
+            QueryKind::HeapTextureSizeAndAlign => {
+                packet.payload =
+                    vec![0u8; HEAP_TEXTURE_REQUEST_HEADER_LEN + HEAP_TEXTURE_SERIALIZED_LEN];
+                packet.payload[HEAP_TEXTURE_REPLY_GVA..HEAP_TEXTURE_REPLY_GVA + 8]
+                    .copy_from_slice(&0x4000u64.to_le_bytes());
+                packet.payload[HEAP_TEXTURE_REPLY_LENGTH..HEAP_TEXTURE_REPLY_LENGTH + 8]
+                    .copy_from_slice(&(HEAP_TEXTURE_REPLY_LEN as u64).to_le_bytes());
+                packet.payload[HEAP_TEXTURE_SERIALIZER_LENGTH..HEAP_TEXTURE_SERIALIZER_LENGTH + 4]
+                    .copy_from_slice(&(HEAP_TEXTURE_SERIALIZED_LEN as u32).to_le_bytes());
+                // The embedded record's own head: the selector's opcode and the
+                // record's length, both from the protocol's constants rather
+                // than written again here.
+                let record = HEAP_TEXTURE_REQUEST_HEADER_LEN;
+                packet.payload[record..record + 4]
+                    .copy_from_slice(&HEAP_TEXTURE_SERIALIZED_TAG.to_le_bytes());
+                packet.payload[record + 4..record + 8]
+                    .copy_from_slice(&(HEAP_TEXTURE_SERIALIZED_LEN as u32).to_le_bytes());
+            }
+            // The other three accept the zeroed fixture: their words are counts
+            // and addresses, and a zero is a valid one of each for a decode.
+            QueryKind::DeviceInfo | QueryKind::DeviceInfoLegacy | QueryKind::ComputeInfo => {}
+        }
     }
 
     fn fifo_for(channel: Channel) -> Fifo {
@@ -910,7 +1023,9 @@ mod tests {
                 // list of opcodes written here, so the test cannot drift into
                 // agreeing with itself.
                 Some(PayloadClass::ResourceLifecycle) => lifetime_gap(row.channel, row.opcode),
-                Some(PayloadClass::Query) => Some(Gap::ReplyDestination),
+                // Crosses. Its reply destination is resolved in whichever
+                // address space its own question uses; see `query_payload`.
+                Some(PayloadClass::Query) => None,
                 // Crosses, and crosses on a namespace nothing is live in: the
                 // target resolves to no backing and the access says so. That
                 // the *unresolved* case still crosses is the assertion — a
@@ -931,7 +1046,11 @@ mod tests {
                             matches!(built.payload, Payload::ResourceLifecycle(_))
                         }
                         Some(PayloadClass::Present) => matches!(built.payload, Payload::Present(_)),
-                        _ => false,
+                        Some(PayloadClass::Query) => matches!(built.payload, Payload::Query(_)),
+                        // Exec is the one class that still gaps, so nothing
+                        // reaches here with it; `None` is a row the ledger has
+                        // not judged and gaps too.
+                        Some(PayloadClass::Exec) | None => false,
                     };
                     assert!(
                         right_class,
@@ -1007,15 +1126,19 @@ mod tests {
         }
     }
 
-    /// What crosses is exactly the whole control class, the whole present class,
-    /// and every resource-lifetime command except the re-point, whose operation
-    /// needs pages that are not in its packet — and nothing else.
+    /// What crosses is the whole control class, the whole present class, the
+    /// whole query class, and every resource-lifetime command except the
+    /// re-point — and nothing else.
+    ///
+    /// The complement is the claim: what is left is EXEC, whose access source
+    /// is the model's own lifecycle owner and arrives with that owner's
+    /// cutover, and the re-point, whose pages are not on its wire.
     ///
     /// The counts are spelled out because this is the cutover's own scoreboard:
     /// a gap that closes moves a number here, and a row that quietly changed
     /// class moves one without anybody deciding to.
     #[test]
-    fn what_crosses_is_control_present_and_every_lifetime_command_but_the_repoint() {
+    fn what_crosses_is_everything_but_exec_and_the_repoint() {
         let crossing: Vec<_> = LEDGER
             .iter()
             .filter(|row| {
@@ -1035,7 +1158,7 @@ mod tests {
             .filter(|row| {
                 matches!(
                     classify(row.channel, row.opcode),
-                    Some(PayloadClass::Control | PayloadClass::Present)
+                    Some(PayloadClass::Control | PayloadClass::Present | PayloadClass::Query)
                 ) || (classify(row.channel, row.opcode) == Some(PayloadClass::ResourceLifecycle)
                     && lifetime_gap(row.channel, row.opcode).is_none())
             })
@@ -1052,7 +1175,7 @@ mod tests {
             .count();
         assert_eq!(
             (control, present, crossing.len()),
-            (23, 3, 40),
+            (23, 3, 44),
             "the ledger's crossing rows changed; what reaches the model is not what the \
              module documentation says it is"
         );
@@ -1258,6 +1381,7 @@ mod tests {
                 mappings: &EveryMapping,
                 objects: &EveryObject,
                 storage: &NoStorage,
+                replies: &EveryReply,
             },
         )
         .expect("an unkeyable target is not a lost packet");

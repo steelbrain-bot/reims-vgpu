@@ -3510,6 +3510,108 @@ fn a_query_reply_destination_is_measured_against_the_allocations_this_device_hol
     );
 }
 
+/// A reply destination is identified in the space its own question uses, and
+/// the three spaces cannot collide.
+///
+/// The collision is the whole risk. A reply buffer inside an allocation this
+/// device identifies must take *that* allocation's identity — given one of its
+/// own, the reply write and every access to the object come out over different
+/// backings and the hazard edge between them is never drawn. A page frame, which
+/// no task's address space names, must take an identity that can equal no
+/// window's and no mapping's; it does, because every route interns on one
+/// monotone counter.
+#[test]
+fn a_reply_destination_is_identified_in_its_own_space_and_collides_with_no_other() {
+    use reims_vgpu_core::query::{Destinations as _, QueryKind};
+    use reims_vgpu_protocol::fifo::COMPUTE_INFO_REQUEST_LEN;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+    const BASE: u64 = 0x20u64 << PAGE_SHIFT_ARM64E;
+    const SIZE: u64 = 0x1000;
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&SIZE.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+    let allocation = super::backing_id(&state, &host, task, buffer).expect("the buffer identifies");
+
+    let compute = |gva: u64| {
+        // The compute-info request's six words, in the order its decoder reads
+        // them: task, pipeline, key-table length, pair capacity, then the reply
+        // address as two halves.
+        let mut payload = vec![0u8; COMPUTE_INFO_REQUEST_LEN];
+        st32(&mut payload[0..], task);
+        st32(&mut payload[4..], 3);
+        st32(&mut payload[8..], 5);
+        st32(&mut payload[12..], 8);
+        st32(&mut payload[16..], gva as u32);
+        st32(&mut payload[20..], (gva >> 32) as u32);
+        payload
+    };
+    let names = super::TaskNames::new(&state, &host);
+
+    // Inside the allocation: the allocation's identity, at the offset the reply
+    // lies at within it.
+    let inside = names
+        .destination(QueryKind::ComputeInfo, &compute(BASE + 0x40))
+        .expect("a reply address resolves");
+    assert_eq!(
+        inside.backing, allocation,
+        "a reply inside an allocation must not be given an identity of its own"
+    );
+    assert_eq!(inside.bytes.offset, 0x40);
+
+    // Outside every allocation: storage all the same, identified as the window
+    // it is, and never equal to the allocation's.
+    let outside = names
+        .destination(QueryKind::ComputeInfo, &compute(BASE + SIZE + 0x8000))
+        .expect("a reply address outside every allocation still names storage");
+    assert_ne!(outside.backing, allocation);
+
+    // A page frame, in the third key space. Two asks for one frame are one
+    // identity, and it equals neither window identity.
+    let device_info = |pfn: u32| {
+        use reims_vgpu_protocol::fifo::DeviceInfoForm;
+        let form = DeviceInfoForm::WithKeyLimit;
+        let mut payload = vec![0u8; 64];
+        st32(&mut payload[form.reply_pfn_offset()..], pfn);
+        st32(&mut payload[form.pair_capacity_offset()..], 512);
+        payload
+    };
+    let frame = names
+        .destination(QueryKind::DeviceInfo, &device_info(0x1a7dc))
+        .expect("a page frame is storage");
+    assert_eq!(
+        frame.backing,
+        names
+            .destination(QueryKind::DeviceInfo, &device_info(0x1a7dc))
+            .expect("asked twice")
+            .backing,
+        "one frame is one identity"
+    );
+    assert_ne!(frame.backing, allocation);
+    assert_ne!(frame.backing, outside.backing);
+    assert_ne!(
+        frame.backing,
+        names
+            .destination(QueryKind::DeviceInfo, &device_info(0x1a7dd))
+            .expect("a second frame")
+            .backing,
+        "two frames are two identities"
+    );
+}
+
 /// The device-info reply census tells "before any identity was minted" from
 /// "after one was", and moves its denominator either way.
 ///

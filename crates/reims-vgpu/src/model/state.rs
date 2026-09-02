@@ -915,6 +915,17 @@ pub struct BackingWindowRefs {
     /// was minted for. See the type doc for why this is a second table and not
     /// a second counter.
     mappings: Mutex<BTreeMap<u32, MappingFacts>>,
+    /// The identity of a bare guest page frame.
+    ///
+    /// The third key space, and the type doc's rule applies to it unchanged: it
+    /// interns on [`Self::next_id`] like the other two, so a frame's identity
+    /// can never equal a window's or a mapping's.
+    ///
+    /// One reader — a `CmdGetDeviceInfo` reply, whose destination is a page
+    /// frame in no task's address space, so neither of the other two key spaces
+    /// can name it. It holds no incarnation because a page frame has no
+    /// re-point: the guest names a physical frame and that frame is the storage.
+    frames: Mutex<BTreeMap<u32, u64>>,
     /// The next dense backing identity to hand out.
     ///
     /// Monotone and never reused, which is the whole of what makes an id an
@@ -968,6 +979,7 @@ impl Default for BackingWindowRefs {
         Self {
             windows: Mutex::new(BTreeMap::new()),
             mappings: Mutex::new(BTreeMap::new()),
+            frames: Mutex::new(BTreeMap::new()),
             // Zero is never handed out, so a zeroed structure cannot read as a
             // valid identity -- the same rule `SlotGeneration` follows.
             next_id: Mutex::new(1),
@@ -1102,6 +1114,32 @@ impl BackingWindowRefs {
     /// carries a bumped `map_generation` (every writer of the page list bumps
     /// it), so `(mapping, generation)` never repeats and a later surface at the
     /// same id cannot inherit the previous one's number.
+    /// The identity of a bare guest page frame, minted once and stable after.
+    ///
+    /// No incarnation, unlike the window and mapping routes: those two exist
+    /// because storage under a name can be replaced, and a page frame is not a
+    /// name — it is the storage. Two asks for one frame are two asks about the
+    /// same bytes and get the same number.
+    fn frame_identity(&self, pfn: u32) -> u64 {
+        if let Some(&id) = self
+            .frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pfn)
+        {
+            return id;
+        }
+        // Minted outside the table's lock, as the window route mints, so the
+        // counter is never advanced under it.
+        let id = self.mint();
+        *self
+            .frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(pfn)
+            .or_insert(id)
+    }
+
     fn mapping_identity(&self, mapping_id: u32, map_generation: u32) -> u64 {
         let candidate = self.mint();
         let mut mappings = self.mappings.lock().unwrap_or_else(|e| e.into_inner());
@@ -3796,6 +3834,15 @@ impl DeviceState {
     /// identity space as a whole.
     pub fn backing_identities_minted(&self) -> u64 {
         self.backing_window_refs.minted()
+    }
+
+    /// The canonical identity of a bare guest page frame.
+    ///
+    /// The one caller is a `CmdGetDeviceInfo` reply destination — see
+    /// [`BackingWindowRefs`]'s `frames` table for why a page frame needs a key
+    /// space of its own and why sharing the counter is what makes that safe.
+    pub fn frame_backing_identity(&self, pfn: u32) -> reims_vgpu_core::access::BackingId {
+        reims_vgpu_core::access::BackingId(self.backing_window_refs.frame_identity(pfn))
     }
 
     pub fn object_name(&self, task_id: u32, obj_ref: u32) -> Option<ResourceId> {

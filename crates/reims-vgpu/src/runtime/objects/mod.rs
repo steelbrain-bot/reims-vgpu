@@ -2421,6 +2421,121 @@ pub fn note_query_reply_destination(
     Some(ref_)
 }
 
+/// The device answering the model's reply-destination resolver.
+///
+/// # Two destination spaces, one identity space
+///
+/// `reims_vgpu_core::query::ReplyDestination` is one `BackingId` and a window,
+/// and the four questions do not share an address space to derive it from.
+/// `CmdGetComputeInfo` and the heap-texture query carry a **task GVA**;
+/// `CmdGetDeviceInfo` carries a **guest page frame** in no task's address space
+/// at all. Each is resolved in the space it belongs to and both arrive at one
+/// identity space, because every route this device interns on draws from one
+/// monotone counter — see `crate::model::state::BackingWindowRefs`.
+///
+/// * A GVA inside an allocation this device already identifies takes **that
+///   allocation's** identity, at the offset the reply lies at within it. This
+///   is the case that must not be given an identity of its own: the reply write
+///   and every access to that object would then come out over different
+///   backings and the hazard edge between them would never be drawn. No driven
+///   boot has produced one — `query_reply_inside_an_allocation` is 0 across
+///   every boot measured — and it is answered correctly rather than left to the
+///   case that has been observed.
+/// * A GVA outside every allocation is storage all the same, and it is
+///   identified as the window it is: `(task, page-aligned base)`, through the
+///   same door an object's allocation goes through. A later object constructed
+///   at that base arrives at the *same* number, which is right — it is the same
+///   bytes.
+/// * A page frame is identified as a frame, in the third key space, with no
+///   incarnation because a frame is storage rather than a name for storage.
+///
+/// # The window is the request's, not the answer's
+///
+/// Each request states how much room it set aside — a pair capacity, a reply
+/// length — and that is what the destination's [`ByteRange`] carries. The
+/// answer's own length is `ReplyShape`'s, and `reims_vgpu_core::query::Stall::
+/// ReplyTooLarge` is the comparison between the two. A destination carrying the
+/// answer's length instead would make that comparison trivially true and the
+/// overflow it exists to catch unrepresentable.
+impl<M: HostMemory> reims_vgpu_core::query::Destinations for TaskNames<'_, M> {
+    fn destination(
+        &self,
+        kind: reims_vgpu_core::query::QueryKind,
+        payload: &[u8],
+    ) -> Option<reims_vgpu_core::query::ReplyDestination> {
+        use reims_vgpu_core::access::ByteRange;
+        use reims_vgpu_core::query::{QueryKind, ReplyDestination};
+        let state = self.state;
+        if let Some(form) = kind.device_info_form() {
+            let request = crate::protocol::fifo::decode_device_info(form, payload).ok()?;
+            // A page frame in no task, so neither the window nor the mapping key
+            // space can name it. The window is the guest's own capacity in
+            // pairs, which is the reply buffer's allocation size — the same
+            // number `reply_device_info` bounds its write by.
+            return Some(ReplyDestination {
+                backing: state.frame_backing_identity(request.reply_pfn),
+                bytes: ByteRange {
+                    offset: 0,
+                    length: u64::from(request.pair_capacity)
+                        * crate::protocol::info_reply::PAIR_LEN as u64,
+                },
+            });
+        }
+        let (raw_task, gva, length) = match kind {
+            QueryKind::ComputeInfo => {
+                let request = crate::protocol::fifo::decode_compute_info(payload).ok()?;
+                (
+                    request.raw_task,
+                    request.reply_gva,
+                    u64::from(request.pair_capacity) * crate::protocol::info_reply::PAIR_LEN as u64,
+                )
+            }
+            QueryKind::HeapTextureSizeAndAlign => {
+                let request = crate::protocol::fifo::decode_heap_texture_query(payload).ok()?;
+                (request.raw_task, request.reply_gva, request.reply_len)
+            }
+            // Both answered `Some` above and returned. Named rather than
+            // wildcarded so a fifth question is a compile error here.
+            QueryKind::DeviceInfo | QueryKind::DeviceInfoLegacy => return None,
+        };
+        let task = crate::runtime::task_slot::resolve_task_word(
+            &state.tasks,
+            crate::runtime::task_slot::TaskWordSite::ComputeInfo,
+            raw_task,
+        )?;
+        // The same question the census asks, asked once: whether these bytes are
+        // already part of an allocation with an identity.
+        match note_query_reply_destination(state, task, gva, length) {
+            Some(holder) => {
+                let name = state.object_name(task, holder)?;
+                let resource = state.task_resources.get(task, name)?;
+                let (base, _) = resource.backing_window(state.page_shift)?;
+                Some(ReplyDestination {
+                    backing: state.backing_identity(task, base),
+                    bytes: ByteRange {
+                        offset: gva.checked_sub(base)?,
+                        length,
+                    },
+                })
+            }
+            None => {
+                // Storage all the same, identified as the window it is. The
+                // base is page aligned so two replies in one page are one
+                // backing at two offsets rather than two backings.
+                let page = 1u64 << state.page_shift;
+                let base = gva & !(page - 1);
+                Some(ReplyDestination {
+                    backing: state.backing_identity(task, base),
+                    bytes: ByteRange {
+                        offset: gva - base,
+                        length,
+                    },
+                })
+            }
+        }
+    }
+}
+
 /// Whether a device-info reply's page frame could collide with storage this
 /// device already identifies, asked at the moment the reply is written.
 ///
