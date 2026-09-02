@@ -18,15 +18,29 @@
 //!
 //! # The gaps are the cutover's remaining work, stated
 //!
-//! One class crosses now. [`reims_vgpu_core::control::resolve`] is a function
-//! of the packet's own bytes, so a control packet needs nothing this device has
-//! not already put in the `drain::Packet`. The other four each name one input
-//! the model needs and this function is not given:
+//! What crosses is what resolves from the packet's own bytes.
+//! [`reims_vgpu_core::control::resolve`] is such a function, so the whole
+//! control class needs nothing this device has not already put in the
+//! `drain::Packet` — and so is
+//! [`reims_vgpu_core::lifecycle::task_lifetime`], which is why two members of
+//! the resource-lifetime class cross with it.
+//!
+//! **The class is not the unit, and that is the point of naming the gaps at
+//! all.** A task definition and a task deletion carry a task id, a kernel bit
+//! and a directory frame; there is no object ref in either, so no namespace is
+//! owed. The other ten members name an object ref, a mapping id, or a counted
+//! list of them. A gap stated as "lifetime commands need a namespace" was true
+//! of the class and false of two of its members, and a gap that over-claims is
+//! one nobody thinks to close.
+//!
+//! What remains, each naming one input the model needs and this function is not
+//! given:
 //!
 //! - **Exec** needs the object-list resolver and the access source that
 //!   [`reims_vgpu_core::walk::exec`] walks a command stream with.
-//! - **Resource lifetime** needs the object and mapping namespaces, and for
-//!   `SetObjectList` the guest table itself.
+//! - **Resource lifetime**, for the ten that name something inside a task,
+//!   needs the object and mapping namespaces — and for `SetObjectList` the
+//!   guest table itself.
 //! - **Query** needs its reply destination *resolved* — a backing and a window,
 //!   not the address the request names.
 //! - **Present** needs the accesses its target mapping resolves to.
@@ -126,8 +140,16 @@ pub enum Gap {
     /// The object-list resolver and the access source an EXEC's command stream
     /// is walked with.
     ExecResolution,
-    /// The object and mapping namespaces a lifetime command's resources
-    /// resolve in.
+    /// The object and mapping namespaces a *resource* lifetime command's
+    /// resources resolve in.
+    ///
+    /// Not every lifetime command has any. A task definition and a task
+    /// deletion name a task and nothing inside it — no object ref, no mapping id
+    /// — so `reims_vgpu_core::lifecycle::task_lifetime` is a function of the
+    /// packet's own bytes and those two cross now. This names what the other ten
+    /// need, which is why it is not "lifetime commands need a namespace": that
+    /// sentence was true of the class and false of two of its members, and a gap
+    /// that over-claims is a gap nobody thinks to close.
     Namespaces,
     /// The reply destination, resolved to a backing and a window of it.
     ReplyDestination,
@@ -149,6 +171,32 @@ impl Gap {
     }
 }
 
+/// The guest's bytes not being the command its opcode names, as the resolver
+/// that judged them said it.
+///
+/// Two vocabularies and not one string, because two resolvers judge two classes
+/// here and they refuse different things — a control packet that is not control,
+/// a lifetime payload too short for the record its opcode implies. Folded into
+/// one name, a reading could not say which layer decided, and the two have
+/// different fixes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    Control(control::ResolveRefusal),
+    Lifecycle(reims_vgpu_core::lifecycle::ResolveRefusal),
+}
+
+impl Refused {
+    /// The name this reaches the failure channel under, from the refusal's own
+    /// owner rather than restated here.
+    #[must_use]
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Control(inner) => inner.slug(),
+            Self::Lifecycle(inner) => inner.slug(),
+        }
+    }
+}
+
 /// Why a drained packet did not become a model packet.
 ///
 /// The two arms are different obligations and are deliberately not one type. A
@@ -162,13 +210,13 @@ pub enum Blocked {
         opcode: u16,
         gap: Gap,
     },
-    Refused(control::ResolveRefusal),
+    Refused(Refused),
 }
 
 impl Blocked {
     /// The name this reaches the failure channel under.
     #[must_use]
-    pub const fn slug(self) -> &'static str {
+    pub fn slug(self) -> &'static str {
         match self {
             Self::Gap { gap, .. } => gap.slug(),
             Self::Refused(refusal) => refusal.slug(),
@@ -216,11 +264,14 @@ pub fn packet(
     let payload = match classify(channel, opcode) {
         None => return Err(blocked(Gap::Unresolved)),
         Some(PayloadClass::Exec) => return Err(blocked(Gap::ExecResolution)),
-        Some(PayloadClass::ResourceLifecycle) => return Err(blocked(Gap::Namespaces)),
+        Some(PayloadClass::ResourceLifecycle) => {
+            Payload::ResourceLifecycle(task_lifetime(channel, opcode, &drained.payload)?)
+        }
         Some(PayloadClass::Query) => return Err(blocked(Gap::ReplyDestination)),
         Some(PayloadClass::Present) => return Err(blocked(Gap::MappingAccesses)),
         Some(PayloadClass::Control) => Payload::Control(
-            control::resolve(channel, opcode, &drained.payload).map_err(Blocked::Refused)?,
+            control::resolve(channel, opcode, &drained.payload)
+                .map_err(|refusal| Blocked::Refused(Refused::Control(refusal)))?,
         ),
     };
 
@@ -243,6 +294,53 @@ pub fn packet(
         }),
         payload,
     })
+}
+
+/// The two lifetime commands that name no resource, and the gap for the ten
+/// that do.
+///
+/// A task definition and a task deletion carry a task id, a kernel-task bit and
+/// a directory frame. There is no object ref in either, so
+/// [`reims_vgpu_core::lifecycle::task_lifetime`] resolves them from the packet's
+/// bytes alone and the payload's access list is empty because the operation
+/// names nothing for it to be about — which
+/// [`reims_vgpu_core::transaction::LifecyclePayload`] states as its own rule
+/// rather than taking on trust here.
+///
+/// Everything else in the class names an object ref, a mapping id, or a counted
+/// list of them, and those resolve in a namespace this bridge is not given.
+///
+/// # Errors
+///
+/// [`Blocked::Gap`] for the ten that need a namespace, and [`Blocked::Refused`]
+/// when a task-lifetime packet's bytes are not the command its opcode names.
+fn task_lifetime(
+    channel: Channel,
+    opcode: u16,
+    payload: &[u8],
+) -> Result<reims_vgpu_core::transaction::LifecyclePayload, Blocked> {
+    use reims_vgpu_core::lifecycle::{self, LifecycleKind};
+    use reims_vgpu_core::transaction::LifecyclePayload;
+    let gap = Blocked::Gap {
+        channel,
+        opcode,
+        gap: Gap::Namespaces,
+    };
+    // Asked of the same table `classify` read, rather than of the opcode again:
+    // the class said this is a lifetime command and the kind says which one.
+    let Some(kind) = LifecycleKind::of(channel, opcode) else {
+        return Err(gap);
+    };
+    if !matches!(kind, LifecycleKind::DefineTask | LifecycleKind::DeleteTask) {
+        return Err(gap);
+    }
+    let op = lifecycle::task_lifetime(kind, payload)
+        .map_err(|refusal| Blocked::Refused(Refused::Lifecycle(refusal)))?;
+    // Cannot mismatch: the operation names no resource, so there is no set for
+    // an empty access list to disagree with. Spelled out rather than unwrapped
+    // because the constructor is what holds the two together and a caller that
+    // bypassed it would be the disagreement the type exists to prevent.
+    LifecyclePayload::new(op, Vec::new()).map_err(|_| gap)
 }
 
 #[cfg(test)]
@@ -296,7 +394,14 @@ mod tests {
             let expected = match classify(row.channel, row.opcode) {
                 Some(PayloadClass::Control) => None,
                 Some(PayloadClass::Exec) => Some(Gap::ExecResolution),
-                Some(PayloadClass::ResourceLifecycle) => Some(Gap::Namespaces),
+                // The class is not the unit here, and this is the one place
+                // that says so. Two of its members — a task definition and a
+                // task deletion — name a task and nothing inside it, so they
+                // need no namespace and cross; the other ten name objects,
+                // mappings or counted lists of them and do not.
+                Some(PayloadClass::ResourceLifecycle) => is_task_lifetime(row.channel, row.opcode)
+                    .then_some(())
+                    .map_or(Some(Gap::Namespaces), |()| None),
                 Some(PayloadClass::Query) => Some(Gap::ReplyDestination),
                 Some(PayloadClass::Present) => Some(Gap::MappingAccesses),
                 None => Some(Gap::Unresolved),
@@ -307,8 +412,15 @@ mod tests {
                     assert_eq!(built.opcode, row.opcode);
                     assert_eq!(built.channel, row.channel);
                     assert_eq!(built.domain, fifo.domain());
+                    let right_class = match classify(row.channel, row.opcode) {
+                        Some(PayloadClass::Control) => matches!(built.payload, Payload::Control(_)),
+                        Some(PayloadClass::ResourceLifecycle) => {
+                            matches!(built.payload, Payload::ResourceLifecycle(_))
+                        }
+                        _ => false,
+                    };
                     assert!(
-                        matches!(built.payload, Payload::Control(_)),
+                        right_class,
                         "{} {:#04x} ({}) built a payload that is not its class",
                         row.channel.name(),
                         row.opcode,
@@ -354,10 +466,27 @@ mod tests {
         );
     }
 
-    /// The one class that crosses is exactly the one the module claims, and it
-    /// is the whole of it.
+    /// Whether an opcode is one of the two lifetime commands that name a task
+    /// and nothing inside it.
+    ///
+    /// Asked of the same table the bridge asks, so the test cannot drift into
+    /// its own list of opcodes and then agree with itself.
+    fn is_task_lifetime(channel: Channel, opcode: u16) -> bool {
+        use reims_vgpu_core::lifecycle::LifecycleKind;
+        matches!(
+            LifecycleKind::of(channel, opcode),
+            Some(LifecycleKind::DefineTask | LifecycleKind::DeleteTask)
+        )
+    }
+
+    /// What crosses is exactly the whole control class plus the two lifetime
+    /// commands that resolve from their own bytes — and nothing else.
+    ///
+    /// The counts are spelled out because this is the cutover's own scoreboard:
+    /// a gap that closes moves a number here, and a row that quietly changed
+    /// class moves one without anybody deciding to.
     #[test]
-    fn control_is_the_only_class_that_crosses_today() {
+    fn what_crosses_is_control_and_the_two_task_lifetime_commands() {
         let crossing: Vec<_> = LEDGER
             .iter()
             .filter(|row| {
@@ -371,17 +500,68 @@ mod tests {
             })
             .map(|row| (row.channel, row.opcode))
             .collect();
-        let control: Vec<_> = LEDGER
+        let expected: Vec<_> = LEDGER
             .iter()
-            .filter(|row| classify(row.channel, row.opcode) == Some(PayloadClass::Control))
+            .filter(|row| {
+                classify(row.channel, row.opcode) == Some(PayloadClass::Control)
+                    || is_task_lifetime(row.channel, row.opcode)
+            })
             .map(|row| (row.channel, row.opcode))
             .collect();
-        assert_eq!(crossing, control);
+        assert_eq!(crossing, expected);
+        let control = LEDGER
+            .iter()
+            .filter(|row| classify(row.channel, row.opcode) == Some(PayloadClass::Control))
+            .count();
         assert_eq!(
-            control.len(),
-            23,
-            "the ledger's control rows changed; what crosses to the model is not what the \
+            (control, crossing.len()),
+            (23, 27),
+            "the ledger's crossing rows changed; what reaches the model is not what the \
              module documentation says it is"
+        );
+    }
+
+    /// A task definition crosses whole: the packet's own fields, decoded, with
+    /// no access list because the operation names nothing for one to be about.
+    ///
+    /// The two crossing lifetime commands are asserted for their *content* and
+    /// not only for the fact that they cross. A bridge that produced a
+    /// well-formed envelope around a task id it had defaulted would pass the
+    /// ledger test above and hand the model a definition for task zero.
+    #[test]
+    fn a_task_definition_crosses_carrying_its_own_decoded_fields() {
+        use reims_vgpu_core::identity::{DirectoryFrame, TaskId};
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+
+        let mut drained = drained(0x38);
+        // `(task_id << 1) | is_kernel_task`, an address-space length this model
+        // deliberately does not carry, then the directory page frame — at the
+        // protocol's own offsets rather than at ones restated here.
+        use reims_vgpu_protocol::fifo::{DEFINE_TASK_DIRECTORY_PFN, DEFINE_TASK_RAW_ID};
+        drained.payload[DEFINE_TASK_RAW_ID..DEFINE_TASK_RAW_ID + 4]
+            .copy_from_slice(&((7u32 << 1) | 1).to_le_bytes());
+        drained.payload[DEFINE_TASK_DIRECTORY_PFN..DEFINE_TASK_DIRECTORY_PFN + 4]
+            .copy_from_slice(&0x1234u32.to_le_bytes());
+
+        let built = packet(Fifo::ROOT, SessionGeneration::FIRST, StampSlot(0), &drained)
+            .expect("a task definition needs no namespace");
+        let Payload::ResourceLifecycle(payload) = &built.payload else {
+            panic!("a lifetime command must not build another class's payload");
+        };
+        assert_eq!(
+            payload.op(),
+            &LifecycleOp::DefineTask {
+                task: TaskId(7),
+                kernel: true,
+                directory: DirectoryFrame(0x1234),
+            },
+            "the fields are the packet's, not defaults around a well-formed \
+             envelope"
+        );
+        assert!(
+            payload.accesses().is_empty(),
+            "a task definition names no resource, so there is nothing for an \
+             access to be about"
         );
     }
 
