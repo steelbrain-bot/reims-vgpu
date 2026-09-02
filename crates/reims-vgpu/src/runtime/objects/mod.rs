@@ -2107,6 +2107,34 @@ impl reims_vgpu_core::resolve::MappingResolver for DeviceState {
 /// perturbing it — the census is the first caller of the door the bridge will
 /// use, and the numbers are what that door does on a real guest.
 ///
+/// # The second reading, on a driven macos-15 boot to the desktop
+///
+/// ```text
+/// lifetime_ref_asked                  1232
+/// lifetime_ref_already_named          1213
+/// lifetime_ref_named_on_demand          19
+/// lifetime_ref_unnameable                0
+/// lifetime_ref_list_would_refuse         0
+/// object_named_before_constructed        0
+/// object_declared_over_a_live_name       0
+/// ```
+///
+/// 1213 + 19 = 1232 exactly, and **the residue is zero**: every ref a real
+/// guest's lifetime lists named was answerable, and not one packet would have
+/// been refused for want of a name. The 19 are the ones the previous boot
+/// counted as losses (49 there, same order of magnitude on a workload of the
+/// same size), and they are now answered from the guest's own table rather than
+/// waiting for a draw that never comes.
+///
+/// The two zeros beside them are what says the door is safe as well as
+/// sufficient. `object_declared_over_a_live_name` stayed at zero, so naming
+/// ahead of construction displaced nothing; and `object_named_before_constructed`
+/// — the arm [`resolve_resource`] takes when it finds a name it did not issue —
+/// also read zero, which is a reading and not a gap: on this rail the 19 refs
+/// named by a lifetime packet were never subsequently drawn. It is the counter
+/// that would say so if they were, and the path it guards is the one that keeps
+/// a later construction from minting a second generation over a live object.
+///
 /// # What it deliberately does not cover
 ///
 /// The two single-ref commands (`DeleteResource`, `ReplacePhysical`) and the
