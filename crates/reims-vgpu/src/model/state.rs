@@ -3933,12 +3933,15 @@ impl DeviceState {
 
     /// Publish an object into a task's namespace and take its name.
     ///
-    /// `backing` is `None` for an object that owns no memory, which is most of a
-    /// list — see `crate::runtime::objects::declared_storage`. It is also `None`
-    /// for one whose storage this device cannot describe: that is a floor on
-    /// what the model can be told and not a licence to invent an identity, and
-    /// the census at the construction site is what measures how often it
-    /// happens.
+    /// `storage` is the whole of what this device could establish about the
+    /// object's bytes, in the vocabulary
+    /// `reims_vgpu_core::lifecycle::Lifecycle` will take when these namespaces
+    /// move to it. `Storage::NoBytes` is an object that owns no memory, which is
+    /// most of a list — see `crate::runtime::objects::declared_storage`. An
+    /// object whose storage this device *cannot describe* is not expressible
+    /// here at all and never reaches this door: that distinction is the caller's
+    /// to make and to count, because `NoBytes` is a claim and "I could not tell"
+    /// is not.
     ///
     /// Returns the whole [`Declared`], displacement included, because a
     /// declaration over a slot that still held a live object is an event with an
@@ -3948,8 +3951,27 @@ impl DeviceState {
         &self,
         task_id: u32,
         obj_ref: u32,
-        backing: Option<BackingId>,
+        storage: reims_vgpu_core::lifecycle::Storage,
     ) -> Declared {
+        use reims_vgpu_core::lifecycle::Storage;
+        // The one place a `Storage` is flattened to what a namespace slot holds,
+        // and it is here because the loss is the namespace's: a slot records
+        // *which* storage a name is over and not how much of it, so the extent
+        // has nowhere to go on this side of the move. A caller doing the
+        // flattening would be deciding that on the namespace's behalf, and both
+        // callers were doing it identically, which is one copy too many of a
+        // decision with one owner.
+        //
+        // `Placed` is unreachable from this device today —
+        // `crate::runtime::objects::declared_storage` refuses a heap placement
+        // by name, because a heap's extent is unrecovered — and it is answered
+        // with the heap's backing rather than with `None`, because a placed
+        // resource does have storage and saying otherwise would be the invented
+        // absence the refusal exists to avoid.
+        let backing = match storage {
+            Storage::Dedicated { backing, .. } => Some(backing),
+            Storage::Placed { .. } | Storage::NoBytes => None,
+        };
         self.namespaces
             .lock()
             .unwrap_or_else(|e| e.into_inner())

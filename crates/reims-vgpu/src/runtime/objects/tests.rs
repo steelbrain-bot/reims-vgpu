@@ -3556,8 +3556,15 @@ fn a_declaration_into_an_undefined_task_is_told_apart_from_one_into_a_live_task(
     // The same declaration in a task nothing defined. It succeeds here — the
     // namespace is created on demand — and that is exactly what the new owner
     // would refuse.
+    let undescribable = store_route_count("object_declared_with_undescribable_storage");
     let name = super::declare_object_name(&state, 99, 7, None);
     assert_eq!(name.slot.0, 7, "this device names it anyway");
+    assert_eq!(
+        store_route_count("object_declared_with_undescribable_storage"),
+        undescribable + 1,
+        "and storage it could not describe is counted rather than claimed as \
+         `NoBytes` without a word"
+    );
     assert_eq!(
         (
             store_route_count("object_declared_into_a_defined_task"),

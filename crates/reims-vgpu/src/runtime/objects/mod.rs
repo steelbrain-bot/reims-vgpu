@@ -2825,17 +2825,10 @@ pub fn resolve_resource<M: HostMemory>(
         let _ = note_backing_window_alias(state, host, task_id, obj_ref, base, size);
     }
     note_backing_identity(state, task_id, &entry, &descriptor);
-    // The one declaration site. `None` for an object that owns no memory, and
-    // also for one whose storage this device cannot describe — a floor on what
-    // the model can be told, never an invented identity, and the census above is
-    // what measures how often it is reached.
-    let backing = declared_storage(state, task_id, &entry, &descriptor)
-        .ok()
-        .and_then(|storage| match storage {
-            reims_vgpu_core::lifecycle::Storage::Dedicated { backing, .. } => Some(backing),
-            reims_vgpu_core::lifecycle::Storage::Placed { .. }
-            | reims_vgpu_core::lifecycle::Storage::NoBytes => None,
-        });
+    // The one declaration site, carrying what this device established about the
+    // object's bytes rather than a flattening of it. See `declare_object_name`
+    // for why an undescribable storage is `None` here and not `NoBytes`.
+    let storage = declared_storage(state, task_id, &entry, &descriptor).ok();
     // Naming is idempotent, and a name may already exist without a memo: a
     // reference is named the first time *anything* asks what it names, and a
     // lifetime packet asks without constructing. Declaring again here would give
@@ -2846,7 +2839,7 @@ pub fn resolve_resource<M: HostMemory>(
             crate::runtime::drain::note_store_route("object_named_before_constructed");
             existing
         }
-        None => declare_object_name(state, task_id, obj_ref, backing),
+        None => declare_object_name(state, task_id, obj_ref, storage),
     };
     let resource = Arc::new(TaskResource::new(entry, descriptor));
     Ok(state.task_resources.register(task_id, name, resource))
@@ -2901,7 +2894,7 @@ fn declare_object_name(
     state: &DeviceState,
     task_id: u32,
     obj_ref: u32,
-    backing: Option<reims_vgpu_core::access::BackingId>,
+    storage: Option<reims_vgpu_core::lifecycle::Storage>,
 ) -> reims_vgpu_core::identity::ResourceId {
     if state.tasks.is_active(task_id) {
         crate::runtime::drain::note_store_route("object_declared_into_a_defined_task");
@@ -2919,7 +2912,30 @@ fn declare_object_name(
             ));
         }
     }
-    let declared = state.declare_object(task_id, obj_ref, backing);
+    // **`None` is not `NoBytes`, and collapsing them is the lie this argument
+    // exists to stop.** `NoBytes` is a claim — the object owns no memory, which
+    // is true of most of a list — and `None` is this device failing to describe
+    // storage that exists. Both used to arrive at the namespace as a `None`
+    // backing, which is harmless while a slot records only *which* storage a
+    // name is over; it stops being harmless the moment these declarations reach
+    // `reims_vgpu_core::lifecycle::Lifecycle`, whose `create_resource` tells the
+    // content authority that a `NoBytes` object has no bytes to be authoritative
+    // about. Declaring that of a resource with bytes would leave its content
+    // owned by nothing.
+    //
+    // So the undescribable case is declared as `NoBytes` here — the namespace
+    // has no third answer and a name must still be issued, or the reference
+    // resolves to nothing and every packet that mentions it is refused — and it
+    // is *counted*, which is what makes it a known floor rather than a silent
+    // claim. Six driven boots have read zero.
+    let declared = state.declare_object(
+        task_id,
+        obj_ref,
+        storage.unwrap_or_else(|| {
+            crate::runtime::drain::note_store_route("object_declared_with_undescribable_storage");
+            reims_vgpu_core::lifecycle::Storage::NoBytes
+        }),
+    );
     // A declaration over a slot that still held a live object owes that
     // occupant's teardown. It should be unreachable: every caller asked the
     // namespace first and found nothing. Reported rather than assumed away,
@@ -2995,14 +3011,8 @@ pub fn name_resource<M: HostMemory>(
     }
     let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
     let descriptor: Arc<[u8]> = Arc::from(read_descriptor(state, host, task_id, &entry)?);
-    let backing = declared_storage(state, task_id, &entry, &descriptor)
-        .ok()
-        .and_then(|storage| match storage {
-            reims_vgpu_core::lifecycle::Storage::Dedicated { backing, .. } => Some(backing),
-            reims_vgpu_core::lifecycle::Storage::Placed { .. }
-            | reims_vgpu_core::lifecycle::Storage::NoBytes => None,
-        });
-    Some(declare_object_name(state, task_id, obj_ref, backing))
+    let storage = declared_storage(state, task_id, &entry, &descriptor).ok();
+    Some(declare_object_name(state, task_id, obj_ref, storage))
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
