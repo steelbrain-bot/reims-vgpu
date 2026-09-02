@@ -34,21 +34,27 @@
 //! the resource-lifetime class cross with it.
 //!
 //! **The class is not the unit, and that is the point of naming the gaps at
-//! all.** A task definition and a task deletion carry a task id, a kernel bit
-//! and a directory frame; there is no object ref in either, so no namespace is
-//! owed. The other ten members name an object ref, a mapping id, or a counted
-//! list of them. A gap stated as "lifetime commands need a namespace" was true
-//! of the class and false of two of its members, and a gap that over-claims is
-//! one nobody thinks to close.
+//! all.** The resource-lifetime class has been three different partitions in
+//! three commits, and each time the coarser name was hiding a member that did
+//! not belong to it. "Lifetime commands need a namespace" was false of the two
+//! that name a task and nothing inside it. Once the namespaces landed it was
+//! false of all twelve — what the remaining ones are short of is the *access*
+//! each named resource takes, which is a different missing thing with a
+//! different owner, and two of them are short of neither. A gap that
+//! over-claims is one nobody thinks to close; a gap that closes and leaves its
+//! name behind is one everybody thinks is closed.
 //!
 //! What remains, each naming one input the model needs and this function is not
 //! given:
 //!
 //! - **Exec** needs the object-list resolver and the access source that
 //!   [`reims_vgpu_core::walk::exec`] walks a command stream with.
-//! - **Resource lifetime**, for the ten that name something inside a task,
-//!   needs the object and mapping namespaces — and for `SetObjectList` the
-//!   guest table itself.
+//! - **Resource lifetime** no longer needs a namespace: all twelve resolve
+//!   their refs, and the class splits three ways instead. Five name no resource
+//!   and cross. Five name resources and owe each one an access — a mode and a
+//!   backing — which the model does not yet state ([`Gap::LifecycleAccesses`]).
+//!   The last two are short of something that is not in their packet at all:
+//!   the guest's object-list table, and the pages behind a re-pointed object.
 //! - **Query** needs its reply destination *resolved* — a backing and a window,
 //!   not the address the request names.
 //!
@@ -92,7 +98,7 @@ use reims_vgpu_core::control;
 use reims_vgpu_core::identity::{
     ChannelId, CompletionStamp, SessionGeneration, StampSlot, StampValue, StampWait,
 };
-use reims_vgpu_core::resolve::MappingResolver;
+use reims_vgpu_core::resolve::{MappingResolver, TaskNamespaces};
 use reims_vgpu_core::session::Packet;
 use reims_vgpu_core::transaction::{classify, Payload, PayloadClass};
 use reims_vgpu_protocol::packets::Channel;
@@ -155,17 +161,52 @@ pub enum Gap {
     /// The object-list resolver and the access source an EXEC's command stream
     /// is walked with.
     ExecResolution,
-    /// The object and mapping namespaces a *resource* lifetime command's
-    /// resources resolve in.
+    /// The guest's object-list table, walked, which is what a rebind's operation
+    /// *is*.
     ///
-    /// Not every lifetime command has any. A task definition and a task
-    /// deletion name a task and nothing inside it — no object ref, no mapping id
-    /// — so `reims_vgpu_core::lifecycle::task_lifetime` is a function of the
-    /// packet's own bytes and those two cross now. This names what the other ten
-    /// need, which is why it is not "lifetime commands need a namespace": that
-    /// sentence was true of the class and false of two of its members, and a gap
-    /// that over-claims is a gap nobody thinks to close.
-    Namespaces,
+    /// `SetObjectList` says where a task's list lives and how many entries it
+    /// has; the operation is the per-entry result of reading it, and every byte
+    /// of that lives in pages `crates/reims-vgpu-memory` owns. Named rather than
+    /// approximated, because a rebind built from the packet alone would rebind
+    /// nothing while reporting that it had — which is
+    /// `reims_vgpu_core::lifecycle::ResolveRefusal::NeedsGuestTable`, restated
+    /// here as this device's own incompleteness rather than as the guest's bytes
+    /// being wrong.
+    ///
+    /// Walking it eagerly is not the closure. A driven boot's `SetObjectList`
+    /// packets each declare **1 048 576** entries — the list's capacity, not its
+    /// population. See `crate::runtime::objects::name_resource`.
+    ObjectListTable,
+    /// The access each of an operation's named resources takes.
+    ///
+    /// The operation resolves; the payload does not. Every resource a lifetime
+    /// operation names owes an `AccessIntent` — a mode, and a backing to key the
+    /// hazard edge on — and `reims_vgpu_core::transaction::LifecyclePayload`
+    /// refuses a payload whose access set disagrees with the operation's
+    /// resource set, which is what makes this a named gap rather than a silently
+    /// unordered packet.
+    ///
+    /// **The mode is the missing term, and it is missing from the model rather
+    /// than from this device.** Nothing in `reims_vgpu_core::lifecycle` says
+    /// what an `Invalidate`, a `Synchronize` or a `Discard` declares about the
+    /// resources it names: `Lifecycle::access` resolves a `Participation` a
+    /// caller supplies, and no caller supplies one for a lifecycle operation.
+    /// The two candidate answers are not interchangeable — an invalidate that
+    /// moves content authority to the guest reads as a write and a synchronize
+    /// that publishes host bytes reads as a read, and each one modelled as the
+    /// other drops exactly the edges the other needs. So it is named here and
+    /// not guessed at.
+    LifecycleAccesses,
+    /// The pages behind a re-pointed object, which its packet does not carry.
+    ///
+    /// `ReplacePhysical` is a bare `{task, object}`: the guest re-points a
+    /// resource at host frames it has already wired, at the same GPU-VA, so the
+    /// new backing and extent are nowhere on the wire. The ref resolves — that
+    /// half is done — and the operation still cannot be built, which is
+    /// `reims_vgpu_core::lifecycle::ResolveRefusal::NeedsStorage`. An operation
+    /// carrying the *old* backing would re-point nothing while reporting
+    /// success.
+    ReplacementStorage,
     /// The reply destination, resolved to a backing and a window of it.
     ///
     /// **The four questions do not share a destination space, and whoever
@@ -192,7 +233,9 @@ impl Gap {
         match self {
             Self::Unresolved => "ingress_row_unresolved",
             Self::ExecResolution => "ingress_needs_exec_resolution",
-            Self::Namespaces => "ingress_needs_namespaces",
+            Self::LifecycleAccesses => "ingress_needs_lifecycle_accesses",
+            Self::ObjectListTable => "ingress_needs_object_list_table",
+            Self::ReplacementStorage => "ingress_needs_replacement_storage",
             Self::ReplyDestination => "ingress_needs_reply_destination",
         }
     }
@@ -256,6 +299,12 @@ impl Refused {
 pub struct Resolvers<'a> {
     /// Which backing a mapping's surface currently occupies.
     pub mappings: &'a dyn MappingResolver,
+    /// Every task's object namespace, asked for by the task a packet names.
+    ///
+    /// Not one namespace: which task's slots a lifecycle packet's refs are
+    /// indices into is stated inside that packet, so only the join that decoded
+    /// it can bind the namespace. See `reims_vgpu_core::resolve::TaskNamespaces`.
+    pub objects: &'a dyn TaskNamespaces,
 }
 
 /// Why a drained packet did not become a model packet.
@@ -326,9 +375,12 @@ pub fn packet(
     let payload = match classify(channel, opcode) {
         None => return Err(blocked(Gap::Unresolved)),
         Some(PayloadClass::Exec) => return Err(blocked(Gap::ExecResolution)),
-        Some(PayloadClass::ResourceLifecycle) => {
-            Payload::ResourceLifecycle(task_lifetime(channel, opcode, &drained.payload)?)
-        }
+        Some(PayloadClass::ResourceLifecycle) => Payload::ResourceLifecycle(resource_lifetime(
+            channel,
+            opcode,
+            &drained.payload,
+            resolvers,
+        )?),
         Some(PayloadClass::Query) => return Err(blocked(Gap::ReplyDestination)),
         Some(PayloadClass::Present) => Payload::Present(present_payload(
             fifo,
@@ -439,51 +491,96 @@ fn present_payload(
         .map_err(|mismatch| Blocked::Refused(Refused::PresentAccesses(mismatch)))
 }
 
-/// The two lifetime commands that name no resource, and the gap for the ten
-/// that do.
+/// Every resource-lifetime command, resolved in the namespaces the packet names.
 ///
-/// A task definition and a task deletion carry a task id, a kernel-task bit and
-/// a directory frame. There is no object ref in either, so
-/// [`reims_vgpu_core::lifecycle::task_lifetime`] resolves them from the packet's
-/// bytes alone and the payload's access list is empty because the operation
-/// names nothing for it to be about — which
-/// [`reims_vgpu_core::transaction::LifecyclePayload`] states as its own rule
-/// rather than taking on trust here.
+/// # The namespaces are here, and they were not the only thing missing
 ///
-/// Everything else in the class names an object ref, a mapping id, or a counted
-/// list of them, and those resolve in a namespace this bridge is not given.
+/// This function was two commands wide: a task definition and a task deletion
+/// name a task and nothing inside it, so they resolved from their own bytes,
+/// and the other ten waited on a namespace nobody had given this bridge. The
+/// namespaces are now here — `reims_vgpu_core::lifecycle::operation` is the one
+/// join that picks which of its five sub-joins a kind belongs to, and it takes
+/// both — and **ten of the twelve now produce an operation**.
+///
+/// An operation is not a payload. `reims_vgpu_core::transaction::LifecyclePayload`
+/// holds an operation together with the accesses its named resources take, and
+/// refuses a list that disagrees with the operation's own resource set. That
+/// refusal is what partitions the ten: four of them name no resource, so the
+/// empty list is not a shortfall but the correct statement, and they cross.
+/// The rest name resources and each named resource owes an access — a mode and
+/// a backing — which is [`Gap::LifecycleAccesses`].
+///
+/// **The partition is the type's and not a list here.** This function offers the
+/// empty access list to the constructor and reads the answer; it does not
+/// enumerate which kinds name resources. A thirteenth command, or a kind that
+/// gains a resource list, moves itself.
+///
+/// # Two commands are short of neither a namespace nor an access
+///
+/// `SetObjectList`'s operation is the result of *walking* the guest's table, and
+/// `ReplacePhysical`'s names pages that are not on the wire at all. Both resolve
+/// their refs and still cannot be built, which is why the core names them with
+/// their own refusals rather than with `UnknownRef` — and why they arrive here
+/// as [`Gap::ObjectListTable`] and [`Gap::ReplacementStorage`] rather than as one
+/// gap called "namespaces" that would have read as closed the day the namespaces
+/// landed.
+///
+/// # A ref that names nothing is the guest's, not this device's
+///
+/// [`reims_vgpu_core::lifecycle::ResolveRefusal::UnknownRef`] stays a
+/// [`Blocked::Refused`], and that is a claim worth stating because it was not
+/// true before `crate::runtime::objects::name_resource`. While this device named
+/// a reference only when something constructed it, an unresolved ref meant "no
+/// draw has touched this yet" — device incompleteness — and 49 well-formed
+/// packets a boot would have been refused under it. Resolution now reads the
+/// guest's own object list, so a ref that still resolves to nothing is an empty
+/// slot or an unreadable descriptor: the packet's, and not a gap that closes
+/// later.
 ///
 /// # Errors
 ///
-/// [`Blocked::Gap`] for the ten that need a namespace, and [`Blocked::Refused`]
-/// when a task-lifetime packet's bytes are not the command its opcode names.
-fn task_lifetime(
+/// [`Blocked::Gap`] for the commands whose payload this bridge cannot yet
+/// complete, and [`Blocked::Refused`] when a lifetime packet's bytes are not the
+/// command its opcode names.
+fn resource_lifetime(
     channel: Channel,
     opcode: u16,
     payload: &[u8],
+    resolvers: Resolvers<'_>,
 ) -> Result<reims_vgpu_core::transaction::LifecyclePayload, Blocked> {
-    use reims_vgpu_core::lifecycle::{self, LifecycleKind};
+    use reims_vgpu_core::lifecycle::{self, LifecycleKind, ResolveRefusal};
     use reims_vgpu_core::transaction::LifecyclePayload;
-    let gap = Blocked::Gap {
+    let gap = |gap| Blocked::Gap {
         channel,
         opcode,
-        gap: Gap::Namespaces,
+        gap,
     };
     // Asked of the same table `classify` read, rather than of the opcode again:
     // the class said this is a lifetime command and the kind says which one.
     let Some(kind) = LifecycleKind::of(channel, opcode) else {
-        return Err(gap);
+        // Unreachable through [`packet`], which reached this arm because
+        // `classify` said `ResourceLifecycle` and `LifecycleKind::of` asks that
+        // same table. Answered rather than unwrapped, because the two are
+        // separate functions and a disagreement between them must be a value a
+        // reader can find in a log.
+        return Err(gap(Gap::Unresolved));
     };
-    if !matches!(kind, LifecycleKind::DefineTask | LifecycleKind::DeleteTask) {
-        return Err(gap);
-    }
-    let op = lifecycle::task_lifetime(kind, payload)
-        .map_err(|refusal| Blocked::Refused(Refused::Lifecycle(refusal)))?;
-    // Cannot mismatch: the operation names no resource, so there is no set for
-    // an empty access list to disagree with. Spelled out rather than unwrapped
-    // because the constructor is what holds the two together and a caller that
-    // bypassed it would be the disagreement the type exists to prevent.
-    LifecyclePayload::new(op, Vec::new()).map_err(|_| gap)
+    let op = lifecycle::operation(kind, payload, resolvers.objects, resolvers.mappings).map_err(
+        |refusal| match refusal {
+            // This device's own incompleteness, each named for what it is short
+            // of. The core states them as refusals because the core has no
+            // vocabulary for "the caller could give me this later"; this bridge
+            // does.
+            ResolveRefusal::NeedsGuestTable { .. } => gap(Gap::ObjectListTable),
+            ResolveRefusal::NeedsStorage { .. } => gap(Gap::ReplacementStorage),
+            other => Blocked::Refused(Refused::Lifecycle(other)),
+        },
+    )?;
+    // The empty access list, offered to the type that knows whether it is the
+    // truth. It is, for an operation that names no resource; for one that does,
+    // the constructor says which resource is unaccounted for and that is the
+    // gap.
+    LifecyclePayload::new(op, Vec::new()).map_err(|_| gap(Gap::LifecycleAccesses))
 }
 
 #[cfg(test)]
@@ -517,8 +614,49 @@ mod tests {
     /// A namespace nothing is live in, for the rows whose class never asks.
     const NOTHING_MAPPED: Mappings = Mappings(Vec::new());
 
-    fn resolvers(mappings: &Mappings) -> Resolvers<'_> {
-        Resolvers { mappings }
+    /// A mapping namespace that answers for every id, so a ledger row that
+    /// gapped because a fixture held no mapping would not be reporting on the
+    /// fixture.
+    struct EveryMapping;
+
+    impl reims_vgpu_core::resolve::MappingResolver for EveryMapping {
+        fn backing(
+            &self,
+            mapping: reims_vgpu_core::identity::MappingId,
+        ) -> Option<reims_vgpu_core::access::BackingId> {
+            Some(reims_vgpu_core::access::BackingId(
+                u64::from(mapping.0) | 1 << 41,
+            ))
+        }
+    }
+
+    /// An object namespace that answers for every ref in every task.
+    ///
+    /// The ledger sweep is about which join a row reaches and what it is still
+    /// short of, so a row that gapped because a fixture happened not to hold an
+    /// object would be reporting on the fixture.
+    struct EveryObject;
+
+    impl reims_vgpu_core::resolve::TaskNamespaces for EveryObject {
+        fn resource(
+            &self,
+            task: reims_vgpu_core::identity::TaskId,
+            object_ref: u32,
+        ) -> Option<reims_vgpu_core::identity::ResourceId> {
+            Some(reims_vgpu_core::identity::ResourceId {
+                slot: reims_vgpu_core::identity::ObjectListRef(object_ref),
+                generation: reims_vgpu_core::identity::SlotGeneration(
+                    u64::from(task.0).saturating_add(1),
+                ),
+            })
+        }
+    }
+
+    fn resolvers(mappings: &dyn MappingResolver) -> Resolvers<'_> {
+        Resolvers {
+            mappings,
+            objects: &EveryObject,
+        }
     }
 
     fn drained(opcode: u16) -> drain::Packet {
@@ -530,6 +668,41 @@ mod tests {
             payload: vec![0u8; ROOMY],
             next_head: 0,
         }
+    }
+
+    /// The same packet, with a one-record resource list for the four commands
+    /// that carry one.
+    ///
+    /// A zero-filled payload decodes those four as a list of **no** resources,
+    /// and an operation naming no resource legitimately crosses — so a ledger
+    /// sweep on the bare fixture would report the list commands as crossing and
+    /// never exercise the path where a named resource owes an access. The list
+    /// is one record long, and the invalidate's record carries the guest-write
+    /// quad because a zero quad is a refusal about the guest's bytes rather than
+    /// a statement about this bridge.
+    fn drained_with_list(channel: Channel, opcode: u16) -> drain::Packet {
+        use reims_vgpu_core::lifecycle::LifecycleKind;
+        use reims_vgpu_protocol::fifo::{
+            InvalidateValidityOps, CHILD_INVALIDATE_RECORD_LEN, CHILD_SYNCHRONIZE_RECORD_LEN,
+        };
+        let mut packet = drained(opcode);
+        let Some(record_len) =
+            LifecycleKind::of(channel, opcode).and_then(LifecycleKind::resource_list_record_len)
+        else {
+            return packet;
+        };
+        // `{u32 task, u32 count}` then `count` records. The count's offset is
+        // the header's own, and the record's shape is the length's.
+        packet.payload[4..8].copy_from_slice(&1u32.to_le_bytes());
+        packet.payload[8..12].copy_from_slice(&9u32.to_le_bytes());
+        assert!(
+            record_len == CHILD_INVALIDATE_RECORD_LEN || record_len == CHILD_SYNCHRONIZE_RECORD_LEN
+        );
+        if record_len == CHILD_INVALIDATE_RECORD_LEN {
+            packet.payload[12..16]
+                .copy_from_slice(&InvalidateValidityOps::PAGEON.to_le_dword().to_le_bytes());
+        }
+        packet
     }
 
     fn fifo_for(channel: Channel) -> Fifo {
@@ -555,8 +728,8 @@ mod tests {
                 fifo,
                 SessionGeneration::FIRST,
                 StampSlot(0),
-                &drained(row.opcode),
-                resolvers(&NOTHING_MAPPED),
+                &drained_with_list(row.channel, row.opcode),
+                resolvers(&EveryMapping),
             );
             let expected = match classify(row.channel, row.opcode) {
                 Some(PayloadClass::Control) => None,
@@ -566,9 +739,11 @@ mod tests {
                 // task deletion — name a task and nothing inside it, so they
                 // need no namespace and cross; the other ten name objects,
                 // mappings or counted lists of them and do not.
-                Some(PayloadClass::ResourceLifecycle) => is_task_lifetime(row.channel, row.opcode)
-                    .then_some(())
-                    .map_or(Some(Gap::Namespaces), |()| None),
+                // The class is not the unit, and this is the one place that
+                // says how it splits. Asked of the kind table rather than of a
+                // list of opcodes written here, so the test cannot drift into
+                // agreeing with itself.
+                Some(PayloadClass::ResourceLifecycle) => lifetime_gap(row.channel, row.opcode),
                 Some(PayloadClass::Query) => Some(Gap::ReplyDestination),
                 // Crosses, and crosses on a namespace nothing is live in: the
                 // target resolves to no backing and the access says so. That
@@ -639,28 +814,49 @@ mod tests {
         );
     }
 
-    /// Whether an opcode is one of the two lifetime commands that name a task
-    /// and nothing inside it.
+    /// What a resource-lifetime row is still short of, or `None` if it crosses.
     ///
-    /// Asked of the same table the bridge asks, so the test cannot drift into
-    /// its own list of opcodes and then agree with itself.
-    fn is_task_lifetime(channel: Channel, opcode: u16) -> bool {
-        use reims_vgpu_core::lifecycle::LifecycleKind;
-        matches!(
-            LifecycleKind::of(channel, opcode),
-            Some(LifecycleKind::DefineTask | LifecycleKind::DeleteTask)
-        )
+    /// Asked of the same kind table the bridge asks, so the test cannot drift
+    /// into its own list of opcodes and then agree with itself. The three-way
+    /// split is the claim: two commands need something that is not in their
+    /// packet, the ones naming resources owe those resources an access, and what
+    /// is left names nothing and crosses.
+    fn lifetime_gap(channel: Channel, opcode: u16) -> Option<Gap> {
+        use reims_vgpu_core::lifecycle::LifecycleKind as K;
+        match K::of(channel, opcode)? {
+            K::SetObjectList => Some(Gap::ObjectListTable),
+            K::ReplacePhysical => Some(Gap::ReplacementStorage),
+            K::DeleteResource
+            | K::Invalidate
+            | K::Synchronize
+            | K::SynchronizeAndDiscard
+            | K::Discard => Some(Gap::LifecycleAccesses),
+            // A task's definition and deletion name a task; a map notice names
+            // an address interval. None of the three names a resource, so the
+            // empty access list is the operation's own statement.
+            //
+            // A backing retirement is the fifth and it is the one worth a
+            // sentence: it names a *backing* and not a resource, so
+            // `LifecycleOp::resources` is empty and the operation makes no
+            // per-resource claim for an access to answer. That is the core's
+            // rule and it is followed here rather than second-guessed — a
+            // retirement this bridge invented an access for would be ordering
+            // against memory the operation did not name.
+            K::DeleteBacking | K::DefineTask | K::DeleteTask | K::MapMemory | K::UnmapMemory => {
+                None
+            }
+        }
     }
 
     /// What crosses is exactly the whole control class, the whole present class,
-    /// and the two lifetime commands that resolve from their own bytes — and
+    /// and the five lifetime commands whose operation names no resource — and
     /// nothing else.
     ///
     /// The counts are spelled out because this is the cutover's own scoreboard:
     /// a gap that closes moves a number here, and a row that quietly changed
     /// class moves one without anybody deciding to.
     #[test]
-    fn what_crosses_is_control_present_and_the_two_task_lifetime_commands() {
+    fn what_crosses_is_control_present_and_the_lifetime_commands_naming_no_resource() {
         let crossing: Vec<_> = LEDGER
             .iter()
             .filter(|row| {
@@ -668,8 +864,8 @@ mod tests {
                     fifo_for(row.channel),
                     SessionGeneration::FIRST,
                     StampSlot(0),
-                    &drained(row.opcode),
-                    resolvers(&NOTHING_MAPPED),
+                    &drained_with_list(row.channel, row.opcode),
+                    resolvers(&EveryMapping),
                 )
                 .is_ok()
             })
@@ -681,7 +877,8 @@ mod tests {
                 matches!(
                     classify(row.channel, row.opcode),
                     Some(PayloadClass::Control | PayloadClass::Present)
-                ) || is_task_lifetime(row.channel, row.opcode)
+                ) || (classify(row.channel, row.opcode) == Some(PayloadClass::ResourceLifecycle)
+                    && lifetime_gap(row.channel, row.opcode).is_none())
             })
             .map(|row| (row.channel, row.opcode))
             .collect();
@@ -696,7 +893,7 @@ mod tests {
             .count();
         assert_eq!(
             (control, present, crossing.len()),
-            (23, 3, 30),
+            (23, 3, 33),
             "the ledger's crossing rows changed; what reaches the model is not what the \
              module documentation says it is"
         );
@@ -820,6 +1017,67 @@ mod tests {
             "the raw index used above is not masked by anything, so the assertion that it was \
              masked would hold for a bridge that carried it through untouched"
         );
+    }
+
+    /// A lifetime command's refs resolve, and what the packet is still short of
+    /// depends on whether it named a resource — not on which opcode it is.
+    ///
+    /// The same opcode, twice, with two payloads. An invalidate naming nothing
+    /// is an operation over no resources and crosses; an invalidate naming one
+    /// owes that resource an access and does not. A bridge whose partition was
+    /// per-opcode would give both answers to whichever list it was written
+    /// against, and the wrong one is silent: an invalidate that crossed with an
+    /// empty access list would move content authority with nothing ordered
+    /// against it.
+    #[test]
+    fn a_lifetime_command_owes_an_access_for_each_resource_it_names() {
+        use reims_vgpu_core::lifecycle::{LifecycleKind, LifecycleOp};
+        use reims_vgpu_protocol::packets::LEDGER;
+
+        let row = LEDGER
+            .iter()
+            .find(|row| {
+                LifecycleKind::of(row.channel, row.opcode) == Some(LifecycleKind::Invalidate)
+            })
+            .expect("the ledger has an invalidate row");
+        let fifo = fifo_for(row.channel);
+        let put = |packet: &drain::Packet| packet_of(fifo, packet);
+
+        // Zero records. The operation names no resource, so the empty access
+        // list is its own statement rather than a shortfall.
+        let empty = put(&drained(row.opcode)).expect("an invalidate over nothing is an operation");
+        let Payload::ResourceLifecycle(payload) = &empty.payload else {
+            panic!("a lifetime command must not build another class's payload");
+        };
+        assert!(matches!(
+            payload.op(),
+            LifecycleOp::Invalidate { resources, .. } if resources.is_empty()
+        ));
+        assert!(payload.accesses().is_empty());
+
+        // One record. The ref resolved — that is what says the namespace is no
+        // longer what is missing — and the packet is short of the access.
+        let named = put(&drained_with_list(row.channel, row.opcode))
+            .expect_err("a named resource owes an access");
+        assert_eq!(
+            named.gap(),
+            Some(Gap::LifecycleAccesses),
+            "an unresolved ref would have been a refusal about the guest's bytes; \
+             this is this device's own incompleteness and says which"
+        );
+        assert_eq!(named.slug(), "ingress_needs_lifecycle_accesses");
+    }
+
+    /// [`packet`] over the ledger sweep's namespaces, so a test naming one
+    /// packet does not restate the four arguments the sweep already fixes.
+    fn packet_of(fifo: Fifo, drained: &drain::Packet) -> Result<Packet, Blocked> {
+        packet(
+            fifo,
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            drained,
+            resolvers(&EveryMapping),
+        )
     }
 
     /// A present crosses carrying one read of the backing its target resolves

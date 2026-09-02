@@ -2226,13 +2226,41 @@ impl reims_vgpu_core::resolve::RefResolver for TaskRefResolver<'_> {
 /// [`TaskRefResolver`] stays for the callers that legitimately are inside one
 /// task already — a command-stream walk, which was given its task by the header
 /// it is walking under.
-impl reims_vgpu_core::resolve::TaskNamespaces for DeviceState {
+///
+/// # Why it carries guest memory, and why there is not a cheaper one beside it
+///
+/// This resolves through [`name_resource`], which reads the guest's object list
+/// when a reference has no name yet. A version answering only from names already
+/// issued would need no host and would be wrong 49 times a boot — see
+/// `name_resource`'s own measurement — and it would be wrong *silently*, because
+/// the model's list join turns an unresolved ref into a refused packet rather
+/// than an error anybody sees.
+///
+/// So there is one door and not two. Two implementations of one trait, one of
+/// which declares and one of which does not, is the shape where a call site
+/// picks the cheap one and loses a packet class; the trait answers what a
+/// reference names, and on this interface that answer is in the guest's table
+/// whether or not this device has read it yet.
+pub struct TaskNames<'a, M> {
+    state: &'a DeviceState,
+    host: &'a M,
+}
+
+impl<'a, M: HostMemory> TaskNames<'a, M> {
+    /// The device's object namespaces, backed by the guest memory their
+    /// object lists live in.
+    pub const fn new(state: &'a DeviceState, host: &'a M) -> Self {
+        Self { state, host }
+    }
+}
+
+impl<M: HostMemory> reims_vgpu_core::resolve::TaskNamespaces for TaskNames<'_, M> {
     fn resource(
         &self,
         task: reims_vgpu_core::identity::TaskId,
         object_ref: u32,
     ) -> Option<reims_vgpu_core::identity::ResourceId> {
-        self.object_name(task.0, object_ref)
+        name_resource(self.state, self.host, task.0, object_ref)
     }
 }
 

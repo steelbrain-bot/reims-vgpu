@@ -628,7 +628,7 @@ impl ResolveRefusal {
 pub fn resource_list(
     kind: LifecycleKind,
     payload: &[u8],
-    namespaces: &impl crate::resolve::TaskNamespaces,
+    namespaces: &(impl crate::resolve::TaskNamespaces + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     let Some(record_len) = kind.resource_list_record_len() else {
         return Err(ResolveRefusal::NotAResourceList { kind });
@@ -720,7 +720,7 @@ pub fn resource_list(
 /// naming nothing live.
 pub fn exec_resource_table(
     payload: &[u8],
-    namespaces: &impl crate::resolve::TaskNamespaces,
+    namespaces: &(impl crate::resolve::TaskNamespaces + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     let header = fifo::decode_exec_header(payload).map_err(ResolveRefusal::ShortNotice)?;
     let table = fifo::decode_exec_resource_table(payload).map_err(ResolveRefusal::Payload)?;
@@ -785,8 +785,8 @@ pub fn exec_resource_table(
 pub fn operation(
     kind: LifecycleKind,
     payload: &[u8],
-    objects: &impl crate::resolve::TaskNamespaces,
-    mappings: &impl crate::resolve::MappingResolver,
+    objects: &(impl crate::resolve::TaskNamespaces + ?Sized),
+    mappings: &(impl crate::resolve::MappingResolver + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     match kind {
         LifecycleKind::DefineTask | LifecycleKind::DeleteTask => task_lifetime(kind, payload),
@@ -862,7 +862,7 @@ pub fn task_lifetime(kind: LifecycleKind, payload: &[u8]) -> Result<LifecycleOp,
 pub fn object_reference(
     kind: LifecycleKind,
     payload: &[u8],
-    namespaces: &impl crate::resolve::TaskNamespaces,
+    namespaces: &(impl crate::resolve::TaskNamespaces + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     if !matches!(
         kind,
@@ -909,7 +909,7 @@ pub fn object_reference(
 pub fn backing_retirement(
     kind: LifecycleKind,
     payload: &[u8],
-    resolver: &impl crate::resolve::MappingResolver,
+    resolver: &(impl crate::resolve::MappingResolver + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     if kind != LifecycleKind::DeleteBacking {
         return Err(ResolveRefusal::NotABackingRetirement { kind });

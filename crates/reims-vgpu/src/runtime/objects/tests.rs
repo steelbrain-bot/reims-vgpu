@@ -3824,13 +3824,14 @@ fn the_device_answers_the_models_object_resolver_from_the_bound_tasks_namespace(
     {
         use reims_vgpu_core::identity::TaskId;
         use reims_vgpu_core::resolve::TaskNamespaces;
+        let names = super::TaskNames::new(&state, &host);
         assert_eq!(
-            TaskNamespaces::resource(&state, TaskId(task), ref_),
+            TaskNamespaces::resource(&names, TaskId(task), ref_),
             Some(name),
             "both doors into one namespace answer with one name"
         );
         assert_eq!(
-            TaskNamespaces::resource(&state, TaskId(task + 1), ref_),
+            TaskNamespaces::resource(&names, TaskId(task + 1), ref_),
             None,
             "and the source routes by task rather than resolving in whichever \
              namespace it reached first"
@@ -3844,7 +3845,13 @@ fn the_device_answers_the_models_object_resolver_from_the_bound_tasks_namespace(
     {
         use reims_vgpu_core::identity::TaskId;
         use reims_vgpu_core::resolve::TaskNamespaces;
-        assert_eq!(TaskNamespaces::resource(&state, TaskId(task), ref_), None);
+        // Deleted, and the guest's list still holds the entry — so the source
+        // names it again, with a new generation. That is the namespace's rule
+        // for a reused slot, and it is why the memo is keyed by a name.
+        let names = super::TaskNames::new(&state, &host);
+        let after = TaskNamespaces::resource(&names, TaskId(task), ref_);
+        assert!(after.is_some());
+        assert_ne!(after, Some(name), "a reused slot is a different name");
     }
 }
 
