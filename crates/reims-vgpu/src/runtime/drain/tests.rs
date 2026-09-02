@@ -6585,6 +6585,105 @@ fn a_fence_delete_forgets_every_generation_its_ref_held() {
     );
 }
 
+/// A destroy of a kind this device retains nothing for says what its ref names
+/// in the guest's object list, which is what decides whether a retirement could
+/// ever be keyed on it.
+///
+/// The integer resolving proves little: the object table's own boot found 22
+/// sampler-delete refs live under a *different* task, which is a collision. The
+/// type agreeing is the evidence, so the census reports the pair and not the
+/// hit.
+#[test]
+fn a_destroy_this_device_cannot_retire_says_what_its_ref_names_in_the_object_list() {
+    use crate::runtime::decode::resource::{OBJECT_TYPE_FUNCTION, OBJECT_TYPE_SERIALIZER_OBJECT};
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::destroy::{DELETE_TOTAL_LEN, OPCODE_DELETE_FUNCTION};
+
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    // One task, a one-level page table mapping GVA page 0 to data pfn 4, and an
+    // object list of eight slots at GVA 0. Stated here rather than shared,
+    // because the slots this test fills are its own.
+    let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+    let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    state.define_task(1, 0x1000, 2);
+    assert!(state.set_object_list(1, 0, 8));
+
+    let destroy_packet = |object_ref: u32| {
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 1);
+        st32(&mut payload[4..], OPCODE_DELETE_FUNCTION);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], object_ref);
+        Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+    let put_entry = |host: &mut FakeHost, slot: u32, object_type: u8| {
+        let mut entry = [0u8; 12];
+        st32(&mut entry[0..], u32::from(object_type) | (16u32 << 8));
+        entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(slot) * 12, &entry);
+    };
+
+    let absent = store_route_count("delete_object_ref_no_list_entry");
+    let agrees = store_route_count("delete_object_ref_type_agrees");
+    let differs = store_route_count("delete_object_ref_type_differs");
+
+    // Slot 4 holds nothing.
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(4));
+    assert_eq!(
+        (
+            store_route_count("delete_object_ref_no_list_entry"),
+            store_route_count("delete_object_ref_type_agrees"),
+            store_route_count("delete_object_ref_type_differs"),
+        ),
+        (absent + 1, agrees, differs),
+        "an empty slot is neither an agreement nor a disagreement"
+    );
+
+    // Slot 5 holds a serializer object, which a function destroy does not name.
+    put_entry(&mut host, 5, OBJECT_TYPE_SERIALIZER_OBJECT);
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(5));
+    assert_eq!(
+        (
+            store_route_count("delete_object_ref_type_agrees"),
+            store_route_count("delete_object_ref_type_differs"),
+        ),
+        (agrees, differs + 1),
+        "a live entry of the wrong type is a collision and says the spaces differ"
+    );
+
+    // Slot 6 holds a function, which is the pairing that would say one space.
+    put_entry(&mut host, 6, OBJECT_TYPE_FUNCTION);
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(6));
+    assert_eq!(
+        (
+            store_route_count("delete_object_ref_type_agrees"),
+            store_route_count("delete_object_ref_type_differs"),
+        ),
+        (agrees + 1, differs + 1),
+        "and the type agreeing is the evidence a retirement could be keyed here"
+    );
+}
+
 /// The host's retired slots are reported as retired, not as undecodable.
 ///
 /// Fifteen opcodes share one deprecated handler on the reference host: it

@@ -281,8 +281,9 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 /// stay fail-visible: the claim "there is nothing to retire" is about this
 /// device's caches and not about the guest's object, and a counter that went
 /// quiet would stop saying which contract gap is still open.
-fn apply_delete_object(
+fn apply_delete_object<H: HostMemory + HostOps>(
     state: &mut DeviceState,
+    host: &mut H,
     channel_id: u32,
     command: &crate::protocol::fifo::DeleteObjectCommand<'_>,
     packet: &Packet,
@@ -379,12 +380,76 @@ fn apply_delete_object(
         note_store_route(object.route(outcome));
         return;
     }
+    // The kinds this device retains nothing by ref for. Before reporting, ask
+    // the one question that decides whether a retirement could ever belong here:
+    // **does this ref name a live entry in the guest's own object list, and is
+    // that entry's type the one this destroy opcode names?**
+    //
+    // The integer resolving proves little on its own — the object table's boot
+    // above found 22 sampler-delete refs live under a *different* task, which is
+    // a collision and not an identity. The *type* agreeing is the evidence: a
+    // function destroy whose ref names an `OBJECT_TYPE_FUNCTION` entry in the
+    // same task is one ref space, and one naming a serializer object or nothing
+    // is not.
+    //
+    // Only eight packets a boot reach here, so the list read costs nothing that
+    // matters, and it is the difference between "we do not know" and a number.
+    note_delete_object_ref_space(state, host, task_id, object_ref, op.opcode());
     note_unimplemented(
         state,
         channel_id,
         UnimplementedCommand::DeleteObject,
         packet,
     );
+}
+
+/// What a destroy record's ref names in the guest's own object list, for the
+/// kinds this device retains nothing by ref for.
+///
+/// The type a kind expects is the wire's, not a guess: a function is its own
+/// object type and every other retained kind — sampler, depth-stencil, both
+/// pipeline states, fence, heap, indirect command buffer, rasterization rate
+/// map — is a `SERIALIZER_OBJECT`, which is the tag the object list carries for
+/// all of them.
+fn note_delete_object_ref_space<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    object_ref: u32,
+    opcode: u32,
+) {
+    use crate::runtime::decode::resource::{
+        OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_SERIALIZER_OBJECT,
+        OBJECT_TYPE_TEXTURE,
+    };
+    use reims_vgpu_wire::ops::destroy as d;
+    let expected = match opcode {
+        d::OPCODE_DELETE_BUFFER => OBJECT_TYPE_BUFFER,
+        d::OPCODE_DELETE_TEXTURE => OBJECT_TYPE_TEXTURE,
+        d::OPCODE_DELETE_FUNCTION => OBJECT_TYPE_FUNCTION,
+        _ => OBJECT_TYPE_SERIALIZER_OBJECT,
+    };
+    let Some(entry) = crate::runtime::objects::lookup_list_entry(state, host, task_id, object_ref)
+    else {
+        note_store_route("delete_object_ref_no_list_entry");
+        return;
+    };
+    let route = if entry.object_type == expected {
+        "delete_object_ref_type_agrees"
+    } else {
+        "delete_object_ref_type_differs"
+    };
+    note_store_route(route);
+    if crate::observe::first_sight(route, (u64::from(opcode) << 32) | u64::from(object_ref)) {
+        crate::observe::fail(format!(
+            "{route} kind={} task={task_id} ref={object_ref} found_type={} expected_type={} \
+             (whether this destroy record's ref is a number in the guest's object-list space \
+             is what decides whether a retirement could ever be keyed on it)",
+            delete_object_kind_route(opcode),
+            entry.object_type,
+            expected
+        ));
+    }
 }
 
 /// Which FIFO a packet arrived on, for a log line.
@@ -4959,7 +5024,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // different problems and only one of them is closed by writing a
             // handler.
             match crate::protocol::fifo::decode_delete_object(&packet.payload) {
-                Ok(command) => apply_delete_object(state, channel_id, &command, packet),
+                Ok(command) => apply_delete_object(state, host, channel_id, &command, packet),
                 Err(error) => note_short_payload(error.slug(), Some(channel_id), &error.short()),
             }
         }
