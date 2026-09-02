@@ -54,6 +54,7 @@ use reims_vgpu_protocol::pass_action::{
     MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
     MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
+use reims_vgpu_protocol::render::RenderKind as ProtoRenderKind;
 use reims_vgpu_protocol::resource_state::ContentDirective;
 use reims_vgpu_protocol::segment::{SegmentBody, SegmentKind, SegmentLifetime, SegmentStream};
 use reims_vgpu_wire::ops::blit as wire_blit;
@@ -2380,6 +2381,199 @@ fn note_render_residency(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
     }
 }
 
+/// Whether this record's whole effect is one field of [`StreamAccum`] that no
+/// other record class writes.
+///
+/// **This is the group's disjointness claim, and it is a claim about
+/// `StreamAccum` rather than about the wire.** The render encoder's records all
+/// land in one accumulator, so "touches no stream state" — the test W8 and W10
+/// could apply to their classes — cannot separate anything here. What separates
+/// these is that each is the *sole writer* of the field it sets: nothing else
+/// on the rail assigns `pipeline_ref`, `cull_mode`, `viewports`, `visibility`
+/// or the rest, so the record's decoder can change without any other record
+/// class being able to disagree with it about a value. `bind_snapshot` reads
+/// them all and reads the same value whichever decoder produced it.
+///
+/// The store actions fail that test and are not here: `SetStoreAction` mutates
+/// `color_slots`, `depth_attach` and `stencil_attach`, which the pass
+/// descriptor writes, so those three move as one group with the descriptor.
+/// The binds write the six bind tables and `unrepresentable`, and the draws
+/// read the whole accumulator and push onto `draws`; both are later groups.
+///
+/// Exhaustive rather than `_ => false`, so a kind added to the contract has to
+/// be classified here instead of silently joining the legacy path.
+const fn is_render_stream_state(kind: ProtoRenderKind) -> bool {
+    use ProtoRenderKind as K;
+    match kind {
+        K::SetRenderPipelineState
+        | K::SetDepthStencilState
+        | K::SetStencilReference
+        | K::SetBlendColor
+        | K::SetCullMode
+        | K::SetFrontFacingWinding
+        | K::SetDepthClipMode
+        | K::SetTriangleFillMode
+        | K::SetDepthBias
+        | K::SetLineWidth
+        | K::SetViewport
+        | K::SetViewports
+        | K::SetScissorRect
+        | K::SetScissorRects
+        | K::SetVisibilityResultMode => true,
+
+        K::Draw
+        | K::DrawWide
+        | K::DrawInstanced
+        | K::DrawInstancedWide
+        | K::DrawInstancedBase
+        | K::DrawInstancedBaseWide
+        | K::DrawIndexed
+        | K::DrawIndexedWide
+        | K::DrawIndexedInstanced
+        | K::DrawIndexedInstancedWide
+        | K::DrawIndexedInstancedBase
+        | K::DrawIndexedInstancedBaseWide
+        | K::DrawIndirect
+        | K::DrawIndexedIndirect
+        | K::WriteDescriptor
+        | K::SetColorStoreAction
+        | K::SetDepthStoreAction
+        | K::SetStencilStoreAction
+        | K::SetVertexBuffers
+        | K::SetVertexBuffersWithStride
+        | K::SetVertexBufferOffset
+        | K::SetVertexBufferOffsetStride
+        | K::SetVertexSamplers
+        | K::SetVertexSamplersWithLod
+        | K::SetVertexTextures
+        | K::SetFragmentBuffers
+        | K::SetFragmentBufferOffset
+        | K::SetFragmentSamplers
+        | K::SetFragmentSamplersWithLod
+        | K::SetFragmentTextures => false,
+    }
+}
+
+/// Apply one render-encoder state record, lifted by the protocol crate.
+///
+/// Every arm here is an assignment to one accumulator field, which is what
+/// [`is_render_stream_state`] selected on. The three ordinals this device does
+/// not parse — cull mode, winding, depth-clip and fill mode — stay raw for the
+/// reason they always have: only the running rail knows whether it can spell
+/// the answer, so only the rail can refuse one by name.
+fn handle_render_stream_state(task_id: u32, opcode: u32, cmd_bytes: &[u8], acc: &mut StreamAccum) {
+    use reims_vgpu_protocol::decode::render::RenderRecord;
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    let record = match reims_vgpu_protocol::decode::render::decode(&framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            return note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+        }
+    };
+    // The ordinal a raw state record carries, narrowed the way this device has
+    // always narrowed them: `u32::MAX` for a word that does not fit, so a wide
+    // value reaches the backend as an out-of-contract number that says its own
+    // name rather than as its own low half — which for a multiple of 2^32 would
+    // be the *default*, the one answer that renders with nothing in the log.
+    let narrow = |mode: u64| u32::try_from(mode).unwrap_or(u32::MAX);
+
+    match record {
+        RenderRecord::SetPipeline(r) => {
+            // Applied whatever the ref, ref 0 included: `acc.pipeline_ref == 0`
+            // is a state the draw arm knows and declines under
+            // `dropped_no_pipeline`, where dropping the record would leave the
+            // *previous* pipeline latched and encode the next draw against it.
+            if r.pipeline_ref == 0 && crate::observe::first_sight("render_set_pipeline_zero", 0) {
+                crate::observe::fail(
+                    "stream_set_pipeline reason=render_set_pipeline_zero_ref \
+                     (a render pipeline was set to ref 0; the pass is now unbound \
+                     and its draws decline as dropped_no_pipeline)",
+                );
+            }
+            acc.pipeline_ref = r.pipeline_ref;
+        }
+        RenderRecord::SetDepthStencilState(r) => acc.depth_stencil_ref = r.state_ref,
+        RenderRecord::SetStencilReference(r) => acc.stencil_ref = Some((r.front, r.back)),
+        RenderRecord::SetBlendColor(r) => {
+            acc.blend_color = Some([
+                f32::from_bits(r.red_bits),
+                f32::from_bits(r.green_bits),
+                f32::from_bits(r.blue_bits),
+                f32::from_bits(r.alpha_bits),
+            ]);
+        }
+        RenderRecord::SetCullMode(r) => acc.cull_mode = Some(narrow(r.mode)),
+        RenderRecord::SetFrontFacingWinding(r) => acc.front_facing = Some(narrow(r.winding)),
+        RenderRecord::SetDepthClipMode(r) => acc.depth_clip_mode = Some(narrow(r.mode)),
+        RenderRecord::SetTriangleFillMode(r) => acc.fill_mode = Some(narrow(r.mode)),
+        RenderRecord::SetDepthBias(r) => {
+            acc.depth_bias = Some([
+                f32::from_bits(r.bias_bits),
+                f32::from_bits(r.slope_scale_bits),
+                f32::from_bits(r.clamp_bits),
+            ]);
+        }
+        // `setLineWidth:` alone. `setTessellationFactorScale:` shares this wire
+        // form and *not* this record — the ledger has not settled it, so it has
+        // no `RenderKind` and never reaches here. It stays on this device's own
+        // decoder with its own census, which is exactly the split the two
+        // selectors deserve: one is state a rail may be able to carry, the other
+        // has no carrier on either.
+        RenderRecord::SetLineWidth(r) => acc.line_width = Some(f32::from_bits(r.width_bits)),
+        RenderRecord::SetViewports(ports) => {
+            // A plural record of count zero. The singular form is this slice at
+            // length one, so an empty one can only be the plural, and it is the
+            // one shape where "replace the state" and "the guest bound none"
+            // are the same assignment for opposite reasons. The previous state
+            // stands and the record is named, which is the reading the legacy
+            // decoder's `ErrBadLength` had without saying which record it was.
+            if ports.is_empty() {
+                return note_empty_viewport_or_scissor(task_id, "viewport", opcode);
+            }
+            acc.viewports.clear();
+            acc.viewports
+                .extend(ports.iter().map(|v| render::viewport_from_wire(v)));
+        }
+        RenderRecord::SetScissorRects(rects) => {
+            if rects.is_empty() {
+                return note_empty_viewport_or_scissor(task_id, "scissor", opcode);
+            }
+            // All-or-nothing on an empty rect: `setScissorRects:count:` replaces
+            // the state atomically and slot order is what a shader's
+            // `[[viewport_array_index]]` selects, so an array cannot be adopted
+            // with the empty slots left out, and adopting them as written would
+            // make exactly those slots clip however the backend reads a zero
+            // rect.
+            let lifted: Vec<ScissorRect> = rects.iter().map(render::scissor_from_wire).collect();
+            match lifted.iter().find(|r| r.is_empty()) {
+                Some(empty) => note_empty_scissor(task_id, *empty),
+                None => acc.scissors = lifted,
+            }
+        }
+        RenderRecord::SetVisibilityResultMode(r) => {
+            // `MTLVisibilityResultModeDisabled` is 0, and it is the guest
+            // disarming the query rather than an unknown value: subsequent draws
+            // simply carry none.
+            acc.visibility = (r.mode != 0).then(|| draw::VisibilityArming {
+                mode: narrow(r.mode),
+                offset: r.offset,
+            });
+        }
+        // `is_render_stream_state` selected these fifteen kinds and
+        // `decode::render` maps each of them to the arm above. Arriving here is
+        // the two disagreeing rather than a guest case, so it is named instead
+        // of being answered a second time.
+        other => crate::observe::fail(format!(
+            "render_state_record_not_state task={task_id} opcode={opcode:#x} \
+             (the rail routed this row to the stream-state arm and the lift \
+             produced {other:?})"
+        )),
+    }
+}
+
 fn handle_render_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
@@ -2424,6 +2618,23 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
         _ => {}
     }
+    // **The encoder's own state records.** Fifteen rows whose whole effect is
+    // one field of `StreamAccum` that no other record class writes — see
+    // [`is_render_stream_state`], which is where that claim lives and what
+    // makes this group separable from the binds, the draws and the pass
+    // descriptor still below.
+    //
+    // Routed on the kind rather than on `classify`, because every encoder
+    // record on this rail is one `OperationClass::Render` and the class cannot
+    // tell fifteen of them from the other thirty. `RenderKind::of_opcode`
+    // answering at all is the ledger's settlement: the rows it does not name
+    // are the ones the contract has not closed, and they keep this device's own
+    // decoder below.
+    if reims_vgpu_protocol::render::RenderKind::of_opcode(opcode)
+        .is_some_and(is_render_stream_state)
+    {
+        return handle_render_stream_state(task_id, opcode, cmd_bytes, acc);
+    }
     let cmd = match render::decode(cmd_bytes) {
         Ok(c) => c,
         // Was `Err(_) => return`: a malformed render command dropped with no
@@ -2442,38 +2653,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
         }
     };
     match cmd.kind {
-        RenderKind::SetPipeline => {
-            // Apply what the record decoded, ref 0 included. This used to be
-            // guarded `if cmd.pipeline_ref != 0`, and the match's last arm is a
-            // bare `_ => {}`, so a zero ref left the *previous* pipeline latched
-            // and the next draw encoded against it — a wrong frame with nothing
-            // on any channel. Dropping the record is not the neutral choice it
-            // looks like: `acc.pipeline_ref == 0` is already a state the draw arm
-            // knows, where it declines as `dropped_no_pipeline` and says so. Letting
-            // the zero through routes this into that named decline instead of
-            // into a stale bind.
-            //
-            // A healthy zero: `setRenderPipelineState:` takes a non-null
-            // pipeline, so Apple's serializer has no reason to emit this record
-            // with ref 0. That is what makes applying the decoded value safe — on
-            // a stream that never sends it, the two behaviors are identical — and
-            // it is why a firing is worth a line rather than a silent drop.
-            //
-            // Measured zero on a driven x86/PCI boot (Ventura guest, 25 s Safari
-            // window drag, ~500 host-window draws), which is the reading that
-            // makes this arm's removal of the old `if cmd.pipeline_ref != 0`
-            // guard inert on that workload rather than merely argued. One boot on
-            // one pathway: it does not prove the arm never fires, it says the
-            // desktop compositor does not take it.
-            if cmd.pipeline_ref == 0 && crate::observe::first_sight("render_set_pipeline_zero", 0) {
-                crate::observe::fail(
-                    "stream_set_pipeline reason=render_set_pipeline_zero_ref \
-                     (a render pipeline was set to ref 0; the pass is now unbound \
-                     and its draws decline as dropped_no_pipeline)",
-                );
-            }
-            acc.pipeline_ref = cmd.pipeline_ref;
-        }
         RenderKind::SetBuffer => {
             // Slots first..first+n from the archive layout's entry array.
             // `render::decode` refuses `count == 0` with `ErrBadLength`, and
@@ -2644,55 +2823,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 },
             );
             out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
-        }
-        RenderKind::SetViewport => {
-            // The whole array, in the guest's order. `setViewports:count:`
-            // replaces the viewport state rather than adding to it, so this
-            // assigns rather than extends — a record of two after a record of
-            // five leaves two, which is what Metal does.
-            acc.viewports.clone_from(&cmd.viewports);
-        }
-        RenderKind::SetScissor => {
-            // All-or-nothing on an empty rect, which is the singular arm's rule
-            // read at array width. `setScissorRects:count:` replaces the state
-            // atomically and slot order is meaningful — it is what a shader's
-            // `[[viewport_array_index]]` selects — so an array cannot be adopted
-            // with the empty slots left out, and adopting them as written would
-            // make exactly those slots clip however the backend reads a zero
-            // rect. Neither is expressible here, so the record is refused whole
-            // and the previous state stands, as one empty rect always has.
-            if let Some(empty) = cmd.scissors.iter().find(|r| r.is_empty()) {
-                note_empty_scissor(task_id, *empty);
-            } else {
-                acc.scissors.clone_from(&cmd.scissors);
-            }
-        }
-        // No `if cmd.has_blend_color` on these five. Each of the five kinds has
-        // exactly one producer in `decode::render`, which sets the kind and the
-        // flag in the same block, so the flag was true whenever the arm was
-        // reached and the guard could not fail. It was not free: the match's last
-        // arm is a bare `_ => {}`, so the shape said a guest could set a cull mode
-        // this device then discarded, when no such loss was possible. A record
-        // too short to hold
-        // the field never gets here at all — the wire view refuses it and
-        // `decode` returns `ErrShort` before a kind is assigned.
-        RenderKind::SetBlendColor => {
-            acc.blend_color = Some(cmd.blend_color);
-        }
-        RenderKind::SetCullMode => {
-            acc.cull_mode = Some(cmd.cull_mode);
-        }
-        RenderKind::SetFrontFacing => {
-            acc.front_facing = Some(cmd.front_facing);
-        }
-        RenderKind::SetDepthBias => {
-            acc.depth_bias = Some(cmd.depth_bias);
-        }
-        RenderKind::SetDepthStencil => {
-            acc.depth_stencil_ref = cmd.depth_stencil_ref;
-        }
-        RenderKind::SetStencilReference => {
-            acc.stencil_ref = Some((cmd.stencil_ref_front, cmd.stencil_ref_back));
         }
         RenderKind::RenderPass => {
             // The pass's own tail, decoded and not applied. Four counters
@@ -3012,31 +3142,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // and nothing about whether any of them mattered.
         //
         // `SetRasterState` was two of them and is no longer here: the counters
-        // it raised are what argued for plumbing it, and both halves now reach
-        // a backend.
-        RenderKind::SetRasterState => {
-            // Two selectors share the one-`NSUInteger` record; the opcode says
-            // which. Both are latched whatever the value, including the Metal
-            // default — a stream that sets Lines and then sets Fill again is
-            // asking for Fill, and dropping the second record would leave the
-            // rest of the pass wireframed.
-            //
-            // The ordinal is carried raw and translated per backend, the way
-            // `cull_mode` and `front_facing` beside it are: only the backend
-            // knows whether the host can spell the answer, so only the backend
-            // can refuse by name.
-            let slot = match cmd.opcode {
-                wire_render::OPCODE_SET_TRIANGLE_FILL_MODE => &mut acc.fill_mode,
-                _ => &mut acc.depth_clip_mode,
-            };
-            // The record's field is 64-bit and the ordinals are small, but a
-            // guest writes what it likes. `u32::MAX` is not a value of either
-            // Metal enum, so a wide word reaches the backend as an
-            // out-of-contract value that says its own name, rather than as its
-            // own low half — which for a multiple of 2^32 would be the
-            // *default*, the one answer that renders with nothing in the log.
-            *slot = Some(u32::try_from(cmd.mode).unwrap_or(u32::MAX));
-        }
+        // it raised are what argued for plumbing it, both halves now reach a
+        // backend, and the row itself has since moved to
+        // `handle_render_stream_state`.
         RenderKind::SetFloatState => {
             // Two selectors share the one-`float` record; the opcode says
             // which.
@@ -3056,7 +3164,16 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // because the guest wrote a literal and the question is whether it
             // wrote *the* literal.
             if cmd.opcode == wire_render::OPCODE_SET_LINE_WIDTH {
-                acc.line_width = Some(cmd.float_value);
+                // Routed to `handle_render_stream_state` before this decoder is
+                // reached, so this branch is that routing disagreeing with
+                // itself. The two selectors share a wire form and not a
+                // settlement: `setLineWidth:` has a `RenderKind` and this one
+                // does not, which is why only half of this arm moved.
+                crate::observe::fail(format!(
+                    "render_record_misrouted task={task_id} opcode={opcode:#x} kind={:?} \
+                     (the ledger settled this row and it reached the rail's own decoder)",
+                    cmd.kind
+                ));
             } else if cmd.float_value != 1.0 {
                 crate::runtime::drain::note_store_route("render_tessellation_scale_dropped");
             }
@@ -3167,27 +3284,30 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 );
             }
         }
-        RenderKind::SetVisibilityResultMode => {
-            // `MTLVisibilityResultModeDisabled` is 0, and it is the guest
-            // disarming the query rather than an unknown value: subsequent draws
-            // simply carry none. The record's field is 64-bit and the ordinals
-            // are small, but a guest writes what it likes — a wide word reaches
-            // the backend as an out-of-contract value that says its own name,
-            // the same treatment `fill_mode` gives its ordinal, rather than as
-            // its own low half.
-            acc.visibility = (cmd.mode != 0).then(|| draw::VisibilityArming {
-                mode: u32::try_from(cmd.mode).unwrap_or(u32::MAX),
-                offset: cmd.visibility_result_offset,
-            });
-        }
         RenderKind::DrawIndirect => {
             execute_indirect_draw(state, host, task_id, &cmd, acc);
         }
-        // The residency declarations, the barriers and the fence pair are
-        // answered by the ledger's own class before this decoder is reached.
-        // Arriving here is that routing disagreeing with itself rather than a
-        // guest case, so it is named instead of being answered a second time.
-        RenderKind::UseResource | RenderKind::UseHeap | RenderKind::Barrier | RenderKind::Fence => {
+        // The fifteen encoder-state rows moved to `handle_render_stream_state`,
+        // beside the residency declarations, the barriers and the fence pair
+        // the ledger's own class answers. All of them are routed before this
+        // decoder is reached, so arriving here is that routing disagreeing with
+        // itself rather than a guest case, and it is named instead of being
+        // answered a second time.
+        RenderKind::SetPipeline
+        | RenderKind::SetViewport
+        | RenderKind::SetScissor
+        | RenderKind::SetBlendColor
+        | RenderKind::SetCullMode
+        | RenderKind::SetFrontFacing
+        | RenderKind::SetDepthBias
+        | RenderKind::SetDepthStencil
+        | RenderKind::SetStencilReference
+        | RenderKind::SetRasterState
+        | RenderKind::SetVisibilityResultMode
+        | RenderKind::UseResource
+        | RenderKind::UseHeap
+        | RenderKind::Barrier
+        | RenderKind::Fence => {
             crate::observe::fail(format!(
                 "render_record_misrouted task={task_id} opcode={opcode:#x} kind={:?} (the ledger \
                  classed this row and it reached the rail's own decoder)",
@@ -5163,10 +5283,11 @@ mod report;
 use report::{
     is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
     note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
-    note_empty_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
-    note_info_record_unanswered, note_pass_array_length_unsupported, note_pass_extent_for_slot,
-    note_pass_raster_sample_count_unsupported, note_pass_target_extent, note_residency_declaration,
-    note_store_action_no_attachment, note_store_action_options_unsupported, note_stream_draw_drops,
+    note_empty_scissor, note_empty_viewport_or_scissor, note_indexed_draw_without_buffer,
+    note_indirect_draw_refused, note_info_record_unanswered, note_pass_array_length_unsupported,
+    note_pass_extent_for_slot, note_pass_raster_sample_count_unsupported, note_pass_target_extent,
+    note_residency_declaration, note_store_action_no_attachment,
+    note_store_action_options_unsupported, note_stream_draw_drops,
     note_unimplemented_render_opcode, note_unnamed_icb_execute,
 };
 // The unimplemented-opcode latch is test-only on both sides, so its import has

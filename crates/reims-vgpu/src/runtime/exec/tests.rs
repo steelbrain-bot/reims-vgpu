@@ -6557,3 +6557,353 @@ fn a_render_fence_orders_in_the_direction_its_own_opcode_names() {
         "a fence moves no stream state"
     );
 }
+
+/// Each ledger-settled render-encoder state record writes the one accumulator
+/// field it names, and nothing else in the accumulator moves.
+///
+/// **This is the group's disjointness claim, made structurally rather than
+/// argued.** W8 and W10 could say "this record touches no stream state at all";
+/// the encoder's own records all land in `StreamAccum`, so that test separates
+/// nothing here. What separates these fifteen is that each is the *sole writer*
+/// of its field — so the fingerprint below is destructured out of the whole
+/// accumulator (a field added to `StreamAccum` fails to compile until it is
+/// named here) and exactly one entry is allowed to differ per record.
+///
+/// It replaces the per-arm assertions that moved with the legacy decoder's
+/// state arms, and is stronger than they were: those checked that the field
+/// they cared about got the right value, and none of them could see whether the
+/// record had also moved a field belonging to a different class.
+#[test]
+fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    /// Every field of `StreamAccum`, as text, in declaration order.
+    ///
+    /// Destructured rather than field-accessed so this cannot fall behind the
+    /// struct: a new field is a compile error here, which is the point.
+    fn fingerprint(acc: &StreamAccum) -> Vec<(&'static str, String)> {
+        let StreamAccum {
+            pipeline_ref,
+            clears,
+            color_slots,
+            color_targets,
+            draws,
+            saw_draw,
+            execute_icb,
+            vertex_buffers,
+            fragment_buffers,
+            vertex_textures,
+            fragment_textures,
+            vertex_samplers,
+            fragment_samplers,
+            viewports,
+            scissors,
+            indexed,
+            blend_color,
+            cull_mode,
+            front_facing,
+            fill_mode,
+            depth_clip_mode,
+            line_width,
+            depth_bias,
+            depth_stencil_ref,
+            stencil_ref,
+            depth_attach,
+            stencil_attach,
+            visibility_buffer_ref,
+            visibility,
+            dropped_no_pipeline,
+            dropped_zero_count,
+            unrepresentable,
+        } = acc;
+        vec![
+            ("pipeline_ref", format!("{pipeline_ref:?}")),
+            ("clears", format!("{clears:?}")),
+            ("color_slots", format!("{color_slots:?}")),
+            ("color_targets", format!("{color_targets:?}")),
+            ("draws", format!("{draws:?}")),
+            ("saw_draw", format!("{saw_draw:?}")),
+            ("execute_icb", format!("{execute_icb:?}")),
+            ("vertex_buffers", format!("{vertex_buffers:?}")),
+            ("fragment_buffers", format!("{fragment_buffers:?}")),
+            ("vertex_textures", format!("{vertex_textures:?}")),
+            ("fragment_textures", format!("{fragment_textures:?}")),
+            ("vertex_samplers", format!("{vertex_samplers:?}")),
+            ("fragment_samplers", format!("{fragment_samplers:?}")),
+            ("viewports", format!("{viewports:?}")),
+            ("scissors", format!("{scissors:?}")),
+            ("indexed", format!("{indexed:?}")),
+            ("blend_color", format!("{blend_color:?}")),
+            ("cull_mode", format!("{cull_mode:?}")),
+            ("front_facing", format!("{front_facing:?}")),
+            ("fill_mode", format!("{fill_mode:?}")),
+            ("depth_clip_mode", format!("{depth_clip_mode:?}")),
+            ("line_width", format!("{line_width:?}")),
+            ("depth_bias", format!("{depth_bias:?}")),
+            ("depth_stencil_ref", format!("{depth_stencil_ref:?}")),
+            ("stencil_ref", format!("{stencil_ref:?}")),
+            ("depth_attach", format!("{depth_attach:?}")),
+            ("stencil_attach", format!("{stencil_attach:?}")),
+            (
+                "visibility_buffer_ref",
+                format!("{visibility_buffer_ref:?}"),
+            ),
+            ("visibility", format!("{visibility:?}")),
+            ("dropped_no_pipeline", format!("{dropped_no_pipeline:?}")),
+            ("dropped_zero_count", format!("{dropped_zero_count:?}")),
+            ("unrepresentable", format!("{unrepresentable:?}")),
+        ]
+    }
+
+    let record = |op: u32, total: u32, body: &[u8]| {
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v[OP_HEADER_LEN..OP_HEADER_LEN + body.len()].copy_from_slice(body);
+        v
+    };
+    let word = |value: u64| value.to_le_bytes().to_vec();
+    let f32s = |vals: &[f32]| -> Vec<u8> {
+        vals.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    // The singular viewport is six `f64`; the singular scissor is four `u64`.
+    let viewport_bytes =
+        |v: [f64; 6]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>() };
+    let scissor_bytes =
+        |r: [u64; 4]| -> Vec<u8> { r.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>() };
+
+    let mut vis = Vec::new();
+    vis.extend_from_slice(&0x1234u64.to_le_bytes());
+    vis.extend_from_slice(&2u64.to_le_bytes());
+
+    // Two viewports and two scissors behind their plural heads, to prove the
+    // plural forms reach the same field as the singular ones rather than a
+    // second slot.
+    let mut viewports_body = 2u32.to_le_bytes().to_vec();
+    viewports_body.extend(viewport_bytes([1.0, 2.0, 3.0, 4.0, 0.0, 1.0]));
+    viewports_body.extend(viewport_bytes([5.0, 6.0, 7.0, 8.0, 0.0, 1.0]));
+    let mut scissors_body = 2u64.to_le_bytes().to_vec();
+    scissors_body.extend(scissor_bytes([1, 2, 3, 4]));
+    scissors_body.extend(scissor_bytes([5, 6, 7, 8]));
+
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        (
+            "setRenderPipelineState:",
+            record(
+                wire_r::OPCODE_SET_RENDER_PIPELINE_STATE,
+                wire_r::SET_STATE_TOTAL_LEN,
+                &7171u32.to_le_bytes(),
+            ),
+            "pipeline_ref",
+        ),
+        (
+            "setDepthStencilState:",
+            record(
+                wire_r::OPCODE_SET_DEPTH_STENCIL_STATE,
+                wire_r::SET_STATE_TOTAL_LEN,
+                &6161u32.to_le_bytes(),
+            ),
+            "depth_stencil_ref",
+        ),
+        (
+            "setStencilFrontReferenceValue:backReferenceValue:",
+            record(
+                wire_r::OPCODE_SET_STENCIL_REFERENCE,
+                wire_r::SET_STENCIL_REFERENCE_TOTAL_LEN,
+                &[11u32.to_le_bytes(), 22u32.to_le_bytes()].concat(),
+            ),
+            "stencil_ref",
+        ),
+        (
+            "setBlendColorRed:green:blue:alpha:",
+            record(
+                wire_r::OPCODE_SET_BLEND_COLOR,
+                wire_r::SET_BLEND_COLOR_TOTAL_LEN,
+                &f32s(&[0.25, 0.5, 0.75, 1.0]),
+            ),
+            "blend_color",
+        ),
+        (
+            "setCullMode:",
+            record(
+                wire_r::OPCODE_SET_CULL_MODE,
+                wire_r::SET_MODE_TOTAL_LEN,
+                &word(2),
+            ),
+            "cull_mode",
+        ),
+        (
+            "setFrontFacingWinding:",
+            record(
+                wire_r::OPCODE_SET_FRONT_FACING,
+                wire_r::SET_MODE_TOTAL_LEN,
+                &word(1),
+            ),
+            "front_facing",
+        ),
+        (
+            "setDepthClipMode:",
+            record(
+                wire_r::OPCODE_SET_DEPTH_CLIP_MODE,
+                wire_r::SET_MODE_TOTAL_LEN,
+                &word(1),
+            ),
+            "depth_clip_mode",
+        ),
+        (
+            "setTriangleFillMode:",
+            record(
+                wire_r::OPCODE_SET_TRIANGLE_FILL_MODE,
+                wire_r::SET_MODE_TOTAL_LEN,
+                &word(1),
+            ),
+            "fill_mode",
+        ),
+        (
+            "setDepthBias:slopeScale:clamp:",
+            record(
+                wire_r::OPCODE_SET_DEPTH_BIAS,
+                wire_r::SET_DEPTH_BIAS_TOTAL_LEN,
+                &f32s(&[0.25, 1.5, 2.25]),
+            ),
+            "depth_bias",
+        ),
+        (
+            "setLineWidth:",
+            record(
+                wire_r::OPCODE_SET_LINE_WIDTH,
+                wire_r::SET_FLOAT_TOTAL_LEN,
+                &f32s(&[3.5]),
+            ),
+            "line_width",
+        ),
+        (
+            "setViewport:",
+            record(
+                wire_r::OPCODE_SET_VIEWPORT,
+                wire_r::SET_VIEWPORT_TOTAL_LEN,
+                &viewport_bytes([1.0, 2.0, 3.0, 4.0, 0.0, 1.0]),
+            ),
+            "viewports",
+        ),
+        (
+            "setViewports:count:",
+            record(
+                wire_r::OPCODE_SET_VIEWPORTS,
+                (OP_HEADER_LEN + viewports_body.len()) as u32,
+                &viewports_body,
+            ),
+            "viewports",
+        ),
+        (
+            "setScissorRect:",
+            record(
+                wire_r::OPCODE_SET_SCISSOR,
+                wire_r::SET_SCISSOR_TOTAL_LEN,
+                &scissor_bytes([1, 2, 3, 4]),
+            ),
+            "scissors",
+        ),
+        (
+            "setScissorRects:count:",
+            record(
+                wire_r::OPCODE_SET_SCISSOR_RECTS,
+                (OP_HEADER_LEN + scissors_body.len()) as u32,
+                &scissors_body,
+            ),
+            "scissors",
+        ),
+        (
+            "setVisibilityResultMode:offset:",
+            record(
+                wire_r::OPCODE_SET_VISIBILITY_RESULT_MODE,
+                wire_r::SET_VISIBILITY_RESULT_MODE_TOTAL_LEN,
+                &vis,
+            ),
+            "visibility",
+        ),
+    ];
+
+    for (selector, command, field) in cases {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let before = fingerprint(&acc);
+        let opcode = ld32(&command[0..]);
+        handle_render_record(&mut state, &host, 1, opcode, &command, &mut out, &mut acc);
+        let after = fingerprint(&acc);
+        for ((name, was), (_, now)) in before.iter().zip(after.iter()) {
+            if *name == field {
+                assert_ne!(
+                    was, now,
+                    "{selector} ({opcode:#x}) left {name} at {was}, so the record reached no field"
+                );
+            } else {
+                assert_eq!(
+                    was, now,
+                    "{selector} ({opcode:#x}) moved {name} from {was} to {now}, which belongs to \
+                     another record class"
+                );
+            }
+        }
+    }
+}
+
+/// A plural viewport or scissor record of count zero keeps the previous state.
+///
+/// The singular form is the plural at length one, so an empty array can only be
+/// the plural — and it is the one shape where "replace the state" and "the guest
+/// bound none" are the same assignment for opposite reasons. The legacy decoder
+/// refused it as `ErrBadLength`, a reading this keeps and names.
+#[test]
+fn a_plural_viewport_or_scissor_of_count_zero_keeps_what_the_stream_already_bound() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let record = |op: u32, body: &[u8]| {
+        let total = (OP_HEADER_LEN + body.len()) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v[OP_HEADER_LEN..].copy_from_slice(body);
+        v
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    acc.viewports.push([1.0, 2.0, 3.0, 4.0, 0.0, 1.0]);
+    acc.scissors.push(ScissorRect {
+        x: 1,
+        y: 2,
+        width: 3,
+        height: 4,
+    });
+
+    for (op, body, route) in [
+        (
+            wire_r::OPCODE_SET_VIEWPORTS,
+            0u32.to_le_bytes().to_vec(),
+            "render_viewport_count_zero",
+        ),
+        (
+            wire_r::OPCODE_SET_SCISSOR_RECTS,
+            0u64.to_le_bytes().to_vec(),
+            "render_scissor_count_zero",
+        ),
+    ] {
+        let before = store_route_count(route);
+        let command = record(op, &body);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count(route),
+            before + 1,
+            "{op:#x} should have been counted as {route}"
+        );
+    }
+    assert_eq!(acc.viewports.len(), 1, "the bound viewport must stand");
+    assert_eq!(acc.scissors.len(), 1, "the bound scissor must stand");
+}

@@ -514,7 +514,7 @@ pub struct DecodedBufferBind {
 
 /// Lift one wire rect. Shared by the singular and plural scissor opcodes, which
 /// carry the identical element and differ only in how many of it follow.
-fn scissor_from_wire(r: &wire::ScissorRect) -> ScissorRect {
+pub(crate) fn scissor_from_wire(r: &wire::ScissorRect) -> ScissorRect {
     ScissorRect {
         x: r.x.get() as u32,
         y: r.y.get() as u32,
@@ -526,7 +526,7 @@ fn scissor_from_wire(r: &wire::ScissorRect) -> ScissorRect {
 /// Lift one wire viewport, in the `[originX, originY, width, height, znear,
 /// zfar]` order both backends read it back in. Shared by the singular and
 /// plural viewport opcodes for the same reason as [`scissor_from_wire`].
-fn viewport_from_wire(v: &wire::Viewport) -> [f64; 6] {
+pub(crate) fn viewport_from_wire(v: &wire::Viewport) -> [f64; 6] {
     [
         v.origin_x.get(),
         v.origin_y.get(),

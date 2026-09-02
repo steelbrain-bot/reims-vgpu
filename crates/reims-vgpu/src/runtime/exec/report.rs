@@ -159,6 +159,29 @@ pub(super) fn reset_unimplemented_opcode_dedup_for_test() {
 /// handles a degenerate one. What changes is that the substitution is now
 /// visible. Deduped on the pair, because a guest emitting one emits it for a
 /// reason that does not vary per record.
+/// A plural viewport or scissor record whose count is zero.
+///
+/// The previous state stands. `setViewports:count:` and `setScissorRects:count:`
+/// replace the state rather than add to it, so a count of zero is either the
+/// guest retiring every viewport or a record it did not mean to send, and this
+/// device cannot tell which — Metal requires at least one, which is the reason
+/// to doubt a guest emits it. Naming it costs nothing and a firing is the
+/// signal that the choice matters.
+pub(super) fn note_empty_viewport_or_scissor(task_id: u32, what: &str, opcode: u32) {
+    crate::runtime::drain::note_store_route(match what {
+        "viewport" => "render_viewport_count_zero",
+        _ => "render_scissor_count_zero",
+    });
+    if crate::observe::first_sight("render_plural_count_zero", u64::from(opcode)) {
+        crate::observe::fail(format!(
+            "render_{what}_count_zero reason=render_plural_count_zero \
+             task={task_id} opcode={opcode:#x} \
+             (the guest replaced its {what} state with an empty array; this rail \
+             kept the previous one)"
+        ));
+    }
+}
+
 pub(super) fn note_empty_scissor(task_id: u32, rect: ScissorRect) {
     let (w, h) = (rect.width, rect.height);
     crate::runtime::drain::note_store_route("render_scissor_empty_kept_previous");
