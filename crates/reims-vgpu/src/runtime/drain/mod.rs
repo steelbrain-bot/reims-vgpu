@@ -2374,6 +2374,12 @@ fn process_root_packet<H: HostMemory + HostOps>(
         ROOT_OP_DEVICE_INFO_TAHOE | ROOT_OP_DEVICE_INFO_MONTEREY => {
             match query_request(WireChannel::Root, packet.opcode, &packet.payload, None) {
                 Some(RequestWords::DeviceInfo(request)) => {
+                    // Asked before the reply is written, because the question is
+                    // what this device identified at the moment of the write.
+                    crate::runtime::objects::note_device_info_reply_destination(
+                        state,
+                        request.reply_pfn,
+                    );
                     let _ = reply_device_info(host, &request, state.page_shift, state.gfx.version);
                 }
                 Some(_) => note_query_layout_mismatch("device_info", None),

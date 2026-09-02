@@ -204,6 +204,29 @@ pub enum Gap {
     /// device mints identities from `(task, allocation base, incarnation)` and a
     /// page frame has no task and no allocation base. That is the term this gap
     /// is actually short of.
+    ///
+    /// # Both halves are now instrumented, and neither is closed by a reading
+    ///
+    /// `crate::runtime::objects::note_query_reply_destination` asks the GVA half
+    /// whether a reply buffer lies inside an allocation this device already
+    /// identifies — the case where a destination given an identity of its own
+    /// leaves the reply write unordered against every access to that object.
+    ///
+    /// `crate::runtime::objects::note_device_info_reply_destination` asks the
+    /// page-frame half the only question that can be asked of it. A page frame
+    /// cannot be compared against a table of task windows, so the instrument
+    /// asks about *population* instead: a minted identity is sound exactly when
+    /// there is no identified storage for it to collide with, and this device
+    /// holding no task and no resource at the moment of the reply is that
+    /// condition. The reply path documents the contract that would make it hold
+    /// — the guest asks once, at accelerator start, and frees the buffer after
+    /// the single parse — and whether "at accelerator start" precedes this
+    /// device's first construction is a fact about a driven guest and not
+    /// something a reading settles.
+    ///
+    /// Neither denominator is large enough to conclude from yet. That is
+    /// recorded here so the next attempt spends its boot rather than its
+    /// reasoning.
     ReplyDestination,
 }
 

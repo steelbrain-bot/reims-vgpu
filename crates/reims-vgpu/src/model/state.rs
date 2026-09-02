@@ -846,6 +846,27 @@ impl TaskResources {
             .collect()
     }
 
+    /// How many constructed resources this device holds, across every task.
+    ///
+    /// Not a per-task question, and that is the point of it: the one reader is
+    /// the device-info reply census, whose destination is a guest page frame in
+    /// no task's address space at all, so "is there any storage this could
+    /// collide with" cannot be asked of one task.
+    pub fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Whether this device holds no constructed resource at all.
+    ///
+    /// Spelled out beside [`Self::len`] because clippy asks for it and because
+    /// the census's question really is the emptiness rather than the count.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn delete_task(&self, task_id: u32) -> usize {
         let mut resources = self
             .0

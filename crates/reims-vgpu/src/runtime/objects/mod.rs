@@ -2421,6 +2421,63 @@ pub fn note_query_reply_destination(
     Some(ref_)
 }
 
+/// Whether a device-info reply's page frame could collide with storage this
+/// device already identifies, asked at the moment the reply is written.
+///
+/// # The other half of the reply-destination question
+///
+/// [`note_query_reply_destination`] asks it of the two queries whose reply
+/// buffer is a **task GVA**: does the buffer lie inside an allocation this
+/// device has a `BackingId` for, so that a destination given an identity of its
+/// own would leave the reply write unordered against every access to that
+/// object. That instrument cannot be pointed at `CmdGetDeviceInfo`, whose reply
+/// is a bare guest **page frame** in no task's address space — there is no
+/// window in that table it could be inside of.
+///
+/// So the same danger has to be ruled out a different way, and the cheapest
+/// sound way is population rather than geometry. `reims_vgpu_core::access::
+/// BackingId` is minted from `(task, allocation base, incarnation)`; a page
+/// frame has neither of the first two, so a device-info destination can only
+/// ever be given an identity of its own. That is *correct* exactly when no
+/// storage this device identifies can be reached through the same bytes — and
+/// if this device identifies no storage at all when the reply is written, there
+/// is nothing for the minted identity to collide with, whatever the page frame
+/// happens to be.
+///
+/// The reply path's own documentation already states the contract that would
+/// make that true: the guest asks **once**, when its accelerator starts, and
+/// frees the reply buffer immediately after the single parse. What it does not
+/// state is whether "when its accelerator starts" is before this device has
+/// constructed anything, and that is not a thing a reading can settle. It is
+/// what this counts.
+///
+/// # What a boot's counters mean
+///
+/// `device_info_reply_scanned` is the denominator — without it, a boot where
+/// every reply landed before any storage existed and a boot where the guest
+/// never asked read the same. `device_info_reply_before_any_storage` is the
+/// closing answer; `device_info_reply_with_live_storage` is the one that keeps
+/// the term open, and it carries the populations on the failure channel because
+/// a bare count would not say which task's storage to go and look at.
+pub fn note_device_info_reply_destination(state: &DeviceState, reply_pfn: u32) {
+    crate::runtime::drain::note_store_route("device_info_reply_scanned");
+    let resources = state.task_resources.len();
+    let tasks = state.tasks.live_count();
+    if resources == 0 && tasks == 0 {
+        crate::runtime::drain::note_store_route("device_info_reply_before_any_storage");
+        return;
+    }
+    crate::runtime::drain::note_store_route("device_info_reply_with_live_storage");
+    if crate::observe::first_sight("device_info_reply_with_live_storage", u64::from(reply_pfn)) {
+        crate::observe::fail(format!(
+            "device_info_reply_with_live_storage pfn={reply_pfn:#x} tasks={tasks} \
+             resources={resources} (the reply page is identified by minting, and this \
+             device already identifies storage the mint cannot be compared against — so \
+             whether the reply write is ordered against that storage is unestablished)"
+        ));
+    }
+}
+
 /// Which bytes of a mapping's surface a mapper-ref texture occupies.
 ///
 /// The texture's storage is the mapping's, so its extent is measured in the
