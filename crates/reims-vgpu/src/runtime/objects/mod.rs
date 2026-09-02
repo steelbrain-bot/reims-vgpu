@@ -2673,10 +2673,21 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     // the second.
     match repointed_window(state, host, task_id, object_id) {
         Some(base) => state.bump_storage_incarnation(task_id, base),
-        // No window, so no incarnation moved. That is a real loss — a later
-        // identity for these pages will compare equal to the one accepted work
-        // holds — and it is named rather than left to a counter that reads the
-        // same as a boot with no re-points at all.
+        // No window. That is only a loss for storage this device reaches *by
+        // address*: an object that owns a mapping carries its incarnation in
+        // that mapping's generation instead, which the arm below moves, and
+        // the two counters are the two ways storage is reached rather than two
+        // answers about one. A driven macos-15 boot puts every one of these in
+        // the second class — seven re-points, all in the accelerator's kernel
+        // task, naming surfaces registered there — so a line that called them
+        // losses would be seven false findings a boot.
+        None if target.is_some() => {
+            crate::runtime::drain::note_store_route("replace_physical_window_via_mapping");
+        }
+        // Neither address nor mapping. Now it is a real loss — a later identity
+        // for these pages will compare equal to the one accepted work holds —
+        // and it is named rather than left to a counter that reads the same as
+        // a boot with no re-points at all.
         None => {
             crate::runtime::drain::note_store_route("replace_physical_window_unknown");
             if crate::observe::first_sight(
