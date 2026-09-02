@@ -2095,9 +2095,13 @@ pub fn note_query_reply_destination(
             .task_resources
             .in_task(task_id)
             .into_iter()
-            .find_map(|(ref_, resource)| {
+            .find_map(|(name, resource)| {
                 let (base, size) = resource.backing_window(state.page_shift)?;
-                (base < end && reply_gva < base.saturating_add(size)).then_some((ref_, base, size))
+                (base < end && reply_gva < base.saturating_add(size)).then_some((
+                    name.slot.0,
+                    base,
+                    size,
+                ))
             });
     let Some((ref_, base, size)) = containing else {
         crate::runtime::drain::note_store_route("query_reply_outside_every_allocation");
@@ -2297,9 +2301,15 @@ pub fn resolve_resource<M: HostMemory>(
     task_id: u32,
     obj_ref: u32,
 ) -> Result<Arc<TaskResource>, LadderRung> {
-    if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
-        note_stale_task_resource(state, host, task_id, obj_ref, &resource);
-        return Ok(resource);
+    // The namespace decides whether this reference still names anything, and the
+    // memo is keyed by its answer. A slot the guest has deleted resolves to
+    // nothing, so the retained bytes behind the name it used to have are
+    // unreachable here rather than merely unlikely to be reached.
+    if let Some(name) = state.object_name(task_id, obj_ref) {
+        if let Some(resource) = state.task_resources.get(task_id, name) {
+            note_stale_task_resource(state, host, task_id, obj_ref, &resource);
+            return Ok(resource);
+        }
     }
 
     let entry = lookup_list_entry(state, host, task_id, obj_ref).ok_or(LadderRung::NoListEntry)?;
@@ -2316,8 +2326,43 @@ pub fn resolve_resource<M: HostMemory>(
         let _ = note_backing_window_alias(state, host, task_id, obj_ref, base, size);
     }
     note_backing_identity(state, task_id, &entry, &descriptor);
+    // The one declaration site. `None` for an object that owns no memory, and
+    // also for one whose storage this device cannot describe — a floor on what
+    // the model can be told, never an invented identity, and the census above is
+    // what measures how often it is reached.
+    let backing = declared_storage(state, task_id, &entry, &descriptor)
+        .ok()
+        .and_then(|storage| match storage {
+            reims_vgpu_core::lifecycle::Storage::Dedicated { backing, .. } => Some(backing),
+            reims_vgpu_core::lifecycle::Storage::Placed { .. }
+            | reims_vgpu_core::lifecycle::Storage::NoBytes => None,
+        });
+    let declared = state.declare_object(task_id, obj_ref, backing);
+    // A declaration over a slot that still held a live object owes that
+    // occupant's teardown. It should be unreachable: this arm runs only on a
+    // memo miss, and a live name always has its memo — the two are written
+    // together and retired together. Reported rather than assumed away, because
+    // if it ever fires the previous occupant's storage is one nothing else will
+    // free.
+    if let Some(displaced) = declared.displaced {
+        crate::runtime::drain::note_store_route("object_declared_over_a_live_name");
+        if crate::observe::first_sight(
+            "object_declared_over_a_live_name",
+            (u64::from(task_id) << 32) | u64::from(obj_ref),
+        ) {
+            crate::observe::fail(format!(
+                "object_declared_over_a_live_name task={task_id} ref={obj_ref} \
+                 displaced_generation={:?} teardown={:?} (a construction found no memo for a \
+                 name the namespace still says is live, so the two were written apart \
+                 somewhere and the displaced occupant's storage is owed to nobody)",
+                displaced.id.generation, displaced.teardown,
+            ));
+        }
+    }
     let resource = Arc::new(TaskResource::new(entry, descriptor));
-    Ok(state.task_resources.register(task_id, obj_ref, resource))
+    Ok(state
+        .task_resources
+        .register(task_id, declared.id, resource))
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
@@ -2343,7 +2388,7 @@ pub fn resolve_descriptor<M: HostMemory>(
     obj_ref: u32,
     want: &[u8],
 ) -> Result<(ListObjectEntry, Arc<[u8]>), LadderRung> {
-    if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
+    if let Some(resource) = state.constructed_object(task_id, obj_ref) {
         if !want.contains(&resource.entry.object_type) {
             return Err(LadderRung::WrongType {
                 got: resource.entry.object_type,
@@ -2367,12 +2412,14 @@ pub fn resolve_descriptor<M: HostMemory>(
     if !object_type_is_resource(entry.object_type) {
         return Ok((entry, Arc::from(bytes)));
     }
-    let descriptor: Arc<[u8]> = Arc::from(bytes);
-    let resource = state.task_resources.register(
-        task_id,
-        obj_ref,
-        Arc::new(TaskResource::new(entry, descriptor)),
-    );
+    // Construction is [`resolve_resource`]'s, and this delegates rather than
+    // registering a second time. It used to build and publish its own
+    // `TaskResource`, which made two sites that could put an object into this
+    // device's hands — and only one of them can be the place a name is issued.
+    // The cost is re-reading the entry and the descriptor, on a path that is
+    // taken once per object lifetime; the alternative is an object with retained
+    // bytes and no name.
+    let resource = resolve_resource(state, host, task_id, obj_ref)?;
     if !want.contains(&resource.entry.object_type) {
         return Err(LadderRung::WrongType {
             got: resource.entry.object_type,
@@ -3612,9 +3659,9 @@ pub fn cached_window_peer(state: &DeviceState, task_id: u32, obj_ref: u32) -> Op
         .task_resources
         .in_task(task_id)
         .into_iter()
-        .filter(|&(ref_, _)| ref_ != obj_ref)
+        .filter(|&(name, _)| name.slot.0 != obj_ref)
         .find(|(_, other)| other.backing_window(state.page_shift) == Some((base.0, base.1)))
-        .map(|(ref_, _)| ref_)
+        .map(|(name, _)| name.slot.0)
 }
 
 /// The allocation a constructed reference names, from its own decode.
@@ -3626,8 +3673,7 @@ pub fn cached_window_peer(state: &DeviceState, task_id: u32, obj_ref: u32) -> Op
 #[must_use]
 pub fn cached_window(state: &DeviceState, task_id: u32, obj_ref: u32) -> Option<(u64, u64)> {
     state
-        .task_resources
-        .get(task_id, obj_ref)?
+        .constructed_object(task_id, obj_ref)?
         .backing_window(state.page_shift)
 }
 

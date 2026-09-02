@@ -5,6 +5,8 @@ use crate::runtime::decode::resource::{
     DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry, SamplerDescriptor,
 };
 use reims_vgpu_core::access::BackingId;
+use reims_vgpu_core::identity::{ObjectListRef, ResourceId};
+use reims_vgpu_core::namespace::{Declared, Namespace, Teardown};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -769,7 +771,25 @@ impl TaskResourceLifetimeRef {
     }
 }
 
-/// Per-task resource objects, keyed by the guest's `(task, reference)` pair.
+/// Per-task resource objects, keyed by the **name** the object namespace issued
+/// for the slot rather than by the slot number.
+///
+/// # Why the key carries a generation
+///
+/// A slot number alone is not an identity: the guest reuses slots, and a memo
+/// keyed by one outlives the object it was built for. That is not a theoretical
+/// hazard on this interface — the guest replaces an object by writing over its
+/// own object-list record, with no packet — and a stale hit binds the bytes of
+/// whatever used to live there, which is a wrong texture rather than a missing
+/// one.
+///
+/// So the key is [`reims_vgpu_core::identity::ResourceId`], which
+/// [`DeviceState::declare_object`] issues and whose generation advances on every
+/// declaration. A caller reaches this table only through a name the namespace
+/// has already resolved, and a name the namespace has retired cannot be spelled
+/// — which makes "the memo and the namespace disagree" unrepresentable instead
+/// of merely unlikely. The namespace is the authority for what a reference
+/// names; this is a memo of the bytes behind a name it has already answered.
 ///
 /// Interior synchronization keeps resource lookup available to encode helpers
 /// that only borrow [`DeviceState`] immutably. Those helpers run while the
@@ -777,14 +797,14 @@ impl TaskResourceLifetimeRef {
 /// also makes the lifetime rule explicit instead of relying on that outer
 /// serialization.
 #[derive(Debug, Default)]
-pub struct TaskResources(Mutex<BTreeMap<(u32, u32), Arc<TaskResource>>>);
+pub struct TaskResources(Mutex<BTreeMap<(u32, ResourceId), Arc<TaskResource>>>);
 
 impl TaskResources {
-    pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<TaskResource>> {
+    pub fn get(&self, task_id: u32, name: ResourceId) -> Option<Arc<TaskResource>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&(task_id, ref_))
+            .get(&(task_id, name))
             .cloned()
     }
 
@@ -792,36 +812,37 @@ impl TaskResources {
     pub fn register(
         &self,
         task_id: u32,
-        ref_: u32,
+        name: ResourceId,
         resource: Arc<TaskResource>,
     ) -> Arc<TaskResource> {
         Arc::clone(
             self.0
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entry((task_id, ref_))
+                .entry((task_id, name))
                 .or_insert(resource),
         )
     }
 
-    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+    pub fn delete(&self, task_id: u32, name: ResourceId) -> bool {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&(task_id, ref_))
+            .remove(&(task_id, name))
             .is_some()
     }
 
-    /// Every constructed resource in one task, as `(reference, resource)`.
+    /// Every constructed resource in one task, as `(name, resource)`.
     ///
     /// Collected rather than iterated under the lock, so a caller may decode
     /// descriptors -- which is what every caller does -- without holding it.
-    pub fn in_task(&self, task_id: u32) -> Vec<(u32, Arc<TaskResource>)> {
+    pub fn in_task(&self, task_id: u32) -> Vec<(ResourceId, Arc<TaskResource>)> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .range((task_id, 0)..=(task_id, u32::MAX))
-            .map(|(&(_, ref_), resource)| (ref_, Arc::clone(resource)))
+            .iter()
+            .filter(|&(&(task, _), _)| task == task_id)
+            .map(|(&(_, name), resource)| (name, Arc::clone(resource)))
             .collect()
     }
 
@@ -2657,9 +2678,26 @@ pub struct DeviceState {
     /// owns the corresponding resource objects and their immutable descriptor
     /// construction input.
     pub objects: std::collections::BTreeSet<(u32, u32)>,
-    /// Retained resource objects, with the task/reference lifetime defined by
-    /// [`TaskResources`].
+    /// Retained resource objects, keyed by the name
+    /// [`Self::declare_object`] issued. See [`TaskResources`].
     pub task_resources: TaskResources,
+    /// The object namespace of each live task: what a guest reference resolves
+    /// to, and at which generation.
+    ///
+    /// **The authority for object naming, and the only issuer of a generation.**
+    /// Everything else this device keeps per object is a memo behind a name this
+    /// answered — [`TaskResources`] most of all, which is keyed by that name so
+    /// a retired one cannot be spelled.
+    ///
+    /// One namespace per task, because an object-list reference is task-local
+    /// and a resolution that reached across tasks would find whatever shared the
+    /// integer. Dropped whole when the task's address space ends, which is the
+    /// same event that ends every name in it.
+    ///
+    /// Behind a lock for [`TaskResources`]' reason: the resolve path holds
+    /// [`DeviceState`] shared, and `reims_vgpu_core::namespace::Namespace`
+    /// counts its own resolutions, so even a lookup takes `&mut`.
+    namespaces: Mutex<BTreeMap<u32, Namespace>>,
     /// Immutable sampler objects in the sampler API's separate ref space.
     pub task_sampler_states: TaskSamplerStates,
     /// Immutable depth-stencil objects in that API's separate ref space.
@@ -3061,6 +3099,7 @@ impl DeviceState {
             node_guard: std::collections::BTreeMap::new(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
+            namespaces: Mutex::new(BTreeMap::new()),
             task_sampler_states: TaskSamplerStates::default(),
             task_depth_stencil_states: TaskDepthStencilStates::default(),
             rail: OnceLock::new(),
@@ -3510,6 +3549,7 @@ impl DeviceState {
         }
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
+        self.delete_task_namespace(task_id);
         self.task_sampler_states.delete_task(task_id);
         crate::runtime::drain::note_store_route_n(
             "ds_state_task_deleted",
@@ -3565,6 +3605,7 @@ impl DeviceState {
         }
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
+        self.delete_task_namespace(task_id);
         self.task_sampler_states.delete_task(task_id);
         crate::runtime::drain::note_store_route_n(
             "ds_state_task_deleted",
@@ -3674,9 +3715,118 @@ impl DeviceState {
         true
     }
 
+    /// What a guest reference names in this task right now, or `None` when the
+    /// slot holds nothing live.
+    ///
+    /// The one way into anything this device keeps per object. A caller holding
+    /// a bare reference number has a slot; a caller holding the answer to this
+    /// has a *name*, and only a name can key [`TaskResources`].
+    ///
+    /// Takes `&self`, because resolution happens on the shared-borrow path and
+    /// this asks the namespace's non-consuming door
+    /// (`reims_vgpu_core::resolve::RefResolver`) rather than the one that hands
+    /// out leases: a lookup that minted a lease nobody acquired would be a claim
+    /// this device never pays off.
+    #[must_use]
+    pub fn object_name(&self, task_id: u32, obj_ref: u32) -> Option<ResourceId> {
+        use reims_vgpu_core::resolve::RefResolver as _;
+        self.namespaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&task_id)?
+            .resource(obj_ref)
+    }
+
+    /// The resource this device constructed for a guest reference, if it has
+    /// one that still resolves.
+    ///
+    /// **The only door to [`Self::task_resources`], and it is two steps for a
+    /// reason.** The memo is keyed by a name; a caller holding a bare reference
+    /// has a slot; and the step between them is the namespace saying whether
+    /// that slot still names anything. A lookup that skipped it would be reading
+    /// the memo of whatever used to live there.
+    #[must_use]
+    pub fn constructed_object(&self, task_id: u32, obj_ref: u32) -> Option<Arc<TaskResource>> {
+        self.task_resources
+            .get(task_id, self.object_name(task_id, obj_ref)?)
+    }
+
+    /// Publish an object into a task's namespace and take its name.
+    ///
+    /// `backing` is `None` for an object that owns no memory, which is most of a
+    /// list — see `crate::runtime::objects::declared_storage`. It is also `None`
+    /// for one whose storage this device cannot describe: that is a floor on
+    /// what the model can be told and not a licence to invent an identity, and
+    /// the census at the construction site is what measures how often it
+    /// happens.
+    ///
+    /// Returns the whole [`Declared`], displacement included, because a
+    /// declaration over a slot that still held a live object is an event with an
+    /// owed teardown and dropping it would leak the previous occupant's storage.
+    #[must_use]
+    pub fn declare_object(
+        &self,
+        task_id: u32,
+        obj_ref: u32,
+        backing: Option<BackingId>,
+    ) -> Declared {
+        self.namespaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(task_id)
+            .or_default()
+            .declare(ObjectListRef(obj_ref), backing)
+    }
+
+    /// Retire a name: stop it resolving, and leave accepted work alone.
+    ///
+    /// `None` when the slot held nothing this device had named — the guest
+    /// deleting an object it never made this device construct, which is
+    /// ordinary and not a refusal worth a type here.
+    #[must_use]
+    pub fn retire_object_name(&self, task_id: u32, name: ResourceId) -> Option<Teardown> {
+        self.namespaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&task_id)?
+            .delete(name)
+            .ok()
+    }
+
+    /// Drop a task's whole object namespace.
+    ///
+    /// Every name in it ends with the address space, which is the same event
+    /// that ends the storage those names resolved to — see
+    /// [`Self::bump_task_storage_incarnations`].
+    fn delete_task_namespace(&self, task_id: u32) {
+        self.namespaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&task_id);
+    }
+
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let removed = self.objects.remove(&(task_id, ref_));
-        let resource_removed = self.task_resources.delete(task_id, ref_);
+        // The namespace first, because it is what decides the reference still
+        // names anything; the memo behind that name goes with it. A name it has
+        // retired cannot be spelled again, so the memo would be unreachable
+        // either way — it is dropped here to free the bytes promptly rather than
+        // because correctness rests on it, which is the same relationship
+        // `MappingEntry::guest_write_token` has to its generation.
+        let resource_removed = match self.object_name(task_id, ref_) {
+            Some(name) => {
+                let teardown = self.retire_object_name(task_id, name);
+                crate::runtime::drain::note_store_route(match teardown {
+                    Some(Teardown::Now { .. }) => "object_teardown_now",
+                    Some(Teardown::WhenUsesRetire { .. }) => "object_teardown_owed",
+                    Some(Teardown::HeldByAnotherName { .. }) => "object_teardown_held_by_peer",
+                    Some(Teardown::NoStorage) => "object_teardown_no_storage",
+                    None => "object_teardown_unnamed",
+                });
+                self.task_resources.delete(task_id, name)
+            }
+            None => false,
+        };
         if removed || resource_removed {
             self.invalidate_object_host_copies(task_id, ref_);
             self.texture_to_mapping.remove(&(task_id, ref_));

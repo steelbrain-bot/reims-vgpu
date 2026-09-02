@@ -207,10 +207,10 @@ fn task_lifetime_retires_all_of_its_resource_objects() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
-    assert!(state.task_resources.get(1, 1).is_some());
+    assert!(state.constructed_object(1, 1).is_some());
 
     assert!(state.delete_task(1));
-    assert!(state.task_resources.get(1, 1).is_none());
+    assert!(state.constructed_object(1, 1).is_none());
     assert_eq!(
         ld32(&resource.descriptor),
         9,
@@ -248,13 +248,13 @@ fn non_resource_descriptors_are_read_again() {
     let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_SERIALIZER_OBJECT])
         .expect("first serializer descriptor");
     assert_eq!(ld32(&first), 1);
-    assert!(state.task_resources.get(1, 2).is_none());
+    assert!(state.constructed_object(1, 2).is_none());
 
     let _ = host.write_gpa(data_gpa + 0x80, &2u32.to_le_bytes());
     let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_SERIALIZER_OBJECT])
         .expect("updated serializer descriptor");
     assert_eq!(ld32(&second), 2);
-    assert!(state.task_resources.get(1, 2).is_none());
+    assert!(state.constructed_object(1, 2).is_none());
 }
 
 fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_min: f32) {
@@ -2810,7 +2810,7 @@ fn a_window_whose_holder_the_guest_freed_is_not_an_alias() {
     // own record. No packet arrives, so the construction cache still holds it.
     write_slot(&mut host, first, false);
     assert!(
-        state.task_resources.get(task, first).is_some(),
+        state.constructed_object(task, first).is_some(),
         "the cache cannot see a free, which is the whole difficulty"
     );
     assert_eq!(
@@ -3552,6 +3552,83 @@ fn the_device_answers_the_models_mapping_resolver_with_the_identity_it_mints() {
         state.backing(MappingId(9)),
         Some(minted),
         "and it moves with the page list, because that is what the identity is"
+    );
+}
+
+/// A guest reference reaches this device's retained bytes only through the name
+/// the namespace issued, and a slot the guest reuses is a different name.
+///
+/// This is the invariant the memo's key exists for. A cache keyed by the slot
+/// number outlives the object it was built for — the guest replaces an object by
+/// writing over its own object-list record, with no packet — and a stale hit
+/// binds the bytes of whatever used to live there, which is a wrong texture
+/// rather than a missing one. Keyed by a name whose generation advances on every
+/// declaration, the stale entry cannot be spelled.
+#[test]
+fn a_reference_reaches_its_bytes_only_through_the_name_the_namespace_issued() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let (task, ref_) = (1u32, 1u32);
+
+    assert_eq!(
+        state.object_name(task, ref_),
+        None,
+        "a reference this device has never constructed names nothing"
+    );
+    assert!(
+        state.constructed_object(task, ref_).is_none(),
+        "and there is no door to the memo that does not go through a name"
+    );
+
+    let built = resolve_resource(&state, &host, task, ref_).expect("construction");
+    let first = state
+        .object_name(task, ref_)
+        .expect("construction names it");
+    assert!(
+        std::sync::Arc::ptr_eq(&state.constructed_object(task, ref_).expect("memo"), &built),
+        "the memo answers under the name the declaration issued"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(
+            &resolve_resource(&state, &host, task, ref_).expect("retrieval"),
+            &built
+        ),
+        "and a second resolution retrieves it rather than constructing again"
+    );
+
+    // The guest deletes the object. The name stops resolving, so the retained
+    // bytes are unreachable — not because they were removed, but because
+    // nothing can name them.
+    assert!(state.delete_object(task, ref_));
+    assert_eq!(state.object_name(task, ref_), None);
+    assert!(state.constructed_object(task, ref_).is_none());
+    assert!(
+        state.task_resources.get(task, first).is_none(),
+        "the memo goes with the name, which is prompt rather than load-bearing"
+    );
+
+    // The slot is used again. It is a different name, and the generation is
+    // what says so.
+    let rebuilt = resolve_resource(&state, &host, task, ref_).expect("reconstruction");
+    let second = state.object_name(task, ref_).expect("named again");
+    assert_ne!(
+        second, first,
+        "a reused slot is a new generation, which is the whole reason the memo \
+         is not keyed by the slot"
+    );
+    assert_eq!(second.slot, first.slot, "and the same slot");
+    assert!(
+        !std::sync::Arc::ptr_eq(&rebuilt, &built),
+        "the second occupant is its own object"
+    );
+
+    // A task teardown ends every name in it.
+    assert!(state.delete_task(task));
+    assert_eq!(
+        state.object_name(task, ref_),
+        None,
+        "the address space ended, and every name in it with it"
     );
 }
 

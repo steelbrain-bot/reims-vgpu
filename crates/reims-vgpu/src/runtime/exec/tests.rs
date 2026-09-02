@@ -1922,9 +1922,12 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
+    // Published through the namespace, because that is the only issuer of the
+    // name the memo is keyed by.
+    let name = state.declare_object(1, 9, None).id;
     let first = state.task_resources.register(
         1,
-        9,
+        name,
         Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
     );
     let total = OP_HEADER_LEN + render_pass::BIND_ENTRIES + 4;
@@ -1949,10 +1952,14 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
         &first
     ));
 
-    assert!(state.task_resources.delete(1, 9));
+    assert!(state.task_resources.delete(1, name));
+    // A second declaration into the same slot, which is a new name: the
+    // generation is what tells the replacement from what it replaced.
+    let replacement_name = state.declare_object(1, 9, None).id;
+    assert_ne!(replacement_name, name);
     let replacement = state.task_resources.register(
         1,
-        9,
+        replacement_name,
         Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
     );
     assert!(Arc::ptr_eq(

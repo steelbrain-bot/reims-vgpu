@@ -4113,7 +4113,7 @@ fn gva_resident_ready(
     identity: &crate::backend::vulkan::engine::TargetIdentity,
 ) -> bool {
     let backing = (texture_ref != 0)
-        .then(|| state.task_resources.get(task_id, texture_ref))
+        .then(|| state.constructed_object(task_id, texture_ref))
         .flatten()
         .filter(|resource| resource_type_owns_gva_resident(resource.entry.object_type))
         .map(|resource| resource_lease::resident_target_backing(&resource, identity));
@@ -8363,8 +8363,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 // survives the 1.8x `us_per_draw` drift between boots on this rig.
                 let backing = req.colors.first().and_then(|c0| {
                     state
-                        .task_resources
-                        .get(req.task_id, c0.texture_ref)
+                        .constructed_object(req.task_id, c0.texture_ref)
                         .filter(|resource| {
                             resource_type_owns_surface_resident(resource.entry.object_type)
                         })
