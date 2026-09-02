@@ -1977,17 +1977,63 @@ pub fn declared_storage(
         Err(BackingIdRefusal::NamesNoStorage { .. }) => return Ok(Storage::NoBytes),
         Err(other) => return Err(StorageRefusal::Backing(other)),
     };
-    let (offset, length) =
+    // Two derivations, because the two kinds of storage measure their extent in
+    // different spaces. An address-named object's window is an offset into the
+    // allocation its own descriptor names, and that descriptor is where it comes
+    // from. A mapper-ref texture's is an offset into a *surface* it shares with
+    // the other planes of one IOSurface, and which plane it is comes from the
+    // mapping's published device descriptor.
+    let extent = if entry.object_type == OBJECT_TYPE_MAPPER_REF_TEXTURE {
+        mapper_ref_surface_extent(state, descriptor)
+    } else {
         crate::runtime::decode::resource::decode_descriptor(entry.object_type, descriptor)
             .ok()
             .and_then(|decoded| decoded.allocation_extent())
-            .ok_or(StorageRefusal::ExtentUnrecovered {
-                object_type: entry.object_type,
-            })?;
+    };
+    let (offset, length) = extent.ok_or(StorageRefusal::ExtentUnrecovered {
+        object_type: entry.object_type,
+    })?;
     Ok(Storage::Dedicated {
         backing,
         extent: ByteRange { offset, length },
     })
+}
+
+/// Which bytes of a mapping's surface a mapper-ref texture occupies.
+///
+/// The texture's storage is the mapping's, so its extent is measured in the
+/// surface's own bytes and not in an allocation of its own. Which part of the
+/// surface it is comes from the mapping's published device descriptor, matched
+/// against the geometry the texture's own descriptor declares — the same
+/// selection every sampling path on this rail makes, through the same function,
+/// so an extent and a sample window can never describe different bytes of one
+/// plane.
+///
+/// `None` when the mapping has published no complete device descriptor yet, or
+/// when the geometry matches no plane. Both are the guest not having said which
+/// plane this is, and a texture given the whole surface as its extent would
+/// declare content authority over its siblings' pixels.
+fn mapper_ref_surface_extent(state: &DeviceState, descriptor: &[u8]) -> Option<(u64, u64)> {
+    let Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+        mapping_id,
+        pixel_format,
+        width,
+        height,
+        ..
+    }) = crate::runtime::decode::resource::decode_iosurface_texture_descriptor(descriptor)
+    else {
+        return None;
+    };
+    let mapping = state.mappings.get(&mapping_id)?;
+    let (offset, _bytes_per_row, span_end) =
+        crate::protocol::iosurface_pages::sample_window_from_device_desc(
+            mapping.device_desc_complete(),
+            None,
+            pixel_format,
+            width,
+            height,
+        )?;
+    Some((offset, span_end.checked_sub(offset)?))
 }
 
 /// Census the canonical backing identity of every object this device

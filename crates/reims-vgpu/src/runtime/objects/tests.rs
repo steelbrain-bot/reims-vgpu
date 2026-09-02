@@ -3278,8 +3278,76 @@ fn a_constructed_object_becomes_the_storage_the_model_is_declared_with() {
     assert_eq!(
         super::declared_storage(&state, task, &t11, &t11_bytes),
         Err(super::StorageRefusal::ExtentUnrecovered { object_type: 11 }),
-        "the identity is there and the extent is not, which is a different \
-         thing from having no identity and must not read as one"
+        "until the mapping publishes a device descriptor, nothing says which \
+         part of its surface this texture is — and the identity being there is \
+         a different fact from the extent being there, which must not read as \
+         one"
+    );
+
+    // The mapping publishes its surface. The texture is 64x32 at format 0x50
+    // (BGRA8, four bytes a pixel), so its plane is 64*4 to a row and the whole
+    // of it is this texture's.
+    let mut device_desc = vec![0u8; crate::protocol::iosurface_pages::DEVICE_DESC_LEN];
+    st64(
+        &mut device_desc[crate::protocol::iosurface_pages::DEVICE_DESC_DIMS..],
+        (64u64 << 8) | (32u64 << 40),
+    );
+    st32(
+        &mut device_desc[crate::protocol::iosurface_pages::DEVICE_DESC_BPR..],
+        64 * 4,
+    );
+    assert!(state.set_mapping_device_desc(9, &device_desc));
+    assert_eq!(
+        super::declared_storage(&state, task, &t11, &t11_bytes),
+        Ok(Storage::Dedicated {
+            backing: super::mapping_backing_id(&state, 9).expect("a mapped surface"),
+            extent: ByteRange {
+                offset: 0,
+                length: 64 * 4 * 32,
+            },
+        }),
+        "the storage is the mapping's and the extent is this texture's plane of \
+         it — the surface's own bytes, not an allocation of the texture's own"
+    );
+
+    // The case the offset is load-bearing in: a two-plane surface where this
+    // texture is the *second* plane. Its bytes start past the surface base, and
+    // an extent anchored at zero would claim the first plane's pixels as this
+    // texture's content.
+    use crate::protocol::iosurface_pages::{
+        DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT, DEVICE_PLANE_BPE, DEVICE_PLANE_BPR,
+        DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET,
+    };
+    const PLANE1_AT: u64 = 0x1_0000;
+    device_desc[DEVICE_DESC_PLANE_COUNT] = 2;
+    for (i, (w, h, bpe, at)) in [(128u32, 64u32, 4u16, 0u32), (64, 32, 4, PLANE1_AT as u32)]
+        .into_iter()
+        .enumerate()
+    {
+        let base = DEVICE_DESC_PLANES + i * DEVICE_PLANE_DESC_LEN;
+        st32(&mut device_desc[base + DEVICE_PLANE_OFFSET..], at);
+        st64(
+            &mut device_desc[base + DEVICE_PLANE_DIMS..],
+            (u64::from(w) << 8) | (u64::from(h) << 40),
+        );
+        st32(
+            &mut device_desc[base + DEVICE_PLANE_BPR..],
+            w * u32::from(bpe),
+        );
+        st16(&mut device_desc[base + DEVICE_PLANE_BPE..], bpe);
+    }
+    assert!(state.set_mapping_device_desc(9, &device_desc));
+    assert_eq!(
+        super::declared_storage(&state, task, &t11, &t11_bytes),
+        Ok(Storage::Dedicated {
+            backing: super::mapping_backing_id(&state, 9).expect("a mapped surface"),
+            extent: ByteRange {
+                offset: PLANE1_AT,
+                length: 64 * 4 * 32,
+            },
+        }),
+        "the second plane's bytes start past the surface base, and an extent \
+         anchored at zero would claim the first plane's pixels"
     );
 }
 
