@@ -326,8 +326,17 @@ pub const LEDGER: &[Packet] = &[
                        named a ref this device held a fence generation under, so that ref space \
                        does coincide and the delete retires the generations --- which leaves 8 \
                        packets, 5 functions and 3 compute pipeline states, both cached by \
-                       content rather than by ref. So the open question is 8 packets wide and \
-                       the row blocks 2166, which is the ratio whoever closes it should know",
+                       content rather than by ref. Those 8 were then measured against the \
+                       guest's own object list, in the form that can answer it: the type the \
+                       destroy opcode names against the type the list entry carries, because a \
+                       resolving integer is a collision and an agreeing type is an identity. \
+                       All 8 named **no list entry at all** --- no agreement and no collision \
+                       --- so those refs are in a space this device holds nothing keyed by and \
+                       there is nothing for a retirement to find. What is left unresolved is \
+                       therefore not any kind a driven guest sends: it is the five kinds one \
+                       never sent --- buffer, texture, heap, rasterization rate map and \
+                       indirect command buffer --- for which there is no evidence either way. \
+                       The row blocks 2166 packets a boot on that residue",
         },
     },
     Packet {

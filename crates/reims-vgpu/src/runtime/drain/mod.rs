@@ -277,10 +277,18 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 ///
 /// The kinds left are the ones this device retains nothing by ref for —
 /// functions and compute pipeline states are cached by *content*, so a ref-keyed
-/// retirement has nothing to find. A driven boot sends 5 and 3 of them. They
-/// stay fail-visible: the claim "there is nothing to retire" is about this
-/// device's caches and not about the guest's object, and a counter that went
-/// quiet would stop saying which contract gap is still open.
+/// retirement has nothing to find. A driven boot sends 5 and 3 of them, and
+/// [`note_delete_object_ref_space`] then asked the only question that could put
+/// a retirement back on the table: **all 8 named no object-list entry at all**,
+/// `delete_object_ref_type_agrees` and `_differs` both silent. So those refs are
+/// in a space this device holds nothing keyed by, and there is nothing to find
+/// in either direction.
+///
+/// They stay fail-visible even so. "There is nothing to retire" is a claim about
+/// this device's caches and not about the guest's object, and a counter that
+/// went quiet would stop saying which contract gap is still open — and the gap
+/// that is still open is now exactly the five kinds a driven guest has never
+/// sent: buffer, texture, heap, rasterization rate map, indirect command buffer.
 fn apply_delete_object<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
