@@ -2591,6 +2591,54 @@ fn one_guest_window_is_claimed_by_one_reference() {
     );
 }
 
+/// Two textures at different offsets in one allocation are one backing.
+///
+/// The descriptor states two addresses and they are not interchangeable:
+/// `handle << page_shift` is where the allocation begins and `+ data_offset`
+/// is where the texels begin. A backing identity taken from the texel base
+/// would give one allocation as many identities as it has tenants — and the
+/// hazard edge between two tenants that write over each other would then never
+/// be drawn, which is the false-distinctness direction. So the window is the
+/// allocation's, and the offset belongs to the extent.
+///
+/// This also protects the alias reading itself: keyed on the texel base, two
+/// textures sharing an allocation would never collide and the reading would be
+/// silent for exactly the case it exists to find.
+#[test]
+fn two_textures_in_one_allocation_have_one_window() {
+    use crate::runtime::decode::resource::{
+        LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_DATA_OFFSET,
+        TEXTURE_DESC_GEOMETRY_LEN,
+    };
+
+    let handle = 0x20u32;
+    let texture = |data_offset: u32| {
+        let mut desc = vec![0u8; TEXTURE_DESC_GEOMETRY_LEN];
+        desc[LINEAR_DESC_SIZE..LINEAR_DESC_SIZE + 8].copy_from_slice(&0x8000u64.to_le_bytes());
+        st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+        st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], data_offset);
+        desc
+    };
+    let entry = ListObjectEntry {
+        object_type: OBJECT_TYPE_TEXTURE,
+        descriptor_length: TEXTURE_DESC_GEOMETRY_LEN as u32,
+        descriptor_gva: 0x1000,
+    };
+
+    let allocation = u64::from(handle) << PAGE_SHIFT_X86;
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry, &texture(0)),
+        Some((allocation, 0x8000)),
+        "a texture at offset zero begins where its allocation does"
+    );
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry, &texture(0x2000)),
+        Some((allocation, 0x8000)),
+        "a texture placed further into the same allocation is the same backing, \
+         and reading its texel base here would say it is a different one"
+    );
+}
+
 /// Only the two object types that name storage by an address in their own task
 /// produce a window.
 ///

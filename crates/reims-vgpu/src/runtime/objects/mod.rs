@@ -1734,7 +1734,7 @@ fn note_stale_task_resource<M: HostMemory>(
     ));
 }
 
-/// The guest-VA window an object's own descriptor says its backing occupies.
+/// The guest-VA **allocation** an object's own descriptor says it lives in.
 ///
 /// `None` for every object type that does not name storage by an address in
 /// its task — a view, a function, a serializer object, a mapper-ref texture, a
@@ -1742,9 +1742,24 @@ fn note_stale_task_resource<M: HostMemory>(
 /// something else, and a window invented for one would be a window over
 /// somebody else's bytes.
 ///
-/// The two that do are the buffer and the texture, and both already state the
-/// arithmetic: `handle << page_shift` plus the allocation size. This reads it
-/// rather than repeating it.
+/// # The allocation base, not the texel base
+///
+/// A texture states two addresses: `handle << page_shift`, which is where its
+/// allocation begins, and that plus `data_offset`, which is where its level-0
+/// texels begin. `TextureDescriptor::backing_gva_size` answers the second,
+/// because its callers are loaders and a loader wants the texels.
+///
+/// This wants the first, and the difference is the whole point of the reading
+/// it feeds. Two textures placed at different offsets in one allocation are
+/// *one piece of storage* — that is what makes them alias — and keyed on the
+/// texel base they would never compare equal and the alias would be invisible.
+/// A backing identity built that way would give one allocation as many ids as
+/// it has tenants, which is false distinctness: the hazard edge between them is
+/// never drawn and the two write over each other. The offset is the extent's,
+/// and the extent is `reims_vgpu_core::access::ByteRange`'s to carry.
+///
+/// A buffer has no such offset, so its two addresses are one and
+/// `backing_gva_size` already answers it.
 fn backing_window(
     page_shift: u32,
     entry: &ListObjectEntry,
@@ -1756,9 +1771,14 @@ fn backing_window(
             .ok()?
             .backing_gva_size(page_shift),
         OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS => {
-            decode_texture_descriptor(descriptor)
-                .ok()?
-                .backing_gva_size(page_shift)
+            let texture = decode_texture_descriptor(descriptor).ok()?;
+            // Both halves are required, and the size is asked through
+            // `backing_gva_size` so the two readers refuse the same
+            // descriptors: a zero allocation size or a zero handle is a
+            // descriptor the guest has not finished writing, and it names no
+            // allocation on either reading.
+            let (_, size) = texture.backing_gva_size(page_shift)?;
+            Some((texture.allocation_base_gva(page_shift)?, size))
         }
         _ => None,
     }
