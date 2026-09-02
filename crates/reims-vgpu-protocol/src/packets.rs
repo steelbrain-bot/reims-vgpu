@@ -322,8 +322,12 @@ pub const LEDGER: &[Packet] = &[
                        delete a sampler state, 4 a depth-stencil state and 4 a render pipeline \
                        state, the three kinds this device does track and does retire. The eight \
                        untracked kinds are 10 packets: 5 functions, 3 compute pipeline states \
-                       and 2 fences. So the open question is 10 packets wide and the row blocks \
-                       2166, which is the ratio whoever closes it should know",
+                       and 2 fences. The fence half then closed: a boot's two fence deletes both \
+                       named a ref this device held a fence generation under, so that ref space \
+                       does coincide and the delete retires the generations --- which leaves 8 \
+                       packets, 5 functions and 3 compute pipeline states, both cached by \
+                       content rather than by ref. So the open question is 8 packets wide and \
+                       the row blocks 2166, which is the ratio whoever closes it should know",
         },
     },
     Packet {

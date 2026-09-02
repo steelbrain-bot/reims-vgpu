@@ -268,8 +268,19 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 /// call could ever have had is destroying an unrelated object that happened to
 /// share the integer.
 ///
-/// Other kinds remain fail-visible until this device owns a corresponding
-/// per-kind object registry. Their counters say which contract gap is active.
+/// The fence kind is no longer among them. It is the one kind this device holds
+/// state for by `(task, ref)` rather than by content, and the same question this
+/// doc records answering *no* for the object table was asked of it and answered
+/// **yes**: a driven boot's two fence deletes both named a ref this device held
+/// a render-domain generation under, with `delete_fence_ref_absent=0`. So the
+/// spaces coincide there, and the delete retires the generations.
+///
+/// The kinds left are the ones this device retains nothing by ref for —
+/// functions and compute pipeline states are cached by *content*, so a ref-keyed
+/// retirement has nothing to find. A driven boot sends 5 and 3 of them. They
+/// stay fail-visible: the claim "there is nothing to retire" is about this
+/// device's caches and not about the guest's object, and a counter that went
+/// quiet would stop saying which contract gap is still open.
 fn apply_delete_object(
     state: &mut DeviceState,
     channel_id: u32,
@@ -331,39 +342,27 @@ fn apply_delete_object(
     // `..._delete_absent` about a table that rail never fills — and on a
     // Metal-only build fell through to `note_unimplemented` instead. One rail,
     // two builds, two different answers about the same guest command.
-    // **Is the serializer's fence ref the same number as a fence record's?**
-    // `DeviceState::fence_generations` is keyed by `(task, domain, ref)` and a
-    // wait is satisfied when the stored generation is at or past its target —
-    // so if the two spaces coincide, a deleted fence whose ref the guest later
-    // reuses starts life already signalled, and the first wait on the new fence
-    // passes without the work behind it. If they do not coincide, retiring on
-    // this ref would clear a live fence that happened to share the integer,
-    // which is the failure this arm's doc records having measured for the
-    // object table.
+    // The one kind this device holds state for by `(task, ref)` rather than by
+    // content, and the one whose stale entry is a wrong answer rather than a
+    // leak: a wait is satisfied when the stored generation is at or past its
+    // target, so a generation that outlives its fence makes the next fence to
+    // get that ref start life already signalled.
     //
-    // Neither is assumed. The overlap is counted, with a denominator, and the
-    // arm still does nothing — the same shape the resource-lifecycle group's
-    // refusals were answered in. `_live` above zero on a driven guest is the
-    // evidence that the retirement belongs here.
+    // Acted on because it was counted first. A driven boot sent two fence
+    // deletes and both named a ref this device held a render-domain generation
+    // under, `delete_fence_ref_absent=0` — so the serializer's fence ref space
+    // and a fence record's are one, which is *not* what the same question
+    // answered for the object table above. The census stays as the denominator:
+    // `_absent` climbing is the reading that would put this arm back in doubt.
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_FENCE {
-        let holding = state.fence_domains_holding(task_id, object_ref);
-        if holding.is_empty() {
+        let cleared = state.retire_fence(task_id, object_ref);
+        if cleared.is_empty() {
             note_store_route("delete_fence_ref_absent");
         } else {
             note_store_route("delete_fence_ref_live");
-            note_store_route_n("delete_fence_ref_live_domains", holding.len() as u64);
-            if crate::observe::first_sight(
-                "delete_fence_ref_live",
-                (u64::from(task_id) << 32) | u64::from(object_ref),
-            ) {
-                crate::observe::fail(format!(
-                    "delete_fence_ref_live task={task_id} ref={object_ref} domains={holding:?} \
-                     (the serializer's fence ref names a fence this device holds generations \
-                     for, so the two reference spaces are one and a reused ref inherits a \
-                     signalled generation — the delete owes those entries)"
-                ));
-            }
+            note_store_route_n("delete_fence_ref_live_domains", cleared.len() as u64);
         }
+        return;
     }
     let retained = match op.opcode() {
         reims_vgpu_wire::ops::destroy::OPCODE_DELETE_DEPTH_STENCIL_STATE => {

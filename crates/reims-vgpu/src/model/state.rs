@@ -3455,35 +3455,50 @@ impl DeviceState {
             .copied()
     }
 
-    /// Every fence-domain tag under which this task holds a generation for
-    /// `fence_ref`, in tag order.
+    /// Forget every generation this task holds for `fence_ref`, and say which
+    /// encoder domains held one.
     ///
-    /// **Asked to find out whether two reference spaces are one.** A
-    /// `CmdDeleteObject` carrying `OPCODE_DELETE_FENCE` names a ref in the
-    /// *serializer's* per-kind space; `fence_generations` is keyed by the ref a
-    /// command stream's fence record carries. Whether those are the same number
-    /// for the same object is not something this device can assume — see
-    /// `crate::runtime::drain::apply_delete_object` for the boot that measured
-    /// the object table against the same question and found the spaces
-    /// unrelated — so it is measured before anything acts on it.
+    /// **The guest's fence is dead and its number will come back.** A wait is
+    /// satisfied when the stored generation is at or past its target, so a
+    /// generation that outlives its fence makes the *next* fence to get that
+    /// ref start life already signalled — the first wait on it passes with
+    /// nothing behind it. Nothing else forgets these: they are not keyed by a
+    /// name the namespace retires, and their task's teardown is the only other
+    /// event that reaches them.
     ///
     /// The tag is this device's own split of one guest fence across encoder
     /// domains, not a guest-visible term, so one ref can hold up to four
-    /// generations and all of them are the same object's.
-    #[must_use]
-    pub fn fence_domains_holding(&self, task_id: u32, fence_ref: u32) -> Vec<u8> {
-        [
+    /// generations and all four are the same object's. All of them go.
+    ///
+    /// # The two reference spaces are one, and that was measured
+    ///
+    /// A `CmdDeleteObject` carrying `OPCODE_DELETE_FENCE` names a ref in the
+    /// *serializer's* per-kind space, and this table is keyed by the ref a
+    /// command stream's fence record carries. Those being the same number for
+    /// the same object is not something this device may assume — see
+    /// `crate::runtime::drain::apply_delete_object` for the boot that asked the
+    /// object table the same question and found its spaces **unrelated**. So
+    /// this one was counted before it was acted on: a driven macos-15 boot sent
+    /// two fence deletes and **both** named a ref this device held a
+    /// render-domain generation under, with `delete_fence_ref_absent=0`. The
+    /// spaces coincide, and the retirement below is what that reading buys.
+    pub fn retire_fence(&mut self, task_id: u32, fence_ref: u32) -> Vec<u8> {
+        let mut cleared = Vec::new();
+        for tag in [
             FENCE_DOMAIN_EVENT,
             FENCE_DOMAIN_BLIT,
             FENCE_DOMAIN_COMPUTE,
             FENCE_DOMAIN_RENDER,
-        ]
-        .into_iter()
-        .filter(|tag| {
-            self.fence_generations
-                .contains_key(&(task_id, *tag, fence_ref))
-        })
-        .collect()
+        ] {
+            if self
+                .fence_generations
+                .remove(&(task_id, tag, fence_ref))
+                .is_some()
+            {
+                cleared.push(tag);
+            }
+        }
+        cleared
     }
 
     /// Store fence generation (monotonic update owned by the planner).

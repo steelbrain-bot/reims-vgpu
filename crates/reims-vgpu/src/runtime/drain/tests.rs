@@ -6423,10 +6423,12 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
 ///
 /// The kind lives in the record's own opcode and nowhere else, so a counter that
 /// did not read it there would be counting the packet rather than the object.
-/// The distribution across kinds is the open question this arm leaves behind —
-/// one merged counter cannot say whether a guest is retiring the one kind this
-/// device holds by ref (fences) or the kinds it holds by content (samplers,
-/// pipeline states) — so the split is the measurement, not decoration.
+/// The distribution across kinds was the open question this arm left behind, and
+/// the split is what answered it: a driven boot reads 2148 sampler states, 4
+/// depth-stencil states, 4 render pipeline states and 2 fences, against 5
+/// functions and 3 compute pipeline states this device retains nothing by ref
+/// for. One merged counter could not have said that, which is why the split is
+/// the measurement and not decoration.
 #[test]
 fn a_delete_object_counts_the_kind_its_record_names() {
     use crate::runtime::drain::store_route_count;
@@ -6473,8 +6475,10 @@ fn a_delete_object_counts_the_kind_its_record_names() {
         "a sampler-state record must not move another kind's counter"
     );
 
-    // The one kind this device holds anything by ref for. Its counter reading
-    // above zero on a boot is the signal that would justify a handler.
+    // The one kind this device holds anything by ref for, and now the one whose
+    // delete retires it — see
+    // `a_fence_delete_forgets_every_generation_its_ref_held` for the hazard and
+    // the boot that established the ref space.
     process_child_packet(
         &mut state,
         &mut host,
@@ -6488,19 +6492,19 @@ fn a_delete_object_counts_the_kind_its_record_names() {
     );
 }
 
-/// A fence delete says whether its ref names a fence this device holds
-/// generations for, which is the question of whether two reference spaces are
-/// one.
+/// A fence delete forgets every generation its ref held, so a reused ref does
+/// not start life already signalled.
 ///
-/// The consequence if they are: `fence_generations` outlives the delete, and a
-/// guest that reuses the ref gets a fence that is already signalled — the first
-/// wait on the new object passes without the work behind it. The consequence if
-/// they are not: retiring on this ref would clear a live fence that happened to
-/// share the integer, which is the failure the object table's own boot measured.
-/// Neither is assumed here; the arm counts and does nothing.
+/// The hazard the retirement removes: a wait is satisfied when the stored
+/// generation is at or past its target, so a generation that outlives its fence
+/// makes the *next* fence to get that ref pass its first wait with nothing
+/// behind it. The census is kept as the denominator — a driven boot answered
+/// `delete_fence_ref_live=2`, `delete_fence_ref_absent=0`, which is what
+/// established that the serializer's fence ref space and a fence record's are
+/// one — and `_absent` climbing is what would put this arm back in doubt.
 #[test]
-fn a_fence_delete_says_whether_its_ref_names_a_fence_this_device_holds() {
-    use crate::model::FENCE_DOMAIN_BLIT;
+fn a_fence_delete_forgets_every_generation_its_ref_held() {
+    use crate::model::{FENCE_DOMAIN_BLIT, FENCE_DOMAIN_RENDER};
     use crate::runtime::drain::store_route_count;
     use reims_vgpu_wire::ops::destroy::{DELETE_TOTAL_LEN, OPCODE_DELETE_FENCE};
 
@@ -6537,8 +6541,14 @@ fn a_fence_delete_says_whether_its_ref_names_a_fence_this_device_holds() {
         "no generation is held for this ref, so the delete names nothing here"
     );
 
-    // Now the same ref, with a generation this device stored under it.
+    // The same ref, now holding a generation in two of the four encoder domains
+    // this device splits one guest fence into. Both are that object's and both
+    // go.
     state.set_fence_generation(2, FENCE_DOMAIN_BLIT, 40, 3);
+    state.set_fence_generation(2, FENCE_DOMAIN_RENDER, 40, 9);
+    // A neighbour under a different ref, to say the retirement is keyed and not
+    // a sweep of the task.
+    state.set_fence_generation(2, FENCE_DOMAIN_RENDER, 41, 5);
     let domains = store_route_count("delete_fence_ref_live_domains");
     process_child_packet(&mut state, &mut host, 4, &destroy_packet(40));
     assert_eq!(
@@ -6547,22 +6557,31 @@ fn a_fence_delete_says_whether_its_ref_names_a_fence_this_device_holds() {
             store_route_count("delete_fence_ref_absent"),
         ),
         (live + 1, absent + 1),
-        "and now it names one, which is the reading that would justify retiring it"
+        "and now it names one, which is what the boot's reading established"
     );
     assert_eq!(
         store_route_count("delete_fence_ref_live_domains"),
-        domains + 1,
-        "one domain held it; the count is how many, since one guest fence can \
-         hold a generation under each encoder domain this device splits it into"
+        domains + 2,
+        "both domains held it, and the count is how many rather than whether"
     );
-
-    // Still nothing retired. The census is the whole of this change: acting on
-    // a ref whose space is not established is what the object table's boot
-    // ruled out.
     assert_eq!(
         state.fence_generation(2, FENCE_DOMAIN_BLIT, 40),
-        Some(3),
-        "the arm counts and does not act"
+        None,
+        "the deleted fence keeps no generation in any domain"
+    );
+    assert_eq!(state.fence_generation(2, FENCE_DOMAIN_RENDER, 40), None);
+    assert_eq!(
+        state.fence_generation(2, FENCE_DOMAIN_RENDER, 41),
+        Some(5),
+        "and a fence the guest did not delete is untouched"
+    );
+
+    // The reuse this exists for: the ref comes back and its first wait must not
+    // be satisfied by the dead fence's progress.
+    assert_eq!(
+        state.fence_generation(2, FENCE_DOMAIN_RENDER, 40),
+        None,
+        "a reused ref starts unsignalled"
     );
 }
 
