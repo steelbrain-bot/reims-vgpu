@@ -610,6 +610,36 @@ pub struct ExecResult {
     pub total_us: u64,
 }
 
+/// How many command buffers one exec packet carried, in buckets.
+///
+/// **Asked because the semantic model's walk takes one buffer and this wire
+/// carries a table of them.** `reims_vgpu_core::walk::exec` consumes an
+/// `ExecBuilder` and finishes it, so a caller with two command buffers has one
+/// transaction and no way to walk both into it — and whether that matters is
+/// exactly this distribution. A stream of single-buffer submissions makes the
+/// signature adequate; a tail above one makes it short of the wire, and the
+/// tail is what a mean would hide.
+///
+/// It is not a hypothetical tail. The ceiling this loop used to carry truncated
+/// at sixteen, and the submission that exposed it declared **seventeen** — see
+/// `every_declared_command_buffer_is_visited_not_just_the_first_sixteen`. What
+/// is missing is a current number, on the guest and workload the replacement
+/// architecture is being cut over against.
+///
+/// Counted after the load, so the bucket is buffers this device could read
+/// rather than buffers the header declared. The two differ exactly when a
+/// descriptor was skipped, and `exec_cmdbuf` says which.
+fn note_command_stream_count(loaded: usize) {
+    crate::runtime::drain::note_store_route(match loaded {
+        0 => "exec_cmdbufs_0",
+        1 => "exec_cmdbufs_1",
+        2..=4 => "exec_cmdbufs_2_4",
+        5..=16 => "exec_cmdbufs_5_16",
+        17..=64 => "exec_cmdbufs_17_64",
+        _ => "exec_cmdbufs_over_64",
+    });
+}
+
 /// Read every command buffer an `EXEC_INDIRECT2` payload's descriptor table
 /// names out of the task's address space.
 ///
@@ -772,6 +802,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     let load_started = std::time::Instant::now();
     let streams = load_command_streams(state, host, task_id, payload, cbufs_off, cmdbuf_count);
     out.streams_loaded += u32::try_from(streams.len()).unwrap_or(u32::MAX);
+    note_command_stream_count(streams.len());
     let load_ns = load_started.elapsed().as_nanos() as u64;
     measured_ns += load_ns;
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Load, load_ns);

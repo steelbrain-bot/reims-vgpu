@@ -148,11 +148,46 @@ impl From<FramingRefusal> for WalkRefusal {
     }
 }
 
-/// Walk one EXEC's command stream into the transaction it describes.
+/// Walk one command buffer into a transaction that is still being built.
+///
+/// **One EXEC packet carries a *table* of command buffers, not one.** Its
+/// header declares `cmdbuf_count` descriptors of `{gva, length}`, and all of
+/// them belong to the single submission the packet is — one ordering position,
+/// one completion word, one access list. So the walk of a buffer and the
+/// finishing of a transaction are two steps, and this is the first: it takes
+/// the builder by `&mut` so a caller with several buffers walks each into the
+/// same one.
+///
+/// [`exec`] is the whole of the second step plus this, kept for the caller that
+/// genuinely has one buffer, and it is where the builder is consumed.
+///
+/// # Errors
+///
+/// Any [`WalkRefusal`]. The transaction is all-or-nothing across *every* buffer
+/// — see the module documentation for why a single unresolvable record refuses
+/// the whole of it, and note that the reason does not weaken when the record is
+/// in the second buffer of five: they are one submission, and a partial one is
+/// a frame drawn from state the guest did not ask for.
+pub fn command_buffer(
+    bytes: &[u8],
+    resolver: &impl RefResolver,
+    source: &mut impl crate::access::AccessSource,
+    builder: &mut ExecBuilder,
+) -> Result<(), WalkRefusal> {
+    for framed in SegmentStream::new(bytes)? {
+        let framed = framed?;
+        segment(&framed, resolver, source, builder)?;
+    }
+    Ok(())
+}
+
+/// Walk one EXEC's single command stream into the transaction it describes.
 ///
 /// The builder is consumed: what comes out is either the finished transaction
 /// or a refusal, and never a half-written builder a caller could submit
-/// anyway.
+/// anyway. A caller whose packet declares more than one command buffer uses
+/// [`command_buffer`] per buffer and finishes once — see that function for why
+/// the two steps are separate.
 ///
 /// # Errors
 ///
@@ -164,10 +199,7 @@ pub fn exec(
     source: &mut impl crate::access::AccessSource,
     mut builder: ExecBuilder,
 ) -> Result<ExecWork, WalkRefusal> {
-    for framed in SegmentStream::new(bytes)? {
-        let framed = framed?;
-        segment(&framed, resolver, source, &mut builder)?;
-    }
+    command_buffer(bytes, resolver, source, &mut builder)?;
     builder
         .finish()
         .map_err(|refusal| WalkRefusal::Unfinished { refusal })
@@ -277,6 +309,66 @@ mod tests {
             reims_vgpu_wire::ops::compute::OPCODE_MEMORY_BARRIER_SCOPE,
             &[1, 0, 0xaa, 0xaa],
         )
+    }
+
+    /// Two command buffers of one packet walk into one transaction, in order.
+    ///
+    /// **The wire fact the one-buffer signature could not express.** An EXEC
+    /// packet's header declares a table of `{gva, length}` descriptors and every
+    /// buffer in it belongs to the single submission the packet is — one
+    /// ordering position, one completion word, one access list. Walked into two
+    /// transactions they would be two positions the guest never asked for, and
+    /// the second's records would be ordered against the first's rather than
+    /// after them.
+    ///
+    /// Order is asserted and not just membership: the records of the first
+    /// buffer precede the records of the second, because that is what "one
+    /// submission" means for a stream the guest wrote in an order.
+    #[test]
+    fn two_command_buffers_of_one_packet_walk_into_one_transaction_in_order() {
+        let first = segment_bytes(
+            SegmentKind::Render.wire_type(),
+            &[bind_vertex_buffers(0, &[5151]), draw_primitives()],
+        );
+        let second = segment_bytes(
+            SegmentKind::Render.wire_type(),
+            &[bind_vertex_buffers(0, &[6262]), draw_primitives()],
+        );
+
+        let mut b = builder();
+        let mut source = StubRegistry(DOMAIN);
+        command_buffer(&first, &Everything, &mut source, &mut b).expect("first buffer");
+        command_buffer(&second, &Everything, &mut source, &mut b).expect("second buffer");
+        let tx = b.finish().expect("both buffers ended their encoders");
+
+        let named: Vec<u64> = tx
+            .accesses
+            .iter()
+            .filter_map(|a| match a.key {
+                crate::access::AccessKey::Range(r, _)
+                | crate::access::AccessKey::Subresource(r, _)
+                | crate::access::AccessKey::Whole(r) => Some(r.backing.0),
+                crate::access::AccessKey::DomainOnly | crate::access::AccessKey::Heap(_) => None,
+            })
+            .collect();
+        assert!(
+            named.contains(&5151) && named.contains(&6262),
+            "one access list carries both buffers' memory: {named:?}"
+        );
+        assert_eq!(
+            named.iter().position(|b| *b == 5151),
+            Some(0),
+            "and the first buffer's is first: {named:?}"
+        );
+
+        // The same two buffers walked separately are two transactions, which is
+        // what this exists to stop being the only option.
+        let alone = exec(&first, &Everything, &mut StubRegistry(DOMAIN), builder())
+            .expect("a well-framed stream");
+        assert!(
+            alone.accesses.len() < tx.accesses.len(),
+            "one buffer alone is a smaller transaction than the two together"
+        );
     }
 
     /// A draw declares the buffers the binds before it named — through decode,
