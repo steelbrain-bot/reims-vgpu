@@ -8,8 +8,9 @@
 use crate::model::{
     DeviceState, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
 };
-use crate::runtime::decode::event::{Command as EventCommand, Kind as EventCmdKind};
 use crate::runtime::plan::event_sync::{self, Decision, Domain, EventKind, FenceAction};
+use reims_vgpu_protocol::decode::sync::EventRecord;
+use reims_vgpu_protocol::sync::EventKind as RecordEventKind;
 
 /// Outcome of a product-path event or encoder fence operation.
 ///
@@ -124,14 +125,6 @@ pub fn execute_fence(
     match plan.decision {
         Decision::SignalUpdate | Decision::SignalNoop | Decision::WaitSatisfied => FenceStatus::Ok,
         Decision::WaitPending => FenceStatus::Pending,
-        Decision::WaitTimeoutUnsupported => refused(
-            FenceStatus::Unsupported("fence_wait_timeout_unsupported"),
-            fence_ref,
-            |e| {
-                e.field("task", task_id)
-                    .field("domain", format!("{domain:?}"))
-            },
-        ),
         Decision::Invalid => refused(
             FenceStatus::Unsupported("fence_plan_invalid"),
             fence_ref,
@@ -150,78 +143,61 @@ pub fn execute_fence(
 /// advance only). Wait is satisfied when the stored value is present and
 /// `>= target`. Wait-with-timeout is unsupported (no host timer). Soft-pending
 /// waits do not block drain.
-pub fn execute_event(state: &mut DeviceState, task_id: u32, cmd: &EventCommand) -> FenceStatus {
+pub fn execute_event(state: &mut DeviceState, task_id: u32, cmd: &EventRecord) -> FenceStatus {
     if cmd.event_ref == 0 {
         return FenceStatus::Missing;
     }
+    // Two kinds, and no third. The device's own decoder had an `Unknown` kind
+    // that a well-formed record could carry, so "which of signal and wait is
+    // this" was a question the executor had to re-ask and could be told the
+    // answer to twice. `reims_vgpu_protocol::sync::EventKind` has the two the
+    // wire has: a record that is neither never becomes an `EventRecord`.
     let kind = match cmd.kind {
-        EventCmdKind::SignalEvent => EventKind::Signal,
-        EventCmdKind::WaitEvent => EventKind::Wait,
-        EventCmdKind::Unknown => {
-            return refused(
-                FenceStatus::Unsupported("event_kind_unknown"),
-                cmd.event_ref,
-                |e| e.field("task", task_id).field("value", cmd.value),
-            );
-        }
+        RecordEventKind::Signal => EventKind::Signal,
+        RecordEventKind::Wait => EventKind::Wait,
     };
     let tag = FENCE_DOMAIN_EVENT;
     let current = state.fence_generation(task_id, tag, cmd.event_ref);
-    let plan = event_sync::plan_event(kind, cmd.value, cmd.has_timeout, current);
+    let plan = event_sync::plan_event(kind, cmd.value, current);
     if plan.updates_state {
         state.set_fence_generation(task_id, tag, cmd.event_ref, plan.update_value);
     }
     match plan.decision {
         Decision::SignalUpdate | Decision::SignalNoop | Decision::WaitSatisfied => FenceStatus::Ok,
         Decision::WaitPending => FenceStatus::Pending,
-        Decision::WaitTimeoutUnsupported => refused(
-            FenceStatus::Unsupported("event_wait_timeout_unsupported"),
-            cmd.event_ref,
-            |e| e.field("task", task_id).field("timeout", cmd.timeout),
-        ),
         Decision::Invalid => refused(
             FenceStatus::Unsupported("event_plan_invalid"),
             cmd.event_ref,
-            |e| {
-                e.field("task", task_id)
-                    .field("value", cmd.value)
-                    .field("has_timeout", cmd.has_timeout)
-            },
+            |e| e.field("task", task_id).field("value", cmd.value),
         ),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_wire::OP_HEADER_LEN;
-
     use super::*;
     use crate::model::{
         DeviceId, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER,
         PAGE_SHIFT_ARM64E,
     };
-    use crate::protocol::endian::{st32, st64};
-    use crate::runtime::decode::event::{
-        OP_SIGNAL_EVENT, OP_WAIT_EVENT, OP_WAIT_EVENT_TIMEOUT, SIGNAL_WAIT_PAYLOAD_LEN, TIMEOUT,
-        WAIT_TIMEOUT_PAYLOAD_LEN,
-    };
-
-    fn event_cmd(opcode: u32, event_ref: u32, value: u64, timeout: Option<u32>) -> EventCommand {
-        let mut payload = if timeout.is_some() {
-            vec![0u8; WAIT_TIMEOUT_PAYLOAD_LEN]
-        } else {
-            vec![0u8; SIGNAL_WAIT_PAYLOAD_LEN]
-        };
-        st32(&mut payload[0..4], event_ref);
-        st64(&mut payload[4..12], value);
-        if let Some(t) = timeout {
-            st32(&mut payload[TIMEOUT..TIMEOUT + 4], t);
+    /// An event record as the protocol crate lifts one.
+    ///
+    /// Built rather than encoded and decoded: these tests are about what
+    /// `execute_event` does with a record, and running the bytes through a
+    /// decoder to get one made every case here depend on the decoder agreeing
+    /// about a layout it is not this file's job to check. Whether the lift is
+    /// right is `reims_vgpu_protocol::decode::sync`'s own tests' question, and
+    /// `runtime::decode::ledger` asks whether this device's rail matches it.
+    ///
+    /// There is no timeout parameter, because there is no bounded-wait record:
+    /// `waitForEvent:value:timeoutMS:` is refused at the lift and cannot become
+    /// an `EventRecord` at all.
+    fn event_cmd(kind: RecordEventKind, event_ref: u32, value: u64) -> EventRecord {
+        EventRecord {
+            kind,
+            event_ref,
+            value,
         }
-        let mut bytes = vec![0u8; OP_HEADER_LEN + payload.len()];
-        st32(&mut bytes[0..4], opcode);
-        st32(&mut bytes[4..8], (OP_HEADER_LEN + payload.len()) as u32);
-        bytes[OP_HEADER_LEN..].copy_from_slice(&payload);
-        crate::runtime::decode::event::decode(&bytes).expect("build event cmd")
     }
 
     #[test]
@@ -264,26 +240,26 @@ mod tests {
             execute_fence(&mut state, 1, Domain::RenderFence, 0, FenceAction::Update,),
             FenceStatus::Missing
         );
-        let cmd = event_cmd(OP_SIGNAL_EVENT, 0, 1, None);
+        let cmd = event_cmd(RecordEventKind::Signal, 0, 1);
         assert_eq!(execute_event(&mut state, 1, &cmd), FenceStatus::Missing);
     }
 
     #[test]
     fn event_signal_then_wait() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let sig = event_cmd(OP_SIGNAL_EVENT, 7, 100, None);
+        let sig = event_cmd(RecordEventKind::Signal, 7, 100);
         assert_eq!(execute_event(&mut state, 1, &sig), FenceStatus::Ok);
         assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 7), Some(100));
 
-        let wait_ok = event_cmd(OP_WAIT_EVENT, 7, 100, None);
+        let wait_ok = event_cmd(RecordEventKind::Wait, 7, 100);
         assert_eq!(execute_event(&mut state, 1, &wait_ok), FenceStatus::Ok);
 
         // Wait for higher value is soft-pending.
-        let wait_hi = event_cmd(OP_WAIT_EVENT, 7, 101, None);
+        let wait_hi = event_cmd(RecordEventKind::Wait, 7, 101);
         assert_eq!(execute_event(&mut state, 1, &wait_hi), FenceStatus::Pending);
 
         // Advance signal, then wait satisfied.
-        let sig2 = event_cmd(OP_SIGNAL_EVENT, 7, 101, None);
+        let sig2 = event_cmd(RecordEventKind::Signal, 7, 101);
         assert_eq!(execute_event(&mut state, 1, &sig2), FenceStatus::Ok);
         assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 7), Some(101));
         assert_eq!(execute_event(&mut state, 1, &wait_hi), FenceStatus::Ok);
@@ -293,16 +269,16 @@ mod tests {
     fn event_stale_signal_noop_and_independent_of_fence() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
         assert_eq!(
-            execute_event(&mut state, 1, &event_cmd(OP_SIGNAL_EVENT, 3, 50, None)),
+            execute_event(&mut state, 1, &event_cmd(RecordEventKind::Signal, 3, 50)),
             FenceStatus::Ok
         );
         // Stale / equal: no regression.
         assert_eq!(
-            execute_event(&mut state, 1, &event_cmd(OP_SIGNAL_EVENT, 3, 40, None)),
+            execute_event(&mut state, 1, &event_cmd(RecordEventKind::Signal, 3, 40)),
             FenceStatus::Ok
         );
         assert_eq!(
-            execute_event(&mut state, 1, &event_cmd(OP_SIGNAL_EVENT, 3, 50, None)),
+            execute_event(&mut state, 1, &event_cmd(RecordEventKind::Signal, 3, 50)),
             FenceStatus::Ok
         );
         assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 3), Some(50));
@@ -317,34 +293,21 @@ mod tests {
     }
 
     #[test]
-    fn event_wait_timeout_unsupported() {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let wait = event_cmd(OP_WAIT_EVENT_TIMEOUT, 1, 1, Some(42));
-        // Asserting the reason, not just the coarse status: this path shares
-        // `Unsupported` with six other checks.
-        assert_eq!(
-            execute_event(&mut state, 1, &wait),
-            FenceStatus::Unsupported("event_wait_timeout_unsupported")
-        );
-        // Satisfied path even with timeout flag is still WaitSatisfied if value present.
-        assert_eq!(
-            execute_event(&mut state, 1, &event_cmd(OP_SIGNAL_EVENT, 1, 5, None)),
-            FenceStatus::Ok
-        );
-        let wait_ok = event_cmd(OP_WAIT_EVENT_TIMEOUT, 1, 5, Some(42));
-        assert_eq!(execute_event(&mut state, 1, &wait_ok), FenceStatus::Ok);
-    }
-
-    #[test]
     fn event_wait_missing_signal_pending() {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let wait = event_cmd(OP_WAIT_EVENT, 99, 1, None);
+        let wait = event_cmd(RecordEventKind::Wait, 99, 1);
         assert_eq!(execute_event(&mut state, 1, &wait), FenceStatus::Pending);
     }
 
     /// Every refusal on these two paths must name a *different* check, or the
-    /// coarse status is back and the log cannot say which one fired. Seven
-    /// distinct causes, seven distinct slugs.
+    /// coarse status is back and the log cannot say which one fired.
+    ///
+    /// Two of the causes this used to walk are gone rather than untested. The
+    /// bounded event wait is refused at the lift now — `event_kind` gives
+    /// `waitForEvent:value:timeoutMS:` no kind, so it never becomes a record —
+    /// and the encoder-fence path's timeout arm was answering a `Decision`
+    /// `plan_fence` cannot return. What is left is the set `execute_fence` can
+    /// still produce.
     #[test]
     fn no_two_fence_checks_answer_with_the_same_reason() {
         use crate::observe::Refusal;
@@ -357,8 +320,8 @@ mod tests {
             }));
         };
 
-        // Fence path: unknown domain, an event ref on the encoder-fence path,
-        // wait-with-timeout, and an invalid plan.
+        // Fence path: an unknown domain, and an event ref on the encoder-fence
+        // path.
         record(execute_fence(
             &mut state,
             1,
@@ -373,13 +336,6 @@ mod tests {
             4,
             FenceAction::Update,
         ));
-        // Event path: unknown kind, wait-with-timeout.
-        record(execute_event(
-            &mut state,
-            1,
-            &event_cmd(OP_WAIT_EVENT_TIMEOUT, 4, 9, Some(42)),
-        ));
-
         let mut unique = seen.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -389,9 +345,7 @@ mod tests {
             "two fence checks share a reason: {seen:?}"
         );
         assert!(
-            seen.contains(&"fence_domain_unknown")
-                && seen.contains(&"fence_event_in_fence_path")
-                && seen.contains(&"event_wait_timeout_unsupported"),
+            seen.contains(&"fence_domain_unknown") && seen.contains(&"fence_event_in_fence_path"),
             "the reasons no longer name their checks: {seen:?}"
         );
     }

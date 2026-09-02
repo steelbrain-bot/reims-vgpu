@@ -27,7 +27,6 @@ use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit::{self, Kind as BlitKind};
 use crate::runtime::decode::compute::{self, Kind as ComputeKind};
-use crate::runtime::decode::event as event_decode;
 use crate::runtime::decode::render::{
     self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
     decode_color_attachment, decode_depth_attachment, decode_stencil_attachment, ColorAttachment,
@@ -1124,25 +1123,77 @@ fn handle_info_record<M: HostMemory + HostOps>(
     note_info_record_unanswered(task_id, opcode, bytes.len());
 }
 
+/// One event-segment record, lifted by the protocol crate and executed here.
+///
+/// **The lift is `reims_vgpu_protocol::decode::sync`'s now.** This device
+/// carried its own event decoder, which framed the same three opcodes and
+/// carried its own copy of the blit encoder's fence numbers in order to refuse
+/// them. That is the wire's question with a contract answer, and the protocol
+/// crate is where it is answered for every rail at once — so the boundary
+/// probes, the cross-encoder refusals and the three-opcode window stop being
+/// this crate's to keep true.
+///
+/// **`waitForEvent:value:timeoutMS:` is refused at the lift and not after it.**
+/// The row is settled: this device runs no clock against the guest's, so
+/// executing the bounded wait as the unbounded one it resembles turns a guest's
+/// timeout into a hang. `event_kind` gives it no kind and the lift refuses it
+/// `RefusedByContract`. The old path decoded it, planned it, and refused it at
+/// the end — one settled row refused in two places, and the one further from
+/// the ledger was the one a reader found first.
 fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {
-    let cmd = match event_decode::decode(cmd_bytes) {
-        Ok(c) => c,
-        Err(status) => {
-            // A malformed event record drops a guest signal or wait outright.
-            // The `Err(_)` here used to feed a counter nothing read, so the loss
-            // left no line at all; the decoder's own typed refusal names which
-            // of its five checks rejected the bytes.
-            if let Some(e) = crate::observe::Emit::refusal("event_decode", &status) {
-                e.field("task", task_id)
-                    .field("len", cmd_bytes.len())
-                    .fail();
-            }
+    let refuse = |decline: &dyn crate::observe::Decline| {
+        // A malformed or refused event record drops a guest signal or wait
+        // outright, so the loss is named rather than counted. The record's
+        // own refusal says which check refused it, on which rail, at which
+        // opcode.
+        crate::observe::Emit::decline("event_record", decline)
+            .field("task", task_id)
+            .field("len", cmd_bytes.len())
+            .fail();
+    };
+    let op = match reims_vgpu_protocol::decode::op(cmd_bytes, 0) {
+        Ok(op) => op,
+        Err(_) => {
+            // The header itself did not frame. `walk_segment_records` has
+            // already framed this record once to hand it over, so this is
+            // unreachable rather than a guest case — and reported, because a
+            // frame that stopped agreeing with itself between two reads is not
+            // something to pass over.
+            crate::observe::fail(format!(
+                "event_record_unframed task={task_id} len={} (the segment walk framed this record                  and the op header did not)",
+                cmd_bytes.len()
+            ));
+            return;
+        }
+    };
+    let record = match reims_vgpu_protocol::decode::sync::decode(
+        reims_vgpu_protocol::closure::Rail::Event,
+        &op,
+    ) {
+        Ok(reims_vgpu_protocol::decode::sync::SyncRecord::Event(record)) => record,
+        Ok(other) => {
+            // The event rail lifts one record class. A fence or a barrier here
+            // would mean `decode::sync` and `event_kind` disagree about which
+            // rail owns which opcode.
+            crate::observe::fail(format!(
+                "event_record_not_an_event task={task_id} op={:#x} kind={} (the event rail lifted                  a record that is not an event)",
+                op.opcode(),
+                match other {
+                    reims_vgpu_protocol::decode::sync::SyncRecord::Fence(_) => "fence",
+                    reims_vgpu_protocol::decode::sync::SyncRecord::Barrier(_) => "barrier",
+                    reims_vgpu_protocol::decode::sync::SyncRecord::Event(_) => "event",
+                }
+            ));
+            return;
+        }
+        Err(refusal) => {
+            refuse(&refusal);
             return;
         }
     };
     // Refusals are emitted by `execute_event` itself, against the ref that
     // failed; there is nothing left for this caller to report.
-    fence_exec::execute_event(state, task_id, &cmd);
+    fence_exec::execute_event(state, task_id, &record);
 }
 
 fn handle_compute_record<M: HostMemory + HostOps>(

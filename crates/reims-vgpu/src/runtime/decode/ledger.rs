@@ -120,26 +120,59 @@ fn the_blit_decoder_recognises_every_blit_operation_the_ledger_records() {
     }
 }
 
+/// The event rail's records lift, and its one refused row still refuses.
+///
+/// The sibling tests above drive *this crate's* per-rail decoders, because
+/// those are the ones that could disagree with the ledger. The event rail no
+/// longer has one: `runtime::exec::handle_event_record` lifts through
+/// `reims_vgpu_protocol::decode::sync`, which is inside the crate that owns the
+/// ledger and is checked against it there.
+///
+/// What is still this crate's to check is the *pairing* — that the rail the
+/// device names when it lifts an event segment is the rail whose records lift,
+/// and that the row the ledger settled as refused is refused rather than
+/// unjudged. Those two are what a reader of `event_record` refusals is told,
+/// and getting either wrong turns a settled decision into an open question.
 #[test]
-fn the_event_decoder_recognises_every_event_operation_the_ledger_records() {
-    use super::event::{decode, DecodeStatus};
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Event)
-        .filter_map(|o| o.opcode)
-    {
-        let refused_the_opcode = probe_records(op).all(|r| {
-            matches!(
-                decode(&r),
-                Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrRejectedOpcode)
-            )
-        });
+fn the_event_rail_lifts_its_records_and_refuses_its_one_settled_row() {
+    use reims_vgpu_protocol::decode::sync::decode;
+    use reims_vgpu_protocol::decode::{op, DecodeRefusal};
+    let mut refused = 0usize;
+    let mut lifted = 0usize;
+    for row in LEDGER.iter().filter(|o| o.rail == Rail::Event) {
+        let opcode = row.opcode.expect("every event row names an opcode");
+        // The rail is the one `handle_event_record` passes, written here rather
+        // than taken from the row: a test that read the rail off the row it is
+        // checking would pass whatever rail the device actually used.
+        // Reduced to `Result<(), DecodeRefusal>` inside the closure: a lifted
+        // record borrows the bytes it was lifted from, and only whether it
+        // lifted is being asked here.
+        let outcomes: Vec<Result<(), DecodeRefusal>> = probe_records(opcode)
+            .map(|bytes| {
+                let framed = op(&bytes, 0).expect("probe records frame");
+                decode(Rail::Event, &framed).map(|_| ())
+            })
+            .collect();
+        if outcomes
+            .iter()
+            .all(|o| matches!(o, Err(DecodeRefusal::RefusedByContract { .. })))
+        {
+            refused += 1;
+            continue;
+        }
         assert!(
-            !refused_the_opcode,
-            "the closure ledger records event {op:#x} and this rail's decoder refuses the opcode \
-             itself under every payload length"
+            outcomes.iter().any(Result::is_ok),
+            "the closure ledger records event {opcode:#x} and the protocol decoder lifts no \
+             record for it at any payload length: {:?}",
+            outcomes.first()
         );
+        lifted += 1;
     }
+    assert_eq!(
+        refused, 1,
+        "one event row is settled as refused — the bounded wait — and it is the only one"
+    );
+    assert_eq!(lifted, 2, "the signal and the unbounded wait both lift");
 }
 
 /// Recognising an opcode is not claiming it.

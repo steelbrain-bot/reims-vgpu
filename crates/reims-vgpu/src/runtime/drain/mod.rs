@@ -4225,25 +4225,31 @@ fn sync_exec_stalled(total_us: u64) -> bool {
     total_us >= SYNC_EXEC_STALL_US
 }
 
-/// The control kind of a child opcode whose payload is inert, or `None` for
-/// every other opcode.
+/// Whether a child opcode is one of the reference host's retired slots.
 ///
-/// **The one place this device asks what a retired slot is.** The fifteen
-/// numbers the reference host routes to its shared deprecated handler used to
-/// be transcribed into `model::regs` beside this crate's own command
-/// constants, so the closure ledger and the drain each carried a list and a
-/// slot that went live had to be remembered in both. The ledger is the
-/// authority now: a row it judges `ProvenNoOp` is what
+/// **The one place this device asks that question.** The fifteen numbers the
+/// reference host routes to its shared deprecated handler used to be
+/// transcribed into `model::regs` beside this crate's own command constants, so
+/// the closure ledger and the drain each carried a list and a slot that went
+/// live had to be remembered in both. The ledger is the authority now: a row it
+/// judges `ProvenNoOp` is what
 /// [`reims_vgpu_core::control::ControlKind::of`] calls a
-/// [`RetiredSlot`](reims_vgpu_core::control::ControlKind::RetiredSlot), and
-/// `CmdNOP` — the command whose entire obligation is its own envelope — is the
-/// other kind with an inert payload.
+/// [`RetiredSlot`](reims_vgpu_core::control::ControlKind::RetiredSlot).
 ///
-/// "Inert" is about the payload and never about the packet. The stamp waits,
+/// This is deliberately *not* the wider `payload_is_inert` question, which is
+/// also true of `CmdNOP`. `CmdNOP` is a live command with a constant of its own
+/// and an arm that names it, and `dispatch_agrees_with_the_packet_ledger` reads
+/// exactly that: every live command is named by its constant, and the retired
+/// slots — which have no constant, by design — are the only rows the dispatch
+/// reaches without naming. Selecting `CmdNOP` by kind instead of by constant
+/// would move it into that asymmetry and make the scan's claim weaker for
+/// nothing.
+///
+/// Retired is about the payload and never about the packet. The stamp waits,
 /// the ordering position and the completion word are owed identically, and the
 /// drain discharges them for every accepted packet whatever this returns.
-fn inert_control_kind(opcode: u16) -> Option<ControlKind> {
-    ControlKind::of(WireChannel::Child, opcode).filter(|kind| kind.payload_is_inert())
+fn is_retired_control_slot(opcode: u16) -> bool {
+    ControlKind::of(WireChannel::Child, opcode) == Some(ControlKind::RetiredSlot)
 }
 
 fn process_child_packet<H: HostMemory + HostOps>(
@@ -4748,12 +4754,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // channel flush the display pipe happens to want is how the constant
         // itself came to be misnamed, and it leaves a reader grepping the log
         // for the command with nothing under it.
-        //
-        // Which opcode this is, is `reims_vgpu_core::control`'s answer and not
-        // a constant here: `CmdNOP` is the inert kind that is *not* a retired
-        // slot, and the two arms below are the two values
-        // [`ControlKind::payload_is_inert`] is true for.
-        op if inert_control_kind(op) == Some(ControlKind::Nop) => {
+        CHILD_OP_NOP => {
             crate::runtime::drain::note_store_route("child_nop");
             // The command allocates no bytes, so payload is the one thing that
             // can falsify this reading. Bytes here would mean the command grew a
@@ -4776,10 +4777,10 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // record exists only to say a guest is still emitting one.
         //
         // Which numbers those are is the closure ledger's judgement, read
-        // through [`inert_control_kind`]. This device used to carry its own
+        // through [`is_retired_control_slot`]. This device used to carry its own
         // fifteen-entry transcription of them, which is one list too many for a
         // set whose whole content is "the ledger proved these do nothing".
-        op if inert_control_kind(op) == Some(ControlKind::RetiredSlot) => {
+        op if is_retired_control_slot(op) => {
             note_unimplemented(state, channel_id, UnimplementedCommand::Deprecated, packet);
         }
         // Everything left is an opcode with no handler at all. Two different

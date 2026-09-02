@@ -1,3 +1,26 @@
+// DISCONNECTED SOURCE — this file does not compile, is not feature-gated, and
+// is not linkable. No `mod` declaration reaches `dead/`. It is here to be read.
+//
+// What this was: this device's own event/sync record decoder, `runtime::decode::event`.
+// It framed the three event opcodes, carried the blit encoder's fence numbers in
+// order to refuse them, derived two boundary probes from its own accepted
+// window, and returned a `Command` with an `Unknown` kind a well-formed record
+// could reach.
+//
+// Why it went: `reims_vgpu_protocol::decode::sync` lifts fence, event and
+// barrier records for every rail at once, from inside the crate that owns the
+// closure ledger — so the cross-encoder refusals and the accepted window stop
+// being this crate's to keep true, and `EventKind` has the two kinds the wire
+// has rather than three. `waitForEvent:value:timeoutMS:` is refused there, at
+// the row that settled it, instead of here-then-again in the planner.
+//
+// The tests below moved with it and stopped running. See the row in README.md
+// for what replaced each of them.
+//
+// Do not resurrect any of this. When a boot regresses on an event record, read
+// it to learn what the old decoder did and fix `reims_vgpu_protocol::decode::sync`
+// or the ledger row.
+
 //! Event/sync command decoder (port of `host/utils/reims-vgpu-event-decode`).
 
 use crate::protocol::endian::{ld32, ld64};
@@ -296,3 +319,59 @@ mod tests {
         }
     }
 }
+
+// ---- The legacy tests that moved with it, from `runtime::fence_exec` ----
+//
+// The bounded wait can no longer be constructed as an `EventRecord`, so this
+// test's subject does not exist. Replaced by
+// `runtime::exec::tests::a_bounded_event_wait_is_refused_by_contract_and_leaves_the_generation_alone`,
+// which drives the bytes through the segment walk and asserts the refusal
+// reaches the failure channel under the row's own name.
+    #[test]
+    fn event_wait_timeout_unsupported() {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let wait = event_cmd(OP_WAIT_EVENT_TIMEOUT, 1, 1, Some(42));
+        // Asserting the reason, not just the coarse status: this path shares
+        // `Unsupported` with six other checks.
+        assert_eq!(
+            execute_event(&mut state, 1, &wait),
+            FenceStatus::Unsupported("event_wait_timeout_unsupported")
+        );
+        // Satisfied path even with timeout flag is still WaitSatisfied if value present.
+        assert_eq!(
+            execute_event(&mut state, 1, &event_cmd(OP_SIGNAL_EVENT, 1, 5, None)),
+            FenceStatus::Ok
+        );
+        let wait_ok = event_cmd(OP_WAIT_EVENT_TIMEOUT, 1, 5, Some(42));
+        assert_eq!(execute_event(&mut state, 1, &wait_ok), FenceStatus::Ok);
+    }
+
+
+// ---- And from `runtime::decode::ledger` ----
+//
+// Drove this crate's event decoder across the ledger's event rows. Replaced by
+// `the_event_rail_lifts_its_records_and_refuses_its_one_settled_row`, which
+// drives the protocol decoder on the rail this device names and additionally
+// asserts that exactly one row is refused by contract rather than unjudged.
+#[test]
+fn the_event_decoder_recognises_every_event_operation_the_ledger_records() {
+    use super::event::{decode, DecodeStatus};
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Event)
+        .filter_map(|o| o.opcode)
+    {
+        let refused_the_opcode = probe_records(op).all(|r| {
+            matches!(
+                decode(&r),
+                Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrRejectedOpcode)
+            )
+        });
+        assert!(
+            !refused_the_opcode,
+            "the closure ledger records event {op:#x} and this rail's decoder refuses the opcode \
+             itself under every payload length"
+        );
+    }
+}
+

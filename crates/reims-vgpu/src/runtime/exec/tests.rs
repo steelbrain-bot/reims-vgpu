@@ -398,7 +398,9 @@ fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
 #[test]
 fn event_segment_signal_wait_in_stream() {
     use crate::model::FENCE_DOMAIN_EVENT;
-    use crate::runtime::decode::event::SIGNAL_WAIT_PAYLOAD_LEN;
+    use reims_vgpu_protocol::sync::{OPCODE_SIGNAL_EVENT, OPCODE_WAIT_EVENT};
+    // The record's own body, from the crate that owns its layout.
+    let signal_wait_payload_len = core::mem::size_of::<reims_vgpu_wire::ops::event::SignalWait>();
     use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
 
     fn push_segment(buf: &mut Vec<u8>, type_: u8, payload: &[u8]) {
@@ -409,22 +411,22 @@ fn event_segment_signal_wait_in_stream() {
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(payload);
     }
-    fn push_event_record(buf: &mut Vec<u8>, opcode: u32, event_ref: u32, value: u64) {
-        let mut payload = [0u8; SIGNAL_WAIT_PAYLOAD_LEN];
+    let push_event_record = |buf: &mut Vec<u8>, opcode: u32, event_ref: u32, value: u64| {
+        let mut payload = vec![0u8; signal_wait_payload_len];
         st32(&mut payload[0..4], event_ref);
         st64(&mut payload[4..12], value);
-        let len = (OP_HEADER_LEN + SIGNAL_WAIT_PAYLOAD_LEN) as u32;
+        let len = (OP_HEADER_LEN + signal_wait_payload_len) as u32;
         let mut hdr = [0u8; 8];
         st32(&mut hdr[0..4], opcode);
         st32(&mut hdr[4..8], len);
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(&payload);
-    }
+    };
 
     let mut records = Vec::new();
-    push_event_record(&mut records, event_decode::OP_SIGNAL_EVENT, 11, 7);
-    push_event_record(&mut records, event_decode::OP_WAIT_EVENT, 11, 7);
-    push_event_record(&mut records, event_decode::OP_WAIT_EVENT, 11, 8); // pending
+    push_event_record(&mut records, OPCODE_SIGNAL_EVENT, 11, 7);
+    push_event_record(&mut records, OPCODE_WAIT_EVENT, 11, 7);
+    push_event_record(&mut records, OPCODE_WAIT_EVENT, 11, 8); // pending
     let mut stream = Vec::new();
     push_segment(&mut stream, SEGMENT_TYPE_EVENT, &records);
 
@@ -438,6 +440,64 @@ fn event_segment_signal_wait_in_stream() {
     // three per-op counters this used to assert had no product reader; the
     // generation store is what the next wait actually reads.
     assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 11), Some(7));
+}
+
+/// The bounded event wait is refused, says so, and moves no generation.
+///
+/// `waitForEvent:value:timeoutMS:` is a settled row: this device runs no clock
+/// against the guest's, so executing it as the unbounded wait it resembles
+/// turns a guest's timeout into a hang. The refusal used to live in the
+/// planner, one arm past a decoder that had lifted the record — so a reader
+/// found it as a gap in the planner rather than as a decision about the wire,
+/// and the settled row was refused in two places.
+///
+/// It is refused at the lift now, and this is the check that the refusal still
+/// *reaches* the guest-visible failure channel from the segment walk. The row's
+/// own name is what the line carries, so a reader lands on the ledger.
+#[test]
+fn a_bounded_event_wait_is_refused_by_contract_and_leaves_the_generation_alone() {
+    use crate::model::FENCE_DOMAIN_EVENT;
+    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
+    use reims_vgpu_protocol::sync::{OPCODE_SIGNAL_EVENT, OPCODE_WAIT_EVENT_TIMEOUT};
+
+    // The bounded wait's own body: the signal/wait pair plus its timeout word.
+    let body = core::mem::size_of::<reims_vgpu_wire::ops::event::SignalWait>() + 4;
+    let mut records = Vec::new();
+    for (opcode, value) in [(OPCODE_SIGNAL_EVENT, 5u64), (OPCODE_WAIT_EVENT_TIMEOUT, 9)] {
+        let mut payload = vec![0u8; body];
+        st32(&mut payload[0..4], 3);
+        st64(&mut payload[4..12], value);
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], opcode);
+        st32(&mut hdr[4..8], (OP_HEADER_LEN + body) as u32);
+        records.extend_from_slice(&hdr);
+        records.extend_from_slice(&payload);
+    }
+    let mut stream = Vec::new();
+    let len = (SEGMENT_HEADER_LEN + records.len()) as u32;
+    let mut hdr = [0u8; 8];
+    st32(&mut hdr[0..4], len);
+    hdr[4] = SEGMENT_TYPE_EVENT;
+    stream.extend_from_slice(&hdr);
+    stream.extend_from_slice(&records);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let cap = crate::observe::FailCapture::start();
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+    let lines = cap.lines();
+
+    assert!(
+        lines.iter().any(|l| l.starts_with("event_record ")
+            && l.contains("reason=decode_opcode_refused_by_contract")
+            && l.contains("opcode=0x192")),
+        "a bounded wait must be refused by name, not dropped: {lines:?}"
+    );
+    // The signal ahead of it still landed — the refusal is the one record's and
+    // not the segment's — and the wait moved nothing.
+    assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 3), Some(5));
 }
 
 #[test]

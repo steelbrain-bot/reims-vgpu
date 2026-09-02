@@ -162,6 +162,54 @@ impl DecodeRefusal {
     }
 }
 
+/// Every refusal here is one check, and the fields are the numbers the check
+/// saw.
+///
+/// The slug is [`DecodeRefusal::reason`] rather than a second set of strings —
+/// a layer that may not depend on `observe` still has to name the refusal it
+/// forwards, which is why `reason` is inherent, and the two spellings drifting
+/// apart would mean a reader greps a name the log does not carry.
+///
+/// The rail and the opcode are on every variant because a refusal without them
+/// says a record on some encoder somewhere did not lift, which is not a report
+/// anyone can act on: the same opcode is a different record on a different
+/// rail, and that is the first thing a reader has to know.
+impl reims_vgpu_observe::Decline for DecodeRefusal {
+    fn slug(&self) -> &'static str {
+        self.reason()
+    }
+
+    fn fields(&self) -> alloc::vec::Vec<(&'static str, alloc::string::String)> {
+        let mut f = alloc::vec![
+            ("rail", alloc::format!("{:?}", self.rail())),
+            ("opcode", alloc::format!("{:#x}", self.opcode())),
+        ];
+        match *self {
+            Self::Short { have, need, .. } => {
+                f.push(("have", alloc::string::ToString::to_string(&have)));
+                f.push(("need", alloc::string::ToString::to_string(&need)));
+            }
+            Self::UnexpectedPayload { have, .. } => {
+                f.push(("have", alloc::string::ToString::to_string(&have)))
+            }
+            Self::UndefinedOrdinal { field, value, .. } => {
+                f.push(("field", alloc::string::ToString::to_string(&field)));
+                f.push(("value", alloc::string::ToString::to_string(&value)));
+            }
+            Self::CountOverruns { count, have, .. } => {
+                f.push(("count", alloc::string::ToString::to_string(&count)));
+                f.push(("have", alloc::string::ToString::to_string(&have)));
+            }
+            // The three opcode judgements carry no third number: what happened
+            // is entirely which of them it is, and the rail and opcode above
+            // are the whole of the evidence.
+            Self::UnknownOpcode { .. } | Self::Unjudged { .. } | Self::RefusedByContract { .. } => {
+            }
+        }
+        f
+    }
+}
+
 /// The refusal for an opcode this rail lifts no record for.
 ///
 /// Three answers, and the difference is what a reader needs. An opcode the
