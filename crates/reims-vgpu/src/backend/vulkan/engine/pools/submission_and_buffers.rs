@@ -5448,7 +5448,7 @@ mod recycle_tests {
         assert_eq!(
             pools.attachment_snapshot_free.count_for(&key),
             BATCH_MAX_DRAWS as usize
-                * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+                * (crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS + 1)
         );
         assert!(
             pools
@@ -5478,7 +5478,7 @@ mod recycle_tests {
         assert_eq!(
             pool.len(),
             BATCH_MAX_DRAWS as usize
-                * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+                * (crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS + 1)
         );
     }
 

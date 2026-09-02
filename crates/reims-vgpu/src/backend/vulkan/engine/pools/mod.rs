@@ -2516,7 +2516,7 @@ const SAMPLED_FREE_CAP_TOTAL: usize = 64;
 /// largest dedicated snapshot population `draws × attachments` rather than
 /// `draws × texture-table width`.
 const fn attachment_snapshot_batch_cap(draws: u64) -> usize {
-    draws as usize * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+    draws as usize * (crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS + 1)
 }
 
 const ATTACHMENT_SNAPSHOT_BATCH_CAP: usize = attachment_snapshot_batch_cap(BATCH_MAX_DRAWS);

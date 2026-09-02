@@ -27,10 +27,6 @@ use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
 use crate::runtime::decode::blit_spi;
 use crate::runtime::decode::compute_spi::{self, Kind as ComputeKind};
-use crate::runtime::decode::render::{
-    self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
-    ColorAttachment, DepthAttachment, LevelSupport, ScissorRect, StencilAttachment,
-};
 use crate::runtime::decode::render_spi::{self, Kind as SpiKind};
 use crate::runtime::draw::{
     self, BindTable, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
@@ -43,6 +39,10 @@ use crate::runtime::mapping_write;
 use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
+use crate::runtime::render_pass::{
+    self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
+    ColorAttachment, DepthAttachment, LevelSupport, ScissorRect, StencilAttachment,
+};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
 use reims_vgpu_core::operation::{OperationClass, OperationHome};
 use reims_vgpu_protocol::closure::Rail;
@@ -2534,7 +2534,7 @@ fn handle_render_stream_state(task_id: u32, opcode: u32, cmd_bytes: &[u8], acc: 
             }
             acc.viewports.clear();
             acc.viewports
-                .extend(ports.iter().map(|v| render::viewport_from_wire(v)));
+                .extend(ports.iter().map(|v| render_pass::viewport_from_wire(v)));
         }
         RenderRecord::SetScissorRects(rects) => {
             if rects.is_empty() {
@@ -2546,7 +2546,8 @@ fn handle_render_stream_state(task_id: u32, opcode: u32, cmd_bytes: &[u8], acc: 
             // with the empty slots left out, and adopting them as written would
             // make exactly those slots clip however the backend reads a zero
             // rect.
-            let lifted: Vec<ScissorRect> = rects.iter().map(render::scissor_from_wire).collect();
+            let lifted: Vec<ScissorRect> =
+                rects.iter().map(render_pass::scissor_from_wire).collect();
             match lifted.iter().find(|r| r.is_empty()) {
                 Some(empty) => note_empty_scissor(task_id, *empty),
                 None => acc.scissors = lifted,
@@ -3055,7 +3056,7 @@ fn handle_render_pass_state<M: HostMemory + HostOps>(
                 // content written over right content, and nothing downstream can
                 // tell because a pass with no depth attachment is exactly what a
                 // guest that wanted none also produces.
-                let depth = render::depth_from_wire(&descriptor.depth);
+                let depth = render_pass::depth_from_wire(&descriptor.depth);
                 if depth.texture_ref != 0 {
                     if attachment_subresource_is_bindable(depth.into(), LevelSupport::LevelZeroOnly)
                     {
@@ -3065,7 +3066,7 @@ fn handle_render_pass_state<M: HostMemory + HostOps>(
                         acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
                 }
-                let stencil = render::stencil_from_wire(&descriptor.stencil);
+                let stencil = render_pass::stencil_from_wire(&descriptor.stencil);
                 if stencil.texture_ref != 0 {
                     if attachment_subresource_is_bindable(
                         stencil.into(),
@@ -3079,7 +3080,7 @@ fn handle_render_pass_state<M: HostMemory + HostOps>(
                     }
                 }
                 for (i, slot_body) in descriptor.color.iter().enumerate() {
-                    let att = render::color_from_wire(slot_body);
+                    let att = render_pass::color_from_wire(slot_body);
                     if att.texture_ref == 0 {
                         continue;
                     }

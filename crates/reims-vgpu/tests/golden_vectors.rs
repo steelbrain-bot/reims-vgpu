@@ -129,7 +129,10 @@ fn corpus_property_random_decode_no_panic() {
             );
         }
         let _ = reims_vgpu::runtime::decode::compute_spi::decode(s);
-        let _ = reims_vgpu::runtime::decode::render::decode(s);
+        let _ = reims_vgpu::runtime::decode::render_spi::decode(s);
+        if let Ok(op) = reims_vgpu::protocol::decode::op(s, 0) {
+            let _ = reims_vgpu::protocol::decode::render::decode(&op);
+        }
         let _ = reims_vgpu::runtime::decode::resource::decode_list_object_entry(s);
     }
 }

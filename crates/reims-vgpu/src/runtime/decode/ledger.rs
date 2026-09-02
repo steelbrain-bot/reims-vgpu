@@ -59,27 +59,6 @@ fn probe_records(opcode: u32) -> impl Iterator<Item = Vec<u8>> {
     })
 }
 
-#[test]
-fn the_render_decoder_recognises_every_render_operation_the_ledger_records() {
-    use super::render::{decode, DecodeStatus};
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Render)
-        .filter_map(|o| o.opcode)
-    {
-        let refused_the_opcode = matches!(
-            decode(&zero_record(op, GENEROUS_PAYLOAD)),
-            Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrUnsupportedOpcode)
-        );
-        assert!(
-            !refused_the_opcode,
-            "the closure ledger records render {op:#x} and this rail's decoder \
-             refuses the opcode itself: one of the two is describing an \
-             operation the other says does not exist"
-        );
-    }
-}
-
 /// Every compute-rail row reaches exactly one decoder, and `classify` is what
 /// says which.
 ///
@@ -285,68 +264,6 @@ fn the_event_rail_lifts_its_records_and_refuses_its_one_settled_row() {
         "one event row is settled as refused — the bounded wait — and it is the only one"
     );
     assert_eq!(lifted, 2, "the signal and the unbounded wait both lift");
-}
-
-/// Recognising an opcode is not claiming it.
-///
-/// The render decoder accepts a contiguous range and falls through to
-/// `Kind::OtherAccepted` inside it, which is how an opcode can be accepted with
-/// no arm decoding it — and the rail then reports the record as
-/// `accepted_without_executor` and drops it. That is precisely the state the
-/// opcode-recognition test above cannot see, because a fall-through is not a
-/// refusal. So this is the sharper claim: an operation the ledger judges must
-/// reach an arm that names what it is.
-///
-/// A record that decodes under none of [`probe_records`]' spellings is
-/// inconclusive rather than a failure: this test is about which arm claims an
-/// opcode, not about whether this file can synthesise a legal record for every
-/// family. The reached count is printed rather than asserted, because it is a
-/// property of the probe.
-#[test]
-fn no_render_operation_the_ledger_judges_decodes_as_unclaimed() {
-    use super::render::{decode, Kind};
-    let mut conclusive = 0usize;
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Render)
-        .filter_map(|o| o.opcode)
-    {
-        let Some(cmd) = probe_records(op).find_map(|r| decode(&r).ok()) else {
-            continue;
-        };
-        conclusive += 1;
-        assert_ne!(
-            cmd.kind,
-            Kind::OtherAccepted,
-            "the closure ledger judges render {op:#x} and the decoder has no arm for it, so the \
-             rail reports it as accepted-without-executor and drops it whatever the ledger says"
-        );
-    }
-    println!("{conclusive} of the ledger's render operations reached a decode arm");
-}
-
-/// The other direction on the one rail that can state its own window.
-///
-/// The render decoder accepts a contiguous opcode range and falls through to
-/// `Kind::OtherAccepted` inside it, so an opcode can be *accepted* without any
-/// arm claiming it — which is a decodable operation the device drops. Those are
-/// numbers rather than known selectors, so the ledger does not carry rows for
-/// them; what it must not do is disagree about the window's edge, because an
-/// operation the ledger judges must be inside it.
-#[test]
-fn no_ledger_operation_sits_outside_the_render_encoder_window() {
-    use super::render::opcode_above_the_encoder_window;
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Render)
-        .filter_map(|o| o.opcode)
-    {
-        assert!(
-            !opcode_above_the_encoder_window(op),
-            "render {op:#x} is judged by the ledger and above the window this \
-             rail accepts, so the judgement can never be acted on"
-        );
-    }
 }
 
 /// The packet half of the same join.

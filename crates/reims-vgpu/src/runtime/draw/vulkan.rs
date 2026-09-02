@@ -12827,7 +12827,7 @@ mod vulkan_split_tests {
         assert_ne!(a, depth_chain_identity(&req(1280, 720), true).unwrap());
         // A named depth texture keeps its own namespace, untouched by this.
         let mut named = req(64, 64);
-        named.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+        named.depth_attach = Some(crate::runtime::render_pass::DepthAttachment {
             texture_ref: 42,
             ..Default::default()
         });
@@ -12866,7 +12866,7 @@ mod vulkan_split_tests {
             height: 8,
             ..Default::default()
         });
-        req.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+        req.depth_attach = Some(crate::runtime::render_pass::DepthAttachment {
             texture_ref: 7,
             load_action: MTL_LOAD_ACTION_CLEAR,
             clear_depth: 0.0,
@@ -12926,7 +12926,7 @@ mod vulkan_split_tests {
             height: 8,
             ..Default::default()
         });
-        req.stencil_attach = Some(crate::runtime::decode::render::StencilAttachment {
+        req.stencil_attach = Some(crate::runtime::render_pass::StencilAttachment {
             texture_ref: 11,
             load_action: MTL_LOAD_ACTION_CLEAR,
             clear_stencil: 3,
@@ -12972,7 +12972,7 @@ mod vulkan_split_tests {
             height: 8,
             ..Default::default()
         });
-        req.stencil_attach = Some(crate::runtime::decode::render::StencilAttachment {
+        req.stencil_attach = Some(crate::runtime::render_pass::StencilAttachment {
             texture_ref: 11,
             clear_stencil: 3,
             ..Default::default()
@@ -13014,7 +13014,7 @@ mod vulkan_split_tests {
             height: 8,
             ..Default::default()
         });
-        req.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+        req.depth_attach = Some(crate::runtime::render_pass::DepthAttachment {
             texture_ref: 3,
             load_action: MTL_LOAD_ACTION_CLEAR,
             clear_depth: 0.25,
@@ -13046,7 +13046,7 @@ mod vulkan_split_tests {
             height: 8,
             ..Default::default()
         });
-        req.depth_attach = Some(crate::runtime::decode::render::DepthAttachment {
+        req.depth_attach = Some(crate::runtime::render_pass::DepthAttachment {
             texture_ref: 9,
             load_action: MTL_LOAD_ACTION_CLEAR,
             ..Default::default()
@@ -14694,7 +14694,7 @@ mod memo_scratch_tests {
         );
 
         // A slot whose texture_ref is unbound cannot resolve a target.
-        let att = crate::runtime::decode::render::ColorAttachment {
+        let att = crate::runtime::render_pass::ColorAttachment {
             texture_ref: 0,
             ..Default::default()
         };

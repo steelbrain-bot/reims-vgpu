@@ -1,3 +1,8 @@
+//! DISCONNECTED — the tests of `render_decoder.rs`. See `dead/README.md`.
+//!
+//! The five that covered the *attachment model* rather than the decoder did
+//! not move: they are `runtime::render_pass`'s own test module now.
+
 /// A malformed render command used to be dropped at the dispatch site with no
 /// log line at all — indistinguishable from a segment carrying no render
 /// work. Each check names itself now, `Ok` still produces nothing, and the
@@ -469,238 +474,9 @@ fn execute_commands_range_and_indirect() {
     assert_eq!(c.icb_args_buffer_offset, 0x40);
 }
 
-#[test]
-fn depth_and_stencil_pass_slots() {
-    use crate::protocol::endian::{st16, st32, st64};
-    use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
-    let mut payload = vec![0u8; PASS_MIN_PAYLOAD];
-    // depth @0
-    st32(
-        &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
-        77,
-    );
-    st16(
-        &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_LOAD_ACTION..],
-        MTL_LOAD_ACTION_CLEAR,
-    );
-    st16(
-        &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_STORE_ACTION..],
-        MTL_STORE_ACTION_STORE,
-    );
-    st64(
-        &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_DEPTH_ATTACH_CLEAR_DEPTH..],
-        0.5f64.to_bits(),
-    );
-    // stencil @0x28
-    st32(
-        &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_ATTACH_TEXREF..],
-        88,
-    );
-    st32(
-        &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_STENCIL_ATTACH_CLEAR_STENCIL..],
-        9,
-    );
-    let d = decode_depth_attachment(&payload);
-    assert_eq!(d.texture_ref, 77);
-    assert!((d.clear_depth - 0.5).abs() < 1e-9);
-    let s = decode_stencil_attachment(&payload);
-    assert_eq!(s.texture_ref, 88);
-    assert_eq!(s.clear_stencil, 9);
-}
 
-/// Each of the first two records ends where the next one begins: depth
-/// `[0x00, 0x28)`, stencil `[0x28, 0x4c)`. A payload that carries both in
-/// full — and not one byte of the color section — must decode both.
-///
-/// A shared `PASS_DEPTH_STENCIL_ATTACH_STRIDE = 0x28` used to give the
-/// stencil record the depth record's length, so the decoder demanded 0x50
-/// bytes to read a 0x24-byte record and sliced 4 bytes past its end, over
-/// color slot 0's texture ref. This payload is exactly `PASS_COLOR_ATTACH_OFF`
-/// long, so the old guard rejected it and returned a defaulted attachment.
-#[test]
-fn depth_and_stencil_records_end_where_the_next_section_begins() {
-    use crate::protocol::endian::{st32, st64};
-    let mut payload = vec![0u8; PASS_COLOR_ATTACH_OFF];
-    st32(
-        &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
-        31,
-    );
-    st64(
-        &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_DEPTH_ATTACH_CLEAR_DEPTH..],
-        0.25f64.to_bits(),
-    );
-    st32(
-        &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_ATTACH_TEXREF..],
-        32,
-    );
-    st32(
-        &mut payload[PASS_STENCIL_ATTACH_OFF + PASS_STENCIL_ATTACH_CLEAR_STENCIL..],
-        0xfe,
-    );
-    let d = decode_depth_attachment(&payload);
-    assert_eq!(
-        d.texture_ref, 31,
-        "depth record is complete at {PASS_STENCIL_ATTACH_OFF} bytes"
-    );
-    assert!((d.clear_depth - 0.25).abs() < 1e-9);
-    let s = decode_stencil_attachment(&payload);
-    assert_eq!(
-        s.texture_ref, 32,
-        "stencil record is complete at {PASS_COLOR_ATTACH_OFF} bytes"
-    );
-    assert_eq!(s.clear_stencil, 0xfe);
-}
 
-/// Whether a scissor reaches the whole target is one rule, and it had been
-/// written twice in opposite polarities.
-///
-/// The draw-coverage census asked
-/// `x == 0 && y == 0 && w >= target_w && h >= target_h`; the partial-store
-/// path asked `x > 0 || y > 0 || w < width || h < height` and acted on the
-/// negation. Two spellings of one predicate, in two files, over four
-/// numbers that travelled loose. Each row below is a case where a term
-/// dropped from either spelling would change the answer.
-#[test]
-fn a_scissor_covers_its_target_only_when_every_term_says_so() {
-    let full = ScissorRect {
-        x: 0,
-        y: 0,
-        width: 800,
-        height: 600,
-    };
-    assert!(full.covers(800, 600), "an exact fit covers");
-    assert!(
-        ScissorRect {
-            width: 900,
-            height: 700,
-            ..full
-        }
-        .covers(800, 600),
-        "a scissor larger than the target still covers it"
-    );
-    for (name, rect) in [
-        ("offset x", ScissorRect { x: 1, ..full }),
-        ("offset y", ScissorRect { y: 1, ..full }),
-        ("narrow", ScissorRect { width: 799, ..full }),
-        (
-            "short",
-            ScissorRect {
-                height: 599,
-                ..full
-            },
-        ),
-    ] {
-        assert!(
-            !rect.covers(800, 600),
-            "a scissor {name} must not read as covering the target"
-        );
-    }
 
-    // A zero-extent rect draws nothing; the stream decode drops it and
-    // keeps the previous scissor rather than binding an empty one.
-    assert!(!full.is_empty());
-    assert!(ScissorRect { width: 0, ..full }.is_empty());
-    assert!(ScissorRect { height: 0, ..full }.is_empty());
-}
-
-/// All four fields of the prefix decide bindability, and both attachment
-/// shapes hand all four to the rule.
-///
-/// The rule had two consumers and the second carried its own copy testing
-/// `level` and `resolve_texture_ref` only — so a depth buffer bound at
-/// slice 5 was refused by the stream decode and would have been accepted by
-/// the Metal rail. This drives each field on its own, from both shapes, so
-/// a consumer that reconstructs three of the four fails here rather than at
-/// a guest that binds an array layer.
-///
-/// `level` is driven from both [`LevelSupport`] arms, because it is the one
-/// field whose answer depends on which rail is asking: a colour attachment's
-/// level resolves to its own plane in the guest allocation and a depth
-/// attachment's does not. Every other field must refuse on both arms — an arm
-/// that reads `AnyLevel` as "anything goes" fails here.
-#[test]
-fn every_field_of_the_attachment_prefix_decides_bindability() {
-    for levels in [LevelSupport::LevelZeroOnly, LevelSupport::AnyLevel] {
-        assert!(
-            attachment_subresource_is_bindable(AttachSubresource::default(), levels),
-            "{levels:?}: the whole texture at level 0, slice 0, plane 0 with no resolve is bindable"
-        );
-    }
-    let mip = AttachSubresource {
-        level: 1,
-        ..AttachSubresource::default()
-    };
-    assert!(
-        !attachment_subresource_is_bindable(mip, LevelSupport::LevelZeroOnly),
-        "a rail that only renders level 0 must refuse a level the guest named"
-    );
-    assert!(
-        attachment_subresource_is_bindable(mip, LevelSupport::AnyLevel),
-        "a rail that resolves the named level's own plane must admit it"
-    );
-
-    for (name, sub) in [
-        (
-            "slice",
-            AttachSubresource {
-                slice: 5,
-                ..AttachSubresource::default()
-            },
-        ),
-        (
-            "depth_plane",
-            AttachSubresource {
-                depth_plane: 2,
-                ..AttachSubresource::default()
-            },
-        ),
-        (
-            "resolve_texture_ref",
-            AttachSubresource {
-                resolve_texture_ref: 99,
-                ..AttachSubresource::default()
-            },
-        ),
-    ] {
-        for levels in [LevelSupport::LevelZeroOnly, LevelSupport::AnyLevel] {
-            assert!(
-                !attachment_subresource_is_bindable(sub, levels),
-                "{levels:?}: a non-default {name} must refuse the attachment on its own"
-            );
-        }
-    }
-
-    // And both shapes hand all four to the rule: a field a conversion drops
-    // arrives as 0, which is the value that admits.
-    let all_four = AttachSubresource {
-        level: 1,
-        slice: 5,
-        depth_plane: 2,
-        resolve_texture_ref: 99,
-    };
-    assert_eq!(
-        AttachSubresource::from(DepthAttachment {
-            texture_ref: 77,
-            level: 1,
-            slice: 5,
-            depth_plane: 2,
-            resolve_texture_ref: 99,
-            ..DepthAttachment::default()
-        }),
-        all_four
-    );
-    assert_eq!(
-        AttachSubresource::from(StencilAttachment {
-            texture_ref: 88,
-            level: 1,
-            slice: 5,
-            depth_plane: 2,
-            resolve_texture_ref: 99,
-            ..StencilAttachment::default()
-        }),
-        all_four
-    );
-}
 
 #[test]
 fn blend_color_and_cull() {
@@ -1263,55 +1039,6 @@ fn the_wide_patch_draw_opcode_is_resolved_by_length_and_refused_without_one() {
     assert!(decode(&truncated).is_err(), "a short buffer was accepted");
 }
 
-/// The store-action options and the tessellation factor buffer.
-///
-/// `0x67`/`0x6a`/`0x79` sit one opcode above the three store actions and
-/// look like longer forms of them. They are not, and the difference is a
-/// *width*: the options are a `u64` where the action is a `u32`, so the
-/// colour form's attachment index moves from payload `+4` to `+8` and the
-/// record grows from 16 bytes to 20. A decoder that reused
-/// `ColorStoreAction` here would read the index out of the options' high
-/// half and report attachment 0 for every one of them.
-///
-/// `0x7a` is checked in the same test because it makes the opposite
-/// mistake available: it names a buffer with an offset, so it reads like a
-/// bind, and a reader that took a `BindHeader` would call the ref `first`
-/// and the low half of the offset `count`.
-/// A colour attachment's `level` is sixteen bits, and `slice` is the
-/// sixteen above it.
-///
-/// This arm read `ld32` at [`PASS_ATTACH_LEVEL`] for as long as it existed,
-/// under a comment on the depth arm that stated the rule as "the archive
-/// uses u16 for depth/stencil level (color uses u32)". Apple's own bytes say
-/// all three attachment shapes are identical through their prefix, so the
-/// wide read returned `level | (slice << 16)`: a pass rendering into array
-/// slice 1 reported mip level 65536 and lost the slice.
-///
-/// The synthetic here is what a cube-face pass looks like — level 1, slice
-/// 5 — and the two fields are read apart. The `0xffff` case is the same
-/// claim at the boundary: a slice that fills its half must not reach the
-/// level at all.
-#[test]
-fn a_colour_attachments_level_does_not_swallow_its_slice() {
-    for (level, slice, plane) in [(1u16, 5u16, 2u16), (0, 0xffff, 0), (0xffff, 0, 0)] {
-        let total = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
-        let mut cmd = vec![0u8; total];
-        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
-        st32(&mut cmd[4..], total as u32);
-        let slot = OP_HEADER_LEN + PASS_COLOR_ATTACH_OFF;
-        st32(&mut cmd[slot + PASS_ATTACH_TEXREF..], 7);
-        cmd[slot + PASS_ATTACH_LEVEL..slot + PASS_ATTACH_LEVEL + 2]
-            .copy_from_slice(&level.to_le_bytes());
-        cmd[slot + PASS_ATTACH_SLICE..slot + PASS_ATTACH_SLICE + 2]
-            .copy_from_slice(&slice.to_le_bytes());
-        cmd[slot + PASS_ATTACH_DEPTH_PLANE..slot + PASS_ATTACH_DEPTH_PLANE + 2]
-            .copy_from_slice(&plane.to_le_bytes());
-        let att = decode_color_attachment(&cmd[OP_HEADER_LEN..], 0);
-        assert_eq!(att.level, u32::from(level), "level took the slice's bits");
-        assert_eq!(att.slice, u32::from(slice), "slice went unread");
-        assert_eq!(att.depth_plane, u32::from(plane), "depth plane went unread");
-    }
-}
 
 /// The pass's tail is four fields this device decodes and does not apply.
 ///
@@ -2531,5 +2258,95 @@ fn property_fuzz() {
         for len in [8usize, 12, 16, 24, 32, 48, 64] {
             let _ = decode(&hdr(op, len));
         }
+    }
+}
+
+
+
+// --- The three `runtime::decode::ledger` cross-checks that named this
+// --- decoder. All three are superseded by
+// --- `every_render_row_reaches_exactly_one_decoder_and_the_ledger_picks_it`,
+// --- which asks both directions where these asked one each.
+
+#[test]
+fn the_render_decoder_recognises_every_render_operation_the_ledger_records() {
+    use super::render::{decode, DecodeStatus};
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Render)
+        .filter_map(|o| o.opcode)
+    {
+        let refused_the_opcode = matches!(
+            decode(&zero_record(op, GENEROUS_PAYLOAD)),
+            Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrUnsupportedOpcode)
+        );
+        assert!(
+            !refused_the_opcode,
+            "the closure ledger records render {op:#x} and this rail's decoder \
+             refuses the opcode itself: one of the two is describing an \
+             operation the other says does not exist"
+        );
+    }
+}
+
+/// Recognising an opcode is not claiming it.
+///
+/// The render decoder accepts a contiguous range and falls through to
+/// `Kind::OtherAccepted` inside it, which is how an opcode can be accepted with
+/// no arm decoding it — and the rail then reports the record as
+/// `accepted_without_executor` and drops it. That is precisely the state the
+/// opcode-recognition test above cannot see, because a fall-through is not a
+/// refusal. So this is the sharper claim: an operation the ledger judges must
+/// reach an arm that names what it is.
+///
+/// A record that decodes under none of [`probe_records`]' spellings is
+/// inconclusive rather than a failure: this test is about which arm claims an
+/// opcode, not about whether this file can synthesise a legal record for every
+/// family. The reached count is printed rather than asserted, because it is a
+/// property of the probe.
+#[test]
+fn no_render_operation_the_ledger_judges_decodes_as_unclaimed() {
+    use super::render::{decode, Kind};
+    let mut conclusive = 0usize;
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Render)
+        .filter_map(|o| o.opcode)
+    {
+        let Some(cmd) = probe_records(op).find_map(|r| decode(&r).ok()) else {
+            continue;
+        };
+        conclusive += 1;
+        assert_ne!(
+            cmd.kind,
+            Kind::OtherAccepted,
+            "the closure ledger judges render {op:#x} and the decoder has no arm for it, so the \
+             rail reports it as accepted-without-executor and drops it whatever the ledger says"
+        );
+    }
+    println!("{conclusive} of the ledger's render operations reached a decode arm");
+}
+
+/// The other direction on the one rail that can state its own window.
+///
+/// The render decoder accepts a contiguous opcode range and falls through to
+/// `Kind::OtherAccepted` inside it, so an opcode can be *accepted* without any
+/// arm claiming it — which is a decodable operation the device drops. Those are
+/// numbers rather than known selectors, so the ledger does not carry rows for
+/// them; what it must not do is disagree about the window's edge, because an
+/// operation the ledger judges must be inside it.
+#[test]
+fn no_ledger_operation_sits_outside_the_render_encoder_window() {
+    use super::render::opcode_above_the_encoder_window;
+    for op in LEDGER
+        .iter()
+        .filter(|o| o.rail == Rail::Render)
+        .filter_map(|o| o.opcode)
+    {
+        assert!(
+            !opcode_above_the_encoder_window(op),
+            "render {op:#x} is judged by the ledger and above the window this \
+             rail accepts, so the judgement can never be acted on"
+        );
     }
 }

@@ -227,7 +227,7 @@ pub struct DepthState {
     ///
     /// The depth buffer is **the guest's resource**, not this device's scratch:
     /// the guest allocated a depth texture and bound it, and
-    /// [`crate::runtime::decode::render::DepthAttachment::texture_ref`] is its
+    /// [`crate::runtime::render_pass::DepthAttachment::texture_ref`] is its
     /// ref. Carrying it lets the engine resolve one resident per guest texture
     /// out of the registry, which is what makes the depth allocation live as
     /// long as the guest's texture does instead of as long as one draw.

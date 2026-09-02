@@ -40,8 +40,8 @@
 use crate::backend::blob::{BlobIdentity, BlobKey};
 use crate::backend::hash::hash_u64;
 use crate::protocol::fnv::FNV_OFFSET_BASIS;
-use crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS;
 use crate::runtime::decode::resource::{MAX_VERTEX_ATTRS, MTL_COLOR_WRITE_MASK_ALL};
+use crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS;
 
 /// Every word of pipeline state, other than the two shaders, that Metal bakes
 /// into an `MTLRenderPipelineState`.

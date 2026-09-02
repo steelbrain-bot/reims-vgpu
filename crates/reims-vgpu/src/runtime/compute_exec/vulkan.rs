@@ -1919,7 +1919,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
         state,
         host,
         task_id,
-        crate::runtime::decode::render::ColorAttachment {
+        crate::runtime::render_pass::ColorAttachment {
             texture_ref,
             ..Default::default()
         },

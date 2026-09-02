@@ -126,7 +126,7 @@ pub(crate) fn canonicalize_layout_bindings(
 ///
 /// The fourth spelling of one number, and the last one to be pinned. The wire
 /// record's colour-slot array is the truth,
-/// [`crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS`] derives from
+/// [`crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS`] derives from
 /// it, and `backend::metal::REIMS_VGPU_METAL_MAX_COLOR_RTS` is held equal to it
 /// by an assertion beside itself. This one is that bound minus one, on the arm
 /// the other assertion cannot reach — `REIMS_VGPU_METAL_MAX_COLOR_RTS` is behind
@@ -140,7 +140,7 @@ pub(crate) fn canonicalize_layout_bindings(
 /// assertion is for.
 pub(crate) const MAX_SECONDARY_ATTACH: usize = 7;
 const _: () =
-    assert!(1 + MAX_SECONDARY_ATTACH == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
+    assert!(1 + MAX_SECONDARY_ATTACH == crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS);
 const _: () = assert!(MAX_SECONDARY_ATTACH < u8::BITS as usize);
 
 /// A secondary MRT attachment's contribution to the render-pass / pipeline key.

@@ -37,8 +37,8 @@ fn m2v_draw_boundary_preserves_the_engine_vk_call_slug() {
 /// black and stores — the pass shape seven bodies need so a draw resolves, and
 /// which none of them is about. The attachments that carry a real load action
 /// or clear colour stay written out.
-fn clear_black_attachment(texture_ref: u32) -> crate::runtime::decode::render::ColorAttachment {
-    use crate::runtime::decode::render::ColorAttachment;
+fn clear_black_attachment(texture_ref: u32) -> crate::runtime::render_pass::ColorAttachment {
+    use crate::runtime::render_pass::ColorAttachment;
     ColorAttachment {
         texture_ref,
         resolve_texture_ref: 0,
@@ -74,7 +74,7 @@ fn single_rt_draw_request<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     pipeline_ref: u32,
-    att: crate::runtime::decode::render::ColorAttachment,
+    att: crate::runtime::render_pass::ColorAttachment,
 ) -> Option<DrawEncodeRequest> {
     mrt_draw_request(
         state,
@@ -2760,8 +2760,8 @@ fn a8_sample_preserves_alpha_coverage() {
 #[test]
 fn mrt_draw_request_load_seed_miss_still_encodes() {
     use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::host::FakeHost;
+    use crate::runtime::render_pass::ColorAttachment;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
@@ -7146,8 +7146,8 @@ fn a_gva_span_no_store_has_stamped_refuses_the_resident_sample_rung() {
 #[test]
 fn a_depth_attachment_is_keyed_on_the_guest_texture_the_pass_bound() {
     use crate::backend::vulkan::engine::TargetIdentity;
-    use crate::runtime::decode::render::DepthAttachment;
     use crate::runtime::draw::vulkan::depth_chain_identity;
+    use crate::runtime::render_pass::DepthAttachment;
 
     let id = |r: &DrawEncodeRequest, st: bool| depth_chain_identity(r, st);
     let req = |depth_ref: u32, w: u32, h: u32| DrawEncodeRequest {
@@ -7585,9 +7585,9 @@ fn a_dontcare_colour_attachment_is_still_served_its_prior_contents() {
 /// count put a test of pure arithmetic on one arm for no reason.
 #[test]
 fn an_attachment_sample_count_taken_from_the_pipeline_names_where_the_samples_go() {
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::drain::store_route_count;
     use crate::runtime::draw::{note_attachment_sample_count_override, AttachmentSampleCounts};
+    use crate::runtime::render_pass::ColorAttachment;
 
     const NO_RESOLVE: &str = "attach_samples_multisample_no_resolve";
     const WITH_RESOLVE: &str = "attach_samples_from_pipeline_with_resolve";
@@ -7715,12 +7715,12 @@ fn a_preserving_gva_attachment_reaches_the_encoder_able_to_preserve() {
     use crate::protocol::endian::{st16, st32, st64};
     use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::decode::resource::{
         list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, TEXTURE_DESC_BASE_LEN,
         TEXTURE_DESC_MIPMAP_LEVEL_COUNT, TEXTURE_DESC_PIXEL_FORMAT, TEXTURE_DESC_ROW_STRIDE,
         TEXTURE_DESC_USED_SIZE, TEXTURE_DESC_WIDTH,
     };
+    use crate::runtime::render_pass::ColorAttachment;
 
     // Same guest-page rig as `a_gva_load_from_resident_draw_with_no_resident_
     // puts_the_seed_back`: a tight 4x2 BGRA8 linear texture whose texels are

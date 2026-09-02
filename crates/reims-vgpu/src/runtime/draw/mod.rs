@@ -37,9 +37,6 @@ use crate::observe::Decline;
 // longer downgrade at all: they carry the source format through to the bind.
 // Only the tests read it here; the rail that acts on it imports its own. The
 // Metal arm tests the band instead (`load_action_in_contract`).
-use crate::runtime::decode::render::{
-    ColorAttachment, DepthAttachment, ScissorRect, StencilAttachment,
-};
 use crate::runtime::decode::resource::{
     decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
     decode_render_pipeline_descriptor, decode_texture_descriptor, texture_view_opcode,
@@ -54,6 +51,9 @@ use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
+use crate::runtime::render_pass::{
+    ColorAttachment, DepthAttachment, ScissorRect, StencilAttachment,
+};
 #[cfg(test)]
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 use reims_vgpu_protocol::pass_action::{is_declared_load_action, is_declared_store_action};
@@ -1900,7 +1900,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
+    color_slots: &[(u32, crate::runtime::render_pass::ColorAttachment)],
     rgba: &[u8],
     cause: ChainAbandonCause,
 ) -> bool {
@@ -2144,7 +2144,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    color: crate::runtime::decode::render::ColorAttachment,
+    color: crate::runtime::render_pass::ColorAttachment,
     pipeline_ref: u32,
     vertex_count: u32,
     instance_count: u32,
@@ -2196,8 +2196,8 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     pipeline_ref: u32,
-    color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
-    clears: &[crate::runtime::decode::render::ColorAttachment],
+    color_slots: &[(u32, crate::runtime::render_pass::ColorAttachment)],
+    clears: &[crate::runtime::render_pass::ColorAttachment],
     draw: crate::protocol::draw::DrawArgs,
 ) -> Option<DrawEncodeRequest> {
     if color_slots.is_empty() {

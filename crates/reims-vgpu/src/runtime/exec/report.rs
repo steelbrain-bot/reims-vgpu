@@ -18,8 +18,8 @@
 
 use super::{ChainAbandonDecline, StreamAccum, StreamDrawDrop};
 use crate::runtime::compute_exec::ComputeStatus;
-use crate::runtime::decode::render::{AttachSubresource, ScissorRect};
 use crate::runtime::draw::EncodeStatus;
+use crate::runtime::render_pass::{AttachSubresource, ScissorRect};
 
 /// Name a compute refusal at the rail boundary.
 ///
@@ -571,7 +571,7 @@ pub(super) fn note_store_action_options_unsupported(
 pub(super) fn note_color_subresource_unsupported(
     task_id: u32,
     slot: u32,
-    att: &crate::runtime::decode::render::ColorAttachment,
+    att: &crate::runtime::render_pass::ColorAttachment,
 ) -> StreamDrawDrop {
     crate::runtime::drain::note_store_route("render_color_subresource_unsupported");
     let drop = StreamDrawDrop::ColorSubresourceUnsupported {

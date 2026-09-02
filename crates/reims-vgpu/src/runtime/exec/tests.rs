@@ -8,11 +8,11 @@ use reims_vgpu_wire::OP_HEADER_LEN;
 use super::*;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::protocol::endian::{st16, st32, st64};
-use crate::runtime::decode::render::{
+use crate::runtime::host::FakeHost;
+use crate::runtime::render_pass::{
     PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
     PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
 };
-use crate::runtime::host::FakeHost;
 use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
 #[test]
@@ -568,7 +568,9 @@ fn a_bounded_event_wait_is_refused_by_contract_and_leaves_the_generation_alone()
 
 #[test]
 fn multi_attachment_decode_in_pass() {
-    let mut payload = vec![0u8; PASS_COLOR_ATTACH_OFF + PASS_COLOR_ATTACH_STRIDE * 2];
+    // The record's own length: a descriptor short of `RenderPassBody` is
+    // refused now rather than read at the offsets that fit.
+    let mut payload = vec![0u8; wire_pass::RENDER_PASS_TOTAL_LEN as usize - OP_HEADER_LEN];
     for (i, tex) in [(0u32, 41u32), (1u32, 42u32)] {
         let slot = PASS_COLOR_ATTACH_OFF + i as usize * PASS_COLOR_ATTACH_STRIDE;
         st32(&mut payload[slot + PASS_ATTACH_TEXREF..], tex);
@@ -597,17 +599,26 @@ fn multi_attachment_decode_in_pass() {
             1.0f64.to_bits(),
         );
     }
-    let a0 = render::decode_color_attachment(&payload, 0);
-    let a1 = render::decode_color_attachment(&payload, 1);
+    let a0 = render_pass::decode_color_attachment(&payload, 0);
+    let a1 = render_pass::decode_color_attachment(&payload, 1);
     assert_eq!(a0.texture_ref, 41);
     assert_eq!(a1.texture_ref, 42);
     let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
     st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
     st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
     cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
-    let c = render::decode(&cmd).unwrap();
-    assert_eq!(c.kind, render::Kind::RenderPass);
-    assert_eq!(c.color0.texture_ref, 41);
+    // The record's own lift, which is what production reads. Slot 0's ref
+    // arrives through `RenderPassBody::color[0]` rather than through a
+    // separately decoded `color0` field — the two used to be lifted apart and
+    // could disagree.
+    let framed = reims_vgpu_protocol::decode::op(&cmd, 0).expect("the record frames");
+    let reims_vgpu_protocol::decode::render::RenderRecord::WriteDescriptor(d) =
+        reims_vgpu_protocol::decode::render::decode(&framed).expect("the descriptor lifts")
+    else {
+        panic!("0x1a lifted as something other than a pass descriptor");
+    };
+    assert_eq!(d.descriptor.color[0].prefix.texture_ref.get(), 41);
+    assert_eq!(d.descriptor.color[1].prefix.texture_ref.get(), 42);
 }
 
 /// An indexed draw whose record named no index buffer says so.
@@ -691,7 +702,7 @@ fn an_indexed_draw_with_no_index_buffer_is_named() {
 /// behaviour) and the refusal is now named.
 #[test]
 fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
-    use crate::runtime::decode::render::{
+    use crate::runtime::render_pass::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
         PASS_ATTACH_TEXREF, PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF,
     };
@@ -850,7 +861,7 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
 #[test]
 fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws() {
     use crate::protocol::endian::st32;
-    use crate::runtime::decode::render::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
+    use crate::runtime::render_pass::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
 
     // A full-length record, not the `PASS_MIN_PAYLOAD` one the arms below use:
     // the array length is read only from the whole `RenderPassBody`, and a
@@ -1132,7 +1143,7 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
 #[test]
 fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_draws() {
     use crate::protocol::endian::st32;
-    use crate::runtime::decode::render::{
+    use crate::runtime::render_pass::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
         PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF,
     };
@@ -1774,11 +1785,10 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
 
     apply_binds(
-        &[crate::runtime::decode::render::DecodedBufferBind {
-            buffer_ref: 77,
-            offset: 0,
-            attribute_stride: None,
-        }],
+        // A bare entry, declared here: `apply_binds` is generic over the entry
+        // type precisely so it takes whichever wire shape a record carries, and
+        // this test is about the walk rather than about any one of them.
+        &[(77u32, 0u64)],
         0,
         BindTarget {
             stage: ShaderStage::Vertex,
@@ -1790,12 +1800,11 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
             refused: &mut acc.unrepresentable,
         },
         |b| b.index,
-        |index, b: &crate::runtime::decode::render::DecodedBufferBind| {
+        |index, (buffer_ref, offset): &(u32, u64)| {
             Some(BufferBind {
                 index,
-                buffer_ref: b.buffer_ref,
-                offset: b.offset,
-                attribute_stride: b.attribute_stride,
+                buffer_ref: *buffer_ref,
+                offset: *offset,
                 ..Default::default()
             })
         },
@@ -1838,12 +1847,12 @@ fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse(
     };
     put_buffer(&mut host, &state, 5, 0x1000);
 
-    let total = OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
+    let total = OP_HEADER_LEN + render_pass::BIND_ENTRIES + render_pass::BUFFER_BIND_ENTRY_SIZE;
     let mut bind = vec![0u8; total];
     st32(&mut bind, wire_render::OPCODE_SET_VERTEX_BUFFER);
     st32(&mut bind[4..], total as u32);
-    st32(&mut bind[OP_HEADER_LEN + render::BIND_COUNT..], 1);
-    st32(&mut bind[OP_HEADER_LEN + render::BIND_ENTRIES..], 7);
+    st32(&mut bind[OP_HEADER_LEN + render_pass::BIND_COUNT..], 1);
+    st32(&mut bind[OP_HEADER_LEN + render_pass::BIND_ENTRIES..], 7);
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
         pipeline_ref: 61,
@@ -1863,12 +1872,12 @@ fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse(
         .clone()
         .expect("setter retain");
 
-    let offset_total = OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
+    let offset_total = OP_HEADER_LEN + render_pass::BUFFER_OFFSET_PAYLOAD_LEN;
     let mut offset = vec![0u8; offset_total];
     st32(&mut offset, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET);
     st32(&mut offset[4..], offset_total as u32);
     st64(
-        &mut offset[OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+        &mut offset[OP_HEADER_LEN + render_pass::BUFFER_OFFSET_VALUE..],
         0x80,
     );
     handle_render_record(
@@ -1918,12 +1927,12 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
         9,
         Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
     );
-    let total = OP_HEADER_LEN + render::BIND_ENTRIES + 4;
+    let total = OP_HEADER_LEN + render_pass::BIND_ENTRIES + 4;
     let mut command = vec![0u8; total];
     st32(&mut command, wire_render::OPCODE_SET_FRAGMENT_TEXTURE);
     st32(&mut command[4..], total as u32);
-    st32(&mut command[OP_HEADER_LEN + render::BIND_COUNT..], 1);
-    st32(&mut command[OP_HEADER_LEN + render::BIND_ENTRIES..], 9);
+    st32(&mut command[OP_HEADER_LEN + render_pass::BIND_COUNT..], 1);
+    st32(&mut command[OP_HEADER_LEN + render_pass::BIND_ENTRIES..], 9);
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
     handle_render_record(
@@ -1980,12 +1989,27 @@ fn accepted_render_without_executor_is_fail_visible() {
     };
     let task_id = 0xfeed;
     let mut command = vec![0u8; OP_HEADER_LEN];
-    // An opcode inside the encoder's range that no arm claims, found rather than named. It used to
-    // be `wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`, which stopped working the moment
-    // that bound was corrected to `0xa6` -- because `0xa6` is a record this rail now decodes.
-    // `0x99` was the replacement and lasted one commit, until `setVertexAmplificationMode:value:`
-    // turned out to be that number. The catch-all is what is under test, not any literal.
-    let op = render::unclaimed_accepted_opcode();
+    // An opcode no decoder on this rail claims, found rather than named. It has
+    // been three different literals over this test's life — each stopped working
+    // the moment that number turned out to be a record — so it is searched for
+    // against the two predicates that decide the routing: no `RenderKind` names
+    // it and `render_spi` does not own it.
+    //
+    // What is under test is the `ErrUnknownOpcode` arm, which is the successor
+    // to the decoder's `OtherAccepted` catch-all and keeps its line and its wire
+    // capture. The old `unclaimed_accepted_opcode` searched inside an "accepted
+    // window" that no longer exists.
+    let op = (0x00..0x400u32)
+        .find(|op| {
+            reims_vgpu_protocol::render::RenderKind::of_opcode(*op).is_none()
+                && !crate::runtime::decode::render_spi::is_unsettled(*op)
+                && reims_vgpu_protocol::closure::find(
+                    reims_vgpu_protocol::closure::Rail::Render,
+                    *op,
+                )
+                .is_none()
+        })
+        .expect("some opcode in the render space is claimed by no decoder");
     st32(&mut command[0..], op);
     st32(&mut command[4..], OP_HEADER_LEN as u32);
     handle_render_record(&mut state, &host, task_id, op, &command, &mut out, &mut acc);
@@ -2186,8 +2210,8 @@ fn clear_only_backing_surface_writes_guest_pages() {
     use crate::protocol::endian::{st32, st64};
     use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
+    use crate::runtime::render_pass::ColorAttachment;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2266,7 +2290,7 @@ fn clear_only_backing_surface_writes_guest_pages() {
 /// keep CLEAR as private Metal seed (no pre-draw guest clear).
 #[test]
 fn finish_stream_clear_only_branch_without_draws() {
-    use crate::runtime::decode::render::ColorAttachment;
+    use crate::runtime::render_pass::ColorAttachment;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
@@ -2467,8 +2491,8 @@ fn clear_only_rg16uint_publishes_native_linear_gva_rows() {
 
 #[test]
 fn finish_stream_with_draws_skips_guest_clear_prelude() {
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
+    use crate::runtime::render_pass::ColorAttachment;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
@@ -2536,9 +2560,9 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
 fn nometal_draw_falls_back_to_backing_clear() {
     use crate::protocol::endian::{st32, st64};
     use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
     use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
+    use crate::runtime::render_pass::ColorAttachment;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2915,8 +2939,8 @@ fn a_store_action_override_reaches_the_slot_it_names() {
 /// the wrong one cannot pass.
 #[test]
 fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
-    use crate::runtime::decode::render::StencilAttachment;
     use crate::runtime::drain::store_route_count;
+    use crate::runtime::render_pass::StencilAttachment;
     use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -3047,8 +3071,8 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
     ];
     let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
     let total = reims_vgpu_wire::OP_HEADER_LEN
-        + render::SCISSOR_RECTS_COUNT_LEN
-        + rects.len() * render::SCISSOR_PAYLOAD_LEN;
+        + render_pass::SCISSOR_RECTS_COUNT_LEN
+        + rects.len() * render_pass::SCISSOR_PAYLOAD_LEN;
     let mut command = vec![0u8; total];
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
@@ -3056,9 +3080,9 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
         &mut command[reims_vgpu_wire::OP_HEADER_LEN..],
         rects.len() as u64,
     );
-    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
+    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render_pass::SCISSOR_RECTS_COUNT_LEN;
     for (n, r) in rects.iter().enumerate() {
-        let at = e0 + n * render::SCISSOR_PAYLOAD_LEN;
+        let at = e0 + n * render_pass::SCISSOR_PAYLOAD_LEN;
         for (i, val) in [r.x, r.y, r.width, r.height].into_iter().enumerate() {
             st64(&mut command[at + i * 8..], u64::from(val));
         }
@@ -3073,7 +3097,7 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
 
     // The singular opcode is the same record at length one, and replaces the
     // array rather than appending to it.
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_PAYLOAD_LEN;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::SCISSOR_PAYLOAD_LEN;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_SCISSOR;
     st32(&mut command[0..], op);
@@ -3123,17 +3147,17 @@ fn an_empty_rect_in_a_plural_scissor_record_keeps_the_previous_state() {
     // Two rects, the second of them zero-width.
     let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
     let total = reims_vgpu_wire::OP_HEADER_LEN
-        + render::SCISSOR_RECTS_COUNT_LEN
-        + 2 * render::SCISSOR_PAYLOAD_LEN;
+        + render_pass::SCISSOR_RECTS_COUNT_LEN
+        + 2 * render_pass::SCISSOR_PAYLOAD_LEN;
     let mut command = vec![0u8; total];
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 2);
-    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
+    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render_pass::SCISSOR_RECTS_COUNT_LEN;
     for (i, val) in [11u64, 22, 33, 44].into_iter().enumerate() {
         st64(&mut command[e0 + i * 8..], val);
     }
-    let e1 = e0 + render::SCISSOR_PAYLOAD_LEN;
+    let e1 = e0 + render_pass::SCISSOR_PAYLOAD_LEN;
     for (i, val) in [55u64, 66, 0, 88].into_iter().enumerate() {
         st64(&mut command[e1 + i * 8..], val);
     }
@@ -3171,29 +3195,36 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
 
     // Past Apple's own table, which is the only way to reach this bound now.
     const COUNT: u32 = MAX_TEXTURE_BIND_SLOTS + 9;
-    let entry = render::REF_BIND_ENTRY_SIZE;
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
+    let entry = render_pass::REF_BIND_ENTRY_SIZE;
+    let total =
+        reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + (COUNT as usize) * entry;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         0,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         COUNT,
     );
     for i in 0..COUNT as usize {
-        let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
+        let at = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + i * entry;
         st32(&mut command[at..], 0x4000 + i as u32);
     }
 
-    // The record itself must survive decode; a cap that refused it whole is
+    // The record itself must survive the lift; a cap that refused it whole is
     // what this counter exists to distinguish from.
-    let c = render::decode(&command).expect("an over-table texture run must decode");
-    assert_eq!(c.ref_binds.len(), COUNT as usize);
+    let framed = reims_vgpu_protocol::decode::op(&command, 0).expect("the record frames");
+    let reims_vgpu_protocol::decode::render::RenderRecord::BindTextures(bind) =
+        reims_vgpu_protocol::decode::render::decode(&framed)
+            .expect("an over-table texture run must lift")
+    else {
+        panic!("a texture bind lifted as another record");
+    };
+    assert_eq!(bind.entries.len(), COUNT as usize);
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
@@ -3297,22 +3328,22 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
     const FIRST: u32 = 20;
     const { assert!(FIRST >= bind_limit::SAMPLER && FIRST < MAX_SAMPLER_BIND_SLOTS) };
 
-    let entry = render::REF_BIND_ENTRY_SIZE;
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + entry;
+    let entry = render_pass::REF_BIND_ENTRY_SIZE;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + entry;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_VERTEX_SAMPLER;
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         FIRST,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         1,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES..],
         0x3333,
     );
 
@@ -3363,22 +3394,23 @@ fn a_texture_bind_past_the_old_band_binds_and_keeps_its_own_descriptor() {
     const COUNT: u32 = 4;
     const { assert!(FIRST >= 32 && FIRST + COUNT <= bind_limit::TEXTURE) };
 
-    let entry = render::REF_BIND_ENTRY_SIZE;
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
+    let entry = render_pass::REF_BIND_ENTRY_SIZE;
+    let total =
+        reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + (COUNT as usize) * entry;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         FIRST,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         COUNT,
     );
     for i in 0..COUNT as usize {
-        let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
+        let at = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + i * entry;
         st32(&mut command[at..], 0x9000 + i as u32);
     }
 
@@ -3429,21 +3461,22 @@ fn the_last_texture_slot_binds_where_the_same_buffer_slot_does_not() {
     const { assert!(LAST_TEXTURE >= MAX_BUFFER_BIND_SLOTS) };
 
     let one_bind = |op: u32, first: u32, obj: u32| {
-        let total =
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE;
+        let total = reims_vgpu_wire::OP_HEADER_LEN
+            + render_pass::BIND_ENTRIES
+            + render_pass::REF_BIND_ENTRY_SIZE;
         let mut command = vec![0u8; total];
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
             first,
         );
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
             1,
         );
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES..],
             obj,
         );
         command
@@ -3513,23 +3546,23 @@ fn every_bind_record_lands_in_one_reach_band_and_the_top_one_reconciles() {
     use reims_vgpu_wire::ops::bind_limit;
 
     let texture_record = |first: u32, count: u32| {
-        let entry = render::REF_BIND_ENTRY_SIZE;
+        let entry = render_pass::REF_BIND_ENTRY_SIZE;
         let total =
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (count as usize) * entry;
+            reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + (count as usize) * entry;
         let mut command = vec![0u8; total];
         let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
             first,
         );
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
             count,
         );
         for i in 0..count as usize {
-            let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
+            let at = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + i * entry;
             st32(&mut command[at..], 0x4000 + i as u32);
         }
         (op, command)
@@ -3705,15 +3738,15 @@ fn a_sampler_bind_carries_its_own_lod_clamps_per_slot() {
     let head = OP_HEADER_LEN;
 
     // Head (first, count) then two 12-byte entries: ref, lodMin, lodMax.
-    let entry = render::SAMPLER_LOD_BIND_ENTRY_SIZE;
-    let total = head + render::BIND_ENTRIES + 2 * entry;
+    let entry = render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE;
+    let total = head + render_pass::BIND_ENTRIES + 2 * entry;
     let op = wire_render::OPCODE_SET_FRAGMENT_SAMPLER_LOD;
     let mut command = vec![0u8; total];
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
-    st32(&mut command[head + render::BIND_FIRST..], 2);
-    st32(&mut command[head + render::BIND_COUNT..], 2);
-    let e0 = head + render::BIND_ENTRIES;
+    st32(&mut command[head + render_pass::BIND_FIRST..], 2);
+    st32(&mut command[head + render_pass::BIND_COUNT..], 2);
+    let e0 = head + render_pass::BIND_ENTRIES;
     st32(&mut command[e0..], 0x51);
     st32(&mut command[e0 + 4..], 0.25f32.to_bits());
     st32(&mut command[e0 + 8..], 0.75f32.to_bits());
@@ -3748,14 +3781,14 @@ fn a_sampler_bind_carries_its_own_lod_clamps_per_slot() {
     // The plain bind carries no clamps, and `None` there is not `(0.0, 0.0)`:
     // it means the sampler object's own range stands.
     let mut acc = StreamAccum::default();
-    let total = head + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE;
+    let total = head + render_pass::BIND_ENTRIES + render_pass::REF_BIND_ENTRY_SIZE;
     let op = wire_render::OPCODE_SET_FRAGMENT_SAMPLER;
     let mut command = vec![0u8; total];
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
-    st32(&mut command[head + render::BIND_FIRST..], 0);
-    st32(&mut command[head + render::BIND_COUNT..], 1);
-    st32(&mut command[head + render::BIND_ENTRIES..], 0x51);
+    st32(&mut command[head + render_pass::BIND_FIRST..], 0);
+    st32(&mut command[head + render_pass::BIND_COUNT..], 1);
+    st32(&mut command[head + render_pass::BIND_ENTRIES..], 0x51);
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
     let binds: Vec<_> = acc.fragment_samplers.as_ref().clone();
     assert_eq!(binds.len(), 1);
@@ -4063,17 +4096,17 @@ fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
     // index:u32 @0, offset:u64 @4 — a different payload shape from the plural
     // binds, which is why it takes its own offsets rather than `BIND_*`.
     let offset_record = |index: u32| {
-        let total = reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
+        let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BUFFER_OFFSET_PAYLOAD_LEN;
         let mut command = vec![0u8; total];
         let op = wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET;
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_INDEX..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BUFFER_OFFSET_INDEX..],
             index,
         );
         st64(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BUFFER_OFFSET_VALUE..],
             0x5555,
         );
         (op, command)
@@ -4340,8 +4373,8 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
     use crate::protocol::endian::st64;
 
     let total = reims_vgpu_wire::OP_HEADER_LEN
-        + render::BIND_ENTRIES
-        + render::BUFFER_STRIDE_BIND_ENTRY_SIZE;
+        + render_pass::BIND_ENTRIES
+        + render_pass::BUFFER_STRIDE_BIND_ENTRY_SIZE;
     let mut command = vec![0u8; total];
     st32(
         &mut command[0..],
@@ -4349,14 +4382,14 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
     );
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         4,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         1,
     );
-    let e = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES;
+    let e = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES;
     st32(&mut command[e..], 5151);
     st64(&mut command[e + 4..], 0x2345);
     st64(&mut command[e + 12..], 0x3456);
@@ -4394,17 +4427,18 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
     // The plain bind carries no stride table, and `None` is not `Some(0)`: a
     // zero stride is a legal Metal request that fetches every vertex from one
     // address, so the two cannot share a spelling.
-    let plain_total =
-        reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
+    let plain_total = reims_vgpu_wire::OP_HEADER_LEN
+        + render_pass::BIND_ENTRIES
+        + render_pass::BUFFER_BIND_ENTRY_SIZE;
     let mut plain = vec![0u8; plain_total];
     st32(&mut plain[0..], wire_render::OPCODE_SET_VERTEX_BUFFER);
     st32(&mut plain[4..], plain_total as u32);
     st32(
-        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         1,
     );
     st32(
-        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES..],
         5151,
     );
     handle_render_record(
@@ -4482,8 +4516,8 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         (
             wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
             reims_vgpu_wire::OP_HEADER_LEN
-                + render::AMPLIFICATION_COUNT_LEN
-                + 2 * render::AMPLIFICATION_MAPPING_SIZE,
+                + render_pass::AMPLIFICATION_COUNT_LEN
+                + 2 * render_pass::AMPLIFICATION_MAPPING_SIZE,
             // Two views. One is Metal's default and means no amplification,
             // so the default arm below asks for one and must not count.
             |p| st32(p, 2),
@@ -4508,10 +4542,12 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         // arm would have to have accepted the wrong length first.
         (
             wire_tile::OPCODE_SET_TILE_BUFFER,
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE,
+            reims_vgpu_wire::OP_HEADER_LEN
+                + render_pass::BIND_ENTRIES
+                + render_pass::BUFFER_BIND_ENTRY_SIZE,
             |p| {
-                st32(&mut p[render::BIND_FIRST..], 3);
-                st32(&mut p[render::BIND_COUNT..], 1);
+                st32(&mut p[render_pass::BIND_FIRST..], 3);
+                st32(&mut p[render_pass::BIND_COUNT..], 1);
             },
             None,
             "render_tile_buffer_bind_dropped",
@@ -4528,20 +4564,24 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         ),
         (
             wire_tile::OPCODE_SET_TILE_TEXTURE,
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+            reims_vgpu_wire::OP_HEADER_LEN
+                + render_pass::BIND_ENTRIES
+                + render_pass::REF_BIND_ENTRY_SIZE,
             |p| {
-                st32(&mut p[render::BIND_FIRST..], 2);
-                st32(&mut p[render::BIND_COUNT..], 1);
+                st32(&mut p[render_pass::BIND_FIRST..], 2);
+                st32(&mut p[render_pass::BIND_COUNT..], 1);
             },
             None,
             "render_tile_texture_bind_dropped",
         ),
         (
             wire_tile::OPCODE_SET_TILE_SAMPLER,
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+            reims_vgpu_wire::OP_HEADER_LEN
+                + render_pass::BIND_ENTRIES
+                + render_pass::REF_BIND_ENTRY_SIZE,
             |p| {
-                st32(&mut p[render::BIND_FIRST..], 4);
-                st32(&mut p[render::BIND_COUNT..], 1);
+                st32(&mut p[render_pass::BIND_FIRST..], 4);
+                st32(&mut p[render_pass::BIND_COUNT..], 1);
             },
             None,
             "render_tile_sampler_bind_dropped",
@@ -4549,11 +4589,11 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         (
             wire_tile::OPCODE_SET_TILE_SAMPLER_LOD,
             reims_vgpu_wire::OP_HEADER_LEN
-                + render::BIND_ENTRIES
-                + render::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                + render_pass::BIND_ENTRIES
+                + render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE,
             |p| {
-                st32(&mut p[render::BIND_FIRST..], 5);
-                st32(&mut p[render::BIND_COUNT..], 1);
+                st32(&mut p[render_pass::BIND_FIRST..], 5);
+                st32(&mut p[render_pass::BIND_COUNT..], 1);
             },
             None,
             "render_tile_sampler_bind_dropped",
@@ -4992,22 +5032,22 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
     assert!(acc.bind_snapshot().is_ok());
 
     // One buffer bind whose whole run sits past the table.
-    let entry = render::BUFFER_BIND_ENTRY_SIZE;
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + entry;
+    let entry = render_pass::BUFFER_BIND_ENTRY_SIZE;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + entry;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         FIRST,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         1,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES..],
         0x4444,
     );
     {
@@ -5062,8 +5102,8 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
 /// be wrong. So this drives the case the reasoning does not cover.
 #[test]
 fn a_buffer_offset_past_the_table_refuses_the_stream() {
-    use crate::runtime::decode::render::{BUFFER_OFFSET_INDEX, BUFFER_OFFSET_PAYLOAD_LEN};
     use crate::runtime::drain::store_route_count;
+    use crate::runtime::render_pass::{BUFFER_OFFSET_INDEX, BUFFER_OFFSET_PAYLOAD_LEN};
 
     const FIRST: u32 = MAX_BUFFER_BIND_SLOTS + 1;
 
@@ -5404,7 +5444,7 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
 /// without restoring the seed leaves the original bug.
 #[test]
 fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
-    use crate::runtime::decode::render::{
+    use crate::runtime::render_pass::{
         PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
         PASS_COLOR_ATTACH_OFF,
     };
@@ -5819,7 +5859,6 @@ fn a_ledger_row_the_rail_cannot_honour_reports_the_disagreement() {
 /// right number of views into the wrong slice.
 #[test]
 fn a_view_mapping_that_offsets_a_view_is_named_apart_from_a_count_above_one() {
-    use crate::runtime::decode::render;
     use crate::runtime::drain::store_route_count;
 
     let record = |count: u32, viewport: u32, render_target: u32| {
@@ -5844,7 +5883,8 @@ fn a_view_mapping_that_offsets_a_view_is_named_apart_from_a_count_above_one() {
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
-        render::decode(&command).expect("a well-formed amplification count decodes");
+        crate::runtime::decode::render_spi::decode(&command)
+            .expect("a well-formed amplification count decodes");
         handle_render_record(
             &mut state,
             &host,
@@ -5914,9 +5954,8 @@ fn a_view_mapping_that_offsets_a_view_is_named_apart_from_a_count_above_one() {
 /// axis the regression ran along.
 #[test]
 fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one() {
-    use crate::runtime::decode::render;
     use crate::runtime::drain::store_route_count;
-    use reims_vgpu_protocol::residency::ResourceUsage;
+    use crate::runtime::render_pass;
 
     // Each form's refs start at its own offset — the heads are three different
     // sizes — so the record is built from the decoder's own constants rather
@@ -5927,7 +5966,7 @@ fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one(
         st32(&mut v[0..], op);
         st32(&mut v[4..], total as u32);
         st32(
-            &mut v[reims_vgpu_wire::OP_HEADER_LEN + render::RESIDENCY_COUNT..],
+            &mut v[reims_vgpu_wire::OP_HEADER_LEN + render_pass::RESIDENCY_COUNT..],
             1,
         );
         v
@@ -5936,33 +5975,48 @@ fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one(
     let forms = [
         (
             wire_render::OPCODE_USE_RESOURCE,
-            render::USE_RESOURCE_REFS,
+            render_pass::USE_RESOURCE_REFS,
             "render_residency_empty",
         ),
         (
             wire_render::OPCODE_USE_HEAP,
-            render::USE_HEAP_REFS,
+            render_pass::USE_HEAP_REFS,
             "render_residency_heap",
         ),
         (
             wire_render::OPCODE_USE_RESOURCES_NO_STAGES,
-            render::USE_RESOURCES_NO_STAGES_REFS,
+            render_pass::USE_RESOURCES_NO_STAGES_REFS,
             "render_residency_empty",
         ),
         (
             wire_render::OPCODE_USE_HEAPS_NO_STAGES,
-            render::USE_HEAPS_NO_STAGES_REFS,
+            render_pass::USE_HEAPS_NO_STAGES_REFS,
             "render_residency_heap",
         ),
     ];
 
     for (op, refs_at, route) in forms {
         let command = record(op, refs_at);
-        let decoded = render::decode(&command).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
-        assert_eq!(
-            decoded.residency_usage,
-            ResourceUsage(0),
-            "op {op:#x}: the fixture declares no usage"
+        let framed = reims_vgpu_protocol::decode::op(&command, 0)
+            .unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
+        // `lift`, not `decode`: every residency row is unsettled, so `decode`
+        // refuses it on principle and the layout question is this one.
+        let decoded = reims_vgpu_protocol::decode::residency::lift(
+            reims_vgpu_protocol::closure::Rail::Render,
+            &framed,
+        )
+        .unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
+        // The `useResource` forms carry a usage argument and this fixture
+        // writes zero into it; the `useHeap` forms carry none at all. Those are
+        // different records and `Option` is what keeps them apart — which is
+        // the whole point of the field, so the assertion is written to allow
+        // both rather than to pick one.
+        assert!(
+            decoded
+                .usage
+                .is_none_or(|u| u == reims_vgpu_protocol::residency::ResourceUsage(0)),
+            "op {op:#x}: the fixture declares no usage and the lift read {:?}",
+            decoded.usage
         );
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -5999,14 +6053,14 @@ fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one(
 /// case additionally reaches the always-on channel with the declaration on it.
 #[test]
 fn a_residency_write_declaration_is_named_rather_than_counted_with_the_reads() {
-    use crate::runtime::decode::render;
     use crate::runtime::drain::store_route_count;
+    use crate::runtime::render_pass;
     use reims_vgpu_protocol::residency::{RenderStages, ResourceUsage};
 
     // `useResource:usage:stages:`: count at +0, usage and stages as two u16
     // sharing the word at +4, refs from +8.
     let record = |usage: u16, stages: u16| {
-        let total = reims_vgpu_wire::OP_HEADER_LEN + render::USE_RESOURCE_REFS + 4;
+        let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::USE_RESOURCE_REFS + 4;
         let mut v = vec![0u8; total];
         st32(&mut v[0..], wire_render::OPCODE_USE_RESOURCE);
         st32(&mut v[4..], total as u32);
@@ -6018,21 +6072,20 @@ fn a_residency_write_declaration_is_named_rather_than_counted_with_the_reads() {
         v
     };
 
-    let decoded = render::decode(&record(
-        ResourceUsage::WRITE as u16,
-        RenderStages::FRAGMENT as u16,
-    ))
-    .expect("a well-formed useResource decodes");
+    let bytes = record(ResourceUsage::WRITE as u16, RenderStages::FRAGMENT as u16);
+    let framed = reims_vgpu_protocol::decode::op(&bytes, 0).expect("the record frames");
+    let decoded = reims_vgpu_protocol::decode::residency::lift(
+        reims_vgpu_protocol::closure::Rail::Render,
+        &framed,
+    )
+    .expect("a well-formed useResource lifts");
     assert_eq!(
-        decoded.residency_usage,
-        ResourceUsage(ResourceUsage::WRITE),
-        "the usage half must survive decode — it is what decides whether \
+        decoded.usage,
+        Some(ResourceUsage(ResourceUsage::WRITE)),
+        "the usage half must survive the lift — it is what decides whether \
          answering by doing nothing is sound"
     );
-    assert_eq!(
-        decoded.residency_stages,
-        RenderStages(RenderStages::FRAGMENT)
-    );
+    assert_eq!(decoded.stages, Some(RenderStages(RenderStages::FRAGMENT)));
 
     let run = |usage: u16, stages: u16| {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -6932,13 +6985,13 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
 
     // `first`, `count`, then `count` entries of `entry_len` bytes.
     let bind = |op: u32, first: u32, entry_len: usize, entry: &[u8]| {
-        let total = HEAD + render::BIND_ENTRIES + entry_len;
+        let total = HEAD + render_pass::BIND_ENTRIES + entry_len;
         let mut v = vec![0u8; total];
         st32(&mut v[0..], op);
         st32(&mut v[4..], total as u32);
-        st32(&mut v[HEAD + render::BIND_FIRST..], first);
-        st32(&mut v[HEAD + render::BIND_COUNT..], 1);
-        v[HEAD + render::BIND_ENTRIES..HEAD + render::BIND_ENTRIES + entry.len()]
+        st32(&mut v[HEAD + render_pass::BIND_FIRST..], first);
+        st32(&mut v[HEAD + render_pass::BIND_COUNT..], 1);
+        v[HEAD + render_pass::BIND_ENTRIES..HEAD + render_pass::BIND_ENTRIES + entry.len()]
             .copy_from_slice(entry);
         v
     };
@@ -6952,25 +7005,25 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
     };
 
     let buffer_entry = {
-        let mut e = vec![0u8; render::BUFFER_BIND_ENTRY_SIZE];
+        let mut e = vec![0u8; render_pass::BUFFER_BIND_ENTRY_SIZE];
         st32(&mut e[0..], 5151);
         st64(&mut e[4..], 0x100);
         e
     };
     let buffer_stride_entry = {
-        let mut e = vec![0u8; render::BUFFER_STRIDE_BIND_ENTRY_SIZE];
+        let mut e = vec![0u8; render_pass::BUFFER_STRIDE_BIND_ENTRY_SIZE];
         st32(&mut e[0..], 5151);
         st64(&mut e[4..], 0x100);
         st64(&mut e[12..], 0x20);
         e
     };
     let ref_entry = {
-        let mut e = vec![0u8; render::REF_BIND_ENTRY_SIZE];
+        let mut e = vec![0u8; render_pass::REF_BIND_ENTRY_SIZE];
         st32(&mut e[0..], 0x51);
         e
     };
     let sampler_lod_entry = {
-        let mut e = vec![0u8; render::SAMPLER_LOD_BIND_ENTRY_SIZE];
+        let mut e = vec![0u8; render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE];
         st32(&mut e[0..], 0x51);
         st32(&mut e[4..], 0.5f32.to_bits());
         st32(&mut e[8..], 4.0f32.to_bits());
@@ -7016,7 +7069,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             bind(
                 wire_r::OPCODE_SET_VERTEX_BUFFER,
                 0,
-                render::BUFFER_BIND_ENTRY_SIZE,
+                render_pass::BUFFER_BIND_ENTRY_SIZE,
                 &buffer_entry,
             ),
             VB,
@@ -7027,7 +7080,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             bind(
                 wire_r::OPCODE_SET_VERTEX_BUFFER_STRIDE,
                 0,
-                render::BUFFER_STRIDE_BIND_ENTRY_SIZE,
+                render_pass::BUFFER_STRIDE_BIND_ENTRY_SIZE,
                 &buffer_stride_entry,
             ),
             VB,
@@ -7038,7 +7091,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             bind(
                 wire_r::OPCODE_SET_FRAGMENT_BUFFER,
                 0,
-                render::BUFFER_BIND_ENTRY_SIZE,
+                render_pass::BUFFER_BIND_ENTRY_SIZE,
                 &buffer_entry,
             ),
             FB,
@@ -7049,7 +7102,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             bind(
                 wire_r::OPCODE_SET_VERTEX_TEXTURE,
                 0,
-                render::REF_BIND_ENTRY_SIZE,
+                render_pass::REF_BIND_ENTRY_SIZE,
                 &ref_entry,
             ),
             VT,
@@ -7060,7 +7113,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             bind(
                 wire_r::OPCODE_SET_FRAGMENT_TEXTURE,
                 0,
-                render::REF_BIND_ENTRY_SIZE,
+                render_pass::REF_BIND_ENTRY_SIZE,
                 &ref_entry,
             ),
             FT,
@@ -7071,7 +7124,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             bind(
                 wire_r::OPCODE_SET_VERTEX_SAMPLER,
                 0,
-                render::REF_BIND_ENTRY_SIZE,
+                render_pass::REF_BIND_ENTRY_SIZE,
                 &ref_entry,
             ),
             VS,
@@ -7082,7 +7135,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             bind(
                 wire_r::OPCODE_SET_FRAGMENT_SAMPLER,
                 0,
-                render::REF_BIND_ENTRY_SIZE,
+                render_pass::REF_BIND_ENTRY_SIZE,
                 &ref_entry,
             ),
             FS,
@@ -7093,7 +7146,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             bind(
                 wire_r::OPCODE_SET_VERTEX_SAMPLER_LOD,
                 0,
-                render::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE,
                 &sampler_lod_entry,
             ),
             VS,
@@ -7104,7 +7157,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
             bind(
                 wire_r::OPCODE_SET_FRAGMENT_SAMPLER_LOD,
                 0,
-                render::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE,
                 &sampler_lod_entry,
             ),
             FS,
@@ -7191,7 +7244,7 @@ fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
 /// the bytes.
 #[test]
 fn a_pass_descriptor_short_of_its_record_is_refused_rather_than_read_at_the_offsets_that_fit() {
-    use crate::runtime::decode::render::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
+    use crate::runtime::render_pass::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
 
     let pass = |payload_len: usize| {
         let mut payload = vec![0u8; payload_len];
@@ -7254,9 +7307,9 @@ fn a_pass_descriptor_short_of_its_record_is_refused_rather_than_read_at_the_offs
 /// publishes to guest pages with nothing on any channel to say so.
 #[test]
 fn each_store_action_override_reaches_the_attachment_its_target_names() {
-    use crate::runtime::decode::render::{PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF};
-    use crate::runtime::decode::render::{PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE};
-    use crate::runtime::decode::render::{PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF};
+    use crate::runtime::render_pass::{PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF};
+    use crate::runtime::render_pass::{PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE};
+    use crate::runtime::render_pass::{PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF};
     use reims_vgpu_wire::ops::render as wire_r;
 
     // A pass declaring colour slots 0 and 3, a depth and a stencil attachment,

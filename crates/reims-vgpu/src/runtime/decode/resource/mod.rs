@@ -4118,7 +4118,7 @@ const MAX_COLOR_ATTACHMENTS: usize = 8;
 // two sides part at compile time instead of this one refusing pipeline
 // descriptors the pass decoder happily accepts.
 const _: () =
-    assert!(MAX_COLOR_ATTACHMENTS == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
+    assert!(MAX_COLOR_ATTACHMENTS == crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS);
 
 /// Parse all color-attachment entries.
 ///
