@@ -48,7 +48,10 @@
 //! given:
 //!
 //! - **Exec** needs the object-list resolver and the access source that
-//!   [`reims_vgpu_core::walk::exec`] walks a command stream with.
+//!   [`reims_vgpu_core::walk::exec`] walks a command stream with. Both exist in
+//!   the model; neither exists in this device, because both are
+//!   `reims_vgpu_core::lifecycle::Lifecycle`'s and it is not production state
+//!   yet. See [`Gap::ExecResolution`].
 //! - **Resource lifetime** is down to one. Eleven of the twelve build a
 //!   payload: five name no resource, five name resources and state what they do
 //!   to them — `reims_vgpu_core::lifecycle::LifecycleOp::declared_access` is the
@@ -164,6 +167,22 @@ pub enum Gap {
     Unresolved,
     /// The object-list resolver and the access source an EXEC's command stream
     /// is walked with.
+    ///
+    /// # Nothing is missing on the model's side, and that is worth stating
+    ///
+    /// `reims_vgpu_core::walk::exec` needs two things and both exist:
+    /// a `RefResolver`, which `resolve::InTask` binds out of the
+    /// `TaskNamespaces` `reims_vgpu_core::lifecycle::Lifecycle` now implements,
+    /// and an `AccessSource`, which is `Lifecycle::task_access` for the packet's
+    /// own task and domain.
+    ///
+    /// The word in `AccessSource`'s own doc is the whole of what is left:
+    /// there is *exactly one* implementation with the terms, and it is
+    /// `Lifecycle` — which owns names, heaps and content authority together, and
+    /// which this device does not hold. So this gap does not close by adding a
+    /// resolver, a door or a translation. It closes when `Lifecycle` becomes
+    /// production state, which is the resource-lifecycle group's cutover, and
+    /// not before it.
     ExecResolution,
     /// The pages behind a re-pointed object, which its packet does not carry.
     ///
