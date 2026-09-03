@@ -33,6 +33,11 @@
 //!   only door. A `[[test]]` or `[[bin]]` with `path = "src/dead/…"` compiles
 //!   and links the file as its own crate root, which is a second semantic model
 //!   that the whole `src/` walk would report as clean.
+//! * **Every function the register names still exists.** A row's last column
+//!   names the owner-level tests that replaced the legacy tests moving with
+//!   the group, and those legacy tests stopped running the moment they moved.
+//!   A row naming a test that has since been renamed or deleted is the silent
+//!   coverage loss the rule exists to catch, and prose cannot notice it.
 //! * **Every `dead/` has a `README.md`.** The register is where a move records
 //!   what it replaced and which owner-level tests replaced the legacy tests
 //!   that moved with it. Those tests stop running the moment they move, so a
@@ -255,4 +260,146 @@ fn no_cargo_target_points_into_dead() {
          report as clean, because the module tree is not the only door. \
          Found at: {offenders:?}"
     );
+}
+
+/// Every function the register's replacement-coverage column names is still a
+/// function.
+///
+/// # The row is the only record that the coverage survived
+///
+/// A group's legacy tests move to `dead/` with its source and stop running
+/// there. What replaced them is written in the register and nowhere else — no
+/// build step relates the two — so a row naming
+/// `runtime::exec::tests::a_bounded_event_wait_is_refused_by_contract…` is the
+/// whole evidence that the case is still covered. Rename or delete that test
+/// and the row keeps reading as if it were, which is the exact failure the
+/// rule was written against, arriving in the record that was supposed to
+/// prevent it.
+///
+/// # What counts as a name, and why the rule is that shape
+///
+/// A backticked path with at least one `::` whose last segment is snake_case
+/// with an underscore in it. That is a function in this workspace — a test, a
+/// door, a helper — and it must exist. Type and variant names end in
+/// CamelCase and are skipped; a bare word with no `::` is a census route or a
+/// counter, which this cannot check and does not claim to.
+///
+/// Existence, not location: a path in the register is prose written by a
+/// human, and pinning the module as well would make the check fail on a
+/// correct row whose module was reorganised — a gate that fails on correct
+/// work is a gate that gets weakened.
+#[test]
+fn every_function_the_register_names_still_exists() {
+    let register = workspace_root()
+        .join("crates")
+        .join("reims-vgpu")
+        .join("src")
+        .join("dead")
+        .join("README.md");
+    let text = std::fs::read_to_string(&register).expect("the register is readable");
+
+    let mut named: Vec<String> = Vec::new();
+    let mut rows = 0usize;
+    for line in text.lines() {
+        // The register's five columns; the live-validation table below it has
+        // three and is not about replacement coverage.
+        if !line.starts_with('|') || line.matches('|').count() < 6 || line.starts_with("|---") {
+            continue;
+        }
+        let Some(column) = line.split('|').nth(5) else {
+            continue;
+        };
+        rows += 1;
+        named.extend(backticked_function_paths(column));
+    }
+    assert!(
+        rows > 5,
+        "only {rows} register rows were parsed, which is too few to have read \
+         the table — a check that inspects nothing passes for the wrong reason"
+    );
+    assert!(
+        named.len() > 10,
+        "only {} names were extracted from {rows} rows",
+        named.len()
+    );
+
+    let defined = defined_function_names();
+    let missing: Vec<&String> = named.iter().filter(|n| !defined.contains(*n)).collect();
+    assert!(
+        missing.is_empty(),
+        "the register names {missing:?}, and no `fn` by that name exists. A row \
+         claiming coverage that has been renamed or deleted is the silent loss \
+         the rule exists to catch: either restore the function, or amend the row \
+         to name what covers the case now"
+    );
+}
+
+/// The snake_case tails of backticked `a::b::c` paths in one register cell.
+fn backticked_function_paths(cell: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in cell.split('`').skip(1).step_by(2) {
+        if !token.contains("::") {
+            continue;
+        }
+        if token
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        {
+            // A type parameter, a field with its type, a lifetime — not a plain
+            // path, and guessing at one is how this check starts failing on
+            // prose.
+            continue;
+        }
+        let last = token.rsplit("::").next().unwrap_or_default();
+        if last.contains('_') && last.chars().all(|c| !c.is_ascii_uppercase()) {
+            out.push(last.to_string());
+        }
+    }
+    out
+}
+
+/// Every `fn` name defined anywhere in the workspace's crates, `dead/`
+/// included — a row may legitimately name a function that moved, as long as it
+/// still exists somewhere to be read.
+fn defined_function_names() -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    let crates = workspace_root().join("crates");
+    for entry in std::fs::read_dir(&crates)
+        .expect("crates/ is readable")
+        .flatten()
+    {
+        walk_all(&entry.path(), &mut files);
+    }
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some(at) = line.find("fn ") else { continue };
+            let rest = &line[at + 3..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+        }
+    }
+    out
+}
+
+fn walk_all(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_all(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
 }

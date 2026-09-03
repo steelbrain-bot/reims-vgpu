@@ -31,7 +31,10 @@ declaration gives that by construction rather than by a flag.
   `mod dead` declaration, a `#[path]` attribute pointing into a `dead/`
   directory, an `include!` splicing a `dead/` file, a Cargo target whose `path`
   points into one, any path naming `dead` from live source, and a `dead/` with
-  no register. Six doors, because the module tree is not the only one: a
+  no register — and it checks that every function a register row's
+  replacement-coverage column names is still a function, because that row is
+  the only record that a moved group's coverage survived and nothing in the
+  build relates the two. Six doors, because the module tree is not the only one: a
   `[[test]]` with `path = "src/dead/…"` compiles and links the file as its own
   crate root while a walk of `src/` reports the tree clean. A convention with no gate is what the amendment was written
   against: `mod dead;` compiles, and the second semantic model it re-links
