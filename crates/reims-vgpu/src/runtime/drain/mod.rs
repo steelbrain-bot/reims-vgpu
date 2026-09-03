@@ -492,6 +492,33 @@ enum RefSpacePopulation {
     Retained,
 }
 
+/// The census route for a destroy whose kind the semantic model cannot name.
+///
+/// A table rather than a format string, for [`RefSpacePopulation::route`]'s
+/// reason: a reader greps these, and a `format!` route is one no grep finds
+/// before it has already been read.
+fn unnamed_kind_route(opcode: u32) -> &'static str {
+    use reims_vgpu_protocol::destroy::DestroyKind as K;
+    match K::of(opcode) {
+        Some(K::Buffer) => "delete_unnamed_buffer",
+        Some(K::Texture) => "delete_unnamed_texture",
+        Some(K::DepthStencilState) => "delete_unnamed_depth_stencil_state",
+        Some(K::SamplerState) => "delete_unnamed_sampler_state",
+        Some(K::Function) => "delete_unnamed_function",
+        Some(K::ComputePipelineState) => "delete_unnamed_compute_pipeline_state",
+        Some(K::RenderPipelineState) => "delete_unnamed_render_pipeline_state",
+        Some(K::Fence) => "delete_unnamed_fence",
+        Some(K::Heap) => "delete_unnamed_heap",
+        Some(K::RasterizationRateMap) => "delete_unnamed_rasterization_rate_map",
+        Some(K::IndirectCommandBuffer) => "delete_unnamed_indirect_command_buffer",
+        // The opcode is not a destroy at all, which this function's caller
+        // cannot produce — it is reached from the destroy arm alone. Counted
+        // rather than asserted, because a census that panics is one nobody
+        // leaves switched on.
+        None => "delete_unnamed_not_a_destroy",
+    }
+}
+
 /// What the guest's object list held at a destroy record's ref.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RefSpaceAnswer {
@@ -582,7 +609,19 @@ fn note_delete_object_ref_space<M: HostMemory>(
     // guest has cleared its slot. Asked read-only here: `name_resource` would
     // declare, and a census that declared would be answering a question it had
     // just changed.
-    note_store_route(retained.named_route(state.object_name(task_id, object_ref).is_some()));
+    let named = state.object_name(task_id, object_ref).is_some();
+    note_store_route(retained.named_route(named));
+    if !named {
+        // *Which* kinds the model cannot name, which the two counters above do
+        // not say. They are the packets `SessionModel::admit` would refuse with
+        // `UnknownRef`, and closing that population means naming each kind
+        // where it is *constructed* — a different site per kind, and a fix
+        // aimed at the wrong one buys nothing. A driven boot puts the whole
+        // population under twenty against ~2160 destroys, so it is small
+        // enough that guessing its composition from an older reading is how a
+        // session spends two rail edits on four packets.
+        note_store_route(unnamed_kind_route(opcode));
+    }
     let Some(entry) = crate::runtime::objects::lookup_list_entry(state, host, task_id, object_ref)
     else {
         note_store_route(retained.route(RefSpaceAnswer::NoListEntry));
