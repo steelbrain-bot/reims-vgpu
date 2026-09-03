@@ -2270,4 +2270,118 @@ mod device_tests {
             "the ICB participates, at the rung a resource with no bytes has"
         );
     }
+    /// A control packet, long enough for every control command's own layout.
+    fn control_packet(opcode: u16, completion: u32) -> drain::Packet {
+        drain::Packet {
+            opcode,
+            stamp_waits: Vec::new(),
+            total_size: 0,
+            completion_stamp: completion,
+            payload: vec![0u8; 64],
+            next_head: 0,
+        }
+    }
+
+    /// One packet's whole path through the model: built, admitted, released to
+    /// run, completed, published.
+    ///
+    /// **The spine of the cutover.** Each of the four doors already had its own
+    /// test; what this asserts is that they compose on one real device — the
+    /// ordinal `admit_packet` issued is the one `take_ready` hands back and the
+    /// one `complete_transaction` publishes for, and the word the guest may
+    /// then read is the word the packet carried.
+    #[test]
+    fn a_packet_is_built_admitted_released_completed_and_published() {
+        let state = device_with_texture();
+        let host = FakeHost::new();
+        let drained = control_packet(crate::model::ROOT_OP_DEFINE_FIFO, 7);
+
+        let built = device_packet(
+            &state,
+            &host,
+            Fifo::ROOT,
+            SESSION,
+            StampSlot(0),
+            &drained,
+            reads(None),
+        )
+        .expect("a control packet on the root FIFO");
+        let admission = state.admit_packet(&built).expect("the root domain is open");
+        let ingress = admission.admitted.transaction.identity.ingress;
+
+        assert!(
+            admission.admitted.ready,
+            "it waits on nothing, so it may run at once"
+        );
+        assert_eq!(
+            state.take_ready(),
+            vec![ingress],
+            "and it leaves the model by the one door work leaves by"
+        );
+
+        let published = state
+            .complete_transaction(admission.epoch, ingress)
+            .expect("completed under the incarnation it was admitted into");
+        assert_eq!(
+            published
+                .iter()
+                .filter_map(|r| r.stamp)
+                .map(|s| s.value.0)
+                .collect::<Vec<_>>(),
+            vec![7],
+            "the guest may now read the word the packet carried"
+        );
+    }
+
+    /// A channel publishes in its own order, whatever order its work finishes
+    /// in.
+    ///
+    /// The second packet completing first publishes **nothing**: its word is
+    /// held behind the first position's, and both arrive when the first
+    /// completes. That is the property the drain's per-packet latch cannot
+    /// express, and it is why publication moves to the model rather than
+    /// staying a value this device writes when a handler returns.
+    #[test]
+    fn a_channels_words_arrive_in_the_channels_order_and_not_the_hosts() {
+        let state = device_with_texture();
+        let host = FakeHost::new();
+
+        let admit = |completion: u32| {
+            let drained = control_packet(crate::model::ROOT_OP_DEFINE_FIFO, completion);
+            let built = device_packet(
+                &state,
+                &host,
+                Fifo::ROOT,
+                SESSION,
+                StampSlot(0),
+                &drained,
+                reads(None),
+            )
+            .expect("a control packet on the root FIFO");
+            state.admit_packet(&built).expect("the root domain is open")
+        };
+        let first = admit(11);
+        let second = admit(22);
+
+        let out_of_order = state
+            .complete_transaction(second.epoch, second.admitted.transaction.identity.ingress)
+            .expect("live incarnation");
+        assert!(
+            out_of_order.is_empty(),
+            "the second position's word is behind the first's: {out_of_order:?}"
+        );
+
+        let in_order = state
+            .complete_transaction(first.epoch, first.admitted.transaction.identity.ingress)
+            .expect("live incarnation");
+        assert_eq!(
+            in_order
+                .iter()
+                .filter_map(|r| r.stamp)
+                .map(|s| s.value.0)
+                .collect::<Vec<_>>(),
+            vec![11, 22],
+            "and both arrive, in the channel's order"
+        );
+    }
 }

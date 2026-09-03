@@ -36,7 +36,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use reims_vgpu_core::identity::IngressOrdinal;
+use reims_vgpu_core::identity::{DeviceEpoch, IngressOrdinal};
 
 use crate::runtime::drain::Packet;
 use crate::runtime::exec::ExecSubmission;
@@ -54,6 +54,14 @@ pub struct ParkedWork {
     /// execution and its completion word belong to. Carried because the ordinal
     /// alone does not spell it and the model hands back ordinals.
     domain: u32,
+    /// The host device incarnation this packet was admitted into.
+    ///
+    /// Retained rather than looked up at completion, because submission is not
+    /// completion: a device loss ends every position admitted into the lost
+    /// epoch, and a completion that read the *current* epoch would report work
+    /// from a dead incarnation as work from the live one. See
+    /// `crate::model::DeviceState::complete_transaction`.
+    epoch: DeviceEpoch,
     packet: Packet,
     submission: Option<ExecSubmission>,
 }
@@ -61,9 +69,10 @@ pub struct ParkedWork {
 impl ParkedWork {
     /// Retain a packet that names no host-side inputs beyond its own payload.
     #[must_use]
-    pub const fn new(domain: u32, packet: Packet) -> Self {
+    pub const fn new(domain: u32, epoch: DeviceEpoch, packet: Packet) -> Self {
         Self {
             domain,
+            epoch,
             packet,
             submission: None,
         }
@@ -72,9 +81,15 @@ impl ParkedWork {
     /// Retain an exec packet together with the command buffers already read out
     /// of guest memory for it.
     #[must_use]
-    pub const fn with_submission(domain: u32, packet: Packet, submission: ExecSubmission) -> Self {
+    pub const fn with_submission(
+        domain: u32,
+        epoch: DeviceEpoch,
+        packet: Packet,
+        submission: ExecSubmission,
+    ) -> Self {
         Self {
             domain,
+            epoch,
             packet,
             submission: Some(submission),
         }
@@ -83,6 +98,13 @@ impl ParkedWork {
     #[must_use]
     pub const fn domain(&self) -> u32 {
         self.domain
+    }
+
+    /// The incarnation this packet was admitted into, which is the one its
+    /// completion belongs to.
+    #[must_use]
+    pub const fn epoch(&self) -> DeviceEpoch {
+        self.epoch
     }
 
     #[must_use]
@@ -317,6 +339,8 @@ mod tests {
         }
     }
 
+    const EPOCH: DeviceEpoch = DeviceEpoch::FIRST;
+
     const fn ordinal(n: u64) -> IngressOrdinal {
         IngressOrdinal(n)
     }
@@ -327,7 +351,7 @@ mod tests {
         let mut store = ParkedStore::new();
         let mut p = packet(8);
         p.payload[3] = 0xab;
-        store.park(ordinal(1), ParkedWork::new(5, p));
+        store.park(ordinal(1), ParkedWork::new(5, EPOCH, p));
 
         let taken = store
             .release(ordinal(1), Release::Ready)
@@ -340,7 +364,7 @@ mod tests {
     #[test]
     fn a_position_is_taken_out_once() {
         let mut store = ParkedStore::new();
-        store.park(ordinal(2), ParkedWork::new(1, packet(4)));
+        store.park(ordinal(2), ParkedWork::new(1, EPOCH, packet(4)));
 
         assert!(store.release(ordinal(2), Release::Ready).is_some());
         assert!(store.release(ordinal(2), Release::Ready).is_none());
@@ -352,7 +376,7 @@ mod tests {
     #[test]
     fn a_withdrawal_hands_nothing_back() {
         let mut store = ParkedStore::new();
-        store.park(ordinal(3), ParkedWork::new(1, packet(4096)));
+        store.park(ordinal(3), ParkedWork::new(1, EPOCH, packet(4096)));
 
         assert!(store.release(ordinal(3), Release::Withdrawn).is_none());
         assert!(!store.is_parked(ordinal(3)));
@@ -364,8 +388,8 @@ mod tests {
     #[test]
     fn retention_is_counted_up_and_down() {
         let mut store = ParkedStore::new();
-        store.park(ordinal(1), ParkedWork::new(1, packet(1000)));
-        store.park(ordinal(2), ParkedWork::new(1, packet(24)));
+        store.park(ordinal(1), ParkedWork::new(1, EPOCH, packet(1000)));
+        store.park(ordinal(2), ParkedWork::new(1, EPOCH, packet(24)));
         assert_eq!(store.retained_bytes(), 1024);
         assert_eq!(store.peak(), (2, 1024));
 
@@ -381,7 +405,7 @@ mod tests {
     fn everything_dropped_at_once_comes_back_in_order() {
         let mut store = ParkedStore::new();
         for n in [7, 2, 5] {
-            store.park(ordinal(n), ParkedWork::new(1, packet(16)));
+            store.park(ordinal(n), ParkedWork::new(1, EPOCH, packet(16)));
         }
 
         assert_eq!(store.drain_all(), vec![ordinal(2), ordinal(5), ordinal(7)],);
@@ -395,8 +419,8 @@ mod tests {
     #[should_panic(expected = "ingress ordinal parked twice")]
     fn one_ordinal_cannot_hold_two_packets() {
         let mut store = ParkedStore::new();
-        store.park(ordinal(4), ParkedWork::new(1, packet(4)));
-        store.park(ordinal(4), ParkedWork::new(1, packet(4)));
+        store.park(ordinal(4), ParkedWork::new(1, EPOCH, packet(4)));
+        store.park(ordinal(4), ParkedWork::new(1, EPOCH, packet(4)));
     }
     /// A position the device declines to run stays runnable, and the ones
     /// behind it still run.
@@ -410,7 +434,7 @@ mod tests {
     fn a_declined_position_does_not_stop_the_ones_behind_it() {
         let mut store = ParkedStore::new();
         for n in [1, 2, 3] {
-            store.park(ordinal(n), ParkedWork::new(1, packet(8)));
+            store.park(ordinal(n), ParkedWork::new(1, EPOCH, packet(8)));
             assert!(store.mark_ready(ordinal(n)));
         }
 
@@ -435,7 +459,7 @@ mod tests {
     #[test]
     fn running_a_position_takes_it_off_the_ready_list_too() {
         let mut store = ParkedStore::new();
-        store.park(ordinal(5), ParkedWork::new(1, packet(8)));
+        store.park(ordinal(5), ParkedWork::new(1, EPOCH, packet(8)));
         assert!(store.mark_ready(ordinal(5)));
 
         assert!(store.release(ordinal(5), Release::Ready).is_some());
@@ -447,7 +471,7 @@ mod tests {
     #[test]
     fn a_withdrawal_takes_a_ready_position_off_the_list() {
         let mut store = ParkedStore::new();
-        store.park(ordinal(6), ParkedWork::new(1, packet(8)));
+        store.park(ordinal(6), ParkedWork::new(1, EPOCH, packet(8)));
         assert!(store.mark_ready(ordinal(6)));
 
         assert!(store.release(ordinal(6), Release::Withdrawn).is_none());

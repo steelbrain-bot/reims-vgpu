@@ -4190,6 +4190,88 @@ impl DeviceState {
             .pipeline_refused(pipeline, reason)
     }
 
+    /// Give one packet an ordering position in the model.
+    ///
+    /// The door `SessionModel::admit` is reached through, and the last of the
+    /// model's four planes to have one — declaration, publication and the
+    /// pipeline table already do. What comes back is the model's answer *and*
+    /// the incarnation it was admitted into, read under the same lock: a caller
+    /// that asked for the epoch separately could be told about a loss between
+    /// the two reads and then complete the transaction under the wrong one,
+    /// which is the race [`reims_vgpu_core::session::SessionModel::complete`]
+    /// takes an epoch argument to answer.
+    ///
+    /// # Errors
+    ///
+    /// The model's own refusal, unchanged. Every one of them is the packet
+    /// being un-admittable rather than this device being unable to ask — a
+    /// closed generation, a domain no definition opened, a payload that is not
+    /// the class its opcode declares — so the caller names it on the failure
+    /// channel and advances the ring.
+    pub fn admit_packet(
+        &self,
+        packet: &reims_vgpu_core::session::Packet,
+    ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
+        let mut session = self.session.lock().expect("session");
+        let admitted = session.admit(packet)?;
+        Ok(Admission {
+            epoch: session.epoch(),
+            admitted,
+        })
+    }
+
+    /// The positions the model has released to run since the last ask.
+    ///
+    /// **The one door work leaves the model by.** A transaction taken off this
+    /// list and not run is one that never runs, and one taken twice is one that
+    /// runs twice; the store that holds its bytes is what makes the second
+    /// unrepresentable — see `crate::runtime::parked::ParkedStore::release`.
+    #[must_use = "a position taken off the ready list and not run is a packet that never runs"]
+    pub fn take_ready(&self) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
+        self.session.lock().expect("session").take_ready()
+    }
+
+    /// A transaction finished on the host.
+    ///
+    /// Releases its dependents, retires its accesses, and hands back what its
+    /// channel published — which is not necessarily this transaction's own
+    /// word: a channel publishes in its own order, so a completion may release
+    /// a queue of earlier words, this one, or nothing at all yet.
+    ///
+    /// `epoch` is the incarnation the work was *submitted* under, which is why
+    /// it is retained with the packet rather than read here. Submission is not
+    /// completion: a device loss withdraws every transaction admitted into the
+    /// lost epoch, and the host can still report those back.
+    ///
+    /// # Errors
+    ///
+    /// If the completion was produced under an incarnation that has ended.
+    #[must_use = "what the channel published is what the guest may now read"]
+    pub fn complete_transaction(
+        &self,
+        epoch: reims_vgpu_core::identity::DeviceEpoch,
+        ingress: reims_vgpu_core::identity::IngressOrdinal,
+    ) -> Result<Vec<reims_vgpu_core::publish::Release>, reims_vgpu_core::session::Refusal> {
+        self.session
+            .lock()
+            .expect("session")
+            .complete(epoch, ingress)
+    }
+
+    /// Take a transaction that will never publish out of every plane holding
+    /// it, and say what its channel released behind it.
+    ///
+    /// Its own completion word is deliberately not published: the work never
+    /// ran, and what the guest is owed instead is the typed reason the caller
+    /// names.
+    #[must_use = "what the channel published is what the guest may now read"]
+    pub fn withdraw_transaction(
+        &self,
+        ingress: reims_vgpu_core::identity::IngressOrdinal,
+    ) -> Vec<reims_vgpu_core::publish::Release> {
+        self.session.lock().expect("session").withdraw(ingress)
+    }
+
     /// The guest's completion word for `slot` has moved to `value`.
     ///
     /// The other end of a stamp wait. `SessionModel::admit` parks a packet
@@ -5449,6 +5531,18 @@ impl DeviceState {
         #[cfg(not(test))]
         let _ = ev;
     }
+}
+
+/// What one admission established.
+///
+/// The model's answer and the host device incarnation it was admitted into,
+/// taken together because they are read under one lock. The epoch travels with
+/// the parked packet and comes back at completion — see
+/// [`DeviceState::complete_transaction`] for why it is the submission's fact
+/// and not a value to look up later.
+pub struct Admission {
+    pub admitted: reims_vgpu_core::session::Admitted,
+    pub epoch: reims_vgpu_core::identity::DeviceEpoch,
 }
 
 /// One task's records, in one submission domain, as an
