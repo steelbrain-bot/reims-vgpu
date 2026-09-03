@@ -78,10 +78,26 @@ reader taking it as current would go looking for work that is done. As of
 What blocks the wholesale delete is the third item on Seam 6's own disconnect
 list, and it is one thing rather than a list: **the process-global mutable
 engine.** `backend/vulkan/engine` is 62 000 lines behind
-`static ENGINE: Lazy<Mutex<EngineState>>` (`engine/mod.rs:330`) plus nine more
-process-global statics beside it, and `BLIT_FAIL_REASON`
-(`runtime/blit_exec/mod.rs:131`) is a thread-local carrying a reason the
-observation channel should carry.
+`static ENGINE: Lazy<Mutex<EngineState>>` plus nine more process-global statics
+beside it. The second item this paragraph used to name, `BLIT_FAIL_REASON` — a
+thread-local carrying a reason the observation channel should carry — is gone:
+`BlitFailure` and `BlitStatus::Failed { failure, reason }` replaced it in
+`13f9aa49`, and `br` is the only constructor, so a refusal without a reason is
+now unspellable.
+
+Two of Seam 6's structural zeros that were *not* about the engine have since
+closed, and neither was where a reader would have looked for them. "No host
+thread is created per EXEC, command buffer, draw, **save**, or watchdog
+operation" was violated twice over: arming the compute stall proxy spawned a
+thread per dispatch that slept the whole threshold holding a copy of the
+kernel's SPIR-V (`5c1be382` — one registry, one thread, sixteen slots), and
+persisting the pipeline cache spawned a thread per pipeline creation
+(`b0bb5b8a` — the owner the plan's own pipeline section asks for). Both are now
+gated behind `/proc/self/task` counts taken *after* the single owner is up, so
+the gate reads per-operation rather than per-process. What is left of the thread
+survey is one long-lived worker each for m2v translation, completion stamping
+and queue ownership, and the plan says a dedicated owner thread is not itself a
+defect.
 
 That is also what holds the rest of `reims-vgpu-vulkan` out. Twelve of its
 thirty-six modules are wired — `raster`, `swapchain`, `vertex`, `blend`,
