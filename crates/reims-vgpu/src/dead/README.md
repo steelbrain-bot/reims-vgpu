@@ -45,6 +45,45 @@ declaration gives that by construction rather than by a flag.
   `dead/` reads as "these were the ones worth keeping", which is the opposite of
   what it means.
 
+## What is still live, read off the tree rather than off the plan
+
+The plan's "final group" section (2026-09-02) names that group as `Namespace` +
+`RefResolver` + the four `ingress::Gap` classes + the ingress switch. **Three of
+those four have since moved, and the section has not been rewritten**, so a
+reader taking it as current would go looking for work that is done. As of
+`02bd23cd`:
+
+- **`Namespace` and `RefResolver` are the production authority.**
+  `DeviceState::object_name` asks `reims_vgpu_core::resolve::TaskNamespaces` on
+  the owner it holds, and `declare_object`, `retire_object_name`,
+  `define_task_namespace`, `delete_task_namespace`, `apply_lifetime` and the
+  access source all route through `reims_vgpu_core::lifecycle::Lifecycle`, which
+  is where `Namespace` lives. There is no second name table.
+- **The ingress switch is cut.** Every accepted packet reaches
+  `runtime::ingress::device_packet` through `admit_and_park`, which is what
+  advances the head.
+- **`ingress::Gap` is down from four variants to two** — `Unresolved` and
+  `ExecStreamsUnread` — and `packet_class_unclassified` is zero on macos-15 and
+  macos-26 both, so the first of those refuses nothing a driven guest sends.
+
+What blocks the wholesale delete is the third item on Seam 6's own disconnect
+list, and it is one thing rather than a list: **the process-global mutable
+engine.** `backend/vulkan/engine` is 62 000 lines behind
+`static ENGINE: Lazy<Mutex<EngineState>>` (`engine/mod.rs:330`) plus nine more
+process-global statics beside it, and `BLIT_FAIL_REASON`
+(`runtime/blit_exec/mod.rs:131`) is a thread-local carrying a reason the
+observation channel should carry.
+
+That is also what holds the rest of `reims-vgpu-vulkan` out. Twelve of its
+thirty-six modules are wired — `raster`, `swapchain`, `vertex`, `blend`,
+`depth_stencil`, `topology`, `sampler`, `pixel`, `view`, `memory`, `queues`,
+`buffer` — and every one of them is a pure translation whose caller kept its
+ownership. The next tier is not: `resident` and `placement` own native handles
+and retirement points, `transfer`, `record`, `pass`, `renderpass` and `barrier`
+are written against them, and the plan's own ordering rule says a module owning
+handles, caches or submission lifetimes wires once the model owning those
+lifetimes is in place. The engine is that model, and it has not moved.
+
 ## Register
 
 Rows are ordered as they landed. A row's **step** is either a *wiring step*
