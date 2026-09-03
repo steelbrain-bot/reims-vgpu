@@ -1230,6 +1230,25 @@ pub fn window_present_resize(width: u32, height: u32) {
 /// blit can be recorded, and it is the window's surface that owns the swapchain.
 /// They say it is not gated on throughput, which is the question that would
 /// otherwise be asked first and answered by guessing.
+///
+/// **The surface is not gated on the thread either, on this rail.** That was the
+/// open question the paragraph above leaves: this function's signature has
+/// always been callable from anywhere, but nothing had established that the
+/// platform's WSI tolerates an acquire and a `vkQueuePresentKHR` from a thread
+/// that is not the one that created the surface. `examples/window_present_off_thread`
+/// asks exactly that and nothing else — the event loop opens the window and then
+/// goes quiet, and every present after its first comes from another thread. On
+/// Linux/Wayland with a native ICD it presented 288 frames in six seconds and
+/// 960 in twenty, `busy` zero and `failed` zero in both, with an empty failure
+/// log.
+///
+/// That is evidence about one WSI implementation. MoltenVK acquires its drawable
+/// through `CAMetalLayer`, which is a different implementation with different
+/// thread rules, and the pathway table carries two Apple rows — so the probe has
+/// to be run on an Apple host before the move is designed for one. It also says
+/// nothing about resizing: it holds one geometry for the whole run and never
+/// makes `recreate_swapchain` race the loop's own resize handling, which is the
+/// second thing the move would have to be right about.
 #[cfg(feature = "host-window")]
 pub fn window_present_frame(
     source: Option<&WindowPresentSource>,
