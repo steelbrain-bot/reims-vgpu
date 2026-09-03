@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use super::context::DeviceContext;
-use super::counters::EngineCounters;
 use super::pools::ResourcePools;
 use super::types::{DrawError, PresentRect, WindowPresentSource};
 use super::vk_call::{VkCall, VkOp};
@@ -1073,7 +1072,6 @@ impl WindowPresenter {
         &mut self,
         ctx: &DeviceContext,
         pools: &mut ResourcePools,
-        counters: &EngineCounters,
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
     ) -> Result<WindowPresentDispatch, DrawError> {
@@ -1144,7 +1142,6 @@ impl WindowPresenter {
         );
         let frame_render_finished = self.render_finished[image_index as usize];
 
-        pools.batch_flush(ctx, counters)?;
         // The whole of this present's source selection, and it reads no
         // registry.
         //

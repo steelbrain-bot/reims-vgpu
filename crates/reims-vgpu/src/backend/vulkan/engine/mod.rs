@@ -1221,7 +1221,7 @@ pub fn window_present_frame(
         let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
             EngineFacadeDecline::WindowPresenterNotAttached,
         ))?;
-        unsafe { presenter.begin_present(ctx, pools, counters, source, cpu) }?
+        unsafe { presenter.begin_present(ctx, pools, source, cpu) }?
     };
     let out = match dispatch {
         window_present::WindowPresentDispatch::Complete(out) => Ok(out),
@@ -2129,6 +2129,39 @@ pub fn prepare_window_resident_present(
     if let Some(ctx) = owner.ctx.as_ref() {
         unsafe {
             pools.advance_registry_maintenance(ctx, counters, now_ms);
+        }
+        // Submit the guest's open batch before vouching for what is in it.
+        //
+        // `content_ready` is set when a draw *records* into a resident, so a
+        // resolution can name pixels that exist only in a command buffer nobody
+        // has ended. Something has to submit that batch before the blit reads
+        // the image, and until now it was the presenter, one lock hold before
+        // its own blit.
+        //
+        // Here instead, for two reasons that are the same reason. The batch is
+        // the drain's, and this is the drain; the window thread submitting a
+        // whole tranche of guest work inside its present is a submission on the
+        // latency path of the display. And a flush at present time also submits
+        // every draw recorded *after* this publish, so the frame reaching the
+        // screen was not the frame this transaction vouched for — a flush here
+        // draws that line where the publish is, which is where the caller
+        // already believes it is.
+        //
+        // Not the end of the story for an open batch: `flush_batched_draws`
+        // runs at every tranche end regardless, so nothing here decides how
+        // long guest work may sit unsubmitted.
+        if let Err(error) = unsafe { pools.batch_flush(ctx, counters) } {
+            // This transaction cannot run the recovery — it holds the engine
+            // guard and no `ObjectCaches`, and the order those two are taken in
+            // is fixed. So it does what every other observer that cannot
+            // recover does, and the end-of-tranche flush acts on it within the
+            // second.
+            if matches!(error, DrawError::DeviceLost(_)) {
+                device_lost::note_device_lost_seen();
+            }
+            crate::observe::Emit::decline("vk_window_publish_flush", &error).fail_once(0);
+            pools.note_window_published(None);
+            return Err("winpub_batch_flush_failed");
         }
     }
     resident_present_decision(pools, identity, width, height)

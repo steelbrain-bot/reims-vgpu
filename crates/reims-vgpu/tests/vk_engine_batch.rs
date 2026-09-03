@@ -610,6 +610,71 @@ fn prefetch_arm_flushes_open_batch() {
     assert_eq!(mid.batch_flushes, 0, "batch still open before the arm");
 }
 
+/// The window publish submits the guest's open batch before it vouches for a
+/// resident, so a resolution never names pixels that exist only in a command
+/// buffer nobody has ended.
+///
+/// This flush used to be the presenter's, one lock hold before its own blit. It
+/// had to move for two reasons that are one reason: the batch is the drain's and
+/// the publish *is* the drain, so the window thread was submitting a whole
+/// tranche of guest work on the display's latency path; and a flush at present
+/// time also submits every draw recorded *after* the publish, so the frame that
+/// reached the screen was not the frame the publish vouched for.
+///
+/// Asserted through `batch_flushes` at the publish rather than through a frame,
+/// because the frame is what this cannot see from here — the property is that
+/// the submission happens inside this transaction, and the counter is where that
+/// is visible.
+#[test]
+fn the_window_publish_flushes_the_open_batch_before_it_vouches() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_501,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let before = engine::counter_snapshot();
+    let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    match engine::execute_draw_request(engine_device(), &opener) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("opener draw: {msg}");
+        }
+    }
+    let mid = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(mid.batch_opens, 1, "the draw opened a batch: {mid:?}");
+    assert_eq!(
+        mid.batch_flushes, 0,
+        "and nothing has flushed it yet: {mid:?}"
+    );
+
+    // Whether the publish accepts this resident is not what is being asserted:
+    // the flush is ahead of the decision, so it happens on both arms. Taking
+    // the result keeps a future refactor that moved the flush behind the
+    // decision from passing this test on the accepting arm alone.
+    let decision = engine::prepare_window_resident_present(&identity, W, H);
+    let after = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        after.batch_flushes,
+        1,
+        "the publish submitted the batch it is vouching for (decision {:?}): {after:?}",
+        decision.as_ref().err()
+    );
+    assert_eq!(
+        after.batch_opens, 1,
+        "and opened no batch of its own: {after:?}"
+    );
+}
+
 /// A batch refuses joiners at `BATCH_MAX_DRAWS`: the draw after a full batch
 /// flushes and reopens, and the one after that joins the second batch. Keeps
 /// the GPU fed and the staging pool recycling instead of hoarding a whole run
