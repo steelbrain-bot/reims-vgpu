@@ -141,7 +141,9 @@ gives — a flag or a `cfg` would give the prohibition's opposite.
 Each move appends a row to `crates/<crate>/src/dead/README.md` naming what moved, which commit
 replaced it, and which new owner-level tests replaced the legacy tests that moved with it. Those
 tests stop running the moment they move, so a group that ships without that replacement coverage
-has silently lost it and the row is where that is caught.
+has silently lost it and the row is where that is caught. Name each replacing test as ``fn `name` ``:
+the `fn` is what `dead_is_unreachable_by_construction` reads to tell a promise about a function from
+the prose beside it, and a name written without it is a claim nothing checks.
 
 Nothing is resurrected from `dead/`, and no build-time or run-time switch may reach it. When a live
 boot regresses, `dead/` is read to learn what the old code did and the fix lands in the new owner.
