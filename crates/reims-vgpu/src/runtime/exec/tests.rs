@@ -61,9 +61,13 @@ fn chain_abandon_reports_how_many_draws_were_lost() {
 
 #[test]
 fn short_payload_noop() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let r = process_exec_indirect2(&mut state, &mut host, &[0u8; 4]);
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let (submission, r) = read_exec_submission(&state, &host, &[0u8; 4]);
+    assert!(
+        submission.is_none(),
+        "four bytes are not a submission header"
+    );
     assert_eq!(r.streams_loaded, 0);
 }
 
@@ -84,7 +88,7 @@ fn short_payload_noop() {
 #[test]
 fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
+    let host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
     assert!(state.tasks[3].active);
     assert!(
@@ -96,7 +100,7 @@ fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
     st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 6);
     st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
 
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let (_submission, r) = read_exec_submission(&state, &host, &payload);
     assert_eq!(
         r.task_id, 6,
         "the refusal must name the word the guest sent, not the slot we \
@@ -120,7 +124,7 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
         CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_TAIL, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
     };
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
+    let host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
 
     const N_RES: u32 = 2;
@@ -167,7 +171,24 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     );
 
     let cap = crate::observe::sink::FailCapture::start();
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    // The resource table is consumed by the *execution* half, so this goes
+    // through the one execution door: read at arrival, run at release. The
+    // resolved work is empty because the command buffers are unreadable, which
+    // is what this fixture is about — there are no records for the model to
+    // have resolved.
+    let mut host = host;
+    let (submission, r) = read_exec_submission(&state, &host, &payload);
+    let submission = submission.expect("the header parses");
+    let resolved = reims_vgpu_core::exec::ExecWork::default();
+    let r = execute_planned(
+        &mut state,
+        &mut host,
+        RetainedInputs {
+            submission: &submission,
+            resolved: &resolved,
+        },
+        r,
+    );
     assert_eq!(r.task_id, 3);
     assert_eq!(r.streams_loaded, 0, "no page table backs the cmdbuf gva");
     let line = cap.one("exec_res_table");
@@ -4947,7 +4968,7 @@ fn a_line_width_reaches_the_stream_state_and_a_draw() {
 fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
     const N_CB: u32 = 33;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
+    let host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
 
     let mut payload = vec![
@@ -4973,7 +4994,7 @@ fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
     }
 
     let cap = crate::observe::sink::FailCapture::start();
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let (_submission, r) = read_exec_submission(&state, &host, &payload);
     assert_eq!(r.task_id, 3);
     let visited: Vec<String> = cap
         .lines()

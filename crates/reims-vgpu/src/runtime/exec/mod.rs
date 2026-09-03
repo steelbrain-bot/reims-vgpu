@@ -992,32 +992,19 @@ fn execute_submission<M: HostMemory + HostOps>(
     }
 }
 
-pub fn process_exec_indirect2<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    payload: &[u8],
-) -> ExecResult {
-    let exec_started = std::time::Instant::now();
-    let mut out = ExecResult::default();
-    let mut measured_ns = 0u64;
-    // A packet that does not describe a submission has already said so where it
-    // refused, and closes no phase tiling: there is nothing between the header
-    // and the refusal for the leftover to account for.
-    let Some(submission) = read_submission(state, host, payload, &mut out, &mut measured_ns) else {
-        note_exec_header(exec_started, measured_ns);
-        return out;
-    };
-    note_exec_header(exec_started, measured_ns);
-    plan_and_execute(state, host, &submission, out)
-}
-
-/// The plan and execute halves of one submission, from bytes already read.
+/// Run one submission whose plan step has already answered, from the inputs it
+/// was admitted with.
 ///
-/// The door for a caller that read the submission itself — which is what an
-/// admitted-then-parked packet is, since its bytes left the guest's ring at
-/// arrival and the guest may have rewritten them by the time it runs.
+/// **The only door into execution.** The door for a caller that planned
+/// earlier — which is every admitted packet, because whether its translations
+/// are done is what decided it could run at all. Planning again here would be
+/// asking a question already answered and paying for it once per pipeline on
+/// the hottest path this device has.
 ///
-/// # The tiling closes over two clocks now, and it has to
+/// The caller owes the answer: a submission run without its plan step having
+/// said `false` may encode against a shader that is still being translated.
+///
+/// # The tiling closes over two clocks, and it has to
 ///
 /// [`ExecPhase::Header`] is a leftover — a span's worth of time minus the
 /// phases that measured themselves — and it used to be derived from one clock
@@ -1030,52 +1017,10 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
 /// property that made the tiling worth having; what changed is that it is now
 /// the sum of two leftovers rather than one. `total_us` is this half's, which
 /// is the half `sync_exec_stalled` is about.
-pub fn plan_and_execute<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    submission: &ExecSubmission,
-    out: ExecResult,
-) -> ExecResult {
-    let mut measured_ns = 0u64;
-    if preflight_submission(state, host, submission, &mut measured_ns) {
-        let mut out = out;
-        out.deferred = true;
-        return out;
-    }
-    run_submission(state, host, submission, None, out)
-}
-
-/// Run a submission whose plan step has already answered.
-///
-/// The door for a caller that planned earlier — which is every admitted
-/// packet, because whether its translations are done is what decided it could
-/// run at all. Planning again here would be asking a question already answered
-/// and paying for it once per pipeline on the hottest path this device has.
-///
-/// The caller owes the answer: a submission run without its plan step having
-/// said `false` may encode against a shader that is still being translated.
 pub fn execute_planned<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     inputs: RetainedInputs<'_>,
-    out: ExecResult,
-) -> ExecResult {
-    run_submission(state, host, inputs.submission, Some(inputs.resolved), out)
-}
-
-/// The execution half, with or without the model's answer about what the
-/// records are.
-///
-/// `resolved` is `Some` for a packet the model admitted and parked, which is
-/// every packet on the driven path, and `None` for the one caller that reads a
-/// submission and runs it in the same breath. That caller has no transaction,
-/// so there is nothing for a cursor to stand in — not a weaker mode of the same
-/// walk, but the absence of the second walk this exists to retire.
-fn run_submission<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    submission: &ExecSubmission,
-    resolved: Option<&reims_vgpu_core::exec::ExecWork>,
     mut out: ExecResult,
 ) -> ExecResult {
     let started = std::time::Instant::now();
@@ -1088,8 +1033,8 @@ fn run_submission<M: HostMemory + HostOps>(
     execute_submission(
         state,
         host,
-        submission,
-        resolved,
+        inputs.submission,
+        Some(inputs.resolved),
         &mut out,
         &mut measured_ns,
     );
@@ -1109,7 +1054,7 @@ fn run_submission<M: HostMemory + HostOps>(
 ///
 /// It closes its own `ExecPhase::Header` leftover, because the running half
 /// happens at a different moment and one clock across both would charge the
-/// leftover with the wait — see [`plan_and_execute`].
+/// leftover with the wait — see [`execute_planned`].
 #[must_use]
 pub fn read_exec_submission<M: HostMemory + HostOps>(
     state: &DeviceState,
@@ -1124,8 +1069,8 @@ pub fn read_exec_submission<M: HostMemory + HostOps>(
     (submission, out)
 }
 
-/// Close the [`ExecPhase`] tiling of `process_exec_indirect2` at one of its
-/// return points.
+/// Close the [`ExecPhase`] tiling of one exec half at one of its return
+/// points.
 ///
 /// [`ExecPhase::Header`] is the **leftover**, not a span: it is the function's
 /// own elapsed time minus the four that measured themselves, so the five sum to

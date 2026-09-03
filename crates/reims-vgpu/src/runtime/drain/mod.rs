@@ -5922,17 +5922,29 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // were done is what decided the packet could run at all, so
                 // asking again would be paying per pipeline for an answer the
                 // model already acted on.
-                let result = match retained {
-                    Some(inputs) => crate::runtime::exec::execute_planned(
-                        state,
-                        host,
-                        inputs,
-                        crate::runtime::exec::ExecResult::default(),
-                    ),
-                    None => {
-                        crate::runtime::exec::process_exec_indirect2(state, host, &packet.payload)
-                    }
+                // **There is one execution path and this is it.** An exec
+                // packet whose command buffers could not be read at arrival is
+                // refused by the ingress bridge (`Gap::ExecStreamsUnread`) and
+                // never reaches an ordering position, and a packet that did
+                // reach one carries both halves by construction — so `None`
+                // here is this device having lost the bytes between admission
+                // and release, not a guest fact. Reading the payload again to
+                // recover would read whatever the guest has since put at those
+                // addresses, which is the second reader the switch exists to
+                // remove; the position is named and nothing runs.
+                let Some(inputs) = retained else {
+                    note_store_route("exec_retained_inputs_missing");
+                    crate::observe::fail(format!(
+                        "exec_retained_inputs_missing reason=parked_without_submission                          ch={channel_id} (an admitted exec packet reached execution without                          the command buffers it was admitted against, so its records cannot                          be run from the bytes the transaction named)"
+                    ));
+                    return ChildPacketDisposition::Complete;
                 };
+                let result = crate::runtime::exec::execute_planned(
+                    state,
+                    host,
+                    inputs,
+                    crate::runtime::exec::ExecResult::default(),
+                );
                 let channel_bit = 1u32.checked_shl(channel_id).unwrap_or(0);
                 if result.deferred {
                     if channel_bit != 0 && state.translation_deferred_mask & channel_bit == 0 {
