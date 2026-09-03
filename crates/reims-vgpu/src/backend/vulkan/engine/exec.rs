@@ -7671,6 +7671,170 @@ mod tests {
         }
     }
 
+    /// A `DrawRequest` that reaches `validate_v1`'s descriptor checks: the
+    /// geometry and both shader modules are what it refuses on before it gets
+    /// there.
+    fn validatable_request() -> DrawRequest {
+        DrawRequest {
+            width: 16,
+            height: 16,
+            vert_spirv: std::sync::Arc::new(vec![0x0723_0203]),
+            frag_spirv: std::sync::Arc::new(vec![0x0723_0203]),
+            ..DrawRequest::default()
+        }
+    }
+
+    fn storage_at(binding: u32) -> super::super::types::StorageBufferResource {
+        super::super::types::StorageBufferResource {
+            binding,
+            content: super::super::types::BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16])),
+        }
+    }
+
+    fn sampled_at(binding: u32, array_element: u32) -> super::super::types::SampledImageResource {
+        super::super::types::SampledImageResource {
+            binding,
+            array_element,
+            descriptor_count: 1,
+            width: 1,
+            height: 1,
+            layers: 1,
+            kind: reims_vgpu_core::texture_shape::TextureKind::D2,
+            multisampled: false,
+            source: super::super::types::SampledSource::Bytes(std::sync::Arc::new(vec![0u8; 4])),
+            byte_origin: Default::default(),
+            format: vk::Format::R8G8B8A8_UNORM,
+            identity: None,
+            swizzle: Default::default(),
+        }
+    }
+
+    /// One descriptor binding claimed twice in a draw is refused, across all
+    /// three lists and not only within one of them.
+    ///
+    /// The set that used to answer this was shared by the three lists, so a
+    /// sampler colliding with a storage buffer was a duplicate. The scan that
+    /// replaced it has to say the same thing, and nothing tested that it did —
+    /// these five declines had no owner-level coverage at all.
+    #[test]
+    fn one_descriptor_binding_claimed_twice_is_refused_across_the_three_lists() {
+        let mut within = validatable_request();
+        within.storage_buffers = vec![storage_at(4), storage_at(4)];
+        assert!(
+            matches!(
+                validate_v1(&within),
+                Err(DrawError::DrawValidation(
+                    DrawValidationDecline::DuplicateStorageDescriptorBinding { binding: 4 }
+                ))
+            ),
+            "two storage buffers at one binding"
+        );
+
+        let mut across = validatable_request();
+        across.storage_buffers = vec![storage_at(4)];
+        across.sampled_images = vec![sampled_at(4, 0)];
+        assert!(
+            matches!(
+                validate_v1(&across),
+                Err(DrawError::DrawValidation(
+                    DrawValidationDecline::DuplicateSampledDescriptorBinding { binding: 4 }
+                ))
+            ),
+            "a sampled image on a storage buffer's binding"
+        );
+
+        let mut sampler = validatable_request();
+        sampler.sampled_images = vec![sampled_at(9, 0)];
+        sampler.samplers = vec![super::super::types::SamplerResource::normalized_default(9)];
+        assert!(
+            matches!(
+                validate_v1(&sampler),
+                Err(DrawError::DrawValidation(
+                    DrawValidationDecline::DuplicateSamplerDescriptorBinding { binding: 9 }
+                ))
+            ),
+            "a sampler on a sampled image's binding"
+        );
+
+        // And the key is the pair, not the binding: two elements of one
+        // descriptor array are the array, not a collision. The count is 2 on
+        // both, because `array_element >= descriptor_count` is refused a few
+        // lines earlier and a test that tripped that would prove nothing here.
+        let mut array = validatable_request();
+        let mut first = sampled_at(7, 0);
+        first.descriptor_count = 2;
+        let mut second = sampled_at(7, 1);
+        second.descriptor_count = 2;
+        array.sampled_images = vec![first, second];
+        assert!(
+            validate_v1(&array).is_ok(),
+            "distinct array elements of one binding are not a duplicate: {:?}",
+            validate_v1(&array).err()
+        );
+    }
+
+    /// A descriptor that is both malformed and duplicated reports the malformed
+    /// decline, because that check runs first.
+    ///
+    /// This is the reason the duplicate scan takes a prefix cursor rather than
+    /// being hoisted into a pre-pass over the whole request: a pre-pass would
+    /// report the duplicate and lose the more specific reason.
+    #[test]
+    fn a_malformed_duplicate_reports_the_malformed_reason() {
+        let mut req = validatable_request();
+        req.storage_buffers = vec![storage_at(5)];
+        let mut bad_lod = super::super::types::SamplerResource::normalized_default(5);
+        bad_lod.lod_min = f32::NAN.to_bits();
+        req.samplers = vec![bad_lod];
+        assert!(
+            matches!(
+                validate_v1(&req),
+                Err(DrawError::DrawValidation(
+                    DrawValidationDecline::InvalidSamplerLod { binding: 5, .. }
+                ))
+            ),
+            "the LOD check runs before the duplicate check and keeps its reason"
+        );
+    }
+
+    /// Two vertex attributes may not share a location or a binding, and the
+    /// location is reported first when both collide.
+    #[test]
+    fn two_vertex_attributes_may_not_share_a_location_or_a_binding() {
+        let attribute =
+            |location: u32, binding: u32| super::super::types::VertexAttributeResource {
+                location,
+                binding,
+                format: super::super::types::VertexAttributeFormat::Float,
+                offset: 0,
+                stride: 4,
+                step_function: super::super::types::VertexStepFunction::PerVertex,
+                step_rate: 1,
+                content: super::super::types::BufferContent::Bytes(std::sync::Arc::new(vec![
+                    0u8;
+                    16
+                ])),
+            };
+
+        let mut location = validatable_request();
+        location.vertex_attributes = vec![attribute(2, 0), attribute(2, 1)];
+        assert!(matches!(
+            validate_v1(&location),
+            Err(DrawError::DrawValidation(
+                DrawValidationDecline::DuplicateVertexLocation { location: 2 }
+            ))
+        ));
+
+        let mut binding = validatable_request();
+        binding.vertex_attributes = vec![attribute(0, 3), attribute(1, 3)];
+        assert!(matches!(
+            validate_v1(&binding),
+            Err(DrawError::DrawValidation(
+                DrawValidationDecline::DuplicateVertexBinding { binding: 3 }
+            ))
+        ));
+    }
+
     /// Past the attachment bound the clear array refuses instead of running
     /// short, because Vulkan indexes it positionally and a short one gives a
     /// later attachment an earlier one's colour.
