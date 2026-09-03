@@ -164,9 +164,14 @@ impl ComputeKind {
 /// emits nothing under any capability this serializer has — so a reader
 /// expecting a record per call would see none and conclude the guest never set
 /// one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// `Serial` is the [`Default`] because it is the encoder's *starting* type
+/// rather than a choice this crate makes on the guest's behalf: a pass that
+/// never writes a descriptor is serial, and the capture reads `0` there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DispatchType {
     /// Dispatches in this pass are ordered against each other.
+    #[default]
     Serial,
     /// Dispatches may overlap. Permission, not a requirement: a device that
     /// orders them anyway is conservative rather than wrong.
@@ -186,6 +191,19 @@ impl DispatchType {
             0 => Some(DispatchType::Serial),
             1 => Some(DispatchType::Concurrent),
             _ => None,
+        }
+    }
+
+    /// The descriptor's word for this type.
+    ///
+    /// The inverse of [`Self::parse`], and the only way back to an ordinal —
+    /// so a caller that has to hand this across an ABI boundary spells the
+    /// value once here rather than re-deriving `0`/`1` at each edge.
+    #[must_use]
+    pub const fn word(self) -> u32 {
+        match self {
+            Self::Serial => 0,
+            Self::Concurrent => 1,
         }
     }
 

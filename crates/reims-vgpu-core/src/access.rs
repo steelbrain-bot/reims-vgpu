@@ -50,8 +50,8 @@ use crate::identity::{ChannelId, ResourceId};
 ///
 /// This crate consumes `BackingId`s and cannot mint one: minting requires
 /// reading a guest descriptor and a page table, which is the device's. A survey
-/// of what this interface's objects actually name found that the device cannot
-/// mint one correctly yet either, and the reason is a contract question rather
+/// of what this interface's objects actually name found that the device could
+/// not mint one correctly either, and the reason was a contract question rather
 /// than missing code. Recorded here, at the type that demands the value,
 /// because the failure mode is silent: an id that is *too distinct* — two names
 /// for one piece of storage getting different ids — makes
@@ -59,9 +59,13 @@ use crate::identity::{ChannelId, ResourceId};
 /// that was ordering a real read against a real write. Nothing refuses, nothing
 /// logs, and the frame is wrong intermittently.
 ///
-/// Two of the three joins are settled. The one that is not is named here with
-/// what would settle it — a value somebody has to supply, not a question
-/// somebody has to think about.
+/// Two of the three joins are settled, and the device mints against both of
+/// them now — an address-named window through one entry point, a mapping's
+/// surface through the other, interned from one counter so the two key spaces
+/// are one identity space. The join that is not settled is named below with
+/// what would settle it: a value somebody has to supply, not a question
+/// somebody has to think about. An object whose identity turns on it is refused
+/// by name and never approximated.
 ///
 /// ## Settled: every name this device can see is a window of one address space
 ///
@@ -113,13 +117,39 @@ use crate::identity::{ChannelId, ResourceId};
 /// each of the two ways it can reach storage. A mapping bumps a generation
 /// whenever its page list changes — a map, an unmap, a replacement, a reattach,
 /// or a page-table refresh that moves frames. Storage named by an address in a
-/// task carries a pair: a per-reference count advanced by a re-point packet or
-/// by the reference being released, and a per-task epoch advanced when the
-/// task's whole address space ends. Two scopes because the events have two
-/// scopes, and an epoch rather than a walk because most references are ones the
-/// guest published and this device never touched — they have no per-name entry
-/// for a walk to find, and the epoch covers them without having to have seen
-/// them.
+/// task carries a pair: a count advanced by a re-point packet, and a per-task
+/// epoch advanced when the task's whole address space ends. Two scopes because
+/// the events have two scopes, and an epoch rather than a walk because most
+/// references are ones the guest published and this device never touched — they
+/// have no per-name entry for a walk to find, and the epoch covers them without
+/// having to have seen them.
+///
+/// ## The count is on the window, and it was on the reference
+///
+/// It was on the reference, because a re-point packet names a reference and
+/// nothing else — which is canonical exactly as long as one window has one
+/// live name. **It does not.** A driven macos-15 boot examined 74 collisions
+/// on that claim and one of them was a genuine alias: two live references in
+/// one task naming a single 8 294 400-byte window, which is 1920×1080×4 — the
+/// compositor's own scanout allocation, and so the most hazard-critical
+/// backing on the device.
+///
+/// A per-reference count would give that framebuffer two identities. A
+/// re-point through one reference advances that reference's count and leaves
+/// the other naming the old incarnation, so a [`Claim`] held under the second
+/// name goes on claiming frames the first has already replaced, and the edge
+/// between the two names is never drawn. That is false distinctness, and it is
+/// on the one buffer where it matters most.
+///
+/// So the re-point resolves the reference it names to that reference's window
+/// and advances the count *there*, and both names move together. Releasing a
+/// name advances nothing: a name is not storage, and a reference reused for
+/// different storage names a different window and is distinct already.
+///
+/// The other 73 collisions were one name after another over a recycled
+/// allocation, which is not an alias — telling those apart needs the holder's
+/// *current* object-list record re-read out of guest memory, because the guest
+/// frees an object by writing over that record and sends no packet at all.
 ///
 /// [`Claim`]: crate::namespace::Claim
 ///
@@ -537,6 +567,37 @@ impl Participation {
             api_stages: self.api_stages,
             input_content_version,
             output_content_version,
+        }
+    }
+
+    /// The participation over a resource that owns no bytes.
+    ///
+    /// A resource declared [`crate::lifecycle::Storage::NoBytes`] resolves to a
+    /// live name with no backing, no extent and no content authority — there
+    /// are no bytes for any of the three to be about. So there is no key to
+    /// compare against another access's key, and the honest answer is
+    /// [`AccessKey::DomainOnly`]: participation is real and incomplete, and
+    /// ordering comes from the submission domain alone.
+    ///
+    /// **Never a missing edge.** `DomainOnly` meets everything in
+    /// [`AccessKey::may_alias`], so this over-orders rather than under-orders,
+    /// and [`AccessKey::rung`] prices exactly that. The alternative — refusing
+    /// the transaction — would drop guest work whose only fault is naming an
+    /// object whose bytes this device cannot address, which is not a fault the
+    /// contract names.
+    ///
+    /// The versions are `None` on both sides for the same reason there is no
+    /// key: a write to bytes that do not exist reserves nothing, and a read of
+    /// them consumes nothing.
+    #[must_use]
+    pub const fn resolve_no_bytes(&self, domain: ChannelId) -> AccessIntent {
+        AccessIntent {
+            domain,
+            key: AccessKey::DomainOnly,
+            mode: self.mode,
+            api_stages: self.api_stages,
+            input_content_version: None,
+            output_content_version: None,
         }
     }
 }

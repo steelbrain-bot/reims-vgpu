@@ -5,6 +5,46 @@
 
 use super::*;
 
+use reims_vgpu_protocol::decode::compute as protocol_compute;
+
+/// One bind entry, in the wire shape production feeds the accumulator with.
+///
+/// These used to be the device decoder's flat `BufferBinding`/`RefBinding`, and
+/// the accumulator took them by name. It takes an entry *contract* now, so the
+/// tests build what the guest actually writes.
+fn buf_bind(buffer_ref: u32, offset: u64) -> reims_vgpu_wire::ops::render::BufferBind {
+    reims_vgpu_wire::ops::render::BufferBind {
+        buffer_ref: reims_vgpu_wire::le::U32le::new(buffer_ref),
+        offset: reims_vgpu_wire::le::U64le::new(offset),
+    }
+}
+
+fn ref_bind(object_ref: u32) -> reims_vgpu_wire::ops::render::RefBind {
+    reims_vgpu_wire::ops::render::RefBind {
+        object_ref: reims_vgpu_wire::le::U32le::new(object_ref),
+    }
+}
+
+/// A `dispatchThreadgroups:threadsPerThreadgroup:` record, as the lift makes it.
+fn threadgroups(grid: [u64; 3], tg: [u64; 3]) -> DispatchRecord {
+    DispatchRecord::Threadgroups(protocol_compute::Threadgroups {
+        groups: extent(grid),
+        threads_per_group: extent(tg),
+    })
+}
+
+fn extent([width, height, depth]: [u64; 3]) -> protocol_compute::Extent {
+    protocol_compute::Extent {
+        width,
+        height,
+        depth,
+    }
+}
+
+fn indirect(buffer_ref: u32, offset: u64) -> protocol_compute::IndirectRef {
+    protocol_compute::IndirectRef { buffer_ref, offset }
+}
+
 /// A rail payload for the tests below that are about what the neutral staging
 /// rails *produce* — geometry, format, bytes, writeback destination — rather
 /// than about what either rail keeps of it.
@@ -31,7 +71,7 @@ use super::vulkan::*;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::protocol::endian::{st32, st64};
 use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-use crate::runtime::decode::compute;
+use crate::runtime::decode::compute_spi;
 use crate::runtime::decode::resource::{
     list_object_entry_offset, OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_BUFFER,
     OBJECT_TYPE_MAPPER_REF_TEXTURE, RESOURCE_PAGE_SHIFT,
@@ -241,13 +281,7 @@ fn stage_texture_ref_texture_plane_index_beats_the_ambiguous_geometry_scan() {
 fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     let mut acc = ComputeAccum::default();
     // In-cap buffer bind (ref != 0) is kept.
-    acc.bind_buffers(
-        5,
-        &[BufferBinding {
-            ref_: 7,
-            ..Default::default()
-        }],
-    );
+    acc.bind_buffers(5, &[buf_bind(7, 0)]);
     assert_eq!(acc.buffers.len(), 1);
     assert_eq!(acc.buffers[0].index, 5);
 
@@ -255,38 +289,20 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     // the drop is fail-visible via `ComputeBindOverflow` (the log itself is a
     // global sink; the line's shape is asserted by
     // `every_compute_bind_table_renders_its_own_slug`). No new buffer slot appears.
-    acc.bind_buffers(
-        MAX_COMPUTE_BUFFER_SLOTS + 9,
-        &[BufferBinding {
-            ref_: 9,
-            ..Default::default()
-        }],
-    );
+    acc.bind_buffers(MAX_COMPUTE_BUFFER_SLOTS + 9, &[buf_bind(9, 0)]);
     assert_eq!(acc.buffers.len(), 1, "over-cap bind must not be stored");
 
     // Boundary: index == MAX is OUT of range (the backend sizes its arg-table
     // array to MAX and guards `idx >= MAX`), so it must be dropped too — this
     // is the off-by-one the `>` → `>=` alignment fixed. Slot MAX-1 is the last
     // valid slot and is kept.
-    acc.bind_buffers(
-        MAX_COMPUTE_BUFFER_SLOTS,
-        &[BufferBinding {
-            ref_: 11,
-            ..Default::default()
-        }],
-    );
+    acc.bind_buffers(MAX_COMPUTE_BUFFER_SLOTS, &[buf_bind(11, 0)]);
     assert_eq!(
         acc.buffers.len(),
         1,
         "index == MAX is out of range, dropped"
     );
-    acc.bind_buffers(
-        MAX_COMPUTE_BUFFER_SLOTS - 1,
-        &[BufferBinding {
-            ref_: 12,
-            ..Default::default()
-        }],
-    );
+    acc.bind_buffers(MAX_COMPUTE_BUFFER_SLOTS - 1, &[buf_bind(12, 0)]);
     assert_eq!(
         acc.buffers.len(),
         2,
@@ -294,13 +310,7 @@ fn compute_bind_overflow_drops_the_bind_but_keeps_in_cap_and_unbinds() {
     );
 
     // A zero-ref entry is an unbind: expected control flow, no new slot.
-    acc.bind_buffers(
-        6,
-        &[BufferBinding {
-            ref_: 0,
-            ..Default::default()
-        }],
-    );
+    acc.bind_buffers(6, &[buf_bind(0, 0)]);
     assert_eq!(acc.buffers.len(), 2, "unbind (ref==0) adds no slot");
 
     // Threadgroup memory has no cap here: the accumulator keeps whatever slot
@@ -392,41 +402,17 @@ fn every_compute_bind_table_renders_its_own_slug() {
 #[test]
 fn a_nil_entry_clears_an_occupied_compute_slot() {
     let mut acc = ComputeAccum::default();
-    acc.bind_buffers(
-        3,
-        &[BufferBinding {
-            ref_: 77,
-            ..Default::default()
-        }],
-    );
-    acc.bind_textures(3, &[RefBinding { ref_: 78 }]);
-    acc.bind_samplers(
-        3,
-        &[SamplerBinding {
-            ref_: 79,
-            ..Default::default()
-        }],
-    );
+    acc.bind_buffers(3, &[buf_bind(77, 0)]);
+    acc.bind_textures(3, &[ref_bind(78)]);
+    acc.bind_samplers(3, &[ref_bind(79)]);
     assert_eq!(
         (acc.buffers.len(), acc.textures.len(), acc.samplers.len()),
         (1, 1, 1)
     );
 
-    acc.bind_buffers(
-        3,
-        &[BufferBinding {
-            ref_: 0,
-            ..Default::default()
-        }],
-    );
-    acc.bind_textures(3, &[RefBinding { ref_: 0 }]);
-    acc.bind_samplers(
-        3,
-        &[SamplerBinding {
-            ref_: 0,
-            ..Default::default()
-        }],
-    );
+    acc.bind_buffers(3, &[buf_bind(0, 0)]);
+    acc.bind_textures(3, &[ref_bind(0)]);
+    acc.bind_samplers(3, &[ref_bind(0)]);
     assert_eq!(
         (acc.buffers.len(), acc.textures.len(), acc.samplers.len()),
         (0, 0, 0),
@@ -438,25 +424,9 @@ fn a_nil_entry_clears_an_occupied_compute_slot() {
 fn accum_pipeline_buffer_texture_sampler() {
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(9);
-    acc.bind_buffers(
-        1,
-        &[BufferBinding {
-            ref_: 3,
-            offset: 16,
-            attribute_stride: 0,
-            has_attribute_stride: false,
-        }],
-    );
-    acc.bind_textures(0, &[RefBinding { ref_: 10 }, RefBinding { ref_: 11 }]);
-    acc.bind_samplers(
-        0,
-        &[SamplerBinding {
-            ref_: 20,
-            lod_min_bits: 0,
-            lod_max_bits: 0,
-            has_lod_clamp: false,
-        }],
-    );
+    acc.bind_buffers(1, &[buf_bind(3, 16)]);
+    acc.bind_textures(0, &[ref_bind(10), ref_bind(11)]);
+    acc.bind_samplers(0, &[ref_bind(20)]);
     assert_eq!(acc.pipeline_ref, 9);
     assert_eq!(acc.buffers.len(), 1);
     assert_eq!(acc.textures.len(), 2);
@@ -496,27 +466,27 @@ fn accum_stage_in_tg_imageblock_and_control_fail_closed() {
         session: None,
         block: None,
     };
+    // The sequencing records are the ledger's unsettled rows, so they keep this
+    // device's decoder and its own entry point.
     let mut cmd = ComputeCommand::default();
     // Empty start-do-while encodes without a condition buffer.
-    cmd.kind = Kind::ControlStartDoWhile;
-    let st = apply_record(&mut state, &mut host, 1, &cmd, &mut seg);
+    cmd.kind = compute_spi::Kind::ControlStartDoWhile;
+    let st = apply_sequencing_record(&mut state, &mut host, 1, &cmd, &mut seg);
     assert!(
         matches!(
             st,
-            Some(ComputeStatus::Ok)
-                | Some(ComputeStatus::NoMetal(_))
-                | Some(ComputeStatus::MetalFailed(_))
+            ComputeStatus::Ok | ComputeStatus::NoMetal(_) | ComputeStatus::MetalFailed(_)
         ),
         "unexpected {st:?}"
     );
-    cmd.kind = Kind::ExecuteCommandsInBuffer;
+    cmd.kind = compute_spi::Kind::ExecuteCommandsInBuffer;
     cmd.indirect_command_buffer_ref = 99;
-    let st = apply_record(&mut state, &mut host, 1, &cmd, &mut seg);
+    let st = apply_sequencing_record(&mut state, &mut host, 1, &cmd, &mut seg);
     // Missing object-list entry → MissingBuffer; still latches sequencing.
     assert!(
         matches!(
             st,
-            Some(ComputeStatus::MissingBuffer(_)) | Some(ComputeStatus::Unsupported(_))
+            ComputeStatus::MissingBuffer(_) | ComputeStatus::Unsupported(_)
         ),
         "unexpected {st:?}"
     );
@@ -584,12 +554,11 @@ fn resolve_indirect_threadgroups_from_buffer() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroupsIndirect;
-    cmd.indirect_buffer_ref = 7;
-    cmd.indirect_buffer_offset = 0;
-    cmd.threads_per_threadgroup = compute::Size3 { x: 8, y: 1, z: 1 };
-    let dims = resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
+    let record = DispatchRecord::ThreadgroupsIndirect(protocol_compute::ThreadgroupsIndirect {
+        source: indirect(7, 0),
+        threads_per_group: extent([8, 1, 1]),
+    });
+    let dims = resolve_dispatch_dims(&mut state, &host, 1, &record).unwrap();
     // The grid comes from the indirect buffer and the threadgroup from the
     // wire, which is the whole point of this arm — asserting them as one flat
     // septuple could not say which source each half came from.
@@ -634,17 +603,14 @@ fn dispatch_threads_indirect_reads_both_extents_from_the_buffer() {
         write_task_gva_arm64e(&mut host, &state.tasks[1], off, &le);
     }
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadsIndirect;
-    cmd.indirect_buffer_ref = 7;
-    cmd.indirect_buffer_offset = 0;
-    cmd.threads_per_threadgroup = compute::Size3 {
-        x: 99,
-        y: 99,
-        z: 99,
-    };
+    // The fully indirect dispatch states no threadgroup extent at all, so
+    // there is no field here to fill with a decoy — the record's shape is the
+    // claim that both halves come from the buffer.
+    let record = DispatchRecord::ThreadsIndirect(protocol_compute::ThreadsIndirect {
+        source: indirect(7, 0),
+    });
 
-    let dims = resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap();
+    let dims = resolve_dispatch_dims(&mut state, &host, 1, &record).unwrap();
     assert_eq!(
         dims.grid,
         Extent3 {
@@ -684,29 +650,26 @@ fn the_zero_threadgroup_wire_shape_is_refused_by_name() {
     assert!(state.map_surface(3));
     assert!(state.set_mapping_geom(3, 1440, 1080, 0x73));
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 {
-        x: 45,
-        y: u64::MAX,
-        z: 1,
-    };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
     assert_eq!(
-        resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap_err(),
+        resolve_dispatch_dims(
+            &mut state,
+            &host,
+            1,
+            &threadgroups([45, u64::MAX, 1], [32, 0, 1])
+        )
+        .unwrap_err(),
         ComputeStatus::BadGrid("compute_grid_dim_range"),
     );
     // Each garbage component refuses on its own account: `u64::MAX` overflows
     // `u32` and `0` is not a dispatchable extent.
-    cmd.grid.y = 3;
     assert_eq!(
-        resolve_dispatch_dims(&mut state, &host, 1, &cmd).unwrap_err(),
+        resolve_dispatch_dims(&mut state, &host, 1, &threadgroups([45, 3, 1], [32, 0, 1]))
+            .unwrap_err(),
         ComputeStatus::BadGrid("compute_grid_dim_range"),
         "tg.y == 0 must still refuse"
     );
-    cmd.threads_per_threadgroup.y = 32;
     assert!(
-        resolve_dispatch_dims(&mut state, &host, 1, &cmd).is_ok(),
+        resolve_dispatch_dims(&mut state, &host, 1, &threadgroups([45, 3, 1], [32, 32, 1])).is_ok(),
         "a wholly sane grid must pass"
     );
 }
@@ -866,11 +829,8 @@ fn dispatch_missing_pipeline() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     let acc = ComputeAccum::default();
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let record = threadgroups([1, 1, 1], [1, 1, 1]);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     // The slug names *which* pipeline check refused, and it differs by rail:
     // both open with `pipeline_ref == 0`, and before the status carried a
     // reason the two were indistinguishable in the log.
@@ -905,25 +865,10 @@ fn dispatch_nometal_with_texture_binds() {
     assert!(state.set_object_list(1, 0, 32));
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(42);
-    acc.bind_textures(0, &[RefBinding { ref_: 111 }]);
-    acc.bind_buffers(
-        0,
-        &[BufferBinding {
-            ref_: 7,
-            offset: 0,
-            attribute_stride: 0,
-            has_attribute_stride: false,
-        }],
-    );
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 {
-        x: 60,
-        y: u64::MAX,
-        z: 1,
-    };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 32, y: 0, z: 1 };
-    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    acc.bind_textures(0, &[ref_bind(111)]);
+    acc.bind_buffers(0, &[buf_bind(7, 0)]);
+    let record = threadgroups([60, u64::MAX, 1], [32, 0, 1]);
+    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     assert!(
         matches!(
             st,
@@ -941,7 +886,9 @@ fn dispatch_nometal_with_texture_binds() {
     // through it — `ComputeSession` has no rail variant for this backend, so
     // there is no such value to build.
     assert_eq!(
-        VulkanBackend::new().open_compute_session(0).err(),
+        VulkanBackend::new()
+            .open_compute_session(DispatchType::Serial)
+            .err(),
         Some(ComputeStatus::NoMetal("compute_session_no_vulkan_path"))
     );
 }
@@ -959,11 +906,8 @@ fn dispatch_missing_pipeline_not_nometal() {
     gva_mem::define_task_pages_arm64e(&mut host, &mut state, 4, 8);
     assert!(state.set_object_list(1, 0, 32));
     let acc = ComputeAccum::default();
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
-    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let record = threadgroups([1, 1, 1], [1, 1, 1]);
+    let st = VulkanBackend::new().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     assert_eq!(
         st,
         ComputeStatus::MissingPipeline("compute_vk_pipeline_ref_zero")
@@ -1121,12 +1065,7 @@ fn dispatch_buffer_kernel_mul3add1() {
 
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(6);
-    let mut bindings = vec![BufferBinding {
-        ref_: 7,
-        offset: 0,
-        attribute_stride: 0,
-        has_attribute_stride: false,
-    }];
+    let mut bindings = vec![buf_bind(7, 0)];
     if crate::backend::selected().rail() == crate::backend::Rail::Vulkan {
         // The kernel declares no buffer 1. Reflection must discard this extra
         // encoder bind before object resolution; the nonexistent ref makes a
@@ -1135,20 +1074,12 @@ fn dispatch_buffer_kernel_mul3add1() {
         // Conditioned on the rail that *runs*, not on the features compiled:
         // this is a stimulus only the Vulkan rail's reflection is expected to
         // survive, and a binary carrying both would otherwise hand it to Metal.
-        bindings.push(BufferBinding {
-            ref_: 31,
-            offset: 0,
-            attribute_stride: 0,
-            has_attribute_stride: false,
-        });
+        bindings.push(buf_bind(31, 0));
     }
     acc.bind_buffers(0, &bindings);
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 4, y: 1, z: 1 };
-    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let record = threadgroups([1, 1, 1], [4, 1, 1]);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     assert!(
         matches!(
             st,
@@ -1186,14 +1117,11 @@ fn dispatch_missing_texture_fails() {
     // Pipeline without function still fails earlier; bind texture only.
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(1);
-    acc.bind_textures(0, &[RefBinding { ref_: 99 }]);
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 1, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 1, y: 1, z: 1 };
+    acc.bind_textures(0, &[ref_bind(99)]);
+    let record = threadgroups([1, 1, 1], [1, 1, 1]);
     // Missing pipeline object → MissingPipeline before texture stage.
     // Non-Apple metal stubs short-circuit to NoMetal (Linux product).
-    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &cmd);
+    let st = crate::backend::selected().execute_dispatch(&mut state, &mut host, 1, &acc, &record);
     assert!(matches!(
         st,
         ComputeStatus::MissingPipeline(_)
@@ -1881,26 +1809,32 @@ fn stage_texture_ref_texture_without_surface_is_missing() {
 }
 
 #[cfg(feature = "backend-vulkan")]
-#[test]
-fn incomplete_compute_engine_call_fires_stall_proxy() {
-    use crate::backend::vulkan::engine::ComputeRequest;
-    use std::time::Duration;
-
-    let pipe = 0xf000_0000 | (std::process::id() & 0x0fff_ffff);
-    let req = ComputeRequest {
-        spirv: vec![0x0723_0203],
+fn stall_request(word: u32) -> crate::backend::vulkan::engine::ComputeRequest {
+    crate::backend::vulkan::engine::ComputeRequest {
+        spirv: vec![word],
         entry: "main".into(),
         dispatch: crate::backend::vulkan::engine::ComputeDispatch::Workgroups([1, 1, 1]),
         ..Default::default()
-    };
-    let done = spawn_compute_engine_stall_watchdog(pipe, &req, Duration::from_millis(10));
-    std::thread::sleep(Duration::from_millis(40));
-    done.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn incomplete_compute_engine_call_fires_stall_proxy() {
+    use crate::runtime::compute_exec::stall_watchdog::arm_compute_engine_stall_watchdog;
+    use std::time::Duration;
+
+    let pipe = 0xf000_0000 | (std::process::id() & 0x0fff_ffff);
+    let req = stall_request(0x0723_0203);
+    let watch = arm_compute_engine_stall_watchdog(pipe, &req, Duration::from_millis(10));
+    std::thread::sleep(Duration::from_millis(200));
+    drop(watch);
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     assert!(log.lines().any(|line| {
         line.contains("compute_engine_stall reason=backend_call_unreturned")
             && line.contains(&format!("pipe={pipe}"))
+            && line.contains("elapsed_ms=10")
     }));
     let base = format!("/tmp/reims-vgpu-compute-stall-pipe-{pipe}");
     let _ = std::fs::remove_file(format!("{base}.spv"));
@@ -2733,71 +2667,6 @@ fn a_resident_answer_is_a_seed_or_a_sample_and_never_both() {
     assert!(none.and_then(ResidentServe::sample_source).is_none());
 }
 
-/// An `MTLDispatchType` the contract does not declare is named, counted, and
-/// substituted — and the two it does declare cross untouched and unremarked.
-///
-/// `WRITE_DESCRIPTOR` puts this ordinal on the wire unbounded: the decoder
-/// stores `d.dispatch_type.get()` with no range check, so whatever the guest
-/// wrote reaches the accumulator. What used to happen next was
-/// `if x == CONCURRENT { CONCURRENT } else { SERIAL }`, at the far end of the
-/// rail inside `execute_dispatch_metal` — so a guest asking for a dispatch type
-/// this device has no contract for got a *serial* encoder, silently, on the one
-/// arm that read the field at all.
-///
-/// Both halves are the test. A substitution nobody can see is the failure this
-/// commit exists to end; a line spent on the ordinary `Serial` and `Concurrent`
-/// records would be a flood on a per-segment path and would bury the one line
-/// that means something.
-#[test]
-fn an_undeclared_dispatch_type_is_named_and_counted_before_it_becomes_serial() {
-    use crate::protocol::dispatch::{MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL};
-    use crate::runtime::drain::store_route_count;
-
-    let before = store_route_count("compute_dispatch_type_unknown");
-
-    let cap = crate::observe::FailCapture::start();
-    assert_eq!(
-        accepted_dispatch_type(3, MTL_DISPATCH_TYPE_SERIAL),
-        MTL_DISPATCH_TYPE_SERIAL
-    );
-    assert_eq!(
-        accepted_dispatch_type(3, MTL_DISPATCH_TYPE_CONCURRENT),
-        MTL_DISPATCH_TYPE_CONCURRENT
-    );
-    assert!(
-        cap.lines().is_empty(),
-        "a declared dispatch type must spend no line: {:?}",
-        cap.lines()
-    );
-    assert_eq!(
-        store_route_count("compute_dispatch_type_unknown"),
-        before,
-        "a declared dispatch type is not a substitution"
-    );
-    drop(cap);
-
-    // An ordinal outside the pair: substituted, named once, counted every time.
-    let cap = crate::observe::FailCapture::start();
-    for _ in 0..3 {
-        assert_eq!(
-            accepted_dispatch_type(3, 0x5e01),
-            MTL_DISPATCH_TYPE_SERIAL,
-            "an unrecognised dispatch type encodes Serial"
-        );
-    }
-    let line = cap.one("compute_dispatch_type");
-    assert!(
-        line.contains("reason=compute_dispatch_type_unknown")
-            && line.contains(" task=3 declared=24065"),
-        "the substitution must name the value that caused it: {line}"
-    );
-    assert_eq!(
-        store_route_count("compute_dispatch_type_unknown"),
-        before + 3,
-        "the line is deduped per value; the count is not"
-    );
-}
-
 /// A stage-input the decoder had to truncate must refuse its pipeline, not
 /// arrive as "this kernel declares no stage-input".
 ///
@@ -2946,23 +2815,20 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
     let host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
 
-    let mut cmd = ComputeCommand::default();
-    cmd.kind = Kind::DispatchThreadgroups;
-    cmd.grid = compute::Size3 { x: 4, y: 1, z: 1 };
-    cmd.threads_per_threadgroup = compute::Size3 { x: 8, y: 1, z: 1 };
+    let record = threadgroups([4, 1, 1], [8, 1, 1]);
 
     let mut acc = ComputeAccum::default();
     assert!(
-        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_ok(),
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc).is_ok(),
         "the dispatch resolves before any bind, so a later refusal is the bind's"
     );
 
-    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 3, &[RefBinding { ref_: 9 }]);
+    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 3, &[ref_bind(9)]);
     assert!(
         acc.textures.is_empty(),
         "the slot is past the table, so there was nowhere to record it"
     );
-    let refused = resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc)
+    let refused = resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc)
         .expect_err("a dispatch missing a binding the guest asked for is refused");
     assert_eq!(
         refused,
@@ -2972,23 +2838,23 @@ fn a_bind_past_the_argument_table_refuses_the_dispatch() {
     // Sticky: the binding stays unrepresentable, so the next dispatch is
     // refused too rather than quietly running without it.
     assert!(
-        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_err(),
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc).is_err(),
         "one refused bind refuses every dispatch that would have used it"
     );
 
     // ...until the guest clears that slot, which makes what this accumulator
     // holds equal to what the guest asked for again.
-    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 3, &[RefBinding { ref_: 0 }]);
+    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 3, &[ref_bind(0)]);
     assert!(
-        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_ok(),
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc).is_ok(),
         "a nil bind at the refused slot retires the refusal with it"
     );
 
     // A clear at a different slot is not that slot, and must not lift it.
-    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 5, &[RefBinding { ref_: 9 }]);
-    acc.bind_textures(2, &[RefBinding { ref_: 0 }]);
+    acc.bind_textures(MAX_COMPUTE_TEXTURE_SLOTS + 5, &[ref_bind(9)]);
+    acc.bind_textures(2, &[ref_bind(0)]);
     assert!(
-        resolve_dispatch_dims_reported(&mut state, &host, 1, &cmd, &acc).is_err(),
+        resolve_dispatch_dims_reported(&mut state, &host, 1, &record, &acc).is_err(),
         "clearing an unrelated slot leaves the refused one refused"
     );
 }
@@ -3545,4 +3411,147 @@ fn the_declared_push_range_is_the_reflected_offset_and_the_pushed_payload() {
         std::mem::size_of::<crate::backend::vulkan::engine::ComputeDispatchPayload>(),
         "the declared range is exactly the bytes a region pushes",
     );
+}
+
+/// A record that carries no stride field and one that carries a stride of zero
+/// are different binds, and the accumulator says so whichever record fed it.
+///
+/// This is the compute rail's `has_options`. The device decoder used to flatten
+/// both plural buffer binds into one entry with an `attribute_stride` and a
+/// `has_attribute_stride` beside it, so the two states were the same bytes told
+/// apart by a flag a decoder had to remember to set. `BufferBindEntry::stride`
+/// is an `Option` and `setBuffers:offsets:withRange:` cannot produce a `Some`,
+/// so the confusion is not expressible on the wire path at all.
+///
+/// Both producers are checked against the same slot because that is what makes
+/// the cutover safe to make: the accumulator is the owner, and it must not care
+/// which of the two records reached it.
+#[test]
+fn a_bind_with_no_stride_field_and_one_with_a_zero_stride_are_not_the_same_slot() {
+    use reims_vgpu_wire::le::{U32le, U64le};
+    use reims_vgpu_wire::ops::render::{BufferBind, BufferStrideBind};
+
+    let slot = |acc: &ComputeAccum| {
+        let b = acc.buffers.first().expect("one slot bound");
+        (
+            b.index,
+            b.buffer_ref,
+            b.offset,
+            b.attribute_stride,
+            b.has_attribute_stride,
+        )
+    };
+
+    let mut plain = ComputeAccum::default();
+    plain.bind_buffers(
+        3,
+        &[BufferBind {
+            buffer_ref: U32le::new(4242),
+            offset: U64le::new(0x5678),
+        }],
+    );
+    let mut zero_stride = ComputeAccum::default();
+    zero_stride.bind_buffers(
+        3,
+        &[BufferStrideBind {
+            buffer_ref: U32le::new(4242),
+            offset: U64le::new(0x5678),
+            attribute_stride: U64le::new(0),
+        }],
+    );
+    assert_eq!(slot(&plain), (3, 4242, 0x5678, 0, false));
+    assert_eq!(slot(&zero_stride), (3, 4242, 0x5678, 0, true));
+    assert_ne!(slot(&plain), slot(&zero_stride));
+}
+
+/// A sampler bound without a LOD clamp and one bound with a clamp of zero are
+/// different binds, and the clamp crosses as bits exactly once.
+///
+/// `setSamplers:withRange:` has no clamp fields at all, so its entry cannot
+/// produce a clamp; `setSamplers:lodMinClamps:lodMaxClamps:` carries two `f32`,
+/// and `0.0` is a clamp the guest can state. The `to_bits` that used to sit in
+/// the device decoder is now in the accumulator's own entry contract, so both
+/// producers convert the same way or neither does.
+#[test]
+fn a_sampler_bound_without_a_clamp_and_one_clamped_to_zero_are_not_the_same_slot() {
+    use reims_vgpu_wire::le::{F32le, U32le};
+    use reims_vgpu_wire::ops::render::{RefBind, SamplerLodBind};
+
+    let slot = |acc: &ComputeAccum| {
+        let s = acc.samplers.first().expect("one slot bound");
+        (
+            s.index,
+            s.sampler_ref,
+            s.lod_min_bits,
+            s.lod_max_bits,
+            s.has_lod_clamp,
+        )
+    };
+
+    let mut plain = ComputeAccum::default();
+    plain.bind_samplers(
+        1,
+        &[RefBind {
+            object_ref: U32le::new(77),
+        }],
+    );
+    let mut zero_clamp = ComputeAccum::default();
+    zero_clamp.bind_samplers(
+        1,
+        &[SamplerLodBind {
+            sampler_ref: U32le::new(77),
+            lod_min_clamp: F32le::new(0.0),
+            lod_max_clamp: F32le::new(0.0),
+        }],
+    );
+    assert_eq!(slot(&plain), (1, 77, 0, 0, false));
+    assert_eq!(slot(&zero_clamp), (1, 77, 0, 0, true));
+
+    let mut clamped = ComputeAccum::default();
+    clamped.bind_samplers(
+        1,
+        &[SamplerLodBind {
+            sampler_ref: U32le::new(77),
+            lod_min_clamp: F32le::new(0.25),
+            lod_max_clamp: F32le::new(4.0),
+        }],
+    );
+    assert_eq!(
+        slot(&clamped),
+        (1, 77, 0.25f32.to_bits(), 4.0f32.to_bits(), true),
+        "the clamp must reach the slot as the bit pattern this device binds with"
+    );
+}
+
+/// A nil ref clears the slot whichever record shape carried it.
+///
+/// The unbind is the sharpest thing the three setters do — a retained bind is a
+/// *write* through a resource the guest unbound, not a stale read — so it is
+/// the claim that most needs to be the accumulator's rather than a decoder's.
+#[test]
+fn a_nil_entry_clears_the_slot_on_the_wire_path_too() {
+    use reims_vgpu_wire::le::U32le;
+    use reims_vgpu_wire::ops::render::RefBind;
+
+    let mut acc = ComputeAccum::default();
+    acc.bind_textures(
+        0,
+        &[
+            RefBind {
+                object_ref: U32le::new(4242),
+            },
+            RefBind {
+                object_ref: U32le::new(4343),
+            },
+        ],
+    );
+    assert_eq!(acc.textures.len(), 2);
+    acc.bind_textures(
+        1,
+        &[RefBind {
+            object_ref: U32le::new(0),
+        }],
+    );
+    assert_eq!(acc.textures.len(), 1);
+    assert_eq!(acc.textures[0].index, 0);
 }

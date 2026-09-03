@@ -1225,9 +1225,9 @@ pub fn load_icb_descriptor<M: HostMemory + HostOps>(
     .map_err(|rung| {
         let slug = crate::observe::ladder_slugs!("icb")(rung);
         match rung {
-            objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                IcbStatus::Missing(slug)
-            }
+            objects::LadderRung::NoListEntry
+            | objects::LadderRung::DescRead { .. }
+            | objects::LadderRung::NoTaskSpace => IcbStatus::Missing(slug),
             objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
         }
     })?;
@@ -1673,9 +1673,9 @@ fn buffer_gva_size<M: HostMemory + HostOps>(
             objects::BufferSpanRefusal::Rung(rung) => {
                 let slug = crate::observe::ladder_slugs!("icb_buffer")(rung);
                 match rung {
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        IcbStatus::Missing(slug)
-                    }
+                    objects::LadderRung::NoListEntry
+                    | objects::LadderRung::DescRead { .. }
+                    | objects::LadderRung::NoTaskSpace => IcbStatus::Missing(slug),
                     objects::LadderRung::WrongType { .. } => IcbStatus::BadDescriptor(slug),
                 }
             }

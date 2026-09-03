@@ -1941,7 +1941,172 @@ pub enum Descriptor {
     IndirectCommandBuffer(IndirectCommandBufferDescriptor),
 }
 
-/// Live Reims VGPU object-list entry size (kb + reims-vgpu-resource-format).
+/// Whether these descriptor bytes are a heap **placement** rather than an
+/// allocation of the object's own.
+///
+/// A heap-placed texture arrives under the ordinary texture object type and is
+/// told apart by the opcode inside its record, so a caller that asks for its
+/// storage must ask this first. [`decode_texture_descriptor`] does not: it
+/// reads the allocation size and handle at fixed offsets, and on a placement
+/// those offsets hold the record's own opcode and length. The window it would
+/// return is a number, not an address.
+///
+/// That matters because the answer feeds a backing identity. A bogus window
+/// would be a plausible-looking identity for storage nothing knows the location
+/// of — false equality with whatever else landed on the same number.
+#[must_use]
+pub fn descriptor_is_heap_placement(bytes: &[u8]) -> bool {
+    matches!(
+        texture_view_opcode(bytes),
+        Some(HEAP_TEXTURE_OPCODE | HEAP_TEXTURE_WIDE_OPCODE)
+    )
+}
+
+impl Descriptor {
+    /// The guest-VA **allocation** this descriptor names, and its size.
+    ///
+    /// `None` for every object that reaches storage through something else — a
+    /// view over another object's bytes, a mapper-ref texture whose pages are a
+    /// mapping's, a function, a serializer object — and for one whose handle or
+    /// allocation size the guest has not written yet.
+    ///
+    /// # A dual-plane texture is one allocation, and it used to answer `None`
+    ///
+    /// It was listed above as reaching its pages through a mapping, next to the
+    /// mapper-ref texture it is decoded beside. It does not: it is built by the
+    /// same `createNormalTexture` path a single-plane texture is, from paging
+    /// info in its own task, and its descriptor carries no mapping id at all —
+    /// the field that would hold one is the object header's allocation size.
+    ///
+    /// The two planes share that header, so they share one handle and one
+    /// allocation size and differ only in the geometry each dimension block
+    /// states — `DualPlaneTextureDescriptor` says so at the type. One
+    /// allocation, two extents, which is exactly what this method already means
+    /// by a window. Answering `None` withheld an identity the device had, and
+    /// on the identity's own terms that is the *dangerous* direction: with no
+    /// window a `CmdReplacePhysical` naming one of these advances no
+    /// incarnation, and it names no first-claimant either, so a plane sharing an
+    /// allocation with another object would never be sighted as the alias it is.
+    ///
+    /// # The allocation base, not a texture's texel base
+    ///
+    /// [`TextureDescriptor::backing_gva_size`] answers `handle << page_shift`
+    /// **plus `data_offset`**, because its callers are loaders and a loader
+    /// wants the texels. This answers the allocation, because its callers ask
+    /// about *storage*: two textures placed at different offsets in one
+    /// allocation are one piece of storage, and telling them apart here is the
+    /// false distinctness `reims_vgpu_core::access::BackingId` names as a
+    /// dropped hazard edge. The offset is the extent's, and the extent is
+    /// `reims_vgpu_core::access::ByteRange`'s to carry.
+    ///
+    /// One implementation for both ways a caller arrives — from a
+    /// `TaskResource`'s decode-once form, or from descriptor bytes read out of
+    /// the guest — so the two cannot answer differently about one object.
+    #[must_use]
+    pub fn backing_window(&self, page_shift: u32) -> Option<(u64, u64)> {
+        match self {
+            Self::Buffer(buffer) => buffer.backing_gva_size(page_shift),
+            Self::Texture(texture) => {
+                let (_, size) = texture.backing_gva_size(page_shift)?;
+                Some((texture.allocation_base_gva(page_shift)?, size))
+            }
+            // Plane 0's, and plane 1's would be the same numbers: both read
+            // the handle and the allocation size out of the one object header
+            // the decoder splices into each plane.
+            Self::DualPlaneTexture(dual) => {
+                let (_, size) = dual.planes[0].backing_gva_size(page_shift)?;
+                Some((dual.planes[0].allocation_base_gva(page_shift)?, size))
+            }
+            Self::Sampler(_)
+            | Self::Function(_)
+            | Self::RenderPipeline(_)
+            | Self::ComputePipeline(_)
+            | Self::DepthStencil(_)
+            | Self::TextureView(_)
+            | Self::IOSurfaceTexture { .. }
+            | Self::IndirectCommandBuffer(_) => None,
+        }
+    }
+
+    /// The resource's own byte window inside the allocation
+    /// [`Self::backing_window`] names, as an offset and a length.
+    ///
+    /// # Why this is not the window
+    ///
+    /// The window is *storage* — what two resources must share an identity for
+    /// — and it is deliberately the whole allocation, because two textures at
+    /// different offsets in one allocation are one piece of storage. This is the
+    /// other half: which bytes of it are **this** object's. A model that
+    /// declared content authority over the window would claim its neighbours'
+    /// bytes and discard their content; one that had no extent at all could not
+    /// tell a write to this texture from a write to the one beside it.
+    ///
+    /// # Where the numbers come from
+    ///
+    /// The guest's own declarations, never a re-derivation. A buffer is its
+    /// allocation, so its window is the whole of it. A texture is the union of
+    /// its level records' `[offset, offset + size)`, and `size` there is the
+    /// level's *allocated* span — the padded one the wire carries at
+    /// `TEXTURE_LEVEL_SIZE` and the decoder computes level 0's from
+    /// `used_size`. That is the right one: this is how much of the allocation
+    /// the object occupies, not how much of it a row-by-row reader touches,
+    /// which is [`TextureLevelLayout::read_span`]'s different question.
+    ///
+    /// A dual-plane texture unions both planes, because both are cut from the
+    /// one allocation its shared object header names.
+    ///
+    /// `None` for every object with no window at all, and for one whose levels
+    /// the guest has not written — an extent guessed at is a claim over bytes
+    /// nothing said were this object's.
+    #[must_use]
+    pub fn allocation_extent(&self) -> Option<(u64, u64)> {
+        fn union(levels: &[TextureLevelLayout]) -> Option<(u64, u64)> {
+            let mut lo = u64::MAX;
+            let mut hi = 0u64;
+            for level in levels.iter().filter(|l| l.size != 0) {
+                lo = lo.min(level.offset);
+                hi = hi.max(level.offset.checked_add(level.size)?);
+            }
+            // `then`, not `then_some`: a descriptor whose levels all declare a
+            // zero size leaves the sentinels untouched, and `then_some` would
+            // evaluate the subtraction under them before deciding not to use
+            // it. That is `u64::MAX` from zero, which is a panic in debug and a
+            // 4-exabyte extent in release.
+            (hi > lo).then(|| (lo, hi - lo))
+        }
+        match self {
+            // A buffer is its allocation: there is nothing else in it, and the
+            // descriptor carries no offset for there to be.
+            Self::Buffer(buffer) => {
+                (buffer.allocation_size != 0).then_some((0, buffer.allocation_size))
+            }
+            Self::Texture(texture) => union(&texture.levels),
+            Self::DualPlaneTexture(dual) => {
+                let (a, b) = (union(&dual.planes[0].levels), union(&dual.planes[1].levels));
+                match (a, b) {
+                    (Some((ao, al)), Some((bo, bl))) => {
+                        let lo = ao.min(bo);
+                        Some((lo, ao.checked_add(al)?.max(bo.checked_add(bl)?) - lo))
+                    }
+                    (one, None) | (None, one) => one,
+                }
+            }
+            // No window, so no window of a window. The mapper-ref texture is
+            // the one that is a gap rather than a category error — its bytes
+            // are a plane of the mapping's surface, and which plane is the
+            // surface descriptor's question rather than this record's.
+            Self::Sampler(_)
+            | Self::Function(_)
+            | Self::RenderPipeline(_)
+            | Self::ComputePipeline(_)
+            | Self::DepthStencil(_)
+            | Self::TextureView(_)
+            | Self::IOSurfaceTexture { .. }
+            | Self::IndirectCommandBuffer(_) => None,
+        }
+    }
+}
+
 pub const OBJECT_LIST_ENTRY_LEN: usize = 12;
 pub const OBJECT_LIST_ENTRY_HEADER: usize = 0;
 pub const OBJECT_LIST_ENTRY_DESC_GVA: usize = 4;
@@ -4118,7 +4283,7 @@ const MAX_COLOR_ATTACHMENTS: usize = 8;
 // two sides part at compile time instead of this one refusing pipeline
 // descriptors the pass decoder happily accepts.
 const _: () =
-    assert!(MAX_COLOR_ATTACHMENTS == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS);
+    assert!(MAX_COLOR_ATTACHMENTS == crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS);
 
 /// Parse all color-attachment entries.
 ///

@@ -310,12 +310,28 @@ pub const LEDGER: &[Packet] = &[
         channel: Channel::Child,
         opcode: 0x28,
         name: "CmdDeleteObject",
-        closure: Closure::Unresolved {
-            question: "the ref is in the serializer's per-kind space, which this device tracks \
-                       for three kinds and not the other eight. The kind is counted and the \
-                       object is not retired; acting on the ref against the object-list namespace \
-                       was measured and would only ever destroy an unrelated object that shared \
-                       the integer",
+        closure: Closure::Implemented {
+            evidence: "retires the object-list name the destroy record's reference holds, and the \
+                       task-local registry entry its kind keeps. The record is self-describing --- \
+                       one of eleven opcodes over an identical twelve-byte body --- so the kind is \
+                       the record's and each kind is settled on its own row on the serializer \
+                       rail; a kind whose row is not settled refuses this packet by name through \
+                       `lifecycle::ResolveRefusal::UnsettledDestroy` rather than holding the whole \
+                       class out of the model. Five kinds are in that state --- buffer, texture, \
+                       heap, rasterization rate map and indirect command buffer --- and no driven \
+                       boot has ever seen one. What settled the row was the ref space, measured \
+                       twice. First: of 2203 destroys this device retires something for, 2123 \
+                       named no live object-list entry, which reads like a second namespace and is \
+                       not --- `objects::resolve_sampler_state` constructs a sampler by looking \
+                       that same number up in the guest's object list and requiring a \
+                       serializer-object entry there, so the spaces are one and the reading is \
+                       about time: the guest clears its slot before it sends the destroy. Second, \
+                       the question that follows from that: could the semantic model *name* the \
+                       reference, which is answered from the device's own namespace before the \
+                       guest's list is consulted --- zero of 1984, because nothing on the sampler \
+                       construction path had ever declared a name. Taking the name at \
+                       construction moved it to 2006 named against 2006 retired, on a driven \
+                       macos-15 boot with no line on the failure channel",
         },
     },
     Packet {

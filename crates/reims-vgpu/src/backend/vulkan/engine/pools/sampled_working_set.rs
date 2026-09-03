@@ -140,10 +140,7 @@ mod tests {
             width: 64,
             height: 64,
             layers: 1,
-            volume: false,
-            cube: false,
-            arrayed: false,
-            one_dim: false,
+            kind: reims_vgpu_core::texture_shape::TextureKind::D2,
             format: ash::vk::Format::R8G8B8A8_UNORM,
             swizzle: Default::default(),
         }

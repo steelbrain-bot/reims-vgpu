@@ -308,6 +308,7 @@ impl ResourcePools {
             registry: HashMap::new(),
             registry_order: VecDeque::new(),
             reclaimed_recent: VecDeque::new(),
+            window_published: Vec::new(),
             registry_non_pinned_peak: 0,
             registry_non_pinned: NonPinnedTotals::default(),
             registry_non_pinned_peak_bytes: 0,
@@ -623,6 +624,17 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<usize, DrawError> {
         unsafe { self.batch_flush(ctx, counters)? };
+        // The window's bit is given back here and not by the presenter, which
+        // is the whole point of spelling it as an atomic the presenter owns and
+        // this side only reads: the presenter must not have to reach into the
+        // registry to say it has finished, because the registry is on its way to
+        // the guest's device and the presenter holds none. Polling it from the
+        // maintenance tick costs one relaxed load and keeps the dependency
+        // one-way.
+        #[cfg(feature = "host-window")]
+        if !super::super::window_present::window_presents_in_flight() {
+            unsafe { self.release_graveyard(&ctx.device, super::WINDOW_PRESENT_SLOT) };
+        }
         unsafe {
             self.retire_signaled_slots(ctx, counters, DeviceLostOp::PoolsFenceStatusMaintenance)
         }
@@ -881,6 +893,32 @@ impl ResourcePools {
     /// either do all of its bookkeeping after the submit, or make its recording
     /// slot visible here the way `open_batch` is. Do not assume the graveyard
     /// covers it: it covers the two states above, and this is a third.
+    ///
+    /// # Every submission, and what makes it visible here
+    ///
+    /// The warning above was abstract and one caller had already walked into it,
+    /// so the inventory is written down. Six sites reach the queue, and each is
+    /// covered by exactly one of three mechanisms:
+    ///
+    /// | submission | covered by |
+    /// |---|---|
+    /// | `exec::execute_draw` | `seal_entry` + `finish_entry_async` mark the slot pending |
+    /// | `exec_compute` transient storage | the same, and the ring entry *is* the slot's lifetime |
+    /// | `exec_compute` registered resident | the pin, plus `compute_rekey_refusal` and `recoverable_compute_storage_residents`' `!pinned` filter |
+    /// | guest-write copy (`mod.rs`) | `seal_entry` + `finish_entry_async` |
+    /// | readback copy (`mod.rs`) | `seal_entry` + `finish_entry_async` |
+    /// | host-window present | [`super::WINDOW_PRESENT_SLOT`] |
+    ///
+    /// The last row was the gap, and it was the one submission whose fence
+    /// belonged to something other than this ring: the presenter's, retired by a
+    /// *later* present rather than by anything here. The compute row is the
+    /// interesting one to keep in mind when adding a submission — it is covered
+    /// twice, and the second mechanism is a pin only because the resident was
+    /// deliberately popped out of the ring's live set at acquire.
+    ///
+    /// This is a reading of six call sites, not a gate. Nothing in the build
+    /// relates a new submission to this table, so a seventh arrives uncovered
+    /// and silent — which is what the paragraph above is for.
     fn open_slot_mask(&self) -> SlotMask {
         let mut mask: SlotMask = 0;
         for (index, slot) in self.slots.iter().enumerate() {
@@ -893,6 +931,14 @@ impl ResourcePools {
             // flush, and every path that retires a slot flushes the batch
             // first, so this bit cannot clear before the batch's work retires.
             mask |= 1 << self.cur;
+        }
+        // The third state the doc above names, now visible rather than assumed
+        // covered. A host-window blit is submitted to this same queue and
+        // retired by a *later* present, so between those two points it is
+        // reading images this device's own slot bookkeeping says nothing about.
+        #[cfg(feature = "host-window")]
+        if super::super::window_present::window_presents_in_flight() {
+            mask |= super::WINDOW_PRESENT_SLOT;
         }
         mask
     }
@@ -2392,45 +2438,47 @@ impl ResourcePools {
         device: &ash::Device,
         cb: vk::CommandBuffer,
         counters: &EngineCounters,
-        requested: &[(u32, super::super::exec::BoundBuffer)],
     ) {
-        let g = &mut self.cb_graphics;
+        // Disjoint field borrows: the request list and the normalization scratch
+        // are two fields of one struct and this is the only place both are live.
+        let super::CbGraphicsState {
+            vertex_binds,
+            vertex_scratch,
+            vertex_buffers,
+            vertex_offsets,
+            ..
+        } = &mut self.cb_graphics;
         counters
             .vertex_buffer_bind_slots
-            .fetch_add(requested.len() as u64, Ordering::Relaxed);
+            .fetch_add(vertex_binds.len() as u64, Ordering::Relaxed);
 
-        g.vertex_scratch.clear();
-        g.vertex_scratch
-            .extend(
-                requested
-                    .iter()
-                    .map(|(binding, bound)| super::VertexBufferBinding {
-                        binding: *binding,
-                        buffer: bound.buffer,
-                        offset: bound.offset,
-                    }),
-            );
-        super::normalize_vertex_bindings(&mut g.vertex_scratch);
+        vertex_scratch.clear();
+        vertex_scratch.extend(vertex_binds.iter().map(|(binding, bound)| {
+            super::VertexBufferBinding {
+                binding: *binding,
+                buffer: bound.buffer,
+                offset: bound.offset,
+            }
+        }));
+        super::normalize_vertex_bindings(vertex_scratch);
         counters
             .vertex_buffer_bind_emitted
-            .fetch_add(g.vertex_scratch.len() as u64, Ordering::Relaxed);
+            .fetch_add(vertex_scratch.len() as u64, Ordering::Relaxed);
 
-        g.vertex_buffers.clear();
-        g.vertex_offsets.clear();
-        g.vertex_buffers
-            .extend(g.vertex_scratch.iter().map(|entry| entry.buffer));
-        g.vertex_offsets
-            .extend(g.vertex_scratch.iter().map(|entry| entry.offset));
+        vertex_buffers.clear();
+        vertex_offsets.clear();
+        vertex_buffers.extend(vertex_scratch.iter().map(|entry| entry.buffer));
+        vertex_offsets.extend(vertex_scratch.iter().map(|entry| entry.offset));
 
         let mut start = 0;
-        while start < g.vertex_scratch.len() {
-            let end = super::vertex_binding_run_end(&g.vertex_scratch, start);
+        while start < vertex_scratch.len() {
+            let end = super::vertex_binding_run_end(vertex_scratch, start);
             unsafe {
                 device.cmd_bind_vertex_buffers(
                     cb,
-                    g.vertex_scratch[start].binding,
-                    &g.vertex_buffers[start..end],
-                    &g.vertex_offsets[start..end],
+                    vertex_scratch[start].binding,
+                    &vertex_buffers[start..end],
+                    &vertex_offsets[start..end],
                 )
             };
             counters
@@ -2440,10 +2488,111 @@ impl ResourcePools {
         }
     }
 
-    /// Scratch in which the next draw normalizes its push-descriptor state.
-    pub(crate) fn push_descriptor_scratch(&mut self) -> &mut Vec<super::PushDescriptorBinding> {
-        self.cb_graphics.push_scratch.clear();
-        &mut self.cb_graphics.push_scratch
+    /// Begin a draw's vertex-bind list, discarding the previous draw's.
+    ///
+    /// Paired with [`Self::stage_vertex_bind`] and consumed by
+    /// [`Self::bind_vertex_buffers`]. The list stays here between draws so its
+    /// capacity survives; only its contents are per draw.
+    pub(crate) fn begin_vertex_binds(&mut self) {
+        self.cb_graphics.vertex_binds.clear();
+    }
+
+    /// Record that the recording draw binds `bound` at `binding`.
+    pub(in crate::backend::vulkan::engine) fn stage_vertex_bind(
+        &mut self,
+        binding: u32,
+        bound: super::super::exec::BoundBuffer,
+    ) {
+        self.cb_graphics.vertex_binds.push((binding, bound));
+    }
+
+    /// Begin a draw's vertex-attribute list, discarding the previous draw's,
+    /// and hand it over to be filled.
+    pub(in crate::backend::vulkan::engine) fn attr_keys_scratch(
+        &mut self,
+    ) -> &mut Vec<super::super::caches::AttrKey> {
+        self.cb_graphics.attr_keys.clear();
+        &mut self.cb_graphics.attr_keys
+    }
+
+    /// The vertex-attribute keys the recording draw declared, for interning.
+    pub(in crate::backend::vulkan::engine) fn attr_keys(&self) -> &[super::super::caches::AttrKey] {
+        &self.cb_graphics.attr_keys
+    }
+
+    /// Begin a draw's layout-binding list, discarding the previous draw's, and
+    /// hand it over to be filled.
+    ///
+    /// `&mut` rather than a `stage_*` call per binding, because unlike the bind
+    /// lists the caller must also *canonicalize* this one — sort, refuse a
+    /// conflict, dedup — and a per-item setter cannot express that.
+    pub(in crate::backend::vulkan::engine) fn layout_bindings_scratch(
+        &mut self,
+    ) -> &mut Vec<super::super::caches::BindingSig> {
+        self.cb_graphics.layout_bindings.clear();
+        &mut self.cb_graphics.layout_bindings
+    }
+
+    /// The canonical bindings the recording draw declared, for the layout
+    /// lookup and the checks around it.
+    pub(in crate::backend::vulkan::engine) fn layout_bindings(
+        &self,
+    ) -> &[super::super::caches::BindingSig] {
+        &self.cb_graphics.layout_bindings
+    }
+
+    /// Begin a draw's storage-bind list, discarding the previous draw's.
+    pub(crate) fn begin_storage_binds(&mut self) {
+        self.cb_graphics.storage_binds.clear();
+    }
+
+    /// Record that the recording draw binds `bound` at `binding`, with `len`
+    /// bytes of content behind it.
+    pub(in crate::backend::vulkan::engine) fn stage_storage_bind(
+        &mut self,
+        binding: u32,
+        bound: super::super::exec::BoundBuffer,
+        len: u64,
+    ) {
+        self.cb_graphics.storage_binds.push((binding, bound, len));
+    }
+
+    /// The cleared descriptor scratch and this draw's storage binds, together.
+    ///
+    /// Together because the caller derives one from the other and both live in
+    /// this struct: asking for them one at a time would be two borrows of
+    /// `self`, and keeping either as a draw-local would be the heap allocation
+    /// per draw that putting them here removed.
+    pub(in crate::backend::vulkan::engine) fn descriptor_scratch_and_storage_binds(
+        &mut self,
+    ) -> (
+        &mut Vec<super::PushDescriptorBinding>,
+        &[(u32, super::super::exec::BoundBuffer, u64)],
+    ) {
+        let super::CbGraphicsState {
+            push_scratch,
+            storage_binds,
+            ..
+        } = &mut self.cb_graphics;
+        push_scratch.clear();
+        (push_scratch, storage_binds)
+    }
+
+    /// The list [`Self::descriptor_scratch_and_storage_binds`] handed out and
+    /// the caller filled, read back for a consumer that has to translate it.
+    /// Shared, so the caller cannot change what the comparison below will
+    /// read.
+    pub(crate) fn push_descriptor_scratch_ref(&self) -> &[super::PushDescriptorBinding] {
+        &self.cb_graphics.push_scratch
+    }
+
+    /// The list this command buffer is *known to carry*, which after
+    /// [`Self::push_descriptors_changed`] returns `true` is the one that has to
+    /// be recorded. It is the scratch the caller filled — the two are swapped,
+    /// not copied — and reading it here rather than the scratch is what keeps
+    /// "what was recorded" and "what was asked for" one value.
+    pub(crate) fn push_descriptor_echo(&self) -> &[super::PushDescriptorBinding] {
+        &self.cb_graphics.push_bindings
     }
 
     /// Return whether this draw must record its push descriptors, retaining a
@@ -3967,10 +4116,7 @@ impl ResourcePools {
         // A component mapping is legal on the view; only the image
         // dimensionality must be the ordinary single-plane 2D form.
         if key.image.layers != 1
-            || key.image.volume
-            || key.image.cube
-            || key.image.arrayed
-            || key.image.one_dim
+            || key.image.kind != reims_vgpu_core::texture_shape::TextureKind::D2
         {
             return Ok(None);
         }
@@ -4074,10 +4220,7 @@ impl ResourcePools {
             width,
             height,
             layers,
-            volume,
-            cube,
-            arrayed,
-            one_dim,
+            kind,
             format,
             swizzle,
         } = sk;
@@ -4097,29 +4240,21 @@ impl ResourcePools {
             }
             return Ok(handles);
         }
-        let image_type = if one_dim {
-            vk::ImageType::TYPE_1D
-        } else if volume {
-            vk::ImageType::TYPE_3D
-        } else {
-            vk::ImageType::TYPE_2D
+        // The view type is `reims_vgpu_vulkan::view`'s answer and not a cascade
+        // here. It used to be six ordered `if`s over four booleans, where the
+        // order was the only thing keeping `one_dim && cube` from producing a
+        // cube view of a 1D image; the shape is a total type now and the
+        // translation is an exhaustive match in the crate that owns it.
+        let view_type = reims_vgpu_vulkan::view::view_type(kind);
+        let image_type = match kind.dimensions() {
+            reims_vgpu_core::texture_shape::Dimensions::One => vk::ImageType::TYPE_1D,
+            reims_vgpu_core::texture_shape::Dimensions::Two => vk::ImageType::TYPE_2D,
+            reims_vgpu_core::texture_shape::Dimensions::Three => vk::ImageType::TYPE_3D,
         };
-        let view_type = if one_dim && arrayed {
-            vk::ImageViewType::TYPE_1D_ARRAY
-        } else if one_dim {
-            vk::ImageViewType::TYPE_1D
-        } else if volume {
-            vk::ImageViewType::TYPE_3D
-        } else if cube {
-            vk::ImageViewType::CUBE
-        } else if arrayed {
-            vk::ImageViewType::TYPE_2D_ARRAY
-        } else {
-            vk::ImageViewType::TYPE_2D
-        };
+        let volume = kind.is_volume();
         let extent_depth = if volume { layers } else { 1 };
         let array_layers = if volume { 1 } else { layers };
-        let flags = if cube {
+        let flags = if kind.is_cube() {
             vk::ImageCreateFlags::CUBE_COMPATIBLE
         } else {
             vk::ImageCreateFlags::empty()
@@ -4195,10 +4330,7 @@ impl ResourcePools {
             width,
             height,
             layers,
-            volume,
-            cube,
-            arrayed,
-            one_dim,
+            kind,
             format,
             swizzle,
         };
@@ -4970,10 +5102,7 @@ mod recycle_tests {
             width: w,
             height: h,
             layers: 1,
-            volume: false,
-            cube: false,
-            arrayed: false,
-            one_dim: false,
+            kind: reims_vgpu_core::texture_shape::TextureKind::D2,
             format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
                 crate::protocol::pixel_format::TexelLayout::Bgra8,
             ),
@@ -5448,7 +5577,7 @@ mod recycle_tests {
         assert_eq!(
             pools.attachment_snapshot_free.count_for(&key),
             BATCH_MAX_DRAWS as usize
-                * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+                * (crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS + 1)
         );
         assert!(
             pools
@@ -5478,7 +5607,7 @@ mod recycle_tests {
         assert_eq!(
             pool.len(),
             BATCH_MAX_DRAWS as usize
-                * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+                * (crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS + 1)
         );
     }
 
@@ -6718,6 +6847,82 @@ mod recycle_tests {
             assert!(
                 matches!(pools.batch_fit(&target(0), narrow), BatchFit::Full),
                 "narrow={narrow}"
+            );
+        }
+    }
+
+    /// The defect the window's slot closes, stated as the mask that used to be
+    /// zero.
+    ///
+    /// An idle ring is the common state between tranches, and it is exactly when
+    /// `dispose` takes its immediate-destroy arm. A host-window blit submitted
+    /// and not yet retired is reading images that arm knows nothing about, so a
+    /// resident retired by a `registry_ensure*` recreate arm at that instant was
+    /// destroyed under the running blit.
+    #[cfg(feature = "host-window")]
+    #[test]
+    fn an_idle_ring_with_a_window_present_outstanding_parks_the_handle_anyway() {
+        let mut pools = ResourcePools::new();
+        pools.slots = (0..4).map(|_| pending_slot()).collect();
+        for slot in &mut pools.slots {
+            slot.pending = None;
+        }
+        assert_eq!(
+            pools.open_slot_mask(),
+            0,
+            "an idle ring with no window present is what the immediate-destroy \
+             arm is for"
+        );
+
+        let _present =
+            crate::backend::vulkan::engine::window_present::PresentInFlightForTest::claim();
+        let waiting = pools.open_slot_mask();
+        assert_eq!(
+            waiting,
+            super::WINDOW_PRESENT_SLOT,
+            "the window is the only thing outstanding, so it is the only bit"
+        );
+
+        pools.graveyard.push((
+            waiting,
+            DeferredHandle::Framebuffer(vk::Framebuffer::null()),
+        ));
+
+        // Every engine slot retiring is not what this handle waits on.
+        for index in 0..pools.slots.len() {
+            assert!(
+                pools.take_released_graveyard(1 << index).is_empty(),
+                "slot {index} retiring says nothing about the window's blit"
+            );
+        }
+        assert_eq!(pools.graveyard.len(), 1);
+
+        assert_eq!(
+            pools
+                .take_released_graveyard(super::WINDOW_PRESENT_SLOT)
+                .len(),
+            1,
+            "the window giving its slot back is what frees it"
+        );
+        assert!(pools.graveyard.is_empty());
+    }
+
+    /// The window's bit is not a slot index, at any ring depth the mask admits.
+    ///
+    /// Asserted over the whole index range rather than against `RING_DEPTH`
+    /// alone, because `open_slot_mask` derives its bits from `slots.len()` and a
+    /// test pinned to today's depth would pass while a grown ring aliased the
+    /// window's blit onto a command buffer's. The `const` assertion beside
+    /// `WINDOW_PRESENT_SLOT` is the other half; this one is what a reader of the
+    /// mask sees.
+    #[cfg(feature = "host-window")]
+    #[test]
+    fn the_window_slot_is_not_one_of_the_rings() {
+        for index in 0..RING_DEPTH {
+            assert_eq!(
+                super::WINDOW_PRESENT_SLOT & (1 << index),
+                0,
+                "slot {index} aliases the window's bit"
             );
         }
     }

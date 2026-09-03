@@ -50,14 +50,17 @@ use crate::render::{
 use crate::resource_state::{ResourceStateOp, ResourceStateTarget, SliceLevel};
 use crate::sync::{BarrierOp, BarrierTarget, EventOp, FenceOp, ResourceSpan};
 use reims_vgpu_protocol::closure::{self, Rail};
+use reims_vgpu_protocol::decode::blit as record;
 use reims_vgpu_protocol::decode::blit::{
     BlitRecord, FillPattern as RecordFill, Origin as RecordOrigin, Size as RecordSize,
     TextureEndpoint,
 };
+use reims_vgpu_protocol::decode::compute as protocol_compute;
 use reims_vgpu_protocol::decode::compute::{
     ComputeRecord, DispatchRecord, Extent as RecordExtent, IndirectRef as ComputeIndirect,
 };
 use reims_vgpu_protocol::decode::icb::IcbRecord;
+use reims_vgpu_protocol::decode::render as protocol_render;
 use reims_vgpu_protocol::decode::render::{
     DrawRecord, IndexRef as RecordIndexRef, IndirectRef as RenderIndirect,
     Instancing as RecordInstancing, RenderRecord,
@@ -79,6 +82,140 @@ use reims_vgpu_protocol::decode::{
 pub trait RefResolver {
     /// The live resource a ref names, or `None` when the slot holds nothing.
     fn resource(&self, object_ref: u32) -> Option<ResourceId>;
+}
+
+/// Every task's object namespace, asked for by the task that owns it.
+///
+/// # Why this exists beside [`RefResolver`] rather than replacing it
+///
+/// A `RefResolver` **is** one namespace. An interpreter holding one is already
+/// inside the task whose refs it is resolving, so "which task" is not a question
+/// it can get wrong, and giving it a task parameter would be a field nothing
+/// could disagree about.
+///
+/// A byte-to-operation join is not in that position. It is handed a payload; the
+/// task id is *inside* that payload; and it learns which task only by decoding.
+/// A join taking a `RefResolver` therefore takes the **caller's guess** about
+/// which namespace the packet meant — on exactly the packets whose own contract
+/// is that the task is the header's and not a guess. Object-list refs are
+/// per-task slot numbers, so the wrong namespace does not refuse: it resolves,
+/// to another task's resource, and the operation retires or invalidates storage
+/// the packet never named.
+///
+/// So [`crate::lifecycle`]'s joins take this instead and bind the task from the
+/// bytes they just decoded, with [`InTask`]. A caller cannot pass the wrong
+/// namespace because it no longer picks one.
+///
+/// # It is not a second lifetime model
+///
+/// One method, and it answers exactly what `RefResolver` answers, for a stated
+/// task. Nothing here mints, leases, retires or generates: the generation in the
+/// returned [`ResourceId`] is the namespace's, and this trait is the routing to
+/// the namespace and nothing else.
+pub trait TaskNamespaces {
+    /// The live resource a ref names in one task's object namespace, or `None`
+    /// when that task has no namespace or the slot holds nothing.
+    fn resource(&self, task: crate::identity::TaskId, object_ref: u32) -> Option<ResourceId>;
+}
+
+/// One task's namespace out of a source of many, in the shape [`RefResolver`]
+/// wants.
+///
+/// The binder, and the only way a [`TaskNamespaces`] becomes a `RefResolver`.
+/// Constructed where a task id has just been decoded from a packet, so the
+/// namespace and the packet's own task cannot come apart.
+#[derive(Clone, Copy)]
+pub struct InTask<'a, S: ?Sized> {
+    source: &'a S,
+    task: crate::identity::TaskId,
+}
+
+impl<'a, S: TaskNamespaces + ?Sized> InTask<'a, S> {
+    /// Bind a namespace source to one task.
+    pub const fn new(source: &'a S, task: crate::identity::TaskId) -> Self {
+        Self { source, task }
+    }
+
+    /// The task this resolves in.
+    #[must_use]
+    pub const fn task(&self) -> crate::identity::TaskId {
+        self.task
+    }
+}
+
+impl<S: TaskNamespaces + ?Sized> RefResolver for InTask<'_, S> {
+    fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+        self.source.resource(self.task, object_ref)
+    }
+}
+
+/// A borrow of a resolver resolves the same as the resolver.
+///
+/// Stated so a caller holding `&Namespace` can hand it to a wrapper that takes
+/// one by value without an owned copy of a namespace being created to satisfy a
+/// type.
+impl<R: RefResolver + ?Sized> RefResolver for &R {
+    fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+        (**self).resource(object_ref)
+    }
+}
+
+/// One namespace standing in for every task's.
+///
+/// **For a holder of exactly one namespace, and it says so in its name.** A
+/// bench, a fixture, or a model whose packets all name one task has one
+/// namespace and no routing question to get wrong; making it satisfy
+/// [`TaskNamespaces`] should not cost it a map keyed by a task id it does not
+/// have.
+///
+/// It is the shape [`TaskNamespaces`] exists to stop a *device* from taking. A
+/// device with more than one task that wrapped one namespace this way would
+/// resolve every packet's refs in whichever namespace it wrapped, which is the
+/// wrong-namespace resolution described above — so this is deliberately not
+/// something the device can arrive at by accident: it has to be written, by
+/// name, at the call site.
+#[derive(Clone, Copy, Debug)]
+pub struct SameForEveryTask<R>(pub R);
+
+impl<R: RefResolver> TaskNamespaces for SameForEveryTask<R> {
+    fn resource(&self, _task: crate::identity::TaskId, object_ref: u32) -> Option<ResourceId> {
+        self.0.resource(object_ref)
+    }
+}
+
+/// The storage a task's live resource name answers for, as an access is keyed
+/// on it.
+///
+/// # Why this is not a fourth method on [`TaskNamespaces`]
+///
+/// [`TaskNamespaces`] answers what a *ref* names, and its whole claim is that it
+/// mints nothing: the generation it hands back is the namespace's. This answers
+/// something else — where a named resource's bytes are — and the two have
+/// different holders on a real device. Folded together, the one implementor that
+/// can answer refs but not storage would have to return `None` from a method it
+/// has no term for, and a caller could not tell that from "this slot holds
+/// nothing".
+///
+/// It is also what stops [`SameForEveryTask`] from having to answer: a fixture
+/// wrapping one [`RefResolver`] has no storage term at all, and a trait it does
+/// not implement is a compile error rather than a `None` that reads as an empty
+/// slot.
+///
+/// # `None` is "no key", never "no ordering"
+///
+/// A caller that gets `None` still has an access to build. What it has lost is
+/// the *key*, so the honest access is [`crate::access::AccessKey::DomainOnly`] —
+/// ordering from the submission domain alone — and not a dropped access, which
+/// would order the operation against nothing at all.
+pub trait ResourceStorage {
+    /// The key an access to this resource is built on, or `None` when the task
+    /// has no namespace, the name is not live in it, or this holder has no
+    /// storage term for it.
+    fn storage(
+        &self,
+        task: crate::identity::TaskId,
+        resource: ResourceId,
+    ) -> Option<crate::access::ResourceKey>;
 }
 
 /// Which backing a guest mapping's surface currently occupies.
@@ -212,20 +349,20 @@ fn endpoint(
 /// Resolve a transfer record.
 pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, ResolveRefusal> {
     Ok(match *record {
-        BlitRecord::BufferToBuffer {
+        BlitRecord::BufferToBuffer(record::BufferToBuffer {
             source_ref,
             source_offset,
             dest_ref,
             dest_offset,
             size: bytes,
-        } => BlitOp::BufferToBuffer {
+        }) => BlitOp::BufferToBuffer {
             source: one(resolver, source_ref)?,
             source_offset,
             dest: one(resolver, dest_ref)?,
             dest_offset,
             size: bytes,
         },
-        BlitRecord::BufferToTexture {
+        BlitRecord::BufferToTexture(record::BufferToTexture {
             source_ref,
             source_offset,
             bytes_per_row,
@@ -233,7 +370,7 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             size: extent,
             dest,
             options,
-        } => BlitOp::BufferToTexture {
+        }) => BlitOp::BufferToTexture {
             source: one(resolver, source_ref)?,
             source_offset,
             source_pitch: ImagePitch {
@@ -244,7 +381,7 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             dest: endpoint(resolver, dest)?,
             options: BlitOptions(options),
         },
-        BlitRecord::TextureToBuffer {
+        BlitRecord::TextureToBuffer(record::TextureToBuffer {
             source,
             size: extent,
             dest_ref,
@@ -252,7 +389,7 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             bytes_per_row,
             bytes_per_image,
             options,
-        } => BlitOp::TextureToBuffer {
+        }) => BlitOp::TextureToBuffer {
             source: endpoint(resolver, source)?,
             size: size(extent),
             dest: one(resolver, dest_ref)?,
@@ -263,18 +400,18 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             },
             options: BlitOptions(u32::from(options)),
         },
-        BlitRecord::TextureRegion {
+        BlitRecord::TextureRegion(record::TextureRegion {
             source,
             dest,
             size: extent,
             options,
-        } => BlitOp::TextureRegion {
+        }) => BlitOp::TextureRegion {
             source: endpoint(resolver, source)?,
             dest: endpoint(resolver, dest)?,
             size: size(extent),
             options: BlitOptions(options),
         },
-        BlitRecord::TextureSlices {
+        BlitRecord::TextureSlices(record::TextureSlices {
             source_ref,
             source_slice,
             source_level,
@@ -283,7 +420,7 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             dest_level,
             slice_count,
             level_count,
-        } => BlitOp::TextureSlices {
+        }) => BlitOp::TextureSlices {
             source: SpanOrigin {
                 texture: one(resolver, source_ref)?,
                 base_slice: source_slice,
@@ -299,12 +436,12 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
             slice_count,
             level_count,
         },
-        BlitRecord::FillBuffer {
+        BlitRecord::FillBuffer(record::FillBuffer {
             buffer_ref,
             location,
             length,
             pattern,
-        } => BlitOp::FillBuffer {
+        }) => BlitOp::FillBuffer {
             dest: BufferSpan {
                 buffer: one(resolver, buffer_ref)?,
                 offset: location,
@@ -315,9 +452,11 @@ pub fn blit(record: &BlitRecord, resolver: &impl RefResolver) -> Result<BlitOp, 
                 RecordFill::Pattern4(w) => FillPattern::Pattern4(w),
             },
         },
-        BlitRecord::GenerateMipmaps { texture_ref } => BlitOp::GenerateMipmaps {
-            texture: one(resolver, texture_ref)?,
-        },
+        BlitRecord::GenerateMipmaps(record::GenerateMipmaps { texture_ref }) => {
+            BlitOp::GenerateMipmaps {
+                texture: one(resolver, texture_ref)?,
+            }
+        }
     })
 }
 
@@ -618,85 +757,104 @@ pub fn compute(
     arenas: &mut ExecArenas,
 ) -> Result<ComputeOp, ResolveRefusal> {
     Ok(match *record {
-        ComputeRecord::BindBuffers { first, entries } => ComputeOp::BindBuffers {
-            first,
-            entries: append_buffer_binds(arenas, resolver, entries)?,
-        },
-        ComputeRecord::BindBuffersWithStride { first, entries } => {
-            ComputeOp::BindBuffersWithStride {
+        ComputeRecord::BindBuffers(protocol_compute::BindBuffers { first, entries }) => {
+            ComputeOp::BindBuffers {
                 first,
-                entries: append_stride_binds(arenas, resolver, entries)?,
+                entries: append_buffer_binds(arenas, resolver, entries)?,
             }
         }
-        ComputeRecord::BindTextures { first, entries } => ComputeOp::BindTextures {
+        ComputeRecord::BindBuffersWithStride(protocol_compute::BindBuffersWithStride {
             first,
-            entries: append_object_binds(arenas, resolver, entries)?,
-        },
-        ComputeRecord::BindSamplers { first, entries } => ComputeOp::BindSamplers {
+            entries,
+        }) => ComputeOp::BindBuffersWithStride {
             first,
-            entries: append_object_binds(arenas, resolver, entries)?,
+            entries: append_stride_binds(arenas, resolver, entries)?,
         },
-        ComputeRecord::BindSamplersWithLod { first, entries } => ComputeOp::BindSamplersWithLod {
+        ComputeRecord::BindTextures(protocol_compute::BindTextures { first, entries }) => {
+            ComputeOp::BindTextures {
+                first,
+                entries: append_object_binds(arenas, resolver, entries)?,
+            }
+        }
+        ComputeRecord::BindSamplers(protocol_compute::BindSamplers { first, entries }) => {
+            ComputeOp::BindSamplers {
+                first,
+                entries: append_object_binds(arenas, resolver, entries)?,
+            }
+        }
+        ComputeRecord::BindSamplersWithLod(protocol_compute::BindSamplersWithLod {
+            first,
+            entries,
+        }) => ComputeOp::BindSamplersWithLod {
             first,
             entries: append_sampler_lod_binds(arenas, resolver, entries)?,
         },
-        ComputeRecord::RebindBufferOffset {
+        ComputeRecord::RebindBufferOffset(protocol_compute::RebindBufferOffset {
             index,
             offset,
             stride,
-        } => ComputeOp::RebindBufferOffset {
+        }) => ComputeOp::RebindBufferOffset {
             index,
             offset,
             stride,
         },
-        ComputeRecord::SetPipeline { pipeline_ref } => ComputeOp::SetPipeline {
-            pipeline: one(resolver, pipeline_ref)?,
-        },
-        ComputeRecord::SetStageInRegion { origin, size } => ComputeOp::SetStageInRegion {
-            origin: ComputeOrigin {
-                x: origin.x,
-                y: origin.y,
-                z: origin.z,
-            },
-            size: compute_extent(size),
-        },
-        ComputeRecord::SetStageInRegionIndirect { source } => ComputeOp::SetStageInRegionIndirect {
+        ComputeRecord::SetPipeline(protocol_compute::SetPipeline { pipeline_ref }) => {
+            ComputeOp::SetPipeline {
+                pipeline: one(resolver, pipeline_ref)?,
+            }
+        }
+        ComputeRecord::SetStageInRegion(protocol_compute::SetStageInRegion { origin, size }) => {
+            ComputeOp::SetStageInRegion {
+                origin: ComputeOrigin {
+                    x: origin.x,
+                    y: origin.y,
+                    z: origin.z,
+                },
+                size: compute_extent(size),
+            }
+        }
+        ComputeRecord::SetStageInRegionIndirect(protocol_compute::SetStageInRegionIndirect {
+            source,
+        }) => ComputeOp::SetStageInRegionIndirect {
             source: indirect(resolver, source)?,
         },
-        ComputeRecord::SetThreadgroupMemory { index, length } => {
-            ComputeOp::SetThreadgroupMemory { index, length }
-        }
-        ComputeRecord::SetImageblockSize { width, height } => {
+        ComputeRecord::SetThreadgroupMemory(protocol_compute::SetThreadgroupMemory {
+            index,
+            length,
+        }) => ComputeOp::SetThreadgroupMemory { index, length },
+        ComputeRecord::SetImageblockSize(protocol_compute::SetImageblockSize { width, height }) => {
             ComputeOp::SetImageblockSize { width, height }
         }
-        ComputeRecord::WriteDescriptor { dispatch_type } => {
+        ComputeRecord::WriteDescriptor(protocol_compute::WriteDescriptor { dispatch_type }) => {
             ComputeOp::WriteDescriptor { dispatch_type }
         }
         ComputeRecord::Dispatch(d) => ComputeOp::Dispatch(match d {
-            DispatchRecord::Threadgroups {
+            DispatchRecord::Threadgroups(protocol_compute::Threadgroups {
                 groups,
                 threads_per_group,
-            } => DispatchOp::Threadgroups {
+            }) => DispatchOp::Threadgroups {
                 groups: compute_extent(groups),
                 threads_per_group: compute_extent(threads_per_group),
             },
-            DispatchRecord::Threads {
+            DispatchRecord::Threads(protocol_compute::Threads {
                 threads,
                 threads_per_group,
-            } => DispatchOp::Threads {
+            }) => DispatchOp::Threads {
                 threads: compute_extent(threads),
                 threads_per_group: compute_extent(threads_per_group),
             },
-            DispatchRecord::ThreadgroupsIndirect {
+            DispatchRecord::ThreadgroupsIndirect(protocol_compute::ThreadgroupsIndirect {
                 source,
                 threads_per_group,
-            } => DispatchOp::ThreadgroupsIndirect {
+            }) => DispatchOp::ThreadgroupsIndirect {
                 source: indirect(resolver, source)?,
                 threads_per_group: compute_extent(threads_per_group),
             },
-            DispatchRecord::ThreadsIndirect { source } => DispatchOp::ThreadsIndirect {
-                source: indirect(resolver, source)?,
-            },
+            DispatchRecord::ThreadsIndirect(protocol_compute::ThreadsIndirect { source }) => {
+                DispatchOp::ThreadsIndirect {
+                    source: indirect(resolver, source)?,
+                }
+            }
         }),
     })
 }
@@ -870,64 +1028,71 @@ pub fn render(
 ) -> Result<RenderOp, ResolveRefusal> {
     Ok(match *record {
         RenderRecord::Draw(d) => RenderOp::Draw(draw(&d, resolver)?),
-        RenderRecord::BindBuffers {
+        RenderRecord::BindBuffers(protocol_render::BindBuffers {
             stage,
             first,
             entries,
-        } => RenderOp::BindBuffers {
+        }) => RenderOp::BindBuffers {
             stage,
             first,
             entries: append_buffer_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::BindBuffersWithStride { first, entries } => RenderOp::BindBuffersWithStride {
+        RenderRecord::BindBuffersWithStride(protocol_render::BindBuffersWithStride {
+            first,
+            entries,
+        }) => RenderOp::BindBuffersWithStride {
             first,
             entries: append_stride_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::BindTextures {
+        RenderRecord::BindTextures(protocol_render::BindTextures {
             stage,
             first,
             entries,
-        } => RenderOp::BindTextures {
+        }) => RenderOp::BindTextures {
             stage,
             first,
             entries: append_object_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::BindSamplers {
+        RenderRecord::BindSamplers(protocol_render::BindSamplers {
             stage,
             first,
             entries,
-        } => RenderOp::BindSamplers {
+        }) => RenderOp::BindSamplers {
             stage,
             first,
             entries: append_object_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::BindSamplersWithLod {
+        RenderRecord::BindSamplersWithLod(protocol_render::BindSamplersWithLod {
             stage,
             first,
             entries,
-        } => RenderOp::BindSamplersWithLod {
+        }) => RenderOp::BindSamplersWithLod {
             stage,
             first,
             entries: append_sampler_lod_binds(arenas, resolver, entries)?,
         },
-        RenderRecord::RebindBufferOffset {
+        RenderRecord::RebindBufferOffset(protocol_render::RebindBufferOffset {
             stage,
             index,
             offset,
             stride,
-        } => RenderOp::RebindBufferOffset {
+        }) => RenderOp::RebindBufferOffset {
             stage,
             index,
             offset,
             stride,
         },
-        RenderRecord::SetPipeline { pipeline_ref } => RenderOp::SetPipeline {
-            pipeline: one(resolver, pipeline_ref)?,
-        },
-        RenderRecord::SetDepthStencilState { state_ref } => RenderOp::SetDepthStencilState {
-            state: one(resolver, state_ref)?,
-        },
-        RenderRecord::WriteDescriptor { descriptor } => {
+        RenderRecord::SetPipeline(protocol_render::SetPipeline { pipeline_ref }) => {
+            RenderOp::SetPipeline {
+                pipeline: one(resolver, pipeline_ref)?,
+            }
+        }
+        RenderRecord::SetDepthStencilState(protocol_render::SetDepthStencilState { state_ref }) => {
+            RenderOp::SetDepthStencilState {
+                state: one(resolver, state_ref)?,
+            }
+        }
+        RenderRecord::WriteDescriptor(protocol_render::WriteDescriptor { descriptor }) => {
             let resolved = pass_descriptor(descriptor, resolver)?;
             let slot = u32::try_from(arenas.pass_descriptors.len())
                 .map_err(|_| ResolveRefusal::ArenaOverflow { wanted: 1 })?;
@@ -942,40 +1107,43 @@ pub fn render(
         RenderRecord::SetScissorRects(rects) => {
             RenderOp::SetScissorRects(append_scissors(arenas, rects)?)
         }
-        RenderRecord::SetCullMode(mode) => RenderOp::SetCullMode(mode),
-        RenderRecord::SetFrontFacingWinding(mode) => RenderOp::SetFrontFacingWinding(mode),
-        RenderRecord::SetDepthClipMode(mode) => RenderOp::SetDepthClipMode(mode),
-        RenderRecord::SetTriangleFillMode(mode) => RenderOp::SetTriangleFillMode(mode),
-        RenderRecord::SetDepthBias {
+        RenderRecord::SetCullMode(r) => RenderOp::SetCullMode(r.mode),
+        RenderRecord::SetFrontFacingWinding(r) => RenderOp::SetFrontFacingWinding(r.winding),
+        RenderRecord::SetDepthClipMode(r) => RenderOp::SetDepthClipMode(r.mode),
+        RenderRecord::SetTriangleFillMode(r) => RenderOp::SetTriangleFillMode(r.mode),
+        RenderRecord::SetDepthBias(protocol_render::SetDepthBias {
             bias_bits,
             slope_scale_bits,
             clamp_bits,
-        } => RenderOp::SetDepthBias {
+        }) => RenderOp::SetDepthBias {
             bias: FloatBits(bias_bits),
             slope_scale: FloatBits(slope_scale_bits),
             clamp: FloatBits(clamp_bits),
         },
-        RenderRecord::SetLineWidth { width_bits } => RenderOp::SetLineWidth(FloatBits(width_bits)),
-        RenderRecord::SetBlendColor {
+        RenderRecord::SetLineWidth(protocol_render::SetLineWidth { width_bits }) => {
+            RenderOp::SetLineWidth(FloatBits(width_bits))
+        }
+        RenderRecord::SetBlendColor(protocol_render::SetBlendColor {
             red_bits,
             green_bits,
             blue_bits,
             alpha_bits,
-        } => RenderOp::SetBlendColor {
+        }) => RenderOp::SetBlendColor {
             red: FloatBits(red_bits),
             green: FloatBits(green_bits),
             blue: FloatBits(blue_bits),
             alpha: FloatBits(alpha_bits),
         },
-        RenderRecord::SetStencilReference { front, back } => {
+        RenderRecord::SetStencilReference(protocol_render::SetStencilReference { front, back }) => {
             RenderOp::SetStencilReference { front, back }
         }
-        RenderRecord::SetStoreAction { target, action } => {
+        RenderRecord::SetStoreAction(protocol_render::SetStoreAction { target, action }) => {
             RenderOp::SetStoreAction { target, action }
         }
-        RenderRecord::SetVisibilityResultMode { mode, offset } => {
-            RenderOp::SetVisibilityResultMode { mode, offset }
-        }
+        RenderRecord::SetVisibilityResultMode(protocol_render::SetVisibilityResultMode {
+            mode,
+            offset,
+        }) => RenderOp::SetVisibilityResultMode { mode, offset },
     })
 }
 
@@ -1010,42 +1178,42 @@ fn instancing(i: RecordInstancing) -> Instancing {
 /// Resolve a draw record.
 pub fn draw(record: &DrawRecord, resolver: &impl RefResolver) -> Result<DrawOp, ResolveRefusal> {
     Ok(match *record {
-        DrawRecord::Primitives {
+        DrawRecord::Primitives(protocol_render::Primitives {
             primitive,
             vertex_start,
             vertex_count,
             instances,
-        } => DrawOp::Primitives {
+        }) => DrawOp::Primitives {
             primitive: PrimitiveType(primitive),
             vertex_start,
             vertex_count,
             instances: instancing(instances),
         },
-        DrawRecord::Indexed {
+        DrawRecord::Indexed(protocol_render::Indexed {
             primitive,
             index,
             index_count,
             instances,
             base_vertex,
-        } => DrawOp::Indexed {
+        }) => DrawOp::Indexed {
             primitive: PrimitiveType(primitive),
             index: index_source(resolver, index)?,
             index_count,
             instances: instancing(instances),
             base_vertex,
         },
-        DrawRecord::PrimitivesIndirect {
+        DrawRecord::PrimitivesIndirect(protocol_render::PrimitivesIndirect {
             primitive,
             arguments,
-        } => DrawOp::PrimitivesIndirect {
+        }) => DrawOp::PrimitivesIndirect {
             primitive: PrimitiveType(primitive),
             arguments: draw_arguments(resolver, arguments)?,
         },
-        DrawRecord::IndexedIndirect {
+        DrawRecord::IndexedIndirect(protocol_render::IndexedIndirect {
             primitive,
             index,
             arguments,
-        } => DrawOp::IndexedIndirect {
+        }) => DrawOp::IndexedIndirect {
             primitive: PrimitiveType(primitive),
             index: index_source(resolver, index)?,
             arguments: draw_arguments(resolver, arguments)?,
@@ -1228,13 +1396,13 @@ mod tests {
     #[test]
     fn a_transfer_resolves_both_of_its_endpoints() {
         let live = Live(vec![5151, 5252]);
-        let record = BlitRecord::BufferToBuffer {
+        let record = BlitRecord::BufferToBuffer(record::BufferToBuffer {
             source_ref: 5151,
             source_offset: 0x10,
             dest_ref: 5252,
             dest_offset: 0x20,
             size: 0x30,
-        };
+        });
         assert_eq!(
             blit(&record, &live),
             Ok(BlitOp::BufferToBuffer {
@@ -1253,13 +1421,13 @@ mod tests {
     #[test]
     fn a_dead_ref_refuses_by_name_rather_than_resolving_to_nothing() {
         let live = Live(vec![5151]);
-        let record = BlitRecord::BufferToBuffer {
+        let record = BlitRecord::BufferToBuffer(record::BufferToBuffer {
             source_ref: 5151,
             source_offset: 0,
             dest_ref: 4242,
             dest_offset: 0,
             size: 1,
-        };
+        });
         assert_eq!(
             blit(&record, &live),
             Err(ResolveRefusal::UnknownRef { object_ref: 4242 })
@@ -1414,10 +1582,10 @@ mod tests {
         let live = Live(vec![5151]);
         let mut arenas = ExecArenas::default();
         let entries = [buffer_entry(5151, 0x10), buffer_entry(0, 0)];
-        let record = ComputeRecord::BindBuffers {
+        let record = ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
             first: 2,
             entries: &entries,
-        };
+        });
         let ComputeOp::BindBuffers { first, entries } =
             compute(&record, &live, &mut arenas).expect("resolved")
         else {
@@ -1448,10 +1616,10 @@ mod tests {
         let live = Live(Vec::new());
         let mut arenas = ExecArenas::default();
         let entries = [buffer_entry(5151, 0)];
-        let record = ComputeRecord::BindBuffers {
+        let record = ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
             first: 0,
             entries: &entries,
-        };
+        });
         assert_eq!(
             compute(&record, &live, &mut arenas),
             Err(ResolveRefusal::UnknownRef { object_ref: 5151 })
@@ -1471,10 +1639,11 @@ mod tests {
             offset: reims_vgpu_protocol::decode::U64le::new(0x10),
             attribute_stride: reims_vgpu_protocol::decode::U64le::new(0x20),
         });
-        let record = ComputeRecord::BindBuffersWithStride {
-            first: 0,
-            entries: &entries,
-        };
+        let record =
+            ComputeRecord::BindBuffersWithStride(protocol_compute::BindBuffersWithStride {
+                first: 0,
+                entries: &entries,
+            });
         let ComputeOp::BindBuffersWithStride { entries, .. } =
             compute(&record, &live, &mut arenas).expect("resolved")
         else {
@@ -1497,10 +1666,10 @@ mod tests {
                 lod_min_clamp: reims_vgpu_protocol::decode::F32le::new(lo),
                 lod_max_clamp: reims_vgpu_protocol::decode::F32le::new(hi),
             });
-        let record = ComputeRecord::BindSamplersWithLod {
+        let record = ComputeRecord::BindSamplersWithLod(protocol_compute::BindSamplersWithLod {
             first: 0,
             entries: &entries,
-        };
+        });
         let ComputeOp::BindSamplersWithLod { entries, .. } =
             compute(&record, &live, &mut arenas).expect("resolved")
         else {
@@ -1528,19 +1697,19 @@ mod tests {
             object_ref: reims_vgpu_protocol::decode::U32le::new(1),
         }];
         let a = compute(
-            &ComputeRecord::BindBuffers {
+            &ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
                 first: 0,
                 entries: &buffers,
-            },
+            }),
             &live,
             &mut arenas,
         )
         .expect("resolved");
         let b = compute(
-            &ComputeRecord::BindTextures {
+            &ComputeRecord::BindTextures(protocol_compute::BindTextures {
                 first: 0,
                 entries: &objects,
-            },
+            }),
             &live,
             &mut arenas,
         )
@@ -1563,11 +1732,11 @@ mod tests {
     fn a_rebind_resolves_nothing_because_it_names_nothing() {
         let live = Live(Vec::new());
         let mut arenas = ExecArenas::default();
-        let record = ComputeRecord::RebindBufferOffset {
+        let record = ComputeRecord::RebindBufferOffset(protocol_compute::RebindBufferOffset {
             index: 6,
             offset: 0x5678,
             stride: Some(0x20),
-        };
+        });
         assert_eq!(
             compute(&record, &live, &mut arenas),
             Ok(ComputeOp::RebindBufferOffset {
@@ -1584,30 +1753,34 @@ mod tests {
     fn only_an_indirect_dispatch_resolves_a_buffer() {
         let live = Live(vec![5151]);
         let mut arenas = ExecArenas::default();
-        let direct = ComputeRecord::Dispatch(DispatchRecord::Threadgroups {
-            groups: RecordExtent {
-                width: 1,
-                height: 2,
-                depth: 3,
+        let direct = ComputeRecord::Dispatch(DispatchRecord::Threadgroups(
+            protocol_compute::Threadgroups {
+                groups: RecordExtent {
+                    width: 1,
+                    height: 2,
+                    depth: 3,
+                },
+                threads_per_group: RecordExtent {
+                    width: 4,
+                    height: 5,
+                    depth: 6,
+                },
             },
-            threads_per_group: RecordExtent {
-                width: 4,
-                height: 5,
-                depth: 6,
-            },
-        });
+        ));
         let ComputeOp::Dispatch(op) = compute(&direct, &live, &mut arenas).expect("resolved")
         else {
             panic!("not a dispatch");
         };
         assert_eq!(op.indirect_read(), None);
 
-        let indirect_record = ComputeRecord::Dispatch(DispatchRecord::ThreadsIndirect {
-            source: ComputeIndirect {
-                buffer_ref: 5151,
-                offset: 0x1111,
+        let indirect_record = ComputeRecord::Dispatch(DispatchRecord::ThreadsIndirect(
+            protocol_compute::ThreadsIndirect {
+                source: ComputeIndirect {
+                    buffer_ref: 5151,
+                    offset: 0x1111,
+                },
             },
-        });
+        ));
         let ComputeOp::Dispatch(op) =
             compute(&indirect_record, &live, &mut arenas).expect("resolved")
         else {
@@ -1849,17 +2022,17 @@ mod tests {
     #[test]
     fn a_draw_resolves_exactly_the_buffers_its_record_names() {
         let live = Live(vec![5151, 5252]);
-        let plain = DrawRecord::Primitives {
+        let plain = DrawRecord::Primitives(protocol_render::Primitives {
             primitive: 3,
             vertex_start: 0,
             vertex_count: 3,
             instances: RecordInstancing::default(),
-        };
+        });
         let resolved = draw(&plain, &Live(Vec::new())).expect("resolved");
         assert_eq!(resolved.index_read(), None);
         assert_eq!(resolved.indirect_read(), None);
 
-        let indexed = DrawRecord::IndexedIndirect {
+        let indexed = DrawRecord::IndexedIndirect(protocol_render::IndexedIndirect {
             primitive: 3,
             index: RecordIndexRef {
                 buffer_ref: 5151,
@@ -1870,7 +2043,7 @@ mod tests {
                 buffer_ref: 5252,
                 offset: 0x200,
             },
-        };
+        });
         let resolved = draw(&indexed, &live).expect("resolved");
         let (source, range) = resolved.index_read().expect("indexed");
         assert_eq!(source.buffer, id(5151));
@@ -1894,11 +2067,11 @@ mod tests {
         }];
         let mut spans = Vec::new();
         for stage in [ShaderStage::Vertex, ShaderStage::Fragment] {
-            let record = RenderRecord::BindTextures {
+            let record = RenderRecord::BindTextures(protocol_render::BindTextures {
                 stage,
                 first: 0,
                 entries: &entries,
-            };
+            });
             let RenderOp::BindTextures {
                 stage: got,
                 entries: span,
@@ -1922,7 +2095,8 @@ mod tests {
         let live = Live(Vec::new());
         let mut arenas = ExecArenas::default();
         let body = pass_body();
-        let record = RenderRecord::WriteDescriptor { descriptor: &body };
+        let record =
+            RenderRecord::WriteDescriptor(protocol_render::WriteDescriptor { descriptor: &body });
         let RenderOp::WriteDescriptor { descriptor } =
             render(&record, &live, &mut arenas).expect("resolved")
         else {
@@ -2329,10 +2503,10 @@ mod tests {
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map(Appended::Buffers);
-                        let record = ComputeRecord::BindBuffers {
+                        let record = ComputeRecord::BindBuffers(protocol_compute::BindBuffers {
                             first: 0,
                             entries: &entries,
-                        };
+                        });
                         let got = compute(&record, &live, &mut arenas).map(|op| match op {
                             ComputeOp::BindBuffers { entries, .. } => Some(entries),
                             other => panic!("a buffer bind resolved to {other:?}"),
@@ -2363,10 +2537,12 @@ mod tests {
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map(Appended::Buffers);
-                        let record = ComputeRecord::BindBuffersWithStride {
-                            first: 0,
-                            entries: &entries,
-                        };
+                        let record = ComputeRecord::BindBuffersWithStride(
+                            protocol_compute::BindBuffersWithStride {
+                                first: 0,
+                                entries: &entries,
+                            },
+                        );
                         let got = compute(&record, &live, &mut arenas).map(|op| match op {
                             ComputeOp::BindBuffersWithStride { entries, .. } => Some(entries),
                             other => panic!("a strided bind resolved to {other:?}"),
@@ -2394,10 +2570,10 @@ mod tests {
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map(Appended::Objects);
-                        let record = ComputeRecord::BindTextures {
+                        let record = ComputeRecord::BindTextures(protocol_compute::BindTextures {
                             first: 0,
                             entries: &entries,
-                        };
+                        });
                         let got = compute(&record, &live, &mut arenas).map(|op| match op {
                             ComputeOp::BindTextures { entries, .. } => Some(entries),
                             other => panic!("a texture bind resolved to {other:?}"),
@@ -2430,10 +2606,12 @@ mod tests {
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .map(Appended::Objects);
-                        let record = ComputeRecord::BindSamplersWithLod {
-                            first: 0,
-                            entries: &entries,
-                        };
+                        let record = ComputeRecord::BindSamplersWithLod(
+                            protocol_compute::BindSamplersWithLod {
+                                first: 0,
+                                entries: &entries,
+                            },
+                        );
                         let got = compute(&record, &live, &mut arenas).map(|op| match op {
                             ComputeOp::BindSamplersWithLod { entries, .. } => Some(entries),
                             other => panic!("a sampler bind resolved to {other:?}"),
@@ -2502,9 +2680,9 @@ mod tests {
                         named = vec![some_ref(&mut rng)];
                         binds = false;
                         let want = shadow_one(&live, named[0]).map(|_| Appended::Nothing);
-                        let record = RenderRecord::SetPipeline {
+                        let record = RenderRecord::SetPipeline(protocol_render::SetPipeline {
                             pipeline_ref: named[0],
-                        };
+                        });
                         let got = render(&record, &live, &mut arenas).map(|_| None);
                         (got, want)
                     }
@@ -2516,13 +2694,13 @@ mod tests {
                         let want = shadow_one(&live, named[0])
                             .and_then(|_| shadow_one(&live, named[1]))
                             .map(|_| Appended::Nothing);
-                        let record = BlitRecord::BufferToBuffer {
+                        let record = BlitRecord::BufferToBuffer(record::BufferToBuffer {
                             source_ref: named[0],
                             source_offset: 0,
                             dest_ref: named[1],
                             dest_offset: 0,
                             size: 64,
-                        };
+                        });
                         let got = blit(&record, &live).map(|_| None);
                         (got, want)
                     }
@@ -2538,7 +2716,10 @@ mod tests {
                             shadow_bound(&live, named[1])
                                 .map(|depth| Appended::Descriptor { color0, depth })
                         });
-                        let record = RenderRecord::WriteDescriptor { descriptor: &body };
+                        let record =
+                            RenderRecord::WriteDescriptor(protocol_render::WriteDescriptor {
+                                descriptor: &body,
+                            });
                         let got = render(&record, &live, &mut arenas).map(|op| match op {
                             RenderOp::WriteDescriptor { descriptor } => Some(ResourceSpan {
                                 start: descriptor.0,

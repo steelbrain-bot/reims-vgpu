@@ -119,7 +119,7 @@ pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 /// indexes with no bound check of its own.
 pub const MAX_CHANNELS: usize = 32;
 
-/// `active_child_mask`, `pending.child_mask` and `child_doorbell_rung` are each
+/// `DeviceState::open_child_mask`, `pending.child_mask` and `child_doorbell_rung` are each
 /// a `u32` carrying one bit per channel, and every producer reaches them with a
 /// bare `1u32 << channel_id`. That is only defined because a channel id is
 /// bounded by 32 — a `MAX_CHANNELS` above `u32::BITS` would make every one of
@@ -361,50 +361,16 @@ pub const ROOT_OP_DEVICE_INFO_TAHOE: u16 = 0x3a;
 /// went unimplemented — they are values no handler exists for at all, and a
 /// packet carrying one is malformed rather than merely unsupported. In range,
 /// the slots split three ways: a command (the constants below), the shared
-/// deprecated handler ([`CHILD_DEPRECATED_OPS`]), or an unassigned slot that
-/// reaches the same error path as an out-of-range value.
+/// deprecated handler — the rows the closure ledger judges
+/// `Closure::ProvenNoOp`, which this device reads through
+/// `reims_vgpu_core::control::ControlKind` and does not transcribe — or an
+/// unassigned slot that reaches the same error path as an out-of-range value.
 ///
 /// The drain reports the two cases apart, because they mean different things to
 /// whoever reads the log: an in-range unassigned slot is a guest sending a
 /// command this build of the host does not have, while out-of-range is a corrupt
 /// header or a desynced ring.
 pub const CHILD_OP_MAX: u16 = 0x40;
-
-/// The opcodes the reference host routes to its one shared deprecated handler.
-///
-/// These are real slots with a real handler, not holes: the host accepts the
-/// packet, does nothing with the payload and retires the stamps. They are
-/// listed rather than folded into the unknown arm so a guest that still emits
-/// one is reported as "sent a retired command" and not as "sent something this
-/// device cannot decode" — the first is expected of an older guest and the
-/// second is a gap in this device.
-///
-/// `0x2d` is in this set on the reference host, and is also
-/// [`ROOT_OP_DEVICE_INFO_MONTEREY`]. Both are true: the Monterey-era device-info
-/// command was retired in favour of [`ROOT_OP_DEVICE_INFO_TAHOE`] (`0x3a`), and
-/// this device still answers it for a guest old enough to ask. The root arm runs
-/// first, so the deprecated arm never sees it on the root channel.
-pub const CHILD_DEPRECATED_OPS: [u16; 15] = [
-    0x03, 0x1f, 0x21, 0x23, 0x24, 0x26, 0x27, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x32,
-];
-
-/// True for the opcodes in [`CHILD_DEPRECATED_OPS`].
-///
-/// A function rather than a match arm because a `match` cannot pattern on an
-/// array's contents, and spelling the fifteen numbers a second time in a pattern
-/// is exactly the duplicated-constant mistake `no_two_child_opcodes_share_a_number`
-/// exists to catch.
-#[must_use]
-pub const fn is_deprecated_child_opcode(opcode: u16) -> bool {
-    let mut i = 0;
-    while i < CHILD_DEPRECATED_OPS.len() {
-        if CHILD_DEPRECATED_OPS[i] == opcode {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
 
 /// `CmdDebug`, a host-side trace marker. Carries whatever the guest wants
 /// logged; nothing in the device model moves.
@@ -418,7 +384,7 @@ pub const CHILD_OP_CURSOR_SHOW: u16 = 0x05;
 /// leg of `submitTransaction`. 12B trailer `[pipe][surface_id][task]`.
 ///
 /// The `_DEPRECATED` in Apple's name is about the *form*, not the slot: this is
-/// a live handler, not one of [`CHILD_DEPRECATED_OPS`].
+/// a live handler, not one of the ledger's retired slots.
 pub const CHILD_OP_DISPLAY_TRANSACTION2: u16 = 0x06;
 /// `CmdDisplayTransaction3` — the current transaction form, submitted from the
 /// other leg of the same guest call. Its trailer carries the gamma table
@@ -617,16 +583,18 @@ pub const ROOT_COMMANDS: &[(&str, u16)] = &[
     ("DEVICE_INFO_TAHOE", ROOT_OP_DEVICE_INFO_TAHOE),
 ];
 
-/// Every command opcode is inside the dispatch ceiling, and no command opcode is
-/// also a deprecated slot.
+/// Every command opcode is inside the dispatch ceiling.
 ///
 /// [`CHILD_OP_MAX`] and the constants above were read off the same dispatch
 /// table but transcribed separately, and the two ways to get that wrong both
 /// cost guest work in the same direction. A command above the ceiling would be
 /// declared here and unreachable in the host, so this device would answer a
 /// packet no real host accepts. A command that is also in
-/// [`CHILD_DEPRECATED_OPS`] would give one number two arms in the drain, and the
-/// deprecated one would swallow a live command.
+/// also a retired slot would give one number two arms in the drain, and the
+/// retired one would swallow a live command — which is
+/// `no_live_command_is_also_a_retired_slot` in `runtime::decode::ledger`, a
+/// test rather than a `const` assertion because the ledger is the authority and
+/// reading it is not a `const fn`.
 const _: () = {
     let ops = CHILD_COMMANDS;
     let mut i = 0;
@@ -634,10 +602,6 @@ const _: () = {
         assert!(
             ops[i].1 <= CHILD_OP_MAX,
             "a command opcode sits above the host's dispatch ceiling"
-        );
-        assert!(
-            !is_deprecated_child_opcode(ops[i].1),
-            "a command opcode is also listed as a deprecated slot"
         );
         i += 1;
     }
@@ -653,14 +617,6 @@ const _: () = {
             "a root command opcode sits above the host's dispatch ceiling"
         );
         r += 1;
-    }
-    let mut j = 0;
-    while j < CHILD_DEPRECATED_OPS.len() {
-        assert!(
-            CHILD_DEPRECATED_OPS[j] <= CHILD_OP_MAX,
-            "a deprecated slot sits above the host's dispatch ceiling"
-        );
-        j += 1;
     }
 };
 

@@ -15,14 +15,14 @@ pub(crate) use regs::*;
 // `mod`, so this is the only path those links can name — and rustc's
 // unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    BackingWalk, ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault,
-    FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness, GvaHostView,
-    HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault, PresentBacking,
-    PresentState, RailDeviceState, RailResourceState, RenderFlushWitness, ResourceValidity,
-    StorageIncarnation, SurfaceWriteKind, TaskEntry, TaskReferenceStates, TaskResource,
-    TaskResourceLifetimeRef, TaskSamplerState, TaskTable, UnimplementedCommand, FENCE_DOMAIN_BLIT,
-    FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT, FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP,
-    GVA_EVICTION_WITNESS_KEYS,
+    Acted, BackingWalk, ChannelRing, ComputeStorageResidencyKey, Declaration, DeviceId,
+    DeviceState, ExecFault, FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness,
+    GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry, PacketFault,
+    PresentBacking, PresentState, RailDeviceState, RailResourceState, RenderFlushWitness,
+    ResourceValidity, StampPublication, StorageIncarnation, SurfaceWriteKind, TaskEntry,
+    TaskReferenceStates, TaskResource, TaskResourceLifetimeRef, TaskSamplerState, TaskTable,
+    UnimplementedCommand, FENCE_DOMAIN_BLIT, FENCE_DOMAIN_COMPUTE, FENCE_DOMAIN_EVENT,
+    FENCE_DOMAIN_RENDER, GVA_ENCODE_CACHE_BYTE_CAP, GVA_EVICTION_WITNESS_KEYS,
 };
 
 use crate::backend::Backend;
@@ -354,7 +354,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             start.wrapping_add(total)
         );
-        assert!(d.state.active_child_mask & (1 << 1) != 0);
+        assert!(d.state.child_domain_open(1));
         assert_eq!(h.get_u32(pfn_to_gpa(0x10, PAGE_SHIFT_ARM64E)), 0x11);
         assert!(h.action_count(HostActionKind::IrqGfxPulse) >= 1);
     }
@@ -703,8 +703,17 @@ mod tests {
         assert!(d.state.cursor.show);
     }
 
+    /// An opcode no ledger row names does not run, and the ring does not stop
+    /// on it.
+    ///
+    /// It used to reach the root dispatch's `_` arm and be reported there. It
+    /// now never reaches an arm at all: the ordering plane refuses it as
+    /// `UnknownCommand`, which is the same statement made by the layer that
+    /// owns the question, and the packet's ring position is released either
+    /// way. The head moving is the assertion that matters — a guest sending one
+    /// unknown opcode must not stall its FIFO forever.
     #[test]
-    fn fail_visible_unknown_root() {
+    fn an_unknown_root_opcode_is_refused_and_the_ring_moves_on() {
         let mut d = dev();
         let mut h = FakeHost::new();
         setup_boot_regs(&mut d, &mut h);
@@ -716,7 +725,18 @@ mod tests {
         d.state.gfx.fifo_written = PACKET_HEADER_LEN;
         d.state.pending.main_drain = true;
         d.drain(&mut h);
-        assert!(!d.fails().is_empty());
+        assert_eq!(
+            d.state
+                .gfx
+                .fifo_read
+                .load(std::sync::atomic::Ordering::Acquire),
+            PACKET_HEADER_LEN,
+            "a packet the model will not take still frees the ring position it held"
+        );
+        assert!(
+            d.state.parked.is_empty(),
+            "and nothing is holding bytes for work that was never admitted"
+        );
     }
 
     #[test]
@@ -758,7 +778,7 @@ mod tests {
         let mut h = FakeHost::new();
         setup_boot_regs(&mut d, &mut h);
         let ch = 1u32;
-        d.state.active_child_mask |= 1 << ch;
+        d.state.open_child_domains_for_test(1 << ch);
         // Minimal child ring setup is covered by main DEFINE_FIFO + drain path.
         let payload = ch.to_le_bytes();
         write_main_packet(&mut h, 0, ROOT_OP_DEFINE_FIFO, 2, &payload);
@@ -769,14 +789,14 @@ mod tests {
         d.state.gfx.fifo_written = PACKET_HEADER_LEN + 4;
         d.state.pending.main_drain = true;
         d.drain(&mut h);
-        assert!(d.state.active_child_mask & (1 << ch) != 0);
+        assert!(d.state.child_domain_open(ch));
     }
 
     #[test]
     fn doorbell_sets_pending_child() {
         let mut d = dev();
         let mut h = FakeHost::new();
-        d.state.active_child_mask = 1 << 3;
+        d.state.open_child_domains_for_test(1 << 3);
         // Child doorbells publish work and schedule the BH; the vCPU MMIO path
         // must not synchronously consume render work.
         d.gfx_write(&mut h, GFX_REG_CHILD_DOORBELL, 3, MMIO_U32);
@@ -786,7 +806,7 @@ mod tests {
             "doorbell leaves pending work for the BH"
         );
         assert!(
-            d.state.active_child_mask & (1 << 3) != 0,
+            d.state.child_domain_open(3),
             "doorbell keeps channel active"
         );
         assert!(

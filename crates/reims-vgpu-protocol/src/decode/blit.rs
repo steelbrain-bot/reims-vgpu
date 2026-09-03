@@ -45,63 +45,100 @@ pub struct TextureEndpoint {
     pub origin: Origin,
 }
 
+/// A buffer-to-buffer copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BufferToBuffer {
+    pub source_ref: u32,
+    pub source_offset: u64,
+    pub dest_ref: u32,
+    pub dest_offset: u64,
+    pub size: u64,
+}
+
+/// A buffer-to-texture copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BufferToTexture {
+    pub source_ref: u32,
+    pub source_offset: u64,
+    pub bytes_per_row: u64,
+    pub bytes_per_image: u64,
+    pub size: Size,
+    pub dest: TextureEndpoint,
+    pub options: u32,
+}
+
+/// A texture-to-buffer copy.
+///
+/// `options` is sixteen bits here and thirty-two on [`BufferToTexture`]; the
+/// widths are the records', not a choice made here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureToBuffer {
+    pub source: TextureEndpoint,
+    pub size: Size,
+    pub dest_ref: u32,
+    pub dest_offset: u64,
+    pub bytes_per_row: u64,
+    pub bytes_per_image: u64,
+    pub options: u16,
+}
+
+/// A texture-to-texture region copy, with or without an `options:` word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureRegion {
+    pub source: TextureEndpoint,
+    pub dest: TextureEndpoint,
+    pub size: Size,
+    /// Zero for the plain opcode, which does not carry the field at all.
+    pub options: u32,
+}
+
+/// A slice-and-level range copy between two textures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextureSlices {
+    pub source_ref: u32,
+    pub source_slice: u16,
+    pub source_level: u16,
+    pub dest_ref: u32,
+    pub dest_slice: u16,
+    pub dest_level: u16,
+    pub slice_count: u16,
+    pub level_count: u16,
+}
+
+/// A buffer fill, in either of its two pattern widths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillBuffer {
+    pub buffer_ref: u32,
+    pub location: u64,
+    pub length: u64,
+    /// One byte for `value:`, four for `pattern4:`. Widened here and
+    /// distinguished by [`BlitRecord::kind`], because the two records are
+    /// byte-identical apart from the width of this field and its opcode.
+    pub pattern: FillPattern,
+}
+
+/// `generateMipmapsForTexture:`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenerateMipmaps {
+    pub texture_ref: u32,
+}
+
 /// One lifted transfer record.
+///
+/// Each variant carries **one named payload** rather than inline fields, so a
+/// consumer can take the record it handles by reference and cannot be handed a
+/// different one. The executor arms below the lift are functions of those
+/// payloads, which is what keeps a nine-record dispatch from becoming a flat
+/// struct with nine records' fields in it and a kind tag saying which are live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlitRecord {
-    BufferToBuffer {
-        source_ref: u32,
-        source_offset: u64,
-        dest_ref: u32,
-        dest_offset: u64,
-        size: u64,
-    },
-    BufferToTexture {
-        source_ref: u32,
-        source_offset: u64,
-        bytes_per_row: u64,
-        bytes_per_image: u64,
-        size: Size,
-        dest: TextureEndpoint,
-        options: u32,
-    },
-    TextureToBuffer {
-        source: TextureEndpoint,
-        size: Size,
-        dest_ref: u32,
-        dest_offset: u64,
-        bytes_per_row: u64,
-        bytes_per_image: u64,
-        options: u16,
-    },
-    TextureRegion {
-        source: TextureEndpoint,
-        dest: TextureEndpoint,
-        size: Size,
-        /// Zero for the plain opcode, which does not carry the field at all.
-        options: u32,
-    },
-    TextureSlices {
-        source_ref: u32,
-        source_slice: u16,
-        source_level: u16,
-        dest_ref: u32,
-        dest_slice: u16,
-        dest_level: u16,
-        slice_count: u16,
-        level_count: u16,
-    },
-    FillBuffer {
-        buffer_ref: u32,
-        location: u64,
-        length: u64,
-        /// One byte for `value:`, four for `pattern4:`. Widened here and
-        /// distinguished by [`BlitRecord::kind`], because the two records are
-        /// byte-identical apart from the width of this field and its opcode.
-        pattern: FillPattern,
-    },
-    GenerateMipmaps {
-        texture_ref: u32,
-    },
+    BufferToBuffer(BufferToBuffer),
+    BufferToTexture(BufferToTexture),
+    TextureToBuffer(TextureToBuffer),
+    TextureRegion(TextureRegion),
+    TextureSlices(TextureSlices),
+    FillBuffer(FillBuffer),
+    GenerateMipmaps(GenerateMipmaps),
 }
 
 /// What a fill writes.
@@ -116,26 +153,47 @@ impl BlitRecord {
     #[must_use]
     pub const fn kind(&self) -> BlitKind {
         match self {
-            Self::BufferToBuffer { .. } => BlitKind::BufferToBuffer,
-            Self::BufferToTexture { .. } => BlitKind::BufferToTexture,
-            Self::TextureToBuffer { .. } => BlitKind::TextureToBuffer,
-            Self::TextureRegion { options, .. } => {
-                if *options == 0 {
+            Self::BufferToBuffer(_) => BlitKind::BufferToBuffer,
+            Self::BufferToTexture(_) => BlitKind::BufferToTexture,
+            Self::TextureToBuffer(_) => BlitKind::TextureToBuffer,
+            Self::TextureRegion(r) => {
+                if r.options == 0 {
                     BlitKind::TextureRegion
                 } else {
                     BlitKind::TextureRegionOptions
                 }
             }
-            Self::TextureSlices { .. } => BlitKind::TextureSlices,
-            Self::FillBuffer {
+            Self::TextureSlices(_) => BlitKind::TextureSlices,
+            Self::FillBuffer(FillBuffer {
                 pattern: FillPattern::Byte(_),
                 ..
-            } => BlitKind::FillBuffer,
-            Self::FillBuffer {
+            }) => BlitKind::FillBuffer,
+            Self::FillBuffer(FillBuffer {
                 pattern: FillPattern::Pattern4(_),
                 ..
-            } => BlitKind::FillBufferPattern4,
-            Self::GenerateMipmaps { .. } => BlitKind::GenerateMipmaps,
+            }) => BlitKind::FillBufferPattern4,
+            Self::GenerateMipmaps(_) => BlitKind::GenerateMipmaps,
+        }
+    }
+
+    /// The guest refs this record reads from and writes to.
+    ///
+    /// Nine records name their endpoints under nine different field names, and
+    /// a reader that wants "what did this copy touch" — a failure line, a
+    /// residency census — otherwise has to restate the whole match to find out.
+    /// `None` is an end the record does not have: a fill has no source, and
+    /// `generateMipmapsForTexture:` reads and writes the same texture, so both
+    /// ends are it.
+    #[must_use]
+    pub const fn refs(&self) -> (Option<u32>, Option<u32>) {
+        match self {
+            Self::BufferToBuffer(r) => (Some(r.source_ref), Some(r.dest_ref)),
+            Self::BufferToTexture(r) => (Some(r.source_ref), Some(r.dest.texture_ref)),
+            Self::TextureToBuffer(r) => (Some(r.source.texture_ref), Some(r.dest_ref)),
+            Self::TextureRegion(r) => (Some(r.source.texture_ref), Some(r.dest.texture_ref)),
+            Self::TextureSlices(r) => (Some(r.source_ref), Some(r.dest_ref)),
+            Self::FillBuffer(r) => (None, Some(r.buffer_ref)),
+            Self::GenerateMipmaps(r) => (Some(r.texture_ref), Some(r.texture_ref)),
         }
     }
 }
@@ -158,18 +216,18 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
         BlitKind::BufferToBuffer => {
             let r = wire::copy_buffer_to_buffer(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::BufferToBuffer>()))?;
-            BlitRecord::BufferToBuffer {
+            BlitRecord::BufferToBuffer(BufferToBuffer {
                 source_ref: r.source_ref.get(),
                 source_offset: r.source_offset.get(),
                 dest_ref: r.dest_ref.get(),
                 dest_offset: r.dest_offset.get(),
                 size: r.size.get(),
-            }
+            })
         }
         BlitKind::BufferToTexture => {
             let r = wire::copy_buffer_to_texture(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::CopyBufferToTexture>()))?;
-            BlitRecord::BufferToTexture {
+            BlitRecord::BufferToTexture(BufferToTexture {
                 source_ref: r.source_ref.get(),
                 source_offset: r.source_offset.get(),
                 bytes_per_row: r.source_bytes_per_row.get(),
@@ -190,12 +248,12 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                     },
                 },
                 options: r.options.get(),
-            }
+            })
         }
         BlitKind::TextureToBuffer => {
             let r = wire::copy_texture_to_buffer(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::CopyTextureToBuffer>()))?;
-            BlitRecord::TextureToBuffer {
+            BlitRecord::TextureToBuffer(TextureToBuffer {
                 source: TextureEndpoint {
                     texture_ref: r.source_ref.get(),
                     slice: r.source_slice.get(),
@@ -216,7 +274,7 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                 bytes_per_row: r.dest_bytes_per_row.get(),
                 bytes_per_image: r.dest_bytes_per_image.get(),
                 options: r.options.get(),
-            }
+            })
         }
         BlitKind::TextureRegion | BlitKind::TextureRegionOptions => {
             let (region, options) = if kind == BlitKind::TextureRegionOptions {
@@ -228,7 +286,7 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                     .map_err(|_| fail(core::mem::size_of::<wire::CopyTextureRegion>()))?;
                 (r, 0)
             };
-            BlitRecord::TextureRegion {
+            BlitRecord::TextureRegion(TextureRegion {
                 source: TextureEndpoint {
                     texture_ref: region.source_ref.get(),
                     slice: region.source_slice.get(),
@@ -255,12 +313,12 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                     depth: region.size_depth.get(),
                 },
                 options,
-            }
+            })
         }
         BlitKind::TextureSlices => {
             let r = wire::copy_texture_slices(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::CopyTextureSlices>()))?;
-            BlitRecord::TextureSlices {
+            BlitRecord::TextureSlices(TextureSlices {
                 source_ref: r.source_ref.get(),
                 source_slice: r.source_slice.get(),
                 source_level: r.source_level.get(),
@@ -269,33 +327,33 @@ pub fn decode(op: &Op<'_>) -> Result<BlitRecord, DecodeRefusal> {
                 dest_level: r.dest_level.get(),
                 slice_count: r.slice_count.get(),
                 level_count: r.level_count.get(),
-            }
+            })
         }
         BlitKind::FillBuffer => {
             let r = wire::fill_buffer(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::FillBuffer>()))?;
-            BlitRecord::FillBuffer {
+            BlitRecord::FillBuffer(FillBuffer {
                 buffer_ref: r.buffer_ref.get(),
                 location: r.range_location.get(),
                 length: r.range_length.get(),
                 pattern: FillPattern::Byte(r.value),
-            }
+            })
         }
         BlitKind::FillBufferPattern4 => {
             let r = wire::fill_buffer_pattern4(op)
                 .map_err(|_| fail(core::mem::size_of::<wire::FillBufferPattern4>()))?;
-            BlitRecord::FillBuffer {
+            BlitRecord::FillBuffer(FillBuffer {
                 buffer_ref: r.buffer_ref.get(),
                 location: r.range_location.get(),
                 length: r.range_length.get(),
                 pattern: FillPattern::Pattern4(r.pattern.get()),
-            }
+            })
         }
         BlitKind::GenerateMipmaps => {
             let r = wire::object_ref(op).map_err(|_| fail(core::mem::size_of::<wire::Ref>()))?;
-            BlitRecord::GenerateMipmaps {
+            BlitRecord::GenerateMipmaps(GenerateMipmaps {
                 texture_ref: r.object_ref.get(),
-            }
+            })
         }
     })
 }
@@ -339,13 +397,13 @@ mod tests {
         let bytes = record(wire::OPCODE_COPY_BUFFER_TO_BUFFER, &payload);
         assert_eq!(
             decode_bytes(&bytes),
-            Ok(BlitRecord::BufferToBuffer {
+            Ok(BlitRecord::BufferToBuffer(BufferToBuffer {
                 source_ref: 5151,
                 source_offset: 0x1111,
                 dest_ref: 5252,
                 dest_offset: 0x2222,
                 size: 0x3333,
-            })
+            }))
         );
     }
 
@@ -368,15 +426,15 @@ mod tests {
         assert_ne!(byte, word);
         match (byte, word) {
             (
-                BlitRecord::FillBuffer {
+                BlitRecord::FillBuffer(FillBuffer {
                     pattern: FillPattern::Byte(b),
                     location,
                     ..
-                },
-                BlitRecord::FillBuffer {
+                }),
+                BlitRecord::FillBuffer(FillBuffer {
                     pattern: FillPattern::Pattern4(w),
                     ..
-                },
+                }),
             ) => {
                 assert_eq!(b, 0x5a);
                 assert_eq!(w, 0x89ab_cdef);
@@ -414,10 +472,10 @@ mod tests {
 
         match (plain, lifted) {
             (
-                BlitRecord::TextureRegion {
+                BlitRecord::TextureRegion(TextureRegion {
                     source, options: a, ..
-                },
-                BlitRecord::TextureRegion { options: b, .. },
+                }),
+                BlitRecord::TextureRegion(TextureRegion { options: b, .. }),
             ) => {
                 assert_eq!(a, 0, "the plain form carries no options field");
                 assert_eq!(b, 4);
@@ -426,6 +484,101 @@ mod tests {
                 assert_eq!(source.origin.x, 0x11);
             }
             _ => panic!("wrong shapes"),
+        }
+    }
+
+    /// `copyFromTexture:toBuffer:` reads two bytes of `options`, not four.
+    ///
+    /// It is the one copy record that narrows the field, and reading it four
+    /// bytes wide once cost every depth-aspect copy on the rail: the two bytes
+    /// past it belong to no field, so on a guest's wire they hold whatever the
+    /// command ring last contained. They are poisoned here to stand in for
+    /// that, and the sibling that really is four bytes wide is read beside it
+    /// so this stays a per-record narrowing rather than a family rule.
+    #[test]
+    fn a_texture_to_buffer_copy_reads_no_byte_past_its_options() {
+        const CTB_OPTIONS: usize = core::mem::offset_of!(wire::CopyTextureToBuffer, options);
+        const CTB_LEN: usize = core::mem::size_of::<wire::CopyTextureToBuffer>();
+        for written in [0u16, 4] {
+            let mut payload = vec![0u8; CTB_LEN];
+            for b in payload.iter_mut().skip(CTB_OPTIONS + 2) {
+                *b = 0xAA;
+            }
+            payload[CTB_OPTIONS..CTB_OPTIONS + 2].copy_from_slice(&written.to_le_bytes());
+            let bytes = record(wire::OPCODE_COPY_TEXTURE_TO_BUFFER, &payload);
+            match decode_bytes(&bytes).expect("a well-formed copy lifts") {
+                BlitRecord::TextureToBuffer(r) => assert_eq!(
+                    r.options, written,
+                    "options picked up a byte the serializer never wrote"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        const CBT_OPTIONS: usize = core::mem::offset_of!(wire::CopyBufferToTexture, options);
+        const CBT_LEN: usize = core::mem::size_of::<wire::CopyBufferToTexture>();
+        let mut payload = vec![0u8; CBT_LEN];
+        payload[CBT_OPTIONS..CBT_OPTIONS + 4].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        match decode_bytes(&record(wire::OPCODE_COPY_BUFFER_TO_TEXTURE, &payload))
+            .expect("the sibling lifts")
+        {
+            BlitRecord::BufferToTexture(r) => assert_eq!(r.options, 0x0001_0000),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The `options:` region copy is four bytes longer than its plain sibling,
+    /// and a record written at the plain length is refused rather than having
+    /// its options word read out of the bytes after it.
+    #[test]
+    fn a_region_copy_with_options_is_refused_at_the_plain_forms_length() {
+        let plain_len = core::mem::size_of::<wire::CopyTextureRegion>();
+        let with_options = core::mem::size_of::<wire::CopyTextureRegionOptions>();
+        assert_eq!(with_options - plain_len, 4);
+        assert!(decode_bytes(&record(
+            wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS,
+            &vec![0u8; with_options]
+        ))
+        .is_ok());
+        assert!(matches!(
+            decode_bytes(&record(
+                wire::OPCODE_COPY_TEXTURE_REGION_OPTIONS,
+                &vec![0u8; plain_len]
+            )),
+            Err(DecodeRefusal::Short { .. })
+        ));
+    }
+
+    /// The slice-and-level copy carries six `u16` after its two refs, and the
+    /// record keeps them in the order the wire writes them.
+    ///
+    /// Every fixture value is distinct so a crossed pair cannot read back
+    /// correct — the base slice and the base level of one end are adjacent
+    /// halves of one word, and swapping them copies a real region that is not
+    /// the one the guest named.
+    #[test]
+    fn a_slice_and_level_copy_lifts_its_six_counts_in_the_records_order() {
+        let mut payload = u32s(&[2121, 3131]);
+        for value in [1u16, 2, 3, 4, 5, 6] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        match decode_bytes(&record(wire::OPCODE_COPY_TEXTURE_SLICES, &payload))
+            .expect("the record lifts")
+        {
+            BlitRecord::TextureSlices(r) => assert_eq!(
+                r,
+                TextureSlices {
+                    source_ref: 2121,
+                    source_slice: 1,
+                    source_level: 2,
+                    dest_ref: 3131,
+                    dest_slice: 3,
+                    dest_level: 4,
+                    slice_count: 5,
+                    level_count: 6,
+                }
+            ),
+            other => panic!("{other:?}"),
         }
     }
 

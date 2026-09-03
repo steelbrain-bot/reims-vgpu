@@ -40,9 +40,8 @@
 // module names no rail.
 use crate::backend::Backend as _;
 use crate::model::DeviceState;
-use crate::observe::Decline;
+use crate::protocol::pixel_format::BlitAspect;
 use crate::protocol::pixel_format::{self, MTL_FORMAT_BGRA8_UNORM};
-use crate::runtime::decode::blit::{self, BlitAspect, Command, CopyKind, Kind, Point};
 use crate::runtime::decode::resource::{
     decode_buffer_descriptor, decode_iosurface_texture_descriptor, decode_texture_descriptor,
     decode_texture_view_descriptor, texture_view_type_is_3d, texture_view_type_supported,
@@ -59,15 +58,24 @@ use crate::runtime::mapper::RectStride;
 use crate::runtime::mapping_write;
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
-use reims_vgpu_wire::ops::blit as wire_blit;
+use reims_vgpu_protocol::blit::BlitKind as WireBlitKind;
+use reims_vgpu_protocol::decode::blit::{
+    BlitRecord, BufferToBuffer, BufferToTexture, FillBuffer, FillPattern, GenerateMipmaps,
+    Origin as Point, TextureRegion, TextureSlices, TextureToBuffer,
+};
 
 /// Chunk size for fill/copy host staging (bounded guest IO).
 const CHUNK: usize = 64 * 1024;
 
-/// Outcome of a product-path blit fill/copy/fence attempt.
+/// The coarse class a blit refusal collapses into.
+///
+/// Six classes over **177 distinct checks across 182 sites** — this rail is the
+/// crate's largest refusal surface, and a 177-arm enum is not a thing anyone
+/// writes. The class is what a caller branches on; which of the 177 fired is
+/// what a reader needs, and it travels in [`BlitStatus::Failed`] beside the
+/// class rather than beside the value in an ambient channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlitStatus {
-    Ok,
+pub enum BlitFailure {
     /// Missing object, wrong kind, or unreadable descriptor.
     MissingResource,
     /// Opcode / options / view / slice / 3D / mapper-ref-texture not on this path.
@@ -78,78 +86,105 @@ pub enum BlitStatus {
     GuestIo,
     /// Pathological size or host staging cap.
     Capacity,
-    /// Zero-size fill or zero-extent rectangular copy (Metal no-op → soft ok).
-    ZeroExtent,
     /// Same buffer, overlapping source/destination windows.
     Overlap,
-    /// Fence wait not yet satisfied (soft; does not block drain).
-    FencePending,
 }
 
-impl crate::observe::Refusal for BlitStatus {
-    /// The reason comes from the thread-local channel, not from the variant.
-    ///
-    /// This rail is the crate's largest refusal surface — **177 distinct checks
-    /// across 182 sites**, collapsing into eight coarse statuses — so the specific
-    /// cause has always travelled beside the value in [`BLIT_FAIL_REASON`] rather
-    /// than inside it. That is a legitimate shape (a 177-arm `slug()` is not a
-    /// thing anyone writes) and the registry reads the vocabulary at the `br(`
-    /// sites, so every one of the 177 is counted and unique crate-wide.
-    ///
-    /// What was *not* legitimate: an uninstrumented site returned a coarse status
-    /// with the channel still empty, and the dispatch line rendered a bare
-    /// `reason=` with nothing after it — unfindable by grep and indistinguishable
-    /// from a missing field. That case is now the registered `blit_unattributed`,
-    /// which names the gap instead of hiding it.
-    ///
-    /// Read on the same thread that ran the blit, which both dispatch sites do
-    /// immediately after the call. `Ok`, `ZeroExtent` and `FencePending` are
-    /// control flow — the first two are the dispatch site's success arm, the third
-    /// is a soft wait the guest re-polls — and this reproduces exactly the two
-    /// sites' previous log conditions.
-    fn refusal(&self) -> Option<&'static str> {
+/// Outcome of a product-path blit fill/copy/fence attempt.
+///
+/// # Why a refusal carries its reason instead of leaving it somewhere
+///
+/// The reason used to travel in a `BLIT_FAIL_REASON` thread-local, set by [`br`]
+/// at the failing site, cleared at every command entry, and read by
+/// [`Refusal::refusal`](crate::observe::Refusal::refusal) on the assumption that
+/// the dispatch site runs on the same thread and reads it before anything else
+/// writes it. Three assumptions, none of them checkable, and the failure mode of
+/// each is a line naming the wrong check — which is worse than no line, because
+/// it is believed.
+///
+/// It also could not say anything at all about a site that forgot to call `br`.
+/// Those returned a coarse status with the channel empty and rendered as
+/// `blit_unattributed`. Naming the gap was better than hiding it, but the gap
+/// was still there and nothing stopped a new one appearing.
+///
+/// Both go away by putting the reason in the value: a refusal is
+/// `Failed { failure, reason }` and there is no way to spell one without a
+/// reason. `blit_unattributed` has no site left to come from, the channel has
+/// no thread to be read on the wrong one of, and the clear at command entry has
+/// nothing to clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlitStatus {
+    Ok,
+    /// Zero-size fill or zero-extent rectangular copy (Metal no-op → soft ok).
+    ZeroExtent,
+    /// Fence wait not yet satisfied (soft; does not block drain).
+    FencePending,
+    /// The blit was refused: which class, and which of the checks in that class.
+    Failed {
+        failure: BlitFailure,
+        /// The registered slug of the check that fired — greppable, and specific
+        /// to the check rather than to the class. A slug may appear at more
+        /// than one site when one check is written in more than one arm; it
+        /// never covers two different checks.
+        reason: &'static str,
+    },
+}
+
+impl BlitStatus {
+    /// The class this refusal collapsed into, or `None` if it is not a refusal.
+    pub fn failure(self) -> Option<BlitFailure> {
         match self {
-            Self::Ok | Self::ZeroExtent | Self::FencePending => None,
-            _ => Some(match blit_fail_reason() {
-                "" => "blit_unattributed",
-                slug => slug,
-            }),
+            Self::Failed { failure, .. } => Some(failure),
+            _ => None,
+        }
+    }
+
+    /// The slug of the check that fired, or `None` if this is not a refusal.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Failed { reason, .. } => Some(reason),
+            _ => None,
         }
     }
 }
 
-thread_local! {
-    /// The specific reason slug for the most recent non-`Ok` [`BlitStatus`], set at
-    /// the failing site so the single dispatch-site failure line can name *which* of
-    /// the many checks that collapse into a coarse status actually fired. Cleared at
-    /// the start of every `execute_blit`/`execute_blit_fence` so an uninstrumented
-    /// site reports empty rather than a stale value from a prior command. Genuine
-    /// failures only reach the dispatch log, so this never floods a healthy boot.
-    static BLIT_FAIL_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+/// Compare a status against the class it collapsed into, ignoring which of that
+/// class's checks named it.
+///
+/// For callers and tests that branch on the class — the class is what decides
+/// whether the guest is told the resource was missing or the extent was out of
+/// bounds, and pinning every such site to one of 177 slugs would make the slug
+/// vocabulary unrefinable without editing them. A test that is *about* a
+/// specific check asserts on [`BlitStatus::reason`] instead.
+impl PartialEq<BlitFailure> for BlitStatus {
+    fn eq(&self, other: &BlitFailure) -> bool {
+        self.failure() == Some(*other)
+    }
 }
 
-/// Record `reason` for a non-`Ok` [`BlitStatus`] at the failing site and return
-/// that status unchanged. Use at every `return Err(..)` / `.ok_or_else(..)` site that
-/// collapses a distinct cause into a coarse status.
+impl crate::observe::Refusal for BlitStatus {
+    /// The reason comes out of the value, which is the only place it can be
+    /// read from without an assumption about which thread is asking.
+    ///
+    /// `Ok`, `ZeroExtent` and `FencePending` are control flow — the first two are
+    /// the dispatch site's success arm, the third is a soft wait the guest
+    /// re-polls — so they name nothing, which is the same condition the two
+    /// dispatch sites logged under before the reason moved into the value.
+    fn refusal(&self) -> Option<&'static str> {
+        match self {
+            Self::Ok | Self::ZeroExtent | Self::FencePending => None,
+            Self::Failed { reason, .. } => Some(reason),
+        }
+    }
+}
+
+/// Build a refusal: the class it collapses into, and the check that fired.
+///
+/// Short because it is at 182 sites, and the only constructor because a refusal
+/// with no reason is what this rail spent a release unable to explain.
 #[inline]
-fn br(status: BlitStatus, reason: &'static str) -> BlitStatus {
-    BLIT_FAIL_REASON.with(|r| r.set(reason));
-    status
-}
-
-/// Read the last recorded blit-failure reason without clearing it, so several call
-/// sites (a path-specific line plus the dispatch summary) can name the same cause.
-/// The channel is reset at the start of the next command via [`clear_blit_fail_reason`],
-/// so a stale reason cannot leak across commands. Read this only on the failure path.
-pub fn blit_fail_reason() -> &'static str {
-    BLIT_FAIL_REASON.with(|r| r.get())
-}
-
-/// Reset the reason channel at entry to a blit command so an uninstrumented failure
-/// reports empty rather than a stale reason from a prior command.
-#[inline]
-fn clear_blit_fail_reason() {
-    BLIT_FAIL_REASON.with(|r| r.set(""));
+fn br(failure: BlitFailure, reason: &'static str) -> BlitStatus {
+    BlitStatus::Failed { failure, reason }
 }
 
 /// Dedup set for the `tex_wrong_type` enrichment line, keyed by
@@ -454,24 +489,24 @@ fn resolve_buffer<M: HostMemory + HostOps>(
     buffer_ref: u32,
 ) -> Result<LinearBuffer, BlitStatus> {
     if buffer_ref == 0 {
-        return Err(br(BlitStatus::MissingResource, "buf_ref_zero"));
+        return Err(br(BlitFailure::MissingResource, "buf_ref_zero"));
     }
     let (_entry, bytes) =
         objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
             .map_err(|rung| {
                 br(
-                    BlitStatus::MissingResource,
+                    BlitFailure::MissingResource,
                     crate::observe::ladder_slugs!("buf")(rung),
                 )
             })?;
     let Ok(buf) = decode_buffer_descriptor(&bytes) else {
         return Err(br(
-            BlitStatus::MissingResource,
+            BlitFailure::MissingResource,
             crate::observe::ladder_slug!("buf", desc_decode),
         ));
     };
     let Some((gva, size)) = buf.backing_gva_size(state.page_shift) else {
-        return Err(br(BlitStatus::MissingResource, "buf_no_backing"));
+        return Err(br(BlitFailure::MissingResource, "buf_no_backing"));
     };
     Ok(LinearBuffer { gva, size })
 }
@@ -505,7 +540,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     view_depth: u32,
 ) -> Result<TextureBacking, BlitStatus> {
     if texture_ref == 0 {
-        return Err(br(BlitStatus::MissingResource, "tex_ref_zero"));
+        return Err(br(BlitFailure::MissingResource, "tex_ref_zero"));
     }
     // Shared with the draw/sample walk on purpose: the two arms read one wire
     // form, and a chain that resolver would follow must not be a copy this one
@@ -518,7 +553,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // MAX`, so admitting that depth is what makes the two arms accept and
     // refuse the same chains.
     if view_depth as usize > crate::runtime::draw::MAX_TEXTURE_VIEW_CHAIN {
-        return Err(br(BlitStatus::Unsupported, "tex_view_depth_cap"));
+        return Err(br(BlitFailure::Unsupported, "tex_view_depth_cap"));
     }
     // **This function is the whole blit rail's definition of "the guest bytes of
     // a texture", and guest bytes are only a resource's content once everything
@@ -553,7 +588,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     crate::runtime::writeback_debt::pay_for_texture(state, host, task_id, texture_ref);
     let Some(entry) = objects::lookup_list_entry(state, host, task_id, texture_ref) else {
         return Err(br(
-            BlitStatus::MissingResource,
+            BlitFailure::MissingResource,
             crate::observe::ladder_slug!("tex", no_list_entry),
         ));
     };
@@ -562,30 +597,30 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     if entry.object_type == OBJECT_TYPE_TEXTURE_VIEW {
         let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
             return Err(br(
-                BlitStatus::MissingResource,
+                BlitFailure::MissingResource,
                 crate::observe::ladder_slug!("view", desc_read),
             ));
         };
         let Ok(view) = decode_texture_view_descriptor(&bytes) else {
             return Err(br(
-                BlitStatus::MissingResource,
+                BlitFailure::MissingResource,
                 crate::observe::ladder_slug!("view", desc_decode),
             ));
         };
         if view.base_texture_ref == 0 {
-            return Err(br(BlitStatus::MissingResource, "view_base_ref_zero"));
+            return Err(br(BlitFailure::MissingResource, "view_base_ref_zero"));
         }
         // Blit rejects swizzled materialization (contract).
         if view.carries_swizzle() {
             let plan = pixel_format::swizzle_plan(&view.swizzle)
-                .ok_or_else(|| br(BlitStatus::Unsupported, "view_swizzle_plan"))?;
+                .ok_or_else(|| br(BlitFailure::Unsupported, "view_swizzle_plan"))?;
             if !pixel_format::swizzle_is_identity(&plan) {
-                return Err(br(BlitStatus::Unsupported, "view_swizzle_nonident"));
+                return Err(br(BlitFailure::Unsupported, "view_swizzle_nonident"));
             }
         }
         let view_type = if view.carries_range() {
             if !texture_view_type_supported(view.texture_type) {
-                return Err(br(BlitStatus::Unsupported, "view_type_unsupported"));
+                return Err(br(BlitFailure::Unsupported, "view_type_unsupported"));
             }
             view.texture_type
         } else {
@@ -604,17 +639,17 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             u64::MAX
         };
         if view.carries_range() && rel_level >= level_count {
-            return Err(br(BlitStatus::Bounds, "view_level_oob"));
+            return Err(br(BlitFailure::Bounds, "view_level_oob"));
         }
         let abs_level = if view.carries_range() {
             view.level_base
                 .checked_add(rel_level)
-                .ok_or_else(|| br(BlitStatus::Bounds, "view_level_overflow"))?
+                .ok_or_else(|| br(BlitFailure::Bounds, "view_level_overflow"))?
         } else {
             rel_level
         };
         if abs_level > u16::MAX as u64 {
-            return Err(br(BlitStatus::Bounds, "view_level_u16"));
+            return Err(br(BlitFailure::Bounds, "view_level_u16"));
         }
         // Relative command slice → absolute (array / cube faces).
         let rel_slice = slice as u64;
@@ -628,28 +663,28 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             u64::MAX
         };
         if view.carries_range() && rel_slice >= slice_count {
-            return Err(br(BlitStatus::Bounds, "view_slice_oob"));
+            return Err(br(BlitFailure::Bounds, "view_slice_oob"));
         }
         let abs_slice = if view.carries_range() {
             view.slice_base
                 .checked_add(rel_slice)
-                .ok_or_else(|| br(BlitStatus::Bounds, "view_slice_overflow"))?
+                .ok_or_else(|| br(BlitFailure::Bounds, "view_slice_overflow"))?
         } else {
             rel_slice
         };
         if abs_slice > u16::MAX as u64 {
-            return Err(br(BlitStatus::Bounds, "view_slice_u16"));
+            return Err(br(BlitFailure::Bounds, "view_slice_u16"));
         }
         // 3D views use depth planes, not array slices.
         if texture_view_type_is_3d(view_type) && abs_slice != 0 {
-            return Err(br(BlitStatus::Unsupported, "view_3d_slice"));
+            return Err(br(BlitFailure::Unsupported, "view_3d_slice"));
         }
         // Non-array 2D/1D: only slice 0.
         if !texture_view_type_uses_slices(view_type)
             && !texture_view_type_is_3d(view_type)
             && abs_slice != 0
         {
-            return Err(br(BlitStatus::Unsupported, "view_2d_slice"));
+            return Err(br(BlitFailure::Unsupported, "view_2d_slice"));
         }
         let mut backing = resolve_texture_backing_depth(
             state,
@@ -669,17 +704,17 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                         | crate::runtime::decode::resource::TEXTURE_VIEW_MTL_TYPE_1D_ARRAY
                 ) && t.height != 1
                 {
-                    return Err(br(BlitStatus::Unsupported, "view_1d_height"));
+                    return Err(br(BlitFailure::Unsupported, "view_1d_height"));
                 }
             }
             TextureBacking::MapperRefTexture(_) => {
                 // Metal forbids mipmapped / multi-slice IOSurface textures; see
                 // MapperRefTexture. Fail closed rather than inventing layout.
                 if abs_level != 0 || abs_slice != 0 {
-                    return Err(br(BlitStatus::Unsupported, "view_t11_level_slice"));
+                    return Err(br(BlitFailure::Unsupported, "view_t11_level_slice"));
                 }
                 if texture_view_type_uses_slices(view_type) || texture_view_type_is_3d(view_type) {
-                    return Err(br(BlitStatus::Unsupported, "view_t11_type"));
+                    return Err(br(BlitFailure::Unsupported, "view_t11_type"));
                 }
             }
         }
@@ -687,17 +722,17 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         if let Some(declared) = view.declared_pixel_format() {
             let base_fmt = backing.pixel_format();
             let eff = draw::effective_view_sample_format(base_fmt, Some(declared))
-                .ok_or_else(|| br(BlitStatus::Unsupported, "view_fmt_incompat"))?;
+                .ok_or_else(|| br(BlitFailure::Unsupported, "view_fmt_incompat"))?;
             match &mut backing {
                 TextureBacking::Linear(t) => {
                     t.pixel_format = eff;
                     t.bpp = pixel_format::bytes_per_pixel(eff)
-                        .ok_or_else(|| br(BlitStatus::Unsupported, "view_fmt_bpp"))?;
+                        .ok_or_else(|| br(BlitFailure::Unsupported, "view_fmt_bpp"))?;
                 }
                 TextureBacking::MapperRefTexture(t) => {
                     t.pixel_format = eff;
                     t.bpp = pixel_format::bytes_per_pixel(eff)
-                        .ok_or_else(|| br(BlitStatus::Unsupported, "view_fmt_bpp"))?;
+                        .ok_or_else(|| br(BlitFailure::Unsupported, "view_fmt_bpp"))?;
                 }
             }
         }
@@ -709,11 +744,11 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // Texture object dims/format select the plane when the mapping is multi-plane.
     if entry.object_type == OBJECT_TYPE_MAPPER_REF_TEXTURE {
         if level != 0 || slice != 0 {
-            return Err(br(BlitStatus::Unsupported, "t11_level_slice"));
+            return Err(br(BlitFailure::Unsupported, "t11_level_slice"));
         }
         let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
             return Err(br(
-                BlitStatus::MissingResource,
+                BlitFailure::MissingResource,
                 crate::observe::ladder_slug!("t11", desc_read),
             ));
         };
@@ -726,21 +761,21 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         }) = decode_iosurface_texture_descriptor(&bytes)
         else {
             return Err(br(
-                BlitStatus::MissingResource,
+                BlitFailure::MissingResource,
                 crate::observe::ladder_slug!("t11", desc_decode),
             ));
         };
         if mapping_id == 0 || tex_w == 0 || tex_h == 0 {
-            return Err(br(BlitStatus::MissingResource, "t11_zero_geom"));
+            return Err(br(BlitFailure::MissingResource, "t11_zero_geom"));
         }
         // Latch texture→mapping and refresh pages / device desc.
         let _ = objects::resolve_mapper_ref_texture(state, host, task_id, texture_ref);
         let _ = mapper::ensure_resolved_for_scanout(state, host, mapping_id);
         let Some(m) = state.mappings.get(&mapping_id) else {
-            return Err(br(BlitStatus::MissingResource, "t11_no_mapping"));
+            return Err(br(BlitFailure::MissingResource, "t11_no_mapping"));
         };
         if !m.mapped || m.page_entries.is_empty() {
-            return Err(br(BlitStatus::MissingResource, "t11_unmapped"));
+            return Err(br(BlitFailure::MissingResource, "t11_unmapped"));
         }
         let format = if tex_fmt != 0 {
             tex_fmt
@@ -750,12 +785,12 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             MTL_FORMAT_BGRA8_UNORM
         };
         let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
-            return Err(br(BlitStatus::Unsupported, "t11_fmt_bpp"));
+            return Err(br(BlitFailure::Unsupported, "t11_fmt_bpp"));
         };
         let Some((surface_offset, surface_bpr, span_end)) =
             mapping_write::mapper_ref_texture_sample_window(m, tex_w, tex_h, format)
         else {
-            return Err(br(BlitStatus::Bounds, "t11_sample_window"));
+            return Err(br(BlitFailure::Bounds, "t11_sample_window"));
         };
         crate::backend::selected().note_blit_t11_resident(state, mapping_id);
         return Ok(TextureBacking::MapperRefTexture(MapperRefTexture {
@@ -787,41 +822,41 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // whichever plane shares the geometry.
     if entry.object_type == objects::OBJECT_TYPE_REF_TEXTURE {
         if level != 0 || slice != 0 {
-            return Err(br(BlitStatus::Unsupported, "t5_level_slice"));
+            return Err(br(BlitFailure::Unsupported, "t5_level_slice"));
         }
         let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
             return Err(br(
-                BlitStatus::MissingResource,
+                BlitFailure::MissingResource,
                 crate::observe::ladder_slug!("t5", desc_read),
             ));
         };
         let Ok(t5) = reims_vgpu_wire::device_desc::ref_texture_header(&bytes) else {
-            return Err(br(BlitStatus::MissingResource, "t5_desc_short"));
+            return Err(br(BlitFailure::MissingResource, "t5_desc_short"));
         };
         let sid = t5.surface_id.get();
         if sid == 0 {
-            return Err(br(BlitStatus::MissingResource, "t5_no_sid"));
+            return Err(br(BlitFailure::MissingResource, "t5_no_sid"));
         }
         let Some(view) = objects::decode_ref_texture_view(&bytes) else {
             // A short/zero-geom record fails closed — no fallback to base geom.
             // Capture why (len/tag/geom) deduped per sid so the exact blit-path
             // ref-texture layout can be decoded without flooding.
             note_t5_decode_fail(sid, &bytes);
-            return Err(br(BlitStatus::Unsupported, "t5_view_decode"));
+            return Err(br(BlitFailure::Unsupported, "t5_view_decode"));
         };
         // Surface id IS the backing mapping mid (never the task object-list ref —
         // those id spaces collide). Resolve the backing, then the mapping.
         let _ = objects::ensure_surface_for_present(state, host, sid);
         let _ = mapper::ensure_resolved_for_scanout(state, host, sid);
         let Some(m) = state.mappings.get(&sid) else {
-            return Err(br(BlitStatus::MissingResource, "t5_no_mapping"));
+            return Err(br(BlitFailure::MissingResource, "t5_no_mapping"));
         };
         if !m.mapped || m.page_entries.is_empty() {
-            return Err(br(BlitStatus::MissingResource, "t5_unmapped"));
+            return Err(br(BlitFailure::MissingResource, "t5_unmapped"));
         }
         let format = view.pixel_format;
         let Some(bpp) = pixel_format::bytes_per_pixel(format) else {
-            return Err(br(BlitStatus::Unsupported, "t5_fmt_bpp"));
+            return Err(br(BlitFailure::Unsupported, "t5_fmt_bpp"));
         };
         let Some((surface_offset, surface_bpr, span_end)) =
             mapping_write::ref_texture_sample_window(
@@ -832,7 +867,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                 format,
             )
         else {
-            return Err(br(BlitStatus::Bounds, "t5_sample_window"));
+            return Err(br(BlitFailure::Bounds, "t5_sample_window"));
         };
         // Whether this arm runs at all. Without it a change to the window this
         // arm resolves cannot be attributed: an unchanged screen and an arm that
@@ -865,19 +900,19 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     {
         let _ = note_tex_wrong_type(task_id, texture_ref, entry.object_type, level, slice);
         return Err(br(
-            BlitStatus::MissingResource,
+            BlitFailure::MissingResource,
             crate::observe::ladder_slug!("tex", wrong_type),
         ));
     }
     let Some(bytes) = objects::read_descriptor(state, host, task_id, &entry) else {
         return Err(br(
-            BlitStatus::MissingResource,
+            BlitFailure::MissingResource,
             crate::observe::ladder_slug!("tex", desc_read),
         ));
     };
     let Ok(tex) = decode_texture_descriptor(&bytes) else {
         return Err(br(
-            BlitStatus::MissingResource,
+            BlitFailure::MissingResource,
             crate::observe::ladder_slug!("tex", desc_decode),
         ));
     };
@@ -886,7 +921,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             "blit tex no_pixel_format ref={texture_ref} w={} h={} fmt={}",
             tex.width, tex.height, tex.pixel_format
         ));
-        return Err(br(BlitStatus::Unsupported, "tex_no_pixel_format"));
+        return Err(br(BlitFailure::Unsupported, "tex_no_pixel_format"));
     }
     // The storage grid rather than a bytes-per-texel, so a block-compressed
     // level resolves instead of being refused here. `tex_bad_bpp` fired 448
@@ -901,7 +936,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             "blit tex bad_bpp ref={texture_ref} fmt={}",
             tex.pixel_format
         ));
-        return Err(br(BlitStatus::Unsupported, "tex_bad_bpp"));
+        return Err(br(BlitFailure::Unsupported, "tex_bad_bpp"));
     };
     let bpp = block.bytes;
     let Some((layout_gva, layout)) = tex.level_gva(level as u32, state.page_shift) else {
@@ -915,10 +950,10 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             tex.height,
             tex.pixel_format
         ));
-        return Err(br(BlitStatus::Bounds, "tex_level_gva"));
+        return Err(br(BlitFailure::Bounds, "tex_level_gva"));
     };
     let Some(base_gva) = tex.allocation_base_gva(state.page_shift) else {
-        return Err(br(BlitStatus::MissingResource, "tex_no_base_gva"));
+        return Err(br(BlitFailure::MissingResource, "tex_no_base_gva"));
     };
     // level_gva already applied offset; keep offset relative to base for plane math.
     let level_offset = match layout_gva.checked_sub(base_gva) {
@@ -928,7 +963,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
                 "blit tex level_offset underflow layout_gva={layout_gva:#x} base={base_gva:#x} page_shift={}",
                 state.page_shift
             ));
-            return Err(br(BlitStatus::Bounds, "tex_level_offset_underflow"));
+            return Err(br(BlitFailure::Bounds, "tex_level_offset_underflow"));
         }
     };
     if layout.width == 0 || layout.height == 0 {
@@ -936,7 +971,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
             "blit tex zero_geom ref={texture_ref} lvl={level} layout={}x{}x{}",
             layout.width, layout.height, layout.depth
         ));
-        return Err(br(BlitStatus::Bounds, "tex_zero_geom"));
+        return Err(br(BlitFailure::Bounds, "tex_zero_geom"));
     }
     // Array-slice packing: contiguous images at this mip
     // (row_stride × height × planes). `TextureLevelLayout` owns both the packing
@@ -945,7 +980,7 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
     // Prefer level.size when it is an exact multiple of one-slice bytes (multi-slice alloc).
     let one_slice = layout
         .slice_stride()
-        .ok_or_else(|| br(BlitStatus::Capacity, "tex_slice_stride"))?;
+        .ok_or_else(|| br(BlitFailure::Capacity, "tex_slice_stride"))?;
     if slice != 0 {
         // Bounds: selected slice must fit in allocation when known.
         // Live x86 buffer→texture (opcode 0x12c) uses slice=1,2 with
@@ -959,25 +994,25 @@ fn resolve_texture_backing_depth<M: HostMemory + HostOps>(
         // it refuses allocations sized exactly for the array — see
         // `TextureLevelLayout::slice_read_span`.
         let tight_row = pixel_format::tight_row_bytes(layout.width, tex.pixel_format)
-            .ok_or_else(|| br(BlitStatus::Unsupported, "tex_slice_tight_row"))?;
+            .ok_or_else(|| br(BlitFailure::Unsupported, "tex_slice_tight_row"))?;
         let slice_read = layout
             .slice_read_span(tight_row)
-            .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_read_span"))?;
+            .ok_or_else(|| br(BlitFailure::Bounds, "tex_slice_read_span"))?;
         let slice_end = (slice as u64)
             .checked_mul(one_slice)
             .and_then(|o| o.checked_add(level_offset))
             .and_then(|o| o.checked_add(slice_read))
-            .ok_or_else(|| br(BlitStatus::Bounds, "tex_slice_overflow"))?;
+            .ok_or_else(|| br(BlitFailure::Bounds, "tex_slice_overflow"))?;
         if tex.allocation_size != 0 && slice_end > tex.allocation_size {
             crate::observe::fail(format!(
                 "blit tex slice Bounds slice={slice} end={slice_end} alloc={} one_slice={one_slice} lvl_off={level_offset}",
                 tex.allocation_size
             ));
-            return Err(br(BlitStatus::Bounds, "tex_slice_bounds"));
+            return Err(br(BlitFailure::Bounds, "tex_slice_bounds"));
         }
         if tex.allocation_size == 0 && layout.size != 0 && layout.size == one_slice && slice != 0 {
             // Unknown alloc and level size covers a single slice only.
-            return Err(br(BlitStatus::Bounds, "tex_slice_single"));
+            return Err(br(BlitFailure::Bounds, "tex_slice_single"));
         }
     }
     Ok(TextureBacking::Linear(LinearTextureLevel {
@@ -1017,7 +1052,7 @@ fn read_texture_row<M: HostMemory + HostOps>(
         z: oz,
     } = origin;
     if row_bytes as usize > buf.len() {
-        return Err(br(BlitStatus::Capacity, "rd_row_buf_cap"));
+        return Err(br(BlitFailure::Capacity, "rd_row_buf_cap"));
     }
     match tex {
         TextureBacking::Linear(t) => {
@@ -1025,14 +1060,14 @@ fn read_texture_row<M: HostMemory + HostOps>(
                 .texel_offset(
                     ox,
                     oy.checked_add(row_i)
-                        .ok_or_else(|| br(BlitStatus::Bounds, "rd_row_y_overflow"))?,
+                        .ok_or_else(|| br(BlitFailure::Bounds, "rd_row_y_overflow"))?,
                     oz,
                 )
-                .ok_or_else(|| br(BlitStatus::Bounds, "rd_row_texel_oob"))?;
+                .ok_or_else(|| br(BlitFailure::Bounds, "rd_row_texel_oob"))?;
             let gva = t
                 .base_gva
                 .checked_add(off)
-                .ok_or_else(|| br(BlitStatus::Bounds, "rd_row_gva_overflow"))?;
+                .ok_or_else(|| br(BlitFailure::Bounds, "rd_row_gva_overflow"))?;
             if gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,
@@ -1043,19 +1078,19 @@ fn read_texture_row<M: HostMemory + HostOps>(
             )
             .is_err()
             {
-                return Err(br(BlitStatus::GuestIo, "rd_row_linear_io"));
+                return Err(br(BlitFailure::GuestIo, "rd_row_linear_io"));
             }
             Ok(())
         }
         TextureBacking::MapperRefTexture(t) => {
             if oz != 0 {
-                return Err(br(BlitStatus::Unsupported, "rd_row_t11_z"));
+                return Err(br(BlitFailure::Unsupported, "rd_row_t11_z"));
             }
             let y = oy
                 .checked_add(row_i)
-                .ok_or_else(|| br(BlitStatus::Bounds, "rd_row_t11_y_overflow"))?;
+                .ok_or_else(|| br(BlitFailure::Bounds, "rd_row_t11_y_overflow"))?;
             if y > u32::MAX as u64 || ox > u32::MAX as u64 {
-                return Err(br(BlitStatus::Bounds, "rd_row_t11_coord_range"));
+                return Err(br(BlitFailure::Bounds, "rd_row_t11_coord_range"));
             }
             let pixels = (row_bytes / t.bpp as u64) as u32;
             if !mapping_write::read_rect_raw_at(
@@ -1077,7 +1112,7 @@ fn read_texture_row<M: HostMemory + HostOps>(
                 &mut buf[..row_bytes as usize],
                 row_bytes as u32,
             ) {
-                return Err(br(BlitStatus::GuestIo, "rd_row_t11_io"));
+                return Err(br(BlitFailure::GuestIo, "rd_row_t11_io"));
             }
             Ok(())
         }
@@ -1113,7 +1148,7 @@ fn write_texture_row<M: HostMemory + HostOps>(
         z: oz,
     } = origin;
     if row_bytes as usize > buf.len() {
-        return Err(br(BlitStatus::Capacity, "wr_row_buf_cap"));
+        return Err(br(BlitFailure::Capacity, "wr_row_buf_cap"));
     }
     match tex {
         TextureBacking::Linear(t) => {
@@ -1121,14 +1156,14 @@ fn write_texture_row<M: HostMemory + HostOps>(
                 .texel_offset(
                     ox,
                     oy.checked_add(row_i)
-                        .ok_or_else(|| br(BlitStatus::Bounds, "wr_row_y_overflow"))?,
+                        .ok_or_else(|| br(BlitFailure::Bounds, "wr_row_y_overflow"))?,
                     oz,
                 )
-                .ok_or_else(|| br(BlitStatus::Bounds, "wr_row_texel_oob"))?;
+                .ok_or_else(|| br(BlitFailure::Bounds, "wr_row_texel_oob"))?;
             let gva = t
                 .base_gva
                 .checked_add(off)
-                .ok_or_else(|| br(BlitStatus::Bounds, "wr_row_gva_overflow"))?;
+                .ok_or_else(|| br(BlitFailure::Bounds, "wr_row_gva_overflow"))?;
             if gva_mem::write_task_gva_product_within(
                 state,
                 host,
@@ -1139,19 +1174,19 @@ fn write_texture_row<M: HostMemory + HostOps>(
             )
             .is_err()
             {
-                return Err(br(BlitStatus::GuestIo, "wr_row_linear_io"));
+                return Err(br(BlitFailure::GuestIo, "wr_row_linear_io"));
             }
             Ok(())
         }
         TextureBacking::MapperRefTexture(t) => {
             if oz != 0 {
-                return Err(br(BlitStatus::Unsupported, "wr_row_t11_z"));
+                return Err(br(BlitFailure::Unsupported, "wr_row_t11_z"));
             }
             let y = oy
                 .checked_add(row_i)
-                .ok_or_else(|| br(BlitStatus::Bounds, "wr_row_t11_y_overflow"))?;
+                .ok_or_else(|| br(BlitFailure::Bounds, "wr_row_t11_y_overflow"))?;
             if y > u32::MAX as u64 || ox > u32::MAX as u64 {
-                return Err(br(BlitStatus::Bounds, "wr_row_t11_coord_range"));
+                return Err(br(BlitFailure::Bounds, "wr_row_t11_coord_range"));
             }
             let pixels = (row_bytes / t.bpp as u64) as u32;
             if !mapping_write::write_rect_raw_at(
@@ -1173,7 +1208,7 @@ fn write_texture_row<M: HostMemory + HostOps>(
                 &buf[..row_bytes as usize],
                 row_bytes as u32,
             ) {
-                return Err(br(BlitStatus::GuestIo, "wr_row_t11_io"));
+                return Err(br(BlitFailure::GuestIo, "wr_row_t11_io"));
             }
             Ok(())
         }
@@ -1217,15 +1252,15 @@ fn read_texture_rect<M: HostMemory + HostOps>(
 ) -> Result<(), BlitStatus> {
     let need = row_bytes
         .checked_mul(row_count)
-        .ok_or_else(|| br(BlitStatus::Capacity, "rd_rect_span_overflow"))?;
+        .ok_or_else(|| br(BlitFailure::Capacity, "rd_rect_span_overflow"))?;
     if need as usize > buf.len() {
-        return Err(br(BlitStatus::Capacity, "rd_rect_buf_cap"));
+        return Err(br(BlitFailure::Capacity, "rd_rect_buf_cap"));
     }
     match tex {
         TextureBacking::Linear(t) => {
             let (gva, rect) = linear_rect(t, origin, row_bytes, row_count, "rd_rect_linear_shape")?;
             crate::runtime::gva_view::read_rect(state, host, task_id, gva, rect, buf)
-                .map_err(|_| br(BlitStatus::GuestIo, "rd_rect_linear_io"))?;
+                .map_err(|_| br(BlitFailure::GuestIo, "rd_rect_linear_io"))?;
             crate::runtime::drain::note_store_route("blit_rect_linear_read_walk");
             crate::runtime::drain::note_store_route_n(
                 "blit_rect_linear_read_rows_hoisted",
@@ -1250,7 +1285,7 @@ fn read_texture_rect<M: HostMemory + HostOps>(
                 &mut buf[..need as usize],
                 row_bytes as u32,
             ) {
-                return Err(br(BlitStatus::GuestIo, "rd_rect_t11_io"));
+                return Err(br(BlitFailure::GuestIo, "rd_rect_t11_io"));
             }
             Ok(())
         }
@@ -1295,18 +1330,18 @@ fn linear_rect(
     } = origin;
     let last_y = oy
         .checked_add(row_count.saturating_sub(1))
-        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+        .ok_or_else(|| br(BlitFailure::Bounds, site))?;
     let first = t
         .texel_offset(ox, oy, oz)
-        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+        .ok_or_else(|| br(BlitFailure::Bounds, site))?;
     t.texel_offset(ox, last_y, oz)
-        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+        .ok_or_else(|| br(BlitFailure::Bounds, site))?;
     let gva = t
         .base_gva
         .checked_add(first)
-        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+        .ok_or_else(|| br(BlitFailure::Bounds, site))?;
     let rect = RectStride::new(t.row_stride, row_bytes, row_count)
-        .ok_or_else(|| br(BlitStatus::Bounds, site))?;
+        .ok_or_else(|| br(BlitFailure::Bounds, site))?;
     Ok((gva, rect))
 }
 
@@ -1336,9 +1371,9 @@ fn write_texture_rect<M: HostMemory + HostOps>(
 ) -> Result<(), BlitStatus> {
     let need = row_bytes
         .checked_mul(row_count)
-        .ok_or_else(|| br(BlitStatus::Capacity, "wr_rect_span_overflow"))?;
+        .ok_or_else(|| br(BlitFailure::Capacity, "wr_rect_span_overflow"))?;
     if need as usize > buf.len() {
-        return Err(br(BlitStatus::Capacity, "wr_rect_buf_cap"));
+        return Err(br(BlitFailure::Capacity, "wr_rect_buf_cap"));
     }
     match tex {
         TextureBacking::Linear(t) => {
@@ -1346,7 +1381,7 @@ fn write_texture_rect<M: HostMemory + HostOps>(
             crate::runtime::gva_view::write_rect_within(
                 state, host, task_id, gva, rect, buf, allowed,
             )
-            .map_err(|_| br(BlitStatus::GuestIo, "wr_rect_linear_io"))?;
+            .map_err(|_| br(BlitFailure::GuestIo, "wr_rect_linear_io"))?;
             crate::runtime::drain::note_store_route("blit_rect_linear_walk");
             crate::runtime::drain::note_store_route_n(
                 "blit_rect_linear_rows_hoisted",
@@ -1389,7 +1424,7 @@ fn write_texture_rect<M: HostMemory + HostOps>(
                 )
             };
             if !ok {
-                return Err(br(BlitStatus::GuestIo, "wr_rect_t11_io"));
+                return Err(br(BlitFailure::GuestIo, "wr_rect_t11_io"));
             }
             Ok(())
         }
@@ -1418,19 +1453,19 @@ fn t11_rect_extent(
     row_count: u64,
 ) -> Result<(u32, u32, u32, u32), BlitStatus> {
     if origin.z != 0 {
-        return Err(br(BlitStatus::Unsupported, "rect_t11_z"));
+        return Err(br(BlitFailure::Unsupported, "rect_t11_z"));
     }
     if t.bpp == 0 {
-        return Err(br(BlitStatus::Bounds, "rect_t11_bpp_zero"));
+        return Err(br(BlitFailure::Bounds, "rect_t11_bpp_zero"));
     }
     let origin_x =
-        u32::try_from(origin.x).map_err(|_| br(BlitStatus::Bounds, "rect_t11_x_range"))?;
+        u32::try_from(origin.x).map_err(|_| br(BlitFailure::Bounds, "rect_t11_x_range"))?;
     let origin_y =
-        u32::try_from(origin.y).map_err(|_| br(BlitStatus::Bounds, "rect_t11_y_range"))?;
+        u32::try_from(origin.y).map_err(|_| br(BlitFailure::Bounds, "rect_t11_y_range"))?;
     let height =
-        u32::try_from(row_count).map_err(|_| br(BlitStatus::Bounds, "rect_t11_height_range"))?;
+        u32::try_from(row_count).map_err(|_| br(BlitFailure::Bounds, "rect_t11_height_range"))?;
     let pixels = u32::try_from(row_bytes / t.bpp as u64)
-        .map_err(|_| br(BlitStatus::Bounds, "rect_t11_width_range"))?;
+        .map_err(|_| br(BlitFailure::Bounds, "rect_t11_width_range"))?;
     Ok((pixels, height, origin_x, origin_y))
 }
 
@@ -1606,7 +1641,7 @@ fn texture_region_window<M: HostMemory>(
     let (Some(last_row), Some(last_plane)) = (copy_h.checked_sub(1), copy_d.checked_sub(1)) else {
         return Ok(Some(std::collections::HashSet::new()));
     };
-    let oob = |slug| br(BlitStatus::Bounds, slug);
+    let oob = |slug| br(BlitFailure::Bounds, slug);
     let first = t
         .texel_offset(ox, oy, oz)
         .ok_or_else(|| oob("tex_window_first_texel_oob"))?;
@@ -1709,11 +1744,11 @@ fn write_fill_pattern<M: HostMemory + HostOps>(
         )
         .is_err()
         {
-            return Err(br(BlitStatus::GuestIo, "fill_write_io"));
+            return Err(br(BlitFailure::GuestIo, "fill_write_io"));
         }
         cur = cur
             .checked_add(n as u64)
-            .ok_or_else(|| br(BlitStatus::Capacity, "fill_gva_advance_overflow"))?;
+            .ok_or_else(|| br(BlitFailure::Capacity, "fill_gva_advance_overflow"))?;
         remaining -= n as u64;
     }
     Ok(())
@@ -1780,19 +1815,19 @@ fn copy_bytes_within<M: HostMemory + HostOps>(
         )
         .is_err()
         {
-            return Err(br(BlitStatus::GuestIo, "copy_bytes_read_io"));
+            return Err(br(BlitFailure::GuestIo, "copy_bytes_read_io"));
         }
         if gva_mem::write_task_gva_product_within(state, host, task_id, d, &buf[..n], allowed)
             .is_err()
         {
-            return Err(br(BlitStatus::GuestIo, "copy_bytes_write_io"));
+            return Err(br(BlitFailure::GuestIo, "copy_bytes_write_io"));
         }
         s = s
             .checked_add(n as u64)
-            .ok_or_else(|| br(BlitStatus::Capacity, "copy_bytes_src_overflow"))?;
+            .ok_or_else(|| br(BlitFailure::Capacity, "copy_bytes_src_overflow"))?;
         d = d
             .checked_add(n as u64)
-            .ok_or_else(|| br(BlitStatus::Capacity, "copy_bytes_dst_overflow"))?;
+            .ok_or_else(|| br(BlitFailure::Capacity, "copy_bytes_dst_overflow"))?;
         remaining -= n as u64;
     }
     Ok(())
@@ -1822,14 +1857,14 @@ fn copy_row_region<M: HostMemory + HostOps>(
     }
     // Stride/row contract only — no host MiB byte budget (chunked row I/O).
     if row_bytes > src_row_stride || row_bytes > dst_row_stride {
-        return Err(br(BlitStatus::Bounds, "copy_region_row_gt_stride"));
+        return Err(br(BlitFailure::Bounds, "copy_region_row_gt_stride"));
     }
     let _total = row_bytes
         .checked_mul(row_count)
         .and_then(|v| v.checked_mul(image_count))
-        .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_total_overflow"))?;
+        .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_total_overflow"))?;
     let row_len = host_alloc_len(row_bytes)
-        .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_row_alloc"))?;
+        .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_row_alloc"))?;
     let dst_span = strided_span(
         row_bytes,
         dst_row_stride,
@@ -1837,7 +1872,7 @@ fn copy_row_region<M: HostMemory + HostOps>(
         dst_image_stride,
         image_count,
     )
-    .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_span_overflow"))?;
+    .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_dst_span_overflow"))?;
     // The window is built once and the rows run against it, so a single total
     // over the pair cannot say which is the cost. `dest_window` walks the whole
     // destination span's guest page table into a `HashSet`, which is per-record
@@ -1856,28 +1891,28 @@ fn copy_row_region<M: HostMemory + HostOps>(
         let src_plane = src_base
             .checked_add(
                 z.checked_mul(src_image_stride)
-                    .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_src_plane_overflow"))?,
+                    .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_src_plane_overflow"))?,
             )
-            .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_src_plane_overflow"))?;
+            .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_src_plane_overflow"))?;
         let dst_plane = dst_base
             .checked_add(
                 z.checked_mul(dst_image_stride)
-                    .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_plane_overflow"))?,
+                    .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_dst_plane_overflow"))?,
             )
-            .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_plane_overflow"))?;
+            .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_dst_plane_overflow"))?;
         for y in 0..row_count {
             let s = src_plane
                 .checked_add(
                     y.checked_mul(src_row_stride)
-                        .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_src_row_overflow"))?,
+                        .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_src_row_overflow"))?,
                 )
-                .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_src_row_overflow"))?;
+                .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_src_row_overflow"))?;
             let d = dst_plane
                 .checked_add(
                     y.checked_mul(dst_row_stride)
-                        .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_row_overflow"))?,
+                        .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_dst_row_overflow"))?,
                 )
-                .ok_or_else(|| br(BlitStatus::Capacity, "copy_region_dst_row_overflow"))?;
+                .ok_or_else(|| br(BlitFailure::Capacity, "copy_region_dst_row_overflow"))?;
             if gva_mem::read_task_gva_by_id(
                 host,
                 &state.tasks,
@@ -1889,7 +1924,7 @@ fn copy_row_region<M: HostMemory + HostOps>(
             .is_err()
             {
                 note_copy_region_io(task_id, false, s, y, z, row_bytes, state.page_shift);
-                return Err(br(BlitStatus::GuestIo, "copy_region_read_io"));
+                return Err(br(BlitFailure::GuestIo, "copy_region_read_io"));
             }
             if gva_mem::write_task_gva_product_within(
                 state,
@@ -1902,7 +1937,7 @@ fn copy_row_region<M: HostMemory + HostOps>(
             .is_err()
             {
                 note_copy_region_io(task_id, true, d, y, z, row_bytes, state.page_shift);
-                return Err(br(BlitStatus::GuestIo, "copy_region_write_io"));
+                return Err(br(BlitFailure::GuestIo, "copy_region_write_io"));
             }
         }
     }
@@ -1917,23 +1952,24 @@ fn exec_fill_buffer<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    cmd: &FillBuffer,
+    value: u8,
 ) -> BlitStatus {
-    if cmd.range_length == 0 {
+    if cmd.length == 0 {
         return BlitStatus::ZeroExtent;
     }
-    let buf = match resolve_buffer(state, host, task_id, cmd.buffer) {
+    let buf = match resolve_buffer(state, host, task_id, cmd.buffer_ref) {
         Ok(b) => b,
         Err(st) => return st,
     };
-    if !range_fits(cmd.range_location, cmd.range_length, buf.size) {
-        return br(BlitStatus::Bounds, "fill_range_oob");
+    if !range_fits(cmd.location, cmd.length, buf.size) {
+        return br(BlitFailure::Bounds, "fill_range_oob");
     }
-    let gva = match buf.gva.checked_add(cmd.range_location) {
+    let gva = match buf.gva.checked_add(cmd.location) {
         Some(v) => v,
-        None => return br(BlitStatus::Bounds, "fill_gva_overflow"),
+        None => return br(BlitFailure::Bounds, "fill_gva_overflow"),
     };
-    match write_fill_range(host, state, task_id, gva, cmd.range_length, cmd.fill_value) {
+    match write_fill_range(host, state, task_id, gva, cmd.length, value) {
         Ok(()) => BlitStatus::Ok,
         Err(st) => st,
     }
@@ -1971,27 +2007,28 @@ fn exec_fill_buffer_pattern4<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    cmd: &FillBuffer,
+    pattern_word: u32,
 ) -> BlitStatus {
-    if cmd.range_length == 0 {
+    if cmd.length == 0 {
         return BlitStatus::ZeroExtent;
     }
-    let pattern = cmd.fill_pattern.to_le_bytes();
-    if !cmd.range_location.is_multiple_of(pattern.len() as u64) {
-        return br(BlitStatus::Unsupported, "fill_pattern4_unaligned_range");
+    let pattern = pattern_word.to_le_bytes();
+    if !cmd.location.is_multiple_of(pattern.len() as u64) {
+        return br(BlitFailure::Unsupported, "fill_pattern4_unaligned_range");
     }
-    let buf = match resolve_buffer(state, host, task_id, cmd.buffer) {
+    let buf = match resolve_buffer(state, host, task_id, cmd.buffer_ref) {
         Ok(b) => b,
         Err(st) => return st,
     };
-    if !range_fits(cmd.range_location, cmd.range_length, buf.size) {
-        return br(BlitStatus::Bounds, "fill_pattern4_range_oob");
+    if !range_fits(cmd.location, cmd.length, buf.size) {
+        return br(BlitFailure::Bounds, "fill_pattern4_range_oob");
     }
-    let gva = match buf.gva.checked_add(cmd.range_location) {
+    let gva = match buf.gva.checked_add(cmd.location) {
         Some(v) => v,
-        None => return br(BlitStatus::Bounds, "fill_pattern4_gva_overflow"),
+        None => return br(BlitFailure::Bounds, "fill_pattern4_gva_overflow"),
     };
-    match write_fill_pattern(host, state, task_id, gva, cmd.range_length, &pattern) {
+    match write_fill_pattern(host, state, task_id, gva, cmd.length, &pattern) {
         Ok(()) => BlitStatus::Ok,
         Err(st) => st,
     }
@@ -2001,43 +2038,38 @@ fn exec_copy_buffer_to_buffer<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    cmd: &BufferToBuffer,
 ) -> BlitStatus {
     if cmd.size == 0 {
         return BlitStatus::ZeroExtent;
     }
-    let src = match resolve_buffer(state, host, task_id, cmd.source) {
+    let src = match resolve_buffer(state, host, task_id, cmd.source_ref) {
         Ok(b) => b,
         Err(st) => return st,
     };
-    let dst = match resolve_buffer(state, host, task_id, cmd.destination) {
+    let dst = match resolve_buffer(state, host, task_id, cmd.dest_ref) {
         Ok(b) => b,
         Err(st) => return st,
     };
     if !range_fits(cmd.source_offset, cmd.size, src.size)
-        || !range_fits(cmd.destination_offset, cmd.size, dst.size)
+        || !range_fits(cmd.dest_offset, cmd.size, dst.size)
     {
-        return br(BlitStatus::Bounds, "b2b_range_oob");
+        return br(BlitFailure::Bounds, "b2b_range_oob");
     }
     // Same allocation (same GVA base + size): reject overlapping windows.
     if src.gva == dst.gva
         && src.size == dst.size
-        && ranges_overlap(
-            cmd.source_offset,
-            cmd.size,
-            cmd.destination_offset,
-            cmd.size,
-        )
+        && ranges_overlap(cmd.source_offset, cmd.size, cmd.dest_offset, cmd.size)
     {
-        return br(BlitStatus::Overlap, "b2b_overlap");
+        return br(BlitFailure::Overlap, "b2b_overlap");
     }
     let s = match src.gva.checked_add(cmd.source_offset) {
         Some(v) => v,
-        None => return br(BlitStatus::Bounds, "b2b_src_gva_overflow"),
+        None => return br(BlitFailure::Bounds, "b2b_src_gva_overflow"),
     };
-    let d = match dst.gva.checked_add(cmd.destination_offset) {
+    let d = match dst.gva.checked_add(cmd.dest_offset) {
         Some(v) => v,
-        None => return br(BlitStatus::Bounds, "b2b_dst_gva_overflow"),
+        None => return br(BlitFailure::Bounds, "b2b_dst_gva_overflow"),
     };
     match copy_bytes(host, state, task_id, s, d, cmd.size) {
         Ok(()) => BlitStatus::Ok,
@@ -2110,24 +2142,32 @@ fn note_extent_over(kind: &'static str, axis: &'static str, requested: u64, max:
 }
 
 /// Resolve `MTLBlitOption` → aspect flags + buffer-side plane bpp.
+/// The plane a copy addresses, and what one of its texels costs.
+///
+/// Takes the `MTLBlitOption` word rather than the record, because the three
+/// copies that carry one carry it at three different widths and only one of
+/// them can be right for any given call. The absent word is a zero: a record
+/// with no `options:` field selects the whole texel, which is what
+/// `select_aspect(0)` answers, so "this record has no options word" and "this
+/// record's options word is zero" no longer need to be two states.
 fn copy_aspect_for_options(
     texture_format: u16,
-    cmd: &Command,
+    options: u32,
 ) -> Result<(BlitAspect, u32), BlitStatus> {
     // The three option checks used to collapse into a bare `Unsupported` with
     // the reason discarded by `map_err(|_| ..)`. The blit reason channel carries
     // the specific slug to the dispatch-site line, so an unknown option bit and
     // a depth+stencil conflict no longer read identically.
-    let aspect = blit::parse_blit_options(cmd.has_options, cmd.options)
-        .map_err(|e: blit::BlitOptionError| br(BlitStatus::Unsupported, e.slug()))?;
+    let aspect = reims_vgpu_protocol::blit::select_aspect(options)
+        .map_err(|e| br(BlitFailure::Unsupported, e.slug()))?;
     let bpp = pixel_format::blit_aspect_bytes_per_pixel(texture_format, aspect)
-        .ok_or(BlitStatus::Unsupported)?;
+        .ok_or(br(BlitFailure::Unsupported, "aspect_bpp_unknown"))?;
     Ok((aspect, bpp))
 }
 
 /// Texture-side full texel bpp (storage). Plane copies use this for GVA strides.
 fn texture_storage_bpp(format: u16) -> Result<u32, BlitStatus> {
-    pixel_format::bytes_per_pixel(format).ok_or(BlitStatus::Unsupported)
+    pixel_format::bytes_per_pixel(format).ok_or(br(BlitFailure::Unsupported, "storage_bpp_unknown"))
 }
 
 /// Read one packed texture row (tight `width * storage_bpp`) at (ox, oy+row_i, oz).
@@ -2151,11 +2191,12 @@ fn read_texture_storage_row<M: HostMemory + HostOps>(
         y: oy,
         z: oz,
     } = origin;
-    let row_bytes = (width as u64)
-        .checked_mul(storage_bpp as u64)
-        .ok_or(BlitStatus::Capacity)?;
+    let row_bytes = (width as u64).checked_mul(storage_bpp as u64).ok_or(br(
+        BlitFailure::Capacity,
+        "bt_read_storage_row_bytes_overflow",
+    ))?;
     if row_bytes as usize > buf.len() {
-        return Err(BlitStatus::Capacity);
+        return Err(br(BlitFailure::Capacity, "bt_read_storage_row_over_buf"));
     }
     // Reuse read_texture_row but with storage row size (not plane size).
     // Temporarily: call the same GVA path with storage row_bytes.
@@ -2197,9 +2238,10 @@ fn write_texture_storage_row<M: HostMemory + HostOps>(
         y: oy,
         z: oz,
     } = origin;
-    let row_bytes = (width as u64)
-        .checked_mul(storage_bpp as u64)
-        .ok_or(BlitStatus::Capacity)?;
+    let row_bytes = (width as u64).checked_mul(storage_bpp as u64).ok_or(br(
+        BlitFailure::Capacity,
+        "bt_write_storage_row_bytes_overflow",
+    ))?;
     write_texture_row(
         state,
         host,
@@ -2252,10 +2294,12 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
     };
     let plane_row = (copy_w as u64)
         .checked_mul(plane_bpp as u64)
-        .ok_or(BlitStatus::Capacity)? as usize;
+        .ok_or(br(BlitFailure::Capacity, "bt_plane_row_bytes_overflow"))?
+        as usize;
     let storage_row = (copy_w as u64)
         .checked_mul(storage_bpp as u64)
-        .ok_or(BlitStatus::Capacity)? as usize;
+        .ok_or(br(BlitFailure::Capacity, "bt_storage_row_bytes_overflow"))?
+        as usize;
     // The other half of the rail. `note_t2t_shape` covers texture-to-texture
     // only, and that left 4 243 of a driven Maps leg's 26 234 blit records
     // uncounted — a population big enough to hold the whole per-record cost if
@@ -2311,7 +2355,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
             buf_image_stride,
             copy_d,
         )
-        .ok_or(BlitStatus::Capacity)?;
+        .ok_or(br(BlitFailure::Capacity, "bt_dest_span_overflow"))?;
         dest_window(state, host, task_id, buf_base_gva, span)
     };
     // The half `blit_rows_us` cannot see. That counter sits in `copy_row_region`,
@@ -2325,11 +2369,14 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
             let buf_gva = buf_base_gva
                 .checked_add(
                     z.checked_mul(buf_image_stride)
-                        .ok_or(BlitStatus::Capacity)?,
+                        .ok_or(br(BlitFailure::Capacity, "bt_slice_offset_overflow"))?,
                 )
-                .ok_or(BlitStatus::Capacity)?
-                .checked_add(y.checked_mul(buf_row_stride).ok_or(BlitStatus::Capacity)?)
-                .ok_or(BlitStatus::Capacity)?;
+                .ok_or(br(BlitFailure::Capacity, "bt_slice_base_overflow"))?
+                .checked_add(
+                    y.checked_mul(buf_row_stride)
+                        .ok_or(br(BlitFailure::Capacity, "bt_row_offset_overflow"))?,
+                )
+                .ok_or(br(BlitFailure::Capacity, "bt_row_base_overflow"))?;
             if to_texture {
                 if gva_mem::read_task_gva_by_id(
                     host,
@@ -2341,7 +2388,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                 )
                 .is_err()
                 {
-                    return Err(BlitStatus::GuestIo);
+                    return Err(br(BlitFailure::GuestIo, "bt_read_guest_row"));
                 }
                 if repack {
                     // RMW: load existing packed row, insert plane, store.
@@ -2367,7 +2414,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                         copy_w,
                         &mut packed[..storage_row],
                     ) {
-                        return Err(BlitStatus::Unsupported);
+                        return Err(br(BlitFailure::Unsupported, "bt_insert_plane_row"));
                     }
                     write_texture_storage_row(
                         state,
@@ -2425,7 +2472,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                     copy_w,
                     &mut plane,
                 ) {
-                    return Err(BlitStatus::Unsupported);
+                    return Err(br(BlitFailure::Unsupported, "bt_extract_plane_row"));
                 }
                 if gva_mem::write_task_gva_product_within(
                     state,
@@ -2437,7 +2484,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                 )
                 .is_err()
                 {
-                    return Err(BlitStatus::GuestIo);
+                    return Err(br(BlitFailure::GuestIo, "bt_write_guest_row_repack"));
                 }
             } else {
                 read_texture_row(
@@ -2464,7 +2511,7 @@ fn copy_buffer_texture_rows_aspect<M: HostMemory + HostOps>(
                 )
                 .is_err()
                 {
-                    return Err(BlitStatus::GuestIo);
+                    return Err(br(BlitFailure::GuestIo, "bt_write_guest_row"));
                 }
             }
         }
@@ -2480,9 +2527,9 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    cmd: &BufferToTexture,
 ) -> BlitStatus {
-    let src = match resolve_buffer(state, host, task_id, cmd.source) {
+    let src = match resolve_buffer(state, host, task_id, cmd.source_ref) {
         Ok(b) => b,
         Err(st) => return st,
     };
@@ -2490,9 +2537,9 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
         state,
         host,
         task_id,
-        cmd.destination,
-        cmd.destination_level,
-        cmd.destination_slice,
+        cmd.dest.texture_ref,
+        cmd.dest.level,
+        cmd.dest.slice,
     ) {
         Ok(t) => t,
         Err(st) => return st,
@@ -2504,43 +2551,43 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     // buffer sized a sixteenth of what it needs. See
     // `exec_copy_texture_to_texture`, which converts to block space instead.
     if dst.block().is_compressed() {
-        return br(BlitStatus::Unsupported, "b2t_compressed");
+        return br(BlitFailure::Unsupported, "b2t_compressed");
     }
-    let (aspect, copy_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd) {
+    let (aspect, copy_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd.options) {
         Ok(v) => v,
         Err(st) => return st,
     };
     let repack = pixel_format::blit_aspect_needs_repack(dst.pixel_format(), aspect);
     // Mapper-ref-texture is 2D only.
-    if dst.is_mapper_ref_texture() && (cmd.destination_origin.z != 0 || cmd.source_size.depth > 1) {
-        if cmd.source_size.depth == 0 {
+    if dst.is_mapper_ref_texture() && (cmd.dest.origin.z != 0 || cmd.size.depth > 1) {
+        if cmd.size.depth == 0 {
             return BlitStatus::ZeroExtent;
         }
-        if cmd.destination_origin.z != 0 || cmd.source_size.depth != 1 {
-            return br(BlitStatus::Unsupported, "b2t_t11_z_or_depth");
+        if cmd.dest.origin.z != 0 || cmd.size.depth != 1 {
+            return br(BlitFailure::Unsupported, "b2t_t11_z_or_depth");
         }
     }
-    let ox = cmd.destination_origin.x;
-    let oy = cmd.destination_origin.y;
-    let oz = cmd.destination_origin.z;
+    let ox = cmd.dest.origin.x;
+    let oy = cmd.dest.origin.y;
+    let oz = cmd.dest.origin.z;
     if ox > dst.width() as u64 || oy > dst.height() as u64 || oz > dst.depth() as u64 {
-        return br(BlitStatus::Bounds, "b2t_origin_oob");
+        return br(BlitFailure::Bounds, "b2t_origin_oob");
     }
     // Refused rather than clipped, and the origin check directly above is why
     // the two now agree: one wire record names a region, and both halves of it
     // are checked the same way.
     let (Some(copy_w), Some(copy_h)) = (
-        copy_extent("b2t", "w", cmd.source_size.width, dst.width() as u64 - ox),
-        copy_extent("b2t", "h", cmd.source_size.height, dst.height() as u64 - oy),
+        copy_extent("b2t", "w", cmd.size.width, dst.width() as u64 - ox),
+        copy_extent("b2t", "h", cmd.size.height, dst.height() as u64 - oy),
     ) else {
-        return br(BlitStatus::Bounds, "b2t_extent_oob");
+        return br(BlitFailure::Bounds, "b2t_extent_oob");
     };
-    let copy_d = if cmd.source_size.depth == 0 {
+    let copy_d = if cmd.size.depth == 0 {
         0
     } else {
-        match copy_extent("b2t", "d", cmd.source_size.depth, dst.depth() as u64 - oz) {
+        match copy_extent("b2t", "d", cmd.size.depth, dst.depth() as u64 - oz) {
             Some(d) => d,
-            None => return br(BlitStatus::Bounds, "b2t_extent_oob"),
+            None => return br(BlitFailure::Bounds, "b2t_extent_oob"),
         }
     };
     if copy_w == 0 || copy_h == 0 || copy_d == 0 {
@@ -2549,29 +2596,29 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     // Buffer-side plane bpp (aspect-aware).
     let row_bytes = match copy_w.checked_mul(copy_bpp as u64) {
         Some(v) => v,
-        None => return br(BlitStatus::Capacity, "b2t_row_bytes_overflow"),
+        None => return br(BlitFailure::Capacity, "b2t_row_bytes_overflow"),
     };
-    let src_bpr = if cmd.source_bytes_per_row != 0 {
-        cmd.source_bytes_per_row
+    let src_bpr = if cmd.bytes_per_row != 0 {
+        cmd.bytes_per_row
     } else {
         row_bytes
     };
     if src_bpr < row_bytes {
-        return br(BlitStatus::Bounds, "b2t_src_bpr_lt_row");
+        return br(BlitFailure::Bounds, "b2t_src_bpr_lt_row");
     }
-    let src_bpi = if cmd.source_bytes_per_image != 0 {
-        cmd.source_bytes_per_image
+    let src_bpi = if cmd.bytes_per_image != 0 {
+        cmd.bytes_per_image
     } else {
         match src_bpr.checked_mul(copy_h) {
             Some(v) => v,
-            None => return br(BlitStatus::Capacity, "b2t_src_bpi_overflow"),
+            None => return br(BlitFailure::Capacity, "b2t_src_bpi_overflow"),
         }
     };
     // Combined DS + aspect: plane repack path (not raw GVA span).
     if repack {
         let src_gva = match src.gva.checked_add(cmd.source_offset) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_repack_gva_overflow"),
+            None => return br(BlitFailure::Bounds, "b2t_repack_gva_overflow"),
         };
         return match copy_buffer_texture_rows_aspect(
             state,
@@ -2601,11 +2648,11 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
     if let TextureBacking::Linear(ref lt) = dst {
         let dst_off = match lt.texel_offset(ox, oy, oz) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_dst_texel_oob"),
+            None => return br(BlitFailure::Bounds, "b2t_dst_texel_oob"),
         };
         let dst_bpi = match lt.bytes_per_image() {
             Some(v) => v,
-            None => return br(BlitStatus::Capacity, "b2t_dst_bpi_overflow"),
+            None => return br(BlitFailure::Capacity, "b2t_dst_bpi_overflow"),
         };
         let last = match dst_off
             .checked_add((copy_d - 1).saturating_mul(dst_bpi))
@@ -2613,10 +2660,10 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             .and_then(|v| v.checked_add(row_bytes))
         {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_dst_span_overflow"),
+            None => return br(BlitFailure::Bounds, "b2t_dst_span_overflow"),
         };
         if lt.alloc_size != 0 && last > lt.alloc_size {
-            return br(BlitStatus::Bounds, "b2t_dst_alloc_oob");
+            return br(BlitFailure::Bounds, "b2t_dst_alloc_oob");
         }
         let src_span = match cmd
             .source_offset
@@ -2625,18 +2672,18 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             .and_then(|v| v.checked_add(row_bytes))
         {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_src_span_overflow"),
+            None => return br(BlitFailure::Bounds, "b2t_src_span_overflow"),
         };
         if src_span > src.size {
-            return br(BlitStatus::Bounds, "b2t_src_span_oob");
+            return br(BlitFailure::Bounds, "b2t_src_span_oob");
         }
         let src_gva = match src.gva.checked_add(cmd.source_offset) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_src_gva_overflow"),
+            None => return br(BlitFailure::Bounds, "b2t_src_gva_overflow"),
         };
         let dst_gva = match lt.base_gva.checked_add(dst_off) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "b2t_dst_gva_overflow"),
+            None => return br(BlitFailure::Bounds, "b2t_dst_gva_overflow"),
         };
         return match copy_row_region(
             host,
@@ -2664,10 +2711,10 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
         .and_then(|v| v.checked_add(row_bytes))
     {
         Some(v) => v,
-        None => return br(BlitStatus::Bounds, "b2t_t11_src_span_overflow"),
+        None => return br(BlitFailure::Bounds, "b2t_t11_src_span_overflow"),
     };
     if src_span > src.size {
-        return br(BlitStatus::Bounds, "b2t_t11_src_span_oob");
+        return br(BlitFailure::Bounds, "b2t_t11_src_span_oob");
     }
     // `None` for the mapper-ref-texture destination this arm is for, which the mapping rail
     // authorises instead; a linear destination reaching here is still bounded.
@@ -2699,7 +2746,7 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
                 .and_then(|b| b.checked_add(y.saturating_mul(src_bpr)))
             {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "b2t_t11_src_gva_overflow"),
+                None => return br(BlitFailure::Bounds, "b2t_t11_src_gva_overflow"),
             };
             if gva_mem::read_task_gva_by_id(
                 host,
@@ -2711,7 +2758,7 @@ fn exec_copy_buffer_to_texture<M: HostMemory + HostOps>(
             )
             .is_err()
             {
-                return br(BlitStatus::GuestIo, "b2t_t11_read_io");
+                return br(BlitFailure::GuestIo, "b2t_t11_read_io");
             }
             if let Err(st) = write_texture_row(
                 state,
@@ -2739,15 +2786,15 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    cmd: &TextureToBuffer,
 ) -> BlitStatus {
     let src = match resolve_texture_backing(
         state,
         host,
         task_id,
-        cmd.source,
-        cmd.source_level,
-        cmd.source_slice,
+        cmd.source.texture_ref,
+        cmd.source.level,
+        cmd.source.slice,
     ) {
         Ok(t) => t,
         Err(st) => return st,
@@ -2759,46 +2806,47 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     // buffer sized a sixteenth of what it needs. See
     // `exec_copy_texture_to_texture`, which converts to block space instead.
     if src.block().is_compressed() {
-        return br(BlitStatus::Unsupported, "t2b_compressed");
+        return br(BlitFailure::Unsupported, "t2b_compressed");
     }
-    let (aspect, copy_bpp) = match copy_aspect_for_options(src.pixel_format(), cmd) {
-        Ok(v) => v,
-        Err(st) => return st,
-    };
+    let (aspect, copy_bpp) =
+        match copy_aspect_for_options(src.pixel_format(), u32::from(cmd.options)) {
+            Ok(v) => v,
+            Err(st) => return st,
+        };
     let repack = pixel_format::blit_aspect_needs_repack(src.pixel_format(), aspect);
-    let dst = match resolve_buffer(state, host, task_id, cmd.destination) {
+    let dst = match resolve_buffer(state, host, task_id, cmd.dest_ref) {
         Ok(b) => b,
         Err(st) => return st,
     };
-    if src.is_mapper_ref_texture() && (cmd.source_origin.z != 0 || cmd.source_size.depth > 1) {
-        if cmd.source_size.depth == 0 {
+    if src.is_mapper_ref_texture() && (cmd.source.origin.z != 0 || cmd.size.depth > 1) {
+        if cmd.size.depth == 0 {
             return BlitStatus::ZeroExtent;
         }
-        if cmd.source_origin.z != 0 || cmd.source_size.depth != 1 {
-            return br(BlitStatus::Unsupported, "t2b_t11_z_or_depth");
+        if cmd.source.origin.z != 0 || cmd.size.depth != 1 {
+            return br(BlitFailure::Unsupported, "t2b_t11_z_or_depth");
         }
     }
-    let ox = cmd.source_origin.x;
-    let oy = cmd.source_origin.y;
-    let oz = cmd.source_origin.z;
+    let ox = cmd.source.origin.x;
+    let oy = cmd.source.origin.y;
+    let oz = cmd.source.origin.z;
     if ox > src.width() as u64 || oy > src.height() as u64 || oz > src.depth() as u64 {
-        return br(BlitStatus::Bounds, "t2b_origin_oob");
+        return br(BlitFailure::Bounds, "t2b_origin_oob");
     }
     // Refused rather than clipped, and the origin check directly above is why
     // the two now agree: one wire record names a region, and both halves of it
     // are checked the same way.
     let (Some(copy_w), Some(copy_h)) = (
-        copy_extent("t2b", "w", cmd.source_size.width, src.width() as u64 - ox),
-        copy_extent("t2b", "h", cmd.source_size.height, src.height() as u64 - oy),
+        copy_extent("t2b", "w", cmd.size.width, src.width() as u64 - ox),
+        copy_extent("t2b", "h", cmd.size.height, src.height() as u64 - oy),
     ) else {
-        return br(BlitStatus::Bounds, "t2b_extent_oob");
+        return br(BlitFailure::Bounds, "t2b_extent_oob");
     };
-    let copy_d = if cmd.source_size.depth == 0 {
+    let copy_d = if cmd.size.depth == 0 {
         0
     } else {
-        match copy_extent("t2b", "d", cmd.source_size.depth, src.depth() as u64 - oz) {
+        match copy_extent("t2b", "d", cmd.size.depth, src.depth() as u64 - oz) {
             Some(d) => d,
-            None => return br(BlitStatus::Bounds, "t2b_extent_oob"),
+            None => return br(BlitFailure::Bounds, "t2b_extent_oob"),
         }
     };
     if copy_w == 0 || copy_h == 0 || copy_d == 0 {
@@ -2806,28 +2854,28 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     }
     let row_bytes = match copy_w.checked_mul(copy_bpp as u64) {
         Some(v) => v,
-        None => return br(BlitStatus::Capacity, "t2b_row_bytes_overflow"),
+        None => return br(BlitFailure::Capacity, "t2b_row_bytes_overflow"),
     };
-    let dst_bpr = if cmd.destination_bytes_per_row != 0 {
-        cmd.destination_bytes_per_row
+    let dst_bpr = if cmd.bytes_per_row != 0 {
+        cmd.bytes_per_row
     } else {
         row_bytes
     };
     if dst_bpr < row_bytes {
-        return br(BlitStatus::Bounds, "t2b_dst_bpr_lt_row");
+        return br(BlitFailure::Bounds, "t2b_dst_bpr_lt_row");
     }
-    let dst_bpi = if cmd.destination_bytes_per_image != 0 {
-        cmd.destination_bytes_per_image
+    let dst_bpi = if cmd.bytes_per_image != 0 {
+        cmd.bytes_per_image
     } else {
         match dst_bpr.checked_mul(copy_h) {
             Some(v) => v,
-            None => return br(BlitStatus::Capacity, "t2b_dst_bpi_overflow"),
+            None => return br(BlitFailure::Capacity, "t2b_dst_bpi_overflow"),
         }
     };
     if repack {
-        let dst_gva = match dst.gva.checked_add(cmd.destination_offset) {
+        let dst_gva = match dst.gva.checked_add(cmd.dest_offset) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "t2b_repack_gva_overflow"),
+            None => return br(BlitFailure::Bounds, "t2b_repack_gva_overflow"),
         };
         return match copy_buffer_texture_rows_aspect(
             state,
@@ -2856,31 +2904,31 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
     if let TextureBacking::Linear(ref lt) = src {
         let src_off = match lt.texel_offset(ox, oy, oz) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "t2b_src_texel_oob"),
+            None => return br(BlitFailure::Bounds, "t2b_src_texel_oob"),
         };
         let src_bpi = match lt.bytes_per_image() {
             Some(v) => v,
-            None => return br(BlitStatus::Capacity, "t2b_src_bpi_overflow"),
+            None => return br(BlitFailure::Capacity, "t2b_src_bpi_overflow"),
         };
         let dst_span = match cmd
-            .destination_offset
+            .dest_offset
             .checked_add((copy_d - 1).saturating_mul(dst_bpi))
             .and_then(|v| v.checked_add((copy_h - 1).saturating_mul(dst_bpr)))
             .and_then(|v| v.checked_add(row_bytes))
         {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "t2b_dst_span_overflow"),
+            None => return br(BlitFailure::Bounds, "t2b_dst_span_overflow"),
         };
         if dst_span > dst.size {
-            return br(BlitStatus::Bounds, "t2b_dst_span_oob");
+            return br(BlitFailure::Bounds, "t2b_dst_span_oob");
         }
         let src_gva = match lt.base_gva.checked_add(src_off) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "t2b_src_gva_overflow"),
+            None => return br(BlitFailure::Bounds, "t2b_src_gva_overflow"),
         };
-        let dst_gva = match dst.gva.checked_add(cmd.destination_offset) {
+        let dst_gva = match dst.gva.checked_add(cmd.dest_offset) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "t2b_dst_gva_overflow"),
+            None => return br(BlitFailure::Bounds, "t2b_dst_gva_overflow"),
         };
         return match copy_row_region(
             host,
@@ -2901,29 +2949,29 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
         };
     }
     let dst_span = match cmd
-        .destination_offset
+        .dest_offset
         .checked_add((copy_d - 1).saturating_mul(dst_bpi))
         .and_then(|v| v.checked_add((copy_h - 1).saturating_mul(dst_bpr)))
         .and_then(|v| v.checked_add(row_bytes))
     {
         Some(v) => v,
-        None => return br(BlitStatus::Bounds, "t2b_stage_dst_span_overflow"),
+        None => return br(BlitFailure::Bounds, "t2b_stage_dst_span_overflow"),
     };
     if dst_span > dst.size {
-        return br(BlitStatus::Bounds, "t2b_stage_dst_span_oob");
+        return br(BlitFailure::Bounds, "t2b_stage_dst_span_oob");
     }
     // `dst_span` is measured from `dst.gva`, so the span this loop writes starts
     // one `destination_offset` in.
-    let dst_base = match dst.gva.checked_add(cmd.destination_offset) {
+    let dst_base = match dst.gva.checked_add(cmd.dest_offset) {
         Some(v) => v,
-        None => return br(BlitStatus::Bounds, "t2b_stage_dst_gva_overflow"),
+        None => return br(BlitFailure::Bounds, "t2b_stage_dst_gva_overflow"),
     };
     let allowed = dest_window(
         state,
         host,
         task_id,
         dst_base,
-        dst_span.saturating_sub(cmd.destination_offset),
+        dst_span.saturating_sub(cmd.dest_offset),
     );
     // `blit_rows_us` lives in `copy_row_region`, which only the linear-to-linear
     // fast path reaches. A texture-to-buffer copy stages every row through
@@ -2954,7 +3002,7 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
                 .and_then(|b| b.checked_add(y.saturating_mul(dst_bpr)))
             {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "t2b_stage_dst_gva_overflow"),
+                None => return br(BlitFailure::Bounds, "t2b_stage_dst_gva_overflow"),
             };
             if gva_mem::write_task_gva_product_within(
                 state,
@@ -2966,7 +3014,7 @@ fn exec_copy_texture_to_buffer<M: HostMemory + HostOps>(
             )
             .is_err()
             {
-                return br(BlitStatus::GuestIo, "t2b_stage_write_io");
+                return br(BlitFailure::GuestIo, "t2b_stage_write_io");
             }
         }
     }
@@ -2982,7 +3030,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    cmd: &TextureRegion,
 ) -> BlitStatus {
     // `walk_blit_us` says this call costs ~1.1 ms and `blit_t2t_bytes` says it
     // moves ~800 of them, so the cost is not in the copy and a single total
@@ -2994,9 +3042,9 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         state,
         host,
         task_id,
-        cmd.source,
-        cmd.source_level,
-        cmd.source_slice,
+        cmd.source.texture_ref,
+        cmd.source.level,
+        cmd.source.slice,
     ) {
         Ok(t) => t,
         Err(st) => return st,
@@ -3005,44 +3053,44 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         state,
         host,
         task_id,
-        cmd.destination,
-        cmd.destination_level,
-        cmd.destination_slice,
+        cmd.dest.texture_ref,
+        cmd.dest.level,
+        cmd.dest.slice,
     ) {
         Ok(t) => t,
         Err(st) => return st,
     };
     // Options apply to both ends; plane bpp must agree under the selected aspect.
-    let (aspect, src_bpp) = match copy_aspect_for_options(src.pixel_format(), cmd) {
+    let (aspect, src_bpp) = match copy_aspect_for_options(src.pixel_format(), cmd.options) {
         Ok(v) => v,
         Err(st) => return st,
     };
-    let (_, dst_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd) {
+    let (_, dst_bpp) = match copy_aspect_for_options(dst.pixel_format(), cmd.options) {
         Ok(v) => v,
         Err(st) => return st,
     };
     if src_bpp != dst_bpp {
-        return br(BlitStatus::Unsupported, "t2t_bpp_mismatch");
+        return br(BlitFailure::Unsupported, "t2t_bpp_mismatch");
     }
     if src.pixel_format() != 0
         && dst.pixel_format() != 0
         && src.pixel_format() != dst.pixel_format()
     {
-        return br(BlitStatus::Unsupported, "t2t_format_mismatch");
+        return br(BlitFailure::Unsupported, "t2t_format_mismatch");
     }
     let copy_bpp = src_bpp;
     let repack_src = pixel_format::blit_aspect_needs_repack(src.pixel_format(), aspect);
     let repack_dst = pixel_format::blit_aspect_needs_repack(dst.pixel_format(), aspect);
     let any_t11 = src.is_mapper_ref_texture() || dst.is_mapper_ref_texture();
-    if any_t11 && (cmd.source_origin.z != 0 || cmd.destination_origin.z != 0) {
-        return br(BlitStatus::Unsupported, "t2t_t11_z");
+    if any_t11 && (cmd.source.origin.z != 0 || cmd.dest.origin.z != 0) {
+        return br(BlitFailure::Unsupported, "t2t_t11_z");
     }
-    let sox = cmd.source_origin.x;
-    let soy = cmd.source_origin.y;
-    let soz = cmd.source_origin.z;
-    let dox = cmd.destination_origin.x;
-    let doy = cmd.destination_origin.y;
-    let doz = cmd.destination_origin.z;
+    let sox = cmd.source.origin.x;
+    let soy = cmd.source.origin.y;
+    let soz = cmd.source.origin.z;
+    let dox = cmd.dest.origin.x;
+    let doy = cmd.dest.origin.y;
+    let doz = cmd.dest.origin.z;
     if sox > src.width() as u64
         || soy > src.height() as u64
         || soz > src.depth() as u64
@@ -3050,7 +3098,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         || doy > dst.height() as u64
         || doz > dst.depth() as u64
     {
-        return br(BlitStatus::Bounds, "t2t_origin_oob");
+        return br(BlitFailure::Bounds, "t2t_origin_oob");
     }
     // One region, checked against both textures. The source and destination
     // halves are separate `kind`s so a refusal says which end was too small,
@@ -3058,60 +3106,30 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     // even come through the extent helper, which made it the quieter of two
     // quiet paths.
     let (Some(copy_w), Some(_)) = (
-        copy_extent(
-            "t2t_src",
-            "w",
-            cmd.source_size.width,
-            src.width() as u64 - sox,
-        ),
-        copy_extent(
-            "t2t_dst",
-            "w",
-            cmd.source_size.width,
-            dst.width() as u64 - dox,
-        ),
+        copy_extent("t2t_src", "w", cmd.size.width, src.width() as u64 - sox),
+        copy_extent("t2t_dst", "w", cmd.size.width, dst.width() as u64 - dox),
     ) else {
-        return br(BlitStatus::Bounds, "t2t_extent_oob");
+        return br(BlitFailure::Bounds, "t2t_extent_oob");
     };
     let (Some(copy_h), Some(_)) = (
-        copy_extent(
-            "t2t_src",
-            "h",
-            cmd.source_size.height,
-            src.height() as u64 - soy,
-        ),
-        copy_extent(
-            "t2t_dst",
-            "h",
-            cmd.source_size.height,
-            dst.height() as u64 - doy,
-        ),
+        copy_extent("t2t_src", "h", cmd.size.height, src.height() as u64 - soy),
+        copy_extent("t2t_dst", "h", cmd.size.height, dst.height() as u64 - doy),
     ) else {
-        return br(BlitStatus::Bounds, "t2t_extent_oob");
+        return br(BlitFailure::Bounds, "t2t_extent_oob");
     };
-    let copy_d = if cmd.source_size.depth == 0 {
+    let copy_d = if cmd.size.depth == 0 {
         0
     } else {
         let (Some(d), Some(_)) = (
-            copy_extent(
-                "t2t_src",
-                "d",
-                cmd.source_size.depth,
-                src.depth() as u64 - soz,
-            ),
-            copy_extent(
-                "t2t_dst",
-                "d",
-                cmd.source_size.depth,
-                dst.depth() as u64 - doz,
-            ),
+            copy_extent("t2t_src", "d", cmd.size.depth, src.depth() as u64 - soz),
+            copy_extent("t2t_dst", "d", cmd.size.depth, dst.depth() as u64 - doz),
         ) else {
-            return br(BlitStatus::Bounds, "t2t_extent_oob");
+            return br(BlitFailure::Bounds, "t2t_extent_oob");
         };
         d
     };
     if any_t11 && copy_d > 1 {
-        return br(BlitStatus::Unsupported, "t2t_t11_volume");
+        return br(BlitFailure::Unsupported, "t2t_t11_volume");
     }
     if copy_w == 0 || copy_h == 0 || copy_d == 0 {
         return BlitStatus::ZeroExtent;
@@ -3140,24 +3158,24 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     } else {
         // Each refusal below is a copy this rail could describe wrongly rather
         // than one Metal forbids, so each is named and none is a clamp.
-        if aspect != blit::BlitAspect::Full || repack_src || repack_dst {
+        if aspect != BlitAspect::Full || repack_src || repack_dst {
             // There is no depth or stencil plane inside a colour block, and a
             // repack pass rewrites texels.
-            return br(BlitStatus::Unsupported, "t2t_compressed_aspect");
+            return br(BlitFailure::Unsupported, "t2t_compressed_aspect");
         }
         if any_t11 {
-            return br(BlitStatus::Unsupported, "t2t_compressed_t11");
+            return br(BlitFailure::Unsupported, "t2t_compressed_t11");
         }
         if dst.block() != block {
             // One allocation reinterpreted at two grids is not a copy; the
             // format-mismatch check above lets a format-0 side through, and this
             // is where that pairing stops.
-            return br(BlitStatus::Unsupported, "t2t_compressed_grid_mismatch");
+            return br(BlitFailure::Unsupported, "t2t_compressed_grid_mismatch");
         }
         if copy_d > 1 || soz != 0 || doz != 0 {
             // `bytes_per_image` strides a depth plane by the *texel* height, and
             // this conversion does not reach it. A 2D copy never asks.
-            return br(BlitStatus::Unsupported, "t2t_compressed_volume");
+            return br(BlitFailure::Unsupported, "t2t_compressed_volume");
         }
         let (bw, bh) = (u64::from(block.width), u64::from(block.height));
         if !sox.is_multiple_of(bw)
@@ -3167,7 +3185,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         {
             // A block is the smallest unit this copy can move, so an origin
             // inside one names bytes it cannot address.
-            return br(BlitStatus::Unsupported, "t2t_compressed_origin_unaligned");
+            return br(BlitFailure::Unsupported, "t2t_compressed_origin_unaligned");
         }
         // An extent may end mid-block only where it reaches the level edge on
         // *both* ends — the one case a partial trailing block is the whole
@@ -3175,7 +3193,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
         let w_edge = sox + copy_w == src.width() as u64 && dox + copy_w == dst.width() as u64;
         let h_edge = soy + copy_h == src.height() as u64 && doy + copy_h == dst.height() as u64;
         if (!copy_w.is_multiple_of(bw) && !w_edge) || (!copy_h.is_multiple_of(bh) && !h_edge) {
-            return br(BlitStatus::Unsupported, "t2t_compressed_extent_unaligned");
+            return br(BlitFailure::Unsupported, "t2t_compressed_extent_unaligned");
         }
         crate::runtime::drain::note_store_route("blit_t2t_compressed");
         (
@@ -3189,7 +3207,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     };
     let row_bytes = match copy_w.checked_mul(copy_bpp as u64) {
         Some(v) => v,
-        None => return br(BlitStatus::Capacity, "t2t_row_bytes_overflow"),
+        None => return br(BlitFailure::Capacity, "t2t_row_bytes_overflow"),
     };
     // Combined DS + aspect: extract plane from src, insert into dst (RMW).
     if repack_src || repack_dst {
@@ -3262,7 +3280,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                         copy_w as u32,
                         &mut plane,
                     ) {
-                        return br(BlitStatus::Unsupported, "t2t_extract_plane");
+                        return br(BlitFailure::Unsupported, "t2t_extract_plane");
                     }
                 } else if let Err(st) = read_texture_row(
                     state,
@@ -3305,7 +3323,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                         copy_w as u32,
                         &mut dst_packed,
                     ) {
-                        return br(BlitStatus::Unsupported, "t2t_insert_plane");
+                        return br(BlitFailure::Unsupported, "t2t_insert_plane");
                     }
                     if let Err(st) = write_texture_storage_row(
                         state,
@@ -3350,27 +3368,27 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
     if let (TextureBacking::Linear(ref sl), TextureBacking::Linear(ref dl)) = (&src, &dst) {
         let src_off = match sl.texel_offset(sox, soy, soz) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "t2t_src_texel_oob"),
+            None => return br(BlitFailure::Bounds, "t2t_src_texel_oob"),
         };
         let dst_off = match dl.texel_offset(dox, doy, doz) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "t2t_dst_texel_oob"),
+            None => return br(BlitFailure::Bounds, "t2t_dst_texel_oob"),
         };
         let src_bpi = match sl.bytes_per_image() {
             Some(v) => v,
-            None => return br(BlitStatus::Capacity, "t2t_src_bpi_overflow"),
+            None => return br(BlitFailure::Capacity, "t2t_src_bpi_overflow"),
         };
         let dst_bpi = match dl.bytes_per_image() {
             Some(v) => v,
-            None => return br(BlitStatus::Capacity, "t2t_dst_bpi_overflow"),
+            None => return br(BlitFailure::Capacity, "t2t_dst_bpi_overflow"),
         };
         let src_gva = match sl.base_gva.checked_add(src_off) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "t2t_src_gva_overflow"),
+            None => return br(BlitFailure::Bounds, "t2t_src_gva_overflow"),
         };
         let dst_gva = match dl.base_gva.checked_add(dst_off) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "t2t_dst_gva_overflow"),
+            None => return br(BlitFailure::Bounds, "t2t_dst_gva_overflow"),
         };
         // Exact identity self-copy is a no-op: source and destination name the
         // same guest bytes with the same layout, so every row reads and writes
@@ -3419,14 +3437,14 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                 // or depth plane still has to read.
                 let plane_bytes = match row_bytes.checked_mul(copy_h) {
                     Some(v) => v,
-                    None => return br(BlitStatus::Capacity, "t2t_overlap_plane_overflow"),
+                    None => return br(BlitFailure::Capacity, "t2t_overlap_plane_overflow"),
                 };
                 let total_bytes = match plane_bytes.checked_mul(copy_d) {
                     Some(v) => v,
-                    None => return br(BlitStatus::Capacity, "t2t_overlap_total_overflow"),
+                    None => return br(BlitFailure::Capacity, "t2t_overlap_total_overflow"),
                 };
                 let Some(total_len) = host_alloc_len(total_bytes) else {
-                    return br(BlitStatus::Capacity, "t2t_overlap_alloc");
+                    return br(BlitFailure::Capacity, "t2t_overlap_alloc");
                 };
                 let allowed = match texture_region_window(
                     state,
@@ -3567,7 +3585,7 @@ fn exec_copy_texture_to_texture<M: HostMemory + HostOps>(
                         state,
                         host,
                         task_id,
-                        cmd.destination,
+                        cmd.dest.texture_ref,
                         s,
                         d,
                     )
@@ -3817,13 +3835,13 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    cmd: &TextureSlices,
 ) -> BlitStatus {
     if cmd.slice_count == 0 || cmd.level_count == 0 {
         return BlitStatus::ZeroExtent;
     }
-    if cmd.source == 0 || cmd.destination == 0 {
-        return br(BlitStatus::MissingResource, "sl_missing_ref");
+    if cmd.source_ref == 0 || cmd.dest_ref == 0 {
+        return br(BlitFailure::MissingResource, "sl_missing_ref");
     }
     // Before the loop, because the loop's first act is to resolve the source and
     // resolving is what pays its debt. See
@@ -3836,23 +3854,23 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
     for level_i in 0..cmd.level_count {
         let src_level = match cmd.source_level.checked_add(level_i) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_src_level_overflow"),
+            None => return br(BlitFailure::Bounds, "sl_src_level_overflow"),
         };
-        let dst_level = match cmd.destination_level.checked_add(level_i) {
+        let dst_level = match cmd.dest_level.checked_add(level_i) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_dst_level_overflow"),
+            None => return br(BlitFailure::Bounds, "sl_dst_level_overflow"),
         };
         let last_slice_delta = match cmd.slice_count.checked_sub(1) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_slice_count_underflow"),
+            None => return br(BlitFailure::Bounds, "sl_slice_count_underflow"),
         };
         let src_last_slice = match cmd.source_slice.checked_add(last_slice_delta) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_src_slice_overflow"),
+            None => return br(BlitFailure::Bounds, "sl_src_slice_overflow"),
         };
-        let dst_last_slice = match cmd.destination_slice.checked_add(last_slice_delta) {
+        let dst_last_slice = match cmd.dest_slice.checked_add(last_slice_delta) {
             Some(v) => v,
-            None => return br(BlitStatus::Bounds, "sl_dst_slice_overflow"),
+            None => return br(BlitFailure::Bounds, "sl_dst_slice_overflow"),
         };
 
         // `blit_kind_t2t_sl_us` charges this function 28.8 s of a 29.1 s rail
@@ -3871,7 +3889,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             state,
             host,
             task_id,
-            cmd.source,
+            cmd.source_ref,
             src_level,
             cmd.source_slice,
         ) {
@@ -3882,27 +3900,27 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             state,
             host,
             task_id,
-            cmd.destination,
+            cmd.dest_ref,
             dst_level,
-            cmd.destination_slice,
+            cmd.dest_slice,
         ) {
             Ok(t) => t,
             Err(st) => return st,
         };
         if src0.bpp() != dst0.bpp() {
-            return br(BlitStatus::Unsupported, "sl_bpp_mismatch");
+            return br(BlitFailure::Unsupported, "sl_bpp_mismatch");
         }
         if src0.pixel_format() != 0
             && dst0.pixel_format() != 0
             && src0.pixel_format() != dst0.pixel_format()
         {
-            return br(BlitStatus::Unsupported, "sl_format_mismatch");
+            return br(BlitFailure::Unsupported, "sl_format_mismatch");
         }
         if src0.width() != dst0.width() || src0.height() != dst0.height() {
-            return br(BlitStatus::Bounds, "sl_dim_mismatch");
+            return br(BlitFailure::Bounds, "sl_dim_mismatch");
         }
         if src0.depth() != dst0.depth() {
-            return br(BlitStatus::Bounds, "sl_depth_mismatch");
+            return br(BlitFailure::Bounds, "sl_depth_mismatch");
         }
         crate::runtime::drain::note_store_route_us(
             "sl_resolve_us",
@@ -3912,30 +3930,35 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         let h = src0.height();
         let d = src0.depth();
         if w == 0 || h == 0 || d == 0 {
-            return br(BlitStatus::Bounds, "sl_zero_geom");
+            return br(BlitFailure::Bounds, "sl_zero_geom");
         }
         let is_volume = d > 1;
         // Metal 3D whole-surface: sliceCount must be 1, slices 0; full depth of mip.
         if is_volume {
-            if cmd.slice_count != 1 || cmd.source_slice != 0 || cmd.destination_slice != 0 {
-                return br(BlitStatus::Unsupported, "sl_volume_slice_constraint");
+            if cmd.slice_count != 1 || cmd.source_slice != 0 || cmd.dest_slice != 0 {
+                return br(BlitFailure::Unsupported, "sl_volume_slice_constraint");
             }
             // Mapper-ref-texture is 2D (depth 1); volume endpoints are linear only.
             if src0.is_mapper_ref_texture() || dst0.is_mapper_ref_texture() {
-                return br(BlitStatus::Unsupported, "sl_volume_t11");
+                return br(BlitFailure::Unsupported, "sl_volume_t11");
             }
         } else if cmd.slice_count > 1 {
             // Array form: last slice must resolve (view / packing bounds).
-            if let Err(st) =
-                resolve_texture_backing(state, host, task_id, cmd.source, src_level, src_last_slice)
-            {
+            if let Err(st) = resolve_texture_backing(
+                state,
+                host,
+                task_id,
+                cmd.source_ref,
+                src_level,
+                src_last_slice,
+            ) {
                 return st;
             }
             if let Err(st) = resolve_texture_backing(
                 state,
                 host,
                 task_id,
-                cmd.destination,
+                cmd.dest_ref,
                 dst_level,
                 dst_last_slice,
             ) {
@@ -3948,45 +3971,45 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         // must agree for the same reason the `bpp`s must.
         let block = src0.block();
         if dst0.block() != block {
-            return br(BlitStatus::Unsupported, "sl_compressed_grid_mismatch");
+            return br(BlitFailure::Unsupported, "sl_compressed_grid_mismatch");
         }
         let rows = u64::from(block.block_rows(h));
         let row_bytes = match u64::from(block.blocks_across(w)).checked_mul(bpp as u64) {
             Some(v) => v,
-            None => return br(BlitStatus::Capacity, "sl_row_bytes_overflow"),
+            None => return br(BlitFailure::Capacity, "sl_row_bytes_overflow"),
         };
 
         // Linear: multi-slice (depth-1) or full volume (depth>1).
         if let (TextureBacking::Linear(ref sl), TextureBacking::Linear(ref dl)) = (&src0, &dst0) {
             if !is_volume && cmd.slice_count > 1 && (sl.slice_stride == 0 || dl.slice_stride == 0) {
-                return br(BlitStatus::Unsupported, "sl_slice_stride_zero");
+                return br(BlitFailure::Unsupported, "sl_slice_stride_zero");
             }
             let src_off = match sl.texel_offset(0, 0, 0) {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "sl_src_texel_oob"),
+                None => return br(BlitFailure::Bounds, "sl_src_texel_oob"),
             };
             let dst_off = match dl.texel_offset(0, 0, 0) {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "sl_dst_texel_oob"),
+                None => return br(BlitFailure::Bounds, "sl_dst_texel_oob"),
             };
             let src_gva = match sl.base_gva.checked_add(src_off) {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "sl_src_gva_overflow"),
+                None => return br(BlitFailure::Bounds, "sl_src_gva_overflow"),
             };
             let dst_gva = match dl.base_gva.checked_add(dst_off) {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "sl_dst_gva_overflow"),
+                None => return br(BlitFailure::Bounds, "sl_dst_gva_overflow"),
             };
             // Volume: image_count = depth, stride = bytes_per_image (z planes).
             // Array: image_count = slice_count, stride = slice_stride when multi.
             let (src_img_stride, dst_img_stride, image_count) = if is_volume {
                 let src_bpi = match sl.bytes_per_image() {
                     Some(v) if v > 0 => v,
-                    _ => return br(BlitStatus::Bounds, "sl_src_bpi_zero"),
+                    _ => return br(BlitFailure::Bounds, "sl_src_bpi_zero"),
                 };
                 let dst_bpi = match dl.bytes_per_image() {
                     Some(v) if v > 0 => v,
-                    _ => return br(BlitStatus::Bounds, "sl_dst_bpi_zero"),
+                    _ => return br(BlitFailure::Bounds, "sl_dst_bpi_zero"),
                 };
                 (src_bpi, dst_bpi, d as u64)
             } else if cmd.slice_count <= 1 {
@@ -4010,7 +4033,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
             if sl.base_gva == dl.base_gva {
                 let span = row_bytes.saturating_mul(rows).saturating_mul(image_count);
                 if ranges_overlap(src_off, span, dst_off, span) {
-                    return br(BlitStatus::Overlap, "sl_overlap");
+                    return br(BlitFailure::Overlap, "sl_overlap");
                 }
             }
             if let Err(st) = copy_row_region(
@@ -4035,7 +4058,7 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         // Mapper-ref-texture / mixed: depth-1 only (mapper-ref-texture is 2D); per-slice
         // whole-surface.
         if is_volume {
-            return br(BlitStatus::Unsupported, "sl_volume_mixed");
+            return br(BlitFailure::Unsupported, "sl_volume_mixed");
         }
         // The slice/level form's mapper-ref-texture arm. It used to stage one row at a
         // time, and a driven Maps leg charged that loop 30.15 s of a 30.28 s
@@ -4048,25 +4071,30 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
         for si in 0..cmd.slice_count {
             let ss = match cmd.source_slice.checked_add(si) {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "sl_inner_src_slice_overflow"),
+                None => return br(BlitFailure::Bounds, "sl_inner_src_slice_overflow"),
             };
-            let ds = match cmd.destination_slice.checked_add(si) {
+            let ds = match cmd.dest_slice.checked_add(si) {
                 Some(v) => v,
-                None => return br(BlitStatus::Bounds, "sl_inner_dst_slice_overflow"),
+                None => return br(BlitFailure::Bounds, "sl_inner_dst_slice_overflow"),
             };
-            let src = match resolve_texture_backing(state, host, task_id, cmd.source, src_level, ss)
-            {
+            let src = match resolve_texture_backing(
+                state,
+                host,
+                task_id,
+                cmd.source_ref,
+                src_level,
+                ss,
+            ) {
                 Ok(t) => t,
                 Err(st) => return st,
             };
             let dst =
-                match resolve_texture_backing(state, host, task_id, cmd.destination, dst_level, ds)
-                {
+                match resolve_texture_backing(state, host, task_id, cmd.dest_ref, dst_level, ds) {
                     Ok(t) => t,
                     Err(st) => return st,
                 };
             if src.width() != w || src.height() != h || dst.width() != w || dst.height() != h {
-                return br(BlitStatus::Bounds, "sl_inner_dim_mismatch");
+                return br(BlitFailure::Bounds, "sl_inner_dim_mismatch");
             }
             let allowed = match texture_region_window(
                 state,
@@ -4119,21 +4147,26 @@ fn exec_copy_texture_to_texture_slice_level<M: HostMemory + HostOps>(
 /// Execute blit fence update (`0x13c`) or wait (`0x13d`) on the blit-fence domain.
 ///
 /// See [`fence_exec::execute_fence`].
-pub fn execute_blit_fence(state: &mut DeviceState, task_id: u32, cmd: &Command) -> BlitStatus {
-    clear_blit_fail_reason();
-    if cmd.kind != Kind::Fence {
-        return br(BlitStatus::Unsupported, "fence_wrong_kind");
-    }
-    let action = match cmd.opcode {
-        wire_blit::OPCODE_UPDATE_FENCE => FenceAction::Update,
-        wire_blit::OPCODE_WAIT_FOR_FENCE => FenceAction::Wait,
-        _ => return br(BlitStatus::Unsupported, "fence_bad_opcode"),
+pub fn execute_blit_fence(
+    state: &mut DeviceState,
+    task_id: u32,
+    record: &reims_vgpu_protocol::decode::sync::FenceRecord,
+) -> BlitStatus {
+    use reims_vgpu_protocol::sync::FenceKind;
+    // Which side of the fence this is comes off the record, and the record only
+    // exists for the two opcodes that are fences. Both refusals this function
+    // used to have — "the caller handed me a non-fence" and "the opcode is not
+    // one of the two" — were about a `Command` that could carry any kind with
+    // any opcode, and neither is expressible now.
+    let action = match record.kind {
+        FenceKind::Update => FenceAction::Update,
+        FenceKind::Wait => FenceAction::Wait,
     };
     blit_status_from_fence(fence_exec::execute_fence(
         state,
         task_id,
         FenceDomain::BlitFence,
-        cmd.fence,
+        record.fence_ref,
         action,
     ))
 }
@@ -4150,14 +4183,14 @@ pub(crate) fn blit_status_from_fence(status: FenceStatus) -> BlitStatus {
     match status {
         FenceStatus::Ok => BlitStatus::Ok,
         FenceStatus::Pending => BlitStatus::FencePending,
-        FenceStatus::Missing => br(BlitStatus::MissingResource, "fence_missing"),
-        FenceStatus::Unsupported(why) => br(BlitStatus::Unsupported, why),
+        FenceStatus::Missing => br(BlitFailure::MissingResource, "fence_missing"),
+        FenceStatus::Unsupported(why) => br(BlitFailure::Unsupported, why),
     }
 }
 
 /// Execute a decoded blit command on the product path.
 ///
-/// Returns [`BlitStatus::Unsupported`] for resource/image/mipmap opcodes
+/// Returns [`BlitFailure::Unsupported`] for resource/image/mipmap opcodes
 /// that other modules own or that are protocol no-ops (caller should not count
 /// those as copy/fill failures). Fences use [`execute_blit_fence`].
 ///
@@ -4170,11 +4203,8 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &Command,
+    record: &BlitRecord,
 ) -> BlitStatus {
-    // Fresh reason channel per command: an uninstrumented failure reports empty
-    // rather than a stale slug left by a prior blit (see `br` / `blit_fail_reason`).
-    clear_blit_fail_reason();
     // One clock over the whole dispatch, attributed by the arm that ran.
     //
     // The per-loop clocks added alongside this are the ones that say *why* an
@@ -4185,52 +4215,45 @@ pub fn execute_blit<M: HostMemory + HostOps>(
     // `blit_kind_*_us` cannot be less than the rail's cost the way a hand-placed
     // set can. A family that turns out to hold the wall clock and has no inner
     // clock yet is then a known gap rather than an invisible one.
+    //
+    // The route and the arm both come from the record's own shape, so a record
+    // charged to one family and executed by another is no longer expressible —
+    // it used to be two independent reads of a `kind` tag and a `copy_kind` tag
+    // that a decoder set separately.
     let kind_started = std::time::Instant::now();
-    let kind_route = match cmd.kind {
-        Kind::FillBuffer => "blit_kind_fill_us",
-        Kind::FillBufferPattern4 => "blit_kind_fill4_us",
-        Kind::Copy => match cmd.copy_kind {
-            CopyKind::BufferToBuffer => "blit_kind_b2b_us",
-            CopyKind::BufferToTexture => "blit_kind_b2t_us",
-            CopyKind::TextureToBuffer => "blit_kind_t2b_us",
-            CopyKind::TextureToTexture => "blit_kind_t2t_us",
-            CopyKind::TextureToTextureSliceLevel => "blit_kind_t2t_sl_us",
-            CopyKind::None => "blit_kind_none_us",
-        },
-        Kind::Fence => "blit_kind_fence_us",
-        _ => "blit_kind_other_us",
+    let kind_route = match record.kind() {
+        WireBlitKind::FillBuffer => "blit_kind_fill_us",
+        WireBlitKind::FillBufferPattern4 => "blit_kind_fill4_us",
+        WireBlitKind::BufferToBuffer => "blit_kind_b2b_us",
+        WireBlitKind::BufferToTexture => "blit_kind_b2t_us",
+        WireBlitKind::TextureToBuffer => "blit_kind_t2b_us",
+        WireBlitKind::TextureRegion | WireBlitKind::TextureRegionOptions => "blit_kind_t2t_us",
+        WireBlitKind::TextureSlices => "blit_kind_t2t_sl_us",
+        WireBlitKind::GenerateMipmaps => "blit_kind_mipmap_us",
     };
-    let status = match cmd.kind {
-        Kind::FillBuffer => exec_fill_buffer(state, host, task_id, cmd),
-        Kind::FillBufferPattern4 => exec_fill_buffer_pattern4(state, host, task_id, cmd),
-        Kind::Copy => match cmd.copy_kind {
-            CopyKind::BufferToBuffer => exec_copy_buffer_to_buffer(state, host, task_id, cmd),
-            CopyKind::BufferToTexture => exec_copy_buffer_to_texture(state, host, task_id, cmd),
-            CopyKind::TextureToBuffer => exec_copy_texture_to_buffer(state, host, task_id, cmd),
-            CopyKind::TextureToTexture => exec_copy_texture_to_texture(state, host, task_id, cmd),
-            CopyKind::TextureToTextureSliceLevel => {
-                exec_copy_texture_to_texture_slice_level(state, host, task_id, cmd)
+    let status = match record {
+        BlitRecord::FillBuffer(fill) => match fill.pattern {
+            // Which fill this is decides which write path runs *and* which of
+            // the two refusal families the arm reports under, so the pattern is
+            // matched once here and each arm receives only the width it writes.
+            FillPattern::Byte(value) => exec_fill_buffer(state, host, task_id, fill, value),
+            FillPattern::Pattern4(word) => {
+                exec_fill_buffer_pattern4(state, host, task_id, fill, word)
             }
-            CopyKind::None => br(BlitStatus::Unsupported, "copy_kind_none"),
         },
-        Kind::Fence => execute_blit_fence(state, task_id, cmd),
-        Kind::Resource | Kind::Image | Kind::Unknown => {
-            br(BlitStatus::Unsupported, "blit_kind_unsupported")
+        BlitRecord::BufferToBuffer(r) => exec_copy_buffer_to_buffer(state, host, task_id, r),
+        BlitRecord::BufferToTexture(r) => exec_copy_buffer_to_texture(state, host, task_id, r),
+        BlitRecord::TextureToBuffer(r) => exec_copy_texture_to_buffer(state, host, task_id, r),
+        BlitRecord::TextureRegion(r) => exec_copy_texture_to_texture(state, host, task_id, r),
+        BlitRecord::TextureSlices(r) => {
+            exec_copy_texture_to_texture_slice_level(state, host, task_id, r)
         }
-        // The three indirect-command-buffer records never reach here:
-        // `handle_blit_record` answers them itself, counting the two that are
-        // lost work and treating the optimize hint as the no-op it is. A
-        // sighting means the dispatch there stopped routing them, so it gets a
-        // reason of its own rather than joining the unsupported kinds above.
-        Kind::IcbRange | Kind::IcbCopy => br(BlitStatus::Unsupported, "blit_kind_icb_misrouted"),
-        // The two `BlitEncoderSPI` records this device decodes and does not
-        // apply. Like the ICB pair above they are answered by
-        // `handle_blit_record`, which counts the texture fill as lost work and
-        // the compressed-texture invalidate as the no-op it is — so reaching
-        // here means that dispatch stopped routing them, which is a different
-        // defect from a kind nobody implemented and gets its own reason.
-        Kind::FillTexture | Kind::InvalidateCompressedTexture => {
-            br(BlitStatus::Unsupported, "blit_kind_spi_misrouted")
+        // `generateMipmapsForTexture:` is a transfer record by opcode and a
+        // filter chain by execution, and it has an owner of its own —
+        // `runtime::mipmap`, which the caller reaches directly. A record
+        // arriving here means that dispatch stopped routing it.
+        BlitRecord::GenerateMipmaps(GenerateMipmaps { .. }) => {
+            br(BlitFailure::Unsupported, "blit_kind_mipmap_misrouted")
         }
     };
     crate::runtime::drain::note_store_route_us(

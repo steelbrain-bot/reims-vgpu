@@ -446,7 +446,7 @@ fn a_child_doorbell_never_queues_behind_the_render_worker() {
         "the fold must turn the ring into pending work"
     );
     assert_ne!(
-        inner.device.state.active_child_mask & (1 << 4),
+        inner.device.state.pending.child_mask & (1 << 4),
         0,
         "and into an active channel, or the stranded-FIFO rescue cannot see it"
     );

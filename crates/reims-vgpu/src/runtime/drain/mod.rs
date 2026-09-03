@@ -8,7 +8,6 @@ use crate::model::*;
 use crate::model::{DeviceState, ExecFault, FailEvent, PacketFault, UnimplementedCommand};
 use crate::observe::Emit;
 use crate::protocol::endian::{ld16, ld32, st16, st32};
-use crate::protocol::fifo::{decode_device_info, DeviceInfoForm};
 use crate::protocol::fifo::{
     display_refresh_hz_1616, display_timing_entry_offset, encode_display_timing_entry,
     DisplayTimingEntry, DISPLAY_DESC_TIMING_STRIDE,
@@ -26,6 +25,8 @@ use crate::runtime::gpa_map;
 use crate::runtime::heap_query::QueryError;
 use crate::runtime::host::{HostAction, HostMemory, HostOps, MemError};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use reims_vgpu_core::control::{self, ControlKind};
+use reims_vgpu_core::query::{self, QueryKind, RequestWords};
 
 pub(crate) mod census;
 pub use census::*;
@@ -70,6 +71,12 @@ pub const MAX_UNPAINTED_PRESENTS: u32 = 2;
 /// mask: it is the shared convention, and naming it after the first user is how
 /// the second one ends up spelling `1` by hand.
 const ROOT_FIFO_BIT: u32 = 1;
+/// The completion slot every root packet's word is written to.
+///
+/// Not read from a register: the root FIFO has no stamp-index register of its
+/// own and this device has always written slot 0 for it. Named so the model's
+/// packets carry the same number this device writes.
+const ROOT_STAMP_SLOT: u32 = 0;
 
 fn note_translation_order_hold(state: &mut DeviceState, held_mask: u32) {
     let new_mask = held_mask & !state.translation_order_hold_mask;
@@ -267,10 +274,30 @@ fn delete_object_kind_route(opcode: u32) -> &'static str {
 /// call could ever have had is destroying an unrelated object that happened to
 /// share the integer.
 ///
-/// Other kinds remain fail-visible until this device owns a corresponding
-/// per-kind object registry. Their counters say which contract gap is active.
-fn apply_delete_object(
+/// The fence kind is no longer among them. It is the one kind this device holds
+/// state for by `(task, ref)` rather than by content, and the same question this
+/// doc records answering *no* for the object table was asked of it and answered
+/// **yes**: a driven boot's two fence deletes both named a ref this device held
+/// a render-domain generation under, with `delete_fence_ref_absent=0`. So the
+/// spaces coincide there, and the delete retires the generations.
+///
+/// The kinds left are the ones this device retains nothing by ref for —
+/// functions and compute pipeline states are cached by *content*, so a ref-keyed
+/// retirement has nothing to find. A driven boot sends 5 and 3 of them, and
+/// [`note_delete_object_ref_space`] then asked the only question that could put
+/// a retirement back on the table: **all 8 named no object-list entry at all**,
+/// `delete_object_ref_type_agrees` and `_differs` both silent. So those refs are
+/// in a space this device holds nothing keyed by, and there is nothing to find
+/// in either direction.
+///
+/// They stay fail-visible even so. "There is nothing to retire" is a claim about
+/// this device's caches and not about the guest's object, and a counter that
+/// went quiet would stop saying which contract gap is still open — and the gap
+/// that is still open is now exactly the five kinds a driven guest has never
+/// sent: buffer, texture, heap, rasterization rate map, indirect command buffer.
+fn apply_delete_object<H: HostMemory + HostOps>(
     state: &mut DeviceState,
+    host: &mut H,
     channel_id: u32,
     command: &crate::protocol::fifo::DeleteObjectCommand<'_>,
     packet: &Packet,
@@ -314,6 +341,27 @@ fn apply_delete_object(
     };
     let object_ref = rec.object_ref.get();
     note_store_route(delete_object_kind_route(op.opcode()));
+    // The ordering group's question, asked of the kinds this device *does*
+    // retire. The untracked kinds were asked it at the bottom of this function
+    // and answered "no list entry at all", which settled that a retirement
+    // cannot be keyed there. The retained kinds decide something larger: if a
+    // sampler-state destroy's ref is an object-list name, the semantic model
+    // can express this command as an operation on a resource it already knows,
+    // and if it is not, the serializer's per-kind spaces are a namespace the
+    // model does not have and this opcode cannot cross the bridge as one.
+    //
+    // Asked before the retirement acts, so the reading is about the ref the
+    // guest sent and not about what dropping it did.
+    let ref_space = is_retained_kind(op.opcode()).then(|| {
+        note_delete_object_ref_space(
+            state,
+            host,
+            task_id,
+            object_ref,
+            op.opcode(),
+            RefSpacePopulation::Retained,
+        )
+    });
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE {
         let retired = state.task_sampler_states.delete(task_id, object_ref);
         note_store_route(if retired {
@@ -330,6 +378,28 @@ fn apply_delete_object(
     // `..._delete_absent` about a table that rail never fills — and on a
     // Metal-only build fell through to `note_unimplemented` instead. One rail,
     // two builds, two different answers about the same guest command.
+    // The one kind this device holds state for by `(task, ref)` rather than by
+    // content, and the one whose stale entry is a wrong answer rather than a
+    // leak: a wait is satisfied when the stored generation is at or past its
+    // target, so a generation that outlives its fence makes the next fence to
+    // get that ref start life already signalled.
+    //
+    // Acted on because it was counted first. A driven boot sent two fence
+    // deletes and both named a ref this device held a render-domain generation
+    // under, `delete_fence_ref_absent=0` — so the serializer's fence ref space
+    // and a fence record's are one, which is *not* what the same question
+    // answered for the object table above. The census stays as the denominator:
+    // `_absent` climbing is the reading that would put this arm back in doubt.
+    if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_FENCE {
+        let cleared = state.retire_fence(task_id, object_ref);
+        if cleared.is_empty() {
+            note_store_route("delete_fence_ref_absent");
+        } else {
+            note_store_route("delete_fence_ref_live");
+            note_store_route_n("delete_fence_ref_live_domains", cleared.len() as u64);
+        }
+        return;
+    }
     let retained = match op.opcode() {
         reims_vgpu_wire::ops::destroy::OPCODE_DELETE_DEPTH_STENCIL_STATE => {
             Some(RetainedObject::DepthStencilState)
@@ -340,17 +410,296 @@ fn apply_delete_object(
         _ => None,
     };
     if let Some(object) = retained {
+        // The ordering plane's half, for the kind it holds a lifetime for. A
+        // render pipeline is declared into `SessionModel::pipelines` when the
+        // guest creates it, and this is the guest saying it is over — without
+        // it the table only grows, and a transaction parked on a compilation
+        // the guest has just cancelled would wait for a step that never comes.
+        if object == RetainedObject::RenderPipelineState {
+            // **Only when the slot the ref names still holds a render pipeline.**
+            // The census two blocks up asks exactly this and it is not
+            // rhetorical: a driven macos-26 boot answered `TypeDiffers` for 34
+            // of the 36 destroys that reached this line. A destroy whose ref
+            // resolves to an object of another kind is a ref in the
+            // serializer's own per-kind space — the census's own conclusion —
+            // and `name_resource` then hands back the name of whatever
+            // *shares the integer*, which this retires.
+            //
+            // A pipeline table entry is a tombstone once retired: `declare`
+            // refuses an id it already holds and `peek` answers
+            // `AbsentBecause::Retired` forever, so one wrong retirement refuses
+            // every later packet that binds the real pipeline. That is what it
+            // cost — **914 exec packets refused `pipeline_absent_retired` on
+            // macos-26 against zero on macos-15**, which is the boot where the
+            // guest deletes four.
+            //
+            // `NoListEntry` retires too, and deliberately: the guest clears its
+            // own object-list slot before sending the destroy, so an absent
+            // entry is the ordinary case and `name_resource` answers it from
+            // the name the slot already had. It is only a *disagreeing* entry
+            // that says the integer belongs to something else.
+            if ref_space == Some(RefSpaceAnswer::TypeDiffers) {
+                note_store_route("pipeline_retire_declined_other_ref_space");
+            } else if let Some(name) =
+                crate::runtime::objects::name_resource(state, host, task_id, object_ref)
+            {
+                let ended = state.retire_pipeline(name);
+                note_store_route_n("pipeline_retire_released", ended.stranded.len() as u64);
+                // Whether the table had an entry to retire, which is not the
+                // same question as whether the guest sent a delete. A driven
+                // `macos-26` boot sent 170 and the table took 116: the other 54
+                // named render pipelines this device never drew with, so they
+                // were never declared. That is ordinary, and naming it is what
+                // makes the day it stops being ordinary visible — the two
+                // numbers were otherwise separated by a subtraction of the
+                // `pipeline_table` occupancy line from this counter.
+                note_store_route(if ended.took {
+                    "pipeline_retired"
+                } else {
+                    "pipeline_retire_absent"
+                });
+            } else {
+                note_store_route("pipeline_retire_unnamed");
+            }
+        }
         let outcome =
             crate::backend::selected().retire_task_object(state, task_id, object, object_ref);
         note_store_route(object.route(outcome));
         return;
     }
+    // The kinds this device retains nothing by ref for. Before reporting, ask
+    // the one question that decides whether a retirement could ever belong here:
+    // **does this ref name a live entry in the guest's own object list, and is
+    // that entry's type the one this destroy opcode names?**
+    //
+    // The integer resolving proves little on its own — the object table's boot
+    // above found 22 sampler-delete refs live under a *different* task, which is
+    // a collision and not an identity. The *type* agreeing is the evidence: a
+    // function destroy whose ref names an `OBJECT_TYPE_FUNCTION` entry in the
+    // same task is one ref space, and one naming a serializer object or nothing
+    // is not.
+    //
+    // Only eight packets a boot reach here, so the list read costs nothing that
+    // matters, and it is the difference between "we do not know" and a number.
+    note_delete_object_ref_space(
+        state,
+        host,
+        task_id,
+        object_ref,
+        op.opcode(),
+        RefSpacePopulation::Untracked,
+    );
     note_unimplemented(
         state,
         channel_id,
         UnimplementedCommand::DeleteObject,
         packet,
     );
+}
+
+/// The destroy kinds this device holds `(task, ref)`-keyed state for.
+///
+/// One list, asked by the census above and matched arm by arm below it. Two
+/// spellings of "which kinds are retained" would let a kind join the handler
+/// without joining the reading, and the reading is the denominator.
+const fn is_retained_kind(opcode: u32) -> bool {
+    use reims_vgpu_wire::ops::destroy as d;
+    matches!(
+        opcode,
+        d::OPCODE_DELETE_SAMPLER_STATE
+            | d::OPCODE_DELETE_FENCE
+            | d::OPCODE_DELETE_DEPTH_STENCIL_STATE
+            | d::OPCODE_DELETE_RENDER_PIPELINE_STATE
+    )
+}
+
+/// Which population of destroys a ref-space reading belongs to.
+///
+/// Two populations and two sets of routes, because they are two different
+/// questions with two different consequences and one bucket could answer
+/// neither. The **untracked** kinds ask whether a retirement could ever be
+/// keyed on the object list, and eight packets a boot reach it. The
+/// **retained** kinds ask something the ordering group needs instead: this
+/// device already drops a task-local registry entry for them, and whether that
+/// ref is an object-list name decides whether the semantic model can express
+/// the retirement as an operation on a resource it knows — or whether the
+/// serializer's per-kind spaces are a namespace the model does not have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefSpacePopulation {
+    /// The kinds this device retains nothing by ref for.
+    Untracked,
+    /// The kinds this device retires a `(task, ref)`-keyed registry entry for.
+    Retained,
+}
+
+/// The census route for a destroy whose kind the semantic model cannot name.
+///
+/// A table rather than a format string, for [`RefSpacePopulation::route`]'s
+/// reason: a reader greps these, and a `format!` route is one no grep finds
+/// before it has already been read.
+fn unnamed_kind_route(opcode: u32) -> &'static str {
+    use reims_vgpu_protocol::destroy::DestroyKind as K;
+    match K::of(opcode) {
+        Some(K::Buffer) => "delete_unnamed_buffer",
+        Some(K::Texture) => "delete_unnamed_texture",
+        Some(K::DepthStencilState) => "delete_unnamed_depth_stencil_state",
+        Some(K::SamplerState) => "delete_unnamed_sampler_state",
+        Some(K::Function) => "delete_unnamed_function",
+        Some(K::ComputePipelineState) => "delete_unnamed_compute_pipeline_state",
+        Some(K::RenderPipelineState) => "delete_unnamed_render_pipeline_state",
+        Some(K::Fence) => "delete_unnamed_fence",
+        Some(K::Heap) => "delete_unnamed_heap",
+        Some(K::RasterizationRateMap) => "delete_unnamed_rasterization_rate_map",
+        Some(K::IndirectCommandBuffer) => "delete_unnamed_indirect_command_buffer",
+        // The opcode is not a destroy at all, which this function's caller
+        // cannot produce — it is reached from the destroy arm alone. Counted
+        // rather than asserted, because a census that panics is one nobody
+        // leaves switched on.
+        None => "delete_unnamed_not_a_destroy",
+    }
+}
+
+/// What the guest's object list held at a destroy record's ref.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefSpaceAnswer {
+    /// Nothing at all — no collision and no identity.
+    NoListEntry,
+    /// An entry whose type is the one this destroy opcode names. The evidence
+    /// that the two spaces are one.
+    TypeAgrees,
+    /// An entry of some other type. A collision, which is what a resolving
+    /// integer is until the type agrees.
+    TypeDiffers,
+}
+
+impl RefSpacePopulation {
+    /// The census route for one population's answer.
+    ///
+    /// A table rather than a format string: six counters a reader greps, and
+    /// the pair that separates "one namespace" from "an integer collision" is
+    /// only readable if all six spellings are written in one place.
+    const fn route(self, answer: RefSpaceAnswer) -> &'static str {
+        match (self, answer) {
+            (Self::Untracked, RefSpaceAnswer::NoListEntry) => "delete_object_ref_no_list_entry",
+            (Self::Untracked, RefSpaceAnswer::TypeAgrees) => "delete_object_ref_type_agrees",
+            (Self::Untracked, RefSpaceAnswer::TypeDiffers) => "delete_object_ref_type_differs",
+            (Self::Retained, RefSpaceAnswer::NoListEntry) => {
+                "delete_object_retained_ref_no_list_entry"
+            }
+            (Self::Retained, RefSpaceAnswer::TypeAgrees) => {
+                "delete_object_retained_ref_type_agrees"
+            }
+            (Self::Retained, RefSpaceAnswer::TypeDiffers) => {
+                "delete_object_retained_ref_type_differs"
+            }
+        }
+    }
+
+    /// The census route for whether the semantic model can name this reference.
+    ///
+    /// Separate from [`Self::route`] because the two answer different
+    /// questions and a boot needs both: the list entry says whether the *guest*
+    /// still holds the object, and this says whether the *model* still holds
+    /// its name. A destroy that arrives after the guest has cleared its slot is
+    /// the ordinary case, and it is only a problem if the model has no name for
+    /// it either — that is the packet the bridge would have to refuse.
+    const fn named_route(self, named: bool) -> &'static str {
+        match (self, named) {
+            (Self::Untracked, true) => "delete_object_ref_model_named",
+            (Self::Untracked, false) => "delete_object_ref_model_unnamed",
+            (Self::Retained, true) => "delete_object_retained_ref_model_named",
+            (Self::Retained, false) => "delete_object_retained_ref_model_unnamed",
+        }
+    }
+}
+
+/// What a destroy record's ref names in the guest's own object list.
+///
+/// The type a kind expects is the wire's, not a guess: a function is its own
+/// object type and every other retained kind — sampler, depth-stencil, both
+/// pipeline states, fence, heap, indirect command buffer, rasterization rate
+/// map — is a `SERIALIZER_OBJECT`, which is the tag the object list carries for
+/// all of them.
+fn note_delete_object_ref_space<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    object_ref: u32,
+    opcode: u32,
+    retained: RefSpacePopulation,
+) -> RefSpaceAnswer {
+    use crate::runtime::decode::resource::{
+        OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_SERIALIZER_OBJECT,
+        OBJECT_TYPE_TEXTURE,
+    };
+    use reims_vgpu_wire::ops::destroy as d;
+    let expected = match opcode {
+        d::OPCODE_DELETE_BUFFER => OBJECT_TYPE_BUFFER,
+        d::OPCODE_DELETE_TEXTURE => OBJECT_TYPE_TEXTURE,
+        d::OPCODE_DELETE_FUNCTION => OBJECT_TYPE_FUNCTION,
+        _ => OBJECT_TYPE_SERIALIZER_OBJECT,
+    };
+    // Whether the *model* can name this reference, which is a different
+    // question from whether the guest's list still holds an entry for it and is
+    // the one that decides whether this command can cross the bridge.
+    //
+    // `objects::name_resource` — which is what the production `RefResolver`
+    // answers with — consults `DeviceState::object_name` **before** the guest's
+    // list, so a reference the model has already named still resolves after the
+    // guest has cleared its slot. Asked read-only here: `name_resource` would
+    // declare, and a census that declared would be answering a question it had
+    // just changed.
+    let named = state.object_name(task_id, object_ref).is_some();
+    note_store_route(retained.named_route(named));
+    if !named {
+        // *Which* kinds the model has no name for, which the two counters above
+        // do not say. Closing this population means naming each kind where it
+        // is *constructed* — a different site per kind, and a fix aimed at the
+        // wrong one buys nothing.
+        note_store_route(unnamed_kind_route(opcode));
+    }
+    let entry = crate::runtime::objects::lookup_list_entry(state, host, task_id, object_ref);
+    if !named {
+        // **Having no name yet is not the same as being unresolvable, and the
+        // difference is the whole refusal population.** `objects::name_resource`
+        // — which is what the production `RefResolver` answers with — falls
+        // through to the guest's list when the model has no name, so a ref whose
+        // entry is still live gets a name taken from it *at that moment* and the
+        // packet crosses. Only a ref with neither is one the bridge refuses with
+        // `ResolveRefusal::UnknownRef`.
+        //
+        // The census cannot ask `name_resource` itself: naming declares, and a
+        // census that declared would be answering a question it had just
+        // changed. Asking the list read-only is the same first step and is what
+        // separates the two.
+        note_store_route(if entry.is_some() {
+            "delete_unnamed_but_list_still_has_it"
+        } else {
+            "delete_unnamed_and_unresolvable"
+        });
+    }
+    let Some(entry) = entry else {
+        note_store_route(retained.route(RefSpaceAnswer::NoListEntry));
+        return RefSpaceAnswer::NoListEntry;
+    };
+    let answer = if entry.object_type == expected {
+        RefSpaceAnswer::TypeAgrees
+    } else {
+        RefSpaceAnswer::TypeDiffers
+    };
+    let route = retained.route(answer);
+    note_store_route(route);
+    if crate::observe::first_sight(route, (u64::from(opcode) << 32) | u64::from(object_ref)) {
+        crate::observe::fail(format!(
+            "{route} kind={} task={task_id} ref={object_ref} found_type={} expected_type={} \
+             (whether this destroy record's ref is a number in the guest's object-list space \
+             is what decides whether a retirement could ever be keyed on it)",
+            delete_object_kind_route(opcode),
+            entry.object_type,
+            expected
+        ));
+    }
+    answer
 }
 
 /// Which FIFO a packet arrived on, for a log line.
@@ -497,6 +846,82 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
 /// Emitted on the `OFF` channel and deduped per `(task, pfn, count)`: this is a
 /// lifecycle packet the guest re-sends, and the reading wanted is which distinct
 /// triples a boot produces, not how often.
+/// Build the model's operation for a lifetime packet, in this device's own
+/// namespaces.
+///
+/// **One join, not one per arm.** `reims_vgpu_core::lifecycle::operation` is the
+/// single place a kind picks which of the five record layouts its payload is,
+/// and it is exhaustive over the twelve kinds — so an arm that decoded its own
+/// record and built its own operation would be the second copy of that choice,
+/// and the copy that reads one command's offsets out of another's payload.
+///
+/// Both resolvers are this device's, and they are different namespaces: an
+/// object-list ref and a mapping id arrive as `u32`s that overlap numerically
+/// and name unrelated things. `crate::runtime::objects::TaskNames` answers the
+/// first, `DeviceState` the second.
+///
+/// `None` where the packet's bytes are not the command its opcode names, or a
+/// ref names nothing live — both reported here, because an arm that acted on a
+/// packet the model could not read is an arm the model has no record of.
+fn lifetime_operation<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    channel: reims_vgpu_protocol::packets::Channel,
+    opcode: u16,
+    payload: &[u8],
+) -> Option<reims_vgpu_core::lifecycle::LifecycleOp> {
+    let kind = reims_vgpu_core::lifecycle::LifecycleKind::of(channel, opcode)?;
+    let names = crate::runtime::objects::TaskNames::new(state, host);
+    match reims_vgpu_core::lifecycle::operation(kind, payload, &names, state) {
+        Ok(op) => Some(op),
+        Err(refusal) => {
+            note_store_route(refusal.slug());
+            if crate::observe::first_sight(
+                "lifetime_operation_unresolved",
+                (u64::from(opcode) << 32) | u64::from(kind as u16),
+            ) {
+                crate::observe::fail(format!(
+                    "lifetime_operation_unresolved kind={} op={opcode:#x} refusal={} (the \
+                     semantic model cannot read this packet as the command its opcode names, \
+                     so it has no record of what this device is about to do)",
+                    kind.name(),
+                    refusal.slug()
+                ));
+            }
+            None
+        }
+    }
+}
+
+/// Report anything a lifetime command obliged that its arm does not act on.
+///
+/// **Not a discard.** Each caller has already taken the obligations its command
+/// can produce; what reaches here is what the command's own contract says it
+/// cannot produce, and a non-empty one means the model has started saying
+/// something the device is not listening to. That is a line on the always-on
+/// channel, not a silence — the failure it prevents is exactly the one
+/// `Effects`' `#[must_use]` exists for, one step further out.
+fn note_inert_lifetime_effects(site: &'static str, acted: &crate::model::Acted) {
+    let counts = [
+        ("teardowns", acted.teardowns.len()),
+        ("remapped", acted.remapped.len()),
+        ("at_completion", acted.at_completion.len()),
+        ("redefined", acted.redefined.len()),
+    ];
+    for (field, n) in counts {
+        if n == 0 {
+            continue;
+        }
+        note_store_route_n("lifetime_effect_unacted", n as u64);
+        if crate::observe::first_sight("lifetime_effect_unacted", 0) {
+            crate::observe::fail(format!(
+                "lifetime_effect_unacted site={site} field={field} n={n} (the model obliged \
+                 work this command's arm does not perform, so it is owed to nobody)"
+            ));
+        }
+    }
+}
+
 fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
     let crate::protocol::fifo::SetObjectListCommand {
         task_id,
@@ -521,6 +946,24 @@ fn apply_set_object_list(state: &mut DeviceState, payload: &[u8], channel: Optio
         state.retire_bound_buffers_for_task(task_id),
     );
     let applied = state.set_object_list(task_id, pfn, count);
+    // The binding, in the model that owns what a reference resolves to. It
+    // retires nothing — a new table changes what an *unresolved* reference
+    // constructs, and the objects already declared keep their own deletes —
+    // which is the same contract the two retirements above implement on this
+    // device's caches. See `LifecycleOp::BindObjectList` for why the operation
+    // is the binding rather than the table's walk.
+    if let Some(acted) = state.apply_lifetime(
+        &reims_vgpu_core::lifecycle::LifecycleOp::BindObjectList {
+            task: reims_vgpu_core::identity::TaskId(task_id),
+            list: reims_vgpu_core::lifecycle::ObjectList {
+                page: reims_vgpu_core::identity::DirectoryFrame(pfn),
+                capacity: count,
+            },
+        },
+        "set_object_list",
+    ) {
+        note_inert_lifetime_effects("set_object_list", &acted);
+    }
     if crate::observe::first_sight(
         "set_object_list",
         (u64::from(task_id) << 48) ^ (u64::from(pfn) << 24) ^ u64::from(count),
@@ -841,89 +1284,20 @@ impl StampWait {
     /// the wrap as unsatisfied and stalls the channel permanently. The signed
     /// difference is correct for any pair less than 2^31 apart, which is the
     /// same window the rest of this protocol's counters assume.
+    ///
+    /// **Deferred rather than restated.** The rule belongs to
+    /// `reims_vgpu_core::identity::StampValue`, which is the type the ordering
+    /// plane decides every stamp wait with, and this device held a second copy
+    /// of it written in raw `u32`. Two implementations of a wrapping comparison
+    /// are two chances to disagree about which of two numbers is later, and the
+    /// disagreement is silent in both directions: one parks a timeline forever
+    /// on a value already written, the other releases work early. So the answer
+    /// comes from the owner and the paragraph above stays as the reason it is
+    /// written that way.
     pub fn satisfied_by(self, current: u32) -> bool {
-        current.wrapping_sub(self.value) as i32 >= 0
+        reims_vgpu_core::identity::StampValue(current)
+            .reached(reims_vgpu_core::identity::StampValue(self.value))
     }
-}
-
-/// The completion stamp one drain of one channel owes, coalesced.
-///
-/// Every packet in a `drain_child_fifo` call stamps **the same slot** — the
-/// index is read once from the channel's register block before the loop — and a
-/// stamp wait is satisfied by any value at or past the one awaited
-/// ([`StampWait::satisfied_by`]). So a run of stamps to one slot is observable
-/// only through its greatest value unless the guest samples between the writes,
-/// and writing only that value discharges every wait the run would have.
-///
-/// That matters because a stamp is a FIFO completion, not merely a word write.
-/// Coalescing avoids one completion record per packet while preserving the
-/// greatest value the guest can observe from the drain.
-///
-/// # What it bought, six driven macos-13 boots, one binary, both arms
-///
-/// All six in one compositing regime (995-999 draws a frame), no panics, same
-/// desktop. `gpu_stamps` fell to **1.9 %** of the per-packet arm and the span
-/// with it:
-///
-/// ```text
-///                   coalesced    per packet
-/// stamp ms/s         5.9-6.8     77.1-97.2
-/// unnamed in drain   224-231      314-317
-/// duty              0.80-0.81    0.89-0.90
-/// slot_us              29 049        37 874
-/// ```
-///
-/// **The arithmetic closes**: the stamp span fell 90.3 ms/s and the whole drain
-/// residue fell 88.6 ms/s, so the time was removed rather than relocated — and
-/// `proc - draw - compute` is 197 against 201 ms/s, unchanged, which says the
-/// same from the other side.
-///
-/// It buys **headroom, not frames**. `present_hz`/`offered_hz` are 15.05 against
-/// 14.90; the guest paces this rail and four CPU wins in a row have moved it by
-/// nothing.
-///
-/// # It holds on all six guest drivers
-///
-/// The measurement above is macos-13 alone, and *when a completion becomes
-/// visible* is exactly the class that can be fine on one guest driver and stall
-/// another — failing as a frozen desktop rather than as a decline, which no
-/// counter reports. So all six x86 rails were swept:
-///
-/// ```text
-/// macos-11  dev=1 ssh=1 dock=1 sd=184 panic=0
-/// macos-12  dev=1 ssh=1 dock=1 sd=147 panic=0
-/// macos-13  dev=1 ssh=1 dock=1 sd=131 panic=0
-/// macos-14  dev=1 ssh=1 dock=1 sd=215 panic=0
-/// macos-15  dev=1 ssh=1 dock=1 sd=281 panic=0
-/// macos-26  dev=1 ssh=1 dock=1 sd=126 panic=0
-/// ```
-///
-/// `sd` is the field that answers the question — host-window standard deviation,
-/// ~38 for the boot screen and >100 for a composited desktop. Every rail cleared
-/// 126, so every one of them put a picture up rather than sitting on a stamp it
-/// was still waiting for. `stamp_write_forward` runs 345-1815 a boot across the
-/// six, so the coalesced write is landing everywhere and not only where it was
-/// tuned.
-///
-/// These are undriven boots: they prove the desktop composites on each driver,
-/// not that the saving reproduces there. Only macos-13 has been driven.
-///
-/// Completion publication does not close an open draw batch. It registers the
-/// stamp in the bounded pending queue and the batch's eventual successful
-/// submission assigns its completion point. The pending-stamp capacity remains
-/// the pressure bound: filling it submits the batch rather than sleeping while
-/// holding the only command buffer that can make room.
-///
-/// [`Self::latch`] takes the **maximum in wrapping-signed order** rather than
-/// the last value seen. For a well-formed guest those are the same, and taking
-/// the maximum means this device cannot introduce a regressing stamp even if a
-/// regressing one arrives — a slot going backwards would unsatisfy a wait the
-/// guest had already been told was met.
-#[derive(Clone, Copy, Default)]
-pub struct PendingStamp {
-    /// `None` until a packet in this drain has completed. A drain that stamps
-    /// nothing owes nothing and must submit nothing.
-    value: Option<u32>,
 }
 
 /// Why a stamp wait was unmet, partitioned by what this device could have done
@@ -1048,79 +1422,6 @@ impl StampLedger {
                 }
             })
             .or_insert(value);
-    }
-}
-
-impl PendingStamp {
-    /// Fold one packet's completion stamp in, keeping the later of the two in
-    /// the same wrapping-signed order [`StampWait::satisfied_by`] compares in.
-    pub fn latch(&mut self, stamp: u32) {
-        self.value = Some(match self.value {
-            Some(held) if stamp.wrapping_sub(held) as i32 <= 0 => held,
-            _ => stamp,
-        });
-    }
-
-    /// The value owed, or `None` when this drain stamped nothing.
-    pub fn owed(self) -> Option<u32> {
-        self.value
-    }
-
-    /// Whether `wait` is already discharged by what this drain has latched but
-    /// not yet written.
-    ///
-    /// Without this a packet waiting on the slot an earlier packet in the same
-    /// drain stamped would read the stale word out of guest RAM, return
-    /// [`StampVerdict::Hold`], and park the channel against a stamp this device
-    /// is itself holding. `slot` is the drain's own stamp index; a wait naming
-    /// any other slot is not ours to answer.
-    ///
-    /// # It fires zero times, and the hazard it guards is real
-    ///
-    /// The A/B above is the same six boots. `packet_stamp_wait_met_pending` is
-    /// **0** on the coalesced arm while `packet_stamp_wait_held` **more than
-    /// doubled**, 5 073 against 2 237, taking `setup_calls` up 47 % with it in
-    /// re-drains. Those two readings together say this comparison never matches:
-    /// the packets that should have been answered here fall through to the stale
-    /// word instead.
-    ///
-    /// It is not a correctness failure — every `break` flushes the pending
-    /// stamp, so a held packet's retry finds the word — but it is ~2 800
-    /// avoidable round trips a boot behind a guard that reads as working.
-    ///
-    /// # Why, measured rather than guessed
-    ///
-    /// It is **not** an encoding mismatch, which was the first suspicion. The
-    /// boot's own `packet_stamp_wait_unmet` lines name both sides, and they
-    /// disagree about the *channel*, not the spelling:
-    ///
-    /// ```text
-    /// packet_stamp_wait_unmet opcode=0x37 ch1 index=2 awaited=0xe  current=0xa
-    /// packet_stamp_wait_unmet opcode=0x6  ch5 index=1 awaited=0x5  current=0x3
-    /// packet_stamp_wait_unmet opcode=0x22 ch2 index=4 awaited=0x1  current=0x0
-    /// ```
-    ///
-    /// Channel 1 waits on slot 2, channel 5 on slot 1, channel 2 on slot 4.
-    /// **Every one of them is waiting on a slot some other channel writes**, and
-    /// this guard answers only the drain's own slot — by construction, as its
-    /// last line above says. So it is not broken; it covers a case this workload
-    /// does not produce, while the case the workload does produce is the one it
-    /// declines.
-    ///
-    /// The mechanism is nesting: `process_child_packet` can reach `drain_other`,
-    /// so channel B's drain runs inside channel A's, and A's latched stamps are
-    /// sitting in A's stack frame where B cannot see them. Answering from them
-    /// would be correct for the same reason it is correct here — the drain
-    /// thread is single-threaded, so a latched stamp is work that finished
-    /// before the waiting packet was decoded — but it needs the latch to live in
-    /// `DeviceState` keyed by channel rather than in a local.
-    ///
-    /// **That is worth ~0.2 ms/s and no more**: 2 836 extra holds over a 45 s
-    /// boot, each costing a re-drain, against a change that bought 88 ms/s. It
-    /// is recorded because a guard that fires zero times should say why, not
-    /// because it is the next thing to fix.
-    fn discharges(self, slot: u32, wait: StampWait) -> bool {
-        stamp_slot_index(wait.index) == slot && self.value.is_some_and(|v| wait.satisfied_by(v))
     }
 }
 
@@ -1392,45 +1693,6 @@ fn note_packet_stamp_records(opcode: u16, waits: &[StampWait]) {
     ));
 }
 
-/// What a packet's stamp waits say the drain should do with it.
-///
-/// The three answers are not degrees of the same thing. [`Self::Ready`] and
-/// [`Self::Hold`] are the wait working; [`Self::Unevaluable`] is the device
-/// unable to decide, and collapsing it into `Hold` is how a report becomes a
-/// hang — see the variant's own note.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StampVerdict {
-    /// Every wait is satisfied, or there were none. Run the packet.
-    Ready,
-    /// At least one wait is genuinely behind. Hold the packet: a stamp this
-    /// device will publish is what clears it.
-    Hold,
-    /// A wait this device cannot decide, and **no future event changes that**.
-    ///
-    /// Holding on one would park the timeline forever, which is strictly worse
-    /// than the ordering slip it was meant to prevent: an ordering slip loses
-    /// one packet's ordering, a parked root FIFO loses the guest. So this runs
-    /// the packet, loudly. Every case here is a refusal with a named reason, and
-    /// none of them fired on a driven boot.
-    Unevaluable,
-}
-
-impl StampVerdict {
-    /// Fold one wait's answer into the packet's, most restrictive winning.
-    ///
-    /// `Unevaluable` outranks `Hold`, which outranks `Ready`. That order is the
-    /// whole point: a packet with one wait genuinely behind and one that can
-    /// never be decided must **run**, because holding for the first would still
-    /// park the timeline forever on the second.
-    fn and(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Unevaluable, _) | (_, Self::Unevaluable) => Self::Unevaluable,
-            (Self::Hold, _) | (_, Self::Hold) => Self::Hold,
-            _ => Self::Ready,
-        }
-    }
-}
-
 /// Evaluate a packet's stamp waits against the slots this device has published.
 ///
 /// The current value is read back out of the stamp page rather than cached
@@ -1447,23 +1709,36 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     host: &H,
     channel: Option<u32>,
     packet: &Packet,
-    pending: Option<(u32, PendingStamp)>,
-) -> StampVerdict {
-    if packet.stamp_waits.is_empty() {
-        return StampVerdict::Ready;
-    }
-    let mut verdict = StampVerdict::Ready;
+) {
     for wait in &packet.stamp_waits {
         let index = stamp_slot_index(wait.index);
-        // Answered from the drain's own latch before guest RAM, because the word
-        // in guest RAM is stale by exactly the stamps this drain is holding. The
-        // ordering the wait asks about already holds: packets are processed in
-        // order on this thread, so a stamp latched here is work that finished
-        // before the packet doing the waiting was decoded.
-        if pending.is_some_and(|(slot, held)| held.discharges(slot, *wait)) {
-            note_store_route("packet_stamp_wait_met_pending");
-            continue;
-        }
+        // Census, deciding nothing: would the ordering plane answer this wait
+        // the same way this drain is about to?
+        //
+        // The two read different things and that is the point. This drain reads
+        // the word out of guest RAM, which is authoritative and includes
+        // anything the *guest* advanced; the model answers from what has been
+        // published to it, which today is only what this device wrote. A wait
+        // guest RAM satisfies and the model does not is a packet the cutover
+        // would park forever — the same hang an unadvanced pipeline was, on the
+        // scheduler's other wait kind — so it is measured before it is relied
+        // on rather than discovered by a guest that stops drawing.
+        let model_satisfies = state
+            .published_completion_stamp(reims_vgpu_core::identity::StampSlot(index))
+            .is_some_and(|v| wait.satisfied_by(v.0));
+        let against_model = |device_satisfies: bool, agree: &'static str| {
+            note_store_route(if device_satisfies == model_satisfies {
+                agree
+            } else if device_satisfies {
+                // The hang: this device runs the packet and the model would
+                // hold it against a value nothing will publish again.
+                "stamp_wait_model_behind"
+            } else {
+                // The other direction, and not the harmless one: the model
+                // would release work this device is still holding back.
+                "stamp_wait_model_ahead"
+            });
+        };
         let unresolvable = |reason: &'static str, detail: String| {
             note_store_route("packet_stamp_wait_unresolvable");
             if crate::observe::first_sight("packet_stamp_wait_unresolvable", u64::from(index)) {
@@ -1483,27 +1758,65 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
                 "stamp_slot_out_of_range",
                 format!("slots={}", stamp_slot_count(state.page_size())),
             );
-            verdict = verdict.and(StampVerdict::Unevaluable);
+            note_store_route(if model_satisfies {
+                "stamp_wait_model_decides_the_unevaluable"
+            } else {
+                "stamp_wait_model_also_cannot_decide"
+            });
             continue;
         };
         // No stamp page means no slot to read and no slot `write_stamp` would
         // write either — it returns early on the same condition.
         if state.gfx.fifo_base_page == 0 {
             unresolvable("no_stamp_page", String::from("fifo_base_page=0"));
-            verdict = verdict.and(StampVerdict::Unevaluable);
+            note_store_route(if model_satisfies {
+                "stamp_wait_model_decides_the_unevaluable"
+            } else {
+                "stamp_wait_model_also_cannot_decide"
+            });
             continue;
         }
         let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
         let Ok(current) = crate::runtime::host::read_u32(host, gpa) else {
             unresolvable("stamp_slot_unreadable", format!("gpa={gpa:#x}"));
-            verdict = verdict.and(StampVerdict::Unevaluable);
+            note_store_route(if model_satisfies {
+                "stamp_wait_model_decides_the_unevaluable"
+            } else {
+                "stamp_wait_model_also_cannot_decide"
+            });
             continue;
         };
-        if wait.satisfied_by(current) {
+        // After the census comparison and never before it: publishing first
+        // would teach the plane the answer and then congratulate it for
+        // knowing. This is the arm that covers the GPU-ordered rail — a word
+        // queued there lands without this device writing it, and the drain's
+        // own read of the slot is the first place this device *observes* that
+        // it has.
+        note_stamp_visible(state, index, current, "stamp_visible_observed");
+        // **The verdict is the plane's.** It has just been told what the page
+        // holds, so it decides on the value this drain read — and the one case
+        // where the two can part is a rewind, where the plane refuses to move
+        // a timeline backwards while a raw read of the page follows it.
+        // `stamp_publish_behind` is that population and it is the witness this
+        // needs; a driven boot measured 0 across 29 852 waits, alongside a
+        // direct comparison of the two answers that read 0 differences and was
+        // removed as a second name for the same event.
+        let device_satisfies = state
+            .published_completion_stamp(reims_vgpu_core::identity::StampSlot(index))
+            .is_some_and(|published| {
+                reims_vgpu_core::identity::StampWait {
+                    slot: reims_vgpu_core::identity::StampSlot(index),
+                    value: reims_vgpu_core::identity::StampValue(wait.value),
+                }
+                .satisfied_by(published)
+            });
+        if device_satisfies {
             note_store_route("packet_stamp_wait_met");
+            against_model(true, "stamp_wait_model_agrees_met");
             continue;
         }
         note_store_route("packet_stamp_wait_unmet");
+        against_model(false, "stamp_wait_model_agrees_unmet");
         // Census only, and it does not change the verdict below. Says whether
         // this device was holding the awaited word (publishable early, and
         // ordering-safe because publication carries the settle), had already
@@ -1532,7 +1845,6 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
                 },
             );
         }
-        verdict = verdict.and(StampVerdict::Hold);
         if crate::observe::first_sight(
             "packet_stamp_wait_unmet",
             (u64::from(packet.opcode) << 32) | u64::from(index),
@@ -1548,7 +1860,6 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
             ));
         }
     }
-    verdict
 }
 
 /// Decode one packet out of a ring snapshot taken at [`packet_snapshot_len`].
@@ -1638,9 +1949,902 @@ fn decode_packet_inner(
     })
 }
 
-/// Timed at the function rather than at its four call sites, so both FIFOs and
-/// both reads per packet are counted and a fifth call site cannot be added
-/// without being measured.
+// ---------------------------------------------------------------------------
+// The ingress switch: arrival, admission, parking, and running what the model
+// releases.
+//
+// The shape this replaces is a loop that ran each packet where it found it and
+// stopped the whole timeline when it could not. Head advances unconditionally
+// here; a packet that cannot run yet holds an ordering position instead of a
+// ring pointer, and the positions behind it are free.
+// ---------------------------------------------------------------------------
+
+/// Put the root FIFO's completion word in slot 0, and say whether it landed in
+/// the page.
+///
+/// The root reaches slot 0 inline rather than through [`write_stamp`], and the
+/// difference is not cosmetic: it is the one slot whose landing raises the
+/// device's own interrupt, so the caller has to be told whether it landed. A
+/// word the completion rail took is *queued* — the worker publishes it and
+/// announces it in that order — and `false` there is the honest answer rather
+/// than an early announcement of an unfinished stamp.
+fn write_root_stamp<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    value: u32,
+) -> bool {
+    if state.gfx.fifo_base_page == 0 {
+        return false;
+    }
+    let Some(off) = stamp_slot_offset(0, state.page_size()) else {
+        return false;
+    };
+    // Recorded here or the ledger would never see slot 0 leave the owed state:
+    // the ordering plane's half is further down, at the arm that puts the word
+    // in the page, and this line is reached by the queued arm too.
+    note_stamp_no_longer_owed(state, 0, value);
+    // Root and child FIFOs own the same bounded pending-stamp queue contract,
+    // so slot 0 takes the same submission-attached completion rail.
+    if crate::backend::selected().order_completion_stamp(
+        state,
+        host,
+        0,
+        value,
+        crate::runtime::render_writeback::SettleSite::RootStamp,
+    ) == crate::backend::StampOrdering::Queued
+    {
+        note_store_route("root_stamp_ordered_gpu");
+        state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
+        return false;
+    }
+    let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
+    if gpa_map::write_u32(host, gpa, value, state.page_size() as usize).is_ok() {
+        note_stamp_visible(state, 0, value, "stamp_visible_root");
+        // A window armed after this point has outlived a fence the moment it is
+        // still armed at the next one. The counter is what `armed_stamp_seq` is
+        // compared against, so a rail that does not move it reads as punctual
+        // however long it actually waited.
+        state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
+        return true;
+    }
+    // The guest waits on this root completion stamp; a silent writeback failure
+    // hangs it forever with no trace (drain.rs Rank-2 audit).
+    state.record_fail(FailEvent::MalformedRootPacket {
+        fault: PacketFault::RootStampWriteback,
+        head: state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire),
+    });
+    false
+}
+
+/// Put one published completion word where its domain's guest reads it.
+///
+/// The two rings write their words differently — the root raises this device's
+/// interrupt from slot 0, a child goes through [`write_stamp`] — and the model
+/// publishes without knowing either. Routing on the domain here is what lets
+/// `complete_transaction`'s releases be written by whoever is holding the drain,
+/// including one on another channel entirely.
+fn publish_word<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    domain: u32,
+    slot: u32,
+    value: u32,
+) {
+    if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
+        if write_root_stamp(state, host, value) {
+            state
+                .gfx
+                .interrupt_status_gpu
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+            host.enqueue(HostAction::irq_gfx());
+        }
+        return;
+    }
+    write_stamp(state, host, slot, value);
+}
+
+/// Everything the device does with one arrived packet *before* the model
+/// judges it.
+///
+/// Two classes need work at arrival, and both for the same kind of reason: the
+/// model's packet cannot be built without a fact only this device can read, and
+/// reading it later would read the wrong one.
+///
+/// * **Exec** — the command buffers live in the task's address space, and the
+///   ring head is about to move past the packet that names them. Whoever runs
+///   the submission later has to have been handed these bytes.
+/// * **Re-point** — the operation names the pages the reference holds *now*,
+///   and "now" is after this device has moved the storage incarnation. See
+///   `crate::runtime::objects::repointed_storage`: an earlier answer is the old
+///   one, so the incarnation move is arrival work by construction.
+struct Arrived {
+    submission: Option<crate::runtime::exec::ExecSubmission>,
+    /// The exec result the reading produced, carrying whatever it refused.
+    exec: crate::runtime::exec::ExecResult,
+    repointed: Result<
+        crate::runtime::ingress::ReplacementStorage,
+        crate::runtime::objects::RepointStorageRefusal,
+    >,
+}
+
+/// Do the arrival work one packet's class needs, and say what it produced.
+fn arrival_work<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    fifo: crate::runtime::ingress::Fifo,
+    packet: &Packet,
+) -> Arrived {
+    let mut arrived = Arrived {
+        submission: None,
+        exec: crate::runtime::exec::ExecResult::default(),
+        repointed: Err(crate::runtime::objects::RepointStorageRefusal::Unnamed),
+    };
+    if fifo.channel() != WireChannel::Child {
+        return arrived;
+    }
+    match packet.opcode {
+        CHILD_OP_EXEC_INDIRECT2 => {
+            let (submission, exec) =
+                crate::runtime::exec::read_exec_submission(state, host, &packet.payload);
+            arrived.exec = exec;
+            arrived.submission = submission;
+        }
+        CHILD_OP_REPLACE_PHYSICAL => {
+            arrived.repointed = repoint_at_arrival(state, host, &packet.payload);
+        }
+        _ => {}
+    }
+    arrived
+}
+
+/// Move a re-pointed reference's storage incarnation, and say what it names now.
+///
+/// **The whole of the re-point's device work, performed at arrival.** The
+/// guest's packet announces that the pages under this reference have *already*
+/// changed, so every host copy of them is stale the moment it arrives and
+/// holding the invalidation until an ordering position would keep serving bytes
+/// the guest has replaced. The identity of the new pages is this device's own
+/// incarnation counter, not guest memory, so reading it after the move is
+/// reading this device's bookkeeping rather than racing the guest.
+fn repoint_at_arrival<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    payload: &[u8],
+) -> Result<
+    crate::runtime::ingress::ReplacementStorage,
+    crate::runtime::objects::RepointStorageRefusal,
+> {
+    let cmd = match crate::protocol::fifo::decode_task_object(payload) {
+        Ok(cmd) => cmd,
+        Err(_) => return Err(crate::runtime::objects::RepointStorageRefusal::Unnamed),
+    };
+    // This device's own indexes first, then the incarnation, then the model's
+    // term — the order the legacy arm used and for its reasons: the caches hold
+    // the window accepted work was planned against and must stop comparing
+    // equal before anything reads the new one.
+    if crate::runtime::writeback_debt::retire_gva_resource(state, cmd.task_id, cmd.object_id) {
+        note_store_route("gva_resource_retired");
+    }
+    note_bb_retired(
+        "bb_retire_replace_physical",
+        state.retire_bound_buffers_for_ref(cmd.task_id, cmd.object_id),
+    );
+    crate::runtime::objects::replace_physical(state, host, cmd.task_id, cmd.object_id);
+    crate::runtime::objects::repointed_storage(state, host, cmd.task_id, cmd.object_id).map(
+        |(_resource, backing, extent)| crate::runtime::ingress::ReplacementStorage {
+            backing,
+            extent,
+        },
+    )
+}
+
+/// Give one arrived packet an ordering position and keep its bytes until the
+/// model releases it.
+///
+/// **Head advances whatever this returns**, which is the switch. A packet the
+/// model refuses is a packet that did not run, and the ring position it
+/// occupied is not the place to record that — the failure channel is.
+fn admit_and_park<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    fifo: crate::runtime::ingress::Fifo,
+    completion_slot: u32,
+    packet: Packet,
+) {
+    use reims_vgpu_core::identity::StampSlot;
+
+    let arrived = arrival_work(state, host, fifo, &packet);
+    let session = state.session_generation();
+    let built = crate::runtime::ingress::device_packet(
+        state,
+        host,
+        fifo,
+        session,
+        StampSlot(stamp_slot_index(completion_slot)),
+        &packet,
+        crate::runtime::ingress::PacketReads {
+            submission: arrived.submission.as_ref(),
+            repointed: arrived.repointed,
+        },
+    );
+    let mut built = match built {
+        Ok(built) => built,
+        Err(blocked) => {
+            note_unadmitted(
+                state,
+                host,
+                fifo,
+                completion_slot,
+                &packet,
+                blocked.slug(),
+                || format!("{blocked:?}"),
+            );
+            return;
+        }
+    };
+    // A wait naming a slot this device's stamp page cannot hold is one **no
+    // drain could ever satisfy**: `write_stamp` returns early on the same
+    // `stamp_slot_offset` that refuses here, so the slot is never written and a
+    // transaction admitted waiting on it would hold its channel's publication
+    // head forever.
+    //
+    // The asymmetry decides it, and it is the same one the legacy path stated:
+    // an ordering slip loses one packet's ordering, while a position parked on
+    // a wait nothing can satisfy loses the guest. So the wait is dropped and
+    // named, here rather than in the bridge — which slot numbers exist is a
+    // property of this device's page and not of the packet.
+    let page_size = state.page_size();
+    built.stamp_waits.retain(|wait| {
+        if stamp_slot_offset(wait.slot.0, page_size).is_some() {
+            return true;
+        }
+        note_store_route("packet_stamp_wait_unresolvable");
+        if crate::observe::first_sight("packet_stamp_wait_unresolvable", u64::from(wait.slot.0)) {
+            crate::observe::fail(format!(
+                "packet_stamp_wait_unresolvable reason=stamp_slot_out_of_range opcode={:#x} \
+                 index={} slots={} (no drain writes a slot outside the stamp page, so the \
+                 packet is admitted unordered against this wait rather than parking forever)",
+                packet.opcode,
+                wait.slot.0,
+                stamp_slot_count(page_size)
+            ));
+        }
+        false
+    });
+    note_access_modes(&built);
+    // The pipelines the records bind, told to the model before it is asked
+    // whether the packet may run: `PipelineTable::waits_for` refuses a lease it
+    // has no entry for, and the entry is this device's to make. The list is the
+    // walk's own answer and not a second scan, so what is declared cannot
+    // disagree with what the transaction is then admitted waiting on.
+    let leases: &[reims_vgpu_core::identity::ResourceId] = built
+        .payload
+        .exec()
+        .map_or(&[], |work| &work.pipeline_leases);
+    // **Asked here and not at arrival, because here is where the leases are.**
+    // Admission readies exactly this list on the rail's answer, so the question
+    // the rail is asked has to be about exactly this list. It used to be asked
+    // before the walk had run, and answered from a second scan of the packet's
+    // bytes for `SetPipeline` records — a set that need not be this one. A lease
+    // readied on an answer that never examined it is a transaction released
+    // against a shader that is still translating, which is the
+    // `m2v_translation_pending_at_sync_boundary` loss measured on a driven
+    // macos-15 desktop.
+    let translating = match (arrived.submission.as_ref(), built.payload.exec()) {
+        (Some(submission), Some(resolved)) => {
+            let mut measured_ns = 0u64;
+            crate::runtime::exec::preflight_submission(
+                state,
+                host,
+                submission,
+                resolved,
+                &mut measured_ns,
+            )
+        }
+        _ => Vec::new(),
+    };
+    for &lease in leases {
+        note_store_route(if state.declare_pipeline(lease) {
+            "pipeline_declared"
+        } else {
+            "pipeline_declared_already"
+        });
+        if translating.contains(&lease.slot.0) {
+            withdraw_lease(state, lease);
+        } else if translating.is_empty() {
+            ready_lease(state, lease, "pipeline_lease_ready_admission");
+        }
+    }
+
+    let admission = match state.admit_packet(&built) {
+        Ok(admission) => admission,
+        Err(refusal) => {
+            note_unadmitted(
+                state,
+                host,
+                fifo,
+                completion_slot,
+                &packet,
+                refusal.slug(),
+                || format!("{refusal:?}"),
+            );
+            return;
+        }
+    };
+    let mut transaction = admission.admitted.transaction;
+    let ingress = transaction.identity.ingress;
+    // The resolved records move out of the transaction the model just handed
+    // back. `admit` keeps a transaction's accesses in its dependency graph and
+    // returns everything else, and nothing downstream of this line reads the
+    // transaction again — so taking the work here is taking the only copy there
+    // is, and the position's pipeline leases become a field of it rather than a
+    // second list that could disagree with it.
+    let resolved = match &mut transaction.payload {
+        reims_vgpu_core::transaction::Payload::Exec(work) => Some(std::mem::take(work)),
+        _ => None,
+    };
+    // Both halves or neither: the command buffers are what the packet was
+    // admitted *against* and the resolved records are what it was admitted
+    // *as*, and a position holding one without the other could plan from bytes
+    // its records never named. An exec packet has both; every other class has
+    // neither.
+    let work = match (arrived.submission, resolved) {
+        (Some(submission), Some(resolved)) => crate::runtime::parked::ParkedWork::with_submission(
+            fifo.domain().0,
+            admission.epoch,
+            packet,
+            submission,
+            resolved,
+        ),
+        _ => crate::runtime::parked::ParkedWork::new(fifo.domain().0, admission.epoch, packet),
+    };
+    state.parked.park(ingress, work);
+}
+
+/// How much of this packet's ordering is bought by knowing, and how much by not
+/// knowing.
+///
+/// [`reims_vgpu_core::access::AccessMode::Unknown`] is a distinct variant from
+/// `ReadWrite` for one reason, and that reason is a number: the two order
+/// identically, so the only thing the split can buy is the ability to say how
+/// many edges exist because a slot is genuinely read-modify-write and how many
+/// exist because no reflection was published for the pipeline that bound it.
+/// The variant has carried that argument since it was written and nothing
+/// counted it, which made Seam 6's "supported operations reaching an unknown
+/// access-mode fallback" unmeasurable rather than met.
+///
+/// Counted at admission, from the transaction the model is about to be handed,
+/// because that is the list the dependency graph will actually order against —
+/// a count taken at the encoder would include intents a payload never carried.
+///
+/// See fn `an_unknown_mode_access_is_counted_apart_from_a_known_one`.
+pub(crate) fn note_access_modes(built: &reims_vgpu_core::session::Packet) {
+    use reims_vgpu_core::access::AccessMode;
+    for access in built.payload.accesses() {
+        note_store_route(match access.mode {
+            AccessMode::Read => "access_mode_read",
+            AccessMode::Write => "access_mode_write",
+            AccessMode::ReadWrite => "access_mode_read_write",
+            AccessMode::Unknown => "access_mode_unknown",
+        });
+    }
+}
+
+/// Advance what the model is waiting on, then run everything it has released.
+///
+/// Called after each admission and at the end of each drain, on both rings. It
+/// is the whole of the second half of the switch: the loop above puts packets
+/// into the model and this takes work out of it, and neither is a function of
+/// where a ring's head happens to be.
+fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    // **Until nothing more runs, not once.** Running a position publishes its
+    // channel's completion words, and a published word discharges the stamp
+    // waits other positions were admitted with — so one pass over what was
+    // ready when the pass began leaves the work it just released for whenever
+    // this device is next entered. A guest that ordered a packet behind a fence
+    // this very drain published would wait on a doorbell instead.
+    loop {
+        observe_awaited_stamps(state, host);
+        pump_translations(state, host);
+        for ingress in state.take_ready() {
+            // `false` is a position the model released and this device holds no
+            // bytes for. `mark_ready` has already named it; there is nothing
+            // here to run.
+            let _ = state.parked.mark_ready(ingress);
+        }
+        let mut ran = false;
+        for ingress in state.parked.ready_in_order() {
+            if declined_by_the_device(state, ingress) {
+                continue;
+            }
+            let Some(work) = state
+                .parked
+                .release(ingress, crate::runtime::parked::Release::Ready)
+            else {
+                continue;
+            };
+            run_parked(state, host, ingress, &work);
+            ran = true;
+        }
+        if !ran {
+            break;
+        }
+    }
+    // A position still parked is work this device owes, and the ring it came
+    // from is empty — so nothing but a re-entry will run it. Asking the store
+    // rather than a mask is what keeps "which timelines are owed" one fact:
+    // the store is what holds the work.
+    for ingress in state.parked.waiting_in_order() {
+        match state.parked.domain_of(ingress) {
+            Some(0) => state.pending.main_drain = true,
+            Some(domain) => state.pending.child_mask |= 1u32.checked_shl(domain).unwrap_or(0),
+            None => {}
+        }
+    }
+}
+
+/// Whether this device is not able to run a released position yet.
+///
+/// **The gates the model does not model, and cannot.** Host paint being two
+/// presents behind is a property of this device's display rail, not of the
+/// packet's ordering, and the model has no term for it. A declined position
+/// keeps its place and is offered again — `ready_in_order` is a list for
+/// exactly this reason — so declining one costs the positions behind it
+/// nothing, which is the head-of-line stall the switch removes.
+fn declined_by_the_device(
+    state: &mut DeviceState,
+    ingress: reims_vgpu_core::identity::IngressOrdinal,
+) -> bool {
+    let Some(opcode) = state.parked.opcode(ingress) else {
+        return false;
+    };
+    if !matches!(
+        opcode,
+        CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
+    ) {
+        return false;
+    }
+    if state.present.unpainted_presents < MAX_UNPAINTED_PRESENTS {
+        return false;
+    }
+    note_store_route("present_backpressure_parked");
+    // Paint will schedule the next worker slice. Preserve the domain without
+    // self-waking the worker ahead of QEMU's action BH.
+    if let Some(domain) = state.parked.domain_of(ingress) {
+        note_present_backpressure_hold(state, domain, ingress);
+        state.pending.child_mask |= 1u32.checked_shl(domain).unwrap_or(0);
+    }
+    true
+}
+
+/// Read the completion slots parked positions are waiting on, and tell the
+/// ordering plane what the guest's page holds.
+///
+/// **Without this a queued word is never observed and its waiters never run.**
+/// `note_stamp_visible`'s own doc names three places a word is seen to have
+/// landed: the two arms that write it inline, and a drain's read of the slot
+/// while evaluating a wait. The third covered the GPU-ordered rail, whose word
+/// lands when a submission retires and not when this device hands it over — and
+/// it used to be enough because it ran for every arriving packet that carried a
+/// wait.
+///
+/// It is not enough now. A parked position's wait is evaluated once, at
+/// admission; if the word it waits for is queued and no further packet with
+/// waits arrives, nothing looks at the slot again and the position waits
+/// forever. So the slots parked work is watching are read every pass, which is
+/// the same observation at the moment it has become the only one.
+fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    if state.gfx.fifo_base_page == 0 {
+        return;
+    }
+    let waiting = state.parked.waiting_in_order();
+    if waiting.is_empty() {
+        return;
+    }
+    let mut seen: Vec<u32> = Vec::new();
+    for ingress in waiting {
+        for index in state.parked.awaited_slots(ingress) {
+            let index = stamp_slot_index(index);
+            if seen.contains(&index) {
+                continue;
+            }
+            seen.push(index);
+            // A slot past the stamp page names a FIFO this device does not
+            // have, so no drain could ever write it. `admit` already holds the
+            // position; nothing here can decide it and nothing here pretends to.
+            let Some(off) = stamp_slot_offset(index, state.page_size()) else {
+                note_store_route("awaited_slot_out_of_range");
+                continue;
+            };
+            let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
+            let Ok(current) = crate::runtime::host::read_u32(host, gpa) else {
+                note_store_route("awaited_slot_unreadable");
+                continue;
+            };
+            note_stamp_visible(state, index, current, "stamp_visible_observed");
+        }
+    }
+}
+
+/// Try to finish the translations every parked position is still waiting on.
+///
+/// **The only thing that can release an exec packet parked on its own
+/// pipelines.** This device builds a pipeline inside the packet that binds it,
+/// so a transaction admitted while its shaders were still translating would
+/// wait forever on a build that only its own execution starts. The plan step is
+/// the way out: it is pure CPU work over bytes the parked position already
+/// holds, it takes a shared borrow, and when it answers `false` the rail has
+/// promised the packet can be executed to completion now.
+///
+/// Nothing here runs anything. It moves pipelines to `Ready`, and readying a
+/// pipeline is what the model turns into released work.
+fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
+    for ingress in state.parked.waiting_in_order() {
+        let Some((submission, resolved)) = state.parked.planning(ingress) else {
+            continue;
+        };
+        let leases = resolved.pipeline_leases.as_slice();
+        // A position whose every lease is already `Ready` has had the rail's
+        // promise made for it, and this pass cannot make it again: `ready_lease`
+        // would find every step illegal and `preflight_submission` would re-walk
+        // the same records to reach the same memo. It is still parked for
+        // something else — a stamp, or a dependency — and neither is this
+        // function's to move. Skipping it is what makes the pump proportional to
+        // the pipelines still building rather than to the parked population
+        // times the passes: a partial boot measured
+        // `parked_translations_finished = 282 172` against 137 pipelines
+        // declared and readied, which is the same handful of plans re-walked
+        // thousands of times.
+        if leases.iter().all(|&lease| state.pipeline_is_ready(lease)) {
+            note_store_route("parked_translations_already_ready");
+            continue;
+        }
+        let mut measured_ns = 0u64;
+        let pending = crate::runtime::exec::preflight_submission(
+            state,
+            &*host,
+            submission,
+            resolved,
+            &mut measured_ns,
+        );
+        if !pending.is_empty() {
+            // The pump's own withdrawal arm. A position can be parked on one
+            // pipeline while another it binds is `Ready` from an earlier
+            // packet, and the guest can rewrite that other one's shader while
+            // this position waits — so the pass that finds the first still
+            // building is also where the second stops being usable.
+            for &lease in leases {
+                if pending.contains(&lease.slot.0) {
+                    withdraw_lease(state, lease);
+                }
+            }
+            continue;
+        }
+        let leases = leases.to_vec();
+        note_store_route("parked_translations_finished");
+        for lease in leases {
+            ready_lease(state, lease, "pipeline_lease_ready_pump");
+        }
+    }
+}
+
+/// Run one released position from the bytes it was admitted with, then tell the
+/// model it finished and write whatever its channel published.
+///
+/// The arms are unchanged: what moved is that they are reached from a retained
+/// packet at an ordering position rather than from the ring at a head, and that
+/// the completion word is the model's answer rather than a value this function
+/// decides.
+fn run_parked<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    ingress: reims_vgpu_core::identity::IngressOrdinal,
+    work: &crate::runtime::parked::ParkedWork,
+) {
+    let domain = work.domain();
+    if domain == crate::runtime::ingress::Fifo::ROOT.domain().0 {
+        process_root_packet(state, host, work.packet());
+    } else {
+        // The re-entry guard this packet used to be run under. A child packet's
+        // arm can reach `drain_other`, and a channel whose own drain is on the
+        // stack must not be re-entered — which used to be true because the
+        // packet ran inside that channel's drain, and is now something this has
+        // to state, since a released position may belong to a channel nobody is
+        // draining.
+        let bit = 1u32.checked_shl(domain).unwrap_or(0);
+        let was_draining = state.draining_mask & bit;
+        let prev_channel = state.draining_channel;
+        state.draining_channel = domain;
+        state.draining_mask |= bit;
+        let started = std::time::Instant::now();
+        let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
+        census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
+        if was_draining == 0 {
+            state.draining_mask &= !bit;
+        }
+        state.draining_channel = prev_channel;
+    }
+    match state.complete_transaction(work.epoch(), ingress) {
+        Ok(released) => {
+            for release in released {
+                // **Counted here because the model cannot count it, and a
+                // publisher nobody counts reads exactly like one that never
+                // runs.** `SessionModel::complete` has already put this stamp
+                // into the scheduler's published map — that is what a channel
+                // publishing means — so the ordering plane's timeline moves on
+                // this line and on no other. `note_stamp_visible`'s routes
+                // report the *page*, which the queued rail writes later, and a
+                // reading that had only those concluded the plane's timeline
+                // had frozen: `stamp_publish_first = 1` and
+                // `stamp_publish_advanced = 1` for a whole driven boot, because
+                // by the time the page was read the entry was always already
+                // there.
+                //
+                // So the two publishers are counted apart, and the pair is what
+                // makes `stamp_publish_behind` readable: this is the numerator
+                // the page's observations are behind.
+                match release.stamp {
+                    Some(stamp) => {
+                        note_store_route("stamp_published_by_channel");
+                        publish_word(state, host, domain, stamp.slot.0, stamp.value.0);
+                    }
+                    // A position whose channel released it owing no word. It is
+                    // the denominator: without it a channel that published
+                    // nothing and a channel that released nothing read alike.
+                    None => note_store_route("stamp_released_without_a_word"),
+                }
+            }
+        }
+        // The incarnation the work was submitted under has ended. Its
+        // withdrawal already released whatever was queued behind it, so there
+        // is nothing to publish and the name is the whole of what is owed.
+        Err(refusal) => note_store_route(refusal.slug()),
+    }
+}
+
+/// Take back the promise that a lease is usable, because this rail no longer
+/// holds a translation for it.
+///
+/// The other half of [`ready_lease`], and the half the table had no step for
+/// until `77f5bd88`. `Ready` used to mean "was translated once", which is not
+/// the question a transaction about to bind it is asking: the guest rewrites
+/// the shader behind a live pipeline ref **in place**, so no delete arrives, no
+/// generation is minted, the [`reims_vgpu_core::identity::ResourceId`] is
+/// unchanged — and the rail's translate cache, being keyed by the shader's
+/// content, stops holding one. Four refs a driven macos-15 desktop, named by
+/// `m2v_pipe_content_changed`.
+///
+/// Silent when the lease was already waiting, which is the common case by three
+/// orders of magnitude: this runs for every pending ref of every pre-scan, and
+/// almost all of those are a cold pipeline that has simply not finished. What
+/// is worth a line is the *withdrawal* — a lease that was `Ready` and is not
+/// any more — and `PipelineTable::advance` is what distinguishes them, so the
+/// counter is read off the table's own census rather than guessed here.
+fn withdraw_lease(state: &DeviceState, lease: reims_vgpu_core::identity::ResourceId) {
+    if state.withdraw_pipeline(lease) {
+        note_store_route("pipeline_lease_withdrawn");
+        if crate::observe::first_sight("pipeline_lease_withdrawn", u64::from(lease.slot.0)) {
+            crate::observe::fail(format!(
+                "pipeline_lease_withdrawn slot={} gen={} (this rail stopped holding a \
+                 translation for a pipeline the model called ready; the guest rewrote its \
+                 shader without renaming it, and work binding it waits again)",
+                lease.slot.0, lease.generation.0
+            ));
+        }
+    }
+}
+
+/// Step a lease to `Ready`, through every state between.
+///
+/// `PipelineState::may_become` is a table and `Declared -> Ready` is not in it,
+/// so becoming usable is three steps whoever takes them. They are taken here
+/// because this is where the answer arrives: the rail's plan step has promised
+/// the packet can be executed to completion now, and that promise is exactly
+/// what a lease wait needs to know.
+fn ready_lease(
+    state: &DeviceState,
+    lease: reims_vgpu_core::identity::ResourceId,
+    site: &'static str,
+) {
+    use reims_vgpu_core::pipeline::PipelineState;
+    state.advance_pipeline(lease, PipelineState::Translating);
+    state.advance_pipeline(lease, PipelineState::Compiling);
+    if state.ready_pipeline(lease) {
+        note_store_route("pipeline_ready");
+        // Which of the three answers put this lease at `Ready`, once per slot
+        // per site.
+        //
+        // A draw has been measured reaching a shader that was still
+        // translating while the model called its lease ready
+        // (`m2v_translation_pending_at_sync_boundary` with
+        // `model_pipeline=ready`), and the three sites that can say ready —
+        // admission, the pump, and the rail's own resolve — are indistinguishable
+        // in the aggregate counter. The one that answered first is the one whose
+        // question was wrong.
+        if crate::observe::first_sight(site, u64::from(lease.slot.0)) {
+            crate::observe::off(format!(
+                "pipeline_lease_ready site={site} slot={} gen={}",
+                lease.slot.0, lease.generation.0
+            ));
+        }
+    }
+}
+
+/// A packet the model would not take, named on the always-on channel and
+/// answered anyway.
+///
+/// **The compromise, stated.** The guest polls the completion word this packet
+/// carries, so a refusal that published nothing would hang whatever is waiting
+/// on it — and there is no ordering position to publish through, because the
+/// packet never got one. So the word is written out of band and counted, which
+/// says "this device dropped your work" rather than saying nothing at all.
+///
+/// Every route into here measures **zero** on the five rails driven, which is
+/// what makes an out-of-band write the lesser of the two: a refusal that never
+/// happens costs nothing, and a hang that does is unrecoverable.
+fn note_unadmitted<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    fifo: crate::runtime::ingress::Fifo,
+    completion_slot: u32,
+    packet: &Packet,
+    reason: &'static str,
+    // The refusal's own value, rendered only when the line is written. The two
+    // call sites hold different types and neither is worth a formatted string
+    // on a path that is silent after its first sighting.
+    detail: impl FnOnce() -> String,
+) {
+    note_store_route("packet_unadmitted");
+    note_store_route(reason);
+    // Latched under the *refusal's* own slug rather than under
+    // `packet_unadmitted`, because `first_sight` keys on the reason it is given
+    // and one opcode refuses for several. A driven macos-26 boot's 918
+    // unadmitted packets were 914 `pipeline_absent` and 4
+    // `resolve_ref_names_no_object`, every one of them child `0x37` — and under
+    // one slug the log printed whichever arrived first and hid the rest.
+    if crate::observe::first_sight(
+        reason,
+        (u64::from(fifo.domain().0) << 32) | u64::from(packet.opcode),
+    ) {
+        crate::observe::fail(format!(
+            "packet_unadmitted ch={} opcode={:#x} reason={reason} refusal={} (the \
+             ordering plane would not take this packet, so its work did not run; its \
+             completion word is written out of band because the guest polls it and no \
+             ordering position exists to publish it through)",
+            fifo.domain().0,
+            packet.opcode,
+            detail()
+        ));
+    }
+    publish_word(
+        state,
+        host,
+        fifo.domain().0,
+        completion_slot,
+        packet.completion_stamp,
+    );
+}
+
+/// A FIFO's bytes, and how this device reaches them.
+///
+/// The root ring is one contiguous guest-physical span; a child ring is a page
+/// list walked at the device's page shift. **That is the whole of the
+/// difference between the two drains' reads**, and naming it is what lets one
+/// arrival step serve both rings instead of each keeping its own copy of
+/// header-snapshot-decode.
+///
+/// The copies had already drifted once — see [`packet_snapshot_len`], whose own
+/// doc records the arm one ring grew and the other did not — which is the
+/// reading this type exists to stop repeating.
+pub enum Ring<'a> {
+    /// The device's own FIFO: one span, from a base GPA.
+    Root { base_gpa: u64, capacity: u32 },
+    /// A guest-defined channel's FIFO: a page list, walked at `page_shift`.
+    Child {
+        page_gpas: &'a [u64],
+        capacity: u32,
+        page_shift: u32,
+    },
+}
+
+impl Ring<'_> {
+    /// The ring's data length, which is the modulus every head is taken under.
+    #[must_use]
+    pub const fn capacity(&self) -> u32 {
+        match *self {
+            Self::Root { capacity, .. } | Self::Child { capacity, .. } => capacity,
+        }
+    }
+
+    fn read<M: HostMemory>(&self, mem: &M, absolute: u32, len: u32) -> Result<Vec<u8>, MemError> {
+        match *self {
+            Self::Root { base_gpa, capacity } => {
+                read_ring_bytes(mem, base_gpa, capacity, absolute, len)
+            }
+            Self::Child {
+                page_gpas,
+                capacity,
+                page_shift,
+            } => read_child_ring_bytes(mem, page_gpas, capacity, absolute, len, page_shift),
+        }
+    }
+
+    /// The faults a failed header read and a failed snapshot read are reported
+    /// as, which are the two names each ring already had for them.
+    const fn read_faults(&self) -> (PacketFault, PacketFault) {
+        match *self {
+            Self::Root { .. } => (PacketFault::RootHeaderRead, PacketFault::RootSnapRead),
+            Self::Child { .. } => (PacketFault::ChildHeaderRead, PacketFault::ChildSnapRead),
+        }
+    }
+}
+
+/// What one look at a ring's consumer pointer found.
+///
+/// Three answers and not more, because a drain does three things with them: run
+/// the packet, stop quietly, or stop and say why.
+pub enum Arrival {
+    /// A whole packet, decoded out of a snapshot of the ring.
+    Packet(Packet),
+    /// Nothing to run, and nothing to report.
+    ///
+    /// The head has caught the tail, or the producer is mid-write: fewer bytes
+    /// published than a header, or a header whose `total_size` names bytes that
+    /// are not there yet. **A partial packet is the normal state of a producer**
+    /// — see [`PacketError::fault`], which is where that carve-out is made
+    /// mechanical — so all three are one answer and none of them is a line in
+    /// the log.
+    Nothing,
+    /// A registered fault. The drain stops and names it on its own ring's
+    /// event; which event that is stays the caller's, because the two rings
+    /// report through different `FailEvent` variants.
+    Fault(PacketFault),
+}
+
+/// Take the next packet at `head`, out of whichever ring this is.
+///
+/// The step both drain loops used to spell for themselves: bound the published
+/// bytes, read the header, work out how much of the packet is safe to snapshot,
+/// read that, and decode it. Every one of those five is shared, and the two
+/// copies differed only in which reader they called and which `FailEvent` they
+/// reported through — the first of which is [`Ring`]'s and the second of which
+/// stays the caller's.
+///
+/// The head is passed rather than read here on purpose: the root ring keeps its
+/// consumer pointer in an atomic this device also publishes to, and a step that
+/// loaded it itself would be a second reader of a value the caller is in the
+/// middle of advancing.
+pub fn arrival<M: HostMemory>(ring: &Ring<'_>, mem: &M, head: u32, tail: u32) -> Arrival {
+    if head == tail {
+        return Arrival::Nothing;
+    }
+    let capacity = ring.capacity();
+    let Some(available) = published_byte_count(head, tail, capacity) else {
+        return Arrival::Fault(PacketFault::DesyncedHeadTail);
+    };
+    if available < PACKET_HEADER_LEN {
+        return Arrival::Nothing;
+    }
+    let (header_fault, snap_fault) = ring.read_faults();
+    let Ok(header) = ring.read(mem, head, PACKET_HEADER_LEN) else {
+        return Arrival::Fault(header_fault);
+    };
+    let snap_len = packet_snapshot_len(&header, available, capacity);
+    let Ok(snap) = ring.read(mem, head, snap_len) else {
+        return Arrival::Fault(snap_fault);
+    };
+    match decode_packet(&snap, head, available, capacity) {
+        Ok(packet) => Arrival::Packet(packet),
+        Err(err) => err.fault().map_or(Arrival::Nothing, Arrival::Fault),
+    }
+}
+
+/// Timed at the function rather than at its call sites, so both FIFOs and both
+/// reads per packet are counted and a further call site cannot be added without
+/// being measured.
 fn read_ring_bytes<M: HostMemory>(
     mem: &M,
     base_gpa: u64,
@@ -1723,6 +2927,123 @@ pub(super) fn note_stamp_direction<H: HostMemory + HostOps>(
     }
 }
 
+/// Record that a completion word is no longer owed by the coalescing rail.
+///
+/// **One function because there are two writers of slot 0's history and they
+/// have already drifted once.** `write_stamp` is the child FIFOs' door; the
+/// root FIFO reaches its own slot inline a few lines below its dispatch, and
+/// the comment there records why it has to say so separately.
+///
+/// This is *not* the ordering plane's event. Handing a word to a rail is
+/// submission, and submission is not completion — see [`note_stamp_visible`],
+/// which is where the plane is told.
+fn note_stamp_no_longer_owed(state: &mut DeviceState, index: u32, value: u32) {
+    let page_bytes = state.page_size();
+    state.stamp_ledger.wrote(index, value, page_bytes);
+}
+
+/// Tell the ordering plane a completion word is **readable by the guest**.
+///
+/// # Why this is not where the word is handed to a rail
+///
+/// It was, for one commit, and a driven boot measured the cost exactly:
+/// `stamp_wait_model_ahead = 12 824` against `stamp_unmet_queued = 12 824`,
+/// the same number twice. `write_stamp` hands the word to the GPU-ordered
+/// rail and returns; the word lands when that rail's submission retires,
+/// which is later, and every wait in between is one the model called
+/// satisfied while the guest could still read the old value. A cutover
+/// publishing there would release, twelve thousand times a boot, work ordered
+/// behind GPU work that had not finished. Submission is not completion.
+///
+/// So the plane is told at the three places a word is *observed to have
+/// landed*: the two arms that write it into the page inline, and the drain's
+/// own read of the slot when it evaluates a wait — which is what covers the
+/// queued arm, because a queued word nobody waits on is one no admitted
+/// transaction is ordered behind.
+///
+/// `site` names which of the three, so the split stays readable: a boot where
+/// the observed arm carries everything is a boot where the inline arms have
+/// stopped running. A driven macos-26 desktop is that boot:
+/// `stamp_visible_observed = 1 700 804` against `stamp_visible_inline = 25`,
+/// because `write_stamp` hands almost every word to the GPU-ordered rail.
+///
+/// # This is not the plane's only publisher, and the other one is why `Behind`
+/// exists
+///
+/// `reims_vgpu_core::session::SessionModel::complete` publishes the stamp its
+/// channel released, straight into the scheduler, at the moment the channel
+/// publishes it. The model cannot count a route, so that publisher used to be
+/// invisible in a store-route dump — which is why a boot read
+/// `stamp_publish_first = 1` while three slots had entries: the entries came
+/// from completions, and this function only ever found them already there. Its
+/// caller counts it now, as `stamp_published_by_channel`, beside
+/// `stamp_released_without_a_word` for a position whose channel released it
+/// owing no word.
+///
+/// So the two are asking different questions of one slot. The plane holds what
+/// the *channel* published; this reports what the *page* carries. Between them
+/// sits the queued rail's write, and a slot read inside that window answers
+/// [`crate::model::StampPublication::Behind`]. It is a latency and not a
+/// rewind: the same boot measured `stamp_write_forward = 2203` against
+/// `stamp_write_backward = 1`.
+fn note_stamp_visible(state: &DeviceState, index: u32, value: u32, site: &'static str) {
+    note_store_route(site);
+    note_store_route(
+        match state.publish_completion_stamp(
+            reims_vgpu_core::identity::StampSlot(index),
+            reims_vgpu_core::identity::StampValue(value),
+        ) {
+            crate::model::StampPublication::First => "stamp_publish_first",
+            crate::model::StampPublication::Advanced => "stamp_publish_advanced",
+            crate::model::StampPublication::Repeat => "stamp_publish_repeat",
+            // The plane's timeline refused to move and something has put a
+            // smaller value in the page. `note_stamp_direction` sees the same
+            // event on the arms that write the word; this sees it on every arm
+            // the guest can read from.
+            //
+            // **Named, once per slot, because the count is two different
+            // facts.** A boot measures about 14 000 of these, and
+            // `dead/README.md` records the same counter at zero when the
+            // publication point was moved to this site — so either the meaning
+            // drifted or the invariant broke, and a bare count cannot say
+            // which. What separates them is *which slot* and *by how much*: one
+            // slot whose page rewound under a timeline that will not follow it
+            // is a slot to explain, and a timeline running ahead of every word
+            // the guest can read is an ordering defect. The pair is on the line.
+            //
+            // **The meaning drifted, and a driven macos-26 desktop is the
+            // reading that says so.** Three slots ever answered this, all of
+            // them in the boot's first 24 seconds and none afterwards, by one
+            // to seven: `slot=1 page=1 held=3`, `slot=2 page=19 held=26`,
+            // `slot=4 page=0 held=1`. The zero was taken when this site was the
+            // plane's only publisher; `SessionModel::complete` is the other one
+            // now, and it publishes at the channel's publication while the word
+            // itself is queued on the GPU-ordered rail. The page is behind
+            // because the write has not landed, not because it went back.
+            //
+            // **And nothing is decided inside that window.** The same boot read
+            // `stamp_wait_model_ahead = 0` and `stamp_wait_model_behind = 0`
+            // against 767 waits decided — `stamp_wait_model_agrees_met = 405`,
+            // `stamp_wait_model_agrees_unmet = 362` — so the model and the
+            // legacy evaluation answered every one of them alike. The window
+            // exists and no wait falls in it, which is the whole difference
+            // between this and the `stamp_wait_model_ahead = 12 824` the
+            // publication point was moved to escape.
+            crate::model::StampPublication::Behind { held } => {
+                if crate::observe::first_sight("stamp_publish_behind", u64::from(index)) {
+                    crate::observe::fail(format!(
+                        "stamp_publish_behind slot={index} site={site} page={value} held={} \
+                         (the ordering plane holds a point later than the word the guest can \
+                         read from this slot)",
+                        held.0
+                    ));
+                }
+                "stamp_publish_behind"
+            }
+        },
+    );
+}
+
 /// Write stamp value to FIFO base page slot and set status bit.
 pub fn write_stamp<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -1737,8 +3058,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // Census: from here the value is no longer owed by the coalescing rail, it
     // is with the publication rail below. Recorded before that rail runs so the
     // ledger never reports as still-owed a word already being settled.
-    let page_bytes = state.page_size();
-    state.stamp_ledger.wrote(index, stamp_value, page_bytes);
+    note_stamp_no_longer_owed(state, index, stamp_value);
     // Before the guest is told anything finished, everything this device still
     // owes guest RAM has to be in guest RAM. After this write the guest may free
     // the render targets and its allocator may hand those pages to anything, and
@@ -1778,6 +3098,9 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     let page_size = state.page_size() as usize;
     note_stamp_direction(host, gpa, index, stamp_value);
     if gpa_map::write_u32(host, gpa, stamp_value, page_size).is_ok() {
+        // The word is in the page: from here the guest can read it, which is
+        // the event the ordering plane's stamp waits are about.
+        note_stamp_visible(state, index, stamp_value, "stamp_visible_inline");
         // The guest's fence has moved. Everything it allocated for the work this
         // stamp completes may be freed from here on, which is why a Store's
         // guest-page write has to have landed before the stamp rather than
@@ -2153,6 +3476,14 @@ fn reply_compute_info<H: HostMemory + HostOps>(
             "get_compute_info truncated reason=reply_pairs_exhausted task={task_id} pipe={pipeline_ref} key_table_len={key_table_len} count={count} wrote={wrote} dropped={dropped:?}"
         ));
     }
+    // Asked before the write, of the address the request named and the span the
+    // encoder produced, so the reading is about the bytes that actually move.
+    let _ = crate::runtime::objects::note_query_reply_destination(
+        state,
+        task_id,
+        reply_gva,
+        written.bytes as u64,
+    );
     if crate::runtime::gva_mem::write_task_gva_product_within(
         state,
         host,
@@ -2230,6 +3561,12 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
             }
         };
     let reply = requirement.encode();
+    let _ = crate::runtime::objects::note_query_reply_destination(
+        state,
+        task_id,
+        request.reply_gva,
+        reply.len() as u64,
+    );
     if crate::runtime::gva_mem::write_task_gva_product_within(
         state,
         host,
@@ -2271,29 +3608,280 @@ fn reply_heap_texture_size_and_align<H: HostMemory + HostOps>(
     true
 }
 
+/// Read a query packet's request at the layout its question uses.
+///
+/// **The one place this device turns a query opcode into a request.** The four
+/// query packets used to be four arms, each naming its own decoder and — for
+/// the two device-info opcodes — its own [`DeviceInfoForm`]. The two forms
+/// decode to one Rust type and their offsets collide, so reading either at the
+/// other's is a well-typed request whose pair count is a page frame and whose
+/// reply goes to whatever page that named. Nothing in the arms could compare
+/// them, because the choice was made inside each one.
+///
+/// [`reims_vgpu_core::query::QueryKind`] makes that unrepresentable: the form
+/// is an opcode question, the kind answers it, and
+/// [`reims_vgpu_core::query::request_words`] reads the layout the kind names.
+/// This function is the join, and the arms below name a question rather than a
+/// decoder.
+///
+/// `None` when the request is not one, with the reason already on the failure
+/// channel under the question's own name.
+fn query_request(
+    channel: WireChannel,
+    opcode: u16,
+    payload: &[u8],
+    channel_id: Option<u32>,
+) -> Option<RequestWords> {
+    let Some(kind) = QueryKind::of(channel, opcode) else {
+        // This dispatch table and the closure ledger disagree about which
+        // packets are queries. Not reachable while `ledger.rs` passes, and
+        // reported rather than dropped because the guest is blocked on the
+        // reply either way.
+        crate::observe::fail(format!(
+            "query_not_a_query_packet site={} op={opcode:#x} (the ledger does not classify this \
+             opcode as a query and the drain dispatched it as one)",
+            packet_site(channel_id)
+        ));
+        return None;
+    };
+    match query::request_words(kind, payload) {
+        Ok(words) => Some(words),
+        Err(query::WordsRefusal::Short(short)) => {
+            note_short_payload(kind.name(), channel_id, &short);
+            None
+        }
+        Err(query::WordsRefusal::HeapTexture(refusal)) => {
+            crate::observe::fail(format!(
+                "query_malformed_request reason={} site={} question={}",
+                refusal.slug(),
+                packet_site(channel_id),
+                kind.name()
+            ));
+            None
+        }
+    }
+}
+
+/// The reply this device cannot build, because the question and its request
+/// words came apart.
+///
+/// [`QueryKind::of`] maps an opcode to a question and
+/// [`reims_vgpu_core::query::request_words`] returns the variant that
+/// question's layout produces, so the two agreeing is
+/// `reims_vgpu_core`'s invariant and not this device's. Unreachable, reported
+/// rather than ignored: a packet that reached it would otherwise be answered
+/// from a request built at the wrong layout, which is the defect the join
+/// exists to remove.
+fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
+    crate::observe::fail(format!(
+        "query_layout_mismatch site={} question={question} (the request words are not the ones \
+         this question's layout produces)",
+        packet_site(channel_id)
+    ));
+}
+
+/// Which payload class the semantic model would read this packet as.
+///
+/// **The ordering and publication group's denominator, taken before that group
+/// moves.** `reims_vgpu_core::session::SessionModel::admit` refuses a packet
+/// whose opcode names no command or whose contract is unestablished —
+/// `UnknownCommand` and `UnestablishedContract` — and both are the same answer
+/// from `reims_vgpu_core::transaction::classify`: `None`. A refusal there is the
+/// whole packet, so the question the last group has to answer with a guest and
+/// not with an argument is *how many packets a driven boot sends that the model
+/// would not classify at all*.
+///
+/// One route per class rather than one counter, because the classes are not
+/// interchangeable: a boot that is nine tenths exec and one that is nine tenths
+/// control need different work from the group that moves them, and a single
+/// "classified" count reads the same for both.
+///
+/// This asks `classify` and nothing else. It resolves no reference, reads no
+/// guest memory and names nothing — deliberately, because the obvious richer
+/// census is to run `crate::runtime::ingress::packet` in shadow, and that would
+/// name references on demand out of the guest's object list. Naming is a
+/// mutation of the namespace the model owns, so a census that did it would be
+/// changing what the device does in order to measure it.
+///
+/// # What a driven boot answered
+///
+/// x86 Vulkan, macos-15, three rounds of five applications:
+/// **`packet_class_exec=20 802`, `packet_class_lifecycle=13 505`,
+/// `packet_class_present=2140`, `packet_class_query=13`,
+/// `packet_class_control=11` — 36 471 classified — and
+/// `packet_class_unclassified=2166`.**
+///
+/// The unclassified 2166 were **one opcode**: `CmdDeleteObject`, child `0x28`,
+/// whose ledger row was `Closure::Unresolved` because its ref lives in the
+/// serializer's per-kind space rather than in the object list. That was five
+/// and a half per cent of that guest's packet stream, and it was the whole of
+/// what the ordering group would refuse — every other command it sent had a
+/// class.
+///
+/// **That row is settled and the denominator is now zero.** `0x28` reads
+/// `Closure::Implemented`; the four rows [`classify`] still answers `None` for
+/// are `CmdDebug`, `CmdDisplaySleepState`, `CmdDisplaySetProperties` and
+/// `CmdDelay`. A driven macos-26 desktop at x86 Vulkan, three rounds of five
+/// applications, sent none of them: **`packet_class_exec=946`,
+/// `packet_class_lifecycle=1096`, `packet_class_present=172`,
+/// `packet_class_query=3`, `packet_class_control=10` — 2227 classified — and
+/// `packet_class_unclassified=0`**, with no line on the failure channel.
+///
+/// **macos-15 retaken, same workload, same day**: `packet_class_exec=9571`,
+/// `packet_class_lifecycle=15033`, `packet_class_present=1066`,
+/// `packet_class_query=13`, `packet_class_control=11` — 25 694 classified —
+/// and `packet_class_unclassified=0` against the 2166 above, with
+/// `packet_unadmitted=0`.
+///
+/// So on both rails the ordering group refuses nothing for want of a class, and
+/// the four remaining rows are a contract question rather than a cutover
+/// blocker. The 2166 is kept as the measurement that found the blocker, not as
+/// a current reading.
+///
+/// **And the kind census says the open question is 10 packets wide.** Of the
+/// 2166, `child_delete_object_sampler_state=2148`,
+/// `child_delete_object_depth_stencil_state=4` and
+/// `child_delete_object_render_pipeline_state=4` are the three kinds
+/// [`apply_delete_object`] tracks and retires — 2156 of them, and they retire:
+/// `sampler_state_deleted=2143`, `ds_state_deleted=4`,
+/// `pipeline_state_deleted=4`. The eight untracked kinds are **10 packets**: 5
+/// functions, 3 compute pipeline states, 2 fences, which is exactly
+/// `cmd_delete_object_unimplemented=10`.
+///
+/// So the last group's blocker was not a breadth of unknown commands, and it
+/// was not 2166 packets of unrecovered contract either. It was one row whose
+/// unresolved half a driven guest exercised ten times a boot, holding back the
+/// 2156 whose per-kind space this device already resolves — and that row is the
+/// one that has since settled.
+///
+/// The shape of the classified traffic is the other half of the reading. It is
+/// over half exec, which is why the class whose payload the bridge could not
+/// build at all was the one that had to close first. It has:
+/// `crate::runtime::ingress::ExecStreams` carries the three inputs an exec
+/// packet costs, and the gap that named them is gone.
+fn note_packet_class(channel: reims_vgpu_protocol::packets::Channel, opcode: u16) {
+    use reims_vgpu_core::transaction::{classify, PayloadClass};
+    match classify(channel, opcode) {
+        Some(PayloadClass::Exec) => note_store_route("packet_class_exec"),
+        Some(PayloadClass::ResourceLifecycle) => note_store_route("packet_class_lifecycle"),
+        Some(PayloadClass::Query) => note_store_route("packet_class_query"),
+        Some(PayloadClass::Present) => note_store_route("packet_class_present"),
+        Some(PayloadClass::Control) => note_store_route("packet_class_control"),
+        None => {
+            note_store_route("packet_class_unclassified");
+            if crate::observe::first_sight(
+                "packet_class_unclassified",
+                (u64::from(channel as u8) << 16) | u64::from(opcode),
+            ) {
+                crate::observe::fail(format!(
+                    "packet_class_unclassified channel={channel:?} op={opcode:#x} (the model \
+                     has no payload class for this command, so admitting it would promise \
+                     ordering and completion for work it cannot describe — the ordering group \
+                     refuses the whole packet where this device acts on it)"
+                ));
+            }
+        }
+    }
+}
+
+/// Whether a lifetime packet names a task the lifecycle owner would hold.
+///
+/// **The resource-lifecycle group's remaining gate, and the last one it has.**
+/// `reims_vgpu_core::lifecycle::Lifecycle` refuses `NoSuchTask` for every one of
+/// the twelve commands except the definition itself, and the refusal is of the
+/// *whole packet* — so a guest that maps memory, retires a backing or deletes a
+/// task it never defined would lose that packet the day the group moves. This
+/// device refuses none of them: its task table is created on demand and its map
+/// family acts on whatever the record names.
+///
+/// `declare_object_name` already counts the same question for the declaration
+/// door, and this is the other eleven commands' half of it. The two are separate
+/// counters because they are separate events: a declaration is produced by
+/// resolution and can happen with no packet of its own, and these are packets.
+///
+/// # Why the refusals a namespace would make are not counted here
+///
+/// Eight of the twelve resolve a ref or a mapping before they reach
+/// `Lifecycle::apply`, and after the group moves that resolution goes through
+/// the same `Lifecycle` the apply does — `TaskNamespaces::resource` answers
+/// `Some` only for a slot that is live at its own generation, which is exactly
+/// what `Namespace::resolve` then accepts. So `Refusal::Namespace` cannot arrive
+/// from a packet whose operation was built a moment earlier out of that
+/// namespace: it is unreachable by construction rather than merely unobserved,
+/// and a counter for it would read zero for a reason a boot does not establish.
+/// The task term has no such argument — nothing resolves it — which is why it is
+/// the one that gets a census.
+///
+/// `LifecycleKind::of` is the same table `classify` reads, so a thirteenth
+/// command joins this census by existing.
+fn note_lifetime_task_definition(
+    state: &DeviceState,
+    channel: reims_vgpu_protocol::packets::Channel,
+    packet: &Packet,
+) {
+    use reims_vgpu_core::lifecycle::{task_named, LifecycleKind};
+    let Some(kind) = LifecycleKind::of(channel, packet.opcode) else {
+        return;
+    };
+    // A definition *is* the event that makes the task hold, so asking whether it
+    // already does would count every first definition as a refusal of a packet
+    // the model accepts.
+    if kind == LifecycleKind::DefineTask {
+        return;
+    }
+    let task = match task_named(kind, &packet.payload) {
+        Ok(task) => task,
+        // Short of its own record. Already reported by the arm that decodes it,
+        // and not this census's question: a packet whose task word is not there
+        // is refused before the task is asked about.
+        Err(_) => return,
+    };
+    if state.tasks.is_active(task.0) {
+        note_store_route("lifetime_command_in_a_defined_task");
+        return;
+    }
+    note_store_route("lifetime_command_in_an_undefined_task");
+    if crate::observe::first_sight(
+        "lifetime_command_in_an_undefined_task",
+        (u64::from(task.0) << 16) | u64::from(packet.opcode),
+    ) {
+        crate::observe::fail(format!(
+            "lifetime_command_in_an_undefined_task kind={} task={} op={:#x} (no CmdDefineTask2              opened this task, so the lifecycle owner these commands move to would refuse the              whole packet with NoSuchTask — this device acts on it)",
+            kind.name(),
+            task.0,
+            packet.opcode
+        ));
+    }
+}
+
 fn process_root_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     packet: &Packet,
 ) {
+    note_packet_class(reims_vgpu_protocol::packets::Channel::Root, packet.opcode);
+    note_lifetime_task_definition(state, reims_vgpu_protocol::packets::Channel::Root, packet);
     match packet.opcode {
         // The two device-info opcodes, one arm. They differ only in which form
         // their payload is — the newer one prepends a parse ceiling — and
         // reading either at the other's offsets would take the count for a page
         // frame and write the reply wherever that landed. Which form an opcode
-        // carries was the one thing the two arms did not share, so it is now
-        // the only thing that differs between them.
+        // carries is no longer this arm's answer at all: `query_request` asks
+        // `reims_vgpu_core::query::QueryKind`, so the two opcodes now differ
+        // here in nothing.
         ROOT_OP_DEVICE_INFO_TAHOE | ROOT_OP_DEVICE_INFO_MONTEREY => {
-            let (form, slug) = if packet.opcode == ROOT_OP_DEVICE_INFO_TAHOE {
-                (DeviceInfoForm::WithKeyLimit, "device_info_tahoe")
-            } else {
-                (DeviceInfoForm::WithoutKeyLimit, "device_info_monterey")
-            };
-            match decode_device_info(form, &packet.payload) {
-                Ok(request) => {
+            match query_request(WireChannel::Root, packet.opcode, &packet.payload, None) {
+                Some(RequestWords::DeviceInfo(request)) => {
+                    // Asked before the reply is written, because the question is
+                    // what this device identified at the moment of the write.
+                    crate::runtime::objects::note_device_info_reply_destination(
+                        state,
+                        request.reply_pfn,
+                    );
                     let _ = reply_device_info(host, &request, state.page_shift, state.gfx.version);
                 }
-                Err(short) => note_short_payload(slug, None, &short),
+                Some(_) => note_query_layout_mismatch("device_info", None),
+                None => {}
             }
         }
         // The two ends of one channel lifetime. They share a payload because
@@ -2301,25 +3889,77 @@ fn process_root_packet<H: HostMemory + HostOps>(
         // reading it here with a length check and an `ld32` at a named offset
         // was a second reading of one record.
         ROOT_OP_DEFINE_FIFO | ROOT_OP_FREE_FIFO => {
-            let opening = packet.opcode == ROOT_OP_DEFINE_FIFO;
-            let slug = if opening { "define_fifo" } else { "free_fifo" };
-            match crate::protocol::fifo::decode_channel_lifetime(&packet.payload) {
-                Ok(ch) if is_child_channel(ch) => {
-                    let bit = 1u32 << ch;
-                    if opening {
-                        state.active_child_mask |= bit;
-                    } else {
-                        state.active_child_mask &= !bit;
-                        // Only a free clears it: an open is not a claim that
-                        // nothing is pending on the channel, and clearing it
-                        // there would drop a drain the guest is owed.
-                        state.pending.child_mask &= !bit;
-                    }
-                    forget_child_channel(state, ch, bit);
+            // Which end of the lifetime this is used to be
+            // `packet.opcode == ROOT_OP_DEFINE_FIFO` — a direction decided from
+            // a constant inside the arm, in the shape the device-info form had.
+            // `reims_vgpu_core::control` reads it off the ledger instead, so
+            // the two opcodes differ here in nothing and the transition is a
+            // value rather than a comparison.
+            let op = match control::resolve(WireChannel::Root, packet.opcode, &packet.payload) {
+                Ok(op) => op,
+                Err(control::ResolveRefusal::Payload(short)) => {
+                    // The kind names the slug, so the reason a reader greps for
+                    // and the command it names cannot drift apart.
+                    let kind = ControlKind::of(WireChannel::Root, packet.opcode);
+                    note_short_payload(
+                        kind.map_or("channel_lifetime", ControlKind::name),
+                        None,
+                        &short,
+                    );
+                    return;
                 }
-                Ok(_) => {}
-                Err(short) => note_short_payload(slug, None, &short),
+                Err(refusal @ control::ResolveRefusal::NotControl { .. }) => {
+                    // This dispatch table and the ledger disagree about what a
+                    // control packet is. Unreachable while `ledger.rs` passes.
+                    crate::observe::fail(format!(
+                        "channel_lifetime_refused reason={} site=root op={:#x}",
+                        refusal.slug(),
+                        packet.opcode
+                    ));
+                    return;
+                }
+            };
+            let control::ControlOp::Channel { transition, domain } = op else {
+                // `ControlKind::channel_transition` answers `Some` for exactly
+                // these two opcodes, so another operation here would mean the
+                // ledger and this arm name different commands.
+                crate::observe::fail(format!(
+                    "channel_lifetime_not_a_channel_op site=root op={:#x} kind={}",
+                    packet.opcode,
+                    op.kind().name()
+                ));
+                return;
+            };
+            let ch = domain.0;
+            if !is_child_channel(ch) {
+                // Dropped in silence before this. A guest opening a domain this
+                // device has no FIFO for gets no ring drained and no completion
+                // published on it, which is a hang with nothing in the log.
+                crate::observe::fail(format!(
+                    "channel_lifetime_out_of_range site=root op={:#x} kind={} channel={ch} \
+                     max={MAX_CHANNELS} (this device drains no such FIFO, so every packet the \
+                     guest puts on it is a completion word nothing will publish)",
+                    packet.opcode,
+                    op.kind().name()
+                ));
+                return;
             }
+            let bit = 1u32 << ch;
+            // **The transition is the model's now.** This arm used to set and
+            // clear a bit of `DeviceState::active_child_mask`; the domain's
+            // openness is `SessionModel::open_channels` and this is the one
+            // writer of it. What stays here is everything that is *not* the
+            // domain's publication lifetime: the pending-work bit, and the
+            // per-channel drain state `forget_child_channel` resets.
+            let verdict = state.apply_channel_control(op);
+            note_channel_transition_verdict(verdict, transition, ch);
+            if transition == control::ChannelTransition::Free {
+                // Only a free clears it: an open is not a claim that nothing is
+                // pending on the channel, and clearing it there would drop a
+                // drain the guest is owed.
+                state.pending.child_mask &= !bit;
+            }
+            forget_child_channel(state, ch, bit);
         }
         ROOT_OP_DEFINE_TASK2 => apply_define_task2(state, host, &packet.payload, None),
         ROOT_OP_SET_OBJECT_LIST => apply_set_object_list(state, &packet.payload, None),
@@ -2341,209 +3981,69 @@ fn process_root_packet<H: HostMemory + HostOps>(
 
 /// Drain the main (root) FIFO while producer != consumer.
 pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    // The hold bit means "the last drain of this timeline stopped on an unmet
-    // stamp wait", so it is cleared on entry and set only by the arm that stops.
-    // Left sticky it would outlive the packet that set it and keep
-    // `retry_stamp_held_timelines` re-entering a ring with nothing in it.
-    state.stamp_deferred_mask &= !ROOT_FIFO_BIT;
     let ring_size = main_ring_data_size(state.gfx.fifo_length, state.gfx.fifo_start);
     if ring_size == 0 || state.gfx.fifo_base_page == 0 {
         state.pending.main_drain = false;
         return;
     }
     let base = state.pfn_gpa(state.gfx.fifo_base_page) + state.gfx.fifo_start as u64;
-    let mut completed = false;
 
-    while state
-        .gfx
-        .fifo_read
-        .load(std::sync::atomic::Ordering::Acquire)
-        != state.gfx.fifo_written
-    {
-        let Some(available) = published_byte_count(
-            state
-                .gfx
-                .fifo_read
-                .load(std::sync::atomic::Ordering::Acquire),
-            state.gfx.fifo_written,
-            ring_size,
-        ) else {
-            state.record_fail(FailEvent::MalformedRootPacket {
-                fault: PacketFault::DesyncedHeadTail,
-                head: state
-                    .gfx
-                    .fifo_read
-                    .load(std::sync::atomic::Ordering::Acquire),
-            });
-            break;
-        };
-        if available < PACKET_HEADER_LEN {
-            break;
-        }
-        // Snapshot up to min(available, ring_size) — header first then full packet.
-        let header = match read_ring_bytes(
-            host,
-            base,
-            ring_size,
-            state
-                .gfx
-                .fifo_read
-                .load(std::sync::atomic::Ordering::Acquire),
-            PACKET_HEADER_LEN,
-        ) {
-            Ok(h) => h,
-            Err(_) => {
-                state.record_fail(FailEvent::MalformedRootPacket {
-                    fault: PacketFault::RootHeaderRead,
-                    head: state
-                        .gfx
-                        .fifo_read
-                        .load(std::sync::atomic::Ordering::Acquire),
-                });
+    let ring = Ring::Root {
+        base_gpa: base,
+        capacity: ring_size,
+    };
+    loop {
+        // Loaded once per turn and used for the whole of it. Every read below
+        // used to load it again, which was the same value each time — nothing
+        // advances the consumer pointer until this loop stores to it — read
+        // seven ways.
+        let head = state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire);
+        match arrival(&ring, host, head, state.gfx.fifo_written) {
+            Arrival::Nothing => break,
+            Arrival::Fault(fault) => {
+                state.record_fail(FailEvent::MalformedRootPacket { fault, head });
                 break;
             }
-        };
-        let snap_len = packet_snapshot_len(&header, available, ring_size);
-        let snap = match read_ring_bytes(
-            host,
-            base,
-            ring_size,
-            state
-                .gfx
-                .fifo_read
-                .load(std::sync::atomic::Ordering::Acquire),
-            snap_len,
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                state.record_fail(FailEvent::MalformedRootPacket {
-                    fault: PacketFault::RootSnapRead,
-                    head: state
-                        .gfx
-                        .fifo_read
-                        .load(std::sync::atomic::Ordering::Acquire),
-                });
-                break;
-            }
-        };
-        match decode_packet(
-            &snap,
-            state
-                .gfx
-                .fifo_read
-                .load(std::sync::atomic::Ordering::Acquire),
-            available,
-            ring_size,
-        ) {
-            Ok(packet) => {
-                // The main FIFO stamps per packet and latches nothing, so there is
-                // no pending value here for a wait to be answered from.
-                if note_packet_stamp_waits(state, host, None, &packet, None) == StampVerdict::Hold {
-                    // Same hold as the child drain, and this is the timeline
-                    // where it matters most: the measured root wait is a
-                    // `DELETE_TASK` ordered behind a child FIFO's stamp, so
-                    // running it early tears down a task whose work has not
-                    // been drained. `fifo_read` stays where it is and no root
-                    // completion stamp is written, so the retry is the same
-                    // packet with the same effects still owed.
-                    note_store_route("packet_stamp_wait_held");
-                    state.stamp_deferred_mask |= ROOT_FIFO_BIT;
-                    state.pending.main_drain = true;
-                    break;
-                }
-                process_root_packet(state, host, &packet);
+            Arrival::Packet(packet) => {
+                // The census, asked for the reading and not for a verdict. The
+                // wait this timeline holds most often is a `DELETE_TASK`
+                // ordered behind a child FIFO's stamp, and running it early
+                // tears down a task whose work has not been drained — which is
+                // exactly the ordering `admit` now holds, on a position rather
+                // than on this ring's consumer pointer.
+                note_packet_stamp_waits(state, host, None, &packet);
+
+                // The head advances first and unconditionally; see the child
+                // drain's copy for why that is the whole of the switch.
                 state
                     .gfx
                     .fifo_read
                     .store(packet.next_head, std::sync::atomic::Ordering::Release);
-                // Root stamp = slot 0.
-                if state.gfx.fifo_base_page != 0 {
-                    if let Some(off) = stamp_slot_offset(0, state.page_size()) {
-                        // Census: the root FIFO publishes slot 0 inline rather
-                        // than through `write_stamp`, so it records here or the
-                        // ledger would never see slot 0 leave the owed state.
-                        let page_bytes = state.page_size();
-                        state
-                            .stamp_ledger
-                            .wrote(0, packet.completion_stamp, page_bytes);
-                        // Root and child FIFOs own the same bounded pending-stamp
-                        // queue contract. Slot 0 therefore takes the same
-                        // submission-attached completion rail: the completion
-                        // worker publishes the word and announces it in that
-                        // order, while `completed` stays false so this drain does
-                        // not announce an unfinished root stamp.
-                        if crate::backend::selected().order_completion_stamp(
-                            state,
-                            host,
-                            0,
-                            packet.completion_stamp,
-                            crate::runtime::render_writeback::SettleSite::RootStamp,
-                        ) == crate::backend::StampOrdering::Queued
-                        {
-                            note_store_route("root_stamp_ordered_gpu");
-                            state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
-                            continue;
-                        }
-                        let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
-                        if gpa_map::write_u32(
-                            host,
-                            gpa,
-                            packet.completion_stamp,
-                            state.page_size() as usize,
-                        )
-                        .is_ok()
-                        {
-                            // A window armed after this point has outlived a fence
-                            // the moment it is still armed at the next one. The
-                            // counter is what `armed_stamp_seq` is compared
-                            // against, so a rail that does not move it reads as
-                            // punctual however long it actually waited.
-                            state.completion_stamp_seq = state.completion_stamp_seq.wrapping_add(1);
-                            completed = true;
-                        } else {
-                            // The guest waits on this root completion stamp; a
-                            // silent writeback failure hangs it forever with no
-                            // trace (drain.rs Rank-2 audit).
-                            state.record_fail(FailEvent::MalformedRootPacket {
-                                fault: PacketFault::RootStampWriteback,
-                                head: state
-                                    .gfx
-                                    .fifo_read
-                                    .load(std::sync::atomic::Ordering::Acquire),
-                            });
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                // `fault()` decides which errors reach the log: a packet the
-                // producer is still writing is ring control flow and answers
-                // `None`. Either way the drain stops here and comes back.
-                if let Some(fault) = err.fault() {
-                    state.record_fail(FailEvent::MalformedRootPacket {
-                        fault,
-                        head: state
-                            .gfx
-                            .fifo_read
-                            .load(std::sync::atomic::Ordering::Acquire),
-                    });
-                }
-                break;
+
+                admit_and_park(
+                    state,
+                    host,
+                    crate::runtime::ingress::Fifo::ROOT,
+                    ROOT_STAMP_SLOT,
+                    packet,
+                );
+                settle_model_work(state, host);
             }
         }
     }
 
-    if completed {
-        state
-            .gfx
-            .interrupt_status_gpu
-            .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
-        host.enqueue(HostAction::irq_gfx());
-    }
-    // A root head held on an unmet stamp wait is unfinished work, not a drained
-    // ring: clearing the flag unconditionally here would drop the retry and the
-    // packet would only run again if some later doorbell happened to set it.
-    state.pending.main_drain = state.stamp_deferred_mask & ROOT_FIFO_BIT != 0;
+    // A last look at what the model released, for the same reason the child
+    // drain takes one: a decode fault stops this loop, and a position that
+    // became runnable while it was working is still owed.
+    settle_model_work(state, host);
+    // A parked root position is unfinished work, not a drained ring: clearing
+    // the flag here would drop the retry, and the packet would only run again
+    // if some later doorbell happened to set it. It is asked of the store
+    // rather than of a mask, because the store is what holds the work.
+    state.pending.main_drain = !state.parked.is_empty();
 }
 
 fn ensure_child_ring<M: HostMemory>(
@@ -3712,10 +5212,44 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // both. So these intervals are the page-table ranges and not merely
         // consistent with themselves. Observation only; nothing reads the
         // verdict. See `runtime::map_audit`.
+        // The notice, in the model that owns the address space it is about.
+        // `Lifecycle` holds nothing keyed by a guest address — deliberately, so
+        // that no resolution it hands out can go stale behind its back — so it
+        // performs nothing here and states the obligation instead: every
+        // resolution held over this interval was computed against pages the
+        // guest has since moved. The audit and the retirements below are this
+        // device discharging exactly that, and the direction they discharge it
+        // in is the model's `Remap::established` rather than a second reading of
+        // the opcode.
+        let remapped = state
+            .apply_lifetime(
+                &if matches!(family, MapFamily::MapMemory2) {
+                    reims_vgpu_core::lifecycle::LifecycleOp::MapMemory {
+                        task: reims_vgpu_core::identity::TaskId(task_id),
+                        span: reims_vgpu_core::access::GuestSpan { base: gva, length },
+                    }
+                } else {
+                    reims_vgpu_core::lifecycle::LifecycleOp::UnmapMemory {
+                        task: reims_vgpu_core::identity::TaskId(task_id),
+                        span: reims_vgpu_core::access::GuestSpan { base: gva, length },
+                    }
+                },
+                family.slug(),
+            )
+            .and_then(|acted| acted.remapped.into_iter().next());
         {
             let page_size = 1u64 << state.page_shift;
+            // The model's answer where there is one. A refusal is reported by
+            // the door and the audit still runs off the packet's own opcode:
+            // this device's caches alias pages whether or not the model kept a
+            // task for them, and an invalidation it skipped would leave a host
+            // view over memory the guest has taken back.
+            let established = remapped.map_or_else(
+                || matches!(family, MapFamily::MapMemory2),
+                |r| r.established,
+            );
             let intervals = state.map_audit.entry(task_id).or_default();
-            let verdict = if matches!(family, MapFamily::MapMemory2) {
+            let verdict = if established {
                 intervals.map(gva, length, page_size)
             } else {
                 intervals.unmap(gva, length)
@@ -3853,6 +5387,23 @@ fn apply_map_family<H: HostMemory + HostOps>(
         // bookkeeping. Keeping page_entries after it lets later id reuse/clear
         // write pixels into pages the guest has recycled.
         let crate::protocol::fifo::DeleteBackingCommand { object_id, task_id } = retire;
+        // The retirement, in the model that owns the names over these bytes.
+        // The contract retires the backing *and* the resources that named it,
+        // so the teardowns below are the model's per-name answers rather than a
+        // second walk of anything here — and they are counted rather than acted
+        // on, because the host-side condemnation this arm performs is keyed by
+        // the mapping id and covers the same storage whichever names were on it.
+        if let Some(acted) = lifetime_operation(
+            state,
+            host,
+            reims_vgpu_protocol::packets::Channel::Child,
+            packet.opcode,
+            &packet.payload,
+        )
+        .and_then(|op| state.apply_lifetime(&op, family.slug()))
+        {
+            note_store_route_n("backing_retire_teardowns", acted.teardowns.len() as u64);
+        }
         // Never write guest pages here — the delete trails the guest's
         // CPU-side release asynchronously and the pages may already be
         // recycled (boot-16 PTE-corruption panic: a 14.7 MB delete-time
@@ -3892,6 +5443,18 @@ fn apply_map_family<H: HostMemory + HostOps>(
         use crate::runtime::resource_validity::{apply, ValiditySite};
         match decode_invalidate_resources(&packet.payload) {
             Ok(cmd) => {
+                // Read-only, and taken before anything is applied: whether the
+                // model's list join could have resolved this packet at all. See
+                // `objects::note_lifetime_refs_named`.
+                crate::runtime::objects::note_lifetime_refs_named(
+                    state,
+                    host,
+                    cmd.task_id,
+                    &cmd.records
+                        .iter()
+                        .map(|rec| rec.object_id)
+                        .collect::<Vec<_>>(),
+                );
                 let mut bumped = 0u32;
                 let mut miss = 0u32;
                 for rec in &cmd.records {
@@ -3913,6 +5476,25 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 // table names task object refs, most of which have no
                 // surface state by construction.
                 note_store_route_n("validity_miss_inv", miss as u64);
+                // The same statement, in the model that owns content authority
+                // — after the loop above, because that loop is what names the
+                // refs on this device and the model's list join resolves every
+                // ref or refuses the whole packet. The guest is declaring it
+                // CPU-authored these resources' pages: authority moves to the
+                // guest replica, outside the GPU timeline, and the device's own
+                // validity quads above are the host-cache half of the same
+                // event.
+                if let Some(acted) = lifetime_operation(
+                    state,
+                    host,
+                    reims_vgpu_protocol::packets::Channel::Child,
+                    packet.opcode,
+                    &packet.payload,
+                )
+                .and_then(|op| state.apply_lifetime(&op, family.slug()))
+                {
+                    note_inert_lifetime_effects(family.slug(), &acted);
+                }
                 let rec0 = cmd.records.first();
                 let oid = rec0.map(|r| r.object_id).unwrap_or(0);
                 let flags = rec0.map(|r| r.flags).unwrap_or(0);
@@ -3993,6 +5575,36 @@ fn apply_map_family<H: HostMemory + HostOps>(
         use crate::protocol::fifo::decode_synchronize_resources;
         match decode_synchronize_resources(&packet.payload) {
             Ok(cmd) => {
+                crate::runtime::objects::note_lifetime_refs_named(
+                    state,
+                    host,
+                    cmd.task_id,
+                    &cmd.object_ids,
+                );
+                // The command, in the model that owns content authority — after
+                // the naming above, because every ref resolves or the whole
+                // packet refuses, and this device names a reference the first
+                // time anything asks what it names. The model's answer is the
+                // deferred discards: a synchronise-and-discard offers each
+                // resource's copy for release, and the offer is taken only where
+                // nothing else still answers for those bytes.
+                //
+                // The transfers it can also owe are structurally none here —
+                // see `crate::model::state`'s effects door — and the
+                // resource-scoped submit below is this device's own deferred
+                // Store obligation, which is a different fact from content
+                // authority and stays where it is.
+                let deferred = lifetime_operation(
+                    state,
+                    host,
+                    reims_vgpu_protocol::packets::Channel::Child,
+                    packet.opcode,
+                    &packet.payload,
+                )
+                .and_then(|op| state.apply_lifetime(&op, family.slug()))
+                .map(|acted| acted.at_completion.len())
+                .unwrap_or(0);
+                note_store_route_n("lifetime_discard_offered", deferred as u64);
                 // Synchronization is resource-scoped. Apple batches the named
                 // resources into transfer encoders; synchronizing one object
                 // does not publish every other host-valid texture in the task.
@@ -4107,12 +5719,180 @@ fn sync_exec_stalled(total_us: u64) -> bool {
     total_us >= SYNC_EXEC_STALL_US
 }
 
+/// Whether a child opcode is one of the reference host's retired slots.
+///
+/// **The one place this device asks that question.** The fifteen numbers the
+/// reference host routes to its shared deprecated handler used to be
+/// transcribed into `model::regs` beside this crate's own command constants, so
+/// the closure ledger and the drain each carried a list and a slot that went
+/// live had to be remembered in both. The ledger is the authority now: a row it
+/// judges `ProvenNoOp` is what
+/// [`reims_vgpu_core::control::ControlKind::of`] calls a
+/// [`RetiredSlot`](reims_vgpu_core::control::ControlKind::RetiredSlot).
+///
+/// This is deliberately *not* the wider `payload_is_inert` question, which is
+/// also true of `CmdNOP`. `CmdNOP` is a live command with a constant of its own
+/// and an arm that names it, and `dispatch_agrees_with_the_packet_ledger` reads
+/// exactly that: every live command is named by its constant, and the retired
+/// slots — which have no constant, by design — are the only rows the dispatch
+/// reaches without naming. Selecting `CmdNOP` by kind instead of by constant
+/// would move it into that asymmetry and make the scan's claim weaker for
+/// nothing.
+///
+/// Retired is about the payload and never about the packet. The stamp waits,
+/// the ordering position and the completion word are owed identically, and the
+/// drain discharges them for every accepted packet whatever this returns.
+fn is_retired_control_slot(opcode: u16) -> bool {
+    ControlKind::of(WireChannel::Child, opcode) == Some(ControlKind::RetiredSlot)
+}
+
+/// What `SessionModel::apply_control` answered this channel transition.
+///
+/// # Two refusals this device did not have
+///
+/// The model's channel set has two guarded doors, and this device had neither
+/// guard while it kept its own bit:
+///
+/// * a definition of a domain already open is `ChannelAlreadyOpen`. Here an open
+///   was `active_child_mask |= bit` — idempotent — and a redefinition is a real
+///   event on this interface: `forget_child_channel` resets the ring cursor and
+///   the translation masks precisely so a redefined FIFO does not inherit the
+///   previous producer's position.
+/// * a free of a domain no definition opened is `ChannelNotOpen`, and one that
+///   still holds unreleased publication positions is `Owed`. Here a free was
+///   `&= !bit` whatever the domain's history.
+///
+/// A refusal withholds no completion word — a control transaction publishes its
+/// stamp whether its transition happened or not, which the model's own doc
+/// states, and the drain still owns that envelope. What a refusal costs is the
+/// model-side *effect*: a refused redefinition leaves the domain open where this
+/// device would have re-opened it, and a refused free leaves it open too. The
+/// device-side effects either way are unchanged, because
+/// `forget_child_channel` runs on the transition and not on the verdict.
+///
+/// `channel_transition_model_agrees` is the denominator, without which a boot
+/// that sent no channel commands reads like a clean one.
+///
+/// # What a driven boot answered, and why five is the population
+///
+/// x86 Vulkan, macos-15, host-driven workload — three rounds of launching and
+/// quitting five applications over ssh, 2049 child packets against an idle
+/// boot's 1916: **`channel_transition_model_agrees=5`,
+/// `channel_open_of_open_domain=0`, `channel_free_of_undefined_domain=0`.**
+///
+/// The five did not move under the workload, and that is the finding rather than
+/// a thin sample. This guest establishes its FIFO set once, at accelerator
+/// start, and per-application GPU contexts share those channels — launching and
+/// quitting applications creates and destroys no domain. So five is what a boot
+/// *has*, the model refuses none of them, and that is what let this lifetime
+/// move.
+fn note_channel_transition_verdict(
+    verdict: Result<(), reims_vgpu_core::session::ControlRefusal>,
+    transition: control::ChannelTransition,
+    channel: u32,
+) {
+    let Err(refusal) = verdict else {
+        note_store_route("channel_transition_model_agrees");
+        return;
+    };
+    let route = match transition {
+        control::ChannelTransition::Open => "channel_open_of_open_domain",
+        control::ChannelTransition::Free => "channel_free_of_undefined_domain",
+    };
+    note_store_route(route);
+    if crate::observe::first_sight(route, u64::from(channel)) {
+        crate::observe::fail(format!(
+            "{route} channel={channel} reason={} (the guest asked for a transition the \
+             domain's lifetime owner refuses, so the domain is left as it was)",
+            refusal.slug()
+        ));
+    }
+}
+
+/// Whether a packet's own domain was opened by a channel definition, which is
+/// the gate the replacement model applies and this device does not.
+///
+/// # The question this exists to answer, and why a reading cannot
+///
+/// `reims_vgpu_core::session::SessionModel::admit` refuses any packet whose
+/// domain is not in `open_channels`, and `open_channels` has exactly one event:
+/// `ControlOp::Channel { transition: Open }`. This device has three events that
+/// make a child domain live — that packet, the locked `GFX_REG_CHILD_DOORBELL`
+/// write in `crate::runtime::mmio`, and the lock-free ring
+/// [`fold_rung_child_doorbells`] folds in — and two of them say nothing about a
+/// definition. `DeviceState::active_child_mask` is the union, so it cannot tell
+/// the three apart after the fact.
+///
+/// That difference decides whether channel lifetime can be the first group to
+/// cut over. If this guest ever puts work on a domain it never defined, the
+/// model's gate turns every packet on that domain into a typed refusal — which
+/// is a hang that names itself, and still a hang. If it never does, the gate is
+/// a restatement of what this device already requires and the group can move.
+///
+/// # It selects nothing
+///
+/// The disposition is unchanged either way. This reads a mask no behaviour
+/// consults and writes two routes, which is what
+/// `crates/reims-vgpu-observe` is for: it describes the decision the model
+/// *would* make, on a device that is not making it.
+///
+/// `child_packet_domain_defined` is the denominator's other half — without it a
+/// boot where every packet's domain was defined and a boot where the guest sent
+/// no child packets at all read the same.
+///
+/// # What a driven boot answered
+///
+/// x86 Vulkan, macos-15, 391 s to the desktop with a guest frame presented:
+/// **`child_packet_domain_defined=1395`, `child_packet_domain_undefined=0`**,
+/// and **2049 / 0** on a later boot driven through three rounds of application
+/// launches and quits.
+/// Every child packet this guest sent was on a domain a `CmdDefineChannel` had
+/// opened, so the model's `ChannelNotOpen` gate would have refused none of
+/// them. The doorbell-only path is real in this device's code and this guest
+/// does not carry packets on a domain it did not define.
+///
+/// That is one of the three terms the channel-lifetime group needs, and it is
+/// the one that would have been a hang. The other two are what
+/// [`note_channel_transition_verdict`] counts, and they are not hangs.
+fn note_packet_domain_definition(state: &DeviceState, channel_id: u32, opcode: u16) {
+    if state.child_domain_open(channel_id) {
+        note_store_route("child_packet_domain_defined");
+        return;
+    }
+    note_store_route("child_packet_domain_undefined");
+    if crate::observe::first_sight(
+        "child_packet_domain_undefined",
+        u64::from(channel_id) << 32 | u64::from(opcode),
+    ) {
+        crate::observe::fail(format!(
+            "child_packet_domain_undefined channel={channel_id} op={opcode:#x} (this domain \
+             was made live by a doorbell and never by a channel definition, so the \
+             replacement model would refuse every packet on it — the definition is the \
+             only event its open-channel set has)"
+        ));
+    }
+}
+
+/// Do one child packet's host work.
+///
+/// `retained` is what a caller running a packet at an ordering position holds:
+/// the command buffers read out of the task's address space **before** the ring
+/// head moved past this packet — the exec class's only input that is not in the
+/// packet — together with the records the model resolved those buffers into.
+/// `None` means "read it now", which is what a caller holding the packet at its
+/// ring position does. The retained form is the same bytes the transaction was
+/// admitted against rather than whatever the guest has since put at those
+/// addresses, and the same records it was admitted as.
 fn process_child_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     channel_id: u32,
     packet: &Packet,
+    retained: Option<crate::runtime::exec::RetainedInputs<'_>>,
 ) -> ChildPacketDisposition {
+    note_packet_domain_definition(state, channel_id, packet.opcode);
+    note_packet_class(reims_vgpu_protocol::packets::Channel::Child, packet.opcode);
+    note_lifetime_task_definition(state, reims_vgpu_protocol::packets::Channel::Child, packet);
     match packet.opcode {
         CHILD_OP_DEFINE_TASK2 => {
             apply_define_task2(state, host, &packet.payload, Some(channel_id));
@@ -4267,7 +6047,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // different problems and only one of them is closed by writing a
             // handler.
             match crate::protocol::fifo::decode_delete_object(&packet.payload) {
-                Ok(command) => apply_delete_object(state, channel_id, &command, packet),
+                Ok(command) => apply_delete_object(state, host, channel_id, &command, packet),
                 Err(error) => note_short_payload(error.slug(), Some(channel_id), &error.short()),
             }
         }
@@ -4313,13 +6093,17 @@ fn process_child_packet<H: HostMemory + HostOps>(
             // `reply_compute_info` each carried their own literal `24`, so
             // neither check could be wrong without the other being wrong too —
             // and no test built a request at all, so neither was exercised.
-            match crate::protocol::fifo::decode_compute_info(&packet.payload) {
-                Ok(request) => {
+            match query_request(
+                WireChannel::Child,
+                packet.opcode,
+                &packet.payload,
+                Some(channel_id),
+            ) {
+                Some(RequestWords::ComputeInfo(request)) => {
                     let _ = reply_compute_info(state, host, &request);
                 }
-                Err(short) => {
-                    note_short_payload("get_compute_info", Some(channel_id), &short);
-                }
+                Some(_) => note_query_layout_mismatch("compute_info", Some(channel_id)),
+                None => {}
             }
         }
         CHILD_OP_CURSOR_SHOW => match crate::protocol::fifo::decode_cursor_show(&packet.payload) {
@@ -4350,8 +6134,33 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // Process this channel's exec packet. Archive does not drain
                 // other child FIFOs here; surface RAW is render_wait_surface on
                 // the specific mapper-ref-texture/GVA key at sample/Load/swap sites.
-                let result =
-                    crate::runtime::exec::process_exec_indirect2(state, host, &packet.payload);
+                // A retained submission runs planned: whether its translations
+                // were done is what decided the packet could run at all, so
+                // asking again would be paying per pipeline for an answer the
+                // model already acted on.
+                // **There is one execution path and this is it.** An exec
+                // packet whose command buffers could not be read at arrival is
+                // refused by the ingress bridge (`Gap::ExecStreamsUnread`) and
+                // never reaches an ordering position, and a packet that did
+                // reach one carries both halves by construction — so `None`
+                // here is this device having lost the bytes between admission
+                // and release, not a guest fact. Reading the payload again to
+                // recover would read whatever the guest has since put at those
+                // addresses, which is the second reader the switch exists to
+                // remove; the position is named and nothing runs.
+                let Some(inputs) = retained else {
+                    note_store_route("exec_retained_inputs_missing");
+                    crate::observe::fail(format!(
+                        "exec_retained_inputs_missing reason=parked_without_submission                          ch={channel_id} (an admitted exec packet reached execution without                          the command buffers it was admitted against, so its records cannot                          be run from the bytes the transaction named)"
+                    ));
+                    return ChildPacketDisposition::Complete;
+                };
+                let result = crate::runtime::exec::execute_planned(
+                    state,
+                    host,
+                    inputs,
+                    crate::runtime::exec::ExecResult::default(),
+                );
                 let channel_bit = 1u32.checked_shl(channel_id).unwrap_or(0);
                 if result.deferred {
                     if channel_bit != 0 && state.translation_deferred_mask & channel_bit == 0 {
@@ -4502,6 +6311,73 @@ fn process_child_packet<H: HostMemory + HostOps>(
                         cmd.task_id,
                         cmd.object_id,
                     );
+                    // And then the model, in that order. The re-point's
+                    // operation names pages the packet does not carry, so the
+                    // storage is asked for *after* this device has moved the
+                    // incarnation — see `objects::repointed_storage` for why an
+                    // earlier answer is the old one.
+                    match crate::runtime::objects::repointed_storage(
+                        state,
+                        host,
+                        cmd.task_id,
+                        cmd.object_id,
+                    ) {
+                        Ok((resource, backing, extent)) => {
+                            if let Some(acted) = state.apply_lifetime(
+                                &reims_vgpu_core::lifecycle::LifecycleOp::ReplacePhysical {
+                                    task: reims_vgpu_core::identity::TaskId(cmd.task_id),
+                                    resource,
+                                    backing,
+                                    extent,
+                                },
+                                "replace_physical",
+                            ) {
+                                note_store_route_n(
+                                    "replace_physical_teardowns",
+                                    acted.teardowns.len() as u64,
+                                );
+                            }
+                        }
+                        // The reference names no describable storage, so there
+                        // is no operation to state. Counted by reason rather
+                        // than as one bucket: a reference that owns no bytes is
+                        // a non-event, while storage this device cannot
+                        // describe is a re-point the model never hears about,
+                        // which leaves its content authority on the old pages.
+                        Err(refusal) => {
+                            note_store_route(refusal.route());
+                            // The type pair, separately. `route` puts a
+                            // no-bytes reference whose integer also names a
+                            // live mapping surface under the mapping arm — the
+                            // one that would mean a real re-point went unheard
+                            // — and that shadows the kind the guest's own list
+                            // is holding there. Both are needed: the integer
+                            // agreeing is a collision until the type agrees too.
+                            if matches!(
+                                refusal,
+                                crate::runtime::objects::RepointStorageRefusal::NoBytes { .. }
+                            ) {
+                                note_store_route(refusal.no_bytes_kind_route());
+                            }
+                            if refusal.leaves_authority_stale()
+                                && crate::observe::first_sight(
+                                    "replace_physical_storage_undescribable",
+                                    u64::from(cmd.task_id) << 32 | u64::from(cmd.object_id),
+                                )
+                            {
+                                crate::observe::fail(format!(
+                                    "replace_physical_storage_undescribable \
+                                     task={} object={} reason={} (the guest re-pointed \
+                                     storage this device cannot describe to the semantic \
+                                     model, so the model's content authority for it stays \
+                                     on the pages the guest has already rewired)",
+                                    cmd.task_id,
+                                    cmd.object_id,
+                                    refusal.route(),
+                                ));
+                            }
+                        }
+                    }
                 }
                 Err(short) => {
                     note_short_payload("replace_physical", Some(channel_id), &short);
@@ -4582,6 +6458,28 @@ fn process_child_packet<H: HostMemory + HostOps>(
             use crate::protocol::fifo::decode_synchronize_resources;
             match decode_synchronize_resources(&packet.payload) {
                 Ok(cmd) => {
+                    crate::runtime::objects::note_lifetime_refs_named(
+                        state,
+                        host,
+                        cmd.task_id,
+                        &cmd.object_ids,
+                    );
+                    // The model's half of the same release, after the naming
+                    // above for the reason the list join gives: every ref
+                    // resolves or the whole packet refuses. It offers each
+                    // resource's copy at completion; this arm's own release is
+                    // of the transfer staging, which the model has no key for.
+                    let deferred = lifetime_operation(
+                        state,
+                        host,
+                        reims_vgpu_protocol::packets::Channel::Child,
+                        packet.opcode,
+                        &packet.payload,
+                    )
+                    .and_then(|op| state.apply_lifetime(&op, "discard_resources"))
+                    .map(|acted| acted.at_completion.len())
+                    .unwrap_or(0);
+                    note_store_route_n("lifetime_discard_offered", deferred as u64);
                     let discarded = crate::runtime::writeback_debt::discard_gva_resources(
                         state,
                         cmd.task_id,
@@ -4626,7 +6524,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // packet, does nothing with the payload and retires the stamps, which is
         // exactly what this arm does — so matching them is fidelity, and the
         // record exists only to say a guest is still emitting one.
-        op if is_deprecated_child_opcode(op) => {
+        //
+        // Which numbers those are is the closure ledger's judgement, read
+        // through [`is_retired_control_slot`]. This device used to carry its own
+        // fifteen-entry transcription of them, which is one list too many for a
+        // set whose whole content is "the ledger proved these do nothing".
+        op if is_retired_control_slot(op) => {
             note_unimplemented(state, channel_id, UnimplementedCommand::Deprecated, packet);
         }
         // Everything left is an opcode with no handler at all. Two different
@@ -4752,6 +6655,14 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     if ring_length == 0 {
         return;
     }
+    // The channel-id bound again, in the vocabulary the model's packets carry.
+    // `child_reg_block_offset` above already refused every id `is_child_channel`
+    // refuses, so this cannot be `None` — and it is asked rather than
+    // constructed because a `Fifo` is what makes "which opcode table" and
+    // "which ordering domain" one answer.
+    let Some(fifo) = crate::runtime::ingress::Fifo::child(channel_id) else {
+        return;
+    };
     let page_gpas = state.child_rings[channel_id as usize].page_gpas.clone();
     census::note_drain_setup(setup_started.elapsed().as_nanos() as u64);
 
@@ -4761,22 +6672,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     let bit = 1u32 << channel_id;
     state.draining_channel = channel_id;
     state.draining_mask |= bit;
-    // Cleared on entry and set only by the arm that stops on an unmet stamp
-    // wait, so the bit always describes this drain rather than an older one.
-    // See `drain_main_fifo`'s copy for what a sticky bit would cost.
-    state.stamp_deferred_mask &= !bit;
-
-    // Every packet below stamps `stamp_index`, which was read once above, so the
-    // whole drain owes one slot one value. See [`PendingStamp`] for why that is
-    // collapsed rather than written per packet, and `config::STAMP_COALESCE` for
-    // the switch that restores the per-packet arm.
-    let coalesce =
-        crate::config::switch(crate::config::STAMP_COALESCE) != crate::config::Switch::Off;
-    let mut pending = PendingStamp::default();
-    // The slot the latch is about, resolved the same way `write_stamp` resolves
-    // it, so a wait naming that slot is compared against the same index the
-    // pending value will be written to.
-    let stamp_index_slot = stamp_slot_index(stamp_index);
 
     loop {
         let regs_started = std::time::Instant::now();
@@ -4796,105 +6691,35 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
         };
-        if head == tail {
-            break;
-        }
-        let Some(available) = published_byte_count(head, tail, ring_length) else {
-            state.record_fail(FailEvent::MalformedChildPacket {
-                channel: channel_id,
-                fault: PacketFault::DesyncedHeadTail,
-                head,
-            });
-            break;
+        let ring = Ring::Child {
+            page_gpas: &page_gpas,
+            capacity: ring_length,
+            page_shift: state.page_shift,
         };
-        if available < PACKET_HEADER_LEN {
-            break;
-        }
-        let header = match read_child_ring_bytes(
-            host,
-            &page_gpas,
-            ring_length,
-            head,
-            PACKET_HEADER_LEN,
-            state.page_shift,
-        ) {
-            Ok(h) => h,
-            Err(_) => {
+        match arrival(&ring, host, head, tail) {
+            Arrival::Nothing => break,
+            Arrival::Fault(fault) => {
                 state.record_fail(FailEvent::MalformedChildPacket {
                     channel: channel_id,
-                    fault: PacketFault::ChildHeaderRead,
+                    fault,
                     head,
                 });
                 break;
             }
-        };
-        let snap_len = packet_snapshot_len(&header, available, ring_length);
-        let snap = match read_child_ring_bytes(
-            host,
-            &page_gpas,
-            ring_length,
-            head,
-            snap_len,
-            state.page_shift,
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                state.record_fail(FailEvent::MalformedChildPacket {
-                    channel: channel_id,
-                    fault: PacketFault::ChildSnapRead,
-                    head,
-                });
-                break;
-            }
-        };
-        // Entry gate before decode of full payload: hold CmdDisplaySwap when
-        // host paint is already two presents behind (apple-gfx pending_frames
-        // >= 2). Leave head unmoved so body draws on other channels can still
-        // land via drain_other; re-enter after note_present_paint_consumed.
-        let peek_opcode = ld16(&header[PACKET_OPCODE..]);
-        if matches!(
-            peek_opcode,
-            CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
-        ) && state.present.unpainted_presents >= MAX_UNPAINTED_PRESENTS
-        {
-            note_present_backpressure_hold(state, channel_id, head, tail);
-            // Paint will schedule the next worker slice. Preserve this channel
-            // without self-waking the worker ahead of QEMU's action BH.
-            state.pending.child_mask |= bit;
-            break;
-        }
-        match decode_packet(&snap, head, available, ring_length) {
-            Ok(packet) => {
-                if note_packet_stamp_waits(
-                    state,
-                    host,
-                    Some(channel_id),
-                    &packet,
-                    Some((stamp_index_slot, pending)),
-                ) == StampVerdict::Hold
-                {
-                    // The guest ordered this packet behind work that has not
-                    // reached its stamp. Hold it: head and completion stamp stay
-                    // untouched, so the retry re-decodes the same bytes and no
-                    // side effect can land twice. Never block — the awaited
-                    // stamp is published by *another* timeline's drain, and this
-                    // one is single-threaded, so waiting here would deadlock
-                    // against the thing being waited for.
-                    note_store_route("packet_stamp_wait_held");
-                    state.stamp_deferred_mask |= bit;
-                    state.pending.child_mask |= bit;
-                    break;
-                }
-                let proc_started = std::time::Instant::now();
-                let disposition = process_child_packet(state, host, channel_id, &packet);
-                census::note_drain_proc(packet.opcode, proc_started.elapsed().as_nanos() as u64);
-                if disposition == ChildPacketDisposition::Deferred {
-                    // Translation owns only immutable AIR bytes. Keep head and
-                    // stamp untouched so retry cannot duplicate any packet
-                    // side effect; continue with sibling channels in the
-                    // outer pending-drain loop.
-                    break;
-                }
+            Arrival::Packet(packet) => {
+                // The census the model's own stamp plane now acts on. Asked for
+                // the reading and not for a verdict: a wait that is not yet met
+                // is an ordering position in `admit`, not a ring head this loop
+                // refuses to move.
+                note_packet_stamp_waits(state, host, Some(channel_id), &packet);
+
+                // **The head advances first, and unconditionally.** Everything
+                // this packet needs has been taken out of the ring — the
+                // snapshot is decoded and the exec class's command buffers are
+                // read at arrival — so the ring position is free whatever the
+                // model then decides. That is the switch: a packet that cannot
+                // run yet holds an ordering position instead of a consumer
+                // pointer, and the packets behind it are not behind anything.
                 head = packet.next_head;
                 let head_started = std::time::Instant::now();
                 let head_write = gpa_map::write_u32(
@@ -4908,10 +6733,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     head_started.elapsed().as_nanos() as u64,
                 );
                 if head_write.is_err() {
-                    // The packet was processed + stamped, but the consumer
-                    // pointer never advanced: the next drain re-reads the stale
-                    // head and RE-EXECUTES the same packets. Fail-visible so
-                    // that silent replay is diagnosable (drain.rs Rank-1 audit).
+                    // The consumer pointer never advanced: the next drain
+                    // re-reads the stale head and admits the same packets again.
+                    // Fail-visible so that silent replay is diagnosable
+                    // (drain.rs Rank-1 audit).
                     state.record_fail(FailEvent::MalformedChildPacket {
                         channel: channel_id,
                         fault: PacketFault::ChildHeadWriteback,
@@ -4919,37 +6744,9 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     });
                 }
 
-                // Completion stamp. Execution is sync-per-packet: the packet's
-                // work is done by the time control reaches here, so the stamp is
-                // owed now. DisplaySwap included — PGDisplay present completion
-                // follows the +0x188 retain, not host encode/paint.
-                //
-                // The archive orders stamps through a per-channel queue because
-                // its draw jobs complete asynchronously (`ApplePVGPUDrawJob`,
-                // `apple_pv_gpu_render_wait_surface`). If this device ever grows
-                // an async execution path, that ordering has to come back with
-                // it — and be written against the async model that then exists,
-                // not inherited from an empty queue.
-                if coalesce {
-                    // Deliberately untimed: the cost this span was measuring is
-                    // the submit, and folding a value into a latch is not one.
-                    // The submit it defers to is timed where it happens, below.
-                    pending.latch(packet.completion_stamp);
-                    // Census: the packet has executed and the word is held in
-                    // the latch above until this drain ends. That window is the
-                    // only one a repair could shorten.
-                    let page_bytes = state.page_size();
-                    state
-                        .stamp_ledger
-                        .owe(stamp_index_slot, packet.completion_stamp, page_bytes);
-                } else {
-                    let stamp_started = std::time::Instant::now();
-                    write_stamp(state, host, stamp_index, packet.completion_stamp);
-                    census::note_drain_regs(
-                        census::RegsOp::Stamp,
-                        stamp_started.elapsed().as_nanos() as u64,
-                    );
-                }
+                admit_and_park(state, host, fifo, stamp_index, packet);
+                settle_model_work(state, host);
+
                 if state.pending.host_action_yield {
                     if head != tail {
                         state.pending.child_mask |= bit;
@@ -4957,32 +6754,15 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     break;
                 }
             }
-            Err(err) => {
-                if let Some(fault) = err.fault() {
-                    state.record_fail(FailEvent::MalformedChildPacket {
-                        channel: channel_id,
-                        fault,
-                        head,
-                    });
-                }
-                break;
-            }
         }
     }
 
-    // Every `break` above lands here, which is what makes one site enough: a
-    // drain that stops on a held stamp, a deferred translation, a decode fault
-    // or a host-action yield owes the stamps it already latched exactly as a
-    // drain that ran the ring dry does. Leaving one unwritten is a guest waiting
-    // on a word that never arrives.
-    if let Some(value) = pending.owed() {
-        let stamp_started = std::time::Instant::now();
-        write_stamp(state, host, stamp_index, value);
-        census::note_drain_regs(
-            census::RegsOp::Stamp,
-            stamp_started.elapsed().as_nanos() as u64,
-        );
-    }
+    // Every `break` above lands here, and what it owes is the same thing a
+    // drain that ran the ring dry owes: a last look at what the model has
+    // released. A drain that stopped on a decode fault or a host-action yield
+    // may still be holding positions that became runnable while it was working,
+    // and leaving one unrun is a guest waiting on a word that never arrives.
+    settle_model_work(state, host);
 
     state.draining_mask &= !bit;
     state.draining_channel = prev_channel;
@@ -5808,8 +7588,9 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
 /// Used by DisplaySwap Dekker rescue and stranded paths — **not** by
 /// `render_wait_surface` (archive wait is surface-keyed async completion only).
 ///
-/// Mask matches archive `poll_tick`: `active_child_mask | pending_child_mask`
-/// so work doorbell'd while a drain was in flight is not skipped. Skips
+/// Mask matches archive `poll_tick`: open domains **or** domains holding work,
+/// which is `DeviceState::drainable_child_mask`, so work doorbell'd while a
+/// drain was in flight is not skipped. Skips
 /// `skip_channel` and every bit in `state.draining_mask` so nested drains
 /// cannot re-enter a mid-packet channel (same head re-process).
 pub fn drain_other_child_fifos<H: HostMemory + HostOps>(
@@ -5817,7 +7598,7 @@ pub fn drain_other_child_fifos<H: HostMemory + HostOps>(
     host: &mut H,
     skip_channel: u32,
 ) {
-    let mask = state.active_child_mask | state.pending.child_mask;
+    let mask = state.drainable_child_mask();
     let nested = state.draining_mask;
 
     // A cold-translation EXEC is already the oldest accepted item in the host
@@ -5882,20 +7663,31 @@ pub fn note_present_paint_consumed(state: &mut DeviceState) {
     state.pending.host_action_yield = false;
 }
 
-fn note_present_backpressure_hold(state: &mut DeviceState, channel: u32, head: u32, tail: u32) {
+/// The pending-frames gate fired on one present, named once per episode.
+///
+/// Keyed on the ordering position rather than on a ring head, because a
+/// declined present has no ring position: the head moved past it when it
+/// arrived. The episode is the transaction the display rail is behind on, which
+/// is what the guest is waiting for.
+fn note_present_backpressure_hold(
+    state: &mut DeviceState,
+    channel: u32,
+    position: reims_vgpu_core::identity::IngressOrdinal,
+) {
     if state.present.backpressure_hold_active
         && state.present.backpressure_hold_channel == channel
-        && state.present.backpressure_hold_head == head
+        && state.present.backpressure_hold_position == position.0
     {
         return;
     }
     state.present.backpressure_hold_active = true;
     state.present.backpressure_hold_channel = channel;
-    state.present.backpressure_hold_head = head;
+    state.present.backpressure_hold_position = position.0;
     state.present.backpressure_hold_count = state.present.backpressure_hold_count.saturating_add(1);
     crate::observe::fail(format!(
-        "THRASH present_action_starvation reason=pending_frames_cap ch={channel} head={head} tail={tail} unpainted={} episode={}",
-        state.present.unpainted_presents, state.present.backpressure_hold_count
+        "THRASH present_action_starvation reason=pending_frames_cap ch={channel} \
+         position={} unpainted={} episode={}",
+        position.0, state.present.unpainted_presents, state.present.backpressure_hold_count
     ));
 }
 
@@ -5921,8 +7713,9 @@ pub fn publish_stranded_fifos<H: HostMemory + HostOps>(
             state.pending.main_drain = true;
             published = true;
         }
-        if state.active_child_mask != 0 {
-            state.pending.child_mask |= state.active_child_mask;
+        let open = state.open_child_mask();
+        if open != 0 {
+            state.pending.child_mask |= open;
             published = true;
         }
     }
@@ -6006,11 +7799,19 @@ const CHILD_DOORBELL_REFILLS: u32 = 3;
 /// [`crate::model::GfxRegs::child_doorbell_rung`] for why that register can be
 /// taken that way and no other can. This is where the bits become work.
 ///
-/// `active_child_mask` is set as well as `pending.child_mask`, because that is
-/// what the locked handler in `runtime::mmio` does for the same register and the
-/// two must not disagree: `publish_stranded_fifos` re-publishes from
-/// `active_child_mask`, so a channel that only ever rang lock-free would be
-/// invisible to the stranded-FIFO rescue.
+/// **Only `pending.child_mask`.** This used to set an `active_child_mask` bit as
+/// well, so that a channel which had only ever rung lock-free would still be
+/// seen by the stranded-FIFO rescue — which read that field. It cannot any more,
+/// and must not: a doorbell says there is work on a domain, it does not say the
+/// guest defined one, and openness is `DeviceState::session`'s with a channel
+/// definition as its one event.
+///
+/// What the rescue reads instead is `DeviceState::open_child_mask`, so a domain
+/// that was rung and never defined is no longer re-published by it. That is a
+/// real difference and it is answered rather than assumed: across four driven
+/// boots this guest put **zero** packets on a domain no definition opened — see
+/// [`note_packet_domain_definition`] — so a channel with a stranded ring is a
+/// defined channel, and a defined channel is in the mask the rescue reads.
 pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
     let rung = state
         .gfx
@@ -6019,79 +7820,7 @@ pub(crate) fn fold_rung_child_doorbells(state: &mut DeviceState) {
     if rung == 0 {
         return;
     }
-    state.active_child_mask |= rung;
     state.pending.child_mask |= rung;
-}
-
-/// Re-offer every timeline held on an unmet stamp wait, for as long as the pass
-/// keeps publishing stamps.
-///
-/// The channel loop above walks channels in id order, so a channel held on a
-/// slot that a *higher-numbered* channel publishes is passed over before the
-/// thing it waits for has run. Its bit then sits in `pending.child_mask` with
-/// nothing guaranteed to ring for it: the doorbell that would re-arm it belongs
-/// to the producing channel, whose work this pass already drained. This closes
-/// that window inside the pass.
-///
-/// **The loop is bounded by progress, not by a count.** Each round runs only if
-/// the previous one advanced [`DeviceState::completion_stamp_seq`] — a stamp
-/// reaching guest RAM is the only event that can turn an unmet wait into a met
-/// one, so a round that publishes nothing cannot have unblocked anything and
-/// there is no reason to look again. That makes a mutual wait between two
-/// channels terminate in one round rather than spin, and it needs no cap to say
-/// so: a cap here would be a bound on how far ordering is honoured, which is
-/// exactly the shape this device is trying not to have.
-///
-/// What is left held is handed back with its bit set, which is correct and not a
-/// drop: the awaited work has not been submitted yet, the guest will submit it,
-/// and that submission rings its own doorbell. Holding is what a GPU does with a
-/// wait it cannot yet satisfy.
-///
-/// # The failure mode honouring the wait creates, named because it is new
-///
-/// A channel whose head packet cannot be decoded stops there: `drain_child_fifo`
-/// records the fault and breaks without advancing the head or writing the
-/// stamp, so that channel's slot never moves again. That has always been a
-/// stall of one channel. It is now a stall of **every timeline waiting on that
-/// channel's slot**, because they are correctly refusing to run ahead of work
-/// that will never complete.
-///
-/// This is faithful — a real GPU's waiters do not proceed past a wedged engine —
-/// and it is the direction to prefer, since the alternative was those timelines
-/// running ahead and corrupting silently. But it changes the *shape* of the
-/// symptom, and that is worth knowing before debugging one: a device that has
-/// gone quiet on several channels at once is more likely to have one wedged
-/// producer than several independent faults. `MalformedChildPacket` on the
-/// producing channel is the line to look for, and it will be the *earliest* of
-/// them; `stamp_hold_handed_back` climbing while nothing else moves is the
-/// secondary signal.
-///
-/// No escape hatch is offered on purpose. A hold that gave up after N rounds
-/// would be a bound on how long ordering is honoured, and it would fire on the
-/// healthy case — a guest that simply has not submitted the producing work yet —
-/// long before it ever reached a wedged one.
-fn retry_stamp_held_timelines<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    while state.stamp_deferred_mask != 0 {
-        let seq_before = state.completion_stamp_seq;
-        if state.stamp_deferred_mask & ROOT_FIFO_BIT != 0 {
-            drain_main_fifo(state, host);
-        }
-        for ch in 1..MAX_CHANNELS as u32 {
-            let bit = 1u32 << ch;
-            if state.stamp_deferred_mask & bit == 0 {
-                continue;
-            }
-            drain_child_fifo(state, host, ch);
-            if state.pending.host_action_yield {
-                return;
-            }
-        }
-        if state.completion_stamp_seq == seq_before {
-            note_store_route("stamp_hold_handed_back");
-            return;
-        }
-        note_store_route("stamp_hold_retry");
-    }
 }
 
 pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
@@ -6181,7 +7910,12 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     }
     // Whatever the refill cap left, handed back to the next wakeup.
     state.pending.child_mask |= mask;
-    retry_stamp_held_timelines(state, host);
+    // The successor of `retry_stamp_held_timelines`, which walked channels in
+    // id order and re-offered the ones held on a slot a higher-numbered channel
+    // publishes. There is no walk to get out of order any more: a released
+    // position is run by whoever is settling, whatever channel it belongs to,
+    // and the stamp that released it was observed in the same pass.
+    settle_model_work(state, host);
     if state.pending.iosfc {
         drain_iosfc(state, host);
     }

@@ -227,7 +227,7 @@ pub struct DepthState {
     ///
     /// The depth buffer is **the guest's resource**, not this device's scratch:
     /// the guest allocated a depth texture and bound it, and
-    /// [`crate::runtime::decode::render::DepthAttachment::texture_ref`] is its
+    /// [`crate::runtime::render_pass::DepthAttachment::texture_ref`] is its
     /// ref. Carrying it lets the engine resolve one resident per guest texture
     /// out of the registry, which is what makes the depth allocation live as
     /// long as the guest's texture does instead of as long as one draw.
@@ -1091,14 +1091,26 @@ pub struct SampledImageResource {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
-    pub arrayed: bool,
-    pub volume: bool,
-    pub cube: bool,
-    /// Metal `texture1d` / `texture1d_array` (color-transfer LUTs): the image is
-    /// created as a Vulkan 1D image so the sampled descriptor type matches the
-    /// shader's declared 1D image. `height` is 1; `arrayed` selects
-    /// `TYPE_1D_ARRAY`. Mutually exclusive with `volume` and `cube`.
-    pub one_dim: bool,
+    /// The image and view shape, as **one** total answer.
+    ///
+    /// This was four independent booleans — `arrayed`, `volume`, `cube`,
+    /// `one_dim` — with the exclusions between them stated in a doc comment
+    /// ("mutually exclusive with `volume` and `cube`") rather than in the type.
+    /// Twelve of their sixteen combinations name no Vulkan image, the three
+    /// structs that carried them set them in two different field orders, and
+    /// the only thing standing between a permuted assignment and the wrong view
+    /// type was an ordered `if` cascade at the creation site and a test that
+    /// existed to catch the permutation. A kind cannot be permuted.
+    ///
+    /// Multisampling is deliberately **not** folded in here even though
+    /// [`reims_vgpu_core::texture_shape::TextureKind`] can spell it: the
+    /// neutral 1×1 substitute below binds a shape without being multisampled,
+    /// so the two are independent facts and [`Self::multisampled`] stays its
+    /// own field. Metal `texture1d` / `texture1d_array` (colour-transfer LUTs)
+    /// arrive as `D1` / `D1Array`, which is what makes the image a Vulkan 1D
+    /// image so the sampled descriptor type matches the shader's declared 1D
+    /// image; `height` is 1 for those.
+    pub kind: reims_vgpu_core::texture_shape::TextureKind,
     /// The shader declares a multisampled 2D image at this binding. Such an
     /// image can only come from a retained multisample target; linear bytes
     /// cannot be uploaded into one with a buffer-to-image copy.
@@ -1903,6 +1915,41 @@ pub struct WindowPresentSource {
     pub width: u32,
     pub height: u32,
     pub identity: TargetIdentity,
+    /// [`super::pools::window_source_epoch`] as it stood when the drain resolved
+    /// this identity and recorded it as the window's published resident.
+    ///
+    /// The window thread's check that the resident it was promised is still the
+    /// one the registry holds — answerable with a single atomic load and no
+    /// registry access, which is the whole point. The registry is guest-derived
+    /// state on its way to the device the guest declared it against, and the
+    /// window thread holds no device and cannot be given one: the lock a device
+    /// would come behind is the one the drain holds for a whole render tranche,
+    /// measured at 935-979 ms per exec packet, and a present waiting on that is
+    /// not a present.
+    ///
+    /// It is the authority, not a check beside one. The window re-resolved the
+    /// identity under the engine lock for three commits while a divergence
+    /// census compared the two on every present and reported no disagreement
+    /// across three driven boots; the re-resolve is gone.
+    pub epoch: u64,
+    /// What the publish resolved this identity to — the image, its layout, its
+    /// extent and its storage class.
+    ///
+    /// The stamp above says the *promise* still stands; this says what was
+    /// promised. Carried because the window's registry access is two
+    /// dependencies and the stamp answers only one: the blit also reads and
+    /// writes `slot.access`, and the barrier it builds from that layout is
+    /// invalid — not merely stale — if the image has since moved. See
+    /// [`super::pools::ResolvedResident`].
+    ///
+    /// This is what the blit reads. The window resolves nothing: `epoch` above
+    /// says the publish's decision still stands, and this is that decision.
+    // Only the host-window arm reads this: it is the window presenter's
+    // comparison against its own re-resolve, and a build with no window has no
+    // presenter. A `cfg` here answers "what did this build compile", which is
+    // the only question one may answer.
+    #[cfg_attr(not(feature = "host-window"), allow(dead_code))]
+    pub(crate) resolved: super::pools::ResolvedResident,
 }
 
 impl Default for TargetIdentity {

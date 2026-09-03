@@ -59,149 +59,211 @@ fn probe_records(opcode: u32) -> impl Iterator<Item = Vec<u8>> {
     })
 }
 
+/// Every compute-rail row reaches exactly one decoder, and `classify` is what
+/// says which.
+///
+/// The same two claims the blit test below makes, on the rail whose split is
+/// wider. The seventeen records the ledger has settled are lifted by
+/// `reims_vgpu_protocol::decode::compute`, the two barriers by `decode::sync`,
+/// the compressed-reinterpretation flush by `decode::resource_state`, the
+/// unqualified residency pair by `decode::residency`, and the eleven rows the
+/// ledger has **not settled** by this crate's `decode::compute_spi`.
+///
+/// No row is dropped by every decoder, and no row is claimed by two. The second
+/// is the claim a single decoder could not make, and it is what catches a
+/// settled row growing a second reading of its bytes — which on this rail is
+/// the specific failure the cutover removed, since the eleven unsettled rows
+/// keep a decoder of their own and drive real work from it.
 #[test]
-fn the_render_decoder_recognises_every_render_operation_the_ledger_records() {
-    use super::render::{decode, DecodeStatus};
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Render)
-        .filter_map(|o| o.opcode)
-    {
-        let refused_the_opcode = matches!(
-            decode(&zero_record(op, GENEROUS_PAYLOAD)),
-            Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrUnsupportedOpcode)
-        );
-        assert!(
-            !refused_the_opcode,
-            "the closure ledger records render {op:#x} and this rail's decoder \
-             refuses the opcode itself: one of the two is describing an \
-             operation the other says does not exist"
-        );
-    }
-}
-
-#[test]
-fn the_compute_decoder_recognises_every_compute_operation_the_ledger_records() {
-    use super::compute::{decode, DecodeStatus};
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Compute)
-        .filter_map(|o| o.opcode)
-    {
-        let refused_the_opcode = matches!(
-            decode(&zero_record(op, GENEROUS_PAYLOAD)),
-            Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrUnsupportedOpcode)
-        );
-        assert!(
-            !refused_the_opcode,
-            "the closure ledger records compute {op:#x} and this rail's decoder \
-             refuses the opcode itself"
-        );
-    }
-}
-
-#[test]
-fn the_blit_decoder_recognises_every_blit_operation_the_ledger_records() {
-    use super::blit::{decode, DecodeStatus};
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Blit)
-        .filter_map(|o| o.opcode)
-    {
-        let refused_the_opcode = matches!(
-            decode(&zero_record(op, GENEROUS_PAYLOAD)),
-            Err(DecodeStatus::ErrUnknownOpcode)
-        );
-        assert!(
-            !refused_the_opcode,
-            "the closure ledger records blit {op:#x} and this rail's decoder \
-             refuses the opcode itself"
-        );
-    }
-}
-
-#[test]
-fn the_event_decoder_recognises_every_event_operation_the_ledger_records() {
-    use super::event::{decode, DecodeStatus};
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Event)
-        .filter_map(|o| o.opcode)
-    {
-        let refused_the_opcode = probe_records(op).all(|r| {
+fn every_compute_row_reaches_exactly_one_decoder_and_the_ledger_picks_it() {
+    use reims_vgpu_protocol::decode::{compute, residency, resource_state, sync, DecodeRefusal};
+    for op in LEDGER.iter().filter(|o| o.rail == Rail::Compute) {
+        let Some(opcode) = op.opcode else { continue };
+        let bytes = zero_record(opcode, GENEROUS_PAYLOAD);
+        let framed = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+        // "Claims this record" means: does not refuse it for being an opcode
+        // this decoder does not own. A refusal for a payload of zeroes is a
+        // statement about the bytes, not about ownership.
+        fn disowned<T>(r: &Result<T, DecodeRefusal>) -> bool {
             matches!(
-                decode(&r),
-                Err(DecodeStatus::ErrUnknownOpcode) | Err(DecodeStatus::ErrRejectedOpcode)
+                r,
+                Err(DecodeRefusal::UnknownOpcode { .. }) | Err(DecodeRefusal::Unjudged { .. })
             )
-        });
-        assert!(
-            !refused_the_opcode,
-            "the closure ledger records event {op:#x} and this rail's decoder refuses the opcode \
-             itself under every payload length"
+        }
+        let claimants: Vec<&str> = [
+            ("record", !disowned(&compute::decode(&framed))),
+            ("sync", !disowned(&sync::decode(Rail::Compute, &framed))),
+            (
+                "resource_state",
+                !disowned(&resource_state::decode(Rail::Compute, &framed)),
+            ),
+            // `lift` rather than `decode`: the residency pair is unsettled, so
+            // `decode` refuses it on principle, and the question here is which
+            // decoder owns the *layout*.
+            (
+                "residency",
+                !disowned(&residency::lift(Rail::Compute, &framed)),
+            ),
+            (
+                "unsettled",
+                !matches!(
+                    super::compute_spi::decode(&bytes),
+                    Err(super::compute_spi::DecodeStatus::ErrUnknownOpcode)
+                        | Err(super::compute_spi::DecodeStatus::ErrSettledElsewhere)
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, claimed)| claimed.then_some(name))
+        .collect();
+        assert_eq!(
+            claimants.len(),
+            1,
+            "the closure ledger records compute {opcode:#x} ({}) and {} decoder(s) claim it: \
+             {claimants:?} — a row with none is work this device drops in silence, and a row \
+             with two is the second reading of one record's bytes the cutover exists to remove",
+            op.selector,
+            claimants.len(),
         );
     }
 }
 
-/// Recognising an opcode is not claiming it.
+/// Every blit-rail row reaches exactly one decoder, and `classify` is what
+/// says which.
 ///
-/// The render decoder accepts a contiguous range and falls through to
-/// `Kind::OtherAccepted` inside it, which is how an opcode can be accepted with
-/// no arm decoding it — and the rail then reports the record as
-/// `accepted_without_executor` and drops it. That is precisely the state the
-/// opcode-recognition test above cannot see, because a fall-through is not a
-/// refusal. So this is the sharper claim: an operation the ledger judges must
-/// reach an arm that names what it is.
+/// The rail no longer has *a* decoder. A record's class comes from the ledger
+/// row, and each class is lifted by the layer that owns its layout: the nine
+/// transfers by `reims_vgpu_protocol::decode::blit`, fences by `decode::sync`,
+/// the indirect-command hint by `decode::icb`, the content directives by
+/// `decode::resource_state`, and the four rows the ledger has **not settled**
+/// by this crate's `decode::blit_spi`.
 ///
-/// A record that decodes under none of [`probe_records`]' spellings is
-/// inconclusive rather than a failure: this test is about which arm claims an
-/// opcode, not about whether this file can synthesise a legal record for every
-/// family. The reached count is printed rather than asserted, because it is a
-/// property of the probe.
+/// So the claim the old single-decoder test made — "the decoder recognises
+/// every row" — is now two claims, and both are worth more than the one was:
+/// no row is dropped by every decoder, and no row is claimed by two. The
+/// second is the one a single decoder could not make at all, and it is the one
+/// that catches a settled row growing a second reading of its bytes.
 #[test]
-fn no_render_operation_the_ledger_judges_decodes_as_unclaimed() {
-    use super::render::{decode, Kind};
-    let mut conclusive = 0usize;
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Render)
-        .filter_map(|o| o.opcode)
-    {
-        let Some(cmd) = probe_records(op).find_map(|r| decode(&r).ok()) else {
+fn every_blit_row_reaches_exactly_one_decoder_and_the_ledger_picks_it() {
+    use reims_vgpu_protocol::decode::{blit, icb, resource_state, sync};
+    for op in LEDGER.iter().filter(|o| o.rail == Rail::Blit) {
+        let Some(opcode) = op.opcode else { continue };
+        let bytes = zero_record(opcode, GENEROUS_PAYLOAD);
+        let framed = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+        // "Claims this record" means: does not refuse it for being an opcode
+        // this decoder does not own. A refusal for a payload of zeroes is a
+        // statement about the bytes, and a generously sized zero record is not
+        // a record any of these selectors would write.
+        let owns = |refused_opcode: bool| !refused_opcode;
+        let claimants: Vec<&str> = [
+            (
+                "transfer",
+                owns(matches!(
+                    blit::decode(&framed),
+                    Err(reims_vgpu_protocol::decode::DecodeRefusal::UnknownOpcode { .. })
+                        | Err(reims_vgpu_protocol::decode::DecodeRefusal::Unjudged { .. })
+                )),
+            ),
+            (
+                "sync",
+                owns(matches!(
+                    sync::decode(Rail::Blit, &framed),
+                    Err(reims_vgpu_protocol::decode::DecodeRefusal::UnknownOpcode { .. })
+                        | Err(reims_vgpu_protocol::decode::DecodeRefusal::Unjudged { .. })
+                )),
+            ),
+            (
+                "icb",
+                owns(matches!(
+                    icb::decode(Rail::Blit, &framed),
+                    Err(reims_vgpu_protocol::decode::DecodeRefusal::UnknownOpcode { .. })
+                        | Err(reims_vgpu_protocol::decode::DecodeRefusal::Unjudged { .. })
+                )),
+            ),
+            (
+                "resource_state",
+                owns(matches!(
+                    resource_state::decode(Rail::Blit, &framed),
+                    Err(reims_vgpu_protocol::decode::DecodeRefusal::UnknownOpcode { .. })
+                        | Err(reims_vgpu_protocol::decode::DecodeRefusal::Unjudged { .. })
+                )),
+            ),
+            (
+                "unsettled",
+                owns(matches!(
+                    super::blit_spi::decode(&bytes),
+                    Err(super::blit_spi::DecodeStatus::ErrUnknownOpcode)
+                )),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, claimed)| claimed.then_some(name))
+        .collect();
+        assert_eq!(
+            claimants.len(),
+            1,
+            "the closure ledger records blit {opcode:#x} ({}) and {} decoder(s) claim it: {claimants:?} \
+             — a row with none is work this device drops in silence, and a row with two is \
+             the second reading of one record's bytes the cutover exists to remove",
+            op.selector,
+            claimants.len(),
+        );
+    }
+}
+
+/// The event rail's records lift, and its one refused row still refuses.
+///
+/// The sibling tests above drive *this crate's* per-rail decoders, because
+/// those are the ones that could disagree with the ledger. The event rail no
+/// longer has one: `runtime::exec::handle_event_record` lifts through
+/// `reims_vgpu_protocol::decode::sync`, which is inside the crate that owns the
+/// ledger and is checked against it there.
+///
+/// What is still this crate's to check is the *pairing* — that the rail the
+/// device names when it lifts an event segment is the rail whose records lift,
+/// and that the row the ledger settled as refused is refused rather than
+/// unjudged. Those two are what a reader of `event_record` refusals is told,
+/// and getting either wrong turns a settled decision into an open question.
+#[test]
+fn the_event_rail_lifts_its_records_and_refuses_its_one_settled_row() {
+    use reims_vgpu_protocol::decode::sync::decode;
+    use reims_vgpu_protocol::decode::{op, DecodeRefusal};
+    let mut refused = 0usize;
+    let mut lifted = 0usize;
+    for row in LEDGER.iter().filter(|o| o.rail == Rail::Event) {
+        let opcode = row.opcode.expect("every event row names an opcode");
+        // The rail is the one `handle_event_record` passes, written here rather
+        // than taken from the row: a test that read the rail off the row it is
+        // checking would pass whatever rail the device actually used.
+        // Reduced to `Result<(), DecodeRefusal>` inside the closure: a lifted
+        // record borrows the bytes it was lifted from, and only whether it
+        // lifted is being asked here.
+        let outcomes: Vec<Result<(), DecodeRefusal>> = probe_records(opcode)
+            .map(|bytes| {
+                let framed = op(&bytes, 0).expect("probe records frame");
+                decode(Rail::Event, &framed).map(|_| ())
+            })
+            .collect();
+        if outcomes
+            .iter()
+            .all(|o| matches!(o, Err(DecodeRefusal::RefusedByContract { .. })))
+        {
+            refused += 1;
             continue;
-        };
-        conclusive += 1;
-        assert_ne!(
-            cmd.kind,
-            Kind::OtherAccepted,
-            "the closure ledger judges render {op:#x} and the decoder has no arm for it, so the \
-             rail reports it as accepted-without-executor and drops it whatever the ledger says"
-        );
-    }
-    println!("{conclusive} of the ledger's render operations reached a decode arm");
-}
-
-/// The other direction on the one rail that can state its own window.
-///
-/// The render decoder accepts a contiguous opcode range and falls through to
-/// `Kind::OtherAccepted` inside it, so an opcode can be *accepted* without any
-/// arm claiming it — which is a decodable operation the device drops. Those are
-/// numbers rather than known selectors, so the ledger does not carry rows for
-/// them; what it must not do is disagree about the window's edge, because an
-/// operation the ledger judges must be inside it.
-#[test]
-fn no_ledger_operation_sits_outside_the_render_encoder_window() {
-    use super::render::opcode_above_the_encoder_window;
-    for op in LEDGER
-        .iter()
-        .filter(|o| o.rail == Rail::Render)
-        .filter_map(|o| o.opcode)
-    {
+        }
         assert!(
-            !opcode_above_the_encoder_window(op),
-            "render {op:#x} is judged by the ledger and above the window this \
-             rail accepts, so the judgement can never be acted on"
+            outcomes.iter().any(Result::is_ok),
+            "the closure ledger records event {opcode:#x} and the protocol decoder lifts no \
+             record for it at any payload length: {:?}",
+            outcomes.first()
         );
+        lifted += 1;
     }
+    assert_eq!(
+        refused, 1,
+        "one event row is settled as refused — the bounded wait — and it is the only one"
+    );
+    assert_eq!(lifted, 2, "the signal and the unbounded wait both lift");
 }
 
 /// The packet half of the same join.
@@ -214,12 +276,43 @@ fn no_ledger_operation_sits_outside_the_render_encoder_window() {
 /// class nobody has judged, and a row naming an opcode no constant declares is a
 /// judgement about a command this device cannot receive.
 mod packets {
-    use crate::model::{
-        is_deprecated_child_opcode, CHILD_COMMANDS, CHILD_DEPRECATED_OPS, CHILD_OP_MAX,
-        ROOT_COMMANDS,
-    };
+    use crate::model::{CHILD_COMMANDS, CHILD_OP_MAX, ROOT_COMMANDS};
+    use reims_vgpu_core::control::ControlKind;
     use reims_vgpu_protocol::packets::{find, Channel, LEDGER, OPCODE_CEILING};
     use std::collections::BTreeSet;
+
+    /// The child opcodes the ledger judges retired, read the one way this
+    /// device reads them.
+    ///
+    /// The set used to be a constant beside the command constants, and the test
+    /// below that walked it was asking the ledger whether it agreed with a copy
+    /// of itself. It is the ledger's now, so the question these tests can still
+    /// ask is the one that was always the point: whether the *commands* this
+    /// device dispatches and the retired set are disjoint, and whether every
+    /// judged row is a packet this device can receive at all.
+    fn retired_slots() -> BTreeSet<u16> {
+        LEDGER
+            .iter()
+            .filter(|p| p.channel == Channel::Child)
+            .filter(|p| ControlKind::of(p.channel, p.opcode) == Some(ControlKind::RetiredSlot))
+            .map(|p| p.opcode)
+            .collect()
+    }
+
+    /// The retired set is not empty and not everything.
+    ///
+    /// Without this a `ControlKind` change that stopped calling anything a
+    /// retired slot would leave the two tests below trivially true: an empty
+    /// set is disjoint from every command list and adds no receivable opcode.
+    #[test]
+    fn the_ledger_judges_a_retired_set_at_all() {
+        assert_eq!(
+            retired_slots().len(),
+            15,
+            "the reference host routes fifteen child slots to its shared \
+             deprecated handler"
+        );
+    }
 
     #[test]
     fn every_declared_command_has_a_ledger_row() {
@@ -239,33 +332,12 @@ mod packets {
         }
     }
 
-    /// The retired slots are commands too — the reference host has one handler
-    /// for all fifteen — so each is a row, and a row that says the shared
-    /// handler's behavior *is* the contract rather than a gap.
-    #[test]
-    fn every_retired_slot_has_a_ledger_row() {
-        for op in CHILD_DEPRECATED_OPS {
-            let row = find(Channel::Child, op)
-                .unwrap_or_else(|| panic!("retired slot {op:#04x} is unjudged"));
-            assert!(
-                matches!(
-                    row.closure,
-                    reims_vgpu_protocol::closure::Closure::ProvenNoOp { .. }
-                ),
-                "retired slot {op:#04x} reads as {} — the reference host's shared handler is the \
-                 whole contract, so anything else claims this device owes more or less than the \
-                 host it is imitating",
-                row.closure.name()
-            );
-        }
-    }
-
     #[test]
     fn no_ledger_row_names_a_command_this_device_cannot_receive() {
         let child: BTreeSet<u16> = CHILD_COMMANDS
             .iter()
             .map(|(_, op)| *op)
-            .chain(CHILD_DEPRECATED_OPS)
+            .chain(retired_slots())
             .collect();
         let root: BTreeSet<u16> = ROOT_COMMANDS.iter().map(|(_, op)| *op).collect();
         for p in LEDGER {
@@ -290,16 +362,141 @@ mod packets {
         assert_eq!(CHILD_OP_MAX, OPCODE_CEILING);
     }
 
+    /// The four opcodes the drain answers as queries are the four the model
+    /// calls questions.
+    ///
+    /// `runtime::drain::query_request` asks
+    /// [`reims_vgpu_core::query::QueryKind::of`] which question a packet is,
+    /// and reports `query_not_a_query_packet` when the answer is `None` — a
+    /// reading that means this device's dispatch table and the closure ledger
+    /// disagree about what a query is, and one the drain cannot check for
+    /// itself because it only ever sees one opcode at a time. This is where it
+    /// is checked, in both directions: every query the ledger judges has an arm
+    /// here, and every arm has a question.
+    #[test]
+    fn the_query_arms_and_the_models_questions_are_the_same_four() {
+        use reims_vgpu_core::query::QueryKind;
+        // The opcodes `process_root_packet` and `process_child_packet` answer
+        // with a reply, written out because a test that derived them from the
+        // same source the drain does would agree with the drain by
+        // construction.
+        let arms = [
+            (Channel::Root, crate::model::ROOT_OP_DEVICE_INFO_TAHOE),
+            (Channel::Root, crate::model::ROOT_OP_DEVICE_INFO_MONTEREY),
+            (Channel::Child, crate::model::CHILD_OP_GET_COMPUTE_INFO),
+            (
+                Channel::Child,
+                crate::model::CHILD_OP_HEAP_TEXTURE_SIZE_AND_ALIGN,
+            ),
+        ];
+        for (channel, op) in arms {
+            assert!(
+                QueryKind::of(channel, op).is_some(),
+                "the drain answers {} {op:#04x} with a reply and the model does not call it a \
+                 question, so `query_request` would refuse a packet the guest is blocked on",
+                channel.name()
+            );
+        }
+        let judged: BTreeSet<(Channel, u16)> = LEDGER
+            .iter()
+            .filter(|p| QueryKind::of(p.channel, p.opcode).is_some())
+            .map(|p| (p.channel, p.opcode))
+            .collect();
+        assert_eq!(
+            judged,
+            arms.into_iter().collect::<BTreeSet<_>>(),
+            "the model's questions and the drain's query arms are not the same set"
+        );
+    }
+
     /// A slot cannot be both a live command and one the host retired, on either
     /// side of the join.
     #[test]
     fn no_live_command_is_also_a_retired_slot() {
+        let retired = retired_slots();
         for (name, op) in CHILD_COMMANDS {
             assert!(
-                !is_deprecated_child_opcode(*op),
+                !retired.contains(op),
                 "CHILD_OP_{name} is also listed as a retired slot, so the drain would give one \
                  number two arms and the retired one would swallow a live command"
             );
         }
+    }
+}
+
+/// Every render-rail row reaches exactly one decoder, and the ledger is what
+/// says which.
+///
+/// The rail no longer has *a* decoder. Forty-five rows are lifted by
+/// `reims_vgpu_protocol::decode::render`, the fence pair and the three barriers
+/// by `decode::sync`, the four residency declarations by `decode::residency`,
+/// and the thirty-one rows the ledger has **not settled** by
+/// [`super::render_spi`] — which refuses every settled opcode by name, so the
+/// two halves cannot both claim a record.
+///
+/// Replaces `the_render_opcode_table_is_exactly_apples_render_manifest` and
+/// `the_accepted_window_ends_where_apples_render_manifest_does`, and is
+/// strictly stronger than either: those asked whether one decoder recognised
+/// every row, which cannot see a row claimed twice. This asks both questions —
+/// no row is dropped by all of them, and no row is claimed by two.
+#[test]
+fn every_render_row_reaches_exactly_one_decoder_and_the_ledger_picks_it() {
+    use reims_vgpu_protocol::decode::{render, residency, sync, DecodeRefusal};
+    for op in LEDGER.iter().filter(|o| o.rail == Rail::Render) {
+        let Some(opcode) = op.opcode else { continue };
+        let bytes = zero_record(opcode, GENEROUS_PAYLOAD);
+        let framed = reims_vgpu_protocol::decode::op(&bytes, 0).expect("framed");
+        // "Claims this record" means: does not refuse it for being an opcode
+        // this decoder does not own. A refusal for a payload of zeroes is a
+        // statement about the bytes, not about ownership.
+        //
+        // `RefusedByContract` is a disowning here and it is the render rail
+        // that makes the distinction matter: this rail has four `Refused` rows
+        // and the other two have none, so this is the first test to ask what a
+        // contract refusal claims. It claims nothing. Every protocol decoder
+        // answers `RefusedByContract` for such a row — that is what the ledger
+        // told it to answer — so counting it as ownership would make all of
+        // them claim the same record, which says nothing about which one owns
+        // its layout. `render_spi` owns those four, because for a refusal the
+        // *value* is the evidence: which options word, or which sample count.
+        fn disowned<T>(r: &Result<T, DecodeRefusal>) -> bool {
+            matches!(
+                r,
+                Err(DecodeRefusal::UnknownOpcode { .. })
+                    | Err(DecodeRefusal::Unjudged { .. })
+                    | Err(DecodeRefusal::RefusedByContract { .. })
+            )
+        }
+        let claimants: Vec<&str> = [
+            ("record", !disowned(&render::decode(&framed))),
+            ("sync", !disowned(&sync::decode(Rail::Render, &framed))),
+            // `lift` rather than `decode`: all four residency rows are
+            // unsettled, so `decode` refuses them on principle, and the
+            // question here is which decoder owns the *layout*.
+            (
+                "residency",
+                !disowned(&residency::lift(Rail::Render, &framed)),
+            ),
+            (
+                "unsettled",
+                !matches!(
+                    super::render_spi::decode(&bytes),
+                    Err(super::render_spi::DecodeStatus::ErrUnknownOpcode)
+                        | Err(super::render_spi::DecodeStatus::ErrSettledElsewhere)
+                ),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, claimed)| claimed.then_some(name))
+        .collect();
+        assert_eq!(
+            claimants.len(),
+            1,
+            "the closure ledger records render {opcode:#x} ({}) and {} decoder(s) claim it: \
+             {claimants:?} — a row with none is work this device drops in silence, and a row \
+             with two is the second reading of one record's bytes the cutover exists to remove",
+            op.selector,
+            claimants.len(),
+        );
     }
 }

@@ -18,10 +18,8 @@
 
 use super::{ChainAbandonDecline, StreamAccum, StreamDrawDrop};
 use crate::runtime::compute_exec::ComputeStatus;
-use crate::runtime::decode::compute::Kind as ComputeKind;
-use crate::runtime::decode::render::{AttachSubresource, ScissorRect};
 use crate::runtime::draw::EncodeStatus;
-use reims_vgpu_wire::ops::render as wire_render;
+use crate::runtime::render_pass::{AttachSubresource, ScissorRect};
 
 /// Name a compute refusal at the rail boundary.
 ///
@@ -35,11 +33,18 @@ use reims_vgpu_wire::ops::render as wire_render;
 /// every frame, so a persistent refusal would otherwise be a per-frame flood —
 /// while a *different* pipeline failing the same check is a distinct event and
 /// still gets its line.
+///
+/// `kind` is taken as a `Debug` rather than as one enum because the three arms
+/// no longer share a vocabulary: a dispatch names a
+/// `reims_vgpu_protocol::compute::ComputeKind`, while the control-flow and
+/// indirect-command records the ledger has not settled name this device's own.
+/// Widening one of those two to cover the other would put settled and unsettled
+/// rows in one type, which is the confusion the ledger's class exists to end.
 pub(super) fn note_compute_refusal(
     status: ComputeStatus,
     task_id: u32,
     pipeline_ref: u32,
-    kind: ComputeKind,
+    kind: &dyn std::fmt::Debug,
 ) {
     // One event token for the whole rail, with `kind=` separating dispatch
     // from control-flow from ICB: the emission gate reads the *literal* first
@@ -153,6 +158,29 @@ pub(super) fn reset_unimplemented_opcode_dedup_for_test() {
 /// handles a degenerate one. What changes is that the substitution is now
 /// visible. Deduped on the pair, because a guest emitting one emits it for a
 /// reason that does not vary per record.
+/// A plural viewport or scissor record whose count is zero.
+///
+/// The previous state stands. `setViewports:count:` and `setScissorRects:count:`
+/// replace the state rather than add to it, so a count of zero is either the
+/// guest retiring every viewport or a record it did not mean to send, and this
+/// device cannot tell which — Metal requires at least one, which is the reason
+/// to doubt a guest emits it. Naming it costs nothing and a firing is the
+/// signal that the choice matters.
+pub(super) fn note_empty_viewport_or_scissor(task_id: u32, what: &str, opcode: u32) {
+    crate::runtime::drain::note_store_route(match what {
+        "viewport" => "render_viewport_count_zero",
+        _ => "render_scissor_count_zero",
+    });
+    if crate::observe::first_sight("render_plural_count_zero", u64::from(opcode)) {
+        crate::observe::fail(format!(
+            "render_{what}_count_zero reason=render_plural_count_zero \
+             task={task_id} opcode={opcode:#x} \
+             (the guest replaced its {what} state with an empty array; this rail \
+             kept the previous one)"
+        ));
+    }
+}
+
 pub(super) fn note_empty_scissor(task_id: u32, rect: ScissorRect) {
     let (w, h) = (rect.width, rect.height);
     crate::runtime::drain::note_store_route("render_scissor_empty_kept_previous");
@@ -182,7 +210,7 @@ pub(super) fn note_empty_scissor(task_id: u32, rect: ScissorRect) {
 /// resource the stream lost.
 pub(super) fn note_unnamed_icb_execute(
     task_id: u32,
-    cmd: &crate::runtime::decode::render::Command,
+    cmd: &crate::runtime::decode::render_spi::Command,
 ) {
     crate::runtime::drain::note_store_route("render_icb_execute_unnamed");
     if crate::observe::first_sight("render_icb_execute_unnamed", u64::from(task_id)) {
@@ -199,28 +227,18 @@ pub(super) fn note_unnamed_icb_execute(
     }
 }
 
-/// The draw opcodes whose records carry an index buffer.
-///
-/// `render::decode` collapses every draw form to `Kind::Draw`, so the decoded
-/// record cannot say which class it came from and the opcode is the only thing
-/// that can.
-pub(super) fn is_indexed_draw_opcode(opcode: u32) -> bool {
-    // wire opcodes via wire_render import
-
-    matches!(
-        opcode,
-        wire_render::OPCODE_DRAW_INDEXED
-            | wire_render::OPCODE_DRAW_INDEXED_INSTANCED
-            | wire_render::OPCODE_DRAW_INDEXED_WIDE
-    )
-}
-
 /// Name an indexed draw whose record carried no index buffer.
 ///
-/// Deduped on the opcode: the three indexed forms read `index_buffer_ref` from
-/// three different payload offsets, so which form fires is the whole diagnostic
-/// value — one form firing alone points at that form's offset, all three
-/// firing points at the guest.
+/// Deduped on the opcode: the six indexed forms read `index_buffer_ref` from six
+/// different payload offsets, so which form fires is the whole diagnostic value
+/// — one form firing alone points at that form's offset, all six firing points
+/// at the guest.
+///
+/// The predicate that used to guard this call site listed **three** of the six,
+/// because it had to name the opcodes itself: the decoder collapsed every draw
+/// form to one `Kind`, so a record could not say which class it came from. It is
+/// gone with that question — `DrawRecord::Indexed` is the guard now, and it is
+/// total over the six.
 pub(super) fn note_indexed_draw_without_buffer(task_id: u32, opcode: u32, index_count: u32) {
     crate::observe::fail(format!(
         "stream_draw reason=indexed_without_index_buffer task={task_id} op={opcode:#x} \
@@ -291,7 +309,11 @@ pub(super) fn note_pass_extent_for_slot(
     task_id: u32,
     slot: u32,
     mapping_id: u32,
-    cmd: &crate::runtime::decode::render::Command,
+    // The pass's own `renderTargetWidth`/`Height`, which is not the attached
+    // texture's — a guest may bind a 4096-wide texture and ask for a 640-wide
+    // pass. Taken as the two numbers rather than as the whole decoded command,
+    // so this cannot be handed a record of a different class.
+    target_extent: (u64, u64),
 ) {
     if slot != 0 {
         return;
@@ -306,12 +328,7 @@ pub(super) fn note_pass_extent_for_slot(
     match state.mappings.get(&mapping_id) {
         Some(e) => {
             note_pass_target(task_id, mapping_id, Some((e.width, e.height)));
-            note_pass_extent_coverage(
-                cmd.pass_render_target_width,
-                cmd.pass_render_target_height,
-                e.width,
-                e.height,
-            );
+            note_pass_extent_coverage(target_extent.0, target_extent.1, e.width, e.height);
         }
         None => note_pass_target(task_id, mapping_id, None),
     }
@@ -554,7 +571,7 @@ pub(super) fn note_store_action_options_unsupported(
 pub(super) fn note_color_subresource_unsupported(
     task_id: u32,
     slot: u32,
-    att: &crate::runtime::decode::render::ColorAttachment,
+    att: &crate::runtime::render_pass::ColorAttachment,
 ) -> StreamDrawDrop {
     crate::runtime::drain::note_store_route("render_color_subresource_unsupported");
     let drop = StreamDrawDrop::ColorSubresourceUnsupported {
@@ -698,15 +715,19 @@ pub(super) fn note_clear_dropped(reason: &'static str, tex_ref: u32, detail: &st
 /// watch for whenever a dedup latch sits next to a decision.
 pub(super) fn note_indirect_draw_refused(
     task_id: u32,
-    cmd: &crate::runtime::decode::render::Command,
+    opcode: u32,
+    // The buffer window the counts were to be read from. Two numbers rather
+    // than the whole decoded command, so this cannot be handed a record of a
+    // different class.
+    arguments: reims_vgpu_protocol::decode::render::IndirectRef,
     status: crate::runtime::compute_exec::ComputeStatus,
 ) {
     if let Some(e) = crate::observe::Emit::refusal("render_draw_indirect", &status) {
         e.field("task", task_id)
-            .field("op", format!("{:#x}", cmd.opcode))
-            .field("args_ref", cmd.indirect_buffer_ref)
-            .field("args_off", cmd.indirect_buffer_offset)
-            .fail_once(u64::from(cmd.indirect_buffer_ref));
+            .field("op", format!("{opcode:#x}"))
+            .field("args_ref", arguments.buffer_ref)
+            .field("args_off", arguments.offset)
+            .fail_once(u64::from(arguments.buffer_ref));
     }
 }
 
@@ -893,9 +914,12 @@ pub(super) fn note_info_record_unanswered(task_id: u32, opcode: u32, len: usize)
 /// with a guest-declared zero would report the two as one.
 pub(super) struct ResidencyWriteDeclared {
     opcode: u32,
-    count: u32,
+    count: usize,
     usage: reims_vgpu_protocol::residency::ResourceUsage,
-    stages: reims_vgpu_protocol::residency::RenderStages,
+    /// `None` when the selector carries no stages argument at all — reported as
+    /// its own word rather than as a zero mask, which would be a stage set the
+    /// guest never named.
+    stages: Option<reims_vgpu_protocol::residency::RenderStages>,
 }
 
 impl crate::observe::Decline for ResidencyWriteDeclared {
@@ -912,7 +936,11 @@ impl crate::observe::Decline for ResidencyWriteDeclared {
             ("op", format!("{:#x}", self.opcode)),
             ("count", self.count.to_string()),
             ("usage", format!("{:#x}", self.usage.0)),
-            ("stages", format!("{:#x}", self.stages.0)),
+            (
+                "stages",
+                self.stages
+                    .map_or_else(|| "none".to_string(), |s| format!("{:#x}", s.0)),
+            ),
             (
                 "undeclared_usage",
                 format!("{:#x}", self.usage.undeclared_bits()),
@@ -923,34 +951,51 @@ impl crate::observe::Decline for ResidencyWriteDeclared {
 
 /// Price and, where the no-op argument does not cover it, name one residency
 /// record.
+///
+/// `usage` and `stages` are `Option` because the four selectors do not all
+/// carry them: the heap forms take no usage argument and the unqualified pair
+/// inherited from the encoder base class takes no stages. A `None` is "the
+/// selector has no such argument" and can never be a guest declaring nothing,
+/// which is the distinction every counter below rests on.
 pub(super) fn note_residency_declaration(
     task_id: u32,
     is_heap: bool,
     opcode: u32,
-    count: u32,
-    usage: reims_vgpu_protocol::residency::ResourceUsage,
-    stages: reims_vgpu_protocol::residency::RenderStages,
+    count: usize,
+    usage: Option<reims_vgpu_protocol::residency::ResourceUsage>,
+    stages: Option<reims_vgpu_protocol::residency::RenderStages>,
 ) {
     use reims_vgpu_protocol::residency::UsageClass;
-    let class = usage.classify();
+    let class = usage.map(reims_vgpu_protocol::residency::ResourceUsage::classify);
     crate::runtime::drain::note_store_route(match (is_heap, class) {
         // `useHeap:`/`useHeaps:count:` carry no usage argument, so there is no
         // class to report — the route says only that a heap was declared.
         (true, _) => "render_residency_heap",
-        (false, UsageClass::Empty) => "render_residency_empty",
-        (false, UsageClass::ReadOnly) => "render_residency_read",
-        (false, UsageClass::Writes) => "render_residency_write",
-        (false, UsageClass::Undeclared) => "render_residency_undeclared",
+        (false, Some(UsageClass::Empty)) => "render_residency_empty",
+        (false, Some(UsageClass::ReadOnly)) => "render_residency_read",
+        (false, Some(UsageClass::Writes)) => "render_residency_write",
+        (false, Some(UsageClass::Undeclared)) => "render_residency_undeclared",
+        // Unreachable: every resource form on this rail carries a usage word.
+        // Named rather than folded onto an empty declaration, which would
+        // report a usage the guest did not state.
+        (false, None) => "render_residency_resource_without_usage",
     });
     // A stage this device has no encoder for, named separately: it is the same
     // gap the tile records report one arm over, and counting it with the render
     // stages would hide which of the two a reading came from.
-    if stages.names_unexecuted_stage() {
-        crate::runtime::drain::note_store_route("render_residency_unexecuted_stage");
+    //
+    // A record with no stages *argument* reaches neither counter, where the
+    // flat command reached them both with a zero.
+    if let Some(stages) = stages {
+        if stages.names_unexecuted_stage() {
+            crate::runtime::drain::note_store_route("render_residency_unexecuted_stage");
+        }
+        if stages.undeclared_bits() != 0 {
+            crate::runtime::drain::note_store_route("render_residency_stages_undeclared");
+        }
     }
-    if stages.undeclared_bits() != 0 {
-        crate::runtime::drain::note_store_route("render_residency_stages_undeclared");
-    }
+    let Some(usage) = usage else { return };
+    let class = usage.classify();
     if is_heap || matches!(class, UsageClass::Empty | UsageClass::ReadOnly) {
         return;
     }
@@ -965,5 +1010,5 @@ pub(super) fn note_residency_declaration(
     };
     crate::observe::Emit::decline("render_residency", &decline)
         .field("task", task_id)
-        .fail_once(u64::from(usage.0) << 32 | u64::from(stages.0));
+        .fail_once(u64::from(usage.0) << 32 | u64::from(stages.map_or(0, |s| s.0)));
 }

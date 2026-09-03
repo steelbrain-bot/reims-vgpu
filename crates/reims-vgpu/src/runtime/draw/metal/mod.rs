@@ -287,6 +287,17 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             None,
         );
     };
+    // `load_render_pipeline` declared it; this rail is about to turn the
+    // guest's shader form into the host's. Unlike the Vulkan rail this one
+    // retains no pipeline state, so it walks the same three steps on every
+    // draw and the second draw's `advance` declines — counted, not ignored.
+    crate::runtime::draw::advance_pipeline(
+        state,
+        host,
+        req.task_id,
+        req.pipeline_ref,
+        reims_vgpu_core::pipeline::PipelineState::Translating,
+    );
     chain_phase::enter(chain_phase::Phase::PipelineMtlb);
     let Some(vert) = load_mtlb(
         state,
@@ -299,6 +310,13 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             "metal_draw MissingMtlb vert_func={} pipe={}",
             pipeline.vertex_func_ref, req.pipeline_ref
         ));
+        crate::runtime::draw::refuse_pipeline(
+            state,
+            host,
+            req.task_id,
+            req.pipeline_ref,
+            reims_vgpu_core::pipeline::RefusalReason::CompilationFailed("vertex_mtlb_missing"),
+        );
         return (EncodeStatus::MissingMtlb("draw_mtl_vertex_mtlb_load"), None);
     };
     let Some(frag) = load_mtlb(
@@ -312,11 +330,30 @@ fn encode_draw_chain_inner<M: HostMemory + HostOps>(
             "metal_draw MissingMtlb frag_func={} pipe={}",
             pipeline.fragment_func_ref, req.pipeline_ref
         ));
+        crate::runtime::draw::refuse_pipeline(
+            state,
+            host,
+            req.task_id,
+            req.pipeline_ref,
+            reims_vgpu_core::pipeline::RefusalReason::CompilationFailed("fragment_mtlb_missing"),
+        );
         return (
             EncodeStatus::MissingMtlb("draw_mtl_fragment_mtlb_load"),
             None,
         );
     };
+    // Both stages loaded. On this rail there is no further step that is about
+    // the *pipeline* rather than about one draw's resources — the MTLBs go to
+    // the shim, which builds the pipeline state as part of encoding — so the
+    // pipeline becomes usable here. Deferring `Ready` to the encode's own
+    // result would let one unrelated texture miss park every exec that leased
+    // this pipeline forever.
+    for step in [
+        reims_vgpu_core::pipeline::PipelineState::Compiling,
+        reims_vgpu_core::pipeline::PipelineState::Ready,
+    ] {
+        crate::runtime::draw::advance_pipeline(state, host, req.task_id, req.pipeline_ref, step);
+    }
 
     // Materialize buffer backs (storage first, then ReimsVgpuBuffer views).
     // Archive apple-pv-gpu-exec: a non-zero bound buffer that does not resolve
@@ -1554,9 +1591,11 @@ fn load_depth_stencil_state<M: HostMemory + HostOps>(
         &[OBJECT_TYPE_SERIALIZER_OBJECT],
     )
     .map_err(|rung| match rung {
-        objects::LadderRung::NoListEntry => MetalStateDecline::DepthStencilEntryMissing {
-            depth_stencil_ref: ds_ref,
-        },
+        objects::LadderRung::NoListEntry | objects::LadderRung::NoTaskSpace => {
+            MetalStateDecline::DepthStencilEntryMissing {
+                depth_stencil_ref: ds_ref,
+            }
+        }
         objects::LadderRung::WrongType { got } => MetalStateDecline::DepthStencilObjectType {
             depth_stencil_ref: ds_ref,
             object_type: got,
@@ -1571,6 +1610,7 @@ fn load_depth_stencil_state<M: HostMemory + HostOps>(
             reason,
         }
     })?;
+    crate::runtime::draw::name_depth_stencil(state, host, task_id, ds_ref);
     Ok(ReimsVgpuDepthStencilState {
         depth_compare_function: d.depth_compare_function,
         depth_write_enabled: if d.depth_write_enabled { 1 } else { 0 },
@@ -2043,10 +2083,12 @@ fn load_sampler<M: HostMemory + HostOps>(
         objects::resolve_sampler_state(state, host, task_id, sampler_ref).map_err(|failure| {
             match failure {
                 objects::SamplerResolveError::Rung(rung) => match rung {
-                    objects::LadderRung::NoListEntry => MetalStateDecline::SamplerEntryMissing {
-                        sampler_ref,
-                        index: slot,
-                    },
+                    objects::LadderRung::NoListEntry | objects::LadderRung::NoTaskSpace => {
+                        MetalStateDecline::SamplerEntryMissing {
+                            sampler_ref,
+                            index: slot,
+                        }
+                    }
                     objects::LadderRung::WrongType { got } => {
                         MetalStateDecline::SamplerObjectType {
                             sampler_ref,
@@ -2401,7 +2443,7 @@ mod tests {
             MetalIcbInheritanceDecline::BindSlotPastTable {
                 bind: PastTableBind {
                     class: BindTableClass::Buffer,
-                    stage: crate::runtime::decode::render::Stage::Vertex,
+                    stage: reims_vgpu_protocol::render::ShaderStage::Vertex,
                     index: MAX_BUFFER_BIND_SLOTS,
                     resource_ref: 1,
                 },

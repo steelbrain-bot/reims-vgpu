@@ -1,3 +1,40 @@
+// DISCONNECTED SOURCE — this file does not compile, is not feature-gated, and
+// is not linkable. No `mod` declaration reaches `dead/`. It is here to be read.
+//
+// What this was: this device's own command-stream framer,
+// `runtime::decode::stream`. It located segments, located the records inside
+// one, and re-validated an already-parsed `Segment` against the buffer on every
+// record — sixteen `stream_reval_*` refusals guarding a state a caller should
+// not have been able to construct.
+//
+// Why it went, three reasons:
+//
+//   * `reims_vgpu_protocol::segment::SegmentStream` frames segments and
+//     `reims_vgpu_wire::op::OpStream` frames the records inside one. Both live
+//     in the layers that own those layouts.
+//   * `FramedSegment` carries its command window as a *slice*, so a segment
+//     cannot claim bytes the buffer does not hold. The whole `validate_segment`
+//     family is gone with the state it guarded, not merely moved.
+//   * `decode_next_segment` found each segment's index with
+//     `segment_index_for_offset`, which re-walks the stream from zero. That is
+//     quadratic in the segment count, and a driven boot puts ninety-five
+//     thousand segments in a stream. `SegmentStream` counts the index it
+//     already knows.
+//
+// THE ONE BEHAVIOUR CHANGE, recorded here because this is where a reader will
+// come looking for it: an unknown segment type. This framer reported it and
+// walked on to the next segment. `SegmentStream` stops. The reason is on
+// `FramingRefusal::UnknownType` — a family whose record framing is unknown can
+// only be skipped on its declared length, and skipping on that hands the
+// following segment an encoder state derived from bytes nothing here
+// understands. `segment_disposition`'s own doc, below, records that the
+// reference host "rejects new non-continuation types >= 4" rather than stepping
+// over them, so stopping is the closer reading of the host being imitated.
+//
+// Do not resurrect any of this. If a boot regresses on a stream this framer
+// walked and `SegmentStream` refuses, read it here and fix
+// `reims_vgpu_protocol::segment`.
+
 //! Command-stream framing decoder (port of `host/utils/reims-vgpu-stream-decode`).
 
 use crate::protocol::checked::size_fits_u32;
@@ -648,3 +685,111 @@ mod tests {
         }
     }
 }
+
+// ---- The legacy tests that moved with it, from `runtime::exec::tests` ----
+//
+// Both of these had subjects that no longer exist. The first constructed a
+// `Segment` naming bytes the buffer did not hold — unrepresentable now — and
+// the second asked `segment_disposition` for a verdict the framer makes
+// itself. See README.md for what replaced each.
+#[test]
+fn a_truncated_segment_names_the_check_rather_than_looking_like_end_of_records() {
+    use reims_vgpu_protocol::segment::{
+        segment_type_name, Segment, SEGMENT_HEADER_LEN, SEGMENT_TYPE_INFO,
+    };
+    // `Err(_) => break` treated a self-inconsistent segment exactly like
+    // `Done`: the remaining records went unexecuted with nothing logged.
+    let stream = vec![0u8; SEGMENT_HEADER_LEN + 4];
+    // A segment claiming a longer body than the buffer holds, handed straight
+    // to the record walker — the shape `iter_segments` would have rejected but
+    // that an already-parsed `Segment` can still carry.
+    let seg = Segment {
+        offset: 0,
+        length: (SEGMENT_HEADER_LEN + 64) as u32,
+        type_: SEGMENT_TYPE_INFO,
+        command_offset: SEGMENT_HEADER_LEN as u32,
+        command_length: 64,
+        ..Segment::default()
+    };
+    let before = sink_body().len();
+    let mut handled = 0usize;
+    walk_segment_records(&stream, &seg, |_, _| handled += 1);
+    let added = sink_body()[before..].to_string();
+    assert_eq!(handled, 0, "the malformed segment yields no records");
+    assert!(
+        added.contains("stream_record_fail"),
+        "dropping a segment's records must reach the sink, got:\n{added}"
+    );
+    assert!(
+        added.contains("reason=stream_reval_span_oob"),
+        "the line must name the failing re-validation check, got:\n{added}"
+    );
+    assert!(
+        added.contains(&format!(
+            "seg={}",
+            segment_type_name(u32::from(SEGMENT_TYPE_INFO))
+        )),
+        "the line must say which segment family lost its records, got:\n{added}"
+    );
+}
+
+#[test]
+fn walking_a_well_formed_segment_to_its_end_logs_nothing() {
+    use reims_vgpu_protocol::segment::{iter_segments, SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
+    // The other half of the obligation: `Done` is how every segment ends, so
+    // if it produced a line the sink would carry one per segment per frame.
+    let mut records = [0u8; 8];
+    st32(&mut records[0..4], 0x190);
+    st32(&mut records[4..8], 8);
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+    st32(
+        &mut stream[0..4],
+        (SEGMENT_HEADER_LEN + records.len()) as u32,
+    );
+    stream[4] = SEGMENT_TYPE_EVENT;
+    stream.extend_from_slice(&records);
+
+    let segs = iter_segments(&stream).expect("a well-formed stream frames");
+    let before = sink_body().len();
+    let mut handled = 0usize;
+    walk_segment_records(&stream, &segs[0], |_, _| handled += 1);
+    let added = sink_body()[before..].to_string();
+    assert_eq!(handled, 1, "the one record is handed over");
+    assert!(
+        !added.contains("stream_record_fail"),
+        "end-of-segment is control flow and must stay out of the log, got:\n{added}"
+    );
+}
+
+#[test]
+fn an_unknown_segment_family_is_refused_and_the_type_5_envelope_is_not() {
+    use crate::observe::Refusal;
+    use reims_vgpu_protocol::segment::{
+        segment_disposition, SegmentDisposition, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_PROTECTION_OPTIONS,
+    };
+    // `walk_stream` ended in `_ => {}`, which gave one silence to two very
+    // different things. Ref-texture is a contract-correct skip; function is wire
+    // format the host has never seen.
+    assert_eq!(
+        segment_disposition(SEGMENT_TYPE_PROTECTION_OPTIONS),
+        SegmentDisposition::Envelope
+    );
+    assert_eq!(
+        segment_disposition(SEGMENT_TYPE_PROTECTION_OPTIONS).refusal(),
+        None,
+        "the envelope arrives on healthy frames; a line here is a flood"
+    );
+    assert_eq!(
+        segment_disposition(SEGMENT_TYPE_BLIT),
+        SegmentDisposition::Walk
+    );
+    assert_eq!(
+        segment_disposition(6).refusal(),
+        Some("stream_segment_type_unknown")
+    );
+    assert_eq!(
+        segment_disposition(0xff).refusal(),
+        Some("stream_segment_type_unknown")
+    );
+}
+

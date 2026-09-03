@@ -147,6 +147,15 @@ pub fn apply(
                     texture_ref: object_id,
                 });
         if !hit || gva_owed {
+            // Whether this generation may stay keyed on the reference. See
+            // `objects::note_reference_shares_storage`: the key stands for
+            // storage, and one allocation can have two live names.
+            crate::runtime::objects::note_reference_shares_storage(
+                state,
+                task_id,
+                object_id,
+                "buffer_write_gen_shared_storage",
+            );
             state.buffer_write_gen.note_write(task_id, object_id);
         }
         crate::runtime::drain::note_store_route(site.clear_host_route());

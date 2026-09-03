@@ -106,14 +106,14 @@ pub(crate) fn emit_guest_import_levels() {
 ///
 /// `m2v` counts translated shaders (`runtime::m2v_cache`); the rest are the
 /// Vulkan engine's immutable-object caches.
-pub(crate) fn emit_object_cache_levels() {
-    let [shaders, layouts, passes, pipelines, samplers, compute_pipelines] =
-        crate::backend::vulkan::engine::object_cache_levels();
+pub(crate) fn emit_object_cache_levels(state: &crate::model::DeviceState) {
+    let [shaders, layouts, attr_sets, passes, pipelines, samplers, compute_pipelines] =
+        crate::backend::vulkan::engine::object_cache_levels(state);
     let (_, _, m2v) = crate::runtime::m2v_cache::stats();
     crate::observe::off(format!(
         "object_cache_levels (levels, not per-interval) m2v={m2v} shaders={shaders} \
-         layouts={layouts} passes={passes} pipelines={pipelines} samplers={samplers} \
-         compute_pipelines={compute_pipelines}"
+         layouts={layouts} attr_sets={attr_sets} passes={passes} pipelines={pipelines} \
+         samplers={samplers} compute_pipelines={compute_pipelines}"
     ));
 }
 

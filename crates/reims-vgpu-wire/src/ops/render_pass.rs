@@ -116,7 +116,7 @@ pub const RENDER_PASS_COLOR_ATTACHMENTS: usize = 8;
 /// three rather than leaving two arms right and one wrong — which is the state
 /// `reims-vgpu` was in.
 #[repr(C)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct AttachmentPrefix {
     /// Serializer ref of the attached texture; 0 when the slot is unattached.
     ///
@@ -188,7 +188,7 @@ impl ColorAttachmentBody {
 
 /// The depth attachment slot. 40 bytes.
 #[repr(C)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct DepthAttachmentBody {
     pub prefix: AttachmentPrefix,
     /// `clearDepth` as an IEEE-754 double. Observed: 1.0 (the value
@@ -215,7 +215,7 @@ impl DepthAttachmentBody {
 
 /// The stencil attachment slot. 36 bytes.
 #[repr(C)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct StencilAttachmentBody {
     pub prefix: AttachmentPrefix,
     /// `clearStencil`, a full 32 bits. Observed: `0x5a` and `0xa5`.
@@ -230,6 +230,53 @@ pub struct StencilAttachmentBody {
 // SAFETY: a `Wire` struct, `le` scalars and a `[u8; 2]`, align-1 and valid for
 // every byte pattern.
 unsafe impl Wire for StencilAttachmentBody {}
+
+// --- `Debug` without the bytes this module declares meaningless -------------
+//
+// The three attachment bodies each carry a field the serializer never writes,
+// which on a real wire is the guest's stale ring. A derived `Debug` renders
+// those bytes, which is this crate advertising noise it has already documented
+// as noise — and a reader comparing two renderings of the same record would see
+// them differ on bytes no field means anything by. `PartialEq` is untouched:
+// byte equality over a descriptor is a legitimate question and a different one.
+
+impl core::fmt::Debug for AttachmentPrefix {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AttachmentPrefix")
+            .field("texture_ref", &self.texture_ref)
+            .field("resolve_texture_ref", &self.resolve_texture_ref)
+            .field("level", &self.level)
+            .field("slice", &self.slice)
+            .field("depth_plane", &self.depth_plane)
+            .field("resolve_level", &self.resolve_level)
+            .field("resolve_slice", &self.resolve_slice)
+            .field("resolve_depth_plane", &self.resolve_depth_plane)
+            .field("load_action", &self.load_action)
+            .field("store_action", &self.store_action)
+            .field("store_action_options", &self.store_action_options)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for DepthAttachmentBody {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DepthAttachmentBody")
+            .field("prefix", &self.prefix)
+            .field("clear_depth_bits", &self.clear_depth_bits)
+            .field("resolve_filter", &self.resolve_filter)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for StencilAttachmentBody {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StencilAttachmentBody")
+            .field("prefix", &self.prefix)
+            .field("clear_stencil", &self.clear_stencil)
+            .field("resolve_filter", &self.resolve_filter)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Payload of a render-pass record.
 ///

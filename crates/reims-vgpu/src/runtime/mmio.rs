@@ -143,7 +143,10 @@ pub fn gfx_write<H: HostMemory + HostOps>(
         GFX_REG_ROOT_PAGE => state.gfx.root_page = val,
         GFX_REG_CHILD_DOORBELL | GFX_REG_CHILD_REPLAY_DOORBELL => {
             if crate::model::accept_child_channel(val, "mmio_child_doorbell") {
-                state.active_child_mask |= 1u32 << val;
+                // A doorbell says there is work on this domain. It does not say
+                // the guest defined it, and this handler no longer claims that
+                // it did: openness is `DeviceState::session`'s and a channel
+                // definition is its one event. See that field's doc.
                 state.pending.child_mask |= 1u32 << val;
                 // Decode/execute belongs to the host BH, never the producer
                 // vCPU's MMIO callback (ack-fast/render-async invariant).
@@ -311,7 +314,7 @@ mod tests {
         gfx_write(&mut state, &mut host, GFX_REG_CHILD_DOORBELL, 4, MMIO_U32);
 
         assert_ne!(state.pending.child_mask & (1 << 4), 0);
-        assert_ne!(state.active_child_mask & (1 << 4), 0);
+        assert_ne!(state.pending.child_mask & (1 << 4), 0);
         assert!(host.bh_scheduled);
     }
 }

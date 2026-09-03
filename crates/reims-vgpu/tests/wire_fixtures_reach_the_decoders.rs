@@ -43,7 +43,7 @@
 //! `REIMS_WIRE_FIXTURES_REQUIRED=1` (any Apple host, and CI) makes their
 //! absence fail the build rather than stand the tests down.
 
-use reims_vgpu::runtime::decode::{blit, compute, render};
+use reims_vgpu::runtime::decode::{blit_spi, compute_spi, render_spi};
 use reims_vgpu_testkit::{fixtures, unhex};
 
 /// One decoder's answer for one record: what it made of the bytes, and what
@@ -75,23 +75,73 @@ enum Verdict {
     WrongShape(&'static str),
 }
 
+/// The render rail's answer, which is four decoders' answers.
+///
+/// The rail no longer has one decoder. Forty-five rows are lifted by
+/// `protocol::decode::render`, the fence pair and the barriers by
+/// `decode::sync`, the residency declarations by `decode::residency`, and the
+/// thirty-one rows the ledger has not settled by `render_spi`. This test asks a
+/// simpler question than the dispatch does — did *anything* in this device read
+/// these bytes as the record they are — so the verdict is the union.
+///
+/// `Verdict::Decoded` used to be reachable through `Kind::OtherAccepted`, an
+/// `Ok` that meant "no arm claimed this". That is what hid `0x80`/`0x71` — the
+/// LOD-bearing sampler binds — behind a passing run: the record went through
+/// `decode` and came back fine while the guest's bind was dropped. There is no
+/// such `Ok` now; a row no decoder claims is `ErrUnknownOpcode`.
 fn render_verdict(bytes: &[u8]) -> Reading {
-    use render::DecodeStatus as S;
-    let decoded = render::decode(bytes);
+    use reims_vgpu::protocol::closure::Rail;
+    use reims_vgpu::protocol::decode::{self, DecodeRefusal};
+
+    let Ok(op) = decode::op(bytes, 0) else {
+        return Reading {
+            verdict: Verdict::WrongShape("render_record_unframed"),
+            signature: "unframed".to_string(),
+        };
+    };
+    let attempts: [Result<String, DecodeRefusal>; 3] = [
+        decode::render::decode(&op).map(|r| format!("{r:?}")),
+        decode::sync::decode(Rail::Render, &op).map(|r| format!("{r:?}")),
+        // `lift`, not `decode`: all four residency rows are unsettled, so
+        // `decode` refuses them on principle and the layout question is the one
+        // this test asks.
+        decode::residency::lift(Rail::Render, &op).map(|r| format!("{r:?}")),
+    ];
+    if let Some(signature) = attempts.iter().find_map(|r| r.as_ref().ok()) {
+        return Reading {
+            verdict: Verdict::Decoded,
+            signature: signature.clone(),
+        };
+    }
+    // The thirty-one rows the ledger has not settled, which this device decodes
+    // for itself.
+    let decoded = render_spi::decode(bytes);
     let verdict = match &decoded {
-        // `OtherAccepted` is an `Ok` that means "no arm claimed this". Counting
-        // it as decoded is what hid `0x80`/`0x71` — the LOD-bearing sampler
-        // binds — behind a passing run, because the record went through
-        // `decode` and came back fine while the guest's bind was dropped.
-        Ok(c) if c.kind == render::Kind::OtherAccepted => {
-            Verdict::NotImplemented("render_other_accepted")
-        }
         Ok(_) => Verdict::Decoded,
-        Err(S::ErrUnknownOpcode) => Verdict::NotImplemented("render_decode_unknown_opcode"),
-        Err(S::ErrUnsupportedOpcode) => Verdict::NotImplemented("render_decode_unsupported_opcode"),
-        Err(S::ErrShort) => Verdict::WrongShape("render_decode_short"),
-        Err(S::ErrBadLength) => Verdict::WrongShape("render_decode_bad_length"),
-        Err(S::ErrCountOutOfRange) => Verdict::WrongShape("render_decode_count_out_of_range"),
+        Err(render_spi::DecodeStatus::ErrShort) => Verdict::WrongShape("render_decode_short"),
+        // Unreachable: a settled row would have been decoded above. Named
+        // rather than folded into "not implemented", which would report a gap
+        // where there is a disagreement between two decoders.
+        Err(render_spi::DecodeStatus::ErrSettledElsewhere) => {
+            Verdict::WrongShape("render_decode_settled_elsewhere")
+        }
+        Err(render_spi::DecodeStatus::ErrUnknownOpcode) => {
+            // No decoder on this rail claims the opcode. If the protocol
+            // decoders refused it for its *shape* rather than its opcode, that
+            // is a layout this project has wrong and must not read as a gap.
+            if attempts.iter().any(|r| {
+                !matches!(
+                    r,
+                    Err(DecodeRefusal::UnknownOpcode { .. })
+                        | Err(DecodeRefusal::Unjudged { .. })
+                        | Err(DecodeRefusal::RefusedByContract { .. })
+                )
+            }) {
+                Verdict::WrongShape("render_record_wrong_shape")
+            } else {
+                Verdict::NotImplemented("render_decode_unknown_opcode")
+            }
+        }
     };
     Reading {
         verdict,
@@ -99,21 +149,65 @@ fn render_verdict(bytes: &[u8]) -> Reading {
     }
 }
 
+/// The compute rail's answer, which is five decoders' answers.
+///
+/// Same shape as [`blit_verdict`] below and for the same reason: the record's
+/// class comes from the closure ledger and each class is lifted by the layer
+/// that owns its layout. The question here is the simpler one — did *anything*
+/// in this device read these bytes as the record they are — so the verdict is
+/// the union, and `ledger.rs` is what asserts at most one owner claims a row.
 fn compute_verdict(bytes: &[u8]) -> Reading {
-    use compute::DecodeStatus as S;
-    let decoded = compute::decode(bytes);
+    use reims_vgpu::protocol::closure::Rail;
+    use reims_vgpu::protocol::decode::{self, DecodeRefusal};
+
+    let Ok(op) = decode::op(bytes, 0) else {
+        return Reading {
+            verdict: Verdict::WrongShape("compute_record_unframed"),
+            signature: "unframed".to_string(),
+        };
+    };
+    let attempts: [Result<String, DecodeRefusal>; 4] = [
+        decode::compute::decode(&op).map(|r| format!("{r:?}")),
+        decode::sync::decode(Rail::Compute, &op).map(|r| format!("{r:?}")),
+        decode::resource_state::decode(Rail::Compute, &op).map(|r| format!("{r:?}")),
+        // `lift`, not `decode`: the unqualified residency pair is unsettled, so
+        // `decode` refuses it on principle and the layout question is the one
+        // this test asks.
+        decode::residency::lift(Rail::Compute, &op).map(|r| format!("{r:?}")),
+    ];
+    if let Some(signature) = attempts.iter().find_map(|r| r.as_ref().ok()) {
+        return Reading {
+            verdict: Verdict::Decoded,
+            signature: signature.clone(),
+        };
+    }
+    // The eleven rows the ledger has not settled, which this device decodes for
+    // itself and executes.
+    let decoded = compute_spi::decode(bytes);
     let verdict = match &decoded {
         Ok(_) => Verdict::Decoded,
-        Err(S::ErrUnknownOpcode) => Verdict::NotImplemented("compute_decode_unknown_opcode"),
-        Err(S::ErrUnsupportedOpcode) => {
-            Verdict::NotImplemented("compute_decode_unsupported_opcode")
+        Err(compute_spi::DecodeStatus::ErrShort) => Verdict::WrongShape("compute_decode_short"),
+        // Unreachable: a settled row would have been decoded above. Named
+        // rather than folded into "not implemented", which would report a gap
+        // where there is a disagreement between two decoders.
+        Err(compute_spi::DecodeStatus::ErrSettledElsewhere) => {
+            Verdict::WrongShape("compute_decode_settled_elsewhere")
         }
-        // `ErrShort` is now the compute arm's only shape failure, the way the
-        // blit arm's became after `ErrUnimplementedOpcode` went. Every compute
-        // refusal that is not an unknown or unsupported opcode is a layout this
-        // project has wrong, which makes the arm strictly stronger than when a
-        // second variant could absorb one.
-        Err(S::ErrShort) => Verdict::WrongShape("compute_decode_short"),
+        Err(compute_spi::DecodeStatus::ErrUnknownOpcode) => {
+            // No decoder on this rail claims the opcode. If the protocol
+            // decoders refused it for its *shape* rather than its opcode, that
+            // is a layout this project has wrong and must not read as a gap.
+            if attempts.iter().any(|r| {
+                !matches!(
+                    r,
+                    Err(DecodeRefusal::UnknownOpcode { .. }) | Err(DecodeRefusal::Unjudged { .. })
+                )
+            }) {
+                Verdict::WrongShape("compute_record_wrong_shape")
+            } else {
+                Verdict::NotImplemented("compute_decode_unknown_opcode")
+            }
+        }
     };
     Reading {
         verdict,
@@ -121,17 +215,76 @@ fn compute_verdict(bytes: &[u8]) -> Reading {
     }
 }
 
+/// The blit rail's answer, which is five decoders' answers.
+///
+/// The rail no longer has one decoder: the record's class comes from the
+/// closure ledger and each class is lifted by the layer that owns its layout.
+/// This test asks a simpler question than the dispatch does — did *anything* in
+/// this device read these bytes as the record they are — so the verdict is the
+/// union.
+///
+/// The order matters for the verdict and not for the answer. A record at most
+/// one owner claims cannot be decoded by two, and `ledger.rs` asserts exactly
+/// that over the whole rail; here the first `Ok` is taken because there can
+/// only be one.
 fn blit_verdict(bytes: &[u8]) -> Reading {
-    use blit::DecodeStatus as S;
-    let decoded = blit::decode(bytes);
-    let verdict = match &decoded {
-        Ok(_) => Verdict::Decoded,
-        Err(S::ErrUnknownOpcode) => Verdict::NotImplemented("blit_decode_unknown_opcode"),
-        Err(S::ErrShort) => Verdict::WrongShape("blit_decode_short"),
+    use reims_vgpu::protocol::closure::Rail;
+    use reims_vgpu::protocol::decode::{self, DecodeRefusal};
+
+    let Ok(op) = decode::op(bytes, 0) else {
+        return Reading {
+            // A record the serializer wrote whose own header will not frame is
+            // this crate's framing wrong, not a gap.
+            verdict: Verdict::WrongShape("blit_record_unframed"),
+            signature: "unframed".to_string(),
+        };
     };
+    let attempts: [Result<String, DecodeRefusal>; 4] = [
+        decode::blit::decode(&op).map(|r| format!("{r:?}")),
+        decode::sync::decode(Rail::Blit, &op).map(|r| format!("{r:?}")),
+        decode::icb::decode(Rail::Blit, &op).map(|r| format!("{r:?}")),
+        decode::resource_state::decode(Rail::Blit, &op).map(|r| format!("{r:?}")),
+    ];
+    if let Some(signature) = attempts.iter().find_map(|r| r.as_ref().ok()) {
+        return Reading {
+            verdict: Verdict::Decoded,
+            signature: signature.clone(),
+        };
+    }
+    // The rows the ledger has not settled. This device decodes them in order to
+    // decline them by name, so a fixture reaching one is decoded here even
+    // though no executor applies it — the shape claim is what this test makes.
+    match blit_spi::decode(bytes) {
+        Ok(record) => {
+            return Reading {
+                verdict: Verdict::Decoded,
+                signature: format!("{record:?}"),
+            }
+        }
+        Err(blit_spi::DecodeStatus::ErrShort) => {
+            return Reading {
+                verdict: Verdict::WrongShape("blit_decode_short"),
+                signature: "blit_spi short".to_string(),
+            }
+        }
+        Err(blit_spi::DecodeStatus::ErrUnknownOpcode) => {}
+    }
+    let signature = format!("{attempts:?}");
+    // An owner claimed the opcode and refused the body: this crate's layout for
+    // a record Apple wrote. That is the failure this file exists to catch, and
+    // it outranks the "nobody implements it" reading below.
+    if attempts
+        .iter()
+        .any(|r| matches!(r, Err(DecodeRefusal::Short { .. })))
+    {
+        return Reading {
+            verdict: Verdict::WrongShape("blit_record_short"),
+            signature,
+        };
+    }
     Reading {
-        verdict,
-        signature: format!("{decoded:?}"),
+        verdict: Verdict::NotImplemented("blit_decode_unknown_opcode"),
+        signature,
     }
 }
 

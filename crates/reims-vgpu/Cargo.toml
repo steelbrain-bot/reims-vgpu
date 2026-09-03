@@ -147,3 +147,7 @@ cc = "1"
 [[example]]
 name = "host_window_smoke"
 required-features = ["host-window"]
+
+[[example]]
+name = "window_present_off_thread"
+required-features = ["host-window", "backend-vulkan"]

@@ -3647,6 +3647,119 @@ fn a_dual_plane_descriptor_decodes_both_planes_and_the_shared_trailer() {
     );
 }
 
+/// A dual-plane texture names the one allocation its two planes share, and it
+/// is the same window a single-plane texture over that handle names.
+///
+/// It answered `None` here, listed beside the mapper-ref texture as reaching
+/// its pages through a mapping. It does not reach a mapping at all: it is built
+/// from paging info in its own task, and the handle and allocation size the
+/// planes are cut from sit in the one object header both share — which the
+/// decoder above asserts by reading `0x51` out of each plane.
+///
+/// The consequence of the `None` was not a missing convenience. A window is
+/// what carries a storage incarnation and what claims a first reference, so
+/// with none of these objects would ever be sighted as an alias of anything,
+/// and a `CmdReplacePhysical` naming one would advance no incarnation at all.
+#[test]
+fn a_dual_plane_texture_names_the_one_allocation_its_planes_share() {
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+    let b = dual_plane_body([1, 1], (1920, 1080), MTL_FORMAT_BGRA8_UNORM);
+    let window = decode_descriptor(OBJECT_TYPE_DUAL_PLANE_TEXTURE, &b)
+        .expect("a well-formed body decodes")
+        .backing_window(PAGE_SHIFT_ARM64E);
+    assert_eq!(
+        window,
+        Some((0x51u64 << PAGE_SHIFT_ARM64E, 0x40_0000)),
+        "the allocation base and size out of the shared object header"
+    );
+
+    // The same allocation described as one plane. Two objects over one piece of
+    // storage have to arrive at one window, or the identity built from it tells
+    // them apart and the hazard edge between them is never drawn.
+    let mut single = vec![0u8; TEXTURE_DESC_BASE_LEN];
+    crate::protocol::endian::st64(&mut single[LINEAR_DESC_SIZE..], 0x40_0000);
+    crate::protocol::endian::st32(&mut single[LINEAR_DESC_HANDLE..], 0x51);
+    assert_eq!(
+        decode_descriptor(OBJECT_TYPE_TEXTURE, &single)
+            .expect("decodes")
+            .backing_window(PAGE_SHIFT_ARM64E),
+        window,
+        "one allocation, whether the guest cut one plane out of it or two"
+    );
+}
+
+/// A resource's extent is which bytes of its allocation are its own, and the
+/// allocation is not it.
+///
+/// The two answers are deliberately different. `backing_window` is storage —
+/// two textures at different offsets in one allocation share it, which is what
+/// makes them one backing — and this is which of those bytes belong to each. A
+/// model that declared content authority over the window would claim its
+/// neighbour's bytes and discard their content.
+#[test]
+fn a_resources_extent_is_its_own_bytes_and_not_the_whole_allocation() {
+    use crate::protocol::endian::st64;
+    use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+    // A buffer is its allocation: no offset, the whole length.
+    let mut buffer = [0u8; LINEAR_DESC_MIN_LEN];
+    st64(&mut buffer[LINEAR_DESC_SIZE..], 0x4000);
+    st64(&mut buffer[LINEAR_DESC_HANDLE..], 0x51);
+    let buffer = decode_descriptor(OBJECT_TYPE_BUFFER, &buffer).expect("decodes");
+    assert_eq!(buffer.allocation_extent(), Some((0, 0x4000)));
+    assert_eq!(
+        buffer.backing_window(PAGE_SHIFT_ARM64E),
+        Some((0x51u64 << PAGE_SHIFT_ARM64E, 0x4000)),
+        "and the window is the allocation, which for a buffer is the same bytes"
+    );
+
+    // A two-plane texture: one allocation, and an extent over both planes'
+    // level records rather than over the allocation the header names.
+    let dual = decode_descriptor(
+        OBJECT_TYPE_DUAL_PLANE_TEXTURE,
+        &dual_plane_body([1, 1], (1920, 1080), MTL_FORMAT_BGRA8_UNORM),
+    )
+    .expect("decodes");
+    let (offset, length) = dual
+        .allocation_extent()
+        .expect("both planes declare a level");
+    assert_eq!(offset, 0, "level 0 of plane 0 sits at the allocation base");
+    assert!(
+        length > 0 && length < 0x40_0000,
+        "the object occupies part of the 4 MiB allocation its header names, and \
+         asking the window would have claimed all of it: {length}"
+    );
+    assert_eq!(
+        dual.backing_window(PAGE_SHIFT_ARM64E).map(|(_, size)| size),
+        Some(0x40_0000),
+        "which is what the window still answers, because storage is the whole \
+         allocation and the extent is this object's part of it"
+    );
+
+    // A texture whose levels all declare a zero size states no bytes of its
+    // own. There is nothing here to answer and nothing to guess: the object is
+    // mid-publication, and an extent invented for it would be a claim over
+    // whatever else is in the allocation.
+    let unwritten = Descriptor::Texture(TextureDescriptor {
+        allocation_size: 0x4000,
+        handle: 0x51,
+        levels: vec![TextureLevelLayout {
+            offset: 0x80,
+            size: 0,
+            row_stride: 64,
+            width: 16,
+            height: 16,
+            depth: 1,
+        }],
+        ..Default::default()
+    });
+    assert_eq!(
+        unwritten.allocation_extent(),
+        None,
+        "no level states any bytes, so neither does the object"
+    );
+}
+
 /// The tag cannot be folded into the single-plane arm, and this is why.
 ///
 /// Plane 1's dimension block begins at exactly the offset a single-plane body

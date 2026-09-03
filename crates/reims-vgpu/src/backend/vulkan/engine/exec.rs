@@ -3,12 +3,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
-use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use super::caches::{
-    canonicalize_layout_bindings, AttrKey, BindingSig, Color0Load, LayoutKey, ObjectCaches,
-    PassKey, PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
+    canonicalize_layout_bindings, AttrKey, BindingSig, Color0Load, ObjectCaches, PassKey,
+    PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
 };
 use super::context::ContextOwner;
 use super::counters::{CreateSite, EngineCounters};
@@ -93,11 +92,17 @@ pub(super) struct BufferGatherRole {
 }
 
 impl BufferGatherRole {
+    /// The two single-consumer answers, as names. Only the test asserts against
+    /// them: [`buffer_gather_role`] accumulates its fields as it scans, because
+    /// an allocation bound as both is one answer carrying both and a seed-then-
+    /// merge shape would have to say so twice.
+    #[cfg(test)]
     const VERTEX: Self = Self {
         vertex: true,
         storage: false,
         index_alignment: None,
     };
+    #[cfg(test)]
     const STORAGE: Self = Self {
         vertex: false,
         storage: true,
@@ -165,84 +170,51 @@ fn buffer_bind_offset_alignment(role: BufferGatherRole, storage_align: u64) -> u
     storage.max(role.index_alignment.unwrap_or(1))
 }
 
-/// One draw's buffer binds partitioned by the consumer(s) each physical content
-/// allocation serves.
+/// The consumer(s) this draw binds one physical content allocation for, or
+/// `None` if this draw does not bind it at all.
 ///
-/// A flat table and not a map. The population is a handful — a driven Maps boot
-/// reads 2.9 vertex attributes and about six buffer binds a draw — and the
-/// question asked of it is three bits wide, so an ordered map cost a node
-/// allocation per *distinct* allocation on every draw plus a pointer-chasing
-/// probe per bind, to answer something a linear scan over one contiguous
-/// allocation answers in a few compares. `sg_roles_us` was 0.15 µs of a 9.3 µs
-/// chain before this and the probes were charged to `sg_vertex`/`sg_index`/
-/// `sg_storage` beside it.
+/// A scan and not a table, and it has been each of the three shapes in turn. It
+/// began as an ordered map, which cost a node allocation per *distinct*
+/// allocation on every draw plus a pointer-chasing probe per bind, to answer
+/// something three bits wide — `sg_roles_us` was 0.15 µs of a 9.3 µs chain and
+/// the probes were charged to `sg_vertex`/`sg_index`/`sg_storage` beside it.
+/// Then it became a flat `Vec` built once per draw and scanned linearly, which
+/// removed the probes and left one heap allocation a draw.
 ///
-/// Built from key derivations that take no reference to what they name — see
-/// [`CbBind::key_of`] — because the `DrawRequest` this borrows outlives the
-/// table, so the allocations cannot go anywhere while it is being read.
-struct BufferGatherRoles {
-    entries: Vec<((usize, u64, u64), BufferGatherRole)>,
-}
-
-impl BufferGatherRoles {
-    fn of(req: &DrawRequest) -> Self {
-        let mut entries: Vec<((usize, u64, u64), BufferGatherRole)> = Vec::with_capacity(
-            req.vertex_attributes.len()
-                + req.storage_buffers.len()
-                + req.indexed.is_some() as usize,
-        );
-        // `entry`-shaped, so a content allocation named twice in one draw stays
-        // one physical operation carrying both roles.
-        let mut merge = |key, seed: BufferGatherRole, add: fn(&mut BufferGatherRole)| match entries
-            .iter_mut()
-            .find(|(held, _)| *held == key)
-        {
-            Some((_, role)) => add(role),
-            None => entries.push((key, seed)),
-        };
-        for content in req.vertex_attributes.iter().map(|r| &r.content) {
-            merge(CbBind::key_of(content), BufferGatherRole::VERTEX, |role| {
-                role.vertex = true
-            });
+/// The table itself is what is gone now. The population is a handful — a driven
+/// Maps boot reads 2.9 vertex attributes and about six buffer binds a draw — and
+/// the three call sites ask about a key they already hold, so scanning the
+/// request the table was *built from* is the same order of work as scanning the
+/// table, minus the allocation and minus a second structure that could disagree
+/// with the first. "Shared content is one operation" stops being an invariant a
+/// merge has to maintain and becomes a property of the answer: both flags come
+/// back from one call because both loops below can set them.
+///
+/// Keys are derived by [`CbBind::key_of`], which takes no reference to what it
+/// names, and the `DrawRequest` outlives every call — so no allocation named
+/// here can move while it is being compared.
+fn buffer_gather_role(req: &DrawRequest, key: (usize, u64, u64)) -> Option<BufferGatherRole> {
+    let mut role = BufferGatherRole::default();
+    let mut bound = false;
+    for content in req.vertex_attributes.iter().map(|r| &r.content) {
+        if CbBind::key_of(content) == key {
+            role.vertex = true;
+            bound = true;
         }
-        for content in req.storage_buffers.iter().map(|r| &r.content) {
-            merge(CbBind::key_of(content), BufferGatherRole::STORAGE, |role| {
-                role.storage = true
-            });
+    }
+    for content in req.storage_buffers.iter().map(|r| &r.content) {
+        if CbBind::key_of(content) == key {
+            role.storage = true;
+            bound = true;
         }
-        if let Some(indexed) = &req.indexed {
-            let alignment = indexed.index_type.byte_size() as u64;
-            let key = CbBind::key_of(&indexed.content);
-            let seed = BufferGatherRole {
-                vertex: false,
-                storage: false,
-                index_alignment: Some(alignment),
-            };
-            match entries.iter_mut().find(|(held, _)| *held == key) {
-                Some((_, role)) => role.index_alignment = Some(alignment),
-                None => entries.push((key, seed)),
-            }
+    }
+    if let Some(indexed) = &req.indexed {
+        if CbBind::key_of(&indexed.content) == key {
+            role.index_alignment = Some(indexed.index_type.byte_size() as u64);
+            bound = true;
         }
-        Self { entries }
     }
-
-    /// The role of the bind this key names. Every bind was classified by
-    /// [`Self::of`] from the same `DrawRequest`, so an absent key is a caller
-    /// asking about a bind that is not in this draw.
-    fn role(&self, key: (usize, u64, u64)) -> Option<BufferGatherRole> {
-        self.entries
-            .iter()
-            .find(|(held, _)| *held == key)
-            .map(|(_, role)| *role)
-    }
-
-    /// How many *physical* operations the draw's binds partition into, which is
-    /// the property the role split exists to preserve. Nothing on the draw path
-    /// asks; the partition test does.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
+    bound.then_some(role)
 }
 
 impl PendingGuestGather {
@@ -1664,18 +1636,16 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
         None => req.vertex_count.saturating_sub(1),
     };
-    let mut bindings = BTreeSet::new();
-    let mut vertex_locations = BTreeSet::new();
-    let mut vertex_bindings = BTreeSet::new();
-    for attribute in &req.vertex_attributes {
-        if !vertex_locations.insert(attribute.location) {
+    for (seen, attribute) in req.vertex_attributes.iter().enumerate() {
+        let earlier = &req.vertex_attributes[..seen];
+        if earlier.iter().any(|a| a.location == attribute.location) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateVertexLocation {
                     location: attribute.location,
                 },
             ));
         }
-        if !vertex_bindings.insert(attribute.binding) {
+        if earlier.iter().any(|a| a.binding == attribute.binding) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateVertexBinding {
                     binding: attribute.binding,
@@ -1798,8 +1768,8 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
-    for buffer in &req.storage_buffers {
-        if !bindings.insert((buffer.binding, 0)) {
+    for (seen, buffer) in req.storage_buffers.iter().enumerate() {
+        if descriptor_binding_claimed(req, (buffer.binding, 0), seen, 0, 0) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateStorageDescriptorBinding {
                     binding: buffer.binding,
@@ -1812,7 +1782,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             buffer.binding,
         )?;
     }
-    for image in &req.sampled_images {
+    for (seen, image) in req.sampled_images.iter().enumerate() {
         if image.width == 0 || image.height == 0 || image.layers == 0 {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledZeroGeometry {
@@ -1823,30 +1793,24 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if (image.arrayed as u8 + image.volume as u8 + image.cube as u8) > 1 {
+        // The two shape conflicts that used to be checked here — two of
+        // `arrayed`/`volume`/`cube` set at once, and a 1D image that was also a
+        // volume or a cube — are gone because they cannot be spelled: the shape
+        // is one `TextureKind` and not four booleans. What is left is the
+        // conflict between the shape and an extent stated beside it, which no
+        // type can rule out.
+        //
+        // A 1D image (`texture1d` / `texture1d_array`) is a single row.
+        if image.kind.is_one_dim() && image.height != 1 {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledShapeConflict {
                     binding: image.binding,
-                    arrayed: image.arrayed,
-                    volume: image.volume,
-                    cube: image.cube,
+                    kind: image.kind.name(),
+                    height: image.height,
                 },
             ));
         }
-        // A 1D image (`texture1d` / `texture1d_array`) is a single row: it may
-        // combine only with `arrayed` (the 1D-array case) and always has
-        // height 1. `volume`/`cube` are 2D/3D shapes and cannot co-occur.
-        if image.one_dim && (image.volume || image.cube || image.height != 1) {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::SampledShapeConflict {
-                    binding: image.binding,
-                    arrayed: image.arrayed,
-                    volume: image.volume,
-                    cube: image.cube,
-                },
-            ));
-        }
-        if image.cube && (image.layers != 6 || image.width != image.height) {
+        if image.kind.is_cube() && (image.layers != 6 || image.width != image.height) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledCubeGeometry {
                     binding: image.binding,
@@ -1856,7 +1820,11 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if !image.arrayed && !image.volume && !image.cube && image.layers != 1 {
+        if !image.kind.is_arrayed()
+            && !image.kind.is_volume()
+            && !image.kind.is_cube()
+            && image.layers != 1
+        {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledNonArrayLayers {
                     binding: image.binding,
@@ -1912,7 +1880,18 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 ));
             }
             SampledSource::Target(identity) => {
-                if image.arrayed || image.volume || image.cube || image.layers != 1 {
+                // Spelled as the three shape questions the four booleans used
+                // to ask, and not as `kind != D2`: this check has never
+                // included the 1D case, so a `texture1d` bind of a resident
+                // reaches the geometry comparison below. Whether it should is a
+                // separate question from how the shape is carried, and
+                // answering it here would be a behaviour change riding on a
+                // representation change.
+                if image.kind.is_arrayed()
+                    || image.kind.is_volume()
+                    || image.kind.is_cube()
+                    || image.layers != 1
+                {
                     return Err(DrawError::Unsupported(
                         super::reason::DrawReason::ResidentSampledNot2d {
                             binding: image.binding,
@@ -1936,7 +1915,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 // A cube's face ordering is not carried by this source. Arrays
                 // and volumes are ordinary consecutive image planes and the
                 // copy below consumes all of them.
-                if image.cube {
+                if image.kind.is_cube() {
                     return Err(DrawError::Unsupported(
                         super::reason::DrawReason::GuestRunSampledNot2d {
                             binding: image.binding,
@@ -2023,7 +2002,13 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if !bindings.insert((image.binding, image.array_element)) {
+        if descriptor_binding_claimed(
+            req,
+            (image.binding, image.array_element),
+            req.storage_buffers.len(),
+            seen,
+            0,
+        ) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateSampledDescriptorBinding {
                     binding: image.binding,
@@ -2031,7 +2016,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
-    for sampler in &req.samplers {
+    for (seen, sampler) in req.samplers.iter().enumerate() {
         let lod_min = sampler.lod_min_f32();
         let lod_max = sampler.lod_max_f32();
         if !lod_min.is_finite() || !lod_max.is_finite() || lod_min > lod_max {
@@ -2043,7 +2028,13 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if !bindings.insert((sampler.binding, 0)) {
+        if descriptor_binding_claimed(
+            req,
+            (sampler.binding, 0),
+            req.storage_buffers.len(),
+            req.sampled_images.len(),
+            seen,
+        ) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateSamplerDescriptorBinding {
                     binding: sampler.binding,
@@ -2052,6 +2043,44 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
     }
     Ok(())
+}
+
+/// Whether a descriptor earlier in this draw already claimed `key`.
+///
+/// # Why the prefix is a parameter and not a set
+///
+/// `validate_v1` used one `BTreeSet<(u32, u32)>` across the three descriptor
+/// lists, and its first insert is a heap node — one allocation on every draw
+/// that binds anything, which is every real draw. "Heap allocations per
+/// steady-state draw" is one of the replacement architecture's structural
+/// zeros, and this was 104 of the bytes.
+///
+/// The scan is quadratic in the number of descriptors a draw binds, which is
+/// the number a shader declares: a handful. Below any size where that matters,
+/// walking a slice already in cache beats allocating and balancing a tree.
+///
+/// The three cursors say how far the caller has got, rather than this taking a
+/// pre-built list, because the duplicate checks are interleaved with
+/// per-descriptor validation — a sampled image with a bad `descriptor_count`
+/// and a sampler with a bad LOD each refuse *before* their duplicate check. A
+/// pre-pass would change which decline a draw that is both malformed and
+/// duplicated reports.
+fn descriptor_binding_claimed(
+    req: &DrawRequest,
+    key: (u32, u32),
+    storage: usize,
+    sampled: usize,
+    samplers: usize,
+) -> bool {
+    req.storage_buffers[..storage]
+        .iter()
+        .any(|b| (b.binding, 0) == key)
+        || req.sampled_images[..sampled]
+            .iter()
+            .any(|i| (i.binding, i.array_element) == key)
+        || req.samplers[..samplers]
+            .iter()
+            .any(|s| (s.binding, 0) == key)
 }
 
 /// Stage a host-written buffer into a freshly created sampled image and leave it
@@ -2911,16 +2940,13 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     phase.enter(super::draw_phase::Phase::Pipeline);
 
-    // Build layout key from storage / sampled / sampler bindings. Sized up
-    // front: this grew from empty on every draw, so a draw with the eight or so
-    // descriptors a Maps chain binds paid three reallocations to reach a width
-    // its inputs already state.
-    let mut layout_bindings = Vec::with_capacity(
-        req.storage_buffers.len()
-            + req.sampled_images.len()
-            + req.samplers.len()
-            + req.color_input as usize,
-    );
+    // Build the layout's bindings from storage / sampled / sampler descriptors,
+    // into the command buffer's own scratch. It was a draw-local `Vec`, sized up
+    // front because growing from empty cost a Maps-sized descriptor set three
+    // reallocations — but a right-sized allocation is still an allocation a
+    // draw, and the layout cache is looked up by a slice of these, so the buffer
+    // that survives between draws is the one the lookup can borrow from.
+    let layout_bindings = pools.layout_bindings_scratch();
     for b in &req.storage_buffers {
         layout_bindings.push(BindingSig {
             binding: b.binding,
@@ -2953,10 +2979,15 @@ pub(crate) unsafe fn execute_draw_inner(
             count: 1,
         });
     }
-    let layout_bindings = canonicalize_layout_bindings(layout_bindings)?;
-    if let Some(binding) = layout_bindings.iter().find(|binding| binding.count > 1) {
+    canonicalize_layout_bindings(layout_bindings)?;
+    if let Some(binding) = pools
+        .layout_bindings()
+        .iter()
+        .find(|binding| binding.count > 1)
+    {
         let dynamic_indexing = ctx.features.sampled_image_array_dynamic_indexing;
-        let required_descriptors = layout_bindings
+        let required_descriptors = pools
+            .layout_bindings()
             .iter()
             .filter(|candidate| {
                 vk::DescriptorType::from_raw(candidate.ty as i32)
@@ -2986,16 +3017,12 @@ pub(crate) unsafe fn execute_draw_inner(
     if let Some((binding, fragment)) = used_binding_absent_from_layout(
         &req.vert_used_descriptor_bindings,
         &req.frag_used_descriptor_bindings,
-        &layout_bindings,
+        pools.layout_bindings(),
     ) {
         return Err(DrawError::Unsupported(
             super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
         ));
     }
-    let layout_key = LayoutKey {
-        bindings: layout_bindings,
-        push_constant: None,
-    };
     // Resolve load action: resident > guest/host seed > Clear black.
     let mut load_uses_gpu_content = req.load_from_target;
     // output_bgra (computed with the batch decision above): BGRA output only
@@ -3155,19 +3182,21 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     pass_key.sample_count = raster_sample_count;
     pass_key.multisample_resolve = req.multisample_resolve;
-    let attr_keys: Vec<AttrKey> = req
-        .vertex_attributes
-        .iter()
-        .map(|a| AttrKey {
-            location: a.location,
-            binding: a.binding,
-            format: a.format,
-            offset: a.offset,
-            stride: a.stride,
-            step_function: a.step_function,
-            step_rate: a.step_rate,
-        })
-        .collect();
+    // Into the command buffer's scratch and then interned, for the reason the
+    // layout bindings below are: `PipelineKey` carries the attribute set, and a
+    // key owning a `Vec<AttrKey>` is a heap allocation on every draw that has
+    // attributes — which is every draw a guest actually sends.
+    let attr_scratch = pools.attr_keys_scratch();
+    attr_scratch.extend(req.vertex_attributes.iter().map(|a| AttrKey {
+        location: a.location,
+        binding: a.binding,
+        format: a.format,
+        offset: a.offset,
+        stride: a.stride,
+        step_function: a.step_function,
+        step_rate: a.step_rate,
+    }));
+    let attr_keys = caches.intern_attrs(pools.attr_keys());
 
     phase.enter(super::draw_phase::Phase::PipelineShader);
     let (vert_digest, vert_module) =
@@ -3175,7 +3204,8 @@ pub(crate) unsafe fn execute_draw_inner(
     let (frag_digest, frag_module) =
         caches.get_or_create_shader_memoized(ctx, &req.frag_spirv, counters, pools)?;
     phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
-    let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
+    let layout = caches.get_or_create_layout(ctx, pools.layout_bindings(), None, counters)?;
+    let (dsl, pipeline_layout) = (layout.dsl, layout.pipeline_layout);
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
     phase.enter(super::draw_phase::Phase::Pipeline);
     // How many viewport slots this draw rasterizes into, checked against the
@@ -3349,7 +3379,7 @@ pub(crate) unsafe fn execute_draw_inner(
         raster: raster_plan.state,
         depth_stencil: depth_stencil_plan.state,
         viewport_slots: slot_count_u32,
-        layout: layout_key.clone(),
+        layout: layout.id,
     };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
@@ -3387,9 +3417,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // this command buffer is copied once.
     let mut guest_gathers: Vec<PendingGuestGather> = Vec::new();
     phase.enter(super::draw_phase::Phase::StageRoles);
-    let gather_roles = BufferGatherRoles::of(req);
     phase.enter(super::draw_phase::Phase::StageVertex);
-    let mut vertex_bufs = Vec::new();
+    pools.begin_vertex_binds();
     for resource in &req.vertex_attributes {
         let needs_shift = !no_vertex_fetch
             && resource.step_function == VertexStepFunction::Constant
@@ -3442,14 +3471,13 @@ pub(crate) unsafe fn execute_draw_inner(
                 &resource.content,
                 StageBufferUse {
                     snapshot_volatile: batch_eligible,
-                    gather_role: gather_roles
-                        .role(CbBind::key_of(&resource.content))
+                    gather_role: buffer_gather_role(req, CbBind::key_of(&resource.content))
                         .expect("every vertex buffer was classified"),
                 },
                 &mut guest_gathers,
             )?
         };
-        vertex_bufs.push((resource.binding, slot));
+        pools.stage_vertex_bind(resource.binding, slot);
     }
 
     // Index data follows the same retained resource path as vertex/storage
@@ -3464,8 +3492,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &indexed.content,
             StageBufferUse {
                 snapshot_volatile: batch_eligible,
-                gather_role: gather_roles
-                    .role(CbBind::key_of(&indexed.content))
+                gather_role: buffer_gather_role(req, CbBind::key_of(&indexed.content))
                     .expect("the index buffer was classified"),
             },
             &mut guest_gathers,
@@ -3478,7 +3505,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // pooled slot carries `POOL_SLOT_USAGE`, so there is no usage for that
     // reuse to be wrong about).
     phase.enter(super::draw_phase::Phase::StageStorage);
-    let mut storage_slots = Vec::new();
+    pools.begin_storage_binds();
     for resource in &req.storage_buffers {
         let slot = stage_buffer_content(
             ctx,
@@ -3487,13 +3514,12 @@ pub(crate) unsafe fn execute_draw_inner(
             &resource.content,
             StageBufferUse {
                 snapshot_volatile: batch_eligible,
-                gather_role: gather_roles
-                    .role(CbBind::key_of(&resource.content))
+                gather_role: buffer_gather_role(req, CbBind::key_of(&resource.content))
                     .expect("every storage buffer was classified"),
             },
             &mut guest_gathers,
         )?;
-        storage_slots.push((resource.binding, slot, resource.content.len() as u64));
+        pools.stage_storage_bind(resource.binding, slot, resource.content.len() as u64);
     }
 
     // Target seed staging (CPU import only — not LoadFromTarget).
@@ -3916,7 +3942,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     array_element: resource.array_element,
                     image: img,
                     staging: st,
-                    volume: resource.volume,
+                    volume: resource.kind.is_volume(),
                     layers: resource.layers,
                 });
             }
@@ -4197,7 +4223,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     image: img,
                     source,
                     row_length_texels: src.row_length_texels,
-                    volume: resource.volume,
+                    volume: resource.kind.is_volume(),
                     layers: resource.layers,
                     gathered_len: src.total_len as usize,
                 });
@@ -4244,7 +4270,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Push descriptors are the Vulkan spelling closest to Metal encoder
     // binding state: the writes become commands in this command buffer, with no
     // separately allocated object. The layout cache made the same decision.
-    let push_descriptors = layout_key.uses_push_descriptors(ctx.caps.push_descriptor);
+    let push_descriptors = layout.push_descriptors;
     // Owning pool block travels alongside an allocated set so the flush-time
     // free routes back to the block it came from. A push layout owns neither.
     let mut dset_pool: Option<vk::DescriptorPool> = None;
@@ -4255,74 +4281,40 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
-    let buffer_infos: Vec<_> = storage_slots
-        .iter()
-        .map(|(_, bound, len)| {
-            vk::DescriptorBufferInfo::default()
-                .buffer(bound.buffer)
-                .offset(bound.offset)
-                .range(descriptor_range(*len))
-        })
-        .collect();
-    let sampled_infos: Vec<_> = sampled
-        .iter()
-        .map(|image| {
-            vk::DescriptorImageInfo::default()
-                .image_view(image.view())
-                .image_layout(image.descriptor_layout())
-        })
-        .collect();
-    let sampler_infos: Vec<_> = sampler_handles
-        .iter()
-        .map(|(_, s)| vk::DescriptorImageInfo::default().sampler(*s))
-        .collect();
     // Framebuffer fetch: the input attachment IS the color target's view;
     // derive the same layout as the subpass reference. A draw that also
     // samples the target upgrades both from GENERAL to the feedback layout.
-    let color_input_info = vk::DescriptorImageInfo::default()
-        .image_view(target_view)
-        .image_layout(pass_key.color_layout(0));
-    let dst_set = dset.unwrap_or_default();
-    let mut descriptor_writes = Vec::new();
-    for (i, (binding, _, _)) in storage_slots.iter().enumerate() {
-        descriptor_writes.push(
-            vk::WriteDescriptorSet::default()
-                .dst_set(dst_set)
-                .dst_binding(*binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(&buffer_infos[i])),
-        );
-    }
-    for (i, image) in sampled.iter().enumerate() {
-        descriptor_writes.push(
-            vk::WriteDescriptorSet::default()
-                .dst_set(dst_set)
-                .dst_binding(image.binding())
-                .dst_array_element(image.array_element())
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .image_info(std::slice::from_ref(&sampled_infos[i])),
-        );
-    }
-    for (i, (binding, _)) in sampler_handles.iter().enumerate() {
-        descriptor_writes.push(
-            vk::WriteDescriptorSet::default()
-                .dst_set(dst_set)
-                .dst_binding(*binding)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .image_info(std::slice::from_ref(&sampler_infos[i])),
-        );
-    }
-    if req.color_input {
-        descriptor_writes.push(
-            vk::WriteDescriptorSet::default()
-                .dst_set(dst_set)
-                .dst_binding(super::types::COLOR_INPUT_BINDING)
-                .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
-                .image_info(std::slice::from_ref(&color_input_info)),
-        );
-    }
-    if dset.is_some() {
-        ctx.device.update_descriptor_sets(&descriptor_writes, &[]);
+    let color_input_layout = pass_key.color_layout(0);
+    // This draw's bindings, as this device's own list rather than as Vulkan's
+    // write structures.
+    //
+    // The write structures used to be built here, unconditionally, for both
+    // consumers at once — and on the push rail the consumer below sends them
+    // only when they *differ* from what the command buffer already carries. A
+    // warm repeat draw therefore built a `Vec<vk::DescriptorBufferInfo>` and a
+    // `Vec<vk::WriteDescriptorSet>` per draw, on the way to sending neither:
+    // measured on the ninth repeat of one `DrawRequest`, `descriptor_pushes`,
+    // `descriptor_set_binds` and `descriptor_set_updates` were all zero while
+    // those two allocations happened every time. Deferring the translation to
+    // each consumer is what makes "no full binding-table rebuild on an unchanged
+    // draw" true of the host side and not only of the recording.
+    //
+    // Built into the command buffer's own scratch, which keeps its capacity
+    // across draws, so this list itself costs no allocation.
+    let (descriptor_scratch, storage_binds) = pools.descriptor_scratch_and_storage_binds();
+    fill_descriptor_bindings(
+        descriptor_scratch,
+        storage_binds,
+        &sampled,
+        &sampler_handles,
+        req.color_input.then_some((target_view, color_input_layout)),
+    );
+    if let Some(dset) = dset {
+        // An allocated set is fresh out of the pool and carries nothing, so
+        // there is no unchanged case to elide: it is written every draw.
+        with_descriptor_writes(pools.push_descriptor_scratch_ref(), dset, |writes| {
+            ctx.device.update_descriptor_sets(writes, &[]);
+        });
         counters
             .descriptor_set_updates
             .fetch_add(1, Ordering::Relaxed);
@@ -5056,7 +5048,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    let clear = clear_values(req);
+    let clear = clear_values(req)?;
     phase.enter(super::draw_phase::Phase::RecordPass);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
@@ -5339,58 +5331,27 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     if push_descriptors {
-        let push_state = pools.push_descriptor_scratch();
-        push_state.extend(storage_slots.iter().zip(&buffer_infos).map(
-            |((binding, _, _), info)| super::pools::PushDescriptorBinding::Buffer {
-                binding: *binding,
-                array_element: 0,
-                ty: vk::DescriptorType::STORAGE_BUFFER,
-                buffer: info.buffer,
-                offset: info.offset,
-                range: info.range,
-            },
-        ));
-        push_state.extend(sampled.iter().zip(&sampled_infos).map(|(image, info)| {
-            super::pools::PushDescriptorBinding::Image {
-                binding: image.binding(),
-                array_element: image.array_element(),
-                ty: vk::DescriptorType::SAMPLED_IMAGE,
-                sampler: info.sampler,
-                view: info.image_view,
-                layout: info.image_layout,
-            }
-        }));
-        push_state.extend(sampler_handles.iter().zip(&sampler_infos).map(
-            |((binding, _), info)| super::pools::PushDescriptorBinding::Image {
-                binding: *binding,
-                array_element: 0,
-                ty: vk::DescriptorType::SAMPLER,
-                sampler: info.sampler,
-                view: info.image_view,
-                layout: info.image_layout,
-            },
-        ));
-        if req.color_input {
-            push_state.push(super::pools::PushDescriptorBinding::Image {
-                binding: super::types::COLOR_INPUT_BINDING,
-                array_element: 0,
-                ty: vk::DescriptorType::INPUT_ATTACHMENT,
-                sampler: color_input_info.sampler,
-                view: color_input_info.image_view,
-                layout: color_input_info.image_layout,
-            });
-        }
         if pools.push_descriptors_changed(pipeline_layout, counters) {
-            ctx.push_descriptor
+            // Only here, and this is the point of the split: the list was built
+            // once above, the comparison read it, and Vulkan's write structures
+            // are derived from it only on the draw that actually sends them.
+            let push_entry = ctx
+                .push_descriptor
                 .as_ref()
-                .expect("push layout requires enabled entry points")
-                .cmd_push_descriptor_set(
-                    cb,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline_layout,
-                    0,
-                    &descriptor_writes,
-                );
+                .expect("push layout requires enabled entry points");
+            with_descriptor_writes(
+                pools.push_descriptor_echo(),
+                vk::DescriptorSet::null(),
+                |writes| {
+                    push_entry.cmd_push_descriptor_set(
+                        cb,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipeline_layout,
+                        0,
+                        writes,
+                    );
+                },
+            );
             counters.descriptor_pushes.fetch_add(1, Ordering::Relaxed);
         }
     } else if let Some(dset) = dset {
@@ -5407,7 +5368,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .fetch_add(1, Ordering::Relaxed);
     }
     phase.enter(super::draw_phase::Phase::RecordDraw);
-    unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
+    unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters) };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
             ctx.device
@@ -6138,20 +6099,21 @@ unsafe fn ad_hoc_attachment_views(
 /// pass to LOAD. The clear now travels as
 /// [`super::types::DrawRequest::color_attachment`], already paired with its
 /// format by attachment translation.
-fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
-    let mut clear = vec![vk::ClearValue {
-        // With no declared attachment the clear is transparent black. Every
-        // Vulkan union member represents that value with the same zero bits.
+fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
+    let mut clear = ClearValues::default();
+    // With no declared attachment the clear is transparent black. Every Vulkan
+    // union member represents that value with the same zero bits.
+    clear.push(vk::ClearValue {
         color: req
             .color_attachment
             .map(|a| a.clear())
             .unwrap_or_default()
             .vk(),
-    }];
+    })?;
     for sec in &req.secondary_targets {
         clear.push(vk::ClearValue {
             color: sec.attachment.clear().vk(),
-        });
+        })?;
     }
     if let Some(d) = &req.depth {
         clear.push(vk::ClearValue {
@@ -6159,9 +6121,205 @@ fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
                 depth: d.clear_value,
                 stencil: d.stencil.map(|s| s.clear_value).unwrap_or(0),
             },
+        })?;
+    }
+    Ok(clear)
+}
+
+/// The clear values of one draw, held inline.
+///
+/// # Why this is an array and not a `Vec`
+///
+/// "Heap allocations per steady-state draw" is one of the replacement
+/// architecture's structural zeros. `clear_values` returned a `Vec` whose first
+/// `push` allocated, and on the overwhelmingly common draw — one colour target,
+/// no secondaries, no depth — that was **the only trip a warm repeat draw made
+/// into the allocator**: 1 trip, 16 bytes, measured through
+/// `reims_vgpu_testkit::allocations` on the live executor. One `malloc` a draw
+/// is the exact shape that instrument's own doc warns about, because it shows
+/// up as a percent or two of drain duty spread evenly across a profile and no
+/// single line got slower.
+///
+/// The capacity is not a guess. `1 + MAX_SECONDARY_ATTACH` is
+/// `PASS_MAX_COLOR_ATTACHMENTS`, which is the wire's own attachment bound, and
+/// the `+ 1` is depth — so this holds every attachment a render pass this device
+/// builds can have, and one more would be a pass Vulkan could not be given
+/// either.
+///
+/// # Why the overflow is a refusal and not a truncation
+///
+/// Vulkan indexes this array positionally against the pass's attachments, so a
+/// short one silently gives a later attachment an earlier one's colour — a wrong
+/// frame with nothing reported. The cap is already enforced where the pass key
+/// is built, but relying on that is relying on a call order this type cannot
+/// see; refusing here makes the bound the array's own, under the same
+/// `SecondaryAttachmentCap` reason, so the two cannot disagree.
+/// Fill `out` with this draw's descriptor bindings, in the order Vulkan's write
+/// structures will be derived in.
+///
+/// The list is this device's own vocabulary, not Vulkan's. That is what lets the
+/// two consumers below take it at different times: the push rail compares it
+/// against what the command buffer already carries and usually sends nothing,
+/// while a freshly allocated descriptor set is always written. Building Vulkan's
+/// structures here would charge every draw for the rarer of the two.
+fn fill_descriptor_bindings(
+    out: &mut Vec<super::pools::PushDescriptorBinding>,
+    storage_slots: &[(u32, BoundBuffer, u64)],
+    sampled: &[PreparedSampled],
+    sampler_handles: &[(u32, vk::Sampler)],
+    color_input: Option<(vk::ImageView, vk::ImageLayout)>,
+) {
+    out.extend(storage_slots.iter().map(|(binding, bound, len)| {
+        super::pools::PushDescriptorBinding::Buffer {
+            binding: *binding,
+            array_element: 0,
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            buffer: bound.buffer,
+            offset: bound.offset,
+            range: descriptor_range(*len),
+        }
+    }));
+    out.extend(
+        sampled
+            .iter()
+            .map(|image| super::pools::PushDescriptorBinding::Image {
+                binding: image.binding(),
+                array_element: image.array_element(),
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                sampler: vk::Sampler::null(),
+                view: image.view(),
+                layout: image.descriptor_layout(),
+            }),
+    );
+    out.extend(sampler_handles.iter().map(|(binding, sampler)| {
+        super::pools::PushDescriptorBinding::Image {
+            binding: *binding,
+            array_element: 0,
+            ty: vk::DescriptorType::SAMPLER,
+            sampler: *sampler,
+            view: vk::ImageView::null(),
+            layout: vk::ImageLayout::UNDEFINED,
+        }
+    }));
+    if let Some((view, layout)) = color_input {
+        out.push(super::pools::PushDescriptorBinding::Image {
+            binding: super::types::COLOR_INPUT_BINDING,
+            array_element: 0,
+            ty: vk::DescriptorType::INPUT_ATTACHMENT,
+            sampler: vk::Sampler::null(),
+            view,
+            layout,
         });
     }
-    clear
+}
+
+/// Derive Vulkan's write structures from `bindings` and hand them to `f`.
+///
+/// A closure and not a return value: `vk::WriteDescriptorSet<'a>` borrows the
+/// `vk::Descriptor*Info` beside it, so the two cannot be returned together
+/// without a self-referential struct. The borrow is load-bearing — it is what
+/// stops a write outliving the info it points at — so the shape that keeps it is
+/// the right one and the callback is the price.
+///
+/// `dst_set` is ignored by `vkCmdPushDescriptorSetKHR`, which is why the push
+/// rail passes a null handle rather than inventing one.
+fn with_descriptor_writes<R>(
+    bindings: &[super::pools::PushDescriptorBinding],
+    dst_set: vk::DescriptorSet,
+    f: impl FnOnce(&[vk::WriteDescriptorSet<'_>]) -> R,
+) -> R {
+    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+    let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+    // Filled first and in full, so neither vector reallocates while the writes
+    // below hold references into it.
+    for binding in bindings {
+        match binding {
+            super::pools::PushDescriptorBinding::Buffer {
+                buffer,
+                offset,
+                range,
+                ..
+            } => buffer_infos.push(
+                vk::DescriptorBufferInfo::default()
+                    .buffer(*buffer)
+                    .offset(*offset)
+                    .range(*range),
+            ),
+            super::pools::PushDescriptorBinding::Image {
+                sampler,
+                view,
+                layout,
+                ..
+            } => image_infos.push(
+                vk::DescriptorImageInfo::default()
+                    .sampler(*sampler)
+                    .image_view(*view)
+                    .image_layout(*layout),
+            ),
+        }
+    }
+    let mut buffers = 0usize;
+    let mut images = 0usize;
+    let mut writes: Vec<vk::WriteDescriptorSet<'_>> = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let (dst_binding, array_element, ty) = binding.slot();
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(dst_set)
+            .dst_binding(dst_binding)
+            .dst_array_element(array_element)
+            .descriptor_type(ty);
+        writes.push(match binding {
+            super::pools::PushDescriptorBinding::Buffer { .. } => {
+                let write = write.buffer_info(std::slice::from_ref(&buffer_infos[buffers]));
+                buffers += 1;
+                write
+            }
+            super::pools::PushDescriptorBinding::Image { .. } => {
+                let write = write.image_info(std::slice::from_ref(&image_infos[images]));
+                images += 1;
+                write
+            }
+        });
+    }
+    f(&writes)
+}
+
+struct ClearValues {
+    values: [vk::ClearValue; 1 + MAX_SECONDARY_ATTACH + 1],
+    len: usize,
+}
+
+impl Default for ClearValues {
+    fn default() -> Self {
+        Self {
+            values: [vk::ClearValue::default(); 1 + MAX_SECONDARY_ATTACH + 1],
+            len: 0,
+        }
+    }
+}
+
+impl ClearValues {
+    fn push(&mut self, value: vk::ClearValue) -> Result<(), DrawError> {
+        let Some(slot) = self.values.get_mut(self.len) else {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::SecondaryAttachmentCap {
+                    requested: self.len,
+                    cap: MAX_SECONDARY_ATTACH,
+                },
+            ));
+        };
+        *slot = value;
+        self.len += 1;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for ClearValues {
+    type Target = [vk::ClearValue];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values[..self.len]
+    }
 }
 
 /// The access a barrier over *this draw's own colour target* must name as its
@@ -6856,23 +7014,29 @@ mod tests {
             ..DrawRequest::default()
         };
 
-        let roles = BufferGatherRoles::of(&req);
-        assert_eq!(roles.len(), 4, "shared content must stay one operation");
-        assert_eq!(roles.role(keys[0]), Some(BufferGatherRole::VERTEX));
-        assert_eq!(roles.role(keys[1]), Some(BufferGatherRole::STORAGE));
-        assert!(roles
-            .role(keys[2])
+        assert_eq!(
+            buffer_gather_role(&req, keys[0]),
+            Some(BufferGatherRole::VERTEX)
+        );
+        assert_eq!(
+            buffer_gather_role(&req, keys[1]),
+            Some(BufferGatherRole::STORAGE)
+        );
+        // "Shared content stays one operation" used to be asserted as a table
+        // length, and a length can only say the merge did not add an entry. It
+        // is one *answer* now: the allocation bound twice comes back carrying
+        // both roles, which is the claim the byte columns actually rest on, and
+        // there is no second structure that could hold it as two.
+        assert!(buffer_gather_role(&req, keys[2])
             .expect("shared was classified")
             .is_shared());
-        let index = roles
-            .role(keys[3])
-            .expect("the index buffer was classified");
+        let index = buffer_gather_role(&req, keys[3]).expect("the index buffer was classified");
         assert!(index.includes_index());
         assert_eq!(index.index_alignment, Some(2));
-        // The table answers only about this draw's binds. An unclassified key
-        // must be `None` and not the role of whichever entry a scan happened to
-        // stop on — the three call sites `expect()` on exactly this.
-        assert_eq!(roles.role((0xdead_beef, 0, 16)), None);
+        // Only about this draw's binds. An unclassified key must be `None` and
+        // not the role of whichever bind a scan happened to stop on — the three
+        // call sites `expect()` on exactly this.
+        assert_eq!(buffer_gather_role(&req, (0xdead_beef, 0, 16)), None);
     }
 
     /// The bands tile every attachment size with no gap and no overlap, and a
@@ -7109,10 +7273,7 @@ mod tests {
                 width: w,
                 height: h,
                 layers: 1,
-                arrayed: false,
-                volume: false,
-                cube: false,
-                one_dim: false,
+                kind: reims_vgpu_core::texture_shape::TextureKind::D2,
                 multisampled: false,
                 source: SampledSource::GuestRuns(
                     GuestRunSource {
@@ -7210,10 +7371,7 @@ mod tests {
             width: 16,
             height: 16,
             layers: 1,
-            arrayed: false,
-            volume: false,
-            cube: false,
-            one_dim: false,
+            kind: reims_vgpu_core::texture_shape::TextureKind::D2,
             multisampled: false,
             source: SampledSource::Target(identity),
             byte_origin: Default::default(),
@@ -7245,7 +7403,7 @@ mod tests {
         assert_eq!(feedback_color_index(&req, &plain, false), None);
 
         let mut non_plain = target_sample(primary);
-        non_plain.arrayed = true;
+        non_plain.kind = reims_vgpu_core::texture_shape::TextureKind::D2Array;
         assert_eq!(feedback_color_index(&req, &non_plain, true), None);
 
         let secondary = secondary_with_clear(super::super::types::ColorClearValue::default());
@@ -7536,7 +7694,7 @@ mod tests {
             ..DrawRequest::default()
         };
 
-        let clear = clear_values(&req);
+        let clear = clear_values(&req).expect("within the attachment cap");
         assert_eq!(
             clear.len(),
             4,
@@ -7554,11 +7712,233 @@ mod tests {
         }
     }
 
+    /// A `DrawRequest` that reaches `validate_v1`'s descriptor checks: the
+    /// geometry and both shader modules are what it refuses on before it gets
+    /// there.
+    fn validatable_request() -> DrawRequest {
+        DrawRequest {
+            width: 16,
+            height: 16,
+            vert_spirv: std::sync::Arc::new(vec![0x0723_0203]),
+            frag_spirv: std::sync::Arc::new(vec![0x0723_0203]),
+            ..DrawRequest::default()
+        }
+    }
+
+    fn storage_at(binding: u32) -> super::super::types::StorageBufferResource {
+        super::super::types::StorageBufferResource {
+            binding,
+            content: super::super::types::BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 16])),
+        }
+    }
+
+    fn sampled_at(binding: u32, array_element: u32) -> super::super::types::SampledImageResource {
+        super::super::types::SampledImageResource {
+            binding,
+            array_element,
+            descriptor_count: 1,
+            width: 1,
+            height: 1,
+            layers: 1,
+            kind: reims_vgpu_core::texture_shape::TextureKind::D2,
+            multisampled: false,
+            source: super::super::types::SampledSource::Bytes(std::sync::Arc::new(vec![0u8; 4])),
+            byte_origin: Default::default(),
+            format: vk::Format::R8G8B8A8_UNORM,
+            identity: None,
+            swizzle: Default::default(),
+        }
+    }
+
+    /// One descriptor binding claimed twice in a draw is refused, across all
+    /// three lists and not only within one of them.
+    ///
+    /// The set that used to answer this was shared by the three lists, so a
+    /// sampler colliding with a storage buffer was a duplicate. The scan that
+    /// replaced it has to say the same thing, and nothing tested that it did —
+    /// these five declines had no owner-level coverage at all.
+    #[test]
+    fn one_descriptor_binding_claimed_twice_is_refused_across_the_three_lists() {
+        let mut within = validatable_request();
+        within.storage_buffers = vec![storage_at(4), storage_at(4)];
+        assert!(
+            matches!(
+                validate_v1(&within),
+                Err(DrawError::DrawValidation(
+                    DrawValidationDecline::DuplicateStorageDescriptorBinding { binding: 4 }
+                ))
+            ),
+            "two storage buffers at one binding"
+        );
+
+        let mut across = validatable_request();
+        across.storage_buffers = vec![storage_at(4)];
+        across.sampled_images = vec![sampled_at(4, 0)];
+        assert!(
+            matches!(
+                validate_v1(&across),
+                Err(DrawError::DrawValidation(
+                    DrawValidationDecline::DuplicateSampledDescriptorBinding { binding: 4 }
+                ))
+            ),
+            "a sampled image on a storage buffer's binding"
+        );
+
+        let mut sampler = validatable_request();
+        sampler.sampled_images = vec![sampled_at(9, 0)];
+        sampler.samplers = vec![super::super::types::SamplerResource::normalized_default(9)];
+        assert!(
+            matches!(
+                validate_v1(&sampler),
+                Err(DrawError::DrawValidation(
+                    DrawValidationDecline::DuplicateSamplerDescriptorBinding { binding: 9 }
+                ))
+            ),
+            "a sampler on a sampled image's binding"
+        );
+
+        // And the key is the pair, not the binding: two elements of one
+        // descriptor array are the array, not a collision. The count is 2 on
+        // both, because `array_element >= descriptor_count` is refused a few
+        // lines earlier and a test that tripped that would prove nothing here.
+        let mut array = validatable_request();
+        let mut first = sampled_at(7, 0);
+        first.descriptor_count = 2;
+        let mut second = sampled_at(7, 1);
+        second.descriptor_count = 2;
+        array.sampled_images = vec![first, second];
+        assert!(
+            validate_v1(&array).is_ok(),
+            "distinct array elements of one binding are not a duplicate: {:?}",
+            validate_v1(&array).err()
+        );
+    }
+
+    /// A descriptor that is both malformed and duplicated reports the malformed
+    /// decline, because that check runs first.
+    ///
+    /// This is the reason the duplicate scan takes a prefix cursor rather than
+    /// being hoisted into a pre-pass over the whole request: a pre-pass would
+    /// report the duplicate and lose the more specific reason.
+    #[test]
+    fn a_malformed_duplicate_reports_the_malformed_reason() {
+        let mut req = validatable_request();
+        req.storage_buffers = vec![storage_at(5)];
+        let mut bad_lod = super::super::types::SamplerResource::normalized_default(5);
+        bad_lod.lod_min = f32::NAN.to_bits();
+        req.samplers = vec![bad_lod];
+        assert!(
+            matches!(
+                validate_v1(&req),
+                Err(DrawError::DrawValidation(
+                    DrawValidationDecline::InvalidSamplerLod { binding: 5, .. }
+                ))
+            ),
+            "the LOD check runs before the duplicate check and keeps its reason"
+        );
+    }
+
+    /// Two vertex attributes may not share a location or a binding, and the
+    /// location is reported first when both collide.
+    #[test]
+    fn two_vertex_attributes_may_not_share_a_location_or_a_binding() {
+        let attribute =
+            |location: u32, binding: u32| super::super::types::VertexAttributeResource {
+                location,
+                binding,
+                format: super::super::types::VertexAttributeFormat::Float,
+                offset: 0,
+                stride: 4,
+                step_function: super::super::types::VertexStepFunction::PerVertex,
+                step_rate: 1,
+                content: super::super::types::BufferContent::Bytes(std::sync::Arc::new(vec![
+                    0u8;
+                    16
+                ])),
+            };
+
+        let mut location = validatable_request();
+        location.vertex_attributes = vec![attribute(2, 0), attribute(2, 1)];
+        assert!(matches!(
+            validate_v1(&location),
+            Err(DrawError::DrawValidation(
+                DrawValidationDecline::DuplicateVertexLocation { location: 2 }
+            ))
+        ));
+
+        let mut binding = validatable_request();
+        binding.vertex_attributes = vec![attribute(0, 3), attribute(1, 3)];
+        assert!(matches!(
+            validate_v1(&binding),
+            Err(DrawError::DrawValidation(
+                DrawValidationDecline::DuplicateVertexBinding { binding: 3 }
+            ))
+        ));
+    }
+
+    /// Past the attachment bound the clear array refuses instead of running
+    /// short, because Vulkan indexes it positionally and a short one gives a
+    /// later attachment an earlier one's colour.
+    ///
+    /// The bound belongs to the array rather than to the pass-key path that also
+    /// enforces it: the array cannot see a call order, and the two answering
+    /// under one reason is what stops them disagreeing.
+    #[test]
+    fn a_clear_array_past_the_attachment_bound_refuses_rather_than_truncating() {
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+        let attachment =
+            crate::backend::vulkan::translate::pixel::color_attachment(MTL_FORMAT_BGRA8_UNORM)
+                .unwrap()
+                .0
+                .with_clear([0.0; 4]);
+
+        // Exactly full: the primary plus every secondary the wire's attachment
+        // bound allows, plus depth.
+        let full = DrawRequest {
+            color_attachment: Some(attachment),
+            secondary_targets: (0..MAX_SECONDARY_ATTACH)
+                .map(|_| secondary_with_attachment(attachment))
+                .collect(),
+            depth: Some(super::super::types::DepthState {
+                identity: None,
+                test_enable: true,
+                write_enable: true,
+                compare: super::super::types::SamplerCompareFunction::Less,
+                clear_value: 0.5,
+                load: false,
+                stencil: None,
+            }),
+            ..DrawRequest::default()
+        };
+        assert_eq!(
+            clear_values(&full).expect("a full pass is a pass").len(),
+            1 + MAX_SECONDARY_ATTACH + 1,
+            "the capacity is every attachment a pass this device builds can have"
+        );
+
+        let over = DrawRequest {
+            secondary_targets: (0..=MAX_SECONDARY_ATTACH)
+                .map(|_| secondary_with_attachment(attachment))
+                .collect(),
+            ..full
+        };
+        assert!(
+            matches!(
+                clear_values(&over),
+                Err(DrawError::Unsupported(
+                    super::super::reason::DrawReason::SecondaryAttachmentCap { .. }
+                ))
+            ),
+            "one attachment past the bound is a refusal, not a short array"
+        );
+    }
+
     /// A default request still clears to transparent black, which is what every
     /// draw that names no colour has always got.
     #[test]
     fn an_unstated_clear_is_transparent_black() {
-        let clear = clear_values(&DrawRequest::default());
+        let clear = clear_values(&DrawRequest::default()).expect("one attachment");
         assert_eq!(clear.len(), 1, "no secondaries and no depth is one entry");
         unsafe { assert_eq!(clear[0].color.float32, [0.0; 4]) };
     }
@@ -7584,7 +7964,7 @@ mod tests {
             ..DrawRequest::default()
         };
 
-        let clear = clear_values(&req);
+        let clear = clear_values(&req).expect("within the attachment cap");
         unsafe {
             assert_eq!(clear[0].color.uint32, [1, 2, 65_535, 0]);
             assert_eq!(clear[1].color.uint32, [5, 6, 7, 8]);
@@ -7640,7 +8020,7 @@ mod tests {
     #[test]
     fn guest_runs_volume_validates_every_depth_plane() {
         let mut req = guest_run_req(16, 8, 16 * 8 * 4 * 3, 0);
-        req.sampled_images[0].volume = true;
+        req.sampled_images[0].kind = reims_vgpu_core::texture_shape::TextureKind::D3;
         req.sampled_images[0].layers = 3;
         assert!(validate_v1(&req).is_ok());
 
@@ -7659,7 +8039,7 @@ mod tests {
         // Three 4-texel-by-2-row planes at a six-texel row pitch: five full
         // padded rows followed by the final tight row.
         let mut req = guest_run_req(4, 2, 5 * 24 + 16, 6);
-        req.sampled_images[0].volume = true;
+        req.sampled_images[0].kind = reims_vgpu_core::texture_shape::TextureKind::D3;
         req.sampled_images[0].layers = 3;
         assert!(validate_v1(&req).is_ok());
     }
@@ -7753,7 +8133,7 @@ mod tests {
         // The sampled arm: four factors, and `layers` is the one that tips it.
         // `arrayed`, because a non-array image with layers != 1 is refused
         // earlier and would never reach the multiplication.
-        req.sampled_images[0].arrayed = true;
+        req.sampled_images[0].kind = reims_vgpu_core::texture_shape::TextureKind::D2Array;
         req.sampled_images[0].width = u32::MAX;
         req.sampled_images[0].height = u32::MAX;
         req.sampled_images[0].layers = u32::MAX;

@@ -739,7 +739,7 @@ pub(super) fn lookup_render_target<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    att: crate::runtime::decode::render::ColorAttachment,
+    att: crate::runtime::render_pass::ColorAttachment,
 ) -> Option<ResolvedRenderTarget> {
     let texture_ref = att.texture_ref;
     if texture_ref == 0 {
@@ -773,7 +773,7 @@ fn resolve_render_target<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    att: crate::runtime::decode::render::ColorAttachment,
+    att: crate::runtime::render_pass::ColorAttachment,
 ) -> Result<ResolvedRenderTarget, RenderTargetRefusal> {
     use RenderTargetCause as C;
     let texture_ref = att.texture_ref;
@@ -1427,8 +1427,8 @@ mod tests {
     /// A colour attachment naming `texture_ref` at level 0 — the shape every
     /// case below is about, so that a case that means to vary the subresource
     /// has to say so.
-    fn attach(texture_ref: u32) -> crate::runtime::decode::render::ColorAttachment {
-        crate::runtime::decode::render::ColorAttachment {
+    fn attach(texture_ref: u32) -> crate::runtime::render_pass::ColorAttachment {
+        crate::runtime::render_pass::ColorAttachment {
             texture_ref,
             ..Default::default()
         }

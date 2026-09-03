@@ -148,7 +148,7 @@ enum CacheSaveOutcome {
 }
 
 /// A pipeline-cache load or persistence failure. The exact filesystem/Vulkan
-/// stage survives the cold-start fallback or detached save thread instead of
+/// stage survives the cold-start fallback or the persistence owner instead of
 /// disappearing behind "cache miss".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PipelineCacheDecline {
@@ -258,11 +258,13 @@ impl crate::observe::Decline for PipelineCacheDecline {
 
 /// Write `data` to `tmp`, then atomically `rename(tmp → path)` with a
 /// best-effort newest-wins guard on `persisted_len` (the largest blob length
-/// landed so far). `tmp` MUST be unique per concurrent save (the caller keys it
-/// on a per-save sequence) so two in-flight saves never share a tmp file — the
-/// bug that made one save's rename move the tmp out from under another's,
-/// failing ENOENT. Returns which stage failed (`write`/`rename`) on error so the
-/// caller can name the reason. Pure w.r.t. Vulkan (fs + atomic only) → unit-testable.
+/// landed so far). `tmp` MUST be unique per concurrent save so two in-flight
+/// saves never share a tmp file — the bug that made one save's rename move the
+/// tmp out from under another's, failing ENOENT. The live caller is
+/// [`persist`], which is a single thread and satisfies that with the pid alone;
+/// the requirement stays stated because it is the function's, not the caller's.
+/// Returns which stage failed (`write`/`rename`) on error so the caller can name
+/// the reason. Pure w.r.t. Vulkan (fs + atomic only) → unit-testable.
 fn write_cache_atomic(
     path: &std::path::Path,
     tmp: &std::path::Path,
@@ -306,6 +308,136 @@ fn discard_cache_blob(
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(PipelineCacheDecline::discard(&error)),
+    }
+}
+
+/// The one thread that puts this process's pipeline-cache blob on disk.
+///
+/// Persistence used to spawn a thread per save. That is a thread created per
+/// pipeline creation, which is one of the structural zeros the replacement plan
+/// names outright — "no host thread is created per EXEC, command buffer, draw,
+/// save, or watchdog operation" — and the plan's own answer for this subsystem
+/// is that lifecycle persistence belongs to an owner rather than to a per-save
+/// thread.
+///
+/// The owner also removes the concurrency the per-save threads created. Two
+/// saves that both cleared the growth debounce used to race each other through
+/// write→rename, which is what made the tmp file need a per-save sequence number
+/// and what made `write_cache_atomic`'s newest-wins guard load-bearing rather
+/// than belt-and-braces. There is one writer now, so there is one tmp file and
+/// the saves are totally ordered.
+///
+/// The mailbox holds **one** job, and a new job replaces whatever is waiting.
+/// That is not a dropped save: a `VkPipelineCache` only grows, so the newer blob
+/// is a superset of the one it displaces, and a discard is by construction the
+/// newest decision about what the file should be. What it buys is the bound —
+/// a queue would let a compile storm grow the backlog without limit while the
+/// disk is the slow part.
+mod persist {
+    use super::{discard_cache_blob, write_cache_atomic, CacheSaveOutcome};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    /// What the owner has been asked to make true of the on-disk blob.
+    pub(super) enum Job {
+        /// Make the file be these bytes.
+        Write { path: PathBuf, data: Vec<u8> },
+        /// Make the file not exist, and let the next boot start cold.
+        Discard { path: PathBuf },
+    }
+
+    struct Mailbox {
+        pending: Mutex<Option<Job>>,
+        arrived: Condvar,
+    }
+
+    fn mailbox() -> &'static Mailbox {
+        static MAILBOX: OnceLock<Mailbox> = OnceLock::new();
+        MAILBOX.get_or_init(|| {
+            // Started once, on the first save of the process's life. It is the
+            // only thread this subsystem ever creates.
+            std::thread::spawn(persist_forever);
+            Mailbox {
+                pending: Mutex::new(None),
+                arrived: Condvar::new(),
+            }
+        })
+    }
+
+    /// Hand the owner a job. Returns as soon as the mailbox is updated; the
+    /// caller never touches the filesystem.
+    pub(super) fn submit(job: Job) {
+        let mailbox = mailbox();
+        let mut pending = mailbox
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *pending = Some(job);
+        drop(pending);
+        mailbox.arrived.notify_one();
+    }
+
+    fn persist_forever() {
+        let mailbox = mailbox();
+        let mut pending = mailbox
+            .pending
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        loop {
+            match pending.take() {
+                Some(job) => {
+                    // The filesystem work runs with the mailbox unlocked, so a
+                    // save submitted during a slow write still lands in it.
+                    drop(pending);
+                    run(job);
+                    pending = mailbox
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+                None => {
+                    pending = mailbox
+                        .arrived
+                        .wait(pending)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                }
+            }
+        }
+    }
+
+    fn run(job: Job) {
+        /// Largest cache length already landed on disk. The `VkPipelineCache`
+        /// only grows, so length orders the snapshots. Keyed per physical device
+        /// via the UUID-derived path (a `DEVICE_LOST` recreate reuses the same
+        /// file), so a process-wide static is correct.
+        static PERSISTED_LEN: AtomicUsize = AtomicUsize::new(0);
+
+        match job {
+            Job::Write { path, data } => {
+                // One writer, so the pid alone makes the tmp file private. The
+                // second process that could collide here is another QEMU, which
+                // the pid already separates.
+                let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+                match write_cache_atomic(&path, &tmp, &data, &PERSISTED_LEN) {
+                    Ok(CacheSaveOutcome::Landed) => crate::observe::off(format!(
+                        "vk_pipeline_cache_save bytes={} path={}",
+                        data.len(),
+                        path.display()
+                    )),
+                    Ok(CacheSaveOutcome::Superseded) => {}
+                    Err(decline) => {
+                        crate::observe::Emit::decline("vk_pipeline_cache_save", &decline)
+                            .fail_once(0)
+                    }
+                }
+            }
+            Job::Discard { path } => {
+                if let Err(decline) = discard_cache_blob(&path, &PERSISTED_LEN) {
+                    crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
+                }
+            }
+        }
     }
 }
 
@@ -1357,27 +1489,14 @@ impl DeviceContext {
     /// Persist the pipeline cache to disk when it has grown since the last
     /// save. Called after each actual pipeline creation (cache misses only —
     /// warm hits never reach this). The serialize under the engine lock is a
-    /// memcpy; the file write runs on a detached thread so nothing on the
-    /// draw path blocks on disk. Saving on creation rather than at context
-    /// destroy is deliberate: the testing boot SIGKILLs QEMU, so destroy
-    /// never runs there. The tmp-then-rename keeps a concurrent reader (or a
-    /// second QEMU process) from ever seeing a torn blob.
+    /// memcpy; the filesystem work is handed to [`persist`], the process's one
+    /// persistence owner, so nothing on the draw path blocks on disk. Saving on
+    /// creation rather than at context destroy is deliberate: the testing boot
+    /// SIGKILLs QEMU, so destroy never runs there.
     pub(crate) fn persist_pipeline_cache(&self) {
         let Some(path) = self.pipeline_cache_path.clone() else {
             return;
         };
-        // Largest cache length already landed on disk. The VkPipelineCache only
-        // grows, so `data.len()` orders the snapshots. Best-effort newest-wins:
-        // if a strictly larger snapshot already landed by the time this thread is
-        // about to rename, drop this smaller one rather than regress the on-disk
-        // cache to a stale subset. This narrows (does not fully serialize) the
-        // concurrent-save window — a residual reorder only costs one pipeline a
-        // warm-start miss next boot and self-heals on the next compile, so a lock
-        // is not warranted for a best-effort cache. Keyed per physical device via
-        // the UUID-derived path (a DEVICE_LOST recreate reuses the same file), so
-        // a process-wide static is correct.
-        static PERSISTED_LEN: AtomicUsize = AtomicUsize::new(0);
-
         let data = match unsafe { self.device.get_pipeline_cache_data(self.pipeline_cache) } {
             Ok(d) => d,
             Err(e) => {
@@ -1406,9 +1525,7 @@ impl DeviceContext {
                 },
             )
             .fail_once(0);
-            if let Err(decline) = discard_cache_blob(&path, &PERSISTED_LEN) {
-                crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0);
-            }
+            persist::submit(persist::Job::Discard { path });
             return;
         }
         // Growth debounce: byte length is the proxy for "a new pipeline
@@ -1421,30 +1538,7 @@ impl DeviceContext {
         {
             return;
         }
-        // Unique tmp name PER SAVE. Keying only on the (constant) pid meant two
-        // concurrent saves — spawned when two calls with different data lengths
-        // both clear the growth debounce — wrote the SAME tmp file, so the first
-        // thread's rename(tmp→path) moved it out from under the second thread's
-        // rename, which then failed ENOENT (the intermittent
-        // `vk_pipeline_cache_save reason=vk_pipeline_cache_rename errno=2 ...`).
-        // A per-save sequence number makes each thread's tmp file private, so the
-        // write→rename is race-free and the newest save always lands.
-        static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
-        std::thread::spawn(move || {
-            let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
-            match write_cache_atomic(&path, &tmp, &data, &PERSISTED_LEN) {
-                Ok(CacheSaveOutcome::Landed) => crate::observe::off(format!(
-                    "vk_pipeline_cache_save bytes={} path={}",
-                    data.len(),
-                    path.display()
-                )),
-                Ok(CacheSaveOutcome::Superseded) => {}
-                Err(decline) => {
-                    crate::observe::Emit::decline("vk_pipeline_cache_save", &decline).fail_once(0)
-                }
-            }
-        });
+        persist::submit(persist::Job::Write { path, data });
     }
 
     pub(crate) unsafe fn destroy(&mut self) {
@@ -2540,5 +2634,93 @@ mod draw_span_probe_tests {
             u64::MAX,
             "64 valid bits must not shift out of range"
         );
+    }
+}
+
+/// The persistence owner's two claims: it is one thread no matter how many
+/// saves arrive, and the newest job is the one that ends up on disk.
+#[cfg(test)]
+mod persist_owner_tests {
+    use super::persist;
+
+    fn owner_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "reims-vgpu-persist-owner-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A pipeline creation that saves must not create a thread. Before the
+    /// owner existed this spawned one per save, which is the structural zero the
+    /// plan states as "no host thread is created per EXEC, command buffer, draw,
+    /// save, or watchdog operation".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sixty_four_saves_create_no_thread_beyond_the_one_owner() {
+        fn live_threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("/proc/self/task")
+                .count()
+        }
+
+        let dir = owner_dir("threads");
+        let path = dir.join("cache.bin");
+        // The first submit starts the owner, so the baseline is taken after it:
+        // the claim under test is per save.
+        persist::submit(persist::Job::Write {
+            path: path.clone(),
+            data: vec![0u8; 8],
+        });
+        let before = live_threads();
+        for length in 0..64 {
+            persist::submit(persist::Job::Write {
+                path: path.clone(),
+                data: vec![0u8; length],
+            });
+        }
+        assert_eq!(
+            live_threads(),
+            before,
+            "64 saves created threads; persistence is per-save again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Replacing a waiting job is the bound on the mailbox, and it is only
+    /// sound because the newest job is the one that should land. A save that
+    /// displaced a waiting one and then failed to land would be the bound
+    /// eating a save.
+    #[test]
+    fn the_newest_submitted_blob_is_the_one_that_lands() {
+        let dir = owner_dir("newest");
+        let path = dir.join("cache.bin");
+        // Lengths chosen above every other blob this test binary submits: the
+        // owner's newest-wins guard is keyed on length and is process-wide, so a
+        // shorter blob from another test must not be able to supersede these.
+        persist::submit(persist::Job::Write {
+            path: path.clone(),
+            data: vec![0xABu8; 1 << 16],
+        });
+        persist::submit(persist::Job::Write {
+            path: path.clone(),
+            data: vec![0xCDu8; 1 << 17],
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(blob) = std::fs::read(&path) {
+                if blob.len() == 1 << 17 {
+                    assert!(blob.iter().all(|byte| *byte == 0xCD));
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the newest blob never landed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

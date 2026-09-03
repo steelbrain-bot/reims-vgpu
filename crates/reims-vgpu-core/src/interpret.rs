@@ -737,7 +737,7 @@ mod tests {
             .expect("a free slot");
     }
 
-    fn builder(ingress: u64) -> crate::testing::At {
+    fn builder(ingress: u64) -> crate::testing::At<'static> {
         crate::testing::At::new(1, ingress)
     }
 

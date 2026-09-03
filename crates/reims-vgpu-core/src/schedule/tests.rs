@@ -24,7 +24,7 @@ fn res(slot: u32) -> ResourceId {
     }
 }
 
-fn builder(domain: u32, ingress: u64) -> crate::testing::At {
+fn builder(domain: u32, ingress: u64) -> crate::testing::At<'static> {
     crate::testing::At::new(domain, ingress)
 }
 

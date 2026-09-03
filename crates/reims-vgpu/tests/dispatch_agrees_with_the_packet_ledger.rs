@@ -154,7 +154,6 @@ fn the_rows_that_block_routing_are_the_ones_production_still_answers_alone() {
             (Channel::Child, 0x00, "CmdDebug"),
             (Channel::Child, 0x09, "CmdDisplaySleepState"),
             (Channel::Child, 0x0a, "CmdDisplaySetProperties"),
-            (Channel::Child, 0x28, "CmdDeleteObject"),
             (Channel::Child, 0x3d, "CmdDelay"),
         ],
         "the unresolved rows changed; the cutover's remaining gap is not what this says it is"

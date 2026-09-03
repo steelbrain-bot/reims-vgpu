@@ -404,6 +404,27 @@ pub(crate) struct ResourcePools {
     /// rather than guessed at. Diagnostic only — nothing reads it to decide
     /// anything.
     reclaimed_recent: VecDeque<(TargetIdentity, ResidentReclaim, u64)>,
+    /// Every resident the host window has been published against since
+    /// [`WINDOW_SOURCE_EPOCH`] last moved.
+    ///
+    /// A *set* and not the latest one, and that distinction is the whole
+    /// correctness of the stamp. The window's frame slot holds the newest
+    /// published source, but the window thread may be holding an older one it
+    /// read out of that slot, or blitting from one — so "the resident currently
+    /// published" is not the set of residents a live source can name. Recording
+    /// only the latest let a switch of displayed surface hide the previous one's
+    /// removal: publish B, retire A, and A's stamp still compared equal because
+    /// A was no longer the one being watched.
+    ///
+    /// Cleared whenever the epoch moves, so it holds only what is still
+    /// vouched for. Bounded by [`WINDOW_PUBLISHED_MAX`]; overflowing bumps the
+    /// epoch rather than dropping an entry, because dropping the oldest is
+    /// exactly the hole above.
+    ///
+    /// The window thread never reads or writes this. It is the drain's record of
+    /// what it has handed out, kept on the side of the boundary that has the
+    /// device.
+    window_published: Vec<TargetIdentity>,
     /// Highest non-pinned resident population this device has held, in slots.
     /// Reported as `registry_pressure`'s `peak`, beside the bytes the same
     /// sample occupied — the pair is what says a slot count was never a proxy
@@ -911,6 +932,34 @@ pub(crate) struct CbGraphicsState {
     vertex_scratch: Vec<VertexBufferBinding>,
     vertex_buffers: Vec<vk::Buffer>,
     vertex_offsets: Vec<vk::DeviceSize>,
+    /// The vertex binds the recording draw has staged so far, in request order.
+    ///
+    /// Scratch and not state, like the three above it: it says what the draw
+    /// currently being assembled asked for, never what the command buffer
+    /// carries. It lives here rather than as a local in the draw because a local
+    /// is a heap allocation per draw, and `bind_vertex_buffers` already claims
+    /// in its own doc that every array it touches is reusable — the caller's was
+    /// the one that was not.
+    vertex_binds: Vec<(u32, super::exec::BoundBuffer)>,
+    /// The storage-buffer binds the recording draw has staged, as
+    /// `(binding, bound, content length)`. Scratch, for the reason
+    /// [`Self::vertex_binds`] is.
+    ///
+    /// It lives beside [`Self::push_scratch`] rather than in the draw because
+    /// the descriptor list is derived from the two together, and a caller
+    /// holding one from here and the other as a local could not hand both to one
+    /// function without borrowing this struct twice.
+    storage_binds: Vec<(u32, super::exec::BoundBuffer, u64)>,
+    /// The descriptor-layout binding signatures the recording draw declares,
+    /// canonicalized in place. Scratch, like the two above it.
+    ///
+    /// The layout cache is looked up by a *slice* of these, so this is the
+    /// buffer that lookup borrows from — and it is why the cache had to stop
+    /// being keyed by an owned `LayoutKey`.
+    layout_bindings: Vec<super::caches::BindingSig>,
+    /// The vertex-attribute keys the recording draw declares. Scratch, and
+    /// interned by the caller into an `AttrsId` its pipeline key carries.
+    attr_keys: Vec<super::caches::AttrKey>,
 }
 
 impl CbGraphicsState {
@@ -951,6 +1000,10 @@ impl CbGraphicsState {
             vertex_scratch: _,
             vertex_buffers: _,
             vertex_offsets: _,
+            vertex_binds: _,
+            storage_binds: _,
+            layout_bindings: _,
+            attr_keys: _,
         } = self;
         *pipeline = None;
         *pipeline_layout = None;
@@ -1016,6 +1069,27 @@ pub(crate) enum PushDescriptorBinding {
         view: vk::ImageView,
         layout: vk::ImageLayout,
     },
+}
+
+impl PushDescriptorBinding {
+    /// The three fields both arms carry, so a consumer that only needs the
+    /// descriptor's identity does not have to match on its payload.
+    pub(crate) fn slot(&self) -> (u32, u32, vk::DescriptorType) {
+        match self {
+            Self::Buffer {
+                binding,
+                array_element,
+                ty,
+                ..
+            }
+            | Self::Image {
+                binding,
+                array_element,
+                ty,
+                ..
+            } => (*binding, *array_element, *ty),
+        }
+    }
 }
 
 fn push_descriptors_match(
@@ -1117,7 +1191,59 @@ pub(crate) const RING_DEPTH: usize = 8;
 /// on. Sized so the whole ring fits, which is what bounds the graveyard — a
 /// handle's mask can only name slots that existed when it was disposed, and
 /// every one of those retires within a ring wrap.
+/// How many distinct residents the window may be published against between two
+/// movements of [`WINDOW_SOURCE_EPOCH`] before the epoch is moved to make room.
+///
+/// One display transaction resolves to one identity, and a settled desktop
+/// republishes the same one, so the live population is 1 and this is headroom
+/// for a surface switch or two rather than a working size. Overflowing costs one
+/// present from host memory, which is why the bound may be this small and why
+/// overflowing bumps rather than evicting.
+const WINDOW_PUBLISHED_MAX: usize = 8;
+
+/// Bumped whenever a resident the host window has been published against leaves
+/// the registry.
+///
+/// The window thread's licence to trust a resolved present source without
+/// re-reading the registry. It is a plain counter rather than a flag so a source
+/// stamped before a retire *and a re-registration* still fails closed: a flag
+/// cleared by the re-registration would read as "still valid" for a source
+/// naming the image that was destroyed in between.
+///
+/// Global rather than per-identity because there is one host window and one
+/// published identity at a time, and a false invalidation costs one frame from
+/// host memory — the conservative direction, and the reason
+/// [`ResourcePools::unregister_resident`] may bump it without proving the window
+/// still cares.
+pub(crate) static WINDOW_SOURCE_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// The stamp a present source resolved right now should carry.
+pub(crate) fn window_source_epoch() -> u64 {
+    WINDOW_SOURCE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) type SlotMask = u32;
+
+/// The [`SlotMask`] bit standing for "a host-window present is submitted and not
+/// yet retired", rather than for one of the engine's command-buffer slots.
+///
+/// The top bit, so it cannot collide with a slot index however `RING_DEPTH`
+/// grows — and the assertion below is what keeps that true rather than the
+/// choice of bit. [`super::window_present::WINDOW_PRESENTS_IN_FLIGHT`] carries
+/// why the window needs a bit at all.
+#[cfg(feature = "host-window")]
+pub(crate) const WINDOW_PRESENT_SLOT: SlotMask = 1 << (SlotMask::BITS - 1);
+
+/// `RING_DEPTH <= SlotMask::BITS` below is what the slot indices need. The
+/// window's bit needs one strictly stronger: a bit left over that no slot index
+/// can reach.
+#[cfg(feature = "host-window")]
+const _: () = assert!(
+    RING_DEPTH < SlotMask::BITS as usize,
+    "WINDOW_PRESENT_SLOT takes the top SlotMask bit; a RING_DEPTH filling the \
+     mask would alias a command-buffer slot onto the host window's"
+);
 const _: () = assert!(
     RING_DEPTH <= SlotMask::BITS as usize,
     "SlotMask must have one bit per ring slot"
@@ -1174,8 +1300,6 @@ pub(crate) enum DeferredHandle {
     ImageView(vk::ImageView),
     Framebuffer(vk::Framebuffer),
     Pipeline(vk::Pipeline),
-    PipelineLayout(vk::PipelineLayout),
-    DescriptorSetLayout(vk::DescriptorSetLayout),
     RenderPass(vk::RenderPass),
     ShaderModule(vk::ShaderModule),
     Sampler(vk::Sampler),
@@ -1199,8 +1323,6 @@ impl DeferredHandle {
             | Self::GuestAllocationBarrier(_)
             | Self::Framebuffer(_)
             | Self::Pipeline(_)
-            | Self::PipelineLayout(_)
-            | Self::DescriptorSetLayout(_)
             | Self::RenderPass(_)
             | Self::ShaderModule(_)
             | Self::Sampler(_) => None,
@@ -1273,10 +1395,6 @@ impl ResourcePools {
             DeferredHandle::ImageView(view) => device.destroy_image_view(view, None),
             DeferredHandle::Framebuffer(fb) => device.destroy_framebuffer(fb, None),
             DeferredHandle::Pipeline(p) => device.destroy_pipeline(p, None),
-            DeferredHandle::PipelineLayout(pl) => device.destroy_pipeline_layout(pl, None),
-            DeferredHandle::DescriptorSetLayout(dsl) => {
-                device.destroy_descriptor_set_layout(dsl, None)
-            }
             DeferredHandle::RenderPass(rp) => device.destroy_render_pass(rp, None),
             DeferredHandle::ShaderModule(s) => device.destroy_shader_module(s, None),
             DeferredHandle::Sampler(s) => device.destroy_sampler(s, None),
@@ -1333,15 +1451,14 @@ pub(crate) struct SampledSlot {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
-    pub volume: bool,
-    pub cube: bool,
-    pub arrayed: bool,
-    /// The image was created as a Vulkan 1D (`TYPE_1D` / `TYPE_1D_ARRAY`) image
-    /// because the shader's sampled binding reflects a Metal `texture1d` /
-    /// `texture1d_array` (color-transfer LUTs). Part of the pool key: a 1D view
-    /// and a `height==1` 2D view are byte-identical images but incompatible
-    /// descriptor types, so a recycled slot must never cross that boundary.
-    pub one_dim: bool,
+    /// The image and view shape this slot was created with.
+    ///
+    /// Part of the pool key: a 1D view and a `height == 1` 2D view are
+    /// byte-identical images but incompatible descriptor types, so a recycled
+    /// slot must never cross that boundary. One field rather than the four
+    /// booleans it replaces — see
+    /// [`crate::backend::vulkan::engine::types::SampledImageResource::kind`].
+    pub kind: reims_vgpu_core::texture_shape::TextureKind,
     pub format: ash::vk::Format,
     /// The view's component mapping, from the decoded texture-view swizzle. Part of
     /// the pool key because it is baked into the `VkImageView`: a recycled slot
@@ -1399,10 +1516,7 @@ pub(crate) struct SampledKey {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) layers: u32,
-    pub(crate) volume: bool,
-    pub(crate) cube: bool,
-    pub(crate) arrayed: bool,
-    pub(crate) one_dim: bool,
+    pub(crate) kind: reims_vgpu_core::texture_shape::TextureKind,
     pub(crate) format: ash::vk::Format,
     pub(crate) swizzle: crate::protocol::pixel_format::SwizzlePlan,
 }
@@ -1420,10 +1534,7 @@ impl SampledKey {
             width: r.width,
             height: r.height,
             layers: r.layers,
-            volume: r.volume,
-            cube: r.cube,
-            arrayed: r.arrayed,
-            one_dim: r.one_dim,
+            kind: r.kind,
             format: r.format,
             swizzle: r.swizzle,
         }
@@ -1436,10 +1547,7 @@ impl SampledKey {
     /// sampled pool rather than entering the attachment-count-sized pool.
     pub(crate) fn is_plain_2d_identity_view(self) -> bool {
         self.layers == 1
-            && !self.volume
-            && !self.cube
-            && !self.arrayed
-            && !self.one_dim
+            && self.kind == reims_vgpu_core::texture_shape::TextureKind::D2
             && self.swizzle.is_identity()
     }
 }
@@ -1450,10 +1558,7 @@ impl SampledSlot {
             width: self.width,
             height: self.height,
             layers: self.layers,
-            volume: self.volume,
-            cube: self.cube,
-            arrayed: self.arrayed,
-            one_dim: self.one_dim,
+            kind: self.kind,
             format: self.format,
             swizzle: self.swizzle,
         }
@@ -1472,10 +1577,7 @@ impl SampledSlot {
             width: self.width,
             height: self.height,
             layers: self.layers,
-            volume: self.volume,
-            cube: self.cube,
-            arrayed: self.arrayed,
-            one_dim: self.one_dim,
+            kind: self.kind,
             format: self.format,
             swizzle: self.swizzle,
         }
@@ -1722,6 +1824,84 @@ pub(crate) fn slot_present_decline(
 
 pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u32) -> bool {
     slot_present_decline(slot, width, height).is_none()
+}
+
+/// The other half of the wholesale cover: a `ResourcePools` that goes away takes
+/// its registry with it, and any window source published against that registry
+/// is void whether or not `destroy_all` ran first.
+///
+/// `destroy_all` is not that cover on its own. `EngineState::flush_device_derived`
+/// reaches `*self.pools = ResourcePools::new()` on a path with no `ctx` to
+/// destroy anything through — the images died with the `VkDevice` — and a stamp
+/// taken before it would otherwise still compare equal against the *new*
+/// registry's untouched epoch.
+///
+/// Guarded on the set being non-empty so a `ResourcePools` that never carried a
+/// window source moves nothing. Every unit test in this crate builds one; a bump
+/// per test would make the counter mean "a pools was dropped" rather than "a
+/// window source died".
+impl Drop for ResourcePools {
+    fn drop(&mut self) {
+        if !self.window_published.is_empty() {
+            self.invalidate_window_sources();
+        }
+    }
+}
+
+/// Everything the host window's blit reads off a resident slot, resolved once by
+/// the publish that named it.
+///
+/// The window thread's registry access is not one dependency but two: it
+/// *resolves* an identity to a slot, and it reads that slot's `access` — the
+/// `oldLayout`, `srcStageMask` and `srcAccessMask` its blit barrier must name.
+/// The stamp on [`super::types::WindowPresentSource`] answers the first without
+/// a registry, and a barrier built from an access the image has left is an
+/// invalid transition rather than a stale picture, so the second needed its own
+/// answer.
+///
+/// It has one: `ResourcePools::set_registry_access` is the sole writer of a
+/// resident's access, and it moves the window epoch when the value *changes*
+/// under an identity the window is published against. A fresh stamp therefore
+/// vouches for this whole value and not only for the image in it.
+///
+/// Every field here is either written once, where the slot is built — `image`,
+/// `width`, `height`, `memory` — or has a sole writer that moves the epoch on a
+/// change: `set_registry_access` and `set_registry_format`. Together with the
+/// registry's sole `remove`, its sole `drain` and `Drop for ResourcePools`, that
+/// is why a fresh stamp vouches for this whole value and the window reads no
+/// registry at all.
+///
+/// It was carried beside the re-resolve for three commits while
+/// `window_source_divergence` compared the two on every present. Three driven
+/// boots reported no class of disagreement, and the re-resolve is gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedResident {
+    pub image: vk::Image,
+    pub access: ResidentAccess,
+    /// The slot's own extent, which the blit reads as the source rect. Not the
+    /// presented extent: `slot_present_decline` has already required the two to
+    /// be equal, and carrying the slot's is what makes a later divergence
+    /// visible instead of assumed away.
+    pub width: u32,
+    pub height: u32,
+    /// Whether the pixels live in the guest's own pages. Decides the layout the
+    /// blit leaves the image in, so it is part of the resolution and not a
+    /// property re-derived at present time.
+    pub guest_imported: bool,
+}
+
+/// Resolve a slot into what the window's blit needs from it.
+///
+/// One place, so the publish-time resolution and the present-time re-resolve
+/// cannot read different fields and call the result agreement.
+pub(crate) fn slot_window_resolution(slot: &ResidentTargetSlot) -> ResolvedResident {
+    ResolvedResident {
+        image: slot.image,
+        access: slot.access,
+        width: slot.width,
+        height: slot.height,
+        guest_imported: slot.memory.is_guest_imported(),
+    }
 }
 
 /// The non-pinned resident population, and the attachment bytes it holds.
@@ -2516,7 +2696,7 @@ const SAMPLED_FREE_CAP_TOTAL: usize = 64;
 /// largest dedicated snapshot population `draws × attachments` rather than
 /// `draws × texture-table width`.
 const fn attachment_snapshot_batch_cap(draws: u64) -> usize {
-    draws as usize * (crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS + 1)
+    draws as usize * (crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS + 1)
 }
 
 const ATTACHMENT_SNAPSHOT_BATCH_CAP: usize = attachment_snapshot_batch_cap(BATCH_MAX_DRAWS);
@@ -3409,7 +3589,9 @@ mod sampled_key_tests {
     use crate::backend::vulkan::engine::types::{SampledImageResource, SampledSource};
     use crate::protocol::pixel_format::SwizzlePlan;
 
-    fn resource(arrayed: bool, volume: bool, cube: bool, one_dim: bool) -> SampledImageResource {
+    use reims_vgpu_core::texture_shape::TextureKind;
+
+    fn resource(kind: TextureKind) -> SampledImageResource {
         SampledImageResource {
             binding: 0,
             array_element: 0,
@@ -3417,10 +3599,7 @@ mod sampled_key_tests {
             width: 7,
             height: 5,
             layers: 3,
-            arrayed,
-            volume,
-            cube,
-            one_dim,
+            kind,
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(Vec::new())),
             byte_origin: Default::default(),
@@ -3430,92 +3609,63 @@ mod sampled_key_tests {
         }
     }
 
-    /// Each shape flag reaches the key field of its own name.
+    /// Every shape a resource can carry reaches the key unchanged.
     ///
-    /// The four are adjacent, all `bool`, and declared in a different order on
-    /// the resource (`arrayed, volume, cube, one_dim`) than on the key
-    /// (`volume, cube, arrayed, one_dim`), so any permutation of them compiles
-    /// and none of the callers could have noticed. One flag set at a time is
-    /// the only pattern that pins all four: with two set, a swap between them
-    /// is invisible.
+    /// This replaces a one-hot sweep over four adjacent `bool` fields that were
+    /// declared in one order on the resource and another on the key, so any
+    /// permutation of them compiled and no caller could have noticed. A single
+    /// `TextureKind` cannot be permuted, and the sweep is now over the whole
+    /// declared set rather than over four flags one at a time — which is
+    /// strictly more than the old test could reach, because with two flags set
+    /// a swap between them was invisible to it.
     #[test]
-    fn every_shape_flag_reaches_the_key_field_of_its_own_name() {
-        // Set on the resource as (arrayed, volume, cube, one_dim); read back
-        // off the key as (volume, cube, arrayed, one_dim).
-        let one_hot = [
-            (
-                "arrayed",
-                (true, false, false, false),
-                (false, false, true, false),
-            ),
-            (
-                "volume",
-                (false, true, false, false),
-                (true, false, false, false),
-            ),
-            (
-                "cube",
-                (false, false, true, false),
-                (false, true, false, false),
-            ),
-            (
-                "one_dim",
-                (false, false, false, true),
-                (false, false, false, true),
-            ),
-        ];
-        for (name, (arrayed, volume, cube, one_dim), want) in one_hot {
-            let k = SampledKey::of(&resource(arrayed, volume, cube, one_dim));
+    fn every_shape_reaches_the_key_unchanged() {
+        for kind in TextureKind::ALL {
             assert_eq!(
-                (k.volume, k.cube, k.arrayed, k.one_dim),
-                want,
-                "{name} did not reach the key field of its own name"
+                SampledKey::of(&resource(kind)).kind,
+                kind,
+                "{} did not reach the key",
+                kind.name()
             );
         }
     }
 
-    /// The extent and view fields carry across too, so a flag test passing
+    /// The extent and view fields carry across too, so a shape test passing
     /// cannot hide a crossed `width`/`height` beside it.
     #[test]
     fn the_extent_and_view_fields_carry_across() {
-        let k = SampledKey::of(&resource(false, false, false, false));
+        let k = SampledKey::of(&resource(TextureKind::D2));
         assert_eq!((k.width, k.height, k.layers), (7, 5, 3));
         assert_eq!(k.format, ash::vk::Format::R8G8B8A8_UNORM);
         assert_eq!(k.swizzle, SwizzlePlan::default());
     }
 
-    /// Only one key can describe the plain view of one attachment. Every shape
-    /// dimension that could make a second incompatible view keeps that bind out
-    /// of the attachment-count-sized scratch pool.
+    /// Only one key can describe the plain view of one attachment. Every other
+    /// shape, and every non-identity swizzle, keeps that bind out of the
+    /// attachment-count-sized scratch pool.
+    ///
+    /// The shape half is now exhaustive: `TextureKind::ALL` minus `D2` is every
+    /// shape that must be excluded, where the old test listed four flags and so
+    /// could not have said anything about a fifth.
     #[test]
     fn attachment_snapshot_pool_accepts_only_plain_2d_identity_views() {
-        let mut plain = SampledKey::of(&resource(false, false, false, false));
+        let mut plain = SampledKey::of(&resource(TextureKind::D2));
         plain.layers = 1;
         assert!(plain.is_plain_2d_identity_view());
 
-        let variants = vec![
+        let mut variants = vec![
             SampledKey { layers: 2, ..plain },
-            SampledKey {
-                volume: true,
-                ..plain
-            },
-            SampledKey {
-                cube: true,
-                ..plain
-            },
-            SampledKey {
-                arrayed: true,
-                ..plain
-            },
-            SampledKey {
-                one_dim: true,
-                ..plain
-            },
             SampledKey {
                 swizzle: crate::protocol::pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap(),
                 ..plain
             },
         ];
+        variants.extend(
+            TextureKind::ALL
+                .into_iter()
+                .filter(|&kind| kind != TextureKind::D2)
+                .map(|kind| SampledKey { kind, ..plain }),
+        );
         assert!(variants
             .into_iter()
             .all(|key| !key.is_plain_2d_identity_view()));

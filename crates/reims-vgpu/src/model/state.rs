@@ -4,6 +4,9 @@ use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
 use crate::runtime::decode::resource::{
     DecodeStatus as ResourceDecodeStatus, Descriptor, ListObjectEntry, SamplerDescriptor,
 };
+use reims_vgpu_core::access::BackingId;
+use reims_vgpu_core::identity::{ObjectListRef, ResourceId};
+use reims_vgpu_core::namespace::Teardown;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -383,7 +386,7 @@ pub struct GfxRegs {
     /// carries no state the decode depends on: its whole effect is to say a
     /// child channel has work. So the guest's ring ORs a bit here without any
     /// lock, and [`crate::runtime::drain::fold_rung_child_doorbells`] moves it
-    /// into `active_child_mask` / `pending.child_mask` — including *inside* the
+    /// into the open-domain set / `pending.child_mask` — including *inside* the
     /// channel loop, so a channel rung mid-tranche is served by that tranche
     /// rather than the next one.
     ///
@@ -618,6 +621,30 @@ impl TaskResource {
         })
     }
 
+    /// The guest-VA allocation this resource's construction descriptor names,
+    /// through the decode this resource already did.
+    ///
+    /// `None` for every object that does not name storage by an address in its
+    /// own task, and for one that names it with a handle or a size the guest
+    /// has not written yet.
+    ///
+    /// See [`Descriptor::backing_window`] for why it is the allocation base and
+    /// not a texture's texel base, and
+    /// [`crate::runtime::decode::resource::descriptor_is_heap_placement`] for
+    /// why the bytes are consulted before the decode: a placement arrives under
+    /// the ordinary texture type and the typed form cannot tell.
+    ///
+    /// Taken off [`Self::decoded`] rather than re-parsing the bytes, because
+    /// the callers are hot: a payment asks it per read and a re-point asks it
+    /// per cached copy in the task.
+    #[must_use]
+    pub fn backing_window(&self, page_shift: u32) -> Option<(u64, u64)> {
+        if crate::runtime::decode::resource::descriptor_is_heap_placement(&self.descriptor) {
+            return None;
+        }
+        self.decoded().as_ref().ok()?.backing_window(page_shift)
+    }
+
     pub fn lifetime_ref(&self) -> TaskResourceLifetimeRef {
         TaskResourceLifetimeRef {
             id: self.lifetime.id,
@@ -704,6 +731,49 @@ pub trait RailDeviceState: Any + Send + Sync + std::fmt::Debug {
     /// Drop everything held under one task's reference namespaces, reporting
     /// what went under this rail's own census names.
     fn delete_task(&self, task_id: u32);
+
+    /// The device's own lifetime has ended. Let go of everything held under it,
+    /// reporting what went under this rail's own census names.
+    ///
+    /// # Why this is a told event and not a `Drop`
+    ///
+    /// [`Self::delete_task`] already establishes the division: the model
+    /// decodes *when* a lifetime ends and the rail knows *what letting go
+    /// costs*. A device lifetime ends the same way and had no such telling —
+    /// the slot was simply dropped, at `DeviceState::reset`'s wholesale
+    /// replacement and again when the device leaves the registry.
+    ///
+    /// That was survivable only while the slot held nothing a host has to be
+    /// told about. It holds identities and `Arc`s today, and every module this
+    /// crate still has to move into it — residency, variant families, transfer
+    /// and record state — owns native objects whose destruction goes through a
+    /// device, which `Drop` cannot reach and cannot report. So the ending is
+    /// told, exactly once, at the one place both doors pass through.
+    ///
+    /// Called with `&self` for the same reason `delete_task` is: the rail owns
+    /// whatever synchronization its own tables need, and the model may not name
+    /// them.
+    fn end_device(&self);
+}
+
+/// Both doors out of a device lifetime, joined into one telling.
+///
+/// A device ends two ways and neither used to reach the rail. [`DeviceState::reset`]
+/// replaces the whole struct, and `device::device_destroy` drops it out of the
+/// registry. Both of those drop the [`RailDeviceState`] slot, so `Drop` is the
+/// one place both pass through — which is why the telling lives here rather
+/// than in `reset`, where the destroy door would have missed it.
+///
+/// Read through [`std::sync::OnceLock::get`] and not through
+/// [`DeviceState::rail_state`]: an ending must not *create* a rail state no
+/// rail ever installed, which is what the initializing accessor would do and
+/// what would then report an empty teardown for a device that had no rail.
+impl Drop for DeviceState {
+    fn drop(&mut self) {
+        if let Some(rail) = self.rail.get() {
+            rail.end_device();
+        }
+    }
 }
 
 static NEXT_TASK_RESOURCE_LIFETIME: std::sync::atomic::AtomicU64 =
@@ -744,7 +814,25 @@ impl TaskResourceLifetimeRef {
     }
 }
 
-/// Per-task resource objects, keyed by the guest's `(task, reference)` pair.
+/// Per-task resource objects, keyed by the **name** the object namespace issued
+/// for the slot rather than by the slot number.
+///
+/// # Why the key carries a generation
+///
+/// A slot number alone is not an identity: the guest reuses slots, and a memo
+/// keyed by one outlives the object it was built for. That is not a theoretical
+/// hazard on this interface — the guest replaces an object by writing over its
+/// own object-list record, with no packet — and a stale hit binds the bytes of
+/// whatever used to live there, which is a wrong texture rather than a missing
+/// one.
+///
+/// So the key is [`reims_vgpu_core::identity::ResourceId`], which
+/// [`DeviceState::declare_object`] issues and whose generation advances on every
+/// declaration. A caller reaches this table only through a name the namespace
+/// has already resolved, and a name the namespace has retired cannot be spelled
+/// — which makes "the memo and the namespace disagree" unrepresentable instead
+/// of merely unlikely. The namespace is the authority for what a reference
+/// names; this is a memo of the bytes behind a name it has already answered.
 ///
 /// Interior synchronization keeps resource lookup available to encode helpers
 /// that only borrow [`DeviceState`] immutably. Those helpers run while the
@@ -752,14 +840,14 @@ impl TaskResourceLifetimeRef {
 /// also makes the lifetime rule explicit instead of relying on that outer
 /// serialization.
 #[derive(Debug, Default)]
-pub struct TaskResources(Mutex<BTreeMap<(u32, u32), Arc<TaskResource>>>);
+pub struct TaskResources(Mutex<BTreeMap<(u32, ResourceId), Arc<TaskResource>>>);
 
 impl TaskResources {
-    pub fn get(&self, task_id: u32, ref_: u32) -> Option<Arc<TaskResource>> {
+    pub fn get(&self, task_id: u32, name: ResourceId) -> Option<Arc<TaskResource>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&(task_id, ref_))
+            .get(&(task_id, name))
             .cloned()
     }
 
@@ -767,24 +855,59 @@ impl TaskResources {
     pub fn register(
         &self,
         task_id: u32,
-        ref_: u32,
+        name: ResourceId,
         resource: Arc<TaskResource>,
     ) -> Arc<TaskResource> {
         Arc::clone(
             self.0
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entry((task_id, ref_))
+                .entry((task_id, name))
                 .or_insert(resource),
         )
     }
 
-    pub fn delete(&self, task_id: u32, ref_: u32) -> bool {
+    pub fn delete(&self, task_id: u32, name: ResourceId) -> bool {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&(task_id, ref_))
+            .remove(&(task_id, name))
             .is_some()
+    }
+
+    /// Every constructed resource in one task, as `(name, resource)`.
+    ///
+    /// Collected rather than iterated under the lock, so a caller may decode
+    /// descriptors -- which is what every caller does -- without holding it.
+    pub fn in_task(&self, task_id: u32) -> Vec<(ResourceId, Arc<TaskResource>)> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|&(&(task, _), _)| task == task_id)
+            .map(|(&(_, name), resource)| (name, Arc::clone(resource)))
+            .collect()
+    }
+
+    /// How many constructed resources this device holds, across every task.
+    ///
+    /// Not a per-task question, and that is the point of it: the one reader is
+    /// the device-info reply census, whose destination is a guest page frame in
+    /// no task's address space at all, so "is there any storage this could
+    /// collide with" cannot be asked of one task.
+    pub fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Whether this device holds no constructed resource at all.
+    ///
+    /// Spelled out beside [`Self::len`] because clippy asks for it and because
+    /// the census's question really is the emptiness rather than the count.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn delete_task(&self, task_id: u32) -> usize {
@@ -795,6 +918,290 @@ impl TaskResources {
         let before = resources.len();
         resources.retain(|&(task, _), _| task != task_id);
         before - resources.len()
+    }
+}
+
+/// The first object reference seen at each guest-VA window, per task, and the
+/// canonical backing identity of every piece of storage this device can name.
+///
+/// Behind a lock for the reason [`TaskResources`] is: the claim is made on the
+/// resolve path, which holds [`DeviceState`] shared.
+///
+/// # Two tables, one counter
+///
+/// Storage is reached two ways on this interface and they are not two answers
+/// about one thing: an object names pages *by address* in its own task, or it
+/// reaches them *through a mapping*, and `crate::runtime::objects::replace_physical`
+/// already treats the two as separate counters because a re-point advances
+/// exactly one of them. So each route interns on its own key — a window on
+/// `(task, base)` with [`DeviceState::storage_incarnation`], a mapping on its id
+/// with [`MappingEntry::map_generation`].
+///
+/// **They share [`Self::next_id`], and that is the load-bearing part.** The
+/// identity is a bare `u64` that the dependency compiler compares for equality
+/// with no idea which route minted it, so two tables with two counters would
+/// hand a window and a mapping the same number and make unrelated storage alias
+/// — false equality, which hands storage back under a live reader. One monotone
+/// counter makes the two key spaces one identity space by construction.
+///
+/// Nothing needs the reverse guarantee — that one piece of storage cannot be
+/// reached by both routes and so get two numbers — because the routes are
+/// disjoint by object type rather than by convention:
+/// `crate::runtime::objects::backing_id` answers by address only for buffers and
+/// address-named textures, and refuses the two mapping-named texture types to
+/// the mapping route; the surface-backing object a mapping's pages are walked
+/// from is `OBJECT_TYPE_BACKING`, which the address route names no storage for
+/// at all.
+pub struct BackingWindowRefs {
+    windows: Mutex<BTreeMap<(u32, u64), WindowFacts>>,
+    /// The identity of each mapping's surface storage, at the incarnation it
+    /// was minted for. See the type doc for why this is a second table and not
+    /// a second counter.
+    mappings: Mutex<BTreeMap<u32, MappingFacts>>,
+    /// The identity of a bare guest page frame.
+    ///
+    /// The third key space, and the type doc's rule applies to it unchanged: it
+    /// interns on [`Self::next_id`] like the other two, so a frame's identity
+    /// can never equal a window's or a mapping's.
+    ///
+    /// One reader — a `CmdGetDeviceInfo` reply, whose destination is a page
+    /// frame in no task's address space, so neither of the other two key spaces
+    /// can name it. It holds no incarnation because a page frame has no
+    /// re-point: the guest names a physical frame and that frame is the storage.
+    frames: Mutex<BTreeMap<u32, u64>>,
+    /// The next dense backing identity to hand out.
+    ///
+    /// Monotone and never reused, which is the whole of what makes an id an
+    /// identity: two windows that are different storage must not be able to
+    /// arrive at one number, and a counter that wrapped or recycled could.
+    /// A `u64` at one per re-point does not run out.
+    next_id: Mutex<u64>,
+}
+
+/// What this device knows about one guest-VA window in one task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowFacts {
+    /// The reference that first constructed an object over this window.
+    ///
+    /// `None` when the entry was created by an identity lookup rather than by
+    /// a construction. The two reach this table by different paths and a
+    /// placeholder reference number would be reported as a live claimant by
+    /// the alias reading, which is a finding about nobody.
+    first_ref: Option<u32>,
+    /// The incarnation [`Self::id`] was minted for.
+    ///
+    /// The entry holds one identity, not a history: when the pages behind the
+    /// window are replaced, the *current* id becomes a new one and the previous
+    /// one stops being mintable — which is right, because nothing needs to mint
+    /// an old identity. Work planned against it holds it already, in its own
+    /// claim, and that is what keeps the old storage alive. Keeping a history
+    /// here would make the table grow with the boot instead of with the live
+    /// namespace, for entries no caller could ever ask for.
+    incarnation: StorageIncarnation,
+    /// The canonical backing identity of this window at that incarnation.
+    id: u64,
+}
+
+/// What this device knows about the identity of one mapping's surface storage.
+///
+/// The mapping analogue of [`WindowFacts`], minus the claim: a mapping has no
+/// "first reference" because it is not reached by a reference at all. It holds
+/// one identity rather than a history for the same reason — nothing mints an
+/// identity it already holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MappingFacts {
+    /// The [`MappingEntry::map_generation`] [`Self::id`] was minted for.
+    map_generation: u32,
+    /// The canonical backing identity of this mapping's surface at that
+    /// generation.
+    id: u64,
+}
+
+impl Default for BackingWindowRefs {
+    fn default() -> Self {
+        Self {
+            windows: Mutex::new(BTreeMap::new()),
+            mappings: Mutex::new(BTreeMap::new()),
+            frames: Mutex::new(BTreeMap::new()),
+            // Zero is never handed out, so a zeroed structure cannot read as a
+            // valid identity -- the same rule `SlotGeneration` follows.
+            next_id: Mutex::new(1),
+        }
+    }
+}
+
+impl std::fmt::Debug for BackingWindowRefs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let claims = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let mappings = self.mappings.lock().unwrap_or_else(|e| e.into_inner());
+        f.debug_struct("BackingWindowRefs")
+            .field("windows", &claims.len())
+            .field("mappings", &mappings.len())
+            .finish()
+    }
+}
+
+impl BackingWindowRefs {
+    /// Reserve an identity for a window this device has not seen before.
+    ///
+    /// Split from the insert so the counter is never advanced under the
+    /// windows lock, and so a lookup that finds a current entry does not touch
+    /// it at all.
+    fn mint(&self) -> u64 {
+        let mut next = self.next_id.lock().unwrap_or_else(|e| e.into_inner());
+        let id = *next;
+        *next += 1;
+        id
+    }
+
+    /// How many identities this device has handed out.
+    ///
+    /// The counter is monotone and shared by both key spaces, so this is the
+    /// whole of "what storage could a newly minted identity be equal to" — and
+    /// zero is the answer that says *nothing*, which is a claim about the
+    /// identity space rather than about any one table's contents.
+    ///
+    /// It is the counter minus one, because the counter starts at one: zero is
+    /// never handed out, so a fresh device holds `next_id == 1` and has minted
+    /// nothing. Reading the raw counter here would report every device as
+    /// having handed out an identity, which is the answer that keeps a term
+    /// open forever.
+    fn minted(&self) -> u64 {
+        self.next_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .saturating_sub(1)
+    }
+
+    fn claim(
+        &self,
+        task_id: u32,
+        ref_: u32,
+        base: u64,
+        incarnation: StorageIncarnation,
+    ) -> Option<u32> {
+        let fresh = WindowFacts {
+            first_ref: Some(ref_),
+            incarnation,
+            id: 0,
+        };
+        match self
+            .windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((task_id, base))
+        {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(fresh);
+                None
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                match slot.get().first_ref {
+                    // Created by an identity lookup, so no construction has
+                    // claimed it. This one is the first.
+                    None => {
+                        slot.get_mut().first_ref = Some(ref_);
+                        None
+                    }
+                    Some(holder) => (holder != ref_).then_some(holder),
+                }
+            }
+        }
+    }
+
+    fn take(&self, task_id: u32, ref_: u32, base: u64, incarnation: StorageIncarnation) {
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        windows
+            .entry((task_id, base))
+            .and_modify(|facts| facts.first_ref = Some(ref_))
+            .or_insert(WindowFacts {
+                first_ref: Some(ref_),
+                incarnation,
+                id: 0,
+            });
+    }
+
+    /// The identity of this window at this incarnation, minting one if the
+    /// window is new or its pages have been replaced since it was last asked.
+    fn identity(&self, task_id: u32, base: u64, incarnation: StorageIncarnation) -> u64 {
+        // Minted outside the windows lock, and discarded unspent when the entry
+        // turns out to be current. An identity is never reused, so an unspent
+        // one is a gap in the sequence and not a hazard -- the invariant is
+        // that two different pieces of storage never share a number, not that
+        // every number is used.
+        let candidate = self.mint();
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let facts = windows.entry((task_id, base)).or_insert(WindowFacts {
+            first_ref: None,
+            incarnation,
+            id: 0,
+        });
+        if facts.id == 0 || facts.incarnation != incarnation {
+            facts.incarnation = incarnation;
+            facts.id = candidate;
+        }
+        facts.id
+    }
+
+    /// The identity of this mapping's surface storage at this generation,
+    /// minting one if the mapping is new or its page list has been replaced
+    /// since it was last asked.
+    ///
+    /// The window route's [`Self::identity`] with the other key, including the
+    /// mint-outside-the-lock and the discard-unspent: an identity is never
+    /// reused, so an unspent one is a gap in the sequence and not a hazard.
+    ///
+    /// The table is bounded by the mapping namespace because a mapping slot is
+    /// never removed from [`DeviceState::mappings`] — it is re-generationed in
+    /// place — which is also what makes one entry per id sound. A recycled slot
+    /// carries a bumped `map_generation` (every writer of the page list bumps
+    /// it), so `(mapping, generation)` never repeats and a later surface at the
+    /// same id cannot inherit the previous one's number.
+    /// The identity of a bare guest page frame, minted once and stable after.
+    ///
+    /// No incarnation, unlike the window and mapping routes: those two exist
+    /// because storage under a name can be replaced, and a page frame is not a
+    /// name — it is the storage. Two asks for one frame are two asks about the
+    /// same bytes and get the same number.
+    fn frame_identity(&self, pfn: u32) -> u64 {
+        if let Some(&id) = self
+            .frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pfn)
+        {
+            return id;
+        }
+        // Minted outside the table's lock, as the window route mints, so the
+        // counter is never advanced under it.
+        let id = self.mint();
+        *self
+            .frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(pfn)
+            .or_insert(id)
+    }
+
+    fn mapping_identity(&self, mapping_id: u32, map_generation: u32) -> u64 {
+        let candidate = self.mint();
+        let mut mappings = self.mappings.lock().unwrap_or_else(|e| e.into_inner());
+        let facts = mappings.entry(mapping_id).or_insert(MappingFacts {
+            map_generation,
+            id: 0,
+        });
+        if facts.id == 0 || facts.map_generation != map_generation {
+            facts.map_generation = map_generation;
+            facts.id = candidate;
+        }
+        facts.id
+    }
+
+    fn delete_task(&self, task_id: u32) {
+        self.windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(t, _), _| t != task_id);
     }
 }
 
@@ -879,6 +1286,19 @@ impl<T> TaskReferenceStates<T> {
         let before = states.len();
         states.retain(|&(task, _), _| task != task_id);
         before - states.len()
+    }
+
+    /// Drop every state under every task, returning how many there were.
+    ///
+    /// The device-lifetime counterpart of [`Self::delete_task`], and not
+    /// expressible as a loop over it: the guest's task ids are not enumerable
+    /// from here, and a device ending does not name them one at a time.
+    pub fn clear(&self) -> usize {
+        let mut states = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *states).len()
     }
 }
 
@@ -1000,6 +1420,115 @@ mod rail_resource_state_tests {
 }
 
 #[cfg(test)]
+mod rail_device_state_tests {
+    use super::*;
+    use crate::model::PAGE_SHIFT_X86;
+    use std::sync::atomic::AtomicU32;
+
+    static ENDINGS: AtomicU32 = AtomicU32::new(0);
+    static TASK_DELETIONS: AtomicU32 = AtomicU32::new(0);
+
+    /// One rail type means one counter, and one of the tests below asserts the
+    /// counter does **not** move — which a concurrently running sibling would
+    /// break. Held for the body of each test rather than relying on
+    /// `--test-threads=1`, because a gate that only holds under a flag somebody
+    /// has to remember is not a gate.
+    static SERIALIZE: Mutex<()> = Mutex::new(());
+
+    fn alone() -> std::sync::MutexGuard<'static, ()> {
+        SERIALIZE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A rail that records only that it was told, because "was the rail told"
+    /// is the whole question at this boundary. What the telling costs is the
+    /// rail's own, and is tested where the rail's table is.
+    #[derive(Debug, Default)]
+    struct CountingRail;
+
+    impl RailDeviceState for CountingRail {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn delete_task(&self, _task_id: u32) {
+            TASK_DELETIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        fn end_device(&self) {
+            ENDINGS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The registry door: a device that leaves the registry is dropped, and the
+    /// rail holding native objects under it has to be told before that drop
+    /// finishes.
+    #[test]
+    fn a_device_that_is_dropped_ends_its_rails_device_lifetime_once() {
+        let _alone = alone();
+        let before = ENDINGS.load(Ordering::Relaxed);
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(
+            state.rail_state::<CountingRail>().is_some(),
+            "the rail installs its slot on first ask"
+        );
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before,
+            "installing a slot is not an ending"
+        );
+
+        drop(state);
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before + 1,
+            "the drop tells the rail exactly once"
+        );
+    }
+
+    /// The reset door. `DeviceState::reset` replaces the struct wholesale, so
+    /// the ending has to arrive there too — and it is the same telling, which
+    /// is why it is owned by `Drop` and not written at both sites.
+    #[test]
+    fn a_reset_ends_the_rails_device_lifetime_and_the_next_one_starts_empty() {
+        let _alone = alone();
+        let before = ENDINGS.load(Ordering::Relaxed);
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.rail_state::<CountingRail>().is_some());
+
+        state.reset();
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before + 1,
+            "the reset ended the lifetime the rail had state under"
+        );
+
+        // The replacement is a different device lifetime with its own empty
+        // slot: asking again installs a second one rather than resurrecting the
+        // first, and ending *that* is a second telling.
+        assert!(state.rail_state::<CountingRail>().is_some());
+        drop(state);
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before + 2,
+            "the lifetime after the reset ends on its own terms"
+        );
+    }
+
+    /// The accessor that installs a slot must not be the one an ending uses.
+    /// A device no rail ever asked about has nothing to let go of, and telling
+    /// it would report an empty teardown for a rail that was never there.
+    #[test]
+    fn a_device_no_rail_ever_claimed_ends_without_creating_one() {
+        let _alone = alone();
+        let before = ENDINGS.load(Ordering::Relaxed);
+        drop(DeviceState::new(DeviceId(1), PAGE_SHIFT_X86));
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before,
+            "no slot, no ending"
+        );
+    }
+}
+
+#[cfg(test)]
 mod task_reference_state_tests {
     use super::TaskReferenceStates;
     use std::sync::Arc;
@@ -1037,6 +1566,33 @@ mod task_reference_state_tests {
         for ref_ in 0..2048 {
             assert_eq!(*states.get(3, ref_).unwrap(), ref_);
         }
+    }
+
+    /// The device's ending takes every task, including the ones the guest never
+    /// deleted — which is the case `delete_task` cannot cover, since nothing
+    /// here can enumerate the guest's task ids.
+    #[test]
+    fn a_device_ending_clears_every_task_and_says_how_many_it_took() {
+        let states = TaskReferenceStates::default();
+        states.register(1, 7, Arc::new(10u32));
+        states.register(1, 8, Arc::new(11u32));
+        states.register(2, 7, Arc::new(12u32));
+        let held = states.get(2, 7).unwrap();
+
+        assert_eq!(states.clear(), 3, "every task's states, counted once");
+        assert!(!states.contains(1, 7));
+        assert!(!states.contains(1, 8));
+        assert!(!states.contains(2, 7));
+        assert_eq!(
+            *held, 12,
+            "a state an encoder still owns outlives the table, exactly as it \
+             does across a reference delete"
+        );
+        assert_eq!(
+            states.clear(),
+            0,
+            "a second ending has nothing left to take"
+        );
     }
 }
 
@@ -1984,14 +2540,20 @@ pub struct PresentState {
     ///
     /// apple-gfx `pending_frames` / PGDisplay `waitForPendingFrames` entry gate:
     /// when this is ≥ [`crate::runtime::drain::MAX_UNPAINTED_PRESENTS`], the
-    /// child drain **holds** the next CmdDisplaySwap at channel head (no stamp)
-    /// until paint clears the count. Accepted presents still stamp at retain.
+    /// drain **declines to run** the released CmdDisplaySwap until paint clears
+    /// the count. Accepted presents still stamp at retain.
     pub unpainted_presents: u32,
     /// Suppress repeated fail-log lines while the same present packet remains
-    /// held at the pending-frames entry gate.
+    /// held at the pending-frames gate.
     pub backpressure_hold_active: bool,
     pub backpressure_hold_channel: u32,
-    pub backpressure_hold_head: u32,
+    /// Which present is being held, as its ordering position.
+    ///
+    /// A position and not a ring head: a held present no longer sits at a
+    /// consumer pointer — the head moved past it at arrival — so the thing that
+    /// distinguishes one hold episode from the next is the transaction, which is
+    /// what the guest is actually waiting on.
+    pub backpressure_hold_position: u64,
     /// Always-on diagnostic counter for distinct pending-frames hold episodes.
     pub backpressure_hold_count: u64,
     /// Recycled scratch for the present-capture frame buffer.
@@ -2307,6 +2869,105 @@ impl NamedMappings {
     }
 }
 
+/// A name the lifecycle owner published, and what publishing it obliged.
+///
+/// Two things because a declaration is two things. The name is what the caller
+/// asked for; the effects are the previous occupant's — a guest that writes
+/// over a live object-list slot ends the object that was there with no delete
+/// packet at all, and the teardown that owes is carried out here or by nobody.
+#[must_use = "a declaration's effects are the displaced occupant's teardown"]
+pub struct Declaration {
+    pub id: ResourceId,
+    pub acted: Acted,
+}
+
+/// The obligations of a lifecycle operation that this device *acts on* rather
+/// than counts.
+///
+/// [`note_lifecycle_effects`] is the one place `reims_vgpu_core::lifecycle::Effects`
+/// is opened, and it splits the six into two kinds. Four of them name work only
+/// this device can do — it holds the host textures a teardown frees, the
+/// resolution caches a remap invalidates, the transfer stagings a discard
+/// releases, and the per-task caches a redefinition ends — so they arrive here
+/// as values. The other two are counted there and are not in this type, because
+/// there is nothing on this device for them to drive; see that function.
+#[must_use = "every field here is work the model has already decided and nothing else will do"]
+pub struct Acted {
+    pub teardowns: Vec<reims_vgpu_core::namespace::Teardown>,
+    pub remapped: Vec<reims_vgpu_core::lifecycle::Remap>,
+    pub at_completion: Vec<reims_vgpu_core::lifecycle::DeferredDiscard>,
+    pub redefined: Vec<reims_vgpu_core::lifecycle::Redefinition>,
+}
+
+/// Open one lifecycle operation's effects, count what this device does not act
+/// on, and hand back what it does.
+///
+/// **The one destructure, so a seventh obligation is a compile error.** Every
+/// door and every lifetime arm reaches the owner's `Effects` through here; a
+/// caller that named three fields by hand would be correct only for as long as
+/// the operation it calls fills exactly those three, which is not a fact a call
+/// site can see, and the failure is an obligation that was owed and then
+/// dropped on the way out.
+///
+/// # The two that are counted here and not returned
+///
+/// * **`storage_freed`** is heap storage whose last allocation went with the
+///   operation. This device declares no heap placement at all —
+///   `crate::runtime::objects::declared_storage` refuses one by name, because a
+///   heap's extent is unrecovered — so the owner's per-task `Heaps` is empty and
+///   this list cannot be non-empty. Counted rather than asserted: a reading
+///   above zero is the day the heap extent landed and this became work.
+/// * **`transfers`** are copies owed before a completion stamp may publish, and
+///   they are produced only where a replica is behind. Nothing in this device
+///   calls `Lifecycle::record_write`, so `Replica::DeviceOwned` never becomes
+///   authoritative over any byte, so no read of the guest's pages is ever
+///   behind and no transfer can be owed. The device's own deferred-Store
+///   obligation is `crate::runtime::writeback_debt`'s and is a different fact —
+///   it is about a render pass that has already run, not about content
+///   authority the model tracks. A reading above zero here means the content
+///   ledger has started deciding something, and that is a change worth a line
+///   on the always-on channel rather than a silent one.
+fn note_lifecycle_effects(
+    effects: reims_vgpu_core::lifecycle::Effects,
+    site: &'static str,
+) -> Acted {
+    let reims_vgpu_core::lifecycle::Effects {
+        transfers,
+        teardowns,
+        storage_freed,
+        at_completion,
+        remapped,
+        redefined,
+    } = effects;
+    if !storage_freed.is_empty() {
+        crate::runtime::drain::note_store_route_n(
+            "lifecycle_storage_freed",
+            storage_freed.len() as u64,
+        );
+        crate::observe::fail(format!(
+            "lifecycle_storage_freed site={site} n={} (this device places nothing in a heap, so \
+             the owner's heaps hold no storage to free — a heap extent has been recovered \
+             somewhere and this is now work)",
+            storage_freed.len()
+        ));
+    }
+    if !transfers.is_empty() {
+        crate::runtime::drain::note_store_route_n("lifecycle_transfers", transfers.len() as u64);
+        crate::observe::fail(format!(
+            "lifecycle_transfers site={site} n={} (nothing calls Lifecycle::record_write, so no \
+             replica can be behind — the content ledger has started deciding transfers and \
+             nothing here executes them)",
+            transfers.len()
+        ));
+    }
+    Acted {
+        teardowns,
+        remapped,
+        at_completion,
+        redefined,
+    }
+}
+
 /// Full device model state (backend-independent).
 #[derive(Debug)]
 pub struct DeviceState {
@@ -2315,22 +2976,54 @@ pub struct DeviceState {
     pub page_shift: u32,
     pub gfx: GfxRegs,
     pub iosfc: IosfcRegs,
-    pub active_child_mask: u32,
+    /// The semantic model's ordering plane, and the owner of which child
+    /// domains are open.
+    ///
+    /// **This is the replacement architecture's `SessionModel`, in production,
+    /// holding one lifetime.** `active_child_mask` used to be a stored bit per
+    /// child domain, written by three events — a channel definition, a locked
+    /// doorbell register write, and a lock-free doorbell ring — and read for two
+    /// unrelated questions: "is this a publication domain the guest defined" and
+    /// "is there work waiting here". One field answering both is why neither
+    /// could be moved.
+    ///
+    /// The two are separated now. Openness is this model's `open_channels`,
+    /// reached through [`Self::child_domain_open`] and
+    /// [`Self::open_child_mask`]; "there is work here" is `pending.child_mask`,
+    /// which the doorbells write. The union the old field held is
+    /// [`Self::drainable_child_mask`], derived rather than stored, so the two
+    /// cannot drift.
+    ///
+    /// Only channel lifetime feeds it, and that is deliberate rather than
+    /// partial: `SessionModel::apply_control` performs a control operation's
+    /// effect, and a channel definition's whole effect is opening the domain its
+    /// next packet names. The packet *envelope* — stamps, ordering position,
+    /// completion — stays with the drain for every class and moves when the
+    /// ordering core does. What has moved is one lifetime, to its one owner.
+    ///
+    /// **Private, and reached through the doors below.** The same shape the
+    /// resource-lifetime group left `lifecycle` in, for the same reason: the
+    /// paths that will feed this model next — a pipeline being declared,
+    /// translated, built or refused — run on the draw rails, which hold
+    /// `&DeviceState` and cannot take a `&mut` field. A `Mutex` and named doors
+    /// keep "which state changes, from where" a list a reader can enumerate,
+    /// instead of a public field any call site can reach into.
+    session: Mutex<reims_vgpu_core::session::SessionModel>,
+    /// The bytes every admitted position is executed from, keyed by the
+    /// ordinal [`Self::admit_packet`] issued.
+    ///
+    /// Beside the ordering plane rather than inside it: the model holds
+    /// ordering and this device holds bytes, and the ordinal is the join. Not
+    /// behind the `Mutex` above, because the drain owns `&mut DeviceState` and
+    /// nothing on a draw rail parks or runs work — see
+    /// [`crate::runtime::parked::ParkedStore`], which owns the identity of a
+    /// parked position and deliberately not its readiness.
+    pub parked: crate::runtime::parked::ParkedStore,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
     /// immutable AIR translation is still loading. The packet head and stamp
     /// remain untouched until retry, so this is scheduler state rather than a
     /// submitted async GPU job.
     pub translation_deferred_mask: u32,
-    /// FIFO timelines whose head packet is held on an unmet stamp wait. Bit 0
-    /// is the root FIFO and child channel N uses bit N, the same convention as
-    /// [`Self::translation_order_hold_mask`].
-    ///
-    /// Held rather than skipped: the head and the completion stamp stay
-    /// untouched, so a retry re-decodes the same packet and no side effect can
-    /// happen twice. The mask is what tells `drain_pending` which timelines to
-    /// re-offer while the pass is still publishing stamps, since another
-    /// timeline's stamp is the only thing that can satisfy one.
-    pub stamp_deferred_mask: u32,
     /// Root/child FIFO timelines held behind a cold-translation EXEC. Bit 0 is
     /// the root FIFO; child channel N uses bit N. This is diagnostic scheduler
     /// ownership, not a guest-visible protocol mask.
@@ -2392,9 +3085,42 @@ pub struct DeviceState {
     /// owns the corresponding resource objects and their immutable descriptor
     /// construction input.
     pub objects: std::collections::BTreeSet<(u32, u32)>,
-    /// Retained resource objects, with the task/reference lifetime defined by
-    /// [`TaskResources`].
+    /// Retained resource objects, keyed by the name
+    /// [`Self::declare_object`] issued. See [`TaskResources`].
     pub task_resources: TaskResources,
+    /// The object namespace of each live task: what a guest reference resolves
+    /// to, and at which generation.
+    ///
+    /// **The authority for object naming, and the only issuer of a generation.**
+    /// Everything else this device keeps per object is a memo behind a name this
+    /// answered — [`TaskResources`] most of all, which is keyed by that name so
+    /// a retired one cannot be spelled.
+    ///
+    /// One namespace per task, because an object-list reference is task-local
+    /// and a resolution that reached across tasks would find whatever shared the
+    /// integer. Dropped whole when the task's address space ends, which is the
+    /// same event that ends every name in it.
+    ///
+    /// Behind a lock for [`TaskResources`]' reason: the resolve path holds
+    /// [`DeviceState`] shared, and `reims_vgpu_core::namespace::Namespace`
+    /// counts its own resolutions, so even a lookup takes `&mut`.
+    ///
+    /// **The semantic model's lifecycle owner, not a map of namespaces.** This
+    /// field held `BTreeMap<u32, Namespace>` until the resource-lifecycle group
+    /// moved: one namespace per task, and nothing owning the events that begin
+    /// or end them. `reims_vgpu_core::lifecycle::Lifecycle` owns the
+    /// namespaces, the per-task heaps and the session's content authority
+    /// together, because the twelve lifetime commands move all three — a device
+    /// that took only the first would be keeping the second record of the other
+    /// two, which is the thing the replacement plan forbids.
+    ///
+    /// **Nothing outside the doors below names this field**, and that is the
+    /// group's disjointness claim in its structural form: the legacy path
+    /// cannot reach this state except through
+    /// [`Self::object_name`], [`Self::declare_object`],
+    /// [`Self::retire_object_name`], [`Self::delete_task_namespace`] and the
+    /// two task-lifetime entry points, all of which moved in one commit.
+    lifecycle: Mutex<reims_vgpu_core::lifecycle::Lifecycle>,
     /// Immutable sampler objects in the sampler API's separate ref space.
     pub task_sampler_states: TaskSamplerStates,
     /// Immutable depth-stencil objects in that API's separate ref space.
@@ -2409,11 +3135,39 @@ pub struct DeviceState {
     rail: OnceLock<Box<dyn RailDeviceState>>,
     /// Mapper-ref-texture object ref → mapping_id: (task_id, ref) -> mapping_id.
     pub texture_to_mapping: BTreeMap<(u32, u32), u32>,
-    /// Per-name half of [`StorageIncarnation`]. Reset for a task whenever its
-    /// epoch moves, which is what keeps it bounded by the live namespace.
-    storage_incarnations: BTreeMap<(u32, u32), u32>,
+    /// Per-window half of [`StorageIncarnation`], keyed `(task, window base)`.
+    /// Reset for a task whenever its epoch moves, which is what keeps it
+    /// bounded by the live namespace.
+    storage_incarnations: BTreeMap<(u32, u64), u32>,
     /// Per-task half of [`StorageIncarnation`].
     task_storage_epochs: BTreeMap<u32, u32>,
+    /// The first object reference seen naming each guest-VA window, per task.
+    ///
+    /// Keyed `(task, window base)`, holding the reference that got there first.
+    /// It answers one question and it is the question a canonical backing
+    /// identity is blocked on: **can two references in one task name one piece
+    /// of storage?**
+    ///
+    /// `BackingId`'s settled derivation is the window plus a *per-reference*
+    /// incarnation, and `replace_physical` advances that count for the
+    /// reference the packet names and no other. If two live references ever
+    /// share a window, the two would then carry different incarnations for the
+    /// same bytes — two ids for one backing, which is a hazard edge the
+    /// dependency compiler never draws, which is a data race. If no two ever
+    /// do, the per-reference count *is* canonical and the derivation stands.
+    ///
+    /// Reset with the task, alongside [`Self::storage_incarnations`], and for
+    /// the same reason: an entry outliving its namespace would answer for a
+    /// window nothing names any more. A stale entry inside a live task is
+    /// possible — a deleted reference leaves its window behind — so the reader
+    /// re-checks that the claimant is still live before calling it an alias.
+    backing_window_refs: BackingWindowRefs,
+    /// References found to share their allocation with another live one.
+    ///
+    /// A lookup table for hot paths that must not pay for the scan that fills
+    /// it. See [`Self::note_aliased_reference`] for what its freshness is.
+    /// Cleared with the task, alongside every other per-window fact.
+    aliased_references: Mutex<BTreeSet<(u32, u32)>>,
     pub mappings: BTreeMap<u32, MappingEntry>,
     /// Host render-cache keyed by surface_id / mapping_id (Linux/Vulkan rail).
     /// See [`crate::runtime::surface_cache`] and kb tahoe-x86-host-reims_vgpu §8.5.
@@ -2728,6 +3482,37 @@ pub const FENCE_DOMAIN_COMPUTE: u8 = 3;
 /// Domain tag for render fences.
 pub const FENCE_DOMAIN_RENDER: u8 = 4;
 
+/// What writing a completion word did to the ordering plane's record of that
+/// slot's timeline.
+///
+/// Four facts and not one, because they mean four different things and only
+/// one of them is a defect. [`Self::Repeat`] is how a packet that signals
+/// nothing is spelled on this wire — the header repeats the slot's current
+/// value rather than clearing it — and [`Self::Behind`] is a fence going
+/// backwards, which unsatisfies every wait between the two values and is the
+/// first thing to rule out before reading an unmet-wait count as an ordering
+/// problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StampPublication {
+    /// Nothing had ever published to this slot.
+    First,
+    /// The timeline moved forward.
+    Advanced,
+    /// The same value again.
+    Repeat,
+    /// The word is behind what the slot already holds, so the model's timeline
+    /// did not move and this device's guest-visible write disagrees with it.
+    ///
+    /// Carries what the plane holds, because the count alone cannot separate
+    /// the two things this can be: a rewind of one slot, where the page went
+    /// backwards under a timeline that will not follow, and a timeline that has
+    /// run ahead of every word the guest can read. The first is a slot to
+    /// explain and the second is an ordering defect, and they are one number.
+    Behind {
+        held: reims_vgpu_core::identity::StampValue,
+    },
+}
+
 impl DeviceState {
     /// GPA for a guest PFN under this device's page size.
     #[inline]
@@ -2751,9 +3536,11 @@ impl DeviceState {
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
             gva_store_witness: Default::default(),
-            active_child_mask: 0,
+            session: Mutex::new(reims_vgpu_core::session::SessionModel::new(
+                reims_vgpu_core::identity::SessionId(id.0 as u32),
+            )),
+            parked: crate::runtime::parked::ParkedStore::new(),
             translation_deferred_mask: 0,
-            stamp_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
             present_translation_holds: 0,
@@ -2768,11 +3555,14 @@ impl DeviceState {
             node_guard: std::collections::BTreeMap::new(),
             objects: std::collections::BTreeSet::new(),
             task_resources: TaskResources::default(),
+            lifecycle: Mutex::new(reims_vgpu_core::lifecycle::Lifecycle::new()),
             task_sampler_states: TaskSamplerStates::default(),
             task_depth_stencil_states: TaskDepthStencilStates::default(),
             rail: OnceLock::new(),
             texture_to_mapping: BTreeMap::new(),
             storage_incarnations: BTreeMap::new(),
+            backing_window_refs: BackingWindowRefs::default(),
+            aliased_references: Mutex::new(BTreeSet::new()),
             task_storage_epochs: BTreeMap::new(),
             mappings: BTreeMap::new(),
             host_surfaces: BTreeMap::new(),
@@ -2900,6 +3690,52 @@ impl DeviceState {
         self.fence_generations
             .get(&(task_id, domain, fence_ref))
             .copied()
+    }
+
+    /// Forget every generation this task holds for `fence_ref`, and say which
+    /// encoder domains held one.
+    ///
+    /// **The guest's fence is dead and its number will come back.** A wait is
+    /// satisfied when the stored generation is at or past its target, so a
+    /// generation that outlives its fence makes the *next* fence to get that
+    /// ref start life already signalled — the first wait on it passes with
+    /// nothing behind it. Nothing else forgets these: they are not keyed by a
+    /// name the namespace retires, and their task's teardown is the only other
+    /// event that reaches them.
+    ///
+    /// The tag is this device's own split of one guest fence across encoder
+    /// domains, not a guest-visible term, so one ref can hold up to four
+    /// generations and all four are the same object's. All of them go.
+    ///
+    /// # The two reference spaces are one, and that was measured
+    ///
+    /// A `CmdDeleteObject` carrying `OPCODE_DELETE_FENCE` names a ref in the
+    /// *serializer's* per-kind space, and this table is keyed by the ref a
+    /// command stream's fence record carries. Those being the same number for
+    /// the same object is not something this device may assume — see
+    /// `crate::runtime::drain::apply_delete_object` for the boot that asked the
+    /// object table the same question and found its spaces **unrelated**. So
+    /// this one was counted before it was acted on: a driven macos-15 boot sent
+    /// two fence deletes and **both** named a ref this device held a
+    /// render-domain generation under, with `delete_fence_ref_absent=0`. The
+    /// spaces coincide, and the retirement below is what that reading buys.
+    pub fn retire_fence(&mut self, task_id: u32, fence_ref: u32) -> Vec<u8> {
+        let mut cleared = Vec::new();
+        for tag in [
+            FENCE_DOMAIN_EVENT,
+            FENCE_DOMAIN_BLIT,
+            FENCE_DOMAIN_COMPUTE,
+            FENCE_DOMAIN_RENDER,
+        ] {
+            if self
+                .fence_generations
+                .remove(&(task_id, tag, fence_ref))
+                .is_some()
+            {
+                cleared.push(tag);
+            }
+        }
+        cleared
     }
 
     /// Store fence generation (monotonic update owned by the planner).
@@ -3193,15 +4029,17 @@ impl DeviceState {
         // the guest published into the old one reads back as zero. macOS 13 does
         // not do this and macOS 26 does, which is why it is counted separately
         // from a first definition rather than folded into one route.
-        if self.tasks.is_active(task_id) {
-            let same_root = self
-                .tasks
-                .get(task_id)
-                .is_some_and(|t| t.directory_pfn == directory_pfn);
-            crate::runtime::drain::note_store_route(if same_root {
-                "define_task_redefined_live_same_root"
-            } else {
+        // The owner's answer, not a second derivation of it beside the owner.
+        // `Lifecycle::define_task` ends the previous address space and reports
+        // the pair of page-table roots; `Redefinition::root_moved` is the
+        // question this route used to ask of `TaskEntry::directory_pfn`, and two
+        // records of one fact are what this group moved to stop.
+        let redefined = self.define_task_namespace(task_id, directory_pfn);
+        if let Some(redefinition) = redefined {
+            crate::runtime::drain::note_store_route(if redefinition.root_moved() {
                 "define_task_redefined_live_new_root"
+            } else {
+                "define_task_redefined_live_same_root"
             });
         }
         // Drop objects for this task on redefine.
@@ -3270,6 +4108,7 @@ impl DeviceState {
         }
         self.objects.retain(|&(t, _)| t != task_id);
         self.task_resources.delete_task(task_id);
+        self.delete_task_namespace(task_id);
         self.task_sampler_states.delete_task(task_id);
         crate::runtime::drain::note_store_route_n(
             "ds_state_task_deleted",
@@ -3379,15 +4218,804 @@ impl DeviceState {
         true
     }
 
+    /// How many backing identities this device has minted.
+    ///
+    /// The one reader is the device-info reply census, whose question is whether
+    /// a freshly minted identity could equal one already in use. It is
+    /// deliberately the *counter* and not a table size: the counter is what
+    /// every key space draws from, so it is the only number that answers for the
+    /// identity space as a whole.
+    #[must_use]
+    pub fn backing_identities_minted(&self) -> u64 {
+        self.backing_window_refs.minted()
+    }
+
+    /// The canonical identity of a bare guest page frame.
+    ///
+    /// The one caller is a `CmdGetDeviceInfo` reply destination — see
+    /// [`BackingWindowRefs`]'s `frames` table for why a page frame needs a key
+    /// space of its own and why sharing the counter is what makes that safe.
+    pub fn frame_backing_identity(&self, pfn: u32) -> reims_vgpu_core::access::BackingId {
+        reims_vgpu_core::access::BackingId(self.backing_window_refs.frame_identity(pfn))
+    }
+
+    /// Open these child domains, for a test that needs one live without driving
+    /// a definition packet through the drain.
+    ///
+    /// `#[cfg(test)]`, and through the owner's own door rather than by writing a
+    /// field: a test that could set openness directly would be testing a second
+    /// record of it, which is exactly what moving this lifetime removed. A
+    /// domain already open is left open — the model refuses the redefinition and
+    /// a fixture asking twice means the same thing either way.
+    #[cfg(test)]
+    pub(crate) fn open_child_domains_for_test(&mut self, mask: u32) {
+        for channel in 1..crate::model::MAX_CHANNELS as u32 {
+            if mask & (1u32 << channel) != 0 {
+                let _ = self
+                    .session
+                    .lock()
+                    .expect("session")
+                    .open_channel(reims_vgpu_core::identity::ChannelId(channel));
+            }
+        }
+    }
+
+    /// Whether a channel definition has opened this child domain.
+    ///
+    /// The model's answer and no copy of it. A domain becomes drainable three
+    /// ways on this interface and only one of them is a definition; see
+    /// [`Self::session`] for why the other two answer a different question.
+    pub fn child_domain_open(&self, channel: u32) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .channel_open(reims_vgpu_core::identity::ChannelId(channel))
+    }
+
+    /// Perform a resolved control operation's effect on the ordering plane.
+    ///
+    /// The one door a channel definition or free reaches the model through, and
+    /// the reason the field below it is private: the drain used to hold a `&mut`
+    /// and call the model directly, which is a shape no `&DeviceState` caller
+    /// could copy.
+    pub fn apply_channel_control(
+        &self,
+        op: reims_vgpu_core::control::ControlOp,
+    ) -> Result<(), reims_vgpu_core::session::ControlRefusal> {
+        self.session.lock().expect("session").apply_control(op)
+    }
+
+    /// Tell the ordering plane that the guest has created a pipeline object.
+    ///
+    /// `reims_vgpu_core::pipeline::PipelineState::Declared` is exactly this:
+    /// the object exists and no host work has started on it. The generation is
+    /// the model's own and is read inside the lock rather than handed in — a
+    /// caller that could state it could declare a pipeline into a lifetime that
+    /// has already closed, which is the one thing
+    /// `PipelineTable::generation_closed` exists to make impossible.
+    ///
+    /// Returns whether this call was the declaration. A pipeline already
+    /// declared answers `false`, which is the ordinary case: the guest binds
+    /// the same pipeline on every draw.
+    ///
+    /// # Why the model is told at all before anything reads it
+    ///
+    /// `SessionModel::admit` refuses an exec transaction whose stream binds a
+    /// pipeline the table does not hold — `LeaseRefusal::Absent`, which is
+    /// every exec packet a real guest sends. The table being empty is the
+    /// ordering group's next blocker after the classes, and this is the
+    /// rail-neutral half of filling it: *that* a pipeline exists is the guest's
+    /// fact, while translating and building it are the running rail's and reach
+    /// the model from there.
+    pub fn declare_pipeline(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+        let mut session = self.session.lock().expect("session");
+        let generation = session.generation();
+        session.pipelines().declare(pipeline, generation)
+    }
+
+    /// Tell the ordering plane the guest has ended a pipeline's life.
+    ///
+    /// The other half of [`Self::declare_pipeline`], and the reason the pair
+    /// can land together: a table that only ever grows is a table whose census
+    /// says nothing, and the guest's own destroy is the one event that says a
+    /// pipeline is over. `CmdDeleteObject` names it — measured, and the name is
+    /// the model's own.
+    ///
+    /// `Ended::stranded` is the transactions parked on a compilation that will
+    /// now never finish — empty today, because nothing is admitted into this
+    /// model yet, and counted rather than dropped so the day it stops being
+    /// empty is a number and not a hang. `Ended::took` is the other half, and a
+    /// driven boot needs it: the guest deletes render pipelines this device
+    /// never drew with, so 170 retirements a boot were 116 the table took and
+    /// 54 that named a slot it has no entry for.
+    pub fn retire_pipeline(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> reims_vgpu_core::session::Ended {
+        self.session
+            .lock()
+            .expect("session")
+            .pipeline_retired(pipeline)
+    }
+
+    /// Step a declared pipeline along its build, from the rail that is
+    /// building it.
+    ///
+    /// `Translating` and `Compiling` are the two steps with no consequence
+    /// outside the table — nothing is released and nothing is stranded — so
+    /// they go through `PipelineTable::advance` directly, which is why
+    /// `SessionModel::pipelines` is read-write. The two steps that *do* have a
+    /// consequence have their own doors: [`Self::ready_pipeline`] and
+    /// [`Self::refuse_pipeline`].
+    ///
+    /// Returns whether the step was legal and taken. An illegal step is
+    /// ordinary rather than a defect — a rail with no memo re-walks the same
+    /// pipeline on every draw and finds it already `Ready` — and the caller
+    /// counts them rather than ignoring them, because the same `false` is also
+    /// what a compile finishing after the guest's delete answers.
+    pub fn advance_pipeline(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        next: reims_vgpu_core::pipeline::PipelineState,
+    ) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .advance(pipeline, next)
+    }
+
+    /// This rail no longer holds a translation for a pipeline the model called
+    /// ready, so work binding it waits again.
+    ///
+    /// See [`reims_vgpu_core::pipeline::PipelineTable::withdraw`] for why this
+    /// is not an [`Self::advance_pipeline`] step.
+    pub fn withdraw_pipeline(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .withdraw(pipeline)
+    }
+
+    /// What an executor found its shaders do with each bound slot.
+    ///
+    /// **Published before [`Self::ready_pipeline`], never after.** Ready is the
+    /// event that lets a transaction lease the pipeline, and a lease taken
+    /// before the reflection landed produces a footprint that is conservative
+    /// forever — the walk asks once, at admission, and never asks again. So the
+    /// order is publish, then ready; the reverse is not a defect the model can
+    /// see, which is exactly why it is written down here.
+    ///
+    /// Returns whether it landed. `false` for a pipeline this model does not
+    /// hold or has already retired or refused; see
+    /// [`reims_vgpu_core::pipeline::PipelineTable::publish_usage`].
+    pub fn publish_pipeline_usage(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        usage: reims_vgpu_core::pipeline::PublishedUsage,
+    ) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .publish_usage(pipeline, usage)
+    }
+
+    /// The published reflections, for the length of one packet's walk.
+    ///
+    /// A guard rather than a per-lookup call, because the walk asks once per
+    /// bound slot per draw and a lock per slot would put the ordering plane's
+    /// mutex on the hottest path this device has. Held across the walk, taken
+    /// and dropped by [`crate::runtime::ingress::device_packet`], and safe to
+    /// hold there because nothing the walk touches reaches this mutex —
+    /// [`Self::task_access`] and the name resolvers are the `lifecycle` owner's,
+    /// which is a different lock.
+    #[must_use]
+    pub fn pipeline_usage(&self) -> PipelineUsage<'_> {
+        PipelineUsage(self.session.lock().expect("session"))
+    }
+
+    /// A pipeline finished building and is usable.
+    ///
+    /// The door rather than `advance(.., Ready)`, because becoming ready is
+    /// the event that releases the transactions parked on it — and a rail that
+    /// recorded the state without releasing the work would leave every exec
+    /// that leased this pipeline holding its channel's publication head.
+    pub fn ready_pipeline(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipeline_ready(pipeline)
+    }
+
+    /// Whether a declared pipeline has already reached `Ready`.
+    ///
+    /// The read half of [`Self::ready_pipeline`], and it exists so a caller can
+    /// decline to redo work whose answer is already in the table. A pipeline the
+    /// table does not hold answers `false`: an undeclared lease is not a
+    /// promise, and treating it as one would skip the step that makes it one.
+    /// What the ordering plane's pipeline table says about one pipeline, for a
+    /// caller reporting a failure that should not have been reachable.
+    ///
+    /// `None` is "the table has no entry", which is a different fact from every
+    /// state it could be in and is the one a lease that was never declared
+    /// produces. Read-only on purpose: this is asked on a path that has already
+    /// lost a draw, and a diagnostic that declared what it was asking about
+    /// would answer its own question.
+    #[must_use]
+    pub fn pipeline_state(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> Option<&'static str> {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .get(pipeline)
+            .map(|entry| entry.state.name())
+    }
+
+    #[must_use]
+    pub fn pipeline_is_ready(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .get(pipeline)
+            .is_some_and(|entry| entry.state.is_ready())
+    }
+
+    /// A pipeline will never build, with the reason the rail refused it.
+    ///
+    /// `Ended::stranded` is the transactions that can therefore never be ready.
+    /// They come back rather than being dropped for the same reason
+    /// [`Self::retire_pipeline`]'s do, and the caller withdraws each and says
+    /// why. Empty today, because nothing is admitted into this model yet.
+    /// `Ended::took` is whether the refusal was a legal step at all.
+    pub fn refuse_pipeline(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        reason: reims_vgpu_core::pipeline::RefusalReason,
+    ) -> reims_vgpu_core::session::Ended {
+        self.session
+            .lock()
+            .expect("session")
+            .pipeline_refused(pipeline, reason)
+    }
+
+    /// Give one packet an ordering position in the model.
+    ///
+    /// The door `SessionModel::admit` is reached through, and the last of the
+    /// model's four planes to have one — declaration, publication and the
+    /// pipeline table already do. What comes back is the model's answer *and*
+    /// the incarnation it was admitted into, read under the same lock: a caller
+    /// that asked for the epoch separately could be told about a loss between
+    /// the two reads and then complete the transaction under the wrong one,
+    /// which is the race [`reims_vgpu_core::session::SessionModel::complete`]
+    /// takes an epoch argument to answer.
+    ///
+    /// # Errors
+    ///
+    /// The model's own refusal, unchanged. Every one of them is the packet
+    /// being un-admittable rather than this device being unable to ask — a
+    /// closed generation, a domain no definition opened, a payload that is not
+    /// the class its opcode declares — so the caller names it on the failure
+    /// channel and advances the ring.
+    pub fn admit_packet(
+        &self,
+        packet: &reims_vgpu_core::session::Packet,
+    ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
+        let mut session = self.session.lock().expect("session");
+        let admitted = session.admit(packet)?;
+        Ok(Admission {
+            epoch: session.epoch(),
+            admitted,
+        })
+    }
+
+    /// The semantic lifetime the model is in right now.
+    ///
+    /// **A reader's fact, and that is why it is asked here rather than inside
+    /// `admit`.** A guest reset races the drain: a packet that left the ring
+    /// before the reset and reaches ingress after it names a lifetime that has
+    /// closed, and nothing else can tell — the guest's packet carries no
+    /// generation. So the reader states the one it was holding when it took the
+    /// bytes, and the model compares. See
+    /// [`reims_vgpu_core::session::Packet::session`].
+    #[must_use]
+    pub fn session_generation(&self) -> reims_vgpu_core::identity::SessionGeneration {
+        self.session.lock().expect("session").generation()
+    }
+
+    /// The positions the model has released to run since the last ask.
+    ///
+    /// **The one door work leaves the model by.** A transaction taken off this
+    /// list and not run is one that never runs, and one taken twice is one that
+    /// runs twice; the store that holds its bytes is what makes the second
+    /// unrepresentable — see `crate::runtime::parked::ParkedStore::release`.
+    #[must_use = "a position taken off the ready list and not run is a packet that never runs"]
+    pub fn take_ready(&self) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
+        self.session.lock().expect("session").take_ready()
+    }
+
+    /// A transaction finished on the host.
+    ///
+    /// Releases its dependents, retires its accesses, and hands back what its
+    /// channel published — which is not necessarily this transaction's own
+    /// word: a channel publishes in its own order, so a completion may release
+    /// a queue of earlier words, this one, or nothing at all yet.
+    ///
+    /// `epoch` is the incarnation the work was *submitted* under, which is why
+    /// it is retained with the packet rather than read here. Submission is not
+    /// completion: a device loss withdraws every transaction admitted into the
+    /// lost epoch, and the host can still report those back.
+    ///
+    /// # Errors
+    ///
+    /// If the completion was produced under an incarnation that has ended.
+    #[must_use = "what the channel published is what the guest may now read"]
+    pub fn complete_transaction(
+        &self,
+        epoch: reims_vgpu_core::identity::DeviceEpoch,
+        ingress: reims_vgpu_core::identity::IngressOrdinal,
+    ) -> Result<Vec<reims_vgpu_core::publish::Release>, reims_vgpu_core::session::Refusal> {
+        self.session
+            .lock()
+            .expect("session")
+            .complete(epoch, ingress)
+    }
+
+    /// Take a transaction that will never publish out of every plane holding
+    /// it, and say what its channel released behind it.
+    ///
+    /// Its own completion word is deliberately not published: the work never
+    /// ran, and what the guest is owed instead is the typed reason the caller
+    /// names.
+    #[must_use = "what the channel published is what the guest may now read"]
+    pub fn withdraw_transaction(
+        &self,
+        ingress: reims_vgpu_core::identity::IngressOrdinal,
+    ) -> Vec<reims_vgpu_core::publish::Release> {
+        self.session.lock().expect("session").withdraw(ingress)
+    }
+
+    /// The guest's completion word for `slot` has moved to `value`.
+    ///
+    /// The other end of a stamp wait. `SessionModel::admit` parks a packet
+    /// whose header names a point another packet must have published, and the
+    /// only thing that discharges that wait is this — so a cutover without it
+    /// would park every packet the guest orders behind a fence, forever, the
+    /// same way an unadvanced pipeline would park every exec.
+    ///
+    /// Answers with what the write did to the slot's timeline, which is four
+    /// different facts and not one. See [`StampPublication`].
+    pub fn publish_completion_stamp(
+        &self,
+        slot: reims_vgpu_core::identity::StampSlot,
+        value: reims_vgpu_core::identity::StampValue,
+    ) -> StampPublication {
+        let mut session = self.session.lock().expect("session");
+        let before = session.published_stamp(slot);
+        session.stamp_published(reims_vgpu_core::identity::CompletionStamp { slot, value });
+        let after = session.published_stamp(slot);
+        match before {
+            None => StampPublication::First,
+            Some(before) if after == Some(value) && before != value => StampPublication::Advanced,
+            Some(before) if before == value => StampPublication::Repeat,
+            Some(held) => StampPublication::Behind { held },
+        }
+    }
+
+    /// What point the ordering plane has the timeline for `slot` standing at,
+    /// or `None` if nothing ever published to it.
+    #[must_use]
+    pub fn published_completion_stamp(
+        &self,
+        slot: reims_vgpu_core::identity::StampSlot,
+    ) -> Option<reims_vgpu_core::identity::StampValue> {
+        self.session.lock().expect("session").published_stamp(slot)
+    }
+
+    /// What the ordering plane holds about the pipelines this session declared.
+    #[must_use]
+    pub fn pipeline_census(&self) -> reims_vgpu_core::pipeline::Census {
+        self.session.lock().expect("session").pipelines().census()
+    }
+
+    /// The census line for what the ordering plane's pipeline table is holding
+    /// right now, once a second, or `None` between windows.
+    ///
+    /// # Why occupancy is emitted and not only the event counts
+    ///
+    /// `store_routes` counts what *happened* — declarations, refusals,
+    /// retirements — and a pipeline that was declared and never advanced is
+    /// counted once there and never again. A table quietly accumulating
+    /// pipelines nothing will ever build therefore reads exactly like a
+    /// healthy one, and the difference is a subtraction across counters that
+    /// nobody performs while watching a live boot.
+    ///
+    /// It is the same argument `backing_outstanding_census` and
+    /// `slot_recheck::outstanding_census` are emitted beside `store_routes`
+    /// for, and it matters more here: `pending` is the pipelines a transaction
+    /// can be *waiting* on, so a `pending` that does not fall is work parked on
+    /// a build nobody is running, and a rising one is a hang forming — visible
+    /// before the guest stops drawing rather than after.
+    ///
+    /// Quiet while the table is empty, so a boot that never declares one is
+    /// not a line a second saying so.
+    pub fn pipeline_occupancy_census(&self) -> Option<String> {
+        const WINDOW_MS: u64 = 1000;
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::observe::elapsed_ms() as u64;
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < WINDOW_MS {
+            return None;
+        }
+        let resting = self.session.lock().expect("session").pipelines().resting();
+        if resting.total() == 0 {
+            return None;
+        }
+        LAST_MS.store(now, Ordering::Relaxed);
+        Some(format!(
+            "pipeline_table pending={} declared={} translating={} compiling={} ready={} \
+             refused={} retired={} total={}",
+            resting.pending(),
+            resting.declared,
+            resting.translating,
+            resting.compiling,
+            resting.ready,
+            resting.refused,
+            resting.retired,
+            resting.total(),
+        ))
+    }
+
+    /// The open child domains as the bit mask this device's registers speak in.
+    ///
+    /// Derived on each ask rather than mirrored into a field: a mirror is the
+    /// second record of channel openness that moving this lifetime was for. The
+    /// walk is over this device's own channel bound rather than over the model's
+    /// set, so a domain outside the FIFO range cannot set a bit that names
+    /// another channel.
+    pub fn open_child_mask(&self) -> u32 {
+        let mut mask = 0u32;
+        for channel in 1..crate::model::MAX_CHANNELS as u32 {
+            if self.child_domain_open(channel) {
+                mask |= 1u32 << channel;
+            }
+        }
+        mask
+    }
+
+    /// Every child FIFO worth looking at: open, or holding work.
+    ///
+    /// What `active_child_mask | pending.child_mask` used to spell, with the
+    /// union derived from its two halves instead of one of them being kept up to
+    /// date by hand at three write sites.
+    pub fn drainable_child_mask(&self) -> u32 {
+        self.open_child_mask() | self.pending.child_mask
+    }
+
+    /// What a guest reference names in this task right now, or `None` when the
+    /// slot holds nothing live.
+    ///
+    /// The one way into anything this device keeps per object. A caller holding
+    /// a bare reference number has a slot; a caller holding the answer to this
+    /// has a *name*, and only a name can key [`TaskResources`].
+    ///
+    /// Takes `&self`, because resolution happens on the shared-borrow path and
+    /// this asks the owner's non-consuming door
+    /// (`reims_vgpu_core::resolve::TaskNamespaces`) rather than the one that
+    /// hands out leases: a lookup that minted a lease nobody acquired would be a
+    /// claim this device never pays off.
+    ///
+    /// Routing through the owner rather than through one task's namespace is
+    /// what makes "which task's slots is this reference in" a question with one
+    /// answer. A task the owner does not hold answers `None`, which is the same
+    /// answer an empty slot gives and is right for both.
+    #[must_use]
+    pub fn object_name(&self, task_id: u32, obj_ref: u32) -> Option<ResourceId> {
+        use reims_vgpu_core::resolve::TaskNamespaces as _;
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resource(reims_vgpu_core::identity::TaskId(task_id), obj_ref)
+    }
+
+    /// This device as the access source for one task's records, in one
+    /// submission domain.
+    ///
+    /// The counterpart of [`Self::object_name`] for the other half of a
+    /// command-stream walk: the resolver says what a reference names, and this
+    /// says what a participation over that name *is*.
+    ///
+    /// # Why it is not [`reims_vgpu_core::lifecycle::Lifecycle::task_access`]
+    ///
+    /// The owner's own door hands out a `TaskAccess<'_>`, which borrows the
+    /// `Lifecycle` mutably for as long as it lives. Reaching it through this
+    /// device would mean holding the lifecycle guard across the whole walk, and
+    /// a walk is exactly where that cannot be held:
+    /// `reims_vgpu_core::walk::segment` resolves a record and then records it,
+    /// resolution is `crate::runtime::objects::TaskNames` → [`Self::object_name`]
+    /// → the same mutex, and `std::sync::Mutex` is not reentrant. Every exec
+    /// packet would hang this device on its first record.
+    ///
+    /// It would also not typecheck: `resolve::TaskNamespaces::resource` takes
+    /// `&self` and `access::AccessSource::access` takes `&mut self`, and
+    /// ingress wants a resolver and an access source alive at the same time.
+    /// One `&mut Lifecycle` cannot back both.
+    ///
+    /// So this locks **per call**, the way [`Self::object_name`] already does,
+    /// and holds nothing between calls. That is not the snapshot
+    /// `TaskAccess`'s own doc argues against: every call reaches the same
+    /// owner, so the content authority's version reservations accumulate across
+    /// a transaction exactly as they do through a held borrow. What is given up
+    /// is nothing; what is bought is that the resolver and the access source
+    /// can never hold the lock at the same moment.
+    #[must_use]
+    pub const fn task_access(
+        &self,
+        task: reims_vgpu_core::identity::TaskId,
+        domain: reims_vgpu_core::identity::ChannelId,
+    ) -> DeviceAccess<'_> {
+        DeviceAccess {
+            state: self,
+            task,
+            domain,
+        }
+    }
+
+    /// The resource this device constructed for a guest reference, if it has
+    /// one that still resolves.
+    ///
+    /// **The only door to [`Self::task_resources`], and it is two steps for a
+    /// reason.** The memo is keyed by a name; a caller holding a bare reference
+    /// has a slot; and the step between them is the namespace saying whether
+    /// that slot still names anything. A lookup that skipped it would be reading
+    /// the memo of whatever used to live there.
+    #[must_use]
+    pub fn constructed_object(&self, task_id: u32, obj_ref: u32) -> Option<Arc<TaskResource>> {
+        self.task_resources
+            .get(task_id, self.object_name(task_id, obj_ref)?)
+    }
+
+    /// Publish an object into a task's namespace and take its name.
+    ///
+    /// `storage` is the whole of what this device could establish about the
+    /// object's bytes, in the lifecycle owner's own vocabulary.
+    /// `Storage::NoBytes` is an object that owns no memory, which is most of a
+    /// list — see `crate::runtime::objects::declared_storage`. An object whose
+    /// storage this device *cannot describe* is not expressible here at all and
+    /// never reaches this door: that distinction is the caller's to make and to
+    /// count, because `NoBytes` is a claim and "I could not tell" is not.
+    ///
+    /// # Errors
+    ///
+    /// The owner's refusal, unchanged. `NoSuchTask` is the reachable one — a
+    /// declaration into a task no `CmdDefineTask2` opened — and a driven boot
+    /// of 3902 declarations read zero of them before this door moved.
+    pub fn declare_object(
+        &self,
+        task_id: u32,
+        obj_ref: u32,
+        storage: reims_vgpu_core::lifecycle::Storage,
+    ) -> Result<Declaration, reims_vgpu_core::lifecycle::Refusal> {
+        use reims_vgpu_core::identity::TaskId;
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        use reims_vgpu_core::resolve::TaskNamespaces as _;
+        let task = TaskId(task_id);
+        let mut owner = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        // The whole `Storage` reaches the owner, extent included. This door used
+        // to flatten it to the backing a namespace slot records, because a
+        // namespace was all this device held; the owner holds the content
+        // authority too, and the extent is what that needs — a dedicated
+        // resource's own pages are authoritative over exactly its bytes, and a
+        // flattened declaration would claim the whole backing for a resource
+        // that is a window of one.
+        let effects = owner.apply(&LifecycleOp::CreateResource {
+            task,
+            slot: ObjectListRef(obj_ref),
+            storage,
+        })?;
+        // Asked of the owner that just published it, under the same lock, so
+        // this is the name this declaration minted rather than one a later
+        // redeclaration replaced it with. `apply` returns the operation's
+        // effects and not its name — no other operation has one — so the second
+        // read is the join, and the lock is what makes the pair one event.
+        let id = owner
+            .resource(task, obj_ref)
+            .expect("the declaration published this slot");
+        drop(owner);
+        Ok(Declaration {
+            id,
+            acted: note_lifecycle_effects(effects, "declare_object"),
+        })
+    }
+
+    /// Retire a name: stop it resolving, and leave accepted work alone.
+    ///
+    /// `None` when the slot held nothing this device had named — the guest
+    /// deleting an object it never made this device construct, which is
+    /// ordinary and not a refusal worth a type here. The owner's `NoSuchTask`
+    /// collapses into the same `None` for the same reason: a name in a task
+    /// that does not exist is a name that resolves to nothing.
+    #[must_use]
+    pub fn retire_object_name(&self, task_id: u32, name: ResourceId) -> Option<Teardown> {
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        let effects = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(&LifecycleOp::DeleteResource {
+                task: reims_vgpu_core::identity::TaskId(task_id),
+                object_ref: name.slot.0,
+                resource: Some(name),
+            })
+            .ok()?;
+        // Exactly one, because a delete names one resource. Taken as the
+        // caller's answer rather than counted away: `delete_object` routes on
+        // which teardown it is, and that answer has one source now.
+        note_lifecycle_effects(effects, "retire_object_name")
+            .teardowns
+            .into_iter()
+            .next()
+    }
+
+    /// Drop a task's whole object namespace.
+    ///
+    /// Every name in it ends with the address space, which is the same event
+    /// that ends the storage those names resolved to — see
+    /// [`Self::bump_task_storage_incarnations`]. The owner performs both: the
+    /// per-name teardowns arrive as effects, and this device's own per-name
+    /// caches are dropped by the two callers around it.
+    ///
+    /// A task the owner does not hold is not an error here. It is the ordinary
+    /// case at a first definition, where there is no previous address space to
+    /// end.
+    fn delete_task_namespace(&self, task_id: u32) {
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        let applied = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(&LifecycleOp::DeleteTask {
+                task: reims_vgpu_core::identity::TaskId(task_id),
+            });
+        if let Ok(effects) = applied {
+            let acted = note_lifecycle_effects(effects, "delete_task_namespace");
+            crate::runtime::drain::note_store_route_n(
+                "task_namespace_teardowns",
+                acted.teardowns.len() as u64,
+            );
+        }
+    }
+
+    /// Apply one lifetime command to the semantic model and take the work it
+    /// obliged.
+    ///
+    /// **The door the nine wire-borne lifetime commands go through**, beside the
+    /// three that have doors of their own because this device reaches them from
+    /// somewhere other than a packet — a declaration is produced by resolution,
+    /// and a task definition and deletion are reached from the device's own
+    /// task table as well as from the wire.
+    ///
+    /// `None` is a refusal, reported on the always-on channel and named. Every
+    /// one of the four the owner can make is either measured at zero on a driven
+    /// guest or unreachable by construction:
+    ///
+    /// * `NoSuchTask` — 14 644 lifetime commands on a driven boot, none of them
+    ///   into a task no `CmdDefineTask2` opened. See the register's live
+    ///   validation table.
+    /// * `Namespace` — every command that names a resource resolved that name
+    ///   through this same owner a moment earlier, and
+    ///   `resolve::TaskNamespaces::resource` answers `Some` only for a slot live
+    ///   at its own generation, which is exactly what `Namespace::resolve`
+    ///   accepts.
+    /// * `Heap` and `PlacedResourceHasNoPhysical` — this device declares no heap
+    ///   placement at all, so the owner's per-task heaps are empty and no
+    ///   resident is `Placed`.
+    ///
+    /// A refusal is therefore a statement that one of those three arguments has
+    /// stopped holding, which is worth a line rather than a dropped packet.
+    #[must_use = "the work a lifetime command obliged is work nothing else does"]
+    pub fn apply_lifetime(
+        &self,
+        op: &reims_vgpu_core::lifecycle::LifecycleOp,
+        site: &'static str,
+    ) -> Option<Acted> {
+        match self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(op)
+        {
+            Ok(effects) => Some(note_lifecycle_effects(effects, site)),
+            Err(refusal) => {
+                crate::runtime::drain::note_store_route(refusal.slug());
+                if crate::observe::first_sight(
+                    "lifetime_command_refused",
+                    (u64::from(op.task().0) << 16) | u64::from(op.kind() as u16),
+                ) {
+                    crate::observe::fail(format!(
+                        "lifetime_command_refused kind={} task={} refusal={} (the semantic \
+                         model refused a lifetime packet this device would have acted on)",
+                        op.kind().name(),
+                        op.task().0,
+                        refusal.slug()
+                    ));
+                }
+                None
+            }
+        }
+    }
+
+    /// Open a task's address space in the lifecycle owner, and say what the
+    /// definition replaced.
+    ///
+    /// `None` at a first definition. `Some` when a live task was redefined
+    /// under the same id, carrying the owner's own answer about whether the
+    /// page-table root moved — which is the question that decides whether what
+    /// the guest published into the old space is still there, and it is read
+    /// from the owner rather than re-derived beside it.
+    fn define_task_namespace(
+        &self,
+        task_id: u32,
+        directory_pfn: u32,
+    ) -> Option<reims_vgpu_core::lifecycle::Redefinition> {
+        use reims_vgpu_core::lifecycle::LifecycleOp;
+        let effects = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(&LifecycleOp::DefineTask {
+                task: reims_vgpu_core::identity::TaskId(task_id),
+                // The class bit is not this device's to carry: it holds no
+                // registry keyed by it, and the owner's own `kernel` field
+                // exists so the kernel task and user task zero are two
+                // registrations of slot zero rather than one.
+                kernel: task_id == 0,
+                directory: reims_vgpu_core::identity::DirectoryFrame(directory_pfn),
+            })
+            .expect("a definition opens the task it names");
+        let mut acted = note_lifecycle_effects(effects, "define_task_namespace");
+        crate::runtime::drain::note_store_route_n(
+            "task_namespace_teardowns",
+            acted.teardowns.len() as u64,
+        );
+        acted.redefined.pop()
+    }
+
     pub fn delete_object(&mut self, task_id: u32, ref_: u32) -> bool {
         let removed = self.objects.remove(&(task_id, ref_));
-        let resource_removed = self.task_resources.delete(task_id, ref_);
+        // The namespace first, because it is what decides the reference still
+        // names anything; the memo behind that name goes with it. A name it has
+        // retired cannot be spelled again, so the memo would be unreachable
+        // either way — it is dropped here to free the bytes promptly rather than
+        // because correctness rests on it, which is the same relationship
+        // `MappingEntry::guest_write_token` has to its generation.
+        let resource_removed = match self.object_name(task_id, ref_) {
+            Some(name) => {
+                let teardown = self.retire_object_name(task_id, name);
+                crate::runtime::drain::note_store_route(match teardown {
+                    Some(Teardown::Now { .. }) => "object_teardown_now",
+                    Some(Teardown::WhenUsesRetire { .. }) => "object_teardown_owed",
+                    Some(Teardown::HeldByAnotherName { .. }) => "object_teardown_held_by_peer",
+                    Some(Teardown::NoStorage) => "object_teardown_no_storage",
+                    None => "object_teardown_unnamed",
+                });
+                self.task_resources.delete(task_id, name)
+            }
+            None => false,
+        };
         if removed || resource_removed {
             self.invalidate_object_host_copies(task_id, ref_);
             self.texture_to_mapping.remove(&(task_id, ref_));
-            // The name is released. Whatever the guest puts at this reference
-            // next is other storage, and must not compare equal to this.
-            self.bump_storage_incarnation(task_id, ref_);
+            // The incarnation is deliberately not advanced here. Releasing a
+            // *name* is not a statement about storage: other storage at this
+            // reference is a different window and is distinct already, and the
+            // same storage back under the same window is the same backing.
+            // See `storage_incarnation`.
         }
         removed || resource_removed
     }
@@ -3425,7 +5053,8 @@ impl DeviceState {
         (had_texture, had_linear)
     }
 
-    /// Which incarnation of the pages behind a task-local name this is.
+    /// Which incarnation of the pages behind a guest-VA window in this task
+    /// this is.
     ///
     /// The other half of [`MappingEntry::map_generation`]. Storage this device
     /// reaches through a mapping has that counter; storage named only by an
@@ -3439,18 +5068,40 @@ impl DeviceState {
     /// the new — handing the old frames back under a live reader. So the
     /// identity is a window *and* this value.
     ///
+    /// # It is keyed on the window, and it was keyed on the reference
+    ///
+    /// A re-point packet names a reference and nothing else, so counting per
+    /// reference was the shape the packet suggested. It is canonical only if
+    /// one window has one live name, and a driven macos-15 boot found that it
+    /// does not: two live references in one task named a single 8 294 400-byte
+    /// window — 1920×1080×4, the compositor's own scanout allocation. Counting
+    /// per reference would give that framebuffer two identities, and a re-point
+    /// through one name would leave a claim held under the other still naming
+    /// frames that had already been replaced.
+    ///
+    /// So the re-point resolves its reference to that reference's window and
+    /// advances the count there. Both names see it, because both names are the
+    /// window.
+    ///
     /// # What advances it, and why that list is complete
     ///
-    /// Two events at the name's own scope, and two at its task's:
+    /// One event at the window's own scope, and two at its task's:
     ///
     /// * `CmdReplacePhysical`, which by its own contract says the PFNs under
     ///   this window have already changed. It is the only announcement there
     ///   is — the address, geometry and length are all unchanged.
-    /// * [`Self::delete_object`], releasing the name, after which anything at
-    ///   that reference is other storage.
     /// * [`Self::delete_task`] and [`Self::define_task`] on a redefine, which
     ///   end the task's whole address space: the objects are dropped and a new
     ///   directory root puts different physical pages under the same addresses.
+    ///
+    /// **Releasing a name is not on the list, and used to be.** It advanced the
+    /// count on the reading that whatever the guest puts at that reference next
+    /// is other storage — which is true and is already answered by the other
+    /// half: other storage is a different window. The same storage back under
+    /// the same window is the same backing, and a bump there would have said it
+    /// was not. Under per-reference keying the distinction was invisible;
+    /// keyed on the window it is the difference between an identity and a
+    /// counter that only ever goes up.
     ///
     /// The remaining candidate is the guest overwriting its own object-list
     /// slot in place, which is how objects are replaced on this interface and
@@ -3460,23 +5111,23 @@ impl DeviceState {
     /// window alone names the same pages, which is the same backing — unless
     /// the guest also re-pointed them, and then it emitted the packet above.
     #[must_use]
-    pub fn storage_incarnation(&self, task_id: u32, ref_: u32) -> StorageIncarnation {
+    pub fn storage_incarnation(&self, task_id: u32, base: u64) -> StorageIncarnation {
         StorageIncarnation {
             epoch: self.task_storage_epochs.get(&task_id).copied().unwrap_or(0),
             count: self
                 .storage_incarnations
-                .get(&(task_id, ref_))
+                .get(&(task_id, base))
                 .copied()
                 .unwrap_or(0),
         }
     }
 
-    /// Say that the pages behind this task-local name may now be different
+    /// Say that the pages behind this guest-VA window may now be different
     /// pages. See [`Self::storage_incarnation`] for the closed list of callers.
-    pub fn bump_storage_incarnation(&mut self, task_id: u32, ref_: u32) {
+    pub fn bump_storage_incarnation(&mut self, task_id: u32, base: u64) {
         let slot = self
             .storage_incarnations
-            .entry((task_id, ref_))
+            .entry((task_id, base))
             .or_insert(0);
         *slot = slot.wrapping_add(1);
     }
@@ -3499,6 +5150,118 @@ impl DeviceState {
         let slot = self.task_storage_epochs.entry(task_id).or_insert(0);
         *slot = slot.wrapping_add(1);
         self.storage_incarnations.retain(|&(t, _), _| t != task_id);
+        self.backing_window_refs.delete_task(task_id);
+        self.aliased_references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&(t, _)| t != task_id);
+    }
+
+    /// Claim `base` for `ref_` in `task_id`, or say who holds it already.
+    ///
+    /// Returns the reference that got there first when one did and it is not
+    /// this one; `None` when this reference is the first, or is the same
+    /// reference re-resolving its own window. See
+    /// [`Self::backing_window_refs`] for what the answer decides.
+    ///
+    /// Takes `&self` because the one caller is a resolve, which holds the
+    /// device state shared — the same reason [`TaskResources`] is behind a
+    /// lock, and the claim is published under the same race the register there
+    /// resolves: first writer wins and every later reader sees that one.
+    pub fn claim_backing_window(&self, task_id: u32, ref_: u32, base: u64) -> Option<u32> {
+        self.backing_window_refs
+            .claim(task_id, ref_, base, self.storage_incarnation(task_id, base))
+    }
+
+    /// The canonical identity of the storage behind a guest-VA window in this
+    /// task, right now.
+    ///
+    /// This is what `reims_vgpu_core::access::BackingId` is: two resources over
+    /// one piece of storage get one number, and a re-point gives the same
+    /// window a different one because it is different storage. It is interned
+    /// rather than computed, because the three things that decide it — a
+    /// task, a 64-bit address and an incarnation pair — do not fit in the
+    /// `u64` the identity is, and a hash of them would trade a guaranteed
+    /// distinction for a probable one. False equality here hands storage back
+    /// under a live reader.
+    ///
+    /// The table holds one entry per live window and is cleared with the task,
+    /// so it is bounded by the namespace and not by how long the device has
+    /// run. A replaced incarnation does not accumulate: the entry moves to the
+    /// new identity and the old one stops being mintable, which is correct
+    /// because nothing mints an identity it already holds.
+    #[must_use]
+    pub fn backing_identity(&self, task_id: u32, base: u64) -> BackingId {
+        BackingId(self.backing_window_refs.identity(
+            task_id,
+            base,
+            self.storage_incarnation(task_id, base),
+        ))
+    }
+
+    /// The canonical identity of the storage behind a guest mapping's surface,
+    /// right now.
+    ///
+    /// [`Self::backing_identity`]'s other half, for the storage this device
+    /// reaches through a mapping rather than by an address in a task. Same
+    /// identity space, same interning, same reason it is interned; the
+    /// difference is which incarnation counter it mixes in, and that difference
+    /// is not a choice. A `CmdReplacePhysical` naming an object that owns a
+    /// mapping does not advance the window counter at all — it drops the page
+    /// list and bumps [`MappingEntry::map_generation`], which is the announcement
+    /// that these are different pages. An identity derived from the window
+    /// would sit still across it, and false equality here hands the old frames
+    /// back under a live reader.
+    ///
+    /// Takes the generation from the caller rather than reading the mapping,
+    /// because the caller has already had to find the entry to know there is
+    /// one; `crate::runtime::objects::mapping_backing_id` is that caller and is
+    /// where a missing mapping is named.
+    #[must_use]
+    pub fn mapping_backing_identity(&self, mapping_id: u32, map_generation: u32) -> BackingId {
+        BackingId(
+            self.backing_window_refs
+                .mapping_identity(mapping_id, map_generation),
+        )
+    }
+
+    /// Remember that this reference shares its allocation with another live
+    /// one, so a hot path can ask in one lookup instead of a scan.
+    ///
+    /// Written by [`crate::runtime::objects::note_reference_shares_storage`],
+    /// which does the scan once per reference. The set is therefore as fresh as
+    /// that sighting: a reference whose *peer* was constructed afterwards is
+    /// not in it. That is a floor on what the payment alarm can see and not a
+    /// ceiling on the hazard, which is the safe direction for an alarm to be
+    /// wrong in — it under-reports rather than crying wolf.
+    pub fn note_aliased_reference(&self, task_id: u32, ref_: u32) {
+        self.aliased_references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((task_id, ref_));
+    }
+
+    /// Whether this reference is known to share its allocation with another.
+    #[must_use]
+    pub fn reference_is_aliased(&self, task_id: u32, ref_: u32) -> bool {
+        self.aliased_references
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(task_id, ref_))
+    }
+
+    /// Move a window's claim to `ref_`, for a holder the guest's own list no
+    /// longer says is there.
+    ///
+    /// The claim table remembers whoever constructed first, and the guest can
+    /// free an object without telling this device — so a holder can stop
+    /// naming its window with nothing to notice. Handing the window to the
+    /// reference that does name it keeps the table's meaning ("who holds this
+    /// window") true, and stops the next claimant being compared against a
+    /// reference that has been gone for a thousand frames.
+    pub fn take_backing_window(&self, task_id: u32, ref_: u32, base: u64) {
+        self.backing_window_refs
+            .take(task_id, ref_, base, self.storage_incarnation(task_id, base));
     }
 
     /// Bump [`MappingEntry::map_generation`] (never 0 after first bump).
@@ -4079,6 +5842,382 @@ impl DeviceState {
     }
 }
 
+/// What one admission established.
+///
+/// The model's answer and the host device incarnation it was admitted into,
+/// taken together because they are read under one lock. The epoch travels with
+/// the parked packet and comes back at completion — see
+/// [`DeviceState::complete_transaction`] for why it is the submission's fact
+/// and not a value to look up later.
+pub struct Admission {
+    pub admitted: reims_vgpu_core::session::Admitted,
+    pub epoch: reims_vgpu_core::identity::DeviceEpoch,
+}
+
+/// One task's records, in one submission domain, as an
+/// [`reims_vgpu_core::access::AccessSource`] backed by this device.
+///
+/// A `&DeviceState` and two `Copy` fields — the same shape as
+/// `crate::runtime::objects::TaskRefResolver`, and for the same reason: the
+/// task and the domain are properties of the *packet*, so binding them once at
+/// the door is what stops a per-record caller pairing a participation with the
+/// wrong one.
+///
+/// See [`DeviceState::task_access`] for why this locks per call rather than
+/// borrowing the owner for the walk.
+#[derive(Clone, Copy)]
+pub struct DeviceAccess<'a> {
+    state: &'a DeviceState,
+    task: reims_vgpu_core::identity::TaskId,
+    domain: reims_vgpu_core::identity::ChannelId,
+}
+
+impl DeviceAccess<'_> {
+    /// The task whose names this places participations in.
+    #[must_use]
+    pub const fn task(self) -> reims_vgpu_core::identity::TaskId {
+        self.task
+    }
+
+    /// The submission domain the accesses are claimed in.
+    #[must_use]
+    pub const fn domain(self) -> reims_vgpu_core::identity::ChannelId {
+        self.domain
+    }
+}
+
+impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
+    /// The owner's answer, with the owner's own refusal slug.
+    ///
+    /// The mapping from `lifecycle::Refusal` to `access::AccessRefusal` is the
+    /// one `lifecycle::TaskAccess` makes, and it is repeated rather than shared
+    /// because sharing it would mean constructing the `TaskAccess` this exists
+    /// not to construct. It is three lines and one `slug()` call; a helper
+    /// taking `&mut Lifecycle` would be the held borrow again.
+    ///
+    /// # The lock is dropped before anything is said about a refusal
+    ///
+    /// **A `map_err` chained onto the locked call runs with the guard still
+    /// alive**, because the guard is a temporary of the whole statement and not
+    /// of the call that produced it. [`note_access_refused`] reads the object
+    /// the slot holds, which reaches `DeviceState::object_name` and takes this
+    /// same lock — so writing it as one chain deadlocks the device on its first
+    /// refused record. It was measured: a driven boot froze with
+    /// `walk_records_render = 42` and a window redrawing stale frames for seven
+    /// minutes. This is the deadlock `DeviceState::task_access`'s own doc is
+    /// about, re-entered from the other side.
+    ///
+    /// So the answer is taken in its own scope and the guard is gone before the
+    /// refusal is described.
+    fn access(
+        &mut self,
+        participation: &reims_vgpu_core::access::Participation,
+    ) -> Result<reims_vgpu_core::access::AccessIntent, reims_vgpu_core::access::AccessRefusal> {
+        let answer = {
+            self.state
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .access(self.task, self.domain, participation)
+        };
+        match answer {
+            Ok(intent) => {
+                note_access_widened(self.state, self.task, participation, &intent);
+                Ok(intent)
+            }
+            Err(refusal) => {
+                note_access_refused(self.state, self.task, participation, refusal);
+                Err(reims_vgpu_core::access::AccessRefusal {
+                    resource: participation.resource,
+                    reason: refusal.slug(),
+                })
+            }
+        }
+    }
+}
+
+/// Name a record whose window the owner could not hold, and widened.
+///
+/// **The event is derived and not reported, because the owner has nowhere to
+/// report it from.** `Lifecycle::access` widens a `Range` participation that
+/// does not fit its resource's extent to the whole of that resource — a bound
+/// built to err long must not be checked as if it were exact, see the arm's own
+/// doc — and `reims_vgpu_core` has no failure channel to say so on. It does not
+/// need one: a caller that asked with a `Range` and was answered with a key that
+/// is not a range has been told, and this is the caller.
+///
+/// It was a refused packet until the owner widened. Seven a boot on a driven
+/// macos-15 run, every one a `0x12c` `copyFromBuffer:…toTexture:…` reading
+/// `offset=65536 length=196608` of a 196 608-byte source buffer, and each one
+/// cost a whole packet of guest work. Counted now rather than counted then,
+/// because the number that matters has changed from "packets dropped" to "edges
+/// drawn coarser than the record asked for".
+fn note_access_widened(
+    state: &DeviceState,
+    task: reims_vgpu_core::identity::TaskId,
+    participation: &reims_vgpu_core::access::Participation,
+    intent: &reims_vgpu_core::access::AccessIntent,
+) {
+    use reims_vgpu_core::access::{AccessKey, ParticipationExtent};
+    let ParticipationExtent::Range(asked) = participation.extent else {
+        return;
+    };
+    if matches!(intent.key, AccessKey::Range(..)) {
+        return;
+    }
+    crate::runtime::drain::note_store_route("access_window_widened");
+    if crate::observe::first_sight(
+        "access_window_widened",
+        (u64::from(task.0) << 32) | u64::from(participation.resource.slot.0),
+    ) {
+        let resident = state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve(task, participation.resource);
+        crate::observe::fail(format!(
+            "access_window_widened task={} ref={} mode={:?} asked={asked:?} \
+             resident={resident:?} rung={} (the record's window is a bound on what it \
+             touches and this resource cannot hold it, so the access orders against the \
+             whole resource rather than against nothing)",
+            task.0,
+            participation.resource.slot.0,
+            participation.mode,
+            intent.key.rung(),
+        ));
+    }
+}
+
+/// Name a refused participation on the always-on channel, with its numbers.
+///
+/// **The slug alone cannot be acted on here.**
+/// [`reims_vgpu_core::access::AccessRefusal`] carries a `&'static str` by
+/// design — every refusal in that crate is greppable by the slug of the check
+/// that produced it — and a refused access refuses the whole packet its record
+/// belongs to, so this is guest work that did not run. A driven macos-15 boot
+/// through the ordering model refused seven exec packets on
+/// `lifecycle_heap`, which is `Resident::window` saying a record's window ends
+/// past its resource's extent; the slug says that much and says nothing about
+/// *which* window and *which* extent, and those three numbers are the whole of
+/// what decides whether the record is out of range or this device's extent is
+/// short.
+///
+/// First sight per `(task, slot)`, so a record refused every frame names itself
+/// once. The owner's refusal is printed as itself rather than re-encoded: the
+/// variant carries its own numbers and a second vocabulary here would drift
+/// from it.
+fn note_access_refused(
+    state: &DeviceState,
+    task: reims_vgpu_core::identity::TaskId,
+    participation: &reims_vgpu_core::access::Participation,
+    refusal: reims_vgpu_core::lifecycle::Refusal,
+) {
+    crate::runtime::drain::note_store_route("access_refused");
+    crate::runtime::drain::note_store_route(refusal.slug());
+    if crate::observe::first_sight(
+        "access_refused",
+        (u64::from(task.0) << 32) | u64::from(participation.resource.slot.0),
+    ) {
+        // The object's own type and descriptor length, because the two things a
+        // window refusal can be are a record naming bytes past the end and this
+        // device having recovered too short an extent — and which one it is
+        // turns on what kind of object the slot holds. `None` when nothing was
+        // ever constructed for the slot, which is itself the answer for a
+        // participation over a name with no memo behind it.
+        let constructed = state.constructed_object(task.0, participation.resource.slot.0);
+        // The resource's own range in its backing's coordinates, which is the
+        // half `heap::Refusal` does not carry: it reports the *length* the
+        // window was checked against and never the offset the extent starts at.
+        // Those two numbers are what tell a record naming bytes past the end
+        // from a record whose offset is in the allocation's coordinates while
+        // `Resident::window` reads it as the object's — the second is exactly a
+        // window whose offset equals its resource's own.
+        //
+        // Asked after the answer's guard is gone, for the reason this function's
+        // caller documents.
+        let resident = state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve(task, participation.resource);
+        crate::observe::fail(format!(
+            "access_refused task={} ref={} reason={} mode={:?} extent={:?} refusal={refusal:?} \
+             object_type={:?} desc_len={:?} resident={resident:?} (a record's participation \
+             could not become an access, which refuses the whole packet it belongs to)",
+            task.0,
+            participation.resource.slot.0,
+            refusal.slug(),
+            participation.mode,
+            participation.extent,
+            constructed.as_ref().map(|r| r.entry.object_type),
+            constructed.as_ref().map(|r| r.descriptor.len()),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod device_access_tests {
+    use super::*;
+    use reims_vgpu_core::access::{
+        AccessMode, AccessSource as _, BackingId, ByteRange, Participation, ParticipationExtent,
+    };
+    use reims_vgpu_core::identity::{ChannelId, TaskId};
+    use reims_vgpu_core::lifecycle::Storage;
+
+    const TASK: u32 = 3;
+    const DOMAIN: ChannelId = ChannelId(1);
+    const BACKING: BackingId = BackingId(0x4000);
+
+    /// A device with one task holding one dedicated resource, and that
+    /// resource's name.
+    fn state_with_one_resource() -> (DeviceState, ResourceId) {
+        let mut state = DeviceState::new(DeviceId(1), 12);
+        state.define_task(TASK, 1 << 20, 0x100);
+        let declared = state
+            .declare_object(
+                TASK,
+                7,
+                Storage::Dedicated {
+                    backing: BACKING,
+                    extent: ByteRange {
+                        offset: 0,
+                        length: 4096,
+                    },
+                },
+            )
+            .expect("the task is open");
+        (state, declared.id)
+    }
+
+    fn participation(resource: ResourceId, mode: AccessMode) -> Participation {
+        Participation {
+            resource,
+            extent: ParticipationExtent::Whole,
+            mode,
+            api_stages: 0,
+        }
+    }
+
+    /// A widened window returns, and saying so does not re-enter the lock.
+    ///
+    /// **A hang here is this test failing.** Both of this door's observers —
+    /// `note_access_widened` and `note_access_refused` — read state that takes
+    /// `DeviceState::lifecycle`, the same lock the answer was produced under.
+    /// Written as one chain on the locked call the guard is still alive when
+    /// they run, and the device deadlocks on the first record that trips one: a
+    /// driven boot froze exactly that way, `walk_records_render = 42` for seven
+    /// minutes. There is no assertion that catches a deadlock from inside the
+    /// thread it deadlocks, so the assertion is that this returns at all — and
+    /// that what comes back is the widened access rather than a refusal.
+    #[test]
+    fn a_widened_access_returns_and_saying_so_does_not_re_enter_the_lock() {
+        use reims_vgpu_core::access::AccessKey;
+
+        let (state, name) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+        // A window one byte past the resource's own 4096: a bound the record
+        // built long, which this resource cannot hold.
+        let intent = access
+            .access(&Participation {
+                resource: name,
+                extent: ParticipationExtent::Range(ByteRange {
+                    offset: 0,
+                    length: 4097,
+                }),
+                mode: AccessMode::Read,
+                api_stages: 0,
+            })
+            .expect("a bound past the end is not a refusal");
+        assert!(
+            !matches!(intent.key, AccessKey::Range(..)),
+            "the window that did not fit is not reported as one: {:?}",
+            intent.key
+        );
+        assert_eq!(intent.domain, DOMAIN);
+    }
+
+    /// The interleaving a command-stream walk performs, which the owner's own
+    /// `TaskAccess` cannot survive.
+    ///
+    /// `reims_vgpu_core::walk::segment` resolves a record's refs and then
+    /// records it, once per record — so a resolver call sits *between* two
+    /// access calls of the same packet. A source holding the lifecycle guard
+    /// would deadlock on the `object_name` in the middle rather than fail, so
+    /// this test hangs where it does not pass; that is the failure mode being
+    /// ruled out and there is no assertion that could report it instead.
+    #[test]
+    fn a_name_resolves_between_two_accesses_of_one_packet() {
+        let (state, resource) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        access
+            .access(&participation(resource, AccessMode::Read))
+            .expect("declared and resident");
+        assert_eq!(state.object_name(TASK, 7), Some(resource));
+        access
+            .access(&participation(resource, AccessMode::Write))
+            .expect("declared and resident");
+    }
+
+    /// Locking per call is not a snapshot: the content authority's reservations
+    /// accumulate across a transaction exactly as they do through a held borrow.
+    ///
+    /// Two writes over one resource take two reservations. A source that copied
+    /// anything out of the owner would hand both records the same one, which is
+    /// the failure `lifecycle::TaskAccess`'s own doc names.
+    #[test]
+    fn two_writes_through_one_door_take_two_reservations() {
+        let (state, resource) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        let first = access
+            .access(&participation(resource, AccessMode::Write))
+            .expect("declared and resident");
+        let second = access
+            .access(&participation(resource, AccessMode::Write))
+            .expect("declared and resident");
+
+        assert!(first.output_content_version.is_some());
+        assert_ne!(
+            first.output_content_version, second.output_content_version,
+            "a second write reserved the version the first one did"
+        );
+    }
+
+    /// The door carries the packet's task and domain, and the domain reaches
+    /// the access it places.
+    #[test]
+    fn the_domain_is_the_packets_and_not_the_participations() {
+        let (state, resource) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        assert_eq!(access.task(), TaskId(TASK));
+        assert_eq!(access.domain(), DOMAIN);
+        let intent = access
+            .access(&participation(resource, AccessMode::Read))
+            .expect("declared and resident");
+        assert_eq!(intent.domain, DOMAIN);
+    }
+
+    /// A name the task never declared refuses with the owner's own slug, and
+    /// refuses rather than resolving to whatever the slot used to hold.
+    #[test]
+    fn an_undeclared_name_refuses_with_the_owners_reason() {
+        let (state, resource) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        let stranger = ResourceId {
+            slot: reims_vgpu_core::identity::ObjectListRef(9),
+            generation: resource.generation,
+        };
+        let refusal = access
+            .access(&participation(stranger, AccessMode::Read))
+            .expect_err("slot 9 was never declared");
+        assert_eq!(refusal.resource, stranger);
+        assert_eq!(refusal.reason, "lifecycle_namespace");
+    }
+}
+
 #[cfg(test)]
 mod device_desc_tests {
     use super::*;
@@ -4483,6 +6622,259 @@ mod fail_vocabulary_tests {
 }
 
 #[cfg(test)]
+mod pipeline_door_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
+
+    fn name(slot: u32) -> ResourceId {
+        ResourceId {
+            slot: ObjectListRef(slot),
+            generation: SlotGeneration(1),
+        }
+    }
+
+    /// The guest creating a pipeline declares it once, and the guest deleting
+    /// it is what ends it.
+    ///
+    /// The pair is what makes the census readable. Declaration alone is a table
+    /// that only grows — the guest re-binds the same pipeline on every draw, so
+    /// "how many pipelines does this session have" would be "how many draws has
+    /// it seen" — and the destroy is the one event on this interface that says
+    /// a pipeline is over.
+    #[test]
+    fn a_pipeline_is_declared_once_and_the_guests_destroy_is_what_retires_it() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(state.pipeline_census().declared, 0);
+
+        assert!(
+            state.declare_pipeline(name(9)),
+            "the first sight of a pipeline is its declaration"
+        );
+        assert!(
+            !state.declare_pipeline(name(9)),
+            "and every re-bind after it is not, which is most of them"
+        );
+        assert_eq!(state.pipeline_census().declared, 1);
+
+        // A different slot is a different pipeline; a different generation of
+        // the same slot is too, which is the whole reason the name carries one.
+        assert!(state.declare_pipeline(name(10)));
+        assert!(state.declare_pipeline(ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(2),
+        }));
+        assert_eq!(state.pipeline_census().declared, 3);
+
+        assert_eq!(
+            state.retire_pipeline(name(9)),
+            reims_vgpu_core::session::Ended {
+                took: true,
+                stranded: Vec::new()
+            },
+            "the table had it, and nothing is admitted into this model yet, so \
+             nothing was parked on it"
+        );
+        let census = state.pipeline_census();
+        assert_eq!(
+            (census.declared, census.retired),
+            (3, 1),
+            "the census counts events and not occupancy: three declarations \
+             happened and one retirement did, and a retirement does not unsay \
+             the declaration it ends"
+        );
+
+        // Retiring what the guest never created is not an event — and says so,
+        // rather than answering the same empty list a real retirement with
+        // nothing parked on it answers. A driven boot needs the difference: the
+        // guest deletes render pipelines this device never drew with.
+        assert_eq!(
+            state.retire_pipeline(name(4000)),
+            reims_vgpu_core::session::Ended::default()
+        );
+        assert_eq!(state.pipeline_census().retired, 1);
+    }
+
+    /// A declared pipeline reaches `Ready` only through the rail's three steps,
+    /// and a rail with no memo walking them again is declined rather than
+    /// reset.
+    ///
+    /// This is the half that keeps an admitted exec from parking forever. The
+    /// table without it holds every pipeline at `Declared`, `Lease` answers
+    /// `Pending` to every draw that binds one, and the transaction is admitted
+    /// into a wait nothing can ever discharge — strictly worse than the
+    /// `Absent` refusal an empty table gave, because a refusal is visible and
+    /// a hang is not.
+    #[test]
+    fn a_rail_walks_a_declared_pipeline_to_ready_and_a_second_walk_is_declined() {
+        use reims_vgpu_core::pipeline::PipelineState;
+
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.declare_pipeline(name(9)));
+
+        assert!(
+            !state.advance_pipeline(name(9), PipelineState::Compiling),
+            "the steps are a lifetime and not a set: nothing compiles that has \
+             not been translated"
+        );
+        assert!(state.advance_pipeline(name(9), PipelineState::Translating));
+        assert!(state.advance_pipeline(name(9), PipelineState::Compiling));
+        assert_eq!(
+            state.pipeline_census().ready,
+            0,
+            "compiling is not usable, and a draw binding it is not ready"
+        );
+        assert!(state.ready_pipeline(name(9)));
+        assert_eq!(state.pipeline_census().ready, 1);
+
+        // The Metal rail retains no pipeline state, so it walks these same
+        // three steps on every draw that binds the pipeline. The second walk
+        // must not take it back to `Translating` — a `Ready` pipeline that
+        // re-enters the build is a pipeline every parked draw waits on again.
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(
+                !state.advance_pipeline(name(9), step),
+                "{} is not a step from ready",
+                step.name()
+            );
+        }
+        assert_eq!(
+            state.pipeline_census().ready,
+            1,
+            "and the census counts the one time it became usable, not the \
+             draws that found it so"
+        );
+    }
+
+    /// A rail that cannot build a pipeline refuses it with the reason, once.
+    #[test]
+    fn a_refused_pipeline_is_terminal_and_a_later_step_cannot_revive_it() {
+        use reims_vgpu_core::pipeline::{PipelineState, RefusalReason};
+
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.declare_pipeline(name(9)));
+        assert!(state.advance_pipeline(name(9), PipelineState::Translating));
+
+        assert!(
+            state
+                .refuse_pipeline(
+                    name(9),
+                    RefusalReason::TranslationFailed("vertex_translate")
+                )
+                .took,
+            "the table had it to refuse"
+        );
+        assert_eq!(state.pipeline_census().refused, 1);
+
+        // The guest re-binds a pipeline this device cannot build on every
+        // frame, and each of those draws re-walks the rail. One refusal is the
+        // whole point of the state being terminal.
+        assert!(!state.advance_pipeline(name(9), PipelineState::Compiling));
+        assert!(
+            !state
+                .refuse_pipeline(name(9), RefusalReason::CompilationFailed("again"))
+                .took
+        );
+        assert_eq!(state.pipeline_census().refused, 1);
+
+        // Refusing what the guest never created is not an event either — which
+        // is why the rails skip the decline that *is* the pipeline being
+        // absent rather than refusing a name the table has no entry for.
+        assert!(
+            !state
+                .refuse_pipeline(name(4000), RefusalReason::CompilationFailed("absent"))
+                .took
+        );
+        assert_eq!(state.pipeline_census().refused, 1);
+    }
+}
+
+#[cfg(test)]
+mod stamp_publication_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use reims_vgpu_core::identity::{StampSlot, StampValue};
+
+    fn publish(state: &DeviceState, slot: u32, value: u32) -> StampPublication {
+        state.publish_completion_stamp(StampSlot(slot), StampValue(value))
+    }
+
+    /// A slot's timeline is first written, then advanced, and a word repeating
+    /// the value it already holds is not movement.
+    ///
+    /// The repeat is not a corner case on this wire: a packet that does not
+    /// signal repeats its channel's current completion word rather than
+    /// leaving the slot alone, so it is the ordinary shape of most of the
+    /// stream and would otherwise read as a fence advancing thousands of times
+    /// a second.
+    #[test]
+    fn a_slot_is_first_written_then_advanced_and_a_repeat_is_neither() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(publish(&state, 3, 10), StampPublication::First);
+        assert_eq!(publish(&state, 3, 10), StampPublication::Repeat);
+        assert_eq!(publish(&state, 3, 11), StampPublication::Advanced);
+
+        // Slots are independent timelines. A device with one counter across
+        // them would report every second channel's first word as behind.
+        assert_eq!(publish(&state, 4, 1), StampPublication::First);
+        assert_eq!(publish(&state, 3, 12), StampPublication::Advanced);
+    }
+
+    /// A word behind the slot leaves the model's timeline where it was, and
+    /// says so.
+    ///
+    /// This device writes the packet header's word into the guest's slot
+    /// without comparing, so the two records *can* disagree — and the
+    /// disagreement is the interesting half: a fence going backwards
+    /// unsatisfies every wait between the two values, and a model that
+    /// silently followed it would take back readiness the guest has already
+    /// been told about.
+    #[test]
+    fn a_word_behind_the_slot_does_not_move_the_model_and_is_named() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(publish(&state, 0, 100), StampPublication::First);
+        assert_eq!(
+            publish(&state, 0, 99),
+            StampPublication::Behind {
+                held: reims_vgpu_core::identity::StampValue(100)
+            },
+            "and it says what the plane holds, so a rewound slot is \
+             distinguishable from a timeline that has run ahead"
+        );
+        assert_eq!(
+            publish(&state, 0, 100),
+            StampPublication::Repeat,
+            "the slot still holds 100, so the model did not follow the rewind"
+        );
+    }
+
+    /// Later is decided on the wrapping timeline and not numerically.
+    ///
+    /// A guest whose completion counter wraps past `u32::MAX` writes a smaller
+    /// number that is nonetheless the later point. A model comparing with `>`
+    /// would call it a rewind and refuse to advance for the rest of the boot,
+    /// which is a hang that starts four billion packets in and cannot be
+    /// reproduced by driving apps.
+    #[test]
+    fn a_wrapped_timeline_advances_to_the_smaller_number() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(publish(&state, 1, u32::MAX - 1), StampPublication::First);
+        assert_eq!(publish(&state, 1, 3), StampPublication::Advanced);
+        assert_eq!(
+            publish(&state, 1, u32::MAX - 1),
+            StampPublication::Behind {
+                held: reims_vgpu_core::identity::StampValue(3)
+            },
+            "and the point before the wrap is behind the one after it"
+        );
+    }
+}
+
+#[cfg(test)]
 mod mapping_declaration_tests {
     use super::*;
     use crate::model::{DeviceId, PAGE_SHIFT_X86};
@@ -4659,5 +7051,27 @@ mod slot_table_reach_tests {
                 "{name} must not have defined the task it refused"
             );
         }
+    }
+}
+
+/// The ordering plane's published reflections, borrowed for one packet's walk.
+///
+/// See [`DeviceState::pipeline_usage`] for why this is a guard and not a
+/// lookup.
+pub struct PipelineUsage<'a>(std::sync::MutexGuard<'a, reims_vgpu_core::session::SessionModel>);
+
+impl std::fmt::Debug for PipelineUsage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PipelineUsage")
+    }
+}
+
+impl reims_vgpu_core::pipeline::UsageSource for PipelineUsage<'_> {
+    fn binding_usage(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        stage: Option<reims_vgpu_protocol::render::ShaderStage>,
+    ) -> Option<&reims_vgpu_core::pipeline::BindingUsage> {
+        self.0.pipelines_ref().binding_usage(pipeline, stage)
     }
 }

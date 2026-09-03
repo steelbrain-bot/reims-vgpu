@@ -170,6 +170,19 @@ pub fn load_mtlb<M: HostMemory + HostOps>(
             format!("desc_len={}", desc.len()),
         );
     };
+    // The slot holds a function, which is all the model needs to hold its name
+    // — and the guest's `CmdDeleteObject` for it arrives after the slot has
+    // been cleared, so this is the only moment the name can be taken. Before
+    // the blob checks below rather than after: a function whose blob this
+    // device cannot read is still a function the guest created and will delete.
+    objects::note_named_at_construction(
+        state,
+        host,
+        task_id,
+        func_ref,
+        "function_model_named",
+        "function_model_unnamed",
+    );
     if f.blob_gva == 0 || f.blob_size < 4 {
         return miss(
             "bad_blob",

@@ -35,7 +35,7 @@ use crate::access::{
 };
 use crate::bind::{BufferBinding, ObjectBinding};
 use crate::blit::BlitOp;
-use crate::compute::ComputeOp;
+use crate::compute::{ComputeExtent, ComputeOp};
 use crate::encoder::{ComputeEncoderState, RenderEncoderState};
 use crate::icb::IcbOp;
 use crate::identity::{
@@ -332,6 +332,104 @@ impl ExecWork {
         }
     }
 
+    /// The pipelines this transaction's **render** records bind.
+    ///
+    /// Derived from the records rather than kept beside
+    /// [`Self::pipeline_leases`], which is deliberately class-blind: the
+    /// ordering plane holds a compute pipeline for exactly the reasons it holds
+    /// a render one, so splitting *that* list would give the model two lists to
+    /// wait on. A backend asking "which render pipelines must I have translated"
+    /// is asking a different question, and this answers it from the same single
+    /// source — a second stored list could disagree with the records, and this
+    /// cannot.
+    ///
+    /// Deduplicated, like [`Self::pipeline_leases`]: a stream that binds one
+    /// pipeline for forty draws names it once.
+    pub fn render_pipeline_leases(&self) -> Vec<ResourceId> {
+        let mut out: Vec<ResourceId> = Vec::new();
+        for record in self.records() {
+            if let ResolvedOperation::Render(crate::render::RenderOp::SetPipeline { pipeline }) =
+                record.op
+            {
+                if !out.contains(&pipeline) {
+                    out.push(pipeline);
+                }
+            }
+        }
+        out
+    }
+
+    /// The **compute** pipelines this transaction dispatches, each with the
+    /// threadgroup size the dispatch stated.
+    ///
+    /// The compute half of [`Self::render_pipeline_leases`], and it cannot be
+    /// the same shape: a kernel's translation is keyed by its threadgroup size
+    /// as well as its ref, so the pre-scan needs a pair and a bare lease list
+    /// does not spell one. That extra field is why this reads the dispatches
+    /// rather than the leases --- the size is the *dispatch's* statement, and
+    /// one pipeline dispatched at two sizes is two translations.
+    ///
+    /// Three things the byte scan this replaces could not say, each of which
+    /// leaves a lease readied on an answer that never examined it:
+    ///
+    /// - A dispatch whose selector carries **no** threadgroup size
+    ///   ([`crate::compute::DispatchOp::ThreadsIndirect`]) contributes nothing,
+    ///   because there is nothing for it to contribute. The scan read a zeroed
+    ///   field and rejected it as an out-of-range extent, which is the same
+    ///   word it uses for "the guest asked for a grid of nothing".
+    /// - The bound pipeline **survives an encoder continuation**. A stream is
+    ///   one encoder however many segments carry it, so a dispatch in the
+    ///   continuation runs under the pipeline the first segment bound; a scan
+    ///   that resets at each framed segment loses exactly that one.
+    /// - A pipeline **bound and never dispatched** is not here, and it is in
+    ///   [`Self::pipeline_leases`]. It compiles nothing because nothing runs
+    ///   it, and the ordering plane holds it regardless.
+    ///
+    /// Deduplicated on the pair: a loop dispatching one kernel at one size
+    /// forty times names it once.
+    pub fn compute_dispatch_translations(&self) -> Vec<(ResourceId, ComputeExtent)> {
+        use crate::compute::DispatchOp;
+
+        let mut out: Vec<(ResourceId, ComputeExtent)> = Vec::new();
+        for stream in &self.streams {
+            // Per stream, because a stream is one encoder: the bound pipeline
+            // is encoder state and does not end where a segment does.
+            let mut bound: Option<ResourceId> = None;
+            for record in &stream.records {
+                let ResolvedOperation::Compute(op) = record.op else {
+                    continue;
+                };
+                let threads_per_group = match op {
+                    ComputeOp::SetPipeline { pipeline } => {
+                        bound = Some(pipeline);
+                        continue;
+                    }
+                    ComputeOp::Dispatch(
+                        DispatchOp::Threadgroups {
+                            threads_per_group, ..
+                        }
+                        | DispatchOp::Threads {
+                            threads_per_group, ..
+                        }
+                        | DispatchOp::ThreadgroupsIndirect {
+                            threads_per_group, ..
+                        },
+                    ) => threads_per_group,
+                    // The selector has no such field. Not a zero, and not a
+                    // size this could guess.
+                    ComputeOp::Dispatch(DispatchOp::ThreadsIndirect { .. }) => continue,
+                    _ => continue,
+                };
+                let Some(pipeline) = bound else { continue };
+                let item = (pipeline, threads_per_group);
+                if !out.contains(&item) {
+                    out.push(item);
+                }
+            }
+        }
+        out
+    }
+
     /// How many records this packet carries.
     #[must_use]
     pub fn record_count(&self) -> usize {
@@ -432,8 +530,20 @@ impl ExecTransaction<'_> {
 /// with its segment, an encoder that never ended — each is the cursor's refusal
 /// and reaches the caller unchanged.
 #[derive(Debug)]
-pub struct ExecBuilder {
+pub struct ExecBuilder<'u> {
     cursor: StreamCursor,
+    /// What an executor has published about the pipelines this packet binds.
+    ///
+    /// A field of the builder rather than an argument to [`Self::record`],
+    /// because it is used for exactly one thing — narrowing the footprint the
+    /// builder's own encoder tables answer — and a per-record argument would
+    /// let two records of one packet be resolved against two different answers.
+    /// It is the same shape as the tables themselves: state of the walk, not of
+    /// the record.
+    ///
+    /// [`Self::new`] supplies [`crate::pipeline::NoUsage`], which is the
+    /// conservative answer and not an absent one; see that type.
+    usages: &'u dyn crate::pipeline::UsageSource,
     streams: Vec<ResolvedStream>,
     open: Option<ResolvedStream>,
     accesses: Vec<AccessIntent>,
@@ -500,13 +610,30 @@ impl EncoderBindings {
     ///
     /// **Changes nothing.** Taking a footprint is not keeping it — see
     /// [`Self::keep`].
-    fn footprint_into(&self, op: &ResolvedOperation, out: &mut Vec<Participation>) {
+    fn footprint_into(
+        &self,
+        op: &ResolvedOperation,
+        usages: &dyn crate::pipeline::UsageSource,
+        out: &mut Vec<Participation>,
+    ) {
+        use reims_vgpu_protocol::render::ShaderStage;
         match (self, op) {
             (Self::Render(state), ResolvedOperation::Render(RenderOp::Draw(_))) => {
-                state.footprint_into(None, None, out);
+                // The bound pipeline is the encoder's own state, so the
+                // question asked is about the pipeline this draw will actually
+                // use. A draw with nothing bound asks nothing and every slot
+                // stays `Unknown`, which is what a draw the device cannot name
+                // a shader for deserves.
+                let bound = state.pipeline;
+                state.footprint_into(
+                    bound.and_then(|id| usages.binding_usage(id, Some(ShaderStage::Vertex))),
+                    bound.and_then(|id| usages.binding_usage(id, Some(ShaderStage::Fragment))),
+                    out,
+                );
             }
             (Self::Compute(state), ResolvedOperation::Compute(ComputeOp::Dispatch(_))) => {
-                state.footprint_into(None, out);
+                let bound = state.pipeline;
+                state.footprint_into(bound.and_then(|id| usages.binding_usage(id, None)), out);
             }
             _ => {}
         }
@@ -561,20 +688,30 @@ impl EncoderBindings {
     }
 }
 
-impl Default for ExecBuilder {
+impl<'u> Default for ExecBuilder<'u> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ExecBuilder {
+/// The answer [`ExecBuilder::new`] uses: nothing published, every bound slot
+/// `Unknown`. A `static` because the builder holds a reference and this one has
+/// no state to be per-builder.
+static NO_USAGE: crate::pipeline::NoUsage = crate::pipeline::NoUsage;
+
+impl<'u> ExecBuilder<'u> {
     /// A builder for a packet whose contents are not yet known and whose
     /// position in the arrival order is not this layer's to know. See
     /// [`ExecWork`].
+    ///
+    /// Nothing is published to it, so every bound slot of every draw and
+    /// dispatch participates as [`crate::access::AccessMode::Unknown`]. A
+    /// caller that can do better uses [`ExecBuilder::with_usage`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             cursor: StreamCursor::new(),
+            usages: &NO_USAGE,
             streams: Vec::new(),
             open: None,
             accesses: Vec::new(),
@@ -583,6 +720,21 @@ impl ExecBuilder {
             arenas: ExecArenas::default(),
             bindings: EncoderBindings::None,
             participation_scratch: Vec::new(),
+        }
+    }
+
+    /// The same builder, resolving its footprints against what an executor has
+    /// published.
+    ///
+    /// **The narrowing arrives here and nowhere else.** Set once for the whole
+    /// packet: a packet's records are one transaction and one access list, so
+    /// two records resolved against two different answers would be one
+    /// transaction describing two different pipelines' shaders.
+    #[must_use]
+    pub fn with_usage(usages: &'u dyn crate::pipeline::UsageSource) -> Self {
+        Self {
+            usages,
+            ..Self::new()
         }
     }
 
@@ -664,7 +816,7 @@ impl ExecBuilder {
     pub fn record(
         &mut self,
         op: ResolvedOperation,
-        source: &mut impl AccessSource,
+        source: &mut (impl AccessSource + ?Sized),
     ) -> Result<StreamPosition, StreamRefusal> {
         // Taken out and put back, so the walk costs no allocation after the
         // first record of the first transaction. It also releases the borrow
@@ -680,7 +832,7 @@ impl ExecBuilder {
         // Gathering only. Whether the encoder has *declared* what it just
         // answered is settled on the success path below, because everything
         // between here and there can still refuse the record.
-        self.bindings.footprint_into(&op, &mut parts);
+        self.bindings.footprint_into(&op, self.usages, &mut parts);
         // Pushed straight onto the transaction's list and rolled back on any
         // refusal, rather than gathered into a second vector: a record's
         // accesses are at most a handful and a `Vec` per record would be an
@@ -922,7 +1074,7 @@ mod tests {
         }
     }
 
-    fn builder() -> ExecBuilder {
+    fn builder() -> ExecBuilder<'static> {
         ExecBuilder::new()
     }
 
@@ -1017,6 +1169,174 @@ mod tests {
             .iter()
             .filter(|a| backing(a.key) != Some(BackingId(5)))
             .all(|a| a.mode == AccessMode::Unknown));
+    }
+
+    /// A published reflection narrows the draw's footprint, and an unpublished
+    /// stage stays `Unknown`.
+    ///
+    /// **The gate on the one door the model's conservatism is bought back
+    /// through.** Before anything published, the first driven boot that counted
+    /// found `access_mode_unknown` at 81 % of every access the dependency graph
+    /// ordered against — every bound slot of every draw, because
+    /// [`crate::encoder::slot_mode`] has no other answer without a
+    /// [`crate::pipeline::BindingUsage`].
+    ///
+    /// Three slots and three answers, because the three are the three things a
+    /// reflection can say and each is wrong in a different way if collapsed:
+    /// slot 0 is read (narrowed, and no longer conflicts with another reader),
+    /// slot 1 is written (narrowed, and still does), slot 2 is *not referenced*
+    /// and contributes no participation at all. The fragment stage publishes
+    /// nothing, so its own bound slot keeps the conservative answer — which is
+    /// what says an unpublished stage is not silently read as "references
+    /// nothing".
+    #[test]
+    fn a_published_reflection_narrows_the_slots_it_names_and_no_others() {
+        use crate::pipeline::{BindingUsage, PipelineState, PipelineTable, PublishedUsage};
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let pipeline = res(9);
+        let mut table = PipelineTable::new();
+        assert!(table.declare(pipeline, crate::identity::SessionGeneration::FIRST));
+        assert!(table.advance(pipeline, PipelineState::Translating));
+        assert!(table.advance(pipeline, PipelineState::Compiling));
+        assert!(table.advance(pipeline, PipelineState::Ready));
+        // Vertex reflected, fragment not. Both are real positions for an
+        // executor and the two answers differ.
+        assert!(table.publish_usage(
+            pipeline,
+            PublishedUsage::render(
+                Some(BindingUsage::new(
+                    vec![Some(AccessMode::Read), Some(AccessMode::Write), None],
+                    Vec::new(),
+                )),
+                None,
+            )
+        ));
+
+        let mut b = ExecBuilder::with_usage(&table);
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        let entries = bind_arena(&mut b, &[res(7), res(8), res(6)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        let fragment = bind_arena(&mut b, &[res(4)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: ShaderStage::Fragment,
+                first: 0,
+                entries: fragment,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        b.record(
+            ResolvedOperation::Render(RenderOp::SetPipeline { pipeline }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("set pipeline");
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+
+        let mode_of = |id: u64| {
+            b.accesses
+                .iter()
+                .find(|a| backing(a.key) == Some(BackingId(id)))
+                .map(|a| a.mode)
+        };
+        assert_eq!(
+            mode_of(7),
+            Some(AccessMode::Read),
+            "the reflection said read"
+        );
+        assert_eq!(
+            mode_of(8),
+            Some(AccessMode::Write),
+            "and said write for the next slot"
+        );
+        assert_eq!(
+            mode_of(6),
+            None,
+            "a slot the shader does not reference contributes nothing at all"
+        );
+        assert_eq!(
+            mode_of(4),
+            Some(AccessMode::Unknown),
+            "the fragment stage published nothing, and nothing published is not \
+             'references nothing'"
+        );
+    }
+
+    /// A pipeline's reflection does not outlive the build it described.
+    ///
+    /// Every door that un-builds or unnames a pipeline drops it, and the reason
+    /// is the same at each: an id the guest can reuse would otherwise answer
+    /// with another object's shader, and a narrower footprint derived from the
+    /// wrong shader is a missing hazard edge rather than a wrong log line.
+    #[test]
+    fn a_reflection_dies_with_the_build_it_described() {
+        use crate::pipeline::{BindingUsage, PipelineState, PipelineTable, PublishedUsage};
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let id = res(9);
+        let usage = || {
+            PublishedUsage::render(
+                Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new())),
+                None,
+            )
+        };
+        let ready = || {
+            let mut t = PipelineTable::new();
+            assert!(t.declare(id, crate::identity::SessionGeneration::FIRST));
+            assert!(t.advance(id, PipelineState::Translating));
+            assert!(t.advance(id, PipelineState::Compiling));
+            assert!(t.advance(id, PipelineState::Ready));
+            assert!(t.publish_usage(id, usage()));
+            t
+        };
+        let published = |t: &PipelineTable| {
+            crate::pipeline::UsageSource::binding_usage(t, id, Some(ShaderStage::Vertex)).is_some()
+        };
+
+        let mut t = ready();
+        assert!(published(&t), "the fixture publishes");
+        assert!(t.withdraw(id));
+        assert!(
+            !published(&t),
+            "the executor said it no longer holds the translation this described"
+        );
+
+        let mut t = ready();
+        assert!(t.retire(id));
+        assert!(!published(&t), "the guest deleted the name");
+
+        let mut t = ready();
+        assert!(!t.device_lost().is_empty());
+        assert!(!published(&t), "the incarnation that built it is gone");
+
+        let mut t = ready();
+        let closed = t.generation_closed(crate::identity::SessionGeneration::FIRST);
+        assert!(closed.removed.contains(&id));
+        assert!(!published(&t), "the generation that named it closed");
+
+        // And a reflection landing after the name is gone does not resurrect
+        // it.
+        let mut t = ready();
+        assert!(t.retire(id));
+        assert!(
+            !t.publish_usage(id, usage()),
+            "a compile finishing after the delete describes a build nothing may bind"
+        );
+        assert!(!published(&t));
     }
 
     /// Three draws over one binding table declare its slots once.
@@ -1540,6 +1860,135 @@ mod tests {
             assert_eq!(work.pipeline_leases, vec![res(3), res(4)], "{kind:?}");
             assert_eq!(work.record_count(), 3, "{kind:?}: every bind is a record");
         }
+    }
+
+    /// The render arm of the lease list holds the render binds and nothing
+    /// else, once each.
+    ///
+    /// This is what the render pre-scan is handed to decide which pipelines it
+    /// must have translated before a draw can run. Two things would break it,
+    /// and only a packet carrying both classes can tell them apart: a compute
+    /// lease reaching the render arm sends a compute pipeline down the
+    /// translator's render path, where its inputs are the wrong shape and it
+    /// refuses; and a duplicate turns a forty-draw stream into forty visits to
+    /// the same memo, which is the cost the class-blind
+    /// [`ExecWork::pipeline_leases`] was already deduplicated to avoid.
+    #[test]
+    fn the_render_arm_of_the_leases_is_the_render_binds_deduplicated() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open render");
+        for pipeline in [res(3), res(3), res(4)] {
+            b.record(
+                ResolvedOperation::Render(RenderOp::SetPipeline { pipeline }),
+                &mut StubRegistry(ChannelId(1)),
+            )
+            .expect("render bind");
+        }
+        b.end_segment().expect("end render");
+
+        b.begin_segment(
+            SegmentKind::Compute.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open compute");
+        b.record(
+            ResolvedOperation::Compute(crate::compute::ComputeOp::SetPipeline { pipeline: res(9) }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("compute bind");
+        b.end_segment().expect("end compute");
+
+        let work = b.finish().expect("frozen");
+        assert_eq!(
+            work.pipeline_leases,
+            vec![res(3), res(4), res(9)],
+            "the ordering plane waits on all three"
+        );
+        assert_eq!(
+            work.render_pipeline_leases(),
+            vec![res(3), res(4)],
+            "the render pre-scan is asked about two"
+        );
+    }
+
+    /// The compute arm names the pipeline a dispatch ran under, at the size
+    /// that dispatch stated, and keeps the pipeline across a continuation.
+    ///
+    /// Each assertion below is one thing the byte scan this replaced could not
+    /// say. The continuation is the one that costs a frame: a scan resetting
+    /// its bound ref at every framed segment sees a dispatch with no pipeline
+    /// and skips it, while the ordering plane still holds that pipeline's lease
+    /// and readies it on the verdict — a transaction released against a kernel
+    /// that is still translating.
+    #[test]
+    fn the_compute_arm_pairs_each_dispatch_with_the_pipeline_and_size_it_ran_under() {
+        use crate::compute::{ComputeExtent, ComputeOp, DispatchOp};
+
+        const fn extent(width: u64) -> ComputeExtent {
+            ComputeExtent {
+                width,
+                height: 1,
+                depth: 1,
+            }
+        }
+        fn dispatch(threads_per_group: ComputeExtent) -> ResolvedOperation {
+            ResolvedOperation::Compute(ComputeOp::Dispatch(DispatchOp::Threadgroups {
+                groups: extent(1),
+                threads_per_group,
+            }))
+        }
+        fn set(pipeline: ResourceId) -> ResolvedOperation {
+            ResolvedOperation::Compute(ComputeOp::SetPipeline { pipeline })
+        }
+
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Compute.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        for op in [
+            set(res(3)),
+            // Twice at one size is one translation.
+            dispatch(extent(64)),
+            dispatch(extent(64)),
+            // The same kernel at another size is another.
+            dispatch(extent(32)),
+            // A grid read from a buffer states its threadgroup size.
+            ResolvedOperation::Compute(ComputeOp::Dispatch(DispatchOp::ThreadsIndirect {
+                source: crate::compute::IndirectSource {
+                    buffer: res(5),
+                    offset: 0,
+                },
+            })),
+            // Bound and never dispatched: the ordering plane holds it, the
+            // translator is never asked about it.
+            set(res(4)),
+        ] {
+            b.record(op, &mut StubRegistry(ChannelId(1)))
+                .expect("record");
+        }
+        b.end_segment().expect("end");
+        let work = b.finish().expect("frozen");
+
+        assert_eq!(
+            work.compute_dispatch_translations(),
+            vec![(res(3), extent(64)), (res(3), extent(32))],
+            "one pair per distinct (pipeline, size) a dispatch stated"
+        );
+        assert_eq!(
+            work.pipeline_leases,
+            vec![res(3), res(4)],
+            "the ordering plane holds the pipeline nothing dispatched too"
+        );
+        assert!(
+            work.render_pipeline_leases().is_empty(),
+            "no render bind reaches the render arm"
+        );
     }
 
     /// A record the cursor refuses leaves no lease behind claiming it ran.

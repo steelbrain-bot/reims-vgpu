@@ -60,6 +60,11 @@ pub use context::MAX_DEVICE_RECREATES;
 pub(crate) use counters::{CounterSnapshot, EngineCounters, TargetReadDelivery};
 pub(crate) use draw_phase::take_window as draw_phase_window;
 pub(crate) use draw_preparation::DrawPreparationDecline;
+// Read only under `host-window`, which is what the boot harness builds. Its
+// absence there is a build failure and not a warning, so the `expect` says the
+// unused warning off `host-window` is the expected state rather than an
+// oversight nobody looked at.
+#[cfg_attr(not(feature = "host-window"), expect(unused_imports))]
 pub(crate) use facade_decline::EngineFacadeDecline;
 pub(crate) use host_ram::GuestWriteDecline;
 pub use types::viewport_slot_count;
@@ -212,9 +217,99 @@ pub(crate) fn color_subresource_layers() -> ash::vk::ImageSubresourceLayers {
     }
 }
 
+/// This device's immutable-object caches, held in the device's own rail slot.
+///
+/// # Why the caches are the device's and the context is not
+///
+/// A `VkInstance` and a `VkDevice` are facts about the host: one physical GPU
+/// per process, chosen once. What is cached against them is not. Every entry
+/// here is keyed by something the *guest* declared — a shader's content digest,
+/// a pipeline's descriptor, a render pass's attachment set, a sampler's state —
+/// so the population is a function of the guest's own object set and ends when
+/// that guest's device does. Keeping it beside the context made it outlive
+/// every device on the process, which is the thing the replacement
+/// architecture's device epochs exist to stop.
+///
+/// # The lock, and the order it is taken in
+///
+/// Its own [`Mutex`] rather than a field under the engine's, because the slot
+/// it lives in belongs to [`crate::model::DeviceState`] and the engine may not
+/// be the thing that owns a device's lifetime. Every entry point that reaches
+/// it holds the engine guard first and this one second, which is the only order
+/// this crate ever takes them in. [`Self::take`] is the exception and is
+/// written to be one: it empties the caches under this lock, releases it, and
+/// only then asks the engine for a context to destroy them through — so the one
+/// path that runs at device teardown cannot invert the order.
+pub(crate) struct DeviceObjectCaches(Mutex<ObjectCaches>);
+
+impl Default for DeviceObjectCaches {
+    fn default() -> Self {
+        Self(Mutex::new(ObjectCaches::new()))
+    }
+}
+
+impl std::fmt::Debug for DeviceObjectCaches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceObjectCaches")
+            .field("levels", &self.levels())
+            .finish()
+    }
+}
+
+impl DeviceObjectCaches {
+    /// Borrow the caches for the length of one engine operation.
+    ///
+    /// The same `Mutex` the engine's own state uses, which is `parking_lot`'s
+    /// and therefore does not poison. That is the behaviour this wants: a panic
+    /// under this lock leaves the caches consistent — every entry is an owned
+    /// handle in a map — and a device that refused every later draw because one
+    /// earlier draw panicked would turn a recoverable refusal into a dead boot.
+    fn with<R>(&self, f: impl FnOnce(&mut ObjectCaches) -> R) -> R {
+        let mut caches = self.0.lock();
+        f(&mut caches)
+    }
+
+    /// Live entries per cache, for the census. See [`ObjectCaches::levels`].
+    pub(crate) fn levels(&self) -> [usize; 7] {
+        self.with(|caches| caches.levels())
+    }
+
+    /// Empty the caches and destroy what came out, through whatever context the
+    /// engine still has.
+    ///
+    /// Called at the end of the device lifetime this slot belongs to. Without a
+    /// context there is nothing to destroy *through* — the `VkDevice` that owned
+    /// these handles is already gone — so the entries are dropped logically,
+    /// which is exactly what `flush_device_derived` does in the same situation.
+    pub(crate) fn end_device(&self) {
+        let mut taken = {
+            let mut caches = self.0.lock();
+            std::mem::replace(&mut *caches, ObjectCaches::new())
+        };
+        // `Device`, which is what its own doc calls teardown.
+        let guard = lock_engine_at(EngineLockSite::Device);
+        if let Some(ctx) = guard.owner.ctx.as_ref() {
+            unsafe { taken.destroy_all(&ctx.device) };
+        } else {
+            taken.clear_logical();
+        }
+    }
+}
+
+/// This rail's caches for `state`'s device.
+///
+/// `None` is another rail holding the slot, which `backend::select`'s
+/// one-rail-per-process latch makes unreachable in any live build. Callers
+/// refuse by name rather than falling back to a second cache, because a second
+/// cache is a second owner of the same handles.
+fn device_caches(state: &crate::model::DeviceState) -> Option<&DeviceObjectCaches> {
+    state
+        .rail_state::<crate::backend::vulkan::pipeline_resolve::VulkanDeviceState>()
+        .map(|rail| &rail.caches)
+}
+
 struct EngineState {
     owner: ContextOwner,
-    caches: ObjectCaches,
     pools: ResourcePools,
     counters: EngineCounters,
     #[cfg(feature = "host-window")]
@@ -225,7 +320,6 @@ impl EngineState {
     fn new() -> Self {
         Self {
             owner: ContextOwner::new(),
-            caches: ObjectCaches::new(),
             pools: ResourcePools::new(),
             counters: EngineCounters::default(),
             #[cfg(feature = "host-window")]
@@ -256,10 +350,10 @@ impl EngineState {
     ///
     /// Returns whether a fresh context came up, so a caller that can retry knows
     /// whether retrying is worth anything.
-    fn on_device_lost(&mut self) -> bool {
+    fn on_device_lost(&mut self, caches: &mut ObjectCaches) -> bool {
         self.counters.device_lost.fetch_add(1, Ordering::Relaxed);
         self.owner.mark_device_lost();
-        self.flush_device_derived();
+        self.flush_device_derived(caches);
         let EngineState {
             ref mut owner,
             ref counters,
@@ -284,9 +378,9 @@ impl EngineState {
     /// the exception — its only constructor is on the window thread — so this
     /// takes it and publishes that it is gone, and
     /// `host_window::present::App::reattach_engine` is what builds it again.
-    fn flush_device_derived(&mut self) {
+    fn flush_device_derived(&mut self, caches: &mut ObjectCaches) {
         clear_device_capabilities();
-        RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+        invalidate_all_resident_holders();
         // Taken and published unconditionally, before anything fallible. The
         // presenter's swapchain, surface and semaphores were made against the
         // device that is going away; whether or not there is still a `ctx` to
@@ -309,16 +403,16 @@ impl EngineState {
             unsafe {
                 #[cfg(feature = "host-window")]
                 if let Some(mut presenter) = presenter {
-                    presenter.destroy(ctx, Some(&mut self.pools));
+                    presenter.destroy(ctx);
                 }
-                self.caches.destroy_all(&ctx.device);
+                caches.destroy_all(&ctx.device);
                 self.pools.destroy_all(&ctx.device);
             }
         } else {
-            self.caches.clear_logical();
+            caches.clear_logical();
         }
         self.pools = ResourcePools::new();
-        self.caches = ObjectCaches::new();
+        *caches = ObjectCaches::new();
     }
 }
 
@@ -993,7 +1087,7 @@ pub struct GuestResetStats {
 pub fn reset_guest_state() -> GuestResetStats {
     let mut guard = lock_engine();
     LAST_TAIL_BATCH_FLUSH_US.store(0, std::sync::atomic::Ordering::Release);
-    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+    invalidate_all_resident_holders();
     let (resident_targets, pooled_targets, sampled_images, storage_images) =
         guard.pools.guest_reset_counts();
     let stats = GuestResetStats {
@@ -1018,7 +1112,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         unsafe {
             #[cfg(feature = "host-window")]
             if let Some(presenter) = window_presenter.as_mut() {
-                presenter.release_pins_after_idle(pools);
+                presenter.release_claims_after_idle();
             }
             pools.destroy_all(&ctx.device);
         }
@@ -1109,6 +1203,56 @@ pub fn window_present_resize(width: u32, height: u32) {
 /// Present the current compositor resident through the engine-owned swapchain,
 /// falling back to `cpu` for presents no resident carries. Acquire is
 /// nonblocking, so a vblank wait never holds `ENGINE`.
+///
+/// # The measurement the next move needs, taken while it was cheap to take
+///
+/// `begin_present` still needs `&mut ResourcePools` for one write — the access
+/// write-back, whose own site says why it cannot move on its own. What can move
+/// is the present: `pools` follows `caches` onto the device once the whole
+/// present is a transaction against the device that owns the registry, run by a
+/// thread that holds one. That thread is the drain, and two readings off the
+/// driven macos-15 boot behind `10696be7` say what it would cost.
+///
+/// **The schedule would not change.** `presents == offered` in all 112 cadence
+/// windows of that boot, with `busy`, `busy_fence`, `busy_acquire` and
+/// `busy_no_area` all zero across every one of them — as they were on the seven
+/// rail boots `window_present::PRESENT_IN_FLIGHT` was measured on. The window
+/// presents exactly once per publish and refuses nothing, so its cadence *is*
+/// the publish's cadence already; moving the work to the publish moves where the
+/// code runs and not when it runs.
+///
+/// **The cost would be small.** The window thread's engine lock on that boot:
+/// median 4 acquisitions per second, median 155 µs held per second, median
+/// longest single hold 68 µs, against a present rate of median 9.7 Hz and p90
+/// 28.8 Hz. A drain that absorbed all of it would take on about 1 ms per second.
+///
+/// Neither reading says the move is easy — the acquire has to happen before the
+/// blit can be recorded, and it is the window's surface that owns the swapchain.
+/// They say it is not gated on throughput, which is the question that would
+/// otherwise be asked first and answered by guessing.
+///
+/// **The surface is not gated on the thread either, on this rail.** That was the
+/// open question the paragraph above leaves: this function's signature has
+/// always been callable from anywhere, but nothing had established that the
+/// platform's WSI tolerates an acquire and a `vkQueuePresentKHR` from a thread
+/// that is not the one that created the surface. `examples/window_present_off_thread`
+/// asks exactly that and nothing else — the event loop opens the window and then
+/// goes quiet, and every present after its first comes from another thread. On
+/// Linux/Wayland with a native ICD it presented 288 frames in six seconds and
+/// 960 in twenty, `busy` zero and `failed` zero in both, with an empty failure
+/// log.
+///
+/// Presenting is the frequent WSI call; **recreating is the dangerous one**, and
+/// a present-only probe would have missed it. It destroys and rebuilds a
+/// `VkSwapchainKHR` against a surface the compositor and the event loop both
+/// still own. The probe therefore arms `recreate_pending` on a cadence, so the
+/// rebuild happens inside an off-thread present: 31 rebuilds across 959 presents
+/// in twenty seconds, same zeros, same empty log.
+///
+/// That is evidence about one WSI implementation. MoltenVK acquires its drawable
+/// through `CAMetalLayer`, which is a different implementation with different
+/// thread rules, and the pathway table carries two Apple rows — so the probe has
+/// to be run on an Apple host before the move is designed for one.
 #[cfg(feature = "host-window")]
 pub fn window_present_frame(
     source: Option<&WindowPresentSource>,
@@ -1127,7 +1271,7 @@ pub fn window_present_frame(
         let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
             EngineFacadeDecline::WindowPresenterNotAttached,
         ))?;
-        unsafe { presenter.begin_present(ctx, pools, counters, source, cpu) }?
+        unsafe { presenter.begin_present(ctx, pools, source, cpu) }?
     };
     let out = match dispatch {
         window_present::WindowPresentDispatch::Complete(out) => Ok(out),
@@ -1171,22 +1315,31 @@ pub fn window_present_detach() {
         return;
     };
     note_window_present_attached(false);
-    let EngineState {
-        ref owner,
-        ref mut pools,
-        ..
-    } = &mut *guard;
-    if let Some(ctx) = owner.ctx.as_ref() {
-        unsafe { presenter.destroy(ctx, Some(pools)) };
+    if let Some(ctx) = guard.owner.ctx.as_ref() {
+        unsafe { presenter.destroy(ctx) };
     }
 }
 
-/// Execute one draw against the persistent engine.
-pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
+/// Execute one draw against the persistent engine, with `state`'s own caches.
+pub fn execute_draw_request(
+    state: &crate::model::DeviceState,
+    req: &DrawRequest,
+) -> Result<DrawOutput, DrawError> {
+    let Some(device_caches) = device_caches(state) else {
+        return Err(DrawError::Facade(
+            facade_decline::EngineFacadeDecline::DeviceCachesUnreachable,
+        ));
+    };
+    device_caches.with(|caches| execute_draw_request_with(caches, req))
+}
+
+fn execute_draw_request_with(
+    caches: &mut ObjectCaches,
+    req: &DrawRequest,
+) -> Result<DrawOutput, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
-        ref mut caches,
         ref mut pools,
         ref counters,
         ..
@@ -1218,7 +1371,7 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
             Ok(out)
         }
         Err(DrawError::DeviceLost(decline)) => {
-            guard.on_device_lost();
+            guard.on_device_lost(caches);
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
@@ -1230,13 +1383,31 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
 /// while the worker sleeps; every in-engine consumer path (reads, compute,
 /// prefetch, next non-joinable draw) already flushes via begin_entry, so this
 /// only bounds the idle-tail latency. No-op without a context or open batch.
-pub fn flush_batched_draws() {
+pub fn flush_batched_draws(state: &crate::model::DeviceState) {
     if !end_of_tranche_requires_engine(
         BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire),
         device_lost::device_lost_seen(),
     ) {
         return;
     }
+    // The tail flush itself touches no cache. It takes the device's caches
+    // because it is one of the three places a device loss is *acted on*, and
+    // acting on one drops everything derived from the `VkDevice` that is going
+    // away — which is where the caches are. An arm here that could not reach
+    // them would leave a boot's worth of handles from a dead device in the
+    // slot, and the next draw would bind one.
+    let Some(device_caches) = device_caches(state) else {
+        crate::observe::Emit::decline(
+            "vk_batch_flush",
+            &facade_decline::EngineFacadeDecline::DeviceCachesUnreachable,
+        )
+        .fail_once(0);
+        return;
+    };
+    device_caches.with(flush_batched_draws_with);
+}
+
+fn flush_batched_draws_with(caches: &mut ObjectCaches) {
     let lock_started = std::time::Instant::now();
     let mut guard = lock_engine();
     guard.counters.batch_tail_lock_us.fetch_add(
@@ -1248,7 +1419,7 @@ pub fn flush_batched_draws() {
     // observed by a thread that cannot take the engine lock gets acted on. See
     // `device_lost::note_device_lost_seen` for the boot that needed it.
     if device_lost::take_device_lost_seen() {
-        guard.on_device_lost();
+        guard.on_device_lost(caches);
         return;
     }
     let lost = {
@@ -1293,7 +1464,7 @@ pub fn flush_batched_draws() {
     // "A lost device surfaces again on the next draw" is only true while draws
     // keep coming, and a device loss is one of the things that stops them.
     if lost {
-        guard.on_device_lost();
+        guard.on_device_lost(caches);
     }
 }
 
@@ -1850,12 +2021,26 @@ pub fn quiesce_guest_reads() {
     }
 }
 
-/// Execute one compute dispatch against the persistent engine.
-pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, ComputeError> {
+/// Execute one compute dispatch against the engine, with `state`'s own caches.
+pub fn execute_compute_request(
+    state: &crate::model::DeviceState,
+    req: &ComputeRequest,
+) -> Result<ComputeOutput, ComputeError> {
+    let Some(device_caches) = device_caches(state) else {
+        return Err(DrawError::Facade(
+            facade_decline::EngineFacadeDecline::DeviceCachesUnreachable,
+        ));
+    };
+    device_caches.with(|caches| execute_compute_request_with(caches, req))
+}
+
+fn execute_compute_request_with(
+    caches: &mut ObjectCaches,
+    req: &ComputeRequest,
+) -> Result<ComputeOutput, ComputeError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
-        ref mut caches,
         ref mut pools,
         ref counters,
         ..
@@ -1869,7 +2054,7 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
             Ok(out)
         }
         Err(DrawError::DeviceLost(decline)) => {
-            guard.on_device_lost();
+            guard.on_device_lost(caches);
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
@@ -1881,9 +2066,14 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
 /// Used by mapper-ref-texture sample dig (`sample_src=… resident_ready=`) to detect the
 /// resident-vs-guest split without a full readback. Does not create devices or
 /// allocate; returns false if the engine is uninit or the key is absent.
-/// Whether the window presenter would take this resident for a present at
-/// `width`x`height`. Shares [`pools::slot_presentable`] with the presenter's own
-/// selection so the two cannot answer differently.
+/// Whether a resident can carry a present at `width`x`height`. Shares
+/// [`pools::slot_presentable`] with `resident_present_decision` — the window
+/// *publish*, which is where this question is now decided — so the two cannot
+/// answer differently.
+///
+/// The presenter used to be the sharer, re-resolving the identity out of the
+/// registry on its own thread. It no longer reads a registry at all: it takes
+/// the publish's `WindowPresentResolution` and checks one atomic stamp.
 ///
 /// Not gated on `host-window`, because the question is about the target registry
 /// rather than about a window: `runtime::drain`'s `present_unbacked` gate asks it
@@ -1899,21 +2089,63 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
         .is_some_and(|slot| pools::slot_presentable(slot, width, height))
 }
 
+/// Decide whether `identity` can carry a direct present, and on `Ok` record it
+/// as the resident the window is published against and return the stamp that
+/// records *when*.
+///
+/// The recording and the decision are one transaction for the reason the pin and
+/// the allocation-kind read in `retain_resident_target` are: a caller that did
+/// them separately could publish one identity and record another, and the
+/// recording is what the one removal path recognises in order to invalidate the
+/// window's source.
 fn resident_present_decision(
-    pools: &ResourcePools,
+    pools: &mut ResourcePools,
     identity: &TargetIdentity,
     width: u32,
     height: u32,
-) -> Result<(), &'static str> {
+) -> Result<WindowPresentResolution, &'static str> {
     let Some(slot) = pools.registry_get(identity) else {
+        pools.note_window_published(None);
         return Err("winpub_no_resident");
     };
-    match pools::slot_present_decline(slot, width, height) {
-        None => Ok(()),
-        Some(pools::ResidentPresentDecline::ContentNotReady) => Err("winpub_content_not_ready"),
-        Some(pools::ResidentPresentDecline::ScanoutOrder) => Err("winpub_scanout_order"),
-        Some(pools::ResidentPresentDecline::Geometry) => Err("winpub_geometry"),
+    if let Some(decline) = pools::slot_present_decline(slot, width, height) {
+        pools.note_window_published(None);
+        return Err(match decline {
+            pools::ResidentPresentDecline::ContentNotReady => "winpub_content_not_ready",
+            pools::ResidentPresentDecline::ScanoutOrder => "winpub_scanout_order",
+            pools::ResidentPresentDecline::Geometry => "winpub_geometry",
+        });
     }
+    // Taken from the slot this transaction just accepted, not re-read after the
+    // recording below: the resolution and the decision must be of one slot, for
+    // the same reason the recording and the decision are one transaction.
+    let resolved = pools::slot_window_resolution(slot);
+    pools.note_window_published(Some(identity));
+    // Read *after* the recording, so a removal racing this transaction is either
+    // ordered before it — and then this stamp is already the post-bump value and
+    // the source is honestly valid — or ordered after, and bumps past this
+    // stamp. Both hold because every removal path and this function are under
+    // the same engine lock; the load is an `Acquire` so the window thread, which
+    // is not, still sees the bump.
+    Ok(WindowPresentResolution {
+        epoch: pools::window_source_epoch(),
+        resolved,
+    })
+}
+
+/// A window publish's two outputs: when it happened, and what it resolved to.
+///
+/// One value rather than two returns because they are one transaction's answer
+/// and a caller holding only the first would be holding a stamp that vouches for
+/// a slot it cannot name.
+pub struct WindowPresentResolution {
+    pub epoch: u64,
+    // Only the host-window arm reads this: it is the window presenter's
+    // comparison against its own re-resolve, and a build with no window has no
+    // presenter. A `cfg` here answers "what did this build compile", which is
+    // the only question one may answer.
+    #[cfg_attr(not(feature = "host-window"), allow(dead_code))]
+    pub(crate) resolved: pools::ResolvedResident,
 }
 
 /// Maintain the resident working set for one published frame and decide
@@ -1935,7 +2167,7 @@ pub fn prepare_window_resident_present(
     identity: &TargetIdentity,
     width: u32,
     height: u32,
-) -> Result<(), &'static str> {
+) -> Result<WindowPresentResolution, &'static str> {
     let now_ms = crate::observe::elapsed_ms() as u64;
     let mut guard = lock_engine();
     let EngineState {
@@ -1947,6 +2179,39 @@ pub fn prepare_window_resident_present(
     if let Some(ctx) = owner.ctx.as_ref() {
         unsafe {
             pools.advance_registry_maintenance(ctx, counters, now_ms);
+        }
+        // Submit the guest's open batch before vouching for what is in it.
+        //
+        // `content_ready` is set when a draw *records* into a resident, so a
+        // resolution can name pixels that exist only in a command buffer nobody
+        // has ended. Something has to submit that batch before the blit reads
+        // the image, and until now it was the presenter, one lock hold before
+        // its own blit.
+        //
+        // Here instead, for two reasons that are the same reason. The batch is
+        // the drain's, and this is the drain; the window thread submitting a
+        // whole tranche of guest work inside its present is a submission on the
+        // latency path of the display. And a flush at present time also submits
+        // every draw recorded *after* this publish, so the frame reaching the
+        // screen was not the frame this transaction vouched for — a flush here
+        // draws that line where the publish is, which is where the caller
+        // already believes it is.
+        //
+        // Not the end of the story for an open batch: `flush_batched_draws`
+        // runs at every tranche end regardless, so nothing here decides how
+        // long guest work may sit unsubmitted.
+        if let Err(error) = unsafe { pools.batch_flush(ctx, counters) } {
+            // This transaction cannot run the recovery — it holds the engine
+            // guard and no `ObjectCaches`, and the order those two are taken in
+            // is fixed. So it does what every other observer that cannot
+            // recover does, and the end-of-tranche flush acts on it within the
+            // second.
+            if matches!(error, DrawError::DeviceLost(_)) {
+                device_lost::note_device_lost_seen();
+            }
+            crate::observe::Emit::decline("vk_window_publish_flush", &error).fail_once(0);
+            pools.note_window_published(None);
+            return Err("winpub_batch_flush_failed");
         }
     }
     resident_present_decision(pools, identity, width, height)
@@ -2011,6 +2276,34 @@ impl ResidentResourceLease {
             epoch: RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire),
         }
     }
+}
+
+/// End the licence every serialized resource lease holds, because the registry
+/// those leases name is being replaced or destroyed.
+///
+/// # Why the window's licence is not bumped here any more
+///
+/// It was, and the comment that stood here said the arrangement "cannot be
+/// tested into place — a *new* wholesale-invalidation site that bumps only one
+/// counter is exactly the defect, and no test relates a future site to this
+/// function". That was true of a rule three call sites had to remember, and it
+/// is the reason the rule moved.
+///
+/// [`pools::WINDOW_SOURCE_EPOCH`] is now moved by the type that owns the
+/// registry, at the two points a published resident's promise can actually end:
+/// `ResourcePools::unregister_resident` when one resident leaves — the sole
+/// `remove` this registry has — and `ResourcePools::destroy_all` plus
+/// `Drop for ResourcePools` when the registry itself does, the sole `drain` and
+/// the path that replaces a pools without destroying it. A wholesale site that
+/// forgets to call this function therefore cannot strand a window stamp, because
+/// it cannot invalidate the registry without going through one of those three.
+///
+/// What is left here is the half that has no such owner: a
+/// [`ResidentResourceLease`] is a value held by a serialized resource, its
+/// `matches` and its `Drop` both read this counter, and nothing in
+/// `ResourcePools` sees one.
+fn invalidate_all_resident_holders() {
+    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -5302,11 +5595,16 @@ pub fn maintain_resources(now_ms: u64) {
 
 /// Snapshot of create/alloc/hit-miss counters (for tests and thrash proxies).
 /// Live entries in each immutable-object cache:
-/// `(shaders, layouts, passes, pipelines, samplers, compute_pipelines)`.
+/// `(shaders, layouts, attribute sets, passes, pipelines, samplers,
+/// compute_pipelines)`.
 ///
 /// See [`caches::ObjectCaches::levels`] for what reading it answers.
-pub fn object_cache_levels() -> [usize; 6] {
-    lock_engine().caches.levels()
+///
+/// Zeros when the device's rail slot is another rail's — the same answer a
+/// census gets for a cache that holds nothing, which is what an unreachable
+/// one holds for this rail.
+pub fn object_cache_levels(state: &crate::model::DeviceState) -> [usize; 7] {
+    device_caches(state).map_or([0; 7], DeviceObjectCaches::levels)
 }
 
 /// Active topology policy for one deferred-submit command buffer, for the
@@ -5395,9 +5693,15 @@ pub fn reset_draw_counters() {
 }
 
 /// Test-only: destroy device, clear recreate budget, rebuild on next draw.
-pub fn test_reset_engine() {
+pub fn test_reset_engine(state: &crate::model::DeviceState) {
+    device_caches(state)
+        .expect("this rail holds the slot")
+        .with(|caches| test_reset_engine_with(caches));
+}
+
+fn test_reset_engine_with(caches: &mut ObjectCaches) {
     let mut g = lock_engine();
-    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+    invalidate_all_resident_holders();
     // A healthy `DeviceContext` is kept across the reset; only the pools, the
     // caches and the owner's flags are rebuilt.
     //
@@ -5426,7 +5730,7 @@ pub fn test_reset_engine() {
             ctx.queue_barrier();
         }
         unsafe {
-            g.caches.destroy_all(&ctx.device);
+            caches.destroy_all(&ctx.device);
             g.pools.destroy_all(&ctx.device);
         }
         if poisoned {
@@ -5439,7 +5743,7 @@ pub fn test_reset_engine() {
     } else {
         g.owner = ContextOwner::new();
     }
-    g.caches = ObjectCaches::new();
+    *caches = ObjectCaches::new();
     g.pools = ResourcePools::new();
     g.counters.reset_all();
 }
@@ -5472,16 +5776,32 @@ pub fn device_recreate_count() -> u32 {
 }
 
 /// Mark context poisoned and flush as if device lost (tests that assert recreate cap).
-pub fn test_poison_and_flush() {
-    let mut g = lock_engine();
-    g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
-    g.owner.mark_device_lost();
-    g.flush_device_derived();
+pub fn test_poison_and_flush(state: &crate::model::DeviceState) {
+    device_caches(state)
+        .expect("this rail holds the slot")
+        .with(|caches| {
+            let mut g = lock_engine();
+            g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
+            g.owner.mark_device_lost();
+            g.flush_device_derived(caches);
+        });
 }
 
 #[cfg(all(test, feature = "host-window"))]
 mod device_loss_window_rail_tests {
     use super::*;
+
+    /// A device whose rail slot this rail holds, which is what every entry
+    /// point below reaches its caches through.
+    fn device() -> crate::model::DeviceState {
+        let state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        assert!(
+            device_caches(&state).is_some(),
+            "precondition: this rail holds the slot"
+        );
+        state
+    }
 
     /// A device-loss flush must leave the window rail claiming nothing.
     ///
@@ -5517,7 +5837,7 @@ mod device_loss_window_rail_tests {
         let _ = device_lost::take_device_lost_seen();
         note_window_present_attached(true);
         device_lost::note_device_lost_seen();
-        flush_batched_draws();
+        flush_batched_draws(&device());
         assert!(
             !window_present_attached(),
             "the end-of-tranche flush must run the recovery for a latched loss"
@@ -5535,7 +5855,7 @@ mod device_loss_window_rail_tests {
             window_present_attached(),
             "precondition: the flag is what a successful attach publishes"
         );
-        test_poison_and_flush();
+        test_poison_and_flush(&device());
         assert!(
             !window_present_attached(),
             "the presenter died with the device, so nothing may still claim it"

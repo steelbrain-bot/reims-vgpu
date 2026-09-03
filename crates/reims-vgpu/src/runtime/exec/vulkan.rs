@@ -12,21 +12,27 @@
 
 use super::*;
 
+/// `pipelines` is the **model's own lease list** for the packet, not a second
+/// scan of its bytes.
+///
+/// The two used to be different answers to "which pipelines does this packet
+/// bind": the walk collected `ResolvedOperation::pipeline_lease` and this
+/// re-framed the stream looking for `SetPipeline` records. That difference is
+/// load-bearing rather than cosmetic — admission readies *the walk's* leases on
+/// *this* function's whole-submission verdict, so a pipeline the scan did not
+/// reach was a lease declared ready on an answer that never examined it, which
+/// is the shape of the `m2v_translation_pending_at_sync_boundary` loss measured
+/// on a driven macos-15 desktop. Taking the list makes the two sets the same
+/// set by construction, and there is nothing left to keep in step.
 pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    stream: &[u8],
-) -> bool {
+    pipelines: &[u32],
+    pending: &mut Vec<u32>,
+) {
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
-    let refs_started = std::time::Instant::now();
-    let pipelines = render_pipeline_refs(stream);
-    note_preflight_part(
-        PreflightPart::Refs,
-        refs_started.elapsed().as_nanos() as u64,
-    );
-    let mut pending = false;
-    for pipeline_ref in pipelines {
+    for &pipeline_ref in pipelines {
         note_preflight_pipe();
         // The draw path's own memo already knows whether these two shaders are
         // translated, and answers for ~0.6 us against the 4.3 us of guest
@@ -50,6 +56,15 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
         let Ok((v_mtlb, f_mtlb)) = pair else {
             // Normal execution emits the precise pipeline/MTLB failure. A
             // missing plan input is deterministic, not asynchronous work.
+            //
+            // Counted, because "not pending" is what this arm says and it is
+            // the answer that readies the packet's pipeline leases at
+            // admission. A draw has been measured reaching a shader that was
+            // still translating while its lease read `ready`, and a pipeline
+            // this pre-scan silently stopped examining is one of the two ways
+            // that can happen — the other being a pipeline the scan never
+            // reached at all. They were one silence.
+            crate::runtime::drain::note_store_route("preflight_mtlb_unloadable");
             continue;
         };
         // A container whose AIR will not extract is the same "deterministic
@@ -59,6 +74,7 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             crate::runtime::mtlb::extract_air(&v_mtlb),
             crate::runtime::mtlb::extract_air(&f_mtlb),
         ) else {
+            crate::runtime::drain::note_store_route("preflight_air_unextractable");
             continue;
         };
         let cache_started = std::time::Instant::now();
@@ -66,73 +82,45 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             v_air,
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
-        ) {
-            pending = true;
-        }
-        if !crate::runtime::m2v_cache::ensure_cached_async(
+        ) | !crate::runtime::m2v_cache::ensure_cached_async(
             f_air,
             metal2vulkan::passes::Stage::Fragment,
             pipeline_ref,
         ) {
-            pending = true;
+            // `|` and not `||`: both stages must be *started*, so they
+            // translate in parallel and the packet is retried once rather than
+            // once per stage.
+            if !pending.contains(&pipeline_ref) {
+                pending.push(pipeline_ref);
+            }
         }
         note_preflight_part(
             PreflightPart::Cache,
             cache_started.elapsed().as_nanos() as u64,
         );
     }
-    pending
 }
 
-pub(crate) fn render_pipeline_refs(stream: &[u8]) -> Vec<u32> {
-    // Deliberately silent on a framing refusal: this is a speculative pre-scan of
-    // the very stream `walk_stream` is about to frame and report on. Logging here
-    // would double every `stream_frame_fail` line for no added information.
-    let Ok(segs) = stream::iter_segments(stream) else {
-        return Vec::new();
-    };
-    let mut pipelines = Vec::new();
-    for seg in segs {
-        if seg.type_ != SEGMENT_TYPE_RENDER {
-            continue;
-        }
-        let mut cursor = 0usize;
-        let mut next = decode_first_record(stream, &seg, &mut cursor);
-        while let Ok(rec) = next {
-            let start = rec.bytes_offset as usize;
-            let end = start.saturating_add(rec.length as usize);
-            if let Some(bytes) = stream.get(start..end) {
-                if let Ok(cmd) = render::decode(bytes) {
-                    if cmd.kind == RenderKind::SetPipeline
-                        && cmd.pipeline_ref != 0
-                        && !pipelines.contains(&cmd.pipeline_ref)
-                    {
-                        pipelines.push(cmd.pipeline_ref);
-                    }
-                }
-            }
-            next = decode_next_record(stream, &seg, &mut cursor);
-        }
-    }
-
-    pipelines
-}
-
+/// `dispatches` is the **model's own record of what this packet dispatches**,
+/// not a second scan of its bytes.
+///
+/// The same correction the render arm took in the commit before this one, and
+/// for the same reason: admission readies the walk's compute leases on this
+/// function's whole-submission verdict, so a kernel the scan did not reach was
+/// a lease declared ready on an answer that never examined it. The scan had
+/// three ways not to reach one --- a selector carrying no threadgroup size, a
+/// dispatch after an encoder continuation, and a framing refusal it swallowed
+/// --- and [`reims_vgpu_core::exec::ExecWork::compute_dispatch_translations`]
+/// has none of them, because it reads records the walk already resolved.
 pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    stream: &[u8],
-) -> bool {
+    dispatches: &[(u32, [u32; 3])],
+    pending: &mut Vec<u32>,
+) {
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
-    let refs_started = std::time::Instant::now();
-    let inputs = compute_translation_inputs(stream);
-    note_preflight_part(
-        PreflightPart::Refs,
-        refs_started.elapsed().as_nanos() as u64,
-    );
-    let mut pending = false;
-    for (pipeline_ref, local_size) in inputs {
+    for &(pipeline_ref, local_size) in dispatches {
         note_preflight_pipe();
         let air_started = std::time::Instant::now();
         let loaded = compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
@@ -159,78 +147,39 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
             PreflightPart::Cache,
             cache_started.elapsed().as_nanos() as u64,
         );
-        if !cached {
-            pending = true;
+        if !cached && !pending.contains(&pipeline_ref) {
+            pending.push(pipeline_ref);
         }
     }
-    pending
 }
 
-/// Structurally collect compute pipeline + LocalSize pairs in command order.
-/// Threads-indirect carries LocalSize in guest argument memory rather than the
-/// stream record, so it deliberately remains on the synchronous fallback.
-pub(crate) fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
-    // Silent for the same reason as `render_pipeline_refs`: a pre-scan whose
-    // framing refusal `walk_stream` will report once, with the task attached.
-    let Ok(segs) = stream::iter_segments(stream) else {
-        return Vec::new();
-    };
-    let mut inputs = Vec::new();
-    for seg in segs {
-        if seg.type_ != SEGMENT_TYPE_COMPUTE {
-            continue;
-        }
-        let mut pipeline_ref = 0u32;
-        let mut cursor = 0usize;
-        let mut next = decode_first_record(stream, &seg, &mut cursor);
-        while let Ok(rec) = next {
-            let start = rec.bytes_offset as usize;
-            let end = start.saturating_add(rec.length as usize);
-            if let Some(bytes) = stream.get(start..end) {
-                if let Ok(cmd) = compute::decode(bytes) {
-                    match cmd.kind {
-                        ComputeKind::Pipeline => pipeline_ref = cmd.pipeline_ref,
-                        ComputeKind::DispatchThreadgroups
-                        | ComputeKind::DispatchThreadgroupsIndirect
-                        | ComputeKind::DispatchThreads => {
-                            let dims = cmd.threads_per_threadgroup;
-                            let local_size = [
-                                u32::try_from(dims.x).ok(),
-                                u32::try_from(dims.y).ok(),
-                                u32::try_from(dims.z).ok(),
-                            ];
-                            if pipeline_ref != 0 {
-                                if let [Some(x), Some(y), Some(z)] = local_size {
-                                    let item = (pipeline_ref, [x, y, z]);
-                                    if x != 0 && y != 0 && z != 0 && !inputs.contains(&item) {
-                                        inputs.push(item);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            next = decode_next_record(stream, &seg, &mut cursor);
-        }
-    }
-    inputs
-}
-/// [`crate::backend::Backend::preflight_translations`] for this rail.
+/// [`crate::backend::Backend::preflight_translations`] for this rail: the
+/// pipeline refs this packet binds that the rail does not hold a translation
+/// for yet, deduplicated.
 ///
-/// Every stream is scanned, not just up to the first pending one: the point is
+/// **The refs and not a bool**, because the caller has two different things to
+/// do with the two halves of the answer. A lease this rail cannot serve must
+/// stop being ready, and a lease it can serve must become ready; a single
+/// "something is pending" cannot tell the caller which lease is which, so it
+/// had to treat the whole packet as one — and the pipelines that *were* ready
+/// stayed ready either way.
+///
+/// Every ref is examined, not just up to the first pending one: the point is
 /// to *start* every cold translation this packet needs, so they proceed in
-/// parallel and the packet is retried once rather than once per stream.
+/// parallel and the packet is retried once rather than once per shader.
 pub fn preflight_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    streams: &[Vec<u8>],
-) -> bool {
-    streams.iter().fold(false, |pending, stream| {
-        let render_pending = preflight_render_translations(state, host, task_id, stream);
-        let compute_pending = preflight_compute_translations(state, host, task_id, stream);
-        render_pending || compute_pending || pending
-    })
+    render_pipelines: &[u32],
+    compute_dispatches: &[(u32, [u32; 3])],
+) -> Vec<u32> {
+    // Both halves are asked once for the whole packet, and both are asked
+    // about what the walk resolved. Neither reads a stream: the packet's bytes
+    // were read once, and a second reading is a second answer to "what does
+    // this packet run".
+    let mut pending = Vec::new();
+    preflight_render_translations(state, host, task_id, render_pipelines, &mut pending);
+    preflight_compute_translations(state, host, task_id, compute_dispatches, &mut pending);
+    pending
 }

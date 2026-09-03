@@ -33,7 +33,7 @@
 //!
 //! That the resolvers *succeed*. Most are handed a zero payload here, and a
 //! command whose operation is not in its own packet — see
-//! `ResolveRefusal::NeedsStorage` and `NeedsGuestTable` — names what is missing
+//! `ResolveRefusal::NeedsStorage` — names what is missing
 //! rather than producing one. Claiming the packet is the question; what the
 //! answer is belongs to each owner's own tests.
 
@@ -222,6 +222,18 @@ impl reims_vgpu_core::resolve::RefResolver for Everything {
             slot: reims_vgpu_core::identity::ObjectListRef(object_ref),
             generation: reims_vgpu_core::identity::SlotGeneration(1),
         })
+    }
+}
+
+// One namespace for every task, which this suite is entitled to: it asks which
+// join a kind reaches, not which task's slots a ref is in.
+impl reims_vgpu_core::resolve::TaskNamespaces for Everything {
+    fn resource(
+        &self,
+        _task: reims_vgpu_core::identity::TaskId,
+        object_ref: u32,
+    ) -> Option<reims_vgpu_core::identity::ResourceId> {
+        reims_vgpu_core::resolve::RefResolver::resource(self, object_ref)
     }
 }
 

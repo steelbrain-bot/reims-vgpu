@@ -16,8 +16,9 @@
 use super::{ComputeAccum, ComputeStatus};
 use crate::model::DeviceState;
 use crate::runtime::compute_exec;
-use crate::runtime::decode::compute::{Command as ComputeCommand, Kind};
+use crate::runtime::decode::compute_spi::{Command as ComputeCommand, Kind};
 use crate::runtime::host::{HostMemory, HostOps};
+use reims_vgpu_protocol::compute::DispatchType;
 
 /// Multi-record Metal compute encoder for a single compute segment.
 pub(crate) struct MetalSession {
@@ -51,7 +52,7 @@ impl Drop for MetalSession {
 }
 
 impl MetalSession {
-    pub(crate) fn open(dispatch_type: u32) -> Result<Self, ComputeStatus> {
+    pub(crate) fn open(dispatch_type: DispatchType) -> Result<Self, ComputeStatus> {
         use crate::backend::metal::abi::REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT;
         use crate::backend::metal::runtime::{system_device, thread_queue};
         use metal::MTLDispatchType;
@@ -60,10 +61,18 @@ impl MetalSession {
             return Err(ComputeStatus::NoMetal("compute_session_no_metal_device"));
         };
         let queue = thread_queue(device);
-        let metal_dt = if dispatch_type == REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT {
-            MTLDispatchType::Concurrent
-        } else {
-            MTLDispatchType::Serial
+        // Total in, total out: the accumulator holds a `DispatchType` because
+        // the protocol crate refused to build one from a word outside the
+        // enumeration, so there is no unrecognised ordinal left to fall through
+        // to `Serial`. The shared constant is still what the two sides agree
+        // on, and the `debug_assert` is where that agreement is checked.
+        debug_assert_eq!(
+            DispatchType::Concurrent.word(),
+            REIMS_VGPU_MTL_DISPATCH_TYPE_CONCURRENT
+        );
+        let metal_dt = match dispatch_type {
+            DispatchType::Concurrent => MTLDispatchType::Concurrent,
+            DispatchType::Serial => MTLDispatchType::Serial,
         };
         let Some(command_buffer) = crate::backend::metal::raw_metal::new_command_buffer(&queue)
         else {

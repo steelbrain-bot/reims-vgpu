@@ -25,6 +25,76 @@ fn resident_resample_band(idle_ms: u64) -> &'static str {
     }
 }
 
+/// A resident left the registry while a holder still had it pinned.
+///
+/// A pin says "somebody is still reading this image", and two of the three
+/// removal reasons honour that. The reclaim sweep never selects a pinned slot —
+/// [`ResourcePools::recoverable_residents`] filters on `pin_count == 0`, so
+/// `AllocationReclaimed` cannot reach one. `ResourceReleased` leaves the slot in
+/// the registry marked [`ResidentTargetSlot::resource_released`] and lets
+/// maintenance retire it once the last pin has left, which is the deferral
+/// written down in that field's own documentation.
+///
+/// The `registry_ensure*` recreate arms are the third, and they cannot defer the
+/// way the other two do: the guest replaced the resource under this identity, so
+/// the key has to be free for the resident taking its place. Every identity
+/// namespace carries width, height and generation, so reaching an arm needs a
+/// `sample_count` or a `Texture`-format change at an otherwise identical key —
+/// which is why it is rare rather than impossible.
+///
+/// # What this used to mean, and what it means now
+///
+/// The removal itself was never the hazard; the *disposal* was.
+/// `retire_resident` hands the image to [`ResourcePools::dispose`], whose
+/// deferral is keyed on `open_slot_mask`, and the host window's present
+/// transaction was not among the slots that mask reported. It carries
+/// `WindowPresenter`'s own per-frame fence, submitted inside `begin_present` and
+/// not waited on until some later present's `retire`, so a recreate arriving
+/// between those two points saw an idle ring, destroyed the image on the spot,
+/// and left the queued blit reading freed memory.
+///
+/// `super::WINDOW_PRESENT_SLOT` closes that: the window's outstanding presents
+/// are a bit in `open_slot_mask` now, exactly as that function's own
+/// documentation prescribes for a caller whose recording outlives its
+/// bookkeeping, so the image is parked in the graveyard until the blit retires.
+///
+/// So this line no longer reports a use-after-free. It reports the condition
+/// underneath it — the guest replaced a resident somebody was still holding —
+/// which is worth a name for the holder classes the window's bit does not speak
+/// for: `pins` in excess of `resource_owners` is the transient GPU and writeback
+/// class, and `open_slot_mask` covers those only while their recording slot is
+/// open. A holder that unpins before its work retires is the third state that
+/// function warns about, and this is where one would first become visible.
+///
+/// # Reading a zero
+///
+/// A zero here is only informative beside a nonzero `evicts` in the census.
+/// `retire_resident` bumps `target_evicts` for every reason but
+/// `ResourceReleased`, so `evicts=0` means no recreate arm and no reclaim ran at
+/// all and this emitter was never reached — which is what a driven macos-15 boot
+/// reported (`evicts=0`, `gen_mismatch=0`, three rounds of five apps opening and
+/// quitting, `direct_frac` up to 1.00, zero `FAIL`). Do not read that boot as
+/// evidence the condition does not arise.
+pub(super) struct ResidentRetiredWhilePinned {
+    why: ResidentReclaim,
+    pins: u32,
+    resource_owners: u32,
+}
+
+impl crate::observe::Decline for ResidentRetiredWhilePinned {
+    fn slug(&self) -> &'static str {
+        "resident_retired_while_pinned"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("why", self.why.slug().to_string()),
+            ("pins", self.pins.to_string()),
+            ("resource_owners", self.resource_owners.to_string()),
+        ]
+    }
+}
+
 /// Everything a creation site knows about a resident it has just built.
 ///
 /// The stored [`ResidentTargetSlot`] is this plus what the registry owns and a
@@ -587,6 +657,46 @@ impl ResourcePools {
         self.set_compute_sole_copy(identity, false)
     }
 
+    /// Record which resident the host window has just been published against,
+    /// or clear it when the publish declined.
+    ///
+    /// Called from the drain, which is the only place that knows: the publish
+    /// path holds a `&DeviceState` and resolves the display transaction to one
+    /// identity. The window thread never calls this and must not — it is the
+    /// side of the boundary that is losing its registry access, not gaining
+    /// more.
+    pub(crate) fn note_window_published(&mut self, identity: Option<&TargetIdentity>) {
+        // A decline is deliberately a no-op rather than a clear. The window keeps
+        // presenting the last source it was given, which nothing has removed, so
+        // that identity must stay vouched for — clearing here would drop it from
+        // the set and its later removal would then move no epoch.
+        let Some(identity) = identity else {
+            return;
+        };
+        if self.window_published.contains(identity) {
+            return;
+        }
+        if self.window_published.len() >= super::WINDOW_PUBLISHED_MAX {
+            // Bump rather than evict: evicting the oldest would leave a live
+            // source whose removal moves nothing, which is the exact hole the
+            // set exists to close. Bumping costs one present from host memory.
+            self.invalidate_window_sources();
+        }
+        self.window_published.push(identity.clone());
+    }
+
+    /// Move [`super::WINDOW_SOURCE_EPOCH`] and drop the identities it was
+    /// vouching for.
+    ///
+    /// The two are one action: the epoch moving is what makes every stamp taken
+    /// before it stale, so every identity in the set has been answered for and
+    /// keeping them would make a later removal move the epoch again for sources
+    /// that are already invalid.
+    pub(super) fn invalidate_window_sources(&mut self) {
+        self.window_published.clear();
+        super::WINDOW_SOURCE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
     /// Pin/unpin a resident against removal while its content exists nowhere but
     /// the GPU image. Answers whether a slot was there to pin.
     ///
@@ -824,6 +934,35 @@ impl ResourcePools {
         let old = old?;
         if old.pin_count == 0 {
             self.registry_non_pinned_adjust(Self::slot_attachment_bytes(&old), false);
+        }
+        // The window's licence to stop re-reading the registry. Bumped here and
+        // nowhere else, because this is the one removal path — so a stamp taken
+        // at publish is invalidated by every way a resident can leave, without
+        // each of those ways having to know a window exists.
+        //
+        // The identity is cleared as well as stamped: the next publish sets it
+        // again, and leaving a stale one here would let a *later* removal of a
+        // re-registered resident bump the epoch for a window that had already
+        // moved on. Costless if it does — the cost of a spurious bump is one
+        // frame from host memory — but it would make the counter mean less than
+        // it says.
+        if self.window_published.contains(identity) {
+            self.invalidate_window_sources();
+        }
+        if old.pin_count > 0 {
+            // Latched per removal reason: a recreate storm re-enters this with
+            // the same story every frame, and the second line would carry
+            // nothing the first did not. Magnitude belongs to a counter, and
+            // there is no counter yet because reachability is the open question.
+            crate::observe::Emit::decline(
+                "resident_retired_while_pinned",
+                &ResidentRetiredWhilePinned {
+                    why,
+                    pins: old.pin_count,
+                    resource_owners: old.resource_owner_count,
+                },
+            )
+            .fail_once(why as u64);
         }
         // A sole-copy slot never leaves here through a *reclaim* — both reclaim
         // paths skip it — but it does leave through the recreate arms, where the
@@ -1077,7 +1216,14 @@ impl ResourcePools {
                 // allocation is unchanged — `reusable_for` matched on it — so
                 // this is the one field a second texture view of one surface
                 // moves.
-                slot.format = format;
+                //
+                // Through the setter, because it is a field the host window's
+                // publish decided presentability on: `slot_present_decline` asks
+                // `scanout_order()`, which reads exactly this. A published BGRA
+                // resident re-declared RGBA under the same allocation would be
+                // blitted in the wrong channel order by a window that had already
+                // been told it could take it.
+                self.set_registry_format(&identity, format);
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1897,8 +2043,8 @@ impl ResourcePools {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
-            slot.access = access;
         }
+        self.set_registry_access(identity, access);
         self.set_sole_copy(identity, !guest_backed);
     }
 
@@ -1925,13 +2071,15 @@ impl ResourcePools {
     pub(crate) fn registry_mark_depth_ready(&mut self, identity: &TargetIdentity) {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
-            // The depth pass declares `final_layout` DEPTH_STENCIL_ATTACHMENT_
-            // OPTIMAL unconditionally, so this is where the image is left and it
-            // is the `initial_layout` the next LOAD pass names. The two agreeing
-            // is what makes a LOAD valid without a barrier between the passes.
-            slot.access =
-                ResidentAccess::ColorWrite(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         }
+        // The depth pass declares `final_layout` DEPTH_STENCIL_ATTACHMENT_
+        // OPTIMAL unconditionally, so this is where the image is left and it
+        // is the `initial_layout` the next LOAD pass names. The two agreeing
+        // is what makes a LOAD valid without a barrier between the passes.
+        self.set_registry_access(
+            identity,
+            ResidentAccess::ColorWrite(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+        );
     }
 
     /// Whether this resident already holds rendered contents — the question a
@@ -2063,13 +2211,63 @@ impl ResourcePools {
         )
     }
 
+    /// Whether the host window is presenting from this resident, and so no
+    /// reclaim path may take it.
+    ///
+    /// This replaced a pin the presenter took around its blit — a
+    /// `&mut ResourcePools` write from a thread that must stop touching this
+    /// registry at all: it holds no device, and the registry is on its way to
+    /// the device the guest declared it against.
+    ///
+    /// `window_published` is the set the publish maintains and every removal
+    /// path already consults to move [`super::WINDOW_SOURCE_EPOCH`]. Asking it
+    /// here makes one set answer both questions — which residents a reclaim must
+    /// not take, and which residents' removal invalidates the window's source —
+    /// instead of a pin and a set that could disagree.
+    ///
+    /// # What the hold actually spans, which is not the whole present
+    ///
+    /// The set is the publish's, so this holds a resident from the publish that
+    /// named it until the next [`Self::invalidate_window_sources`]. In steady
+    /// state that end comes *before* the blit completes and often before it is
+    /// submitted: the present's own `registry_note_access` write-back moves the
+    /// access to `TransferRead`, and [`Self::set_registry_access`] bumps the
+    /// epoch on a change under a published identity — deliberately, since the
+    /// resolution the window is holding really has gone wrong. So the span is
+    /// [publish .. that write-back], and the in-flight blit after it is held by
+    /// `WINDOW_PRESENT_SLOT`'s graveyard bit instead.
+    ///
+    /// That is the division of labour and not a gap. The graveyard covers "a
+    /// blit is outstanding", which is a fact about submitted GPU work and
+    /// belongs to the thread that submitted it. This covers "the drain has
+    /// promised this resident to the window", which is a fact about a publish
+    /// and belongs to the registry. Neither can answer the other's question,
+    /// and the pin that used to try answered the first one badly — it existed
+    /// only while a blit was in flight, so a resident the window was displaying
+    /// but not currently blitting was an ordinary reclaim victim.
+    ///
+    /// Bounded either way: at most [`super::WINDOW_PUBLISHED_MAX`] identities,
+    /// and the publish that would exceed it bumps the epoch and clears the set,
+    /// which returns every stale one to the reclaim paths in the same call.
+    ///
+    /// It is not a safety mechanism and does not have to be one. A reclaim that
+    /// *did* take a published resident would move the epoch, so the window's next
+    /// present falls to host memory rather than to a destroyed handle, and a blit
+    /// already in flight is held by `WINDOW_PRESENT_SLOT`'s graveyard bit. This
+    /// is the policy half: do not reclaim the surface the user is looking at.
+    fn window_holds(&self, identity: &TargetIdentity) -> bool {
+        self.window_published.contains(identity)
+    }
+
     fn released_resident_keys(&self, max: usize) -> Vec<TargetIdentity> {
         self.registry_order
             .iter()
             .filter(|identity| {
-                self.registry
-                    .get(*identity)
-                    .is_some_and(ResidentTargetSlot::released_and_collectable)
+                !self.window_holds(identity)
+                    && self
+                        .registry
+                        .get(*identity)
+                        .is_some_and(ResidentTargetSlot::released_and_collectable)
             })
             .take(max)
             .cloned()
@@ -2139,8 +2337,84 @@ impl ResourcePools {
         identity: &TargetIdentity,
         access: ResidentAccess,
     ) {
-        if let Some(slot) = self.registry.get_mut(identity) {
-            slot.access = access;
+        self.set_registry_access(identity, access);
+    }
+
+    /// The one place a resident's declared format is written, and the place the
+    /// host window's licence is checked against that write.
+    ///
+    /// The sibling of [`Self::set_registry_access`], for the other field of a
+    /// live slot that production mutates in place. `registry_ensure`'s
+    /// framebuffer-only arm re-declares a surface's interpretation while keeping
+    /// its allocation, and `ResidentTargetSlot::scanout_order` — the condition
+    /// `slot_present_decline` refuses a non-BGRA resident on — derives from it.
+    ///
+    /// The failure is quieter than the access one and no less wrong: not an
+    /// invalid barrier but a frame blitted in the wrong channel order, by a
+    /// window that was told at publish that this resident could carry it.
+    ///
+    /// On a change, for the reason the sibling gives.
+    fn set_registry_format(
+        &mut self,
+        identity: &TargetIdentity,
+        format: translate::pixel::ResidentFormat,
+    ) {
+        let Some(slot) = self.registry.get_mut(identity) else {
+            return;
+        };
+        if slot.format == format {
+            return;
+        }
+        slot.format = format;
+        if self.window_published.contains(identity) {
+            self.invalidate_window_sources();
+        }
+    }
+
+    /// The one place a resident's access is written, and the place the host
+    /// window's licence is checked against that write.
+    ///
+    /// # Why the window cares about a layout at all
+    ///
+    /// `ResidentAccess` is not decoration on a slot. It is the `oldLayout`,
+    /// `srcStageMask` and `srcAccessMask` of the next barrier over that image,
+    /// and the host window builds one: its present blit reads
+    /// [`ResolvedResident::access`] resolved at publish. `WINDOW_SOURCE_EPOCH`
+    /// says the promised *image* still stands; without this, nothing said the
+    /// promised *access* did, and a barrier from an access the image has left is
+    /// an invalid transition rather than a stale picture.
+    ///
+    /// # Why the bump is on a change and not on a write
+    ///
+    /// Most writes here are no-ops for this purpose. A colour target rendered
+    /// again ends in the access it was already in, so bumping per write would
+    /// invalidate the window's source on every frame the drain redraws the
+    /// displayed surface — which is every frame — and send every present through
+    /// host memory. `window_source_access_moved` counted **zero** occurrences
+    /// across two driven boots (264 964 and 278 859 render records, 97 and 89
+    /// census windows at `direct_frac=1.00`), which is the same statement from
+    /// the other side: the value is stable under repeated identical rendering
+    /// and moves only when the resident's *use kind* changes.
+    ///
+    /// So the cost of this rule is exactly what that census measured, and the
+    /// hazard it closes is the case the census exists to find.
+    ///
+    /// The window's own blit write-back is deliberately not exempt. It moves the
+    /// access to `TransferRead`, which genuinely makes the resolution the window
+    /// is holding wrong; a re-present of that same source — reachable through
+    /// `needs_present`'s `redraw_required` on a resize or a suboptimal swapchain
+    /// — must take host memory rather than build a barrier from an access it has
+    /// itself invalidated.
+    fn set_registry_access(&mut self, identity: &TargetIdentity, access: ResidentAccess) {
+        let Some(slot) = self.registry.get_mut(identity) else {
+            return;
+        };
+        if slot.access == access {
+            return;
+        }
+        slot.access = access;
+        if self.window_published.contains(identity) {
+            self.invalidate_window_sources();
         }
     }
 
@@ -2392,9 +2666,11 @@ impl ResourcePools {
         self.registry_order
             .iter()
             .filter(|k| {
-                self.registry
-                    .get(*k)
-                    .is_some_and(|slot| slot.pin_count == 0 && !slot.gpu_only_content)
+                !self.window_holds(k)
+                    && self
+                        .registry
+                        .get(*k)
+                        .is_some_and(|slot| slot.pin_count == 0 && !slot.gpu_only_content)
             })
             .cloned()
             .collect()
@@ -2694,6 +2970,13 @@ pub(super) mod pin_count_tests {
         dummy_slot(true)
     }
 
+    /// The one interpretation this rail builds that is *not* the scanout's byte
+    /// order, so a test can name "not presentable for format reasons" without
+    /// transcribing a Vulkan enum.
+    fn rgba_format() -> translate::pixel::ResidentFormat {
+        translate::pixel::ResidentFormat::of(translate::pixel::RESIDENT_RGBA_FORMAT)
+    }
+
     fn dummy_slot(content_ready: bool) -> ResidentTargetSlot {
         ResidentTargetSlot {
             image: vk::Image::null(),
@@ -2722,6 +3005,655 @@ pub(super) mod pin_count_tests {
             gpu_only_content: false,
             last_touch_ms: 0,
         }
+    }
+
+    /// `unregister_resident` is the one removal path, so it is the one place
+    /// that can see a pin outstanding at removal — and the only place the
+    /// condition is nameable before the image is already gone.
+    ///
+    /// Asserted on the always-on stream rather than on a counter because the
+    /// open question this instrument exists to answer is reachability on a live
+    /// boot, and the log is what a boot is read from. The unpinned arm is here
+    /// for the reason the readback-memory probe reports both of its outcomes: a
+    /// silence has to be readable as "no holder was outstanding", which it
+    /// cannot be if the healthy case never says anything and the emitter might
+    /// simply be unwired.
+    #[test]
+    fn removing_a_pinned_resident_names_the_holder_the_disposal_will_not_wait_for() {
+        let cap = crate::observe::FailCapture::start();
+        let mut pools = ResourcePools::new();
+        let identity = pinned_identity();
+
+        // Through the product pin path, not `slot.pin_count = 1`: the count and
+        // the non-pinned totals are maintained together, and a hand-set field
+        // would remove a slot the totals still believe is unpinned.
+        pools.registry.insert(identity.clone(), ready_slot());
+        pools.registry_order.push_back(identity.clone());
+        assert!(
+            pools.pin_resident_target(&identity, true),
+            "a ready, unreleased slot grants a pin"
+        );
+
+        assert!(pools
+            .unregister_resident(&identity, ResidentReclaim::Recreated)
+            .is_some());
+        let line = cap.one("resident_retired_while_pinned");
+        assert!(
+            line.contains("reason=resident_retired_while_pinned"),
+            "{line}"
+        );
+        assert!(line.contains("why=recreated"), "{line}");
+        assert!(line.contains("pins=1"), "{line}");
+        // No serialized resource owns this one, so the whole pin is the
+        // transient class — the one whose fence `dispose` does not consult.
+        assert!(line.contains("resource_owners=0"), "{line}");
+    }
+
+    /// The other half of the pair above: a removal with no holder outstanding is
+    /// the ordinary case and must stay silent, or the line stops meaning
+    /// anything on a boot.
+    #[test]
+    fn removing_an_unpinned_resident_says_nothing() {
+        let cap = crate::observe::FailCapture::start();
+        let mut pools = ResourcePools::new();
+        let identity = pinned_identity();
+        pools.registry.insert(identity.clone(), ready_slot());
+        pools.registry_order.push_back(identity.clone());
+
+        assert!(pools
+            .unregister_resident(&identity, ResidentReclaim::Recreated)
+            .is_some());
+        assert!(
+            !cap.lines()
+                .iter()
+                .any(|l| l.contains("resident_retired_while_pinned")),
+            "{:?}",
+            cap.lines()
+        );
+    }
+
+    fn surface(id: u32) -> TargetIdentity {
+        TargetIdentity::Surface {
+            id,
+            width: 16,
+            height: 16,
+            generation: 0,
+            format: translate::pixel::SCANOUT_FORMAT,
+        }
+    }
+
+    fn admit_ready(pools: &mut ResourcePools, identity: &TargetIdentity) {
+        pools.registry.insert(identity.clone(), ready_slot());
+        pools.registry_order.push_back(identity.clone());
+    }
+
+    /// The publish's own ladder, in the order a slot progresses through it, and
+    /// the route name each rung answers with.
+    ///
+    /// This is where a resident is judged unable to carry a present. It used to
+    /// be judged twice — once here and once again by the presenter, which
+    /// re-read the slot on its failure path to name a `SlateReason` — and the
+    /// presenter's copy was the tested one. It is not any more: the presenter
+    /// takes the publish's decision and reads no registry, so this ladder is the
+    /// only one, and these are the tests the presenter's four classification
+    /// tests became.
+    ///
+    /// Ordered, and reported as the *first* blocker: a resident with no content
+    /// yet is not a resident of the wrong size, and remedying the size would not
+    /// make it presentable.
+    #[test]
+    fn the_publish_names_the_first_blocker_a_resident_carries() {
+        let ready = ready_slot();
+        assert!(super::slot_present_decline(&ready, 16, 16).is_none());
+
+        let mut unready = ready_slot();
+        unready.content_ready = false;
+        assert!(matches!(
+            super::slot_present_decline(&unready, 16, 16),
+            Some(super::ResidentPresentDecline::ContentNotReady)
+        ));
+
+        // Struct-update rather than an assignment, so the source-level count in
+        // `the_registry_writes_a_residents_access_in_exactly_one_place` keeps
+        // meaning "this many writers of a live slot's field".
+        let rgba = ResidentTargetSlot {
+            format: rgba_format(),
+            ..ready_slot()
+        };
+        assert!(
+            !rgba.scanout_order(),
+            "the present blit does no channel-order conversion"
+        );
+        assert!(matches!(
+            super::slot_present_decline(&rgba, 16, 16),
+            Some(super::ResidentPresentDecline::ScanoutOrder)
+        ));
+
+        assert!(matches!(
+            super::slot_present_decline(&ready, 32, 16),
+            Some(super::ResidentPresentDecline::Geometry)
+        ));
+
+        // Every rung failing at once answers the coarsest, not the finest.
+        let mut all = rgba;
+        all.content_ready = false;
+        assert!(matches!(
+            super::slot_present_decline(&all, 32, 16),
+            Some(super::ResidentPresentDecline::ContentNotReady)
+        ));
+    }
+
+    /// And each blocker reaches the drain as its own route name, because the
+    /// fallback it selects copies the whole framebuffer through host memory on
+    /// every frame and "no direct present" without a cause is what let
+    /// `direct_frac` sit at 0.00 for a whole boot.
+    #[test]
+    fn each_publish_blocker_has_its_own_route_name() {
+        let mut pools = ResourcePools::new();
+        let absent = surface(61);
+        assert_eq!(
+            super::super::super::resident_present_decision(&mut pools, &absent, 16, 16).err(),
+            Some("winpub_no_resident")
+        );
+
+        let unready = surface(62);
+        let mut slot = ready_slot();
+        slot.content_ready = false;
+        pools.registry.insert(unready.clone(), slot);
+        assert_eq!(
+            super::super::super::resident_present_decision(&mut pools, &unready, 16, 16).err(),
+            Some("winpub_content_not_ready")
+        );
+
+        let rgba = surface(63);
+        pools.registry.insert(
+            rgba.clone(),
+            ResidentTargetSlot {
+                format: rgba_format(),
+                ..ready_slot()
+            },
+        );
+        assert_eq!(
+            super::super::super::resident_present_decision(&mut pools, &rgba, 16, 16).err(),
+            Some("winpub_scanout_order")
+        );
+
+        let sized = surface(64);
+        pools.registry.insert(sized.clone(), ready_slot());
+        assert_eq!(
+            super::super::super::resident_present_decision(&mut pools, &sized, 32, 16).err(),
+            Some("winpub_geometry")
+        );
+
+        // And the accepting arm hands back the resolution the presenter blits
+        // from, resolved off the slot this transaction just accepted.
+        let good = surface(65);
+        pools.registry.insert(good.clone(), ready_slot());
+        let publication = super::super::super::resident_present_decision(&mut pools, &good, 16, 16)
+            .expect("a ready, BGRA, correctly sized resident carries the present");
+        assert_eq!(
+            publication.resolved,
+            super::slot_window_resolution(pools.registry_get(&good).expect("registered"))
+        );
+        assert_eq!(publication.epoch, super::window_source_epoch());
+    }
+
+    /// A declined publish records nothing, so a resident the window cannot take
+    /// does not join the set whose removal moves the epoch.
+    #[test]
+    fn a_declined_publish_vouches_for_nothing() {
+        let mut pools = ResourcePools::new();
+        let unready = surface(66);
+        let mut slot = ready_slot();
+        slot.content_ready = false;
+        pools.registry.insert(unready.clone(), slot);
+        assert!(
+            super::super::super::resident_present_decision(&mut pools, &unready, 16, 16).is_err()
+        );
+        let stamped = super::window_source_epoch();
+        assert!(pools
+            .unregister_resident(&unready, ResidentReclaim::ResourceReleased)
+            .is_some());
+        assert_eq!(
+            super::window_source_epoch(),
+            stamped,
+            "nothing was published against it"
+        );
+    }
+
+    /// The access half of the window's licence: the promised layout and source
+    /// masks, not only the promised image.
+    ///
+    /// Driven through the public door the drain uses, not by writing the field,
+    /// because the claim is that a *use-kind change* invalidates the source.
+    #[test]
+    fn moving_a_published_residents_access_moves_the_window_stamp() {
+        let mut pools = ResourcePools::new();
+        let published = surface(51);
+        admit_ready(&mut pools, &published);
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        pools.registry_note_access(&published, ResidentAccess::transfer_read(false));
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the barrier the window would build names an access the image has left"
+        );
+    }
+
+    /// And re-writing the access it already holds moves nothing.
+    ///
+    /// This is the whole reason the rule is on a *change* and not on a write. A
+    /// colour target rendered again ends in the access it was already in, so a
+    /// per-write bump would invalidate the window's source on every frame the
+    /// drain redraws the displayed surface and send every present through host
+    /// memory — the throughput cliff `direct_frac` measures.
+    #[test]
+    fn rewriting_the_access_a_published_resident_already_holds_moves_nothing() {
+        let mut pools = ResourcePools::new();
+        let published = surface(52);
+        admit_ready(&mut pools, &published);
+        let held = pools
+            .registry_get(&published)
+            .expect("just admitted")
+            .access;
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        for _ in 0..8 {
+            pools.registry_note_access(&published, held);
+        }
+        assert_eq!(super::window_source_epoch(), stamped);
+    }
+
+    /// A resident the window was never published against is not the window's
+    /// business, however its access moves.
+    #[test]
+    fn moving_an_unpublished_residents_access_moves_nothing() {
+        let mut pools = ResourcePools::new();
+        let published = surface(53);
+        let other = surface(54);
+        admit_ready(&mut pools, &published);
+        admit_ready(&mut pools, &other);
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        pools.registry_note_access(&other, ResidentAccess::transfer_read(true));
+        assert_eq!(super::window_source_epoch(), stamped);
+    }
+
+    /// The format half: a published resident re-declared under a different
+    /// channel order stops being the resident the window was told it could
+    /// take.
+    ///
+    /// `registry_ensure`'s framebuffer-only arm is where this happens in
+    /// production — same allocation, second texture view, new interpretation —
+    /// and the failure is quieter than the access one: not an invalid barrier
+    /// but a frame blitted in the wrong channel order.
+    #[test]
+    fn re_declaring_a_published_residents_format_moves_the_window_stamp() {
+        let mut pools = ResourcePools::new();
+        let published = surface(55);
+        admit_ready(&mut pools, &published);
+        let held = pools
+            .registry_get(&published)
+            .expect("just admitted")
+            .format;
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        // Re-declaring the interpretation it already carries is not a change,
+        // for the reason the access sibling gives.
+        pools.set_registry_format(&published, held);
+        assert_eq!(super::window_source_epoch(), stamped);
+
+        let other = rgba_format();
+        assert_ne!(other, held, "the two interpretations must actually differ");
+        pools.set_registry_format(&published, other);
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the publish decided presentability on `scanout_order`, which reads \
+             exactly this field"
+        );
+    }
+
+    /// Every door that writes a resident's access goes through the one that
+    /// checks the window's licence.
+    ///
+    /// Three public doors exist — `registry_mark_ready_at`,
+    /// `registry_mark_ready_with_access` and `registry_note_access`, plus the
+    /// depth sibling — and the rule is a property of the *field*, not of any one
+    /// of them. A fourth door assigning it directly would be a barrier the window
+    /// builds from an access the image has left, and nothing in the build relates
+    /// a new assignment to this rule.
+    #[test]
+    fn the_registry_writes_a_residents_access_in_exactly_one_place() {
+        const SOURCES: [&str; 6] = [
+            include_str!("images_and_registry.rs"),
+            include_str!("teardown.rs"),
+            include_str!("mod.rs"),
+            include_str!("submission_and_buffers.rs"),
+            include_str!("buffer_gather_working_set.rs"),
+            include_str!("sampled_working_set.rs"),
+        ];
+        // Any receiver, not just a binding called `slot`: a fourth door could
+        // write through `self.registry.get_mut(..).unwrap()` and a
+        // receiver-specific needle would not see it. `cargo fmt` normalizes the
+        // spacing, so one form is the whole space.
+        let format = concat!(".", "format", " = ");
+        let format_hits: usize = SOURCES.iter().map(|src| src.matches(format).count()).sum();
+        assert_eq!(
+            format_hits, 2,
+            "exactly two writers of a `format` field in `pools/`: \
+             `set_registry_format`, which is the only writer of a *live* slot's \
+             declared interpretation and where the window's stamp is checked \
+             against the write — `scanout_order` is what the publish decided \
+             presentability on — and one test helper building a slot before it \
+             is registered, which no window can be published against"
+        );
+        let needle = concat!(".", "access", " = ");
+        let hits: usize = SOURCES.iter().map(|src| src.matches(needle).count()).sum();
+        assert_eq!(
+            hits, 2,
+            "exactly two writers of an `access` field in `pools/`: \
+             `set_registry_access`, which is where the window's stamp is checked \
+             against the write, and `mark_resident_storage_image`, which writes \
+             the *compute-storage* registry — a different registry the host \
+             window is never published against"
+        );
+    }
+
+    /// A pools that goes away takes its registry with it, and the stamps
+    /// published against it with it.
+    ///
+    /// The path this covers has no `destroy_all` in it:
+    /// `EngineState::flush_device_derived` reaches `*pools = ResourcePools::new()`
+    /// with no `ctx`, the images having died with the `VkDevice`. The old pools
+    /// is dropped there and nothing else moves the epoch.
+    #[test]
+    fn dropping_a_pools_that_carried_a_window_source_moves_the_stamp() {
+        let stamped = {
+            let mut pools = ResourcePools::new();
+            let published = surface(41);
+            admit_ready(&mut pools, &published);
+            pools.note_window_published(Some(&published));
+            super::window_source_epoch()
+        };
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the registry the stamp names no longer exists"
+        );
+    }
+
+    /// And a pools that never carried one moves nothing.
+    ///
+    /// Every test in this crate builds a `ResourcePools`. A bump per drop would
+    /// make the counter mean "a pools was dropped" rather than "a window source
+    /// died", and the window would take a host-memory frame for each.
+    #[test]
+    fn dropping_a_pools_that_carried_no_window_source_moves_nothing() {
+        let stamped = super::window_source_epoch();
+        drop(ResourcePools::new());
+        {
+            let mut pools = ResourcePools::new();
+            admit_ready(&mut pools, &surface(42));
+            // A publish that *declined* records nothing, so this pools carries
+            // no source either.
+            pools.note_window_published(None);
+        }
+        assert_eq!(super::window_source_epoch(), stamped);
+    }
+
+    /// Every way out of the resident registry, counted in the source, because
+    /// the window's stamp is only sound if there are exactly the ones this
+    /// module answers for.
+    ///
+    /// The stamp lets the host window trust a resolved `VkImage` without reading
+    /// the registry. That trust rests on one claim: a published resident's slot
+    /// can stop being valid only by leaving through
+    /// [`ResourcePools::unregister_resident`] — which moves the epoch — or by the
+    /// registry itself going away, which `destroy_all` and `Drop for
+    /// ResourcePools` move it for. A third exit, added later by someone who did
+    /// not know the window existed, is a use-after-free and nothing in the build
+    /// relates it to this rule.
+    ///
+    /// So the rule is a count. `registry` is a private field of `ResourcePools`,
+    /// so `pools/` is the complete search space, and the needles are assembled
+    /// from pieces so this test's own source is not one of the hits.
+    #[test]
+    fn the_resident_registry_has_exactly_one_removal_and_one_drain() {
+        const SOURCES: [(&str, &str); 6] = [
+            (
+                "images_and_registry.rs",
+                include_str!("images_and_registry.rs"),
+            ),
+            ("teardown.rs", include_str!("teardown.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            (
+                "submission_and_buffers.rs",
+                include_str!("submission_and_buffers.rs"),
+            ),
+            (
+                "buffer_gather_working_set.rs",
+                include_str!("buffer_gather_working_set.rs"),
+            ),
+            (
+                "sampled_working_set.rs",
+                include_str!("sampled_working_set.rs"),
+            ),
+        ];
+        let count = |needle: &str| -> usize {
+            SOURCES
+                .iter()
+                .map(|(_, src)| src.matches(needle).count())
+                .sum()
+        };
+        let registry = concat!("self.", "registry");
+        assert_eq!(
+            count(&format!("{registry}.remove(")),
+            1,
+            "one removal path, and it is `unregister_resident`, which moves the \
+             window epoch when the slot it takes was published"
+        );
+        assert_eq!(
+            count(&format!("{registry}.drain(")),
+            1,
+            "one wholesale path, and it is `destroy_all`, which moves the window \
+             epoch on the line above it"
+        );
+        for other in [
+            ".clear()",
+            ".retain(",
+            ".extract_if(",
+            " = Default::default()",
+        ] {
+            assert_eq!(
+                count(&format!("{registry}{other}")),
+                0,
+                "`{registry}{other}` empties the registry without passing either \
+                 of the two paths the window's stamp is defended by"
+            );
+        }
+    }
+
+    /// The wholesale bump is in the same function as the destruction it answers
+    /// for, and before it.
+    ///
+    /// Ordering matters and the source is where it is visible: the loop frees
+    /// every image, so a bump after it would leave a window of frames in which
+    /// the stamp still compares equal and the handles are already destroyed.
+    #[test]
+    fn the_wholesale_bump_precedes_the_destruction_it_answers_for() {
+        const TEARDOWN: &str = include_str!("teardown.rs");
+        let bump = TEARDOWN
+            .find("invalidate_window_sources()")
+            .expect("`destroy_all` moves the window epoch");
+        let drain = TEARDOWN
+            .find(concat!("self.", "registry", ".drain("))
+            .expect("`destroy_all` is where the registry drains");
+        assert!(
+            bump < drain,
+            "the epoch moves before the images the window may be holding are freed"
+        );
+    }
+
+    /// The stamp the window checks instead of the registry, at the one removal
+    /// path that can invalidate it.
+    ///
+    /// Driven through `note_window_published` + `unregister_resident` rather than
+    /// by writing the epoch, because the claim is that *removal* is what
+    /// invalidates a published source — a test that moved the counter itself
+    /// would pass with the bump wired to nothing.
+    #[test]
+    fn removing_a_published_resident_moves_the_window_stamp() {
+        let mut pools = ResourcePools::new();
+        let published = surface(1);
+        let other = surface(2);
+        admit_ready(&mut pools, &published);
+        admit_ready(&mut pools, &other);
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        // A resident the window was never published against moves nothing.
+        // Every `ResourceReleased` retire in a boot comes through here, and a
+        // stamp that moved on each would send the window to host memory
+        // constantly — `direct_frac` is what that costs.
+        assert!(pools
+            .unregister_resident(&other, ResidentReclaim::ResourceReleased)
+            .is_some());
+        assert_eq!(
+            super::window_source_epoch(),
+            stamped,
+            "an unrelated resident leaving is not the window's business"
+        );
+
+        assert!(pools
+            .unregister_resident(&published, ResidentReclaim::Recreated)
+            .is_some());
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "a published resident leaving is exactly what the stamp is for"
+        );
+    }
+
+    /// The defect that made this a set rather than "the latest published
+    /// identity".
+    ///
+    /// The window's frame slot holds the newest source, but the window thread
+    /// may be holding an older one it has already read out — so a switch of
+    /// displayed surface must not stop vouching for the previous one. Recording
+    /// only the latest, publishing B and then retiring A left A's stamp
+    /// comparing equal, and A's image handle is what a source the window still
+    /// held would have blitted from.
+    #[test]
+    fn publishing_a_second_surface_does_not_stop_vouching_for_the_first() {
+        let mut pools = ResourcePools::new();
+        let first = surface(1);
+        let second = surface(2);
+        admit_ready(&mut pools, &first);
+        admit_ready(&mut pools, &second);
+
+        pools.note_window_published(Some(&first));
+        let stamped_for_first = super::window_source_epoch();
+        pools.note_window_published(Some(&second));
+        assert_eq!(
+            super::window_source_epoch(),
+            stamped_for_first,
+            "publishing another surface invalidates nothing by itself"
+        );
+
+        assert!(pools
+            .unregister_resident(&first, ResidentReclaim::Recreated)
+            .is_some());
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped_for_first,
+            "the first surface is still one a live source can name"
+        );
+    }
+
+    /// A decline is a no-op, not a clear.
+    ///
+    /// The window goes on presenting the source it was last given, which nothing
+    /// has removed — so that identity has to stay vouched for. Clearing on
+    /// decline would drop it and its later removal would move no epoch.
+    #[test]
+    fn a_declined_publish_keeps_vouching_for_what_was_already_handed_out() {
+        let mut pools = ResourcePools::new();
+        let published = surface(1);
+        admit_ready(&mut pools, &published);
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+        pools.note_window_published(None);
+
+        assert!(pools
+            .unregister_resident(&published, ResidentReclaim::Recreated)
+            .is_some());
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the decline did not take back the source already in the window's slot"
+        );
+    }
+
+    /// The set is answered for when the epoch moves, so a re-registered
+    /// identity nobody has published again moves nothing.
+    ///
+    /// A spurious bump would still be *safe* — it costs one present from host
+    /// memory — but the counter would stop meaning "a resident some live source
+    /// names has gone", which is the only claim the window reads it for.
+    #[test]
+    fn the_stamp_moves_once_per_publish_not_once_per_key() {
+        let mut pools = ResourcePools::new();
+        let published = surface(1);
+        admit_ready(&mut pools, &published);
+        pools.note_window_published(Some(&published));
+
+        assert!(pools
+            .unregister_resident(&published, ResidentReclaim::Recreated)
+            .is_some());
+        let after_first = super::window_source_epoch();
+
+        admit_ready(&mut pools, &published);
+        assert!(pools
+            .unregister_resident(&published, ResidentReclaim::Recreated)
+            .is_some());
+        assert_eq!(
+            super::window_source_epoch(),
+            after_first,
+            "no publish named this resident, so no live source can be holding it"
+        );
+    }
+
+    /// Overflow bumps rather than evicting, because evicting the oldest would
+    /// leave a live source whose removal moves nothing — the hole the set
+    /// exists to close, reintroduced by its own bound.
+    #[test]
+    fn overflowing_the_published_set_invalidates_instead_of_forgetting() {
+        let mut pools = ResourcePools::new();
+        let first = surface(0);
+        admit_ready(&mut pools, &first);
+        pools.note_window_published(Some(&first));
+        let stamped = super::window_source_epoch();
+
+        for id in 1..=super::WINDOW_PUBLISHED_MAX as u32 {
+            let identity = surface(id);
+            admit_ready(&mut pools, &identity);
+            pools.note_window_published(Some(&identity));
+        }
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the set could not go on vouching for every one of them, so it \
+             vouched for none"
+        );
+        assert!(pools
+            .unregister_resident(&first, ResidentReclaim::Recreated)
+            .is_some());
     }
 
     fn pinned_identity() -> TargetIdentity {
@@ -3007,6 +3939,121 @@ pub(super) mod pin_count_tests {
 
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(pools.released_resident_keys(1), vec![id]);
+    }
+
+    /// The resident the host window has been published against is not a reclaim
+    /// victim on either path, and stops being held the moment the publish set is
+    /// answered for.
+    ///
+    /// Asserted on both `released_resident_keys` (the drain's collection of what
+    /// the guest has released) and `recoverable_residents` (the allocation
+    /// retry's wider sweep), because they are separate predicates and a hold
+    /// that only one of them honoured would let the other destroy the image the
+    /// window is blitting from.
+    #[test]
+    fn a_window_published_resident_is_taken_by_neither_reclaim_path() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert_eq!(pools.release_resident_ownership(&id), Some(true));
+        assert_eq!(
+            pools.released_resident_keys(1),
+            vec![id.clone()],
+            "released and unheld is the baseline this test moves away from"
+        );
+
+        pools.note_window_published(Some(&id));
+        assert!(
+            pools.released_resident_keys(1).is_empty(),
+            "the surface the user is looking at is not collectable because the guest let go of it"
+        );
+        assert!(
+            pools.recoverable_residents().is_empty(),
+            "nor is it recoverable memory for a retried allocation"
+        );
+
+        // The hold is the publish set and nothing else, so answering for the set
+        // gives the resident back to both paths in one action.
+        pools.invalidate_window_sources();
+        assert_eq!(pools.released_resident_keys(1), vec![id.clone()]);
+        assert_eq!(pools.recoverable_residents(), vec![id]);
+    }
+
+    /// The hold ends where the window's own blit write-back invalidates the
+    /// source, which is before the blit retires and is not a gap.
+    ///
+    /// Asserted because [`ResourcePools::window_holds`] claims a span, and a
+    /// span no test draws is a span the next reader will assume is the whole
+    /// present. It is not: `registry_note_access(_, TransferRead)` is a change
+    /// under a published identity, so it bumps the epoch and clears the set that
+    /// is doing the holding. What covers the outstanding blit from there is
+    /// `WINDOW_PRESENT_SLOT`, which is not this registry's business.
+    #[test]
+    fn the_window_hold_ends_at_the_blits_own_access_write_back() {
+        let mut pools = ResourcePools::new();
+        let now = 10_000;
+        pools.idle_clock_ms = now;
+        admit(&mut pools, surf(1), now, 0);
+        pools.registry_note_access(
+            &surf(1),
+            super::ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+        );
+
+        pools.note_window_published(Some(&surf(1)));
+        let published_epoch = super::window_source_epoch();
+        assert!(
+            pools.recoverable_residents().is_empty(),
+            "held from the publish that named it"
+        );
+
+        // Exactly the write-back `begin_present` makes after recording its read
+        // barrier, at the same argument.
+        pools.registry_note_access(&surf(1), super::ResidentAccess::transfer_read(false));
+        assert_ne!(
+            super::window_source_epoch(),
+            published_epoch,
+            "the write-back is a change under a published identity, so it bumps"
+        );
+        assert_eq!(
+            pools.recoverable_residents(),
+            vec![surf(1)],
+            "and the bump cleared the set, so the hold is over before the blit is"
+        );
+    }
+
+    /// Overflowing the publish set returns everything it was holding, so the
+    /// hold cannot accumulate residents a long-running guest never gets back.
+    ///
+    /// This is the bound the hold rests on: it is not that a stale entry leaves
+    /// when the window stops reading it — nothing on this side of the boundary
+    /// knows that — but that the (`WINDOW_PUBLISHED_MAX` + 1)th publish clears
+    /// every one of them.
+    #[test]
+    fn overflowing_the_publish_set_returns_the_residents_it_was_holding() {
+        let mut pools = ResourcePools::new();
+        let now = 10_000;
+        pools.idle_clock_ms = now;
+        for id in 1..=super::WINDOW_PUBLISHED_MAX as u32 {
+            admit(&mut pools, surf(id), now, 0);
+            pools.note_window_published(Some(&surf(id)));
+        }
+        assert!(
+            pools.recoverable_residents().is_empty(),
+            "every admitted resident is held by the publish set"
+        );
+
+        let overflow = surf(super::WINDOW_PUBLISHED_MAX as u32 + 1);
+        admit(&mut pools, overflow.clone(), now, 0);
+        pools.note_window_published(Some(&overflow));
+        assert_eq!(
+            pools.recoverable_residents(),
+            (1..=super::WINDOW_PUBLISHED_MAX as u32)
+                .map(surf)
+                .collect::<Vec<_>>(),
+            "the bump cleared the set, and only the identity that caused it is held"
+        );
     }
 
     /// A released resource whose resident still holds the only copy of a frame

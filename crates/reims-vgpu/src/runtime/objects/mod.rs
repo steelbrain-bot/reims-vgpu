@@ -23,7 +23,9 @@ use crate::protocol::iosurface_pages::{
 };
 use crate::runtime::decode::resource::{
     decode_list_object_entry, list_object_entry_offset, ListObjectEntry, OBJECT_LIST_ENTRY_LEN,
-    OBJECT_TYPE_MAPPER_REF_TEXTURE,
+    OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_MAPPER_REF_TEXTURE,
+    OBJECT_TYPE_SERIALIZER_OBJECT, OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS,
+    OBJECT_TYPE_TEXTURE_VIEW,
 };
 use crate::runtime::gva_mem;
 use crate::runtime::host::HostMemory;
@@ -1586,6 +1588,23 @@ pub enum LadderRung {
     /// rung — "the entry said this many bytes at that GVA and they could not be
     /// read" — and the entry it came from is gone by the time a caller reports.
     DescRead { declared_len: u32 },
+    /// The task's address space does not exist, so the reference is a slot in
+    /// no namespace.
+    ///
+    /// **The rung below [`Self::NoListEntry`]**, and it is a different
+    /// statement: an empty slot is a live task that has published nothing
+    /// there, and this is a reference into a task that was never defined or has
+    /// been deleted. The two used to be one answer because this device created a
+    /// task's namespace on demand; `reims_vgpu_core::lifecycle::Lifecycle`
+    /// refuses instead, and a name minted into a space with no page directory is
+    /// a name whose every address resolves through nothing.
+    ///
+    /// Unreachable through the two callers that can produce it — both ask
+    /// `lookup_list_entry` first, which requires `DeviceState::tasks` to hold an
+    /// active task, and that table and the owner's are written by the same pair
+    /// of functions. Named rather than assumed away, because the coupling is a
+    /// property of two functions and a reader of either one cannot see it.
+    NoTaskSpace,
 }
 
 /// Why construction of a retained sampler object did not complete.
@@ -1643,6 +1662,27 @@ pub fn resolve_sampler_state<M: HostMemory>(
             tag,
             declared_len,
         })?;
+    // The model's name for this slot, taken at the one moment it can be.
+    //
+    // A sampler is constructed out of the guest's object list once and then
+    // answered from `task_sampler_states` forever, so nothing asks the list
+    // about it again — and the guest clears the list slot before it sends the
+    // destroy. A driven macos-15 boot measured what that cost: of 1984 destroys
+    // this device retires something for, **the semantic model had a name for
+    // zero of them** (`delete_object_retained_ref_model_unnamed`), because the
+    // only paths that declare a name are the ones this construction bypasses.
+    // A retirement the model cannot name is a retirement it cannot be told
+    // about, which is the whole of why `CmdDeleteObject` could not cross the
+    // ingress bridge.
+    //
+    // `name_resource` is that door and not a second declaration site: it
+    // answers from `DeviceState::object_name` when a name exists and declares
+    // through `declare_object_name` when one does not, exactly as the
+    // production `RefResolver` does. Its answer is deliberately dropped — this
+    // function returns a sampler, and whether the slot could also be *named* is
+    // a separate fact whose absence must not fail a construction that
+    // succeeded.
+    let _ = name_resource(state, host, task_id, sampler_ref);
     let sampler = state.task_sampler_states.register(
         task_id,
         sampler_ref,
@@ -1696,6 +1736,12 @@ fn note_stale_task_resource<M: HostMemory>(
     cached: &TaskResource,
 ) {
     let Some(entry) = lookup_list_entry(state, host, task_id, obj_ref) else {
+        // The guest's list no longer answers for this reference at all. Counted
+        // apart from the comparisons: it is not a disagreement about what the
+        // slot holds, it is the list having moved or gone, and folding it into
+        // the denominator would make the agreement rate a function of task
+        // teardown.
+        crate::runtime::drain::note_store_route("task_resource_unlisted");
         return;
     };
     // The entry is half the snapshot. The other half is the descriptor bytes it
@@ -1707,9 +1753,55 @@ fn note_stale_task_resource<M: HostMemory>(
     let descriptor_moved = live_descriptor
         .as_ref()
         .is_some_and(|bytes| bytes.as_slice() != &*cached.descriptor);
+    // The denominator, and it decides something. The `task_resource_stale` line
+    // below is `first_sight`-gated, so a boot with no line is a boot where the
+    // guest never overwrote a slot **or** a boot where this witness never
+    // compared anything -- and those are opposite facts about the same silence.
+    //
+    // What it decides is the cutover's declaration discipline. This device
+    // declares an object when it first constructs it, and on this interface the
+    // guest replaces an object by writing over its own object-list record with
+    // no packet at all. `reims_vgpu_core::namespace::Namespace::declare` says a
+    // live slot may be redeclared and gives the new occupant a new generation;
+    // if that happens on a real guest, the replacement model needs the device to
+    // notice it here and redeclare, or every later reference resolves to the
+    // previous occupant's bytes. If it never happens, it does not.
+    //
+    // Read, on a driven macos-15 boot to the desktop:
+    //
+    //     task_resource_reexamined            68965
+    //     task_resource_slot_repointed            0
+    //     task_resource_descriptor_rewritten      0
+    //     task_resource_unlisted                  0
+    //
+    // And again, on the boot where the namespace is the naming authority and a
+    // repoint would have to be answered rather than only counted:
+    //
+    //     task_resource_reexamined           137041
+    //     task_resource_slot_repointed            0
+    //     task_resource_descriptor_rewritten      0
+    //     task_resource_unlisted                  0
+    //
+    // Twice the comparisons, the same zero. Sixty-nine thousand comparisons and
+    // not one disagreement, then a hundred and thirty-seven thousand. On this rail the
+    // guest never repoints a live slot and never rewrites a descriptor under
+    // one, so declaring at first construction is sound here and the
+    // redeclaration path is unexercised rather than unneeded — the model handles
+    // the overwrite either way, and this is the number that says how often it
+    // would have to.
+    crate::runtime::drain::note_store_route("task_resource_reexamined");
     if entry == cached.entry && !descriptor_moved {
         return;
     }
+    // Counted on every sighting rather than the first, and split, because the
+    // two disagreements are different events: the slot pointing somewhere else
+    // is the guest replacing the object, and the same bytes at the same address
+    // having changed is the serializer rewriting a descriptor in place.
+    crate::runtime::drain::note_store_route(if entry == cached.entry {
+        "task_resource_descriptor_rewritten"
+    } else {
+        "task_resource_slot_repointed"
+    });
     let disc = crate::backend::hash::hash_u64(
         u64::from(task_id) << 32 | u64::from(obj_ref),
         entry.descriptor_gva
@@ -1733,6 +1825,1152 @@ fn note_stale_task_resource<M: HostMemory>(
     ));
 }
 
+/// The guest-VA allocation an object's own descriptor names, from bytes.
+///
+/// For the callers that hold descriptor *bytes* rather than a constructed
+/// resource — a re-read of the guest's own list, where the whole point is not
+/// to trust this device's cache. It decodes and then asks
+/// [`Descriptor::backing_window`], which is the one implementation of the
+/// arithmetic; a caller holding a `TaskResource` should use
+/// [`cached_window`] and pay for no decode at all.
+fn backing_window(
+    page_shift: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Option<(u64, u64)> {
+    if crate::runtime::decode::resource::descriptor_is_heap_placement(descriptor) {
+        return None;
+    }
+    crate::runtime::decode::resource::decode_descriptor(entry.object_type, descriptor)
+        .ok()?
+        .backing_window(page_shift)
+}
+
+/// Whether the guest's object list still says `holder` occupies `base`.
+///
+/// Read out of guest memory rather than out of this device's construction
+/// cache, because the cache cannot see a free: see
+/// [`note_backing_window_alias`] for what that costs and why this is the only
+/// test that separates an alias from a reuse.
+fn holder_still_names<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    holder: u32,
+    base: u64,
+) -> bool {
+    let Some(entry) = probe_list_entry(state, host, task_id, holder) else {
+        return false;
+    };
+    let Some(descriptor) = read_descriptor(state, host, task_id, &entry) else {
+        return false;
+    };
+    backing_window(state.page_shift, &entry, &descriptor).is_some_and(|(held, _)| held == base)
+}
+
+/// Whether a second live reference in this task already names this window.
+///
+/// # The question this settles, and why it blocks a canonical backing identity
+///
+/// `reims_vgpu_core::access::BackingId` is the identity two resources sharing
+/// backing must share, and the derivation this device is committed to is the
+/// window plus an incarnation. The incarnation was counted *per reference*,
+/// because a re-point packet names a reference and nothing else.
+///
+/// That is canonical exactly as long as one window has one live name. If two
+/// references in one task name one window, then re-pointing through one of them
+/// advances that reference's count and leaves the other where it was — and the
+/// same bytes carry two ids. Two ids for one backing is a hazard edge the
+/// dependency compiler never draws, which is a data race, and it is the failure
+/// direction `BackingId`'s own doc calls false distinctness.
+///
+/// So this was never a diagnostic about tidiness: a single sighting falsifies
+/// the derivation. **It sighted one.** A driven macos-15 boot examined 74
+/// collisions and one was a genuine alias — two live references over a single
+/// 8 294 400-byte window, 1920×1080×4, the compositor's own scanout allocation
+/// and so the most hazard-critical backing on the device. The count moved from
+/// the reference to the window, which is where `DeviceState::storage_incarnation`
+/// keeps it now.
+///
+/// That is not the end of this instrument's job. It still adjudicates every
+/// collision, and it is what fills the aliased-reference set the per-reference
+/// state that *remains* is checked against — see
+/// [`note_reference_shares_storage`]. A second sighting on a window nothing has
+/// re-keyed is still a finding.
+///
+/// # The confound this has to exclude, and how
+///
+/// One name *after* another over one allocation is not two names at once, and
+/// it is the common case: the guest frees an object by writing over its own
+/// object-list record, with no packet, and then reuses the pages. This device
+/// is not told, so [`crate::model::TaskResources`] goes on holding the freed
+/// reference's construction and a liveness test against it would call a
+/// sequence an alias.
+///
+/// So liveness is asked of the guest's own list, not of this device's cache:
+/// the holder's *current* object-list entry is re-read and its window
+/// re-derived, and the sighting stands only if that still names the very same
+/// window. A holder whose slot has been overwritten, cleared, or re-pointed
+/// answers with a different window or none, and the claim quietly moves to the
+/// new reference. That is the same technique — and the same reason —
+/// [`note_stale_task_resource`] uses to tell a recycled slot from a steady one.
+///
+/// One `first_sight` per distinct window, so a compositor recycling one
+/// allocation reports once and not once per frame.
+///
+/// The aliasing reference is returned as well as reported, so the reading can
+/// be asserted where a boot is not available — the same reason
+/// [`note_heap_reference`] returns one.
+fn note_backing_window_alias<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+    base: u64,
+    size: u64,
+) -> Option<u32> {
+    let holder = state.claim_backing_window(task_id, obj_ref, base)?;
+    // Every collision is counted, whichever way it is adjudicated, because a
+    // zero on the sighting alone is not interpretable: a boot where no window
+    // was ever claimed twice and a boot where the guest-list re-read never
+    // succeeded read the same. `backing_window_reclaimed` is the denominator
+    // that tells them apart, and a null reading only means "no aliases" when
+    // it is non-zero.
+    crate::runtime::drain::note_store_route("backing_window_collision");
+    if !holder_still_names(state, host, task_id, holder, base) {
+        crate::runtime::drain::note_store_route("backing_window_reclaimed");
+        state.take_backing_window(task_id, obj_ref, base);
+        return None;
+    }
+    // Recorded before the reporting gate, and on every sighting rather than the
+    // first. The hot paths that ask `DeviceState::reference_is_aliased` are
+    // only as sharp as this set is early and complete, and construction is the
+    // earliest moment either name exists — a payment for a reference the set
+    // has not heard of yet is a payment the alarm cannot examine.
+    state.note_aliased_reference(task_id, obj_ref);
+    state.note_aliased_reference(task_id, holder);
+    if !crate::observe::first_sight("backing_window_alias", (u64::from(task_id) << 40) ^ base) {
+        return Some(holder);
+    }
+    crate::observe::fail(format!(
+        "backing_window_alias task={task_id} base={base:#x} size={size} \
+         refs=[{holder},{obj_ref}] (two live references in one task name one \
+         guest-VA window; the storage incarnation is keyed on the window so both \
+         names move together, and this line is what any per-reference state \
+         still standing for storage has to be checked against)"
+    ));
+    Some(holder)
+}
+
+/// Why an object this device constructed cannot be declared into the semantic
+/// model.
+///
+/// Both arms are gaps rather than guest errors, and both are counted, because
+/// the number that matters before the cutover is what fraction of a real
+/// guest's object list the model can describe at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageRefusal {
+    /// The storage has no canonical identity. Carries the identity's own
+    /// refusal, so the reason is the one [`backing_id`] names rather than a
+    /// second vocabulary for the same facts.
+    Backing(BackingIdRefusal),
+    /// The identity is known and the object's own byte window inside it is not.
+    ///
+    /// The mapper-ref texture is the case: its storage is a mapping's surface,
+    /// which has an identity, and which *plane* of that surface the texture is
+    /// comes from the surface descriptor rather than from this record. An
+    /// extent guessed at would declare content authority over a neighbouring
+    /// plane's bytes.
+    ExtentUnrecovered { object_type: u8 },
+}
+
+impl StorageRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Backing(inner) => inner.slug(),
+            Self::ExtentUnrecovered { .. } => "storage_extent_unrecovered",
+        }
+    }
+}
+
+/// What the semantic model would be told this object's storage is.
+///
+/// The object-list walk's per-object translation, and a pure function of the
+/// entry, the descriptor and the identity interning:
+/// `reims_vgpu_core::lifecycle::LifecycleOp::CreateResource` carries exactly
+/// this value, and it is the last thing between a constructed guest object and
+/// a declaration the model admits.
+///
+/// # The three answers, and why the third is not a fourth
+///
+/// An object that owns an allocation is `Dedicated`, with the *identity* of the
+/// allocation and this object's own byte window inside it — two different
+/// questions, answered by two different methods, because two textures at
+/// different offsets in one allocation are one storage with two extents.
+///
+/// An object that owns no bytes at all is `NoBytes`, which is most of a list:
+/// samplers, functions, pipeline states, depth-stencil states, views over
+/// another object's bytes. That is a description and not a refusal — the model
+/// holds the name, the generation and the deletion, and holds no memory because
+/// there is none.
+///
+/// A heap placement would be `Placed`, and is not produced here. The identity
+/// half is settled but a heap's *extent* is not, so a placement cannot be
+/// bounded and two placements sharing bytes would come out distinct; it arrives
+/// as [`BackingIdRefusal::HeapPlaced`] and is refused by name. No driven boot
+/// has yet placed a heap texture, which is why the term is still open.
+///
+/// # Errors
+///
+/// [`StorageRefusal`], one arm per half of the answer that is missing.
+pub fn declared_storage(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Result<reims_vgpu_core::lifecycle::Storage, StorageRefusal> {
+    use reims_vgpu_core::access::ByteRange;
+    use reims_vgpu_core::lifecycle::Storage;
+    let backing = match backing_id_of(state, task_id, obj_ref, entry, descriptor) {
+        Ok(backing) => backing,
+        // The object names no storage, which is the whole answer rather than a
+        // failure to find one.
+        Err(BackingIdRefusal::NamesNoStorage { .. }) => return Ok(Storage::NoBytes),
+        Err(other) => return Err(StorageRefusal::Backing(other)),
+    };
+    // Two derivations, because the two kinds of storage measure their extent in
+    // different spaces. An address-named object's window is an offset into the
+    // allocation its own descriptor names, and that descriptor is where it comes
+    // from. A mapper-ref texture's is an offset into a *surface* it shares with
+    // the other planes of one IOSurface, and which plane it is comes from the
+    // mapping's published device descriptor.
+    let extent = if entry.object_type == OBJECT_TYPE_MAPPER_REF_TEXTURE {
+        mapper_ref_surface_extent(state, descriptor)
+    } else if entry.object_type == OBJECT_TYPE_BACKING {
+        // A surface-backing object *is* the whole surface, and its own record
+        // says how long that is. There is no plane to pick out and no
+        // allocation to be a window of: the mapper-ref textures over this
+        // mapping are the ones with offsets, and they take them from the
+        // published device descriptor.
+        reims_vgpu_wire::device_desc::backing_header(descriptor)
+            .ok()
+            .map(|header| (0u64, header.length.get()))
+    } else {
+        crate::runtime::decode::resource::decode_descriptor(entry.object_type, descriptor)
+            .ok()
+            .and_then(|decoded| decoded.allocation_extent())
+    };
+    let (offset, length) = extent.ok_or(StorageRefusal::ExtentUnrecovered {
+        object_type: entry.object_type,
+    })?;
+    note_extent_against_allocation(state, task_id, obj_ref, entry, descriptor, offset, length);
+    Ok(Storage::Dedicated {
+        backing,
+        extent: ByteRange { offset, length },
+    })
+}
+
+/// Say when a declared extent is a strict sub-window of the allocation it sits
+/// in, and how short.
+///
+/// **The census the exec window refusals need.** `Lifecycle::access` checks a
+/// record's `Range` participation against the resource's *extent* — the union of
+/// its level records for a texture, the whole allocation for a buffer — and a
+/// driven macos-15 boot refuses seven exec packets a boot on
+/// `OutOfPlacement`, one of them `ref=28` asking `offset=65536 length=196608`
+/// of a resource whose resident range is `{offset: 0, length: 196608}`. The
+/// window's end is 262 144, which is exactly 256 KiB, and the extent is exactly
+/// 192 KiB: a record naming the allocation where the model holds a sub-window
+/// of it would look precisely like that.
+///
+/// So this measures the gap directly, and the gap is not rare. A driven
+/// macos-15 boot:
+///
+/// ```text
+/// declared_extent_is_the_allocation   6348
+/// declared_extent_is_a_sub_window     4117
+/// declared_extent_over_no_window       204
+/// ```
+///
+/// **Two declarations in five put an extent strictly inside its allocation**,
+/// and every one of the 492 distinct `(task, ref)` pairs named is a texture —
+/// 175 `OBJECT_TYPE_TEXTURE` and 317 `OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS`,
+/// none of any other type. That is `Descriptor::allocation_extent`'s union of
+/// level records doing exactly what its doc says, and it is what makes the
+/// window check a live surface rather than a corner: the refusals are seven a
+/// boot today against four thousand declarations that could produce one.
+///
+/// It also shows the neighbours. `ref=27` holds `{0, 65536}` of a 196 608-byte
+/// allocation and `ref=28` holds the whole 196 608 of one — and it is `ref=28`
+/// that a record asks for `offset=65536 length=196608` of, overrunning by
+/// exactly `ref=27`'s length. What is still unrecovered is which record that
+/// is: the refusal names its `StreamSite` and not its kind, and the kind is
+/// what says whether the offset belongs to the object or to the allocation.
+fn note_extent_against_allocation(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+    offset: u64,
+    length: u64,
+) {
+    let Some((_, allocation)) = backing_window(state.page_shift, entry, descriptor) else {
+        crate::runtime::drain::note_store_route("declared_extent_over_no_window");
+        return;
+    };
+    if offset.saturating_add(length) >= allocation {
+        crate::runtime::drain::note_store_route("declared_extent_is_the_allocation");
+        return;
+    }
+    crate::runtime::drain::note_store_route("declared_extent_is_a_sub_window");
+    if crate::observe::first_sight(
+        "declared_extent_is_a_sub_window",
+        (u64::from(task_id) << 32) | u64::from(obj_ref),
+    ) {
+        crate::observe::fail(format!(
+            "declared_extent_is_a_sub_window task={task_id} ref={obj_ref} \
+             object_type={} extent_offset={offset} extent_length={length} \
+             allocation={allocation} (the model will check every record's window against \
+             the extent, so a record naming the allocation refuses here)",
+            entry.object_type,
+        ));
+    }
+}
+
+/// The device answering the semantic model's mapping-namespace resolver.
+///
+/// # The first of the model's two resolvers this device satisfies
+///
+/// `reims_vgpu_core::resolve` splits resolution in two because it splits two
+/// namespaces: a mapping id and an object-list ref arrive as `u32`s that overlap
+/// numerically and name unrelated things. This is the mapping half, and the
+/// device can answer it in full today — [`mapping_backing_id`] mints the
+/// identity of a mapping's surface storage, and that is the whole of what this
+/// trait asks.
+///
+/// The object half is answered by [`TaskRefResolver`], and what unblocked it was
+/// the device taking a namespace: `RefResolver` answers a `ResourceId`, which
+/// carries a slot *generation*, and generations are
+/// `reims_vgpu_core::namespace::Namespace`'s to issue. While this device had
+/// only a construction cache keyed by `(task, reference)` with no generation in
+/// it, implementing the trait over that cache would have minted generations from
+/// nothing — the second lifetime model the replacement plan forbids. It now has
+/// the namespace, so the answer is the namespace's and is not minted here.
+///
+/// # A refusal is `None`, and that is the trait's own shape
+///
+/// The trait answers "the backing a mapping's surface is resolved to, or `None`
+/// when the mapping names no live surface". Both of [`MappingBackingRefusal`]'s
+/// arms are exactly that — a mapping id nothing is listed for, and an entry the
+/// guest has never mapped a surface into — so nothing is lost by flattening
+/// them here. The typed arms stay available to callers that want to say which,
+/// and `reims_vgpu_core::query`'s present path wants only whether.
+impl reims_vgpu_core::resolve::MappingResolver for DeviceState {
+    fn backing(
+        &self,
+        mapping: reims_vgpu_core::identity::MappingId,
+    ) -> Option<reims_vgpu_core::access::BackingId> {
+        mapping_backing_id(self, mapping.0).ok()
+    }
+}
+
+/// Census whether the refs a resource-lifetime packet names already have names
+/// in the task's object namespace.
+///
+/// # The question the cutover cannot ask afterwards
+///
+/// `reims_vgpu_core::lifecycle::resource_list` resolves every ref in a counted
+/// list or refuses the whole packet — deliberately, since a partial
+/// `Invalidate` claims the resources that happened to resolve are the only ones
+/// that went stale. So the four list commands cross to the model exactly when
+/// every ref they name resolves, and this device's namespace is populated
+/// **lazily**: [`resolve_resource`] declares an object the first time something
+/// reads it, not when the guest publishes its object list.
+///
+/// Those two facts have a collision in them. A guest may legally synchronize,
+/// invalidate or discard a resource this device has never had a reason to
+/// construct — nothing in the interface says a resource must be drawn before it
+/// is named — and every such packet would refuse at the bridge while being
+/// perfectly well formed. Whether that is a corner or the common case is not
+/// something the code says; it is a property of a real driver's ordering, and it
+/// decides whether the lazy declaration can stand or whether the namespace has
+/// to be populated from the guest's table at `SetObjectList` time.
+///
+/// So the reading is taken before the switch is cut, at the two arms that
+/// already decode these lists, against an unmodified guest.
+/// `lifetime_ref_asked` is the denominator — without it a boot where every ref
+/// resolved and a boot where no list packet arrived read the same.
+///
+/// # It reads twice, because the first reading answered the wrong half
+///
+/// The first driven reading of this census was **49 unnamed of 1339**, which
+/// said lazy declaration leaves a residue and said nothing about what closes it.
+/// Read early in that same boot it was 16 of 17 — which is why a census is
+/// summed over a whole run and never sampled: the cold start had the ratio
+/// inverted, and stopping there would have concluded that lazy declaration was
+/// useless rather than nearly sufficient. So the
+/// census now asks the second question too, at the same site: for a ref
+/// construction has not named, can [`name_resource`] name it from the guest's
+/// own object list? That is what the bridge will do, and
+/// `lifetime_ref_named_on_demand` is the count of refs it works for.
+/// `lifetime_ref_unnameable` is the residue — an empty slot, an unreadable
+/// descriptor — which no namespace could have answered for either and which the
+/// cutover would still refuse.
+///
+/// Asking is not free of consequence and is not meant to be: `name_resource`
+/// declares. That is the behaviour the reading is *of*, not an observation
+/// perturbing it — the census is the first caller of the door the bridge will
+/// use, and the numbers are what that door does on a real guest.
+///
+/// # The second reading, on a driven macos-15 boot to the desktop
+///
+/// ```text
+/// lifetime_ref_asked                  1232
+/// lifetime_ref_already_named          1213
+/// lifetime_ref_named_on_demand          19
+/// lifetime_ref_unnameable                0
+/// lifetime_ref_list_would_refuse         0
+/// object_named_before_constructed        0
+/// object_declared_over_a_live_name       0
+/// ```
+///
+/// 1213 + 19 = 1232 exactly, and **the residue is zero**: every ref a real
+/// guest's lifetime lists named was answerable, and not one packet would have
+/// been refused for want of a name. The 19 are the ones the previous boot
+/// counted as losses (49 there, same order of magnitude on a workload of the
+/// same size), and they are now answered from the guest's own table rather than
+/// waiting for a draw that never comes.
+///
+/// The two zeros beside them are what says the door is safe as well as
+/// sufficient. `object_declared_over_a_live_name` stayed at zero, so naming
+/// ahead of construction displaced nothing; and `object_named_before_constructed`
+/// — the arm [`resolve_resource`] takes when it finds a name it did not issue —
+/// also read zero, which is a reading and not a gap: on this rail the 19 refs
+/// named by a lifetime packet were never subsequently drawn. It is the counter
+/// that would say so if they were, and the path it guards is the one that keeps
+/// a later construction from minting a second generation over a live object.
+///
+/// # What it deliberately does not cover
+///
+/// The two single-ref commands (`DeleteResource`, `ReplacePhysical`) and the
+/// EXEC resource table are not counted here. Each decodes elsewhere, and a
+/// census spread across four decoders would be four chances to count one packet
+/// twice or none. These two arms are where the model's own list join reads, and
+/// they are the ones whose all-or-nothing rule makes an unnamed ref cost the
+/// whole packet.
+pub fn note_lifetime_refs_named<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    refs: &[u32],
+) {
+    // Counted per packet as well as per ref, because the refusal is per packet:
+    // one unnamed ref in a list of forty costs all forty.
+    crate::runtime::drain::note_store_route("lifetime_ref_list_asked");
+    let mut unnamed = 0usize;
+    for &object_ref in refs {
+        crate::runtime::drain::note_store_route("lifetime_ref_asked");
+        if state.object_name(task_id, object_ref).is_some() {
+            crate::runtime::drain::note_store_route("lifetime_ref_already_named");
+            continue;
+        }
+        // The second half of the reading, and the one that decides. The first
+        // half said construction had not named this ref; this asks whether the
+        // guest's own object list can, which is what the bridge will do. A ref
+        // this cannot name is one no populated namespace would have either — an
+        // empty slot or an unreadable descriptor — and is the residue the
+        // cutover would still have to refuse.
+        if name_resource(state, host, task_id, object_ref).is_some() {
+            crate::runtime::drain::note_store_route("lifetime_ref_named_on_demand");
+        } else {
+            crate::runtime::drain::note_store_route("lifetime_ref_unnameable");
+            unnamed += 1;
+        }
+    }
+    if unnamed == 0 {
+        return;
+    }
+    // The packet-level count is what the bridge's all-or-nothing rule prices.
+    crate::runtime::drain::note_store_route("lifetime_ref_list_would_refuse");
+    if crate::observe::first_sight(
+        "lifetime_ref_unnamed",
+        (u64::from(task_id) << 32) | refs.first().copied().map_or(0, u64::from),
+    ) {
+        crate::observe::fail(format!(
+            "lifetime_ref_unnamed task={task_id} unnamed={unnamed} of={} first_ref={:?}              (the guest named a resource in a lifetime list that this device has never              constructed, so the namespace has no name for it; the model's list join              resolves every ref or refuses the packet, which makes this the count that              decides whether lazy declaration can stand)",
+            refs.len(),
+            refs.first(),
+        ));
+    }
+}
+
+/// The device answering the semantic model's object-namespace resolver, for one
+/// task.
+///
+/// # Why this is a borrow of the device and not the device
+///
+/// `reims_vgpu_core::resolve::RefResolver::resource` takes an `object_ref` and
+/// nothing else, because in the model a resolver *is* one namespace: the
+/// interpreter that holds one is already inside the task whose refs it is
+/// resolving. This device holds every task's namespace at once, keyed by
+/// `task_id`, so it cannot implement the trait itself without inventing an
+/// answer to "which task" — and the two plausible inventions, a current-task
+/// field or a default, are both a place for the wrong namespace to answer a
+/// well-formed question.
+///
+/// So the task is bound at construction and the trait is implemented on the
+/// binding. A caller that has not said which task cannot ask, which is the
+/// property the trait's shape assumes and this device would otherwise not have.
+///
+/// # It resolves and does not lease
+///
+/// [`DeviceState::object_name`] is the whole implementation, and it asks the
+/// namespace's non-consuming door. A resolver that took a lease would be a claim
+/// on a resource nobody acquired, made by a lookup — the dependency compiler
+/// resolves refs to draw edges, not to hold things.
+#[derive(Clone, Copy)]
+pub struct TaskRefResolver<'a> {
+    state: &'a DeviceState,
+    task_id: u32,
+}
+
+impl<'a> TaskRefResolver<'a> {
+    /// Bind this device's resolution to one task's namespace.
+    #[must_use]
+    pub const fn new(state: &'a DeviceState, task_id: u32) -> Self {
+        Self { state, task_id }
+    }
+
+    /// The task whose namespace this answers from.
+    #[must_use]
+    pub const fn task_id(self) -> u32 {
+        self.task_id
+    }
+}
+
+impl reims_vgpu_core::resolve::RefResolver for TaskRefResolver<'_> {
+    fn resource(&self, object_ref: u32) -> Option<reims_vgpu_core::identity::ResourceId> {
+        self.state.object_name(self.task_id, object_ref)
+    }
+}
+
+/// The device as the source of every task's object namespace.
+///
+/// # Why the device implements this and not [`TaskRefResolver`]'s trait
+///
+/// A byte-to-operation join in `reims_vgpu_core::lifecycle` learns which task a
+/// packet is about by decoding the packet, so it cannot be handed a namespace
+/// that is already bound — the binding is the answer it is computing. It is
+/// handed this instead, and binds the task itself. That is the whole difference
+/// between the two traits and it is not stylistic: a ref is an index into the
+/// naming task's own object list, so another task's namespace does not refuse
+/// it, it resolves it, to another task's resource.
+///
+/// [`TaskRefResolver`] stays for the callers that legitimately are inside one
+/// task already — a command-stream walk, which was given its task by the header
+/// it is walking under.
+///
+/// # Why it carries guest memory, and why there is not a cheaper one beside it
+///
+/// This resolves through [`name_resource`], which reads the guest's object list
+/// when a reference has no name yet. A version answering only from names already
+/// issued would need no host and would be wrong 49 times a boot — see
+/// `name_resource`'s own measurement — and it would be wrong *silently*, because
+/// the model's list join turns an unresolved ref into a refused packet rather
+/// than an error anybody sees.
+///
+/// So there is one door and not two. Two implementations of one trait, one of
+/// which declares and one of which does not, is the shape where a call site
+/// picks the cheap one and loses a packet class; the trait answers what a
+/// reference names, and on this interface that answer is in the guest's table
+/// whether or not this device has read it yet.
+pub struct TaskNames<'a, M> {
+    state: &'a DeviceState,
+    host: &'a M,
+}
+
+impl<'a, M: HostMemory> TaskNames<'a, M> {
+    /// The device's object namespaces, backed by the guest memory their
+    /// object lists live in.
+    pub const fn new(state: &'a DeviceState, host: &'a M) -> Self {
+        Self { state, host }
+    }
+}
+
+impl<M: HostMemory> reims_vgpu_core::resolve::TaskNamespaces for TaskNames<'_, M> {
+    fn resource(
+        &self,
+        task: reims_vgpu_core::identity::TaskId,
+        object_ref: u32,
+    ) -> Option<reims_vgpu_core::identity::ResourceId> {
+        name_resource(self.state, self.host, task.0, object_ref)
+    }
+}
+
+/// The device answering where a named resource's bytes are.
+///
+/// # Why the same holder answers both traits
+///
+/// [`TaskNames`] already carries the two things this needs — the namespaces that
+/// issued the name, and the guest memory the object list lives in — and the two
+/// questions are asked one after the other about one resource. A second holder
+/// would be a second `(state, host)` pair that a call site could pair with the
+/// wrong task.
+///
+/// # The generation is checked, and that is the whole of the guard
+///
+/// A [`reims_vgpu_core::identity::ResourceId`] is a slot *and* a generation, and
+/// the slot alone is what [`backing_id`] reads the guest's list with. So a name
+/// whose generation is no longer the slot's current one would resolve to the
+/// bytes of whatever occupies the slot **now** — the wrong storage, keyed onto
+/// an access the guest asked for over the old occupant. Asking
+/// `DeviceState::object_name` first makes that a `None` instead: no key, an
+/// access at the coarse rung, and no edge drawn against memory the packet did
+/// not name.
+///
+/// # `heap` is `None` because a heap placement never gets this far
+///
+/// [`ResourceKey`](reims_vgpu_core::access::ResourceKey) carries the heap so a
+/// heap-use record and a member access have something to compare. This device
+/// has no heap term to carry: a heap's extent is unrecovered, so [`backing_id`]
+/// refuses a placement by name as [`BackingIdRefusal::HeapPlaced`] rather than
+/// minting an identity that would make two placements over one heap look
+/// distinct. Every backing that reaches this line is therefore a dedicated
+/// allocation, for which `None` is the fact and not an omission — and the day
+/// the heap extent lands, the refusal is where the term arrives.
+impl<M: HostMemory> reims_vgpu_core::resolve::ResourceStorage for TaskNames<'_, M> {
+    fn storage(
+        &self,
+        task: reims_vgpu_core::identity::TaskId,
+        resource: reims_vgpu_core::identity::ResourceId,
+    ) -> Option<reims_vgpu_core::access::ResourceKey> {
+        let slot = resource.slot.0;
+        if self.state.object_name(task.0, slot) != Some(resource) {
+            crate::runtime::drain::note_store_route("lifecycle_storage_name_not_current");
+            return None;
+        }
+        match backing_id(self.state, self.host, task.0, slot) {
+            Ok(backing) => Some(reims_vgpu_core::access::ResourceKey {
+                backing,
+                heap: None,
+            }),
+            Err(refusal) => {
+                crate::runtime::drain::note_store_route(refusal.slug());
+                None
+            }
+        }
+    }
+}
+
+/// Whether a query's reply buffer lands inside an allocation this device
+/// already has an identity for.
+///
+/// # The question, and why it is asked before anything needs the answer
+///
+/// `reims_vgpu_core::query::ReplyDestination` is a backing and a window of it,
+/// not an address: a query writes into guest memory and the model orders that
+/// write like any other. So the reply buffer needs a `BackingId`, and there are
+/// only two ways to give it one — resolve it to the allocation it lies in, or
+/// mint it one of its own.
+///
+/// Those are not interchangeable. If a reply buffer is a page of an object's
+/// allocation and it gets an identity of its own, the reply write and every
+/// access to that object come out over different backings and the hazard edge
+/// between them is never drawn. If it lies in no allocation and is resolved to
+/// one anyway, the write is ordered against memory it does not touch. Which
+/// error is available is a question about a real guest, and this is the
+/// instrument that answers it.
+///
+/// Only the two queries whose destination is a **task GVA** can be asked at all:
+/// a device-info reply names a page frame, which is in no task's address space,
+/// so no window in this table could contain it. `Gap::ReplyDestination` records
+/// that split.
+///
+/// # What it looks at
+///
+/// Every constructed resource in the task, from the construction cache, which
+/// is the same set `cached_window_peer` scans and is affordable here for the
+/// reason it is not everywhere: a query is a handful of packets a boot, not a
+/// per-draw path.
+///
+/// `query_reply_scanned` is the denominator. Without it a boot where no reply
+/// overlapped anything and a boot where no query resolved a task read the same.
+///
+/// # What two driven boots answered
+///
+/// **Twenty-eight replies scanned, twenty-eight outside every allocation, none
+/// inside.** macos-15 reads `query_reply_scanned = 24` and
+/// `query_reply_outside_every_allocation = 24`; macos-26 reads 4 and 4. Neither
+/// rail produced a `query_reply_inside_an_allocation` line.
+///
+/// So of the two errors the cutover has to choose between, only one has a
+/// population here: giving a task-GVA reply destination a backing of its own is
+/// the construction these guests support, and resolving it into an allocation
+/// would be ordering the write against memory it does not touch. Twenty-eight
+/// is a small denominator and this is a rail-and-workload reading, not a
+/// theorem — the route stays so a boot that finds the other case says so.
+pub fn note_query_reply_destination(
+    state: &DeviceState,
+    task_id: u32,
+    reply_gva: u64,
+    reply_len: u64,
+) -> Option<u32> {
+    crate::runtime::drain::note_store_route("query_reply_scanned");
+    let end = reply_gva.saturating_add(reply_len.max(1));
+    let containing =
+        state
+            .task_resources
+            .in_task(task_id)
+            .into_iter()
+            .find_map(|(name, resource)| {
+                let (base, size) = resource.backing_window(state.page_shift)?;
+                (base < end && reply_gva < base.saturating_add(size)).then_some((
+                    name.slot.0,
+                    base,
+                    size,
+                ))
+            });
+    let Some((ref_, base, size)) = containing else {
+        crate::runtime::drain::note_store_route("query_reply_outside_every_allocation");
+        return None;
+    };
+    crate::runtime::drain::note_store_route("query_reply_inside_an_allocation");
+    if crate::observe::first_sight(
+        "query_reply_inside_an_allocation",
+        (u64::from(task_id) << 40) ^ base,
+    ) {
+        crate::observe::fail(format!(
+            "query_reply_inside_an_allocation task={task_id} gva={reply_gva:#x} len={reply_len} \
+             holder={ref_} base={base:#x} size={size} (the reply buffer is part of an \
+             allocation this device already identifies, so a reply destination given a \
+             backing of its own would leave the write unordered against every access to \
+             that object)"
+        ));
+    }
+    Some(ref_)
+}
+
+/// The device answering the model's reply-destination resolver.
+///
+/// # Two destination spaces, one identity space
+///
+/// `reims_vgpu_core::query::ReplyDestination` is one `BackingId` and a window,
+/// and the four questions do not share an address space to derive it from.
+/// `CmdGetComputeInfo` and the heap-texture query carry a **task GVA**;
+/// `CmdGetDeviceInfo` carries a **guest page frame** in no task's address space
+/// at all. Each is resolved in the space it belongs to and both arrive at one
+/// identity space, because every route this device interns on draws from one
+/// monotone counter — see `crate::model::state::BackingWindowRefs`.
+///
+/// * A GVA inside an allocation this device already identifies takes **that
+///   allocation's** identity, at the offset the reply lies at within it. This
+///   is the case that must not be given an identity of its own: the reply write
+///   and every access to that object would then come out over different
+///   backings and the hazard edge between them would never be drawn. No driven
+///   boot has produced one — `query_reply_inside_an_allocation` is 0 across
+///   every boot measured — and it is answered correctly rather than left to the
+///   case that has been observed.
+/// * A GVA outside every allocation is storage all the same, and it is
+///   identified as the window it is: `(task, page-aligned base)`, through the
+///   same door an object's allocation goes through. A later object constructed
+///   at that base arrives at the *same* number, which is right — it is the same
+///   bytes.
+/// * A page frame is identified as a frame, in the third key space, with no
+///   incarnation because a frame is storage rather than a name for storage.
+///
+/// # The window is the request's, not the answer's
+///
+/// Each request states how much room it set aside — a pair capacity, a reply
+/// length — and that is what the destination's [`ByteRange`] carries. The
+/// answer's own length is `ReplyShape`'s, and `reims_vgpu_core::query::Stall::
+/// ReplyTooLarge` is the comparison between the two. A destination carrying the
+/// answer's length instead would make that comparison trivially true and the
+/// overflow it exists to catch unrepresentable.
+impl<M: HostMemory> reims_vgpu_core::query::Destinations for TaskNames<'_, M> {
+    fn destination(
+        &self,
+        kind: reims_vgpu_core::query::QueryKind,
+        payload: &[u8],
+    ) -> Option<reims_vgpu_core::query::ReplyDestination> {
+        use reims_vgpu_core::access::ByteRange;
+        use reims_vgpu_core::query::{QueryKind, ReplyDestination};
+        let state = self.state;
+        if let Some(form) = kind.device_info_form() {
+            let request = crate::protocol::fifo::decode_device_info(form, payload).ok()?;
+            // A page frame in no task, so neither the window nor the mapping key
+            // space can name it. The window is the guest's own capacity in
+            // pairs, which is the reply buffer's allocation size — the same
+            // number `reply_device_info` bounds its write by.
+            return Some(ReplyDestination {
+                backing: state.frame_backing_identity(request.reply_pfn),
+                bytes: ByteRange {
+                    offset: 0,
+                    length: u64::from(request.pair_capacity)
+                        * crate::protocol::info_reply::PAIR_LEN as u64,
+                },
+            });
+        }
+        let (raw_task, gva, length) = match kind {
+            QueryKind::ComputeInfo => {
+                let request = crate::protocol::fifo::decode_compute_info(payload).ok()?;
+                (
+                    request.raw_task,
+                    request.reply_gva,
+                    u64::from(request.pair_capacity) * crate::protocol::info_reply::PAIR_LEN as u64,
+                )
+            }
+            QueryKind::HeapTextureSizeAndAlign => {
+                let request = crate::protocol::fifo::decode_heap_texture_query(payload).ok()?;
+                (request.raw_task, request.reply_gva, request.reply_len)
+            }
+            // Both answered `Some` above and returned. Named rather than
+            // wildcarded so a fifth question is a compile error here.
+            QueryKind::DeviceInfo | QueryKind::DeviceInfoLegacy => return None,
+        };
+        let task = crate::runtime::task_slot::resolve_task_word(
+            &state.tasks,
+            crate::runtime::task_slot::TaskWordSite::ComputeInfo,
+            raw_task,
+        )?;
+        // The same question the census asks, asked once: whether these bytes are
+        // already part of an allocation with an identity.
+        match note_query_reply_destination(state, task, gva, length) {
+            Some(holder) => {
+                let name = state.object_name(task, holder)?;
+                let resource = state.task_resources.get(task, name)?;
+                let (base, _) = resource.backing_window(state.page_shift)?;
+                Some(ReplyDestination {
+                    backing: state.backing_identity(task, base),
+                    bytes: ByteRange {
+                        offset: gva.checked_sub(base)?,
+                        length,
+                    },
+                })
+            }
+            None => {
+                // Storage all the same, identified as the window it is. The
+                // base is page aligned so two replies in one page are one
+                // backing at two offsets rather than two backings.
+                let page = 1u64 << state.page_shift;
+                let base = gva & !(page - 1);
+                Some(ReplyDestination {
+                    backing: state.backing_identity(task, base),
+                    bytes: ByteRange {
+                        offset: gva - base,
+                        length,
+                    },
+                })
+            }
+        }
+    }
+}
+
+/// Whether a device-info reply's page frame could collide with storage this
+/// device already identifies, asked at the moment the reply is written.
+///
+/// # The other half of the reply-destination question
+///
+/// [`note_query_reply_destination`] asks it of the two queries whose reply
+/// buffer is a **task GVA**: does the buffer lie inside an allocation this
+/// device has a `BackingId` for, so that a destination given an identity of its
+/// own would leave the reply write unordered against every access to that
+/// object. That instrument cannot be pointed at `CmdGetDeviceInfo`, whose reply
+/// is a bare guest **page frame** in no task's address space — there is no
+/// window in that table it could be inside of.
+///
+/// So the same danger has to be ruled out a different way, and the sound way is
+/// the *identity space* rather than geometry. `reims_vgpu_core::access::
+/// BackingId` is minted from `(task, allocation base, incarnation)`; a page
+/// frame has neither of the first two, so a device-info destination can only
+/// ever be given an identity of its own. That is correct exactly when the
+/// identity it is given can equal nothing else's — and
+/// [`DeviceState::backing_identities_minted`] is the whole of that question,
+/// because one monotone counter feeds every key space this device interns on.
+/// **Zero minted is the closing answer**: a fresh number cannot equal a number
+/// nobody holds, whatever page frame the guest named.
+///
+/// Counting identities rather than tasks or resources is the correction a
+/// driven boot forced. The first reading of this counted both populations and
+/// found `tasks=1 resources=0`, which reads as the open case and is not one: a
+/// task is a namespace, not storage, and a task that has constructed nothing
+/// has caused nothing to be interned. The number that decides is the one the
+/// dependency compiler compares.
+///
+/// The reply path's own documentation states the contract that makes this hold
+/// at all: the guest asks **once**, when its accelerator starts, and frees the
+/// reply buffer immediately after the single parse. What it does not say is
+/// whether "when its accelerator starts" precedes this device's first mint, and
+/// no reading settles that. It is what this counts.
+///
+/// # What a boot's counters mean
+///
+/// `device_info_reply_scanned` is the denominator — without it, a boot where
+/// every reply preceded every mint and a boot where the guest never asked read
+/// the same. `device_info_reply_before_any_identity` is the closing answer;
+/// `device_info_reply_after_an_identity` is the one that keeps the term open,
+/// and it carries the counts on the failure channel because a bare route would
+/// not say how much storage the mint would have to be compared against.
+///
+/// # The mint count alone cannot close it, and two driven boots are why
+///
+/// macos-15 and macos-26 both read `device_info_reply_scanned = 1` and
+/// `device_info_reply_after_an_identity = 1`: the guest asks after this device
+/// has minted, every time, so the closing arm above never runs on a real rail
+/// and the term would stay open forever on the counter alone.
+///
+/// The counter was also answering the wrong question. A monotone never-reused
+/// [`crate::model::BackingWindowRefs`] counter feeds all three key spaces, so a
+/// fresh number *cannot* equal one already handed out — that part is closed by
+/// construction and needs no boot. The danger the plan names is the opposite
+/// one and is about **storage, not numbers**: if the reply page is also part of
+/// storage some other identity already names, then the reply write and every
+/// access to that storage come out over two backings and the hazard edge
+/// between them is never drawn.
+///
+/// So the question is asked of geometry, in the one key space a page frame can
+/// collide with. A task-GVA window is reached through a task's page table and
+/// is [`note_query_reply_destination`]'s half; what is left is a mapping's
+/// surface, whose storage *is* a list of guest page frames
+/// ([`crate::model::MappingEntry::page_entries`]). Scanning them is affordable
+/// here for the same reason the other half's scan is: the guest asks once a
+/// boot.
+///
+/// `device_info_reply_frame_in_no_mapping` is the closing answer and
+/// `device_info_reply_frame_in_a_mapping` is the open one — and unlike the
+/// mint count, both are reachable on a rail that has already minted.
+pub fn note_device_info_reply_destination(state: &DeviceState, reply_pfn: u32) {
+    crate::runtime::drain::note_store_route("device_info_reply_scanned");
+    let minted = state.backing_identities_minted();
+    if minted == 0 {
+        crate::runtime::drain::note_store_route("device_info_reply_before_any_identity");
+        return;
+    }
+    crate::runtime::drain::note_store_route("device_info_reply_after_an_identity");
+    // Which mapping, if any, already holds this page as part of its surface.
+    // `mapped` and a non-empty page list together are what make an entry live
+    // storage: an unmapped mapping's stale list names pages it no longer holds,
+    // and reporting one would be a finding about nothing.
+    let reply_gpa = state.pfn_gpa(reply_pfn);
+    let page_shift = state.page_shift;
+    let holder = state.mappings.iter().find_map(|(&id, mapping)| {
+        if !mapping.mapped || mapping.page_entries.is_empty() {
+            return None;
+        }
+        mapping
+            .page_entries
+            .iter()
+            .any(|&entry| {
+                crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift)
+                    == Some(reply_gpa)
+            })
+            .then_some(id)
+    });
+    let Some(holder) = holder else {
+        crate::runtime::drain::note_store_route("device_info_reply_frame_in_no_mapping");
+        return;
+    };
+    crate::runtime::drain::note_store_route("device_info_reply_frame_in_a_mapping");
+    if crate::observe::first_sight("device_info_reply_frame_in_a_mapping", u64::from(reply_pfn)) {
+        let resources = state.task_resources.len();
+        let tasks = state.tasks.live_count();
+        crate::observe::fail(format!(
+            "device_info_reply_frame_in_a_mapping pfn={reply_pfn:#x} mapping={holder} \
+             minted={minted} tasks={tasks} resources={resources} (the reply page is part \
+             of a mapping's surface, so an identity of its own would leave the reply write \
+             unordered against every access to that surface)"
+        ));
+    }
+}
+
+/// Which bytes of a mapping's surface a mapper-ref texture occupies.
+///
+/// The texture's storage is the mapping's, so its extent is measured in the
+/// surface's own bytes and not in an allocation of its own. Which part of the
+/// surface it is comes from the mapping's published device descriptor, matched
+/// against the geometry the texture's own descriptor declares — the same
+/// selection every sampling path on this rail makes, through the same function,
+/// so an extent and a sample window can never describe different bytes of one
+/// plane.
+///
+/// `None` when the mapping has published no complete device descriptor yet, or
+/// when the geometry matches no plane. Both are the guest not having said which
+/// plane this is, and a texture given the whole surface as its extent would
+/// declare content authority over its siblings' pixels.
+fn mapper_ref_surface_extent(state: &DeviceState, descriptor: &[u8]) -> Option<(u64, u64)> {
+    let Ok(crate::runtime::decode::resource::Descriptor::IOSurfaceTexture {
+        mapping_id,
+        pixel_format,
+        width,
+        height,
+        ..
+    }) = crate::runtime::decode::resource::decode_iosurface_texture_descriptor(descriptor)
+    else {
+        return None;
+    };
+    let mapping = state.mappings.get(&mapping_id)?;
+    let (offset, _bytes_per_row, span_end) =
+        crate::protocol::iosurface_pages::sample_window_from_device_desc(
+            mapping.device_desc_complete(),
+            None,
+            pixel_format,
+            width,
+            height,
+        )?;
+    Some((offset, span_end.checked_sub(offset)?))
+}
+
+/// Census the canonical backing identity of every object this device
+/// constructs.
+///
+/// # Why an identity nothing consumes is measured
+///
+/// `reims_vgpu_core::access::BackingId` is what the replacement model's
+/// dependency compiler draws every hazard edge on, and no packet class has
+/// moved to that model yet — so [`backing_id_of`] has no production consumer.
+/// It will have exactly one, all at once, and the question a cutover cannot ask
+/// afterwards is *what fraction of a real guest's objects the identity actually
+/// answers for*. A rail where a tenth of constructions land on a refusal is a
+/// rail where a tenth of the hazard graph is missing, and it would show up as
+/// an intermittently wrong frame rather than as a refusal.
+///
+/// So the reading is taken now, at the one site every constructed object passes
+/// through, against an unmodified guest. `backing_identity_asked` is the
+/// denominator — without it a boot with no refusals and a boot with no
+/// constructions read the same — and each refusal arm is counted under its own
+/// slug.
+///
+/// What is asked for is the whole *declaration*, not the identity alone, because
+/// the declaration is what the cutover needs. An object with an identity and no
+/// extent is one the model can name and cannot hold content authority for, and a
+/// census that stopped at the identity would score it as an answer. So the
+/// `declared_storage_*` counts partition the objects the model can describe —
+/// an allocation with an extent, or no bytes at all — and the refusals partition
+/// the ones it cannot.
+///
+/// # Read, on a driven macos-15 boot to the desktop
+///
+/// ```text
+/// backing_identity_asked                 1447
+/// backing_identity_minted                1371
+/// backing_id_names_no_storage              76
+/// backing_id_unresolved                     0
+/// backing_id_heap_placed                    0
+/// backing_id_mapping_names_no_surface       0
+/// ```
+///
+/// 1371 + 76 = 1447 exactly: **every object this guest constructed got an
+/// answer**, and none of them fell to a missing contract term. Both halves of
+/// the identity answered — the zero on `mapping_names_no_surface` is the
+/// mapper-ref delegation landing identities rather than refusals, and before it
+/// every object of that type was unidentifiable by construction. The 5% that
+/// name no storage are the samplers, functions, pipeline states and views,
+/// which is a description of what they are rather than a shortfall.
+///
+/// A second boot, once the census asked for the whole declaration:
+///
+/// ```text
+/// backing_identity_asked                 1462
+/// declared_storage_dedicated             1393
+/// declared_storage_no_bytes                69
+/// storage_extent_unrecovered                0
+/// backing_id_unresolved                     0
+/// backing_id_heap_placed                    0
+/// ```
+///
+/// 1393 + 69 = 1462, again exactly. **Every object a real guest constructs can be
+/// declared into the semantic model** — an allocation with the object's own byte
+/// window inside it, or no bytes at all. The zero on `extent_unrecovered` is the
+/// mapper-ref texture's plane derivation holding on a live guest: before it, that
+/// whole class had an identity the model could name and no content authority to
+/// go with it.
+///
+/// A third boot, this one with the object namespace as the device's naming
+/// authority rather than a shadow beside it:
+///
+/// ```text
+/// backing_identity_asked                 1638
+/// declared_storage_dedicated             1566
+/// declared_storage_no_bytes                72
+/// declared_storage_placed                   0
+/// storage_extent_unrecovered                0
+/// backing_id_unresolved                     0
+/// backing_id_heap_placed                    0
+/// ```
+///
+/// 1566 + 72 = 1638, exact for the third time, on the boot where the declaration
+/// is no longer only measured — the name every object carries is the one this
+/// walk issued. The split holds its shape across all three boots (95% owning an
+/// allocation, 5% owning nothing) on workloads differing by 13%, which is what
+/// says the partition is a property of what a macOS object list *is* rather than
+/// of one boot's timing.
+///
+/// One arm is a fail line as well as a count.
+/// [`BackingIdRefusal::HeapPlaced`] is the one open contract term
+/// `BackingId`'s own doc still names: a heap's extent is unrecovered, so two
+/// placements sharing bytes would come out distinct. No driven boot has yet
+/// placed a heap texture, and the *sighting* is what would turn that from a
+/// term nobody can look for into a descriptor at a known address.
+fn note_backing_identity(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) {
+    use reims_vgpu_core::lifecycle::Storage;
+    crate::runtime::drain::note_store_route("backing_identity_asked");
+    // The declaration is asked for rather than the identity, because it is the
+    // declaration the cutover needs: an identity with no extent describes an
+    // object the model can name and cannot hold content authority for, and a
+    // census that stopped at the identity would score that as an answer.
+    let refusal = match declared_storage(state, task_id, obj_ref, entry, descriptor) {
+        Ok(Storage::Dedicated { .. }) => {
+            crate::runtime::drain::note_store_route("backing_identity_minted");
+            crate::runtime::drain::note_store_route("declared_storage_dedicated");
+            return;
+        }
+        // Not a refusal: the object owns no bytes and the model is told so.
+        Ok(Storage::NoBytes) => {
+            crate::runtime::drain::note_store_route("declared_storage_no_bytes");
+            return;
+        }
+        // Never produced here — a heap placement arrives as an identity refusal
+        // because a heap's extent is unrecovered. Counted so that the day it
+        // does, the reading says so rather than the arm being unreachable
+        // forever by assumption.
+        Ok(Storage::Placed { .. }) => {
+            crate::runtime::drain::note_store_route("declared_storage_placed");
+            return;
+        }
+        Err(refusal) => refusal,
+    };
+    crate::runtime::drain::note_store_route(refusal.slug());
+    let StorageRefusal::Backing(refusal) = refusal else {
+        // The identity was mintable; only the extent was not.
+        crate::runtime::drain::note_store_route("backing_identity_minted");
+        return;
+    };
+    if !matches!(refusal, BackingIdRefusal::HeapPlaced) {
+        return;
+    }
+    if crate::observe::first_sight(
+        "backing_id_heap_placed",
+        (u64::from(task_id) << 32) | u64::from(entry.descriptor_length),
+    ) {
+        crate::observe::fail(format!(
+            "backing_id_heap_placed task={task_id} type={} desc_len={} desc_gva={:#x} \
+             (a heap placement, and a heap's extent is the one identity term still \
+             unrecovered — two placements sharing bytes come out distinct, which is a \
+             hazard edge the dependency compiler would never draw; the length and \
+             address here are where the extent would be read from)",
+            entry.object_type, entry.descriptor_length, entry.descriptor_gva,
+        ));
+    }
+}
+
 /// Retrieve or construct the resource named by `task_id` / `obj_ref`.
 ///
 /// A successful construction snapshots the object-list entry and descriptor
@@ -1746,9 +2984,15 @@ pub fn resolve_resource<M: HostMemory>(
     task_id: u32,
     obj_ref: u32,
 ) -> Result<Arc<TaskResource>, LadderRung> {
-    if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
-        note_stale_task_resource(state, host, task_id, obj_ref, &resource);
-        return Ok(resource);
+    // The namespace decides whether this reference still names anything, and the
+    // memo is keyed by its answer. A slot the guest has deleted resolves to
+    // nothing, so the retained bytes behind the name it used to have are
+    // unreachable here rather than merely unlikely to be reached.
+    if let Some(name) = state.object_name(task_id, obj_ref) {
+        if let Some(resource) = state.task_resources.get(task_id, name) {
+            note_stale_task_resource(state, host, task_id, obj_ref, &resource);
+            return Ok(resource);
+        }
     }
 
     let entry = lookup_list_entry(state, host, task_id, obj_ref).ok_or(LadderRung::NoListEntry)?;
@@ -1761,8 +3005,259 @@ pub fn resolve_resource<M: HostMemory>(
         declared_len: entry.descriptor_length,
     })?;
     let descriptor: Arc<[u8]> = Arc::from(bytes);
+    if let Some((base, size)) = backing_window(state.page_shift, &entry, &descriptor) {
+        let _ = note_backing_window_alias(state, host, task_id, obj_ref, base, size);
+    }
+    note_backing_identity(state, task_id, obj_ref, &entry, &descriptor);
+    // The one declaration site, carrying what this device established about the
+    // object's bytes rather than a flattening of it. See `declare_object_name`
+    // for why an undescribable storage is `None` here and not `NoBytes`.
+    let storage = declared_storage(state, task_id, obj_ref, &entry, &descriptor).ok();
+    // Naming is idempotent, and a name may already exist without a memo: a
+    // reference is named the first time *anything* asks what it names, and a
+    // lifetime packet asks without constructing. Declaring again here would give
+    // the slot a second generation and displace the first — retiring an object
+    // the guest never deleted — so the existing name is taken when there is one.
+    let name = match state.object_name(task_id, obj_ref) {
+        Some(existing) => {
+            crate::runtime::drain::note_store_route("object_named_before_constructed");
+            existing
+        }
+        None => declare_object_name(state, task_id, obj_ref, storage)?,
+    };
     let resource = Arc::new(TaskResource::new(entry, descriptor));
-    Ok(state.task_resources.register(task_id, obj_ref, resource))
+    Ok(state.task_resources.register(task_id, name, resource))
+}
+
+/// Declare a reference into its task's namespace and take the name issued.
+///
+/// The one call to `DeviceState::declare_object` in this crate, so the
+/// displacement it can report is judged once. Callers reach it through
+/// [`name_resource`] or through the construction path, both of which have
+/// established that the slot holds no live name — which is what makes a
+/// displacement here an event rather than the ordinary redeclaration the
+/// namespace also supports.
+///
+/// # The refusal is the owner's now, and it is the one this group was gated on
+///
+/// `reims_vgpu_core::lifecycle::Lifecycle::create_resource` **refuses**
+/// `NoSuchTask` for a declaration into a task no `DefineTask` opened. This
+/// device used to create the namespace it needed —
+/// `entry(task_id).or_default()` — so the declaration always succeeded, and the
+/// difference was counted here against `DeviceState::tasks` as a proxy before
+/// the group moved.
+///
+/// It is not a proxy any more and it is not reachable either. Both callers ask
+/// `lookup_list_entry` first, which requires an active `DeviceState::tasks`
+/// entry, and that table and the owner's tasks are written by the same pair of
+/// functions — `DeviceState::define_task` and `DeviceState::delete_task`. So a
+/// refusal here means those two tables have come apart, which is why it is a
+/// [`LadderRung::NoTaskSpace`] on the always-on channel rather than a silent
+/// `None`.
+///
+/// # What a driven boot answered
+///
+/// x86 Vulkan, macos-15, host-driven workload, 8914 draws:
+/// **`object_declared_into_a_defined_task=1301`,
+/// `object_declared_into_an_undefined_task=0`.** Every declaration this guest
+/// makes is into a task a `DefineTask` opened, so the lifecycle owner's
+/// `NoSuchTask` would refuse none of them, and the group's one identified
+/// refusal costs nothing.
+///
+/// The same boot re-confirmed the other term the group needs, for the sixth
+/// time: `declared_storage_dedicated=1279` + `declared_storage_no_bytes=22` =
+/// **1301**, exactly the declarations counted here, with
+/// `storage_extent_unrecovered` and `object_declared_over_a_live_name` both
+/// silent. Every object this guest constructs is expressible as a
+/// `reims_vgpu_core::lifecycle::Storage`, and none would reach the content
+/// ledger as a `NoBytes` that has bytes.
+fn declare_object_name(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    storage: Option<reims_vgpu_core::lifecycle::Storage>,
+) -> Result<reims_vgpu_core::identity::ResourceId, LadderRung> {
+    // **`None` is not `NoBytes`, and collapsing them is the lie this argument
+    // exists to stop.** `NoBytes` is a claim — the object owns no memory, which
+    // is true of most of a list — and `None` is this device failing to describe
+    // storage that exists. Both used to arrive at the namespace as a `None`
+    // backing, which is harmless while a slot records only *which* storage a
+    // name is over; it stops being harmless the moment these declarations reach
+    // `reims_vgpu_core::lifecycle::Lifecycle`, whose `create_resource` tells the
+    // content authority that a `NoBytes` object has no bytes to be authoritative
+    // about. Declaring that of a resource with bytes would leave its content
+    // owned by nothing.
+    //
+    // So the undescribable case is declared as `NoBytes` here — the namespace
+    // has no third answer and a name must still be issued, or the reference
+    // resolves to nothing and every packet that mentions it is refused — and it
+    // is *counted*, which is what makes it a known floor rather than a silent
+    // claim. A driven boot of 15 937 draws read **zero** on this counter
+    // directly, which is the reading `storage_extent_unrecovered` had already
+    // predicted on six boots by proxy.
+    let declared = state.declare_object(
+        task_id,
+        obj_ref,
+        storage.unwrap_or_else(|| {
+            crate::runtime::drain::note_store_route("object_declared_with_undescribable_storage");
+            reims_vgpu_core::lifecycle::Storage::NoBytes
+        }),
+    );
+    let declared = match declared {
+        Ok(declared) => declared,
+        Err(refusal) => {
+            crate::runtime::drain::note_store_route("object_declared_into_an_undefined_task");
+            if crate::observe::first_sight(
+                "object_declared_into_an_undefined_task",
+                (u64::from(task_id) << 32) | u64::from(obj_ref),
+            ) {
+                crate::observe::fail(format!(
+                    "object_declared_into_an_undefined_task task={task_id} ref={obj_ref} \
+                     refusal={} (this reference reached a declaration through an object-list \
+                     entry, so DeviceState::tasks holds the task and the lifecycle owner does \
+                     not — the two tables are written by one pair of functions and have come \
+                     apart)",
+                    refusal.slug()
+                ));
+            }
+            return Err(LadderRung::NoTaskSpace);
+        }
+    };
+    crate::runtime::drain::note_store_route("object_declared_into_a_defined_task");
+    // Opened once, by name. A declaration names one resource, so the three
+    // fields below cannot be filled by it — an address interval, a deferred
+    // discard and a task redefinition all belong to other commands — and
+    // naming them here is what makes an arm that starts filling one a change at
+    // this site rather than a silent loss.
+    let crate::model::Acted {
+        teardowns,
+        remapped,
+        at_completion,
+        redefined,
+    } = declared.acted;
+    debug_assert!(
+        remapped.is_empty() && at_completion.is_empty() && redefined.is_empty(),
+        "a declaration obliges nothing but its displaced occupant's teardown"
+    );
+    // A declaration over a slot that still held a live object owes that
+    // occupant's teardown. It should be unreachable: every caller asked the
+    // namespace first and found nothing. Reported rather than assumed away,
+    // because if it ever fires the previous occupant's storage is one nothing
+    // else will free.
+    //
+    // The owner carries the displaced occupant's teardown out through the
+    // effects rather than handing back the displacement for a caller to
+    // discharge — `Lifecycle::create_resource` retires the resident, the heap
+    // window and the content authority together, which is exactly what this
+    // site could not do when all it held was a namespace.
+    for teardown in teardowns {
+        crate::runtime::drain::note_store_route("object_declared_over_a_live_name");
+        if crate::observe::first_sight(
+            "object_declared_over_a_live_name",
+            (u64::from(task_id) << 32) | u64::from(obj_ref),
+        ) {
+            crate::observe::fail(format!(
+                "object_declared_over_a_live_name task={task_id} ref={obj_ref} \
+                 teardown={teardown:?} (a declaration displaced a live occupant after its \
+                 caller had asked the namespace and been told the slot was empty, so the two \
+                 reads were not of one namespace)"
+            ));
+        }
+    }
+    Ok(declared.id)
+}
+
+/// The name a guest reference has in its task, reading the guest's object list
+/// to give it one if this is the first sighting.
+///
+/// # Why naming is separate from constructing
+///
+/// A driven boot measured it. Of the object refs a real guest names in its
+/// resource-lifetime lists — synchronize, invalidate, discard — a namespace
+/// populated only by construction answers for **1290 of 1339**, and the
+/// remaining **49** are objects this device had never had a reason to construct.
+/// Those commands are the guest saying "I am about to touch these with the CPU",
+/// and nothing on this interface says a resource must be drawn before it is
+/// named.
+///
+/// 49 is small and it is not a rounding error, because the model's list join
+/// resolves every ref in a list or refuses the whole packet — deliberately,
+/// since a partial `Invalidate` claims the resources that happened to resolve
+/// are the only ones that went stale. This guest's lists carry **one ref each**
+/// (1339 lists, 1339 refs), so 49 unnamed refs are 49 refused packets: 49
+/// content-authority moves the model would never hear about, spread across the
+/// boot rather than clustered at its start.
+///
+/// Eager declaration is not the alternative. The same boot's
+/// `CmdSetObjectList` packets each declare a table of **1 048 576** entries,
+/// eighteen times — that number is the list's *capacity* and not its
+/// population, and walking it would read twelve megabytes of guest memory per
+/// bind to declare a few thousand live objects.
+///
+/// So a reference is named the first time anything asks what it names, and
+/// naming is the cheap half: one list entry and one descriptor read, no host
+/// texture, no buffer, no pipeline. [`resolve_resource`] adds the expensive half
+/// on top of the same name.
+///
+/// # It names every object type, not only the resource types
+///
+/// `resolve_resource` refuses a ref whose entry is not a resource constructor,
+/// which is right for construction and wrong for naming: a sampler, a function
+/// and a pipeline state are named by their slots exactly as a texture is, they
+/// resolve, and they stop resolving when the guest deletes them. See
+/// `reims_vgpu_core::namespace`. Their storage is `Storage::NoBytes`, which the
+/// declaration carries as `None`.
+/// Name the slot a construction has just resolved, and say whether it took.
+///
+/// # Why construction is where naming has to happen for these kinds
+///
+/// A destroy arrives after the guest has cleared its object-list slot — 2072
+/// of ~2160 on a driven boot — so the destroy itself cannot name what it ends.
+/// [`name_resource`] answers from `DeviceState::object_name` before the guest's
+/// list, which means a slot named while it was still live is still nameable
+/// afterwards; a slot never named is a destroy `SessionModel::admit` refuses
+/// with `UnknownRef`. So each kind is named where it is *constructed*, which is
+/// a different site per kind, and the boot-measured population says which sites
+/// are worth one: `delete_unnamed_*` names the eleven kinds apart precisely so
+/// this is aimed rather than guessed.
+///
+/// The two routes are the caller's because they name the kind, and a caller
+/// that passed a `format!` would be a counter no reader greps.
+pub fn note_named_at_construction<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+    named: &'static str,
+    unnamed: &'static str,
+) {
+    crate::runtime::drain::note_store_route(
+        if name_resource(state, host, task_id, obj_ref).is_some() {
+            named
+        } else {
+            // The model cannot name the slot even now, while the construction
+            // that asked for it is succeeding. Counted rather than silent: it
+            // means the list entry the construction read is not the one
+            // `name_resource` walks, which is a namespace question and not a
+            // missing call.
+            unnamed
+        },
+    );
+}
+
+pub fn name_resource<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+) -> Option<reims_vgpu_core::identity::ResourceId> {
+    if let Some(name) = state.object_name(task_id, obj_ref) {
+        return Some(name);
+    }
+    let entry = lookup_list_entry(state, host, task_id, obj_ref)?;
+    let descriptor: Arc<[u8]> = Arc::from(read_descriptor(state, host, task_id, &entry)?);
+    let storage = declared_storage(state, task_id, obj_ref, &entry, &descriptor).ok();
+    declare_object_name(state, task_id, obj_ref, storage).ok()
 }
 
 /// Look `obj_ref` up in `task_id`'s list, require its type to be one of `want`,
@@ -1781,6 +3276,72 @@ pub fn resolve_resource<M: HostMemory>(
 /// from a ref naming nothing, several rails treat it as expected control flow
 /// and stay silent, and `AGENTS.md` names it as one of the things that must not
 /// be logged. Callers that care test it before calling.
+/// Say whether a memo that refused a caller's type is the guest's own answer.
+///
+/// **It decides nothing, and what it decides against is a fix.**
+/// [`resolve_descriptor`] refuses a memo hit whose type is not wanted without
+/// re-reading the guest's list. That is right if the memo is the guest's current
+/// answer and wrong if the slot has been recycled under it — and "re-read on a
+/// type refusal" is the obvious repair, so the reading below is what says it
+/// would repair nothing. `note_stale_task_resource` asks the same question on
+/// the memo *hit* path; this asks it where a hit turns into a refusal.
+///
+/// Read, on a driven macos-15 boot through the ordering model, x86/Vulkan:
+///
+/// ```text
+/// memo_wrong_type                 10216
+/// memo_wrong_type_guest_agrees    10216
+/// memo_wrong_type_memo_stale          0
+/// memo_wrong_type_third_type          0
+/// memo_wrong_type_unlisted            0
+/// ```
+///
+/// Ten thousand refusals and not one disagreement: every time a caller was told
+/// "that slot is not the type you want", the guest's own object list said the
+/// same. The population is one shape — a caller asking for
+/// `OBJECT_TYPE_TEXTURE_VIEW` about a slot the guest filled with an
+/// `OBJECT_TYPE_REF_TEXTURE` — so it is a question being asked of the wrong
+/// slot, not a cache answering for a dead one, and no repair belongs in this
+/// resolver.
+///
+/// [`probe_list_entry`] rather than [`lookup_list_entry`], because this is a
+/// question about the slot and not a resolution: the recheck bookkeeping a named
+/// lookup does must not count an instrument's read.
+fn note_memo_wrong_type<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+    cached: &TaskResource,
+    want: &[u8],
+) {
+    crate::runtime::drain::note_store_route("memo_wrong_type");
+    let live = probe_list_entry(state, host, task_id, obj_ref);
+    crate::runtime::drain::note_store_route(match live {
+        None => "memo_wrong_type_unlisted",
+        Some(ref entry) if entry.object_type == cached.entry.object_type => {
+            "memo_wrong_type_guest_agrees"
+        }
+        Some(ref entry) if want.contains(&entry.object_type) => "memo_wrong_type_memo_stale",
+        Some(_) => "memo_wrong_type_third_type",
+    });
+    if crate::observe::first_sight(
+        "memo_wrong_type",
+        (u64::from(task_id) << 32) | u64::from(obj_ref),
+    ) {
+        crate::observe::fail(format!(
+            "memo_wrong_type task={task_id} ref={obj_ref} want={want:?} memo_ot={} \
+             live_ot={:?} memo_desc_gva={:#x} live_desc_gva={:?} (a retained resolution \
+             refused a caller's type without re-reading the guest's list; live_ot is what \
+             that list says now)",
+            cached.entry.object_type,
+            live.as_ref().map(|e| e.object_type),
+            cached.entry.descriptor_gva,
+            live.as_ref().map(|e| e.descriptor_gva),
+        ));
+    }
+}
+
 pub fn resolve_descriptor<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -1788,8 +3349,9 @@ pub fn resolve_descriptor<M: HostMemory>(
     obj_ref: u32,
     want: &[u8],
 ) -> Result<(ListObjectEntry, Arc<[u8]>), LadderRung> {
-    if let Some(resource) = state.task_resources.get(task_id, obj_ref) {
+    if let Some(resource) = state.constructed_object(task_id, obj_ref) {
         if !want.contains(&resource.entry.object_type) {
+            note_memo_wrong_type(state, host, task_id, obj_ref, &resource, want);
             return Err(LadderRung::WrongType {
                 got: resource.entry.object_type,
             });
@@ -1812,12 +3374,14 @@ pub fn resolve_descriptor<M: HostMemory>(
     if !object_type_is_resource(entry.object_type) {
         return Ok((entry, Arc::from(bytes)));
     }
-    let descriptor: Arc<[u8]> = Arc::from(bytes);
-    let resource = state.task_resources.register(
-        task_id,
-        obj_ref,
-        Arc::new(TaskResource::new(entry, descriptor)),
-    );
+    // Construction is [`resolve_resource`]'s, and this delegates rather than
+    // registering a second time. It used to build and publish its own
+    // `TaskResource`, which made two sites that could put an object into this
+    // device's hands — and only one of them can be the place a name is issued.
+    // The cost is re-reading the entry and the descriptor, on a path that is
+    // taken once per object lifetime; the alternative is an object with retained
+    // bytes and no name.
+    let resource = resolve_resource(state, host, task_id, obj_ref)?;
     if !want.contains(&resource.entry.object_type) {
         return Err(LadderRung::WrongType {
             got: resource.entry.object_type,
@@ -2476,6 +4040,206 @@ fn record_backing_owner(state: &mut DeviceState, surface_id: u32, task_id: u32) 
 /// those, and it exists
 /// because a bare "reached nothing" cannot: an announcement with nothing to
 /// apply it to and an announcement that missed a live host copy read the same.
+/// The storage a re-pointed reference names *now*, in the lifecycle owner's
+/// vocabulary.
+///
+/// **Asked after the re-point, and that is the whole reason it is a function
+/// and not a resolver.** `reims_vgpu_core::lifecycle::ResolveRefusal::NeedsStorage`
+/// says a re-point's operation names pages that are not on the wire: the guest
+/// wired them itself and re-committed at the same GPU-VA, so the packet carries
+/// a task and a ref and nothing about the new memory. A resolver consulted while
+/// the operation was being built would answer with the *old* identity, because
+/// the storage incarnation has not moved yet — and one that moved it would be a
+/// mutation from the one function in the join that performs none.
+///
+/// So the caller applies this device's re-point first, and then asks what the
+/// reference names. That is the moment the answer is the new one.
+///
+/// # Why the failure is an enum and not a `None`
+///
+/// It used to be one `None` covering six unrelated facts, and the caller
+/// counted it as `replace_physical_storage_undescribable`. A driven macos-15
+/// boot put 34 of 204 re-points in that bucket, and the bucket could not say
+/// whether they were re-points of references that name no bytes at all — for
+/// which telling the model nothing is correct — or re-points of real storage
+/// the model was never told had moved, which is content authority left on the
+/// old pages. Those are a non-event and a defect, and one counter cannot be
+/// read as either. [`RepointStorageRefusal`] is the split.
+pub fn repointed_storage<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+) -> Result<
+    (
+        reims_vgpu_core::identity::ResourceId,
+        reims_vgpu_core::access::BackingId,
+        reims_vgpu_core::access::ByteRange,
+    ),
+    RepointStorageRefusal,
+> {
+    let name =
+        name_resource(state, host, task_id, obj_ref).ok_or(RepointStorageRefusal::Unnamed)?;
+    let entry = lookup_list_entry(state, host, task_id, obj_ref)
+        .ok_or(RepointStorageRefusal::NoListEntry)?;
+    let descriptor = read_descriptor(state, host, task_id, &entry)
+        .ok_or(RepointStorageRefusal::DescriptorUnread)?;
+    match declared_storage(state, task_id, obj_ref, &entry, &descriptor) {
+        Ok(reims_vgpu_core::lifecycle::Storage::Dedicated { backing, extent }) => {
+            Ok((name, backing, extent))
+        }
+        // A placement has no physical of its own to re-point — the owner
+        // refuses that by name — and `NoBytes` is a reference with nothing to
+        // move. Neither is an operation, and both are named so that a boot can
+        // tell them from storage that moved unheard.
+        Ok(reims_vgpu_core::lifecycle::Storage::Placed { .. }) => {
+            Err(RepointStorageRefusal::Placed)
+        }
+        Ok(reims_vgpu_core::lifecycle::Storage::NoBytes) => {
+            Err(RepointStorageRefusal::NoBytes {
+                object_type: entry.object_type,
+                // Asked because a re-point whose reference names no bytes in
+                // the object list, while the *same integer* names a live
+                // mapping surface in this task, is not a no-op: it is storage
+                // reached through the other namespace, and the object list
+                // cannot describe it. The two namespaces overlap numerically,
+                // so this is recorded as a reading and not acted on — what
+                // makes it one fact rather than a collision is the type at the
+                // list entry, which travels with it.
+                mapping_names_a_surface: mapping_backing_id(state, obj_ref).is_ok(),
+            })
+        }
+        Err(refusal) => Err(RepointStorageRefusal::Refused(refusal)),
+    }
+}
+
+/// Why a re-pointed reference names no storage operation the model can be told
+/// about.
+///
+/// Each variant carries its own census route, because the whole point of the
+/// enum is that the routes are read separately: a boot where every one is
+/// `NoBytes` has lost nothing, and a boot where they are `Refused` has one
+/// silent stale-content hazard per count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepointStorageRefusal {
+    /// The reference resolves to no resource name — no task space, or no live
+    /// slot. There is nothing for an operation to be about.
+    Unnamed,
+    /// The name exists and the guest's object list holds no entry at it.
+    NoListEntry,
+    /// The entry exists and its descriptor did not read out of guest memory.
+    DescriptorUnread,
+    /// The reference names a heap window. A placement owns no physical of its
+    /// own, so a re-point of one is the heap's event, not this reference's.
+    Placed,
+    /// The reference names an object with no bytes at all — a sampler, a
+    /// function, a view. A re-point announcement against one is a no-op, and
+    /// the type is carried so that a boot can say which kinds this guest
+    /// re-points and whether the answer is plausible for them.
+    NoBytes {
+        object_type: u8,
+        /// Whether the same integer names a live mapping surface in this task.
+        ///
+        /// If it does, the announcement is about storage the mapping namespace
+        /// has and the object list does not, and "no bytes" is the object
+        /// list's answer rather than the resource's.
+        mapping_names_a_surface: bool,
+    },
+    /// The reference names storage this device could not describe. This is the
+    /// one that costs: the pages moved and the model was not told.
+    Refused(StorageRefusal),
+}
+
+impl RepointStorageRefusal {
+    /// The census route this refusal is counted on.
+    #[must_use]
+    pub const fn route(self) -> &'static str {
+        match self {
+            Self::Unnamed => "replace_physical_storage_unnamed",
+            Self::NoListEntry => "replace_physical_storage_no_list_entry",
+            Self::DescriptorUnread => "replace_physical_storage_descriptor_unread",
+            Self::Placed => "replace_physical_storage_placed",
+            Self::NoBytes {
+                mapping_names_a_surface: true,
+                ..
+            } => "replace_physical_storage_no_bytes_but_mapping_names_a_surface",
+            Self::NoBytes { .. } => self.no_bytes_kind_route(),
+            Self::Refused(_) => self.refused_route(),
+        }
+    }
+
+    /// The kind at the object-list entry, whatever the mapping namespace says.
+    ///
+    /// [`Self::route`]'s no-bytes arms are shadowed by the mapping arm, and the
+    /// mapping arm is exactly the case where the type pair decides whether the
+    /// two namespaces are naming one thing or the integer merely collided.
+    /// So the caller counts both, and only this one answers "what is the guest's
+    /// own list holding at that reference".
+    #[must_use]
+    pub const fn no_bytes_kind_route(self) -> &'static str {
+        match self {
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_FUNCTION,
+                ..
+            } => "replace_physical_storage_no_bytes_function",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_SERIALIZER_OBJECT,
+                ..
+            } => "replace_physical_storage_no_bytes_serializer",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_TEXTURE_VIEW,
+                ..
+            } => "replace_physical_storage_no_bytes_texture_view",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_REF_TEXTURE,
+                ..
+            } => "replace_physical_storage_no_bytes_ref_texture",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_BACKING,
+                ..
+            } => "replace_physical_storage_no_bytes_backing",
+            Self::NoBytes {
+                object_type: OBJECT_TYPE_MAPPER_REF_TEXTURE,
+                ..
+            } => "replace_physical_storage_no_bytes_mapper_ref_texture",
+            Self::NoBytes { .. } => "replace_physical_storage_no_bytes_other",
+            _ => "replace_physical_storage_kind_not_asked",
+        }
+    }
+
+    const fn refused_route(self) -> &'static str {
+        match self {
+            Self::Refused(StorageRefusal::ExtentUnrecovered { .. }) => {
+                "replace_physical_storage_extent_unrecovered"
+            }
+            Self::Refused(StorageRefusal::Backing(BackingIdRefusal::Unresolved(_))) => {
+                "replace_physical_storage_backing_unresolved"
+            }
+            Self::Refused(StorageRefusal::Backing(BackingIdRefusal::ThroughMapping { .. })) => {
+                "replace_physical_storage_mapping_names_no_surface"
+            }
+            Self::Refused(StorageRefusal::Backing(BackingIdRefusal::HeapPlaced)) => {
+                "replace_physical_storage_heap_placed"
+            }
+            Self::Refused(StorageRefusal::Backing(BackingIdRefusal::NamesNoStorage { .. })) => {
+                "replace_physical_storage_names_no_storage"
+            }
+            _ => "replace_physical_storage_refusal_not_asked",
+        }
+    }
+
+    /// Whether this refusal leaves the model's content authority on pages the
+    /// guest has already re-pointed.
+    ///
+    /// The four resolution and no-bytes arms do not: there is no storage for
+    /// the model to hold authority over. [`Self::Refused`] does — the storage
+    /// is real and only this device's vocabulary for it is missing.
+    #[must_use]
+    pub const fn leaves_authority_stale(self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+}
+
 pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -2509,7 +4273,51 @@ pub fn replace_physical<H: HostMemory + crate::runtime::host::HostOps>(
     // changed, so it says so whether or not this device was holding anything to
     // invalidate — the announcement is about the guest's memory, not about our
     // caches. Ahead of the unreached arm's early return for that reason.
-    state.bump_storage_incarnation(task_id, object_id);
+    //
+    // The packet names a reference and the incarnation is kept on the window,
+    // so the reference is resolved to one first. Both are asked, cache before
+    // guest, because they answer different questions: the cache holds the
+    // window *accepted work was planned against*, which is the one that must
+    // stop comparing equal, while the guest's list holds whatever the
+    // reference names now. A reference this device never constructed has only
+    // the second.
+    match repointed_window(state, host, task_id, object_id) {
+        Some(base) => {
+            state.bump_storage_incarnation(task_id, base);
+            invalidate_window_peers(state, host, task_id, object_id, base);
+        }
+        // No window. That is only a loss for storage this device reaches *by
+        // address*: an object that owns a mapping carries its incarnation in
+        // that mapping's generation instead, which the arm below moves, and
+        // the two counters are the two ways storage is reached rather than two
+        // answers about one. A driven macos-15 boot puts every one of these in
+        // the second class — seven re-points, all in the accelerator's kernel
+        // task, naming surfaces registered there — so a line that called them
+        // losses would be seven false findings a boot.
+        None if target.is_some() => {
+            crate::runtime::drain::note_store_route("replace_physical_window_via_mapping");
+        }
+        // Neither address nor mapping. Now it is a real loss — a later identity
+        // for these pages will compare equal to the one accepted work holds —
+        // and it is named rather than left to a counter that reads the same as
+        // a boot with no re-points at all.
+        None => {
+            crate::runtime::drain::note_store_route("replace_physical_window_unknown");
+            if crate::observe::first_sight(
+                "replace_physical_window_unknown",
+                u64::from(task_id) << 32 | u64::from(object_id),
+            ) {
+                crate::observe::fail(format!(
+                    "replace_physical_window_unknown task={task_id} object={object_id} \
+                     (neither this device's construction of this reference nor the \
+                     guest's own list gives it a guest-VA window, so the incarnation \
+                     of the pages the packet says have moved was not advanced and a \
+                     later identity for them will compare equal to the one accepted \
+                     work holds)"
+                ));
+            }
+        }
+    }
 
     let Some(target) = target else {
         note_replace_physical_unmapped_after_invalidation(
@@ -2739,6 +4547,496 @@ pub enum HeapReference {
         object_type: u8,
         descriptor_length: u32,
     },
+}
+
+/// Why a guest object reference has no canonical backing identity.
+///
+/// Three of the four are a contract term this device does not have, named
+/// rather than guessed; the fourth is a mapping that names no surface yet,
+/// carried whole from the resolver that does have the term. `reims_vgpu_core::access::BackingId`'s own doc says why the
+/// guess is not available: an identity that is wrong in the equal direction
+/// hands storage back under a live reader, and one that is wrong in the
+/// distinct direction drops a hazard edge. Neither failure has a symptom at
+/// the point it is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackingIdRefusal {
+    /// The reference names nothing in the task's object list, or its
+    /// descriptor did not read.
+    Unresolved(LadderRung),
+    /// The object reaches its storage through a mapping — a mapper-ref texture
+    /// — and that mapping names no live surface.
+    ///
+    /// The refusal is the *mapping's*, carried whole, and it is no longer this
+    /// one's own: the descriptor names a mapping id, so the reference is
+    /// followed to it and [`mapping_backing_id`] answers. It used to stop here
+    /// on the type alone, which read as "this device does not have the term"
+    /// when the term was one decode away.
+    ///
+    /// Following a decoded field is not one resolver answering two namespaces.
+    /// The two entry points stay separate, keyed by the two `u32`s that overlap
+    /// numerically and name unrelated things — a caller holding a mapping id
+    /// asks [`mapping_backing_id`], a caller holding an object reference asks
+    /// [`backing_id`] — and a caller that could pass either to one method would
+    /// get a plausible number for the wrong question. That is what the split is
+    /// for, and it survives the delegation.
+    ///
+    /// **A dual-plane texture is not one of these and used to be.** It is built
+    /// from paging info in its own task like any normal texture, its two planes
+    /// share the one object header's handle and allocation size, and
+    /// `Descriptor::backing_window` now answers for it — one allocation, two
+    /// extents.
+    ThroughMapping {
+        mapping_id: u32,
+        refusal: MappingBackingRefusal,
+    },
+    /// The object is placed inside a heap, and a heap's extent is unrecovered.
+    ///
+    /// A placement names a heap reference and an offset. The heap's identity is
+    /// settled — it is an object-list object like any other — but without its
+    /// *length* nothing can say which two offsets in it overlap, so two
+    /// placements sharing bytes would come out distinct. That is a dropped
+    /// hazard edge, so the identity is refused until the extent is recovered.
+    HeapPlaced,
+    /// The object names no storage at all: a function, a serializer object, a
+    /// texture view over another object's bytes.
+    NamesNoStorage { object_type: u8 },
+}
+
+impl BackingIdRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Unresolved(_) => "backing_id_unresolved",
+            Self::ThroughMapping { .. } => "backing_id_mapping_names_no_surface",
+            Self::HeapPlaced => "backing_id_heap_placed",
+            Self::NamesNoStorage { .. } => "backing_id_names_no_storage",
+        }
+    }
+}
+
+/// The canonical backing identity of the storage a guest object reference
+/// names.
+///
+/// # What makes this the identity and not a name
+///
+/// `reims_vgpu_core::access::BackingId` is what two resources sharing backing
+/// must share, and the dependency compiler draws its hazard edges on it. So it
+/// is derived from *where the storage is* and never from what it is called: two
+/// references over one allocation arrive here at one number — which a driven
+/// boot proved is not hypothetical, the compositor holds its scanout buffer
+/// under two — and one reference across a physical replacement arrives at two,
+/// because the pages changed.
+///
+/// The window is the allocation's, not the texel base's, so two textures placed
+/// at different offsets in one allocation are one backing with two extents.
+/// The extent is `reims_vgpu_core::access::ByteRange`'s and is not asked here.
+///
+/// # Errors
+///
+/// [`BackingIdRefusal`], one variant per contract term this device does not
+/// have for the reference. None of them is a failure to try harder.
+pub fn backing_id<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+) -> Result<reims_vgpu_core::access::BackingId, BackingIdRefusal> {
+    let entry = lookup_list_entry(state, host, task_id, obj_ref)
+        .ok_or(BackingIdRefusal::Unresolved(LadderRung::NoListEntry))?;
+    let descriptor = read_descriptor(state, host, task_id, &entry).ok_or(
+        BackingIdRefusal::Unresolved(LadderRung::DescRead {
+            declared_len: entry.descriptor_length,
+        }),
+    )?;
+    backing_id_of(state, task_id, obj_ref, &entry, &descriptor)
+}
+
+/// [`backing_id`] for a caller that has already read the list entry and the
+/// descriptor.
+///
+/// The construction path holds both — it decodes the descriptor to build the
+/// resource — so making it go back to guest memory for them would be two reads
+/// of the same bytes and, worse, two chances for the identity and the resource
+/// to describe different versions of the object.
+///
+/// # Errors
+///
+/// [`BackingIdRefusal`], exactly as [`backing_id`].
+pub fn backing_id_of(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Result<reims_vgpu_core::access::BackingId, BackingIdRefusal> {
+    match backing_window(state.page_shift, entry, descriptor) {
+        Some((base, _)) => Ok(state.backing_identity(task_id, base)),
+        // One type's storage is somewhere else rather than not yet named, and
+        // the rest are refusals whose variant says what would have to land for
+        // them to stop being one. Both live in the classifier below, so the
+        // answer is exhaustive over the types rather than a fallthrough.
+        None => backing_id_without_window(state, obj_ref, entry, descriptor),
+    }
+}
+
+/// Why a guest mapping's surface has no canonical backing identity.
+///
+/// Both arms are "the guest has not said there is a surface here yet", never
+/// "this device could not work it out". Storage reached through a mapping needs
+/// no descriptor read and no page walk to be *identified* — the mapping id and
+/// its generation are the identity — so there is no ladder of ways to fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingBackingRefusal {
+    /// This device holds no entry at that mapping id.
+    Unlisted,
+    /// An entry exists but the guest has never mapped a surface into it.
+    ///
+    /// Entries are created by any of several statements about a slot — a
+    /// geometry declaration, a validity quad — and one that has never carried a
+    /// MAP or an attach names no storage to identify. Minting for it would hand
+    /// an identity to a slot number rather than to storage, which is the
+    /// name-derived id `reims_vgpu_core::access::BackingId` rules out.
+    Unmapped,
+}
+
+impl MappingBackingRefusal {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Unlisted => "mapping_backing_id_unlisted",
+            Self::Unmapped => "mapping_backing_id_unmapped",
+        }
+    }
+}
+
+/// The canonical backing identity of the storage a guest mapping's surface
+/// occupies.
+///
+/// [`backing_id`]'s other half, and the answer to
+/// `reims_vgpu_core::resolve::MappingResolver`. The two are separate functions
+/// over separate namespaces — a mapping id and an object-list reference arrive
+/// as `u32`s that overlap numerically and name unrelated things — but they mint
+/// into one identity space, so a mapping-reached and an address-reached piece of
+/// storage can never collide. `crate::model::BackingWindowRefs` states how.
+///
+/// The incarnation is the mapping's own `map_generation` rather than the window
+/// counter, and `DeviceState::mapping_backing_identity` says why that is forced
+/// rather than chosen.
+///
+/// # Errors
+///
+/// [`MappingBackingRefusal`], for the two ways a mapping id names no surface.
+pub fn mapping_backing_id(
+    state: &DeviceState,
+    mapping_id: u32,
+) -> Result<reims_vgpu_core::access::BackingId, MappingBackingRefusal> {
+    let entry = state
+        .mappings
+        .get(&mapping_id)
+        .ok_or(MappingBackingRefusal::Unlisted)?;
+    if !entry.mapped {
+        return Err(MappingBackingRefusal::Unmapped);
+    }
+    Ok(state.mapping_backing_identity(mapping_id, entry.map_generation))
+}
+
+/// What an object that named no guest-VA window is, when it is not a window.
+///
+/// Split from [`backing_id`] so the answer is exhaustive over the object types
+/// the resource constructor accepts, rather than a fallthrough from a decode
+/// that happened not to produce a window.
+///
+/// One arm is not a refusal at all. A mapper-ref texture's storage is a
+/// mapping's, and the descriptor in hand names which mapping — so the reference
+/// is followed to [`mapping_backing_id`] and only the mapping's own refusal can
+/// come back. A zero mapping id, and a descriptor that does not decode, are the
+/// descriptor rung rather than a mapping refusal: the bytes are there and they
+/// do not yet name a mapping, which is what an unwritten handle is on the
+/// address-named types.
+fn backing_id_without_window(
+    state: &DeviceState,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+) -> Result<reims_vgpu_core::access::BackingId, BackingIdRefusal> {
+    use crate::runtime::decode::resource::{
+        decode_iosurface_texture_descriptor, texture_view_opcode, Descriptor, HEAP_TEXTURE_OPCODE,
+        HEAP_TEXTURE_WIDE_OPCODE, OBJECT_TYPE_DUAL_PLANE_TEXTURE,
+    };
+    let unresolved = BackingIdRefusal::Unresolved(LadderRung::DescRead {
+        declared_len: entry.descriptor_length,
+    });
+    Err(match entry.object_type {
+        // The surface-backing object, whose storage is the mapping's and whose
+        // mapping id is its own object-list slot.
+        //
+        // This is not the numeric coincidence the two namespaces are otherwise
+        // kept apart for. A backing is registered at slot `surface_id` *because*
+        // that is what a surface id is here — `backing_claimant_tasks` finds a
+        // surface's owner by probing exactly this slot for exactly this type,
+        // and `crate::model::BackingWindowRefs` says the address route names no
+        // storage for `OBJECT_TYPE_BACKING` precisely because the mapping route
+        // owns it. The type is what makes the integer one namespace rather than
+        // two, which is why the arm is keyed on the type and not on the id
+        // resolving.
+        //
+        // It answered `NamesNoStorage` before, and a driven macos-15 boot said
+        // what that cost: every one of 36 re-points the semantic model was not
+        // told about was a backing object whose slot also named a live mapping
+        // surface.
+        OBJECT_TYPE_BACKING => {
+            return mapping_backing_id(state, obj_ref).map_err(|refusal| {
+                BackingIdRefusal::ThroughMapping {
+                    mapping_id: obj_ref,
+                    refusal,
+                }
+            });
+        }
+        OBJECT_TYPE_MAPPER_REF_TEXTURE => {
+            let Ok(Descriptor::IOSurfaceTexture { mapping_id, .. }) =
+                decode_iosurface_texture_descriptor(descriptor)
+            else {
+                return Err(unresolved);
+            };
+            if mapping_id == 0 {
+                return Err(unresolved);
+            }
+            return mapping_backing_id(state, mapping_id).map_err(|refusal| {
+                BackingIdRefusal::ThroughMapping {
+                    mapping_id,
+                    refusal,
+                }
+            });
+        }
+        // A texture whose descriptor is a heap placement, which is a record at
+        // its own opcode rather than an object type of its own -- the placement
+        // is how a texture is made, not what kind of object it is.
+        OBJECT_TYPE_TEXTURE | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
+            if matches!(
+                texture_view_opcode(descriptor),
+                Some(HEAP_TEXTURE_OPCODE) | Some(HEAP_TEXTURE_WIDE_OPCODE)
+            ) =>
+        {
+            BackingIdRefusal::HeapPlaced
+        }
+        // A texture or buffer that produced no window has a descriptor the
+        // guest has not finished writing -- a zero handle or a zero allocation
+        // size. That is the ladder's `DescRead` in substance: the bytes are
+        // there and they do not yet name an allocation.
+        OBJECT_TYPE_TEXTURE
+        | OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS
+        | OBJECT_TYPE_BUFFER
+        | OBJECT_TYPE_DUAL_PLANE_TEXTURE => unresolved,
+        other => BackingIdRefusal::NamesNoStorage { object_type: other },
+    })
+}
+
+/// Whether another constructed reference in this task names the same
+/// allocation, asked without touching guest memory.
+///
+/// The construction cache alone, because the callers are on hot paths and
+/// because the cache is the right question for them: it holds the window each
+/// reference was *resolved* against, which is the window the device's own
+/// per-reference state was built for.
+///
+/// `None` when this reference has no cached construction, no window, or no
+/// company. It is a reading and not a decision — see
+/// [`note_reference_shares_storage`] for what a caller does with it.
+pub fn cached_window_peer(state: &DeviceState, task_id: u32, obj_ref: u32) -> Option<u32> {
+    let base = cached_window(state, task_id, obj_ref)?;
+    state
+        .task_resources
+        .in_task(task_id)
+        .into_iter()
+        .filter(|&(name, _)| name.slot.0 != obj_ref)
+        .find(|(_, other)| other.backing_window(state.page_shift) == Some((base.0, base.1)))
+        .map(|(name, _)| name.slot.0)
+}
+
+/// The allocation a constructed reference names, from its own decode.
+///
+/// The construction cache alone and no guest read, which is what makes it
+/// affordable on the payment path. A reference this device has not constructed
+/// has no cached window and is not one this device is keeping per-reference
+/// state for either, so the two absences agree.
+#[must_use]
+pub fn cached_window(state: &DeviceState, task_id: u32, obj_ref: u32) -> Option<(u64, u64)> {
+    state
+        .constructed_object(task_id, obj_ref)?
+        .backing_window(state.page_shift)
+}
+
+/// Report that per-reference state is being kept for a reference that shares
+/// its storage with another.
+///
+/// # What this is asking
+///
+/// Several of this device's caches and generations are keyed
+/// `(task, reference)` and stand for *storage*: the guest-write generation a
+/// GVA writeback debt compares against, and the two host-copy caches. A
+/// reference is a lawful key for those only if one allocation has one live
+/// reference — and it does not. `note_backing_window_alias` found the
+/// compositor holding its scanout allocation under two, so a guest write
+/// declared through one reference leaves the other's generation unchanged and
+/// its stale image authoritative.
+///
+/// The host-copy caches are fixed: a re-point now sweeps the window's peers.
+/// The guest-write generation is **not**, and this is what says whether it
+/// needs to be — it is bumped some six thousand times per census window, far
+/// too hot to resolve a window on, so the question is asked once per distinct
+/// reference.
+///
+/// # The reading, and why the re-key did not happen
+///
+/// A driven macos-15 boot asked it of **1285** distinct references and every
+/// one of them was the only constructed name for its allocation
+/// (`reference_storage_asked=1285`, `reference_storage_shared=0`). So the
+/// `(task, reference)` key stands for storage everywhere this path uses it,
+/// and re-keying it on the window would have bought nothing at a cost the hot
+/// path cannot carry.
+///
+/// That is not the same as saying the alias does not exist — it does, and
+/// `note_backing_window_alias` finds it on the compositor's scanout allocation
+/// on every boot. It says the two sets do not overlap: the references that
+/// share an allocation are not the references this generation is kept for.
+/// Two facts, and only the measurement distinguishes them.
+///
+/// This stays on, at one scan per distinct reference, because the claim is
+/// about a workload and not about the code: a guest that does bind two names
+/// over one buffer would make the re-key necessary, and this is what would say
+/// so rather than a wrong frame.
+///
+/// # More than one site asks it
+///
+/// The GVA writeback debt asks it too. `GvaResourceKey` is the resource
+/// because that is what `CmdSynchronizeResources` names, and the debt it holds
+/// is owed by *storage* — so a second live name over one allocation could be
+/// synchronised while this one's frame stays owed, and the guest would CPU-read
+/// pages the device still holds newer pixels for.
+///
+/// `reference_storage_asked` and `reference_storage_shared` are shared across
+/// the sites on purpose: the question they answer is "does any per-reference
+/// key that stands for storage alias", which is one question. Which site saw it
+/// is on the failure line, and that is where it matters — a non-zero
+/// `reference_storage_shared` is read by finding the line, not by reading the
+/// counter.
+pub fn note_reference_shares_storage(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    site: &'static str,
+) {
+    // Once per reference, not per write. The scan is over one task's
+    // constructed resources and the hot path cannot afford it per call; the
+    // contract question it answers is about the reference, so once is enough.
+    if !crate::observe::first_sight(site, u64::from(task_id) << 32 | u64::from(obj_ref)) {
+        return;
+    }
+    crate::runtime::drain::note_store_route("reference_storage_asked");
+    let Some(peer) = cached_window_peer(state, task_id, obj_ref) else {
+        return;
+    };
+    crate::runtime::drain::note_store_route("reference_storage_shared");
+    // Both names, so a hot path may ask about either in one lookup.
+    state.note_aliased_reference(task_id, obj_ref);
+    state.note_aliased_reference(task_id, peer);
+    crate::observe::fail(format!(
+        "{site} task={task_id} ref={obj_ref} peer={peer} (per-reference state is \
+         standing for storage that has a second live name, so a statement made \
+         through this reference leaves the other one's copy of it unchanged)"
+    ));
+}
+
+/// Drop the host copies held under *every other* reference over the re-pointed
+/// window.
+///
+/// # The defect this closes
+///
+/// A re-point invalidated the host copies keyed by the reference its packet
+/// named, on the reading that a reference is a resource and a resource has one
+/// set of copies. Both host caches are keyed `(task, reference)`, so a second
+/// reference over the same allocation kept its texture — built from pages the
+/// packet has just said are different pages, and served to every later draw
+/// that binds it. That is a wrong surface with no refusal anywhere, which is
+/// the failure the whole window derivation exists to prevent, reached through
+/// the cache rather than through the identity.
+///
+/// It is not hypothetical: `note_backing_window_alias` found the compositor
+/// holding its 1920×1080 scanout allocation under two live references, and the
+/// scanout buffer is the one this device re-points.
+///
+/// # Why the peers are found by walking the caches
+///
+/// The set that matters is the set that *has* a copy to drop, and that is
+/// exactly the keys in the two caches. It is small — a host copy per bound
+/// resource, not per reference the guest published — and it needs no index
+/// this device would then have to keep true. A window→references map would be
+/// a third thing to invalidate on every lifetime event, and the events it
+/// would have to see include the one no packet announces.
+fn invalidate_window_peers<M: HostMemory>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    named: u32,
+    base: u64,
+) {
+    let peers: Vec<u32> = state
+        .host_texture_surfaces
+        .keys()
+        .chain(state.host_linear_textures.keys())
+        .filter(|&&(task, ref_)| task == task_id && ref_ != named)
+        .map(|&(_, ref_)| ref_)
+        .collect();
+    // Counted whether or not anything is dropped, for the reason
+    // `backing_window_collision` is: a boot where no reference over the
+    // re-pointed window held a copy and a boot where the sweep never ran read
+    // the same on the drop counter alone, and only the first says the guard
+    // cost nothing.
+    crate::runtime::drain::note_store_route_n(
+        "replace_physical_window_peers_examined",
+        peers.len() as u64,
+    );
+    for peer in peers {
+        if repointed_window(state, host, task_id, peer) != Some(base) {
+            continue;
+        }
+        let (texture, linear) = state.invalidate_object_host_copies(task_id, peer);
+        if texture || linear {
+            crate::runtime::drain::note_store_route("replace_physical_window_peer_dropped");
+            if crate::observe::first_sight(
+                "replace_physical_window_peer",
+                u64::from(task_id) << 32 | u64::from(peer),
+            ) {
+                crate::observe::fail(format!(
+                    "replace_physical_window_peer task={task_id} named={named} peer={peer} \
+                     base={base:#x} tex={texture} lin={linear} (a second reference over the \
+                     re-pointed window was holding a host copy built from the pages the \
+                     packet says have already changed, and every later bind of it would \
+                     have been served those pages)"
+                ));
+            }
+        }
+    }
+}
+
+/// The guest-VA window a re-point packet's reference names.
+///
+/// The construction cache first: it holds the descriptor the accepted work was
+/// planned against, and that is the window whose incarnation has to move.
+/// Falling back to the guest's own list covers a reference this device has
+/// never constructed, which is 96 of 103 re-points on a driven boot.
+fn repointed_window<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    object_id: u32,
+) -> Option<u64> {
+    if let Some((base, _)) = cached_window(state, task_id, object_id) {
+        return Some(base);
+    }
+    let entry = probe_list_entry(state, host, task_id, object_id)?;
+    let descriptor = read_descriptor(state, host, task_id, &entry)?;
+    backing_window(state.page_shift, &entry, &descriptor).map(|(base, _)| base)
 }
 
 /// Report what a heap-placed texture's heap reference names.

@@ -192,6 +192,55 @@ mod tests {
     use super::*;
     use crate::closure::{Rail, LEDGER};
 
+    /// Every option word this device can read, and every one it refuses.
+    ///
+    /// `select_aspect` is the only place a `MTLBlitOption` word becomes a plane
+    /// selection, and both rails and every copy record ask it here. A zero and
+    /// an absent options field are the same answer on purpose: a record with no
+    /// `options:` field selects the whole texel, so the caller no longer needs
+    /// to carry "this record has no options word" beside the word itself.
+    #[test]
+    fn an_option_word_selects_one_plane_or_names_why_it_cannot() {
+        assert_eq!(select_aspect(MTL_BLIT_OPTION_NONE), Ok(BlitAspect::Full));
+        assert_eq!(
+            select_aspect(MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL),
+            Ok(BlitAspect::Depth)
+        );
+        assert_eq!(
+            select_aspect(MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL),
+            Ok(BlitAspect::Stencil)
+        );
+        // Both plane bits at once names no plane a copy can address.
+        assert_eq!(
+            select_aspect(
+                MTL_BLIT_OPTION_DEPTH_FROM_DEPTH_STENCIL
+                    | MTL_BLIT_OPTION_STENCIL_FROM_DEPTH_STENCIL
+            ),
+            Err(OptionRefusal::ConflictingAspects)
+        );
+        // No PVRTC rail to apply a row-linear addressing rule to.
+        assert_eq!(
+            select_aspect(MTL_BLIT_OPTION_ROW_LINEAR_PVRTC),
+            Err(OptionRefusal::RowLinearPvrtc)
+        );
+        // Unknown stays unknown: the bit this device cannot read may be the one
+        // that says which bytes the guest meant.
+        assert_eq!(
+            select_aspect(1 << 8),
+            Err(OptionRefusal::UnknownBits { options: 1 << 8 })
+        );
+        // Each refusal answers under its own name; a shared slug would report
+        // three different losses as one.
+        let slugs = [
+            OptionRefusal::ConflictingAspects.slug(),
+            OptionRefusal::RowLinearPvrtc.slug(),
+            OptionRefusal::UnknownBits { options: 1 << 8 }.slug(),
+        ];
+        for (i, a) in slugs.iter().enumerate() {
+            assert!(!slugs[i + 1..].contains(a), "{a} is two refusals' name");
+        }
+    }
+
     #[test]
     fn no_two_kinds_share_an_opcode() {
         for (i, a) in BlitKind::ALL.iter().enumerate() {

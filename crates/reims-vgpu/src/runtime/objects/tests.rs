@@ -207,10 +207,10 @@ fn task_lifetime_retires_all_of_its_resource_objects() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     setup_task_with_list(&mut host, &mut state);
     let resource = resolve_resource(&state, &host, 1, 1).expect("construction");
-    assert!(state.task_resources.get(1, 1).is_some());
+    assert!(state.constructed_object(1, 1).is_some());
 
     assert!(state.delete_task(1));
-    assert!(state.task_resources.get(1, 1).is_none());
+    assert!(state.constructed_object(1, 1).is_none());
     assert_eq!(
         ld32(&resource.descriptor),
         9,
@@ -248,13 +248,13 @@ fn non_resource_descriptors_are_read_again() {
     let (_, first) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_SERIALIZER_OBJECT])
         .expect("first serializer descriptor");
     assert_eq!(ld32(&first), 1);
-    assert!(state.task_resources.get(1, 2).is_none());
+    assert!(state.constructed_object(1, 2).is_none());
 
     let _ = host.write_gpa(data_gpa + 0x80, &2u32.to_le_bytes());
     let (_, second) = resolve_descriptor(&state, &host, 1, 2, &[OBJECT_TYPE_SERIALIZER_OBJECT])
         .expect("updated serializer descriptor");
     assert_eq!(ld32(&second), 2);
-    assert!(state.task_resources.get(1, 2).is_none());
+    assert!(state.constructed_object(1, 2).is_none());
 }
 
 fn put_sampler_object(host: &mut FakeHost, ref_: u32, descriptor_gva: u64, lod_min: f32) {
@@ -306,6 +306,103 @@ fn sampler_construction_is_retained_until_its_own_explicit_delete() {
     let replacement = resolve_sampler_state(&state, &host, 1, 2).expect("replacement sampler");
     assert!(!Arc::ptr_eq(&first, &replacement));
     assert_eq!(replacement.descriptor.lod_min_clamp, 7.5);
+}
+
+/// Constructing a sampler names its slot, because the destroy that ends its
+/// life arrives when nothing else can.
+///
+/// A sampler is built out of the guest's object list once and answered from
+/// `task_sampler_states` forever after, and the guest clears the list slot
+/// before it sends `CmdDeleteObject`. So the destroy resolves against neither a
+/// cached construction nor a live entry — a driven macos-15 boot found the
+/// semantic model holding a name for **zero of 1984** of them. A retirement the
+/// model cannot name is one it cannot be told about.
+///
+/// The name is taken at construction because that is the only moment the list
+/// entry and the model's namespace are both available.
+#[test]
+fn constructing_a_sampler_names_its_slot_so_its_destroy_can_still_be_resolved() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    put_sampler_object(&mut host, 2, 0x80, 1.25);
+
+    assert_eq!(
+        state.object_name(1, 2),
+        None,
+        "nothing has asked what this slot names yet"
+    );
+    let _ = resolve_sampler_state(&state, &host, 1, 2).expect("first sampler");
+    let named = state
+        .object_name(1, 2)
+        .expect("construction names the slot it constructed from");
+
+    // The guest clears the slot, which is what it does before the destroy. The
+    // name outlives the entry, which is the whole point.
+    let cleared = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let _ = host.write_gpa(data_gpa + 2 * OBJECT_LIST_ENTRY_LEN as u64, &cleared);
+    assert_eq!(
+        lookup_list_entry(&state, &host, 1, 2),
+        None,
+        "the fixture must really have cleared the entry, or this proves nothing"
+    );
+    assert_eq!(
+        super::name_resource(&state, &host, 1, 2),
+        Some(named),
+        "the production ref resolver still answers, so the destroy has a \
+         resource to name"
+    );
+}
+
+/// Naming at construction is a name that outlives the guest's list entry, and
+/// it is taken for every object type rather than for resources alone.
+///
+/// The kinds this door is called for are the ones a driven boot measured
+/// arriving at `CmdDeleteObject` with no name the model could hold — depth
+/// stencil 4, function 5, compute pipeline 3, against about 2160 destroys — and
+/// each is named at its own construction site because there is no shared one.
+/// What every site depends on is this: the name is taken while the entry is
+/// live, and it answers afterwards, because the guest clears the slot before it
+/// sends the destroy.
+///
+/// The fixture uses a sampler's object-list entry because the entry is the
+/// whole input — `name_resource` names a sampler, a function and a pipeline
+/// state by their slots exactly as it names a texture, and a door that behaved
+/// differently per type would be the bug this asserts against.
+#[test]
+fn naming_at_construction_outlives_the_guests_list_entry() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    put_sampler_object(&mut host, 3, 0x100, 0.5);
+
+    assert_eq!(state.object_name(1, 3), None);
+    super::note_named_at_construction(&state, &host, 1, 3, "named", "unnamed");
+    let named = state
+        .object_name(1, 3)
+        .expect("the door names the slot it was called for");
+
+    // What the guest does before every destroy this population is about.
+    let cleared = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let _ = host.write_gpa(data_gpa + 3 * OBJECT_LIST_ENTRY_LEN as u64, &cleared);
+    assert_eq!(
+        lookup_list_entry(&state, &host, 1, 3),
+        None,
+        "the fixture must really have cleared the entry, or this proves nothing"
+    );
+    assert_eq!(
+        super::name_resource(&state, &host, 1, 3),
+        Some(named),
+        "so the destroy has a resource to name and does not have to be refused"
+    );
+
+    // A slot with no entry at all cannot be named even at construction time,
+    // and the door says so rather than inventing one — that is what the
+    // `unnamed` route counts.
+    super::note_named_at_construction(&state, &host, 1, 5, "named", "unnamed");
+    assert_eq!(state.object_name(1, 5), None);
 }
 
 #[test]
@@ -2271,104 +2368,150 @@ fn a_repoint_retires_a_backing_mapping_owned_by_the_packet_task() {
 }
 
 /// Storage named by an address rather than by a mapping gets an incarnation,
-/// and it advances on exactly the events that make the pages behind that name
-/// different pages.
+/// and it advances on exactly the events that make the pages behind that
+/// *window* different pages.
 ///
 /// The counter exists so a canonical backing identity can be a window *and* a
 /// number. A window alone repeats across a physical replacement — same
 /// guest-virtual address, different host frames — and equal ids would let a
 /// claim on the old frames be satisfied by the new ones, handing storage back
 /// under a live reader. Each assertion below is one way that could happen.
+///
+/// It is keyed on the window and not on the reference, and the assertion that
+/// two references over one window move together is the one a driven boot made
+/// load-bearing: it found exactly that, on the compositor's scanout buffer.
 #[test]
 fn address_named_storage_counts_its_incarnations() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     let mut host = FakeHost::new();
-    let (task, object, neighbour) = (3u32, 9u32, 10u32);
-    state.define_task(task, 0x1000, 0x40);
-    assert!(state.insert_object(task, object));
-    assert!(state.insert_object(task, neighbour));
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    // Two references over one window, and a third over another, so the test can
+    // say both that the count is shared where the storage is and separate where
+    // it is not.
+    let (task, object, twin, neighbour) = (1u32, 2u32, 3u32, 4u32);
+    let write_object = |host: &mut FakeHost, ref_: u32, desc_gva: u64, handle: u64| {
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+        desc[8..16].copy_from_slice(&handle.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + desc_gva, &desc);
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+    let (handle, other_handle) = (0x20u64, 0x30u64);
+    let window = handle << PAGE_SHIFT_ARM64E;
+    let other_window = other_handle << PAGE_SHIFT_ARM64E;
+    write_object(&mut host, object, 0x100, handle);
+    write_object(&mut host, twin, 0x120, handle);
+    write_object(&mut host, neighbour, 0x140, other_handle);
+    for ref_ in [object, twin, neighbour] {
+        assert!(state.insert_object(task, ref_));
+    }
 
     // The first incarnation is a value, not an absence: nothing has re-pointed
-    // this name, which is a fact about it and not missing information.
-    let first = state.storage_incarnation(task, object);
+    // this window, which is a fact about it and not missing information.
+    let first = state.storage_incarnation(task, window);
     assert_eq!(
         first,
         StorageIncarnation::default(),
         "nothing has happened yet"
     );
-    // Every incarnation this one reference has ever carried. Distinctness is
-    // the whole property, and a pairwise assertion would only catch neighbours.
+    // Every incarnation this window has ever carried. Distinctness is the whole
+    // property, and a pairwise assertion would only catch neighbours.
     let mut seen = vec![first];
 
     // A re-point that reaches no mapping and no host copy still advances it.
     // The packet is an announcement about the guest's memory; what this device
     // happened to be caching does not decide whether the pages moved.
     super::replace_physical(&mut state, &mut host, task, object);
-    let after_repoint = state.storage_incarnation(task, object);
+    let after_repoint = state.storage_incarnation(task, window);
     assert_ne!(after_repoint, first, "the announcement was not recorded");
     seen.push(after_repoint);
     assert_eq!(
-        state.storage_incarnation(task, neighbour),
+        state.storage_incarnation(task, other_window),
         first,
-        "a re-point of one reference moved another reference's storage"
+        "a re-point of one window moved another window's storage"
     );
 
-    // Releasing the name advances it too. A compositor recycles object-list
-    // slots, so the next object at this reference is unrelated storage that a
-    // window-only identity would call the same.
-    assert!(state.delete_object(task, object));
-    let after_delete = state.storage_incarnation(task, object);
-    assert!(
-        !seen.contains(&after_delete),
-        "a recycled reference repeats"
-    );
-    seen.push(after_delete);
-    assert!(state.insert_object(task, object));
+    // The other name over the same window moves with it. This is the assertion
+    // the reference-keyed version could not make, and the one a boot proved is
+    // needed: a claim held under `twin` must stop naming the frames `object`'s
+    // packet has just replaced.
+    //
+    // The twin's window is resolved the way production resolves it, from its
+    // own object-list record, rather than reusing this test's `window` -- the
+    // claim is that the two references arrive at one key, and asserting it with
+    // the key already in hand would assert nothing.
+    let twin_entry = lookup_list_entry(&state, &host, task, twin).expect("the twin is listed");
+    let twin_descriptor =
+        super::read_descriptor(&state, &host, task, &twin_entry).expect("its descriptor reads");
+    let (twin_window, _) = super::backing_window(state.page_shift, &twin_entry, &twin_descriptor)
+        .expect("a buffer names a window");
     assert_eq!(
-        state.storage_incarnation(task, object),
-        after_delete,
-        "taking the name again is not itself a re-point"
+        twin_window, window,
+        "the two references are over one allocation, which is the case the \
+         reading found on a live compositor"
+    );
+    assert_eq!(
+        state.storage_incarnation(task, twin_window),
+        after_repoint,
+        "the second name over this window kept the incarnation the re-point \
+         retired, so a claim under it would still be satisfied by the old frames"
     );
 
-    // A task teardown ends every name the task held at once, and a task id
+    // Releasing a name is deliberately *not* one of the events. Other storage
+    // at this reference is a different window and is distinct already; the same
+    // storage back is the same backing, and a bump would deny it.
+    assert!(state.delete_object(task, object));
+    assert_eq!(
+        state.storage_incarnation(task, window),
+        after_repoint,
+        "releasing a name is not a statement about the storage behind a window"
+    );
+
+    // A task teardown ends every window the task held at once, and a task id
     // comes back.
     assert!(state.delete_task(task));
-    let after_teardown = state.storage_incarnation(task, object);
+    let after_teardown = state.storage_incarnation(task, window);
     assert!(
         !seen.contains(&after_teardown),
-        "the task teardown left this reference on an incarnation it already had"
+        "the task teardown left this window on an incarnation it already had"
     );
     seen.push(after_teardown);
     assert_ne!(
-        state.storage_incarnation(task, neighbour),
+        state.storage_incarnation(task, other_window),
         first,
-        "a reference the guest published and never re-pointed has no per-name \
-         entry, so only the task epoch can carry it across a teardown"
+        "a window the guest published and this device never re-pointed has no \
+         per-window entry, so only the task epoch can carry it across a teardown"
     );
 
     // Taking the id again moves nothing further, and does not have to: the
     // teardown is the event that separated the two tasks' storage.
     state.define_task(task, 0x1000, 0x40);
-    assert!(state.insert_object(task, object));
     assert_eq!(
-        state.storage_incarnation(task, object),
+        state.storage_incarnation(task, window),
         after_teardown,
-        "the new task's reference left the incarnation its teardown established"
+        "the new task's window left the incarnation its teardown established"
     );
 
     // And a redefinition of a live task is the same event: it drops the task's
     // objects and may root a different physical page under the same addresses.
-    let before_redefine = state.storage_incarnation(task, object);
+    let before_redefine = state.storage_incarnation(task, window);
     state.define_task(task, 0x1000, 0x41);
-    assert_ne!(state.storage_incarnation(task, object), before_redefine);
+    assert_ne!(state.storage_incarnation(task, window), before_redefine);
     assert!(
-        !seen.contains(&state.storage_incarnation(task, object)),
-        "an incarnation this reference already had came back"
+        !seen.contains(&state.storage_incarnation(task, window)),
+        "an incarnation this window already had came back"
     );
 
-    // A different task's identically-numbered reference is its own count, which
-    // is what makes the key task-local rather than a global object number.
-    assert_eq!(state.storage_incarnation(task + 1, object), first);
+    // A different task's identically-addressed window is its own count, which
+    // is what makes the key task-local rather than a global address.
+    assert_eq!(state.storage_incarnation(task + 1, window), first);
 }
 
 /// A re-point that reaches nothing changes nothing, and does not invent a
@@ -2532,5 +2675,1985 @@ fn a_freed_or_between_tenants_slot_never_answers_from_an_earlier_generation() {
         lookup_list_entry(&state, &host, 1, 1),
         None,
         "a second empty tenancy gap cannot resurrect the first or second object"
+    );
+}
+
+/// A guest-VA window is claimed by one reference, and the claim table says who
+/// got there first.
+///
+/// This is the state behind [`super::note_backing_window_alias`], and what it
+/// answers decides whether the incarnation `BackingId` mixes in may stay on the
+/// reference. Each assertion is one way the claim could stop meaning "these two
+/// names are over one piece of storage".
+#[test]
+fn one_guest_window_is_claimed_by_one_reference() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    let (task, other_task, first, second) = (3u32, 4u32, 9u32, 10u32);
+    let window = 0x4_0000u64;
+    state.define_task(task, 0x1000, 0x40);
+    state.define_task(other_task, 0x2000, 0x40);
+
+    assert_eq!(
+        state.claim_backing_window(task, first, window),
+        None,
+        "nothing held this window, so the first reference takes it"
+    );
+    assert_eq!(
+        state.claim_backing_window(task, first, window),
+        None,
+        "the same reference re-resolving its own window is not two names"
+    );
+    assert_eq!(
+        state.claim_backing_window(task, second, window),
+        Some(first),
+        "a second reference over one window is the sighting the reading is for"
+    );
+    assert_eq!(
+        state.claim_backing_window(task, second, window),
+        Some(first),
+        "the holder does not change hands, so a repeat reports the same pair \
+         rather than the two references taking turns"
+    );
+
+    // The window is task-local. Two tasks name their own address spaces, and a
+    // number they happen to share is not one piece of storage -- the same
+    // reason an object ref in task B is never tried as task A's mapping id.
+    assert_eq!(
+        state.claim_backing_window(other_task, second, window),
+        None,
+        "one number in two address spaces is two windows"
+    );
+
+    // A task teardown ends every name in it, so the claims go with them. An
+    // entry outliving its namespace would answer for a window nothing names.
+    state.delete_task(task);
+    assert_eq!(
+        state.claim_backing_window(task, second, window),
+        None,
+        "the teardown released the window, so the next claimant is the first"
+    );
+}
+
+/// Two textures at different offsets in one allocation are one backing.
+///
+/// The descriptor states two addresses and they are not interchangeable:
+/// `handle << page_shift` is where the allocation begins and `+ data_offset`
+/// is where the texels begin. A backing identity taken from the texel base
+/// would give one allocation as many identities as it has tenants — and the
+/// hazard edge between two tenants that write over each other would then never
+/// be drawn, which is the false-distinctness direction. So the window is the
+/// allocation's, and the offset belongs to the extent.
+///
+/// This also protects the alias reading itself: keyed on the texel base, two
+/// textures sharing an allocation would never collide and the reading would be
+/// silent for exactly the case it exists to find.
+#[test]
+fn two_textures_in_one_allocation_have_one_window() {
+    use crate::runtime::decode::resource::{
+        LINEAR_DESC_HANDLE, LINEAR_DESC_SIZE, OBJECT_TYPE_TEXTURE, TEXTURE_DESC_DATA_OFFSET,
+        TEXTURE_DESC_GEOMETRY_LEN,
+    };
+
+    let handle = 0x20u32;
+    let texture = |data_offset: u32| {
+        let mut desc = vec![0u8; TEXTURE_DESC_GEOMETRY_LEN];
+        desc[LINEAR_DESC_SIZE..LINEAR_DESC_SIZE + 8].copy_from_slice(&0x8000u64.to_le_bytes());
+        st32(&mut desc[LINEAR_DESC_HANDLE..], handle);
+        st32(&mut desc[TEXTURE_DESC_DATA_OFFSET..], data_offset);
+        desc
+    };
+    let entry = ListObjectEntry {
+        object_type: OBJECT_TYPE_TEXTURE,
+        descriptor_length: TEXTURE_DESC_GEOMETRY_LEN as u32,
+        descriptor_gva: 0x1000,
+    };
+
+    let allocation = u64::from(handle) << PAGE_SHIFT_X86;
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry, &texture(0)),
+        Some((allocation, 0x8000)),
+        "a texture at offset zero begins where its allocation does"
+    );
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry, &texture(0x2000)),
+        Some((allocation, 0x8000)),
+        "a texture placed further into the same allocation is the same backing, \
+         and reading its texel base here would say it is a different one"
+    );
+}
+
+/// Only the two object types that name storage by an address in their own task
+/// produce a window.
+///
+/// A view, a function, a serializer object and a mapper-ref texture each name
+/// storage through something else or name none at all, and a window invented
+/// for one of them would be a window over another object's bytes -- which is
+/// the false-equality direction, the one that hands memory back under a live
+/// reader.
+#[test]
+fn only_address_named_object_types_have_a_window() {
+    use crate::runtime::decode::resource::{
+        OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_MAPPER_REF_TEXTURE,
+        OBJECT_TYPE_SERIALIZER_OBJECT, OBJECT_TYPE_TEXTURE_VIEW,
+    };
+
+    // A linear descriptor: size then handle, which is the whole of what the
+    // window is built from.
+    let mut buffer_desc = [0u8; 16];
+    buffer_desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    buffer_desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+
+    let entry = |object_type: u8| ListObjectEntry {
+        object_type,
+        descriptor_length: buffer_desc.len() as u32,
+        descriptor_gva: 0x1000,
+    };
+
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry(OBJECT_TYPE_BUFFER), &buffer_desc),
+        Some((0x20u64 << PAGE_SHIFT_X86, 0x3000)),
+        "a buffer names its backing by handle and size"
+    );
+    for named_elsewhere in [
+        OBJECT_TYPE_FUNCTION,
+        OBJECT_TYPE_SERIALIZER_OBJECT,
+        OBJECT_TYPE_TEXTURE_VIEW,
+        OBJECT_TYPE_MAPPER_REF_TEXTURE,
+    ] {
+        assert_eq!(
+            super::backing_window(PAGE_SHIFT_X86, &entry(named_elsewhere), &buffer_desc),
+            None,
+            "type {named_elsewhere} does not name storage by an address in its task, \
+             so it has no window of its own however the bytes happen to read"
+        );
+    }
+
+    // A handle of zero is not a window at address zero. The descriptor's own
+    // arithmetic refuses it, and this is where that refusal is relied on.
+    let mut unpublished = buffer_desc;
+    unpublished[8..16].copy_from_slice(&0u64.to_le_bytes());
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry(OBJECT_TYPE_BUFFER), &unpublished),
+        None,
+        "a descriptor whose handle the guest has not written names no window"
+    );
+}
+
+/// One name after another over one window is not two names at once.
+///
+/// The guest frees an object by writing over its own object-list record, with
+/// no packet at all, and then reuses the pages. This device is never told, so
+/// its construction cache goes on holding the freed reference — which is why
+/// the alias reading asks the *guest's* list whether the holder is still there
+/// and not its own cache. Without that, every recycled allocation on a busy
+/// guest reads as two names over one backing, and the reading that decides
+/// where the incarnation lives would be decided by a confound.
+#[test]
+fn a_window_whose_holder_the_guest_freed_is_not_an_alias() {
+    use crate::runtime::drain::census::store_route_count;
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, first, second) = (1u32, 2u32, 3u32);
+
+    // One linear descriptor, past the eight list entries, named by both
+    // references in turn.
+    let desc_gva = 0x100u64;
+    let handle = 0x20u64;
+    let window = handle << PAGE_SHIFT_ARM64E;
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&handle.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + desc_gva, &desc);
+
+    let write_slot = |host: &mut FakeHost, ref_: u32, present: bool| {
+        let mut entry = [0u8; 12];
+        if present {
+            st32(
+                &mut entry[0..],
+                u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+            );
+            entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        }
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+    write_slot(&mut host, first, true);
+
+    assert!(
+        resolve_resource(&state, &host, task, first).is_ok(),
+        "the first reference constructs and claims the window"
+    );
+    write_slot(&mut host, second, true);
+    let collisions = store_route_count("backing_window_collision");
+    let reclaims = store_route_count("backing_window_reclaimed");
+    assert_eq!(
+        super::note_backing_window_alias(&state, &host, task, second, window, 0x3000),
+        Some(first),
+        "both references are in the guest's list naming one window, which is \
+         the sighting this reading exists to make"
+    );
+    assert_eq!(
+        (
+            store_route_count("backing_window_collision") - collisions,
+            store_route_count("backing_window_reclaimed") - reclaims,
+        ),
+        (1, 0),
+        "the collision is counted and it was not a reclaim, which is what makes \
+         a boot's zero sightings mean no aliases rather than no collisions"
+    );
+
+    // The guest frees the first object the only way it can: it writes over its
+    // own record. No packet arrives, so the construction cache still holds it.
+    write_slot(&mut host, first, false);
+    assert!(
+        state.constructed_object(task, first).is_some(),
+        "the cache cannot see a free, which is the whole difficulty"
+    );
+    assert_eq!(
+        super::note_backing_window_alias(&state, &host, task, second, window, 0x3000),
+        None,
+        "the guest's list no longer names the holder, so this is a reuse"
+    );
+    assert_eq!(
+        (
+            store_route_count("backing_window_collision") - collisions,
+            store_route_count("backing_window_reclaimed") - reclaims,
+        ),
+        (2, 1),
+        "the reuse is a second collision and the one reclaim, so the two \
+         counters separate what the sighting count alone cannot"
+    );
+
+    // And the window has changed hands, so a later claimant is compared
+    // against the reference that actually holds it.
+    assert_eq!(
+        state.claim_backing_window(task, second, window),
+        None,
+        "the live reference took the window when the dead holder lost it"
+    );
+}
+
+/// A re-point drops the host copies of every reference over the window, not
+/// only of the reference the packet names.
+///
+/// Both host caches are keyed `(task, reference)`, and a driven macos-15 boot
+/// found the compositor holding its 1920×1080 scanout allocation under **two**
+/// live references at once. Dropping only the named one leaves the other
+/// serving a texture built from pages the packet has just said are different
+/// pages — a wrong surface with no refusal anywhere, on the one buffer this
+/// device re-points.
+///
+/// Fails without the fix: the peer's copy survives the packet.
+#[test]
+fn a_repoint_drops_every_reference_over_the_window_it_moved() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, named, peer, elsewhere) = (1u32, 2u32, 3u32, 4u32);
+
+    let write_object = |host: &mut FakeHost, ref_: u32, desc_gva: u64, handle: u64| {
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+        desc[8..16].copy_from_slice(&handle.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + desc_gva, &desc);
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+    // Two references over one allocation, and a third over another so the
+    // sweep is shown to be selective rather than a task-wide flush.
+    write_object(&mut host, named, 0x100, 0x20);
+    write_object(&mut host, peer, 0x120, 0x20);
+    write_object(&mut host, elsewhere, 0x140, 0x30);
+
+    let surface = |fill: u8| crate::model::HostSurface {
+        width: 4,
+        height: 4,
+        bgra: std::sync::Arc::new(vec![fill; 4 * 4 * 4]),
+        host_gen: 1,
+        producer_object_type: 0,
+        last_touch: 0,
+        backing: None,
+        guest_holds_bytes: false,
+        source_gva: 0,
+    };
+    for (ref_, fill) in [(named, 0xAAu8), (peer, 0xBB), (elsewhere, 0xCC)] {
+        state
+            .host_texture_surfaces
+            .insert((task, ref_), surface(fill));
+    }
+
+    super::replace_physical(&mut state, &mut host, task, named);
+
+    assert!(
+        !state.host_texture_surfaces.contains_key(&(task, named)),
+        "the named reference's copy was read from pages the guest has re-pointed"
+    );
+    assert!(
+        !state.host_texture_surfaces.contains_key(&(task, peer)),
+        "the second reference over the same allocation kept a copy of the pages \
+         the packet says have already changed, and every later bind of it would \
+         have been served them"
+    );
+    assert!(
+        state.host_texture_surfaces.contains_key(&(task, elsewhere)),
+        "a reference over a different allocation was not re-pointed, and a sweep \
+         that dropped it would turn one packet into a task-wide cache flush"
+    );
+}
+
+/// A guest object reference becomes a canonical backing identity, or a refusal
+/// that says which contract term is missing.
+///
+/// Two references over one allocation get **one** identity — that is what the
+/// dependency compiler draws its hazard edges on, and what a name-derived id
+/// gets wrong in the direction that drops the edge. A re-point gives the same
+/// window a **different** identity, because the pages changed and work already
+/// accepted must keep the old ones.
+#[test]
+fn one_allocation_has_one_identity_and_a_repoint_gives_it_another() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, named, peer, elsewhere) = (1u32, 2u32, 3u32, 4u32);
+
+    let write_object = |host: &mut FakeHost, ref_: u32, desc_gva: u64, handle: u64| {
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+        desc[8..16].copy_from_slice(&handle.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + desc_gva, &desc);
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+    write_object(&mut host, named, 0x100, 0x20);
+    write_object(&mut host, peer, 0x120, 0x20);
+    write_object(&mut host, elsewhere, 0x140, 0x30);
+
+    let id = |state: &DeviceState, host: &FakeHost, ref_: u32| {
+        super::backing_id(state, host, task, ref_).expect("a buffer names an allocation")
+    };
+    let before = id(&state, &host, named);
+    assert_eq!(
+        id(&state, &host, peer),
+        before,
+        "two references over one allocation are one backing, and an identity \
+         that told them apart would drop the hazard edge between them"
+    );
+    assert_ne!(
+        id(&state, &host, elsewhere),
+        before,
+        "a different allocation is different storage"
+    );
+    assert_eq!(
+        id(&state, &host, named),
+        before,
+        "asking twice is not an event, and an identity that moved when it was \
+         read would never compare equal to itself"
+    );
+
+    super::replace_physical(&mut state, &mut host, task, named);
+    let after = id(&state, &host, named);
+    assert_ne!(
+        after, before,
+        "the packet says these are different pages, and an equal identity would \
+         let a claim on the old ones be satisfied by the new"
+    );
+    assert_eq!(
+        id(&state, &host, peer),
+        after,
+        "the second name over the window moved with it"
+    );
+
+    // The mapper-ref texture the fixture lists at reference 1 reaches its
+    // storage through a mapping, which has its own counter. The reference is
+    // followed to the mapping its descriptor names — 9 — and what comes back is
+    // that mapping's refusal, not a number derived from an address it never had.
+    assert_eq!(
+        super::backing_id(&state, &host, task, 1),
+        Err(super::BackingIdRefusal::ThroughMapping {
+            mapping_id: 9,
+            refusal: super::MappingBackingRefusal::Unlisted,
+        }),
+        "the refusal names which mapping was asked, so a reading says what is \
+         missing rather than that this type is not answered for"
+    );
+    assert!(state.map_surface(9));
+    let through_ref = super::backing_id(&state, &host, task, 1)
+        .expect("the mapping the descriptor names has a surface now");
+    assert_eq!(
+        through_ref,
+        super::mapping_backing_id(&state, 9).expect("and it is mintable directly"),
+        "the reference has the identity that mapping's storage has — one number, \
+         reached the two ways a caller can hold the question"
+    );
+    assert_ne!(
+        through_ref, after,
+        "which is still not an address-named window's"
+    );
+}
+
+/// A guest mapping's surface becomes a canonical backing identity, and it is
+/// the mapping's generation that separates its incarnations.
+///
+/// The other half of the identity from
+/// `one_allocation_has_one_identity_and_a_repoint_gives_it_another`, and the
+/// half whose incarnation counter is not the window's. A re-point of an object
+/// that owns a mapping never advances the window counter — it drops the page
+/// list and bumps `map_generation` — so an identity that read the window would
+/// sit still across the one packet that says the pages have moved.
+///
+/// The last assertion is the one that makes the two halves one identity space:
+/// a mapping-reached and an address-reached piece of storage must never arrive
+/// at the same number, because the dependency compiler compares the number with
+/// no idea which route minted it.
+#[test]
+fn a_mapping_has_one_identity_and_a_replaced_page_list_gives_it_another() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let (mid, other) = (7u32, 8u32);
+    // Taken first so the disjointness check at the end has a window identity
+    // that predates every mapping mint.
+    let first_window = state.backing_identity(1, 0x2_0000);
+
+    assert_eq!(
+        super::mapping_backing_id(&state, mid),
+        Err(super::MappingBackingRefusal::Unlisted),
+        "a mapping id this device holds nothing for names no storage, and a \
+         number minted for it would be a number for the id itself"
+    );
+
+    // A geometry declaration creates the entry without mapping a surface into
+    // it. The slot exists; the storage does not.
+    assert!(state.set_mapping_geom(mid, 1920, 1080, 0));
+    assert_eq!(
+        super::mapping_backing_id(&state, mid),
+        Err(super::MappingBackingRefusal::Unmapped),
+        "an entry the guest has never mapped a surface into is still a slot \
+         number rather than storage"
+    );
+
+    assert!(state.map_surface(mid));
+    assert!(state.map_surface(other));
+    let before = super::mapping_backing_id(&state, mid).expect("a mapped surface is storage");
+    assert_eq!(
+        super::mapping_backing_id(&state, mid),
+        Ok(before),
+        "asking twice is not an event, and an identity that moved when it was \
+         read would never compare equal to itself"
+    );
+    let second = super::mapping_backing_id(&state, other).expect("also mapped");
+    assert_ne!(second, before, "a different mapping is different storage");
+
+    let e = state.mappings.get_mut(&mid).expect("just mapped");
+    DeviceState::bump_map_generation(e);
+    let after = super::mapping_backing_id(&state, mid).expect("still mapped");
+    assert_ne!(
+        after, before,
+        "the page list under this mapping has been replaced, and an equal \
+         identity would let a claim on the old pages be satisfied by the new"
+    );
+    assert_eq!(
+        super::mapping_backing_id(&state, mid),
+        Ok(after),
+        "the new incarnation is an identity too, not a value that moves every \
+         time it is asked for"
+    );
+
+    // Every identity either route has minted, pairwise distinct — the whole
+    // reason one is a `u64` both routes may produce. `first_window` was taken
+    // before any mapping was asked about, so a mapping table with its own
+    // counter would have handed its first mint that very number.
+    let mut minted = [
+        ("the window asked for before any mapping", first_window),
+        ("the mapping's first incarnation", before),
+        ("a second mapping", second),
+        ("the first mapping's replaced page list", after),
+        (
+            "a window asked for after the mapping mints",
+            state.backing_identity(1, 0x3_0000),
+        ),
+    ];
+    minted.sort_by_key(|&(_, id)| id);
+    for pair in minted.windows(2) {
+        assert_ne!(
+            pair[0].1, pair[1].1,
+            "{} and {} are unrelated storage, and storage reached by address and \
+             storage reached through a mapping share one identity space — two \
+             counters would make them alias",
+            pair[0].0, pair[1].0
+        );
+    }
+}
+
+/// A dual-plane texture and a buffer over one allocation are one backing.
+///
+/// The consequence, at the identity, of the window the decoder now answers for
+/// a two-plane object. While `Descriptor::backing_window` said `None` for it
+/// this reference had no identity at all — `backing_id` classified it as
+/// storage reached through a mapping, which it never was — so nothing could
+/// order a read of it against a write of the buffer sharing its bytes.
+#[test]
+fn a_dual_plane_texture_shares_one_identity_with_a_buffer_over_its_allocation() {
+    use crate::runtime::decode::resource::tests::dual_plane_body;
+    use crate::runtime::decode::resource::OBJECT_TYPE_DUAL_PLANE_TEXTURE;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, planes, buffer) = (1u32, 2u32, 3u32);
+    // `dual_plane_body` writes this handle into the object header both planes
+    // are cut from.
+    const SHARED_HANDLE: u64 = 0x51;
+
+    let write_entry = |host: &mut FakeHost, ref_: u32, ty: u8, len: usize, desc_gva: u64| {
+        let mut entry = [0u8; 12];
+        st32(&mut entry[0..], u32::from(ty) | ((len as u32) << 8));
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+
+    let body = dual_plane_body([1, 1], (1920, 1080), 0x50);
+    let _ = host.write_gpa(data_gpa + 0x400, &body);
+    write_entry(
+        &mut host,
+        planes,
+        OBJECT_TYPE_DUAL_PLANE_TEXTURE,
+        body.len(),
+        0x400,
+    );
+
+    let mut buffer_desc = [0u8; 16];
+    buffer_desc[0..8].copy_from_slice(&0x40_0000u64.to_le_bytes());
+    buffer_desc[8..16].copy_from_slice(&SHARED_HANDLE.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x500, &buffer_desc);
+    write_entry(
+        &mut host,
+        buffer,
+        OBJECT_TYPE_BUFFER,
+        buffer_desc.len(),
+        0x500,
+    );
+
+    let id = |ref_: u32| super::backing_id(&state, &host, task, ref_);
+    assert_eq!(
+        id(planes),
+        id(buffer),
+        "two names for one allocation are one backing, whether the guest cut \
+         two planes out of it or a flat buffer"
+    );
+    assert!(
+        id(planes).is_ok(),
+        "and both of them have an identity: a two-plane texture is address-named \
+         like any other normal texture, so refusing it as mapping-named withheld \
+         one the device had"
+    );
+}
+
+/// Every constructed object is counted against the identity, and each refusal
+/// is counted under its own name.
+///
+/// The census has no consumer to fail if it stops working — the identity it
+/// measures has none yet either — so this is what says it is still measuring.
+/// The denominator is the point: a boot with no refusals and a boot with no
+/// constructions read the same without it.
+#[test]
+fn every_construction_is_counted_against_the_backing_identity() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+
+    let asked = store_route_count("backing_identity_asked");
+    let minted = store_route_count("backing_identity_minted");
+    resolve_resource(&state, &host, task, buffer).expect("a buffer constructs");
+    assert_eq!(
+        store_route_count("backing_identity_asked"),
+        asked + 1,
+        "the denominator moves for every construction, whatever the answer"
+    );
+    assert_eq!(
+        store_route_count("backing_identity_minted"),
+        minted + 1,
+        "a buffer names an allocation, so it has an identity"
+    );
+
+    // The fixture's reference 1 is a mapper-ref texture over a mapping this
+    // state has never mapped a surface into, which is the mapping's refusal
+    // rather than this object's.
+    let through = store_route_count("backing_id_mapping_names_no_surface");
+    resolve_resource(&state, &host, task, 1).expect("a mapper-ref texture constructs");
+    assert_eq!(
+        store_route_count("backing_id_mapping_names_no_surface"),
+        through + 1,
+        "and a refusal is counted under the arm it took, not as one number that \
+         cannot say which term is missing"
+    );
+    assert_eq!(
+        store_route_count("backing_identity_asked"),
+        asked + 2,
+        "an object with no identity is still in the denominator"
+    );
+}
+
+/// A surface-backing object declares the mapping's storage, because its
+/// object-list slot *is* the mapping id.
+///
+/// It used to declare `NoBytes`, on the grounds that the address route names no
+/// storage for `OBJECT_TYPE_BACKING` — which is true and is not the whole
+/// answer, because the mapping route does. A driven macos-15 boot measured the
+/// cost: every one of 36 re-points the semantic model was never told about was
+/// a backing object whose slot also named a live mapping surface.
+///
+/// The type is what makes the shared integer one namespace rather than two.
+/// `backing_claimant_tasks` already finds a surface's owner by probing exactly
+/// this slot for exactly this type.
+#[test]
+fn a_surface_backing_object_declares_the_storage_of_the_mapping_at_its_own_slot() {
+    use reims_vgpu_core::access::ByteRange;
+    use reims_vgpu_core::lifecycle::Storage;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, surface) = (1u32, 3u32);
+
+    // The backing's own record: length and first page frame, no planes.
+    let mut desc = [0u8; 0x20];
+    desc[0..8].copy_from_slice(&0x8000u64.to_le_bytes());
+    st32(&mut desc[8..], 0x1234);
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BACKING) | (0x20u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(surface) * 12, &entry);
+
+    let listed = lookup_list_entry(&state, &host, task, surface).expect("listed");
+    let bytes = read_descriptor(&state, &host, task, &listed).expect("descriptor");
+
+    // Before the guest maps a surface into that slot there is storage to name
+    // and no identity for it, and the refusal is the mapping's own, carried.
+    assert_eq!(
+        super::declared_storage(&state, task, surface, &listed, &bytes),
+        Err(super::StorageRefusal::Backing(
+            super::BackingIdRefusal::ThroughMapping {
+                mapping_id: surface,
+                refusal: super::MappingBackingRefusal::Unlisted,
+            }
+        )),
+        "not `NoBytes` — the object owns bytes and the mapper has not been told \
+         about them yet, which are different facts"
+    );
+
+    assert!(state.map_surface(surface));
+    assert_eq!(
+        super::declared_storage(&state, task, surface, &listed, &bytes),
+        Ok(Storage::Dedicated {
+            backing: super::mapping_backing_id(&state, surface).expect("mapped"),
+            extent: ByteRange {
+                offset: 0,
+                length: 0x8000,
+            },
+        }),
+        "the identity is the mapping's, so a mapper-ref texture over the same \
+         surface aliases it by construction; the extent is the whole backing, \
+         because a backing has no window of anything larger"
+    );
+
+    // And that is what a re-point of it now hands the model.
+    let (_, backing, extent) =
+        super::repointed_storage(&state, &host, task, surface).expect("a backing names storage");
+    assert_eq!(
+        (backing, extent.length),
+        (
+            super::mapping_backing_id(&state, surface).expect("mapped"),
+            0x8000
+        ),
+    );
+}
+
+/// A re-point that the semantic model is not told about says which of six
+/// facts stopped it, because only one of them costs anything.
+///
+/// The caller used to count one `replace_physical_storage_undescribable`, and a
+/// driven boot put 34 of 204 re-points in it. A reference that owns no bytes
+/// and a reference whose real storage this device has no vocabulary for read
+/// identically there, and they are a non-event and a stale-content hazard.
+#[test]
+fn a_repoint_the_model_is_not_told_about_names_which_fact_stopped_it() {
+    use super::RepointStorageRefusal;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+
+    let (name, backing, extent) = super::repointed_storage(&state, &host, task, buffer)
+        .expect("a buffer names storage the model can be told moved");
+    assert_eq!(
+        (name, backing),
+        (
+            super::name_resource(&state, &host, task, buffer).expect("named"),
+            super::backing_id(&state, &host, task, buffer).expect("a buffer has one"),
+        ),
+        "and the operation carries the reference's own name and identity"
+    );
+    assert_eq!(extent.length, 0x3000);
+
+    // Reference 1 is a mapper-ref texture over mapping 9. Its surface has an
+    // identity and its plane within that surface does not, so this device holds
+    // real storage it cannot describe: the one refusal that costs.
+    assert!(state.map_surface(9));
+    let refusal = super::repointed_storage(&state, &host, task, 1)
+        .expect_err("the plane of the surface is unrecovered");
+    assert_eq!(
+        refusal,
+        RepointStorageRefusal::Refused(super::StorageRefusal::ExtentUnrecovered {
+            object_type: 11
+        }),
+        "carried whole from the owner that has the term, not re-worded"
+    );
+    assert_eq!(
+        refusal.route(),
+        "replace_physical_storage_extent_unrecovered"
+    );
+    assert!(
+        refusal.leaves_authority_stale(),
+        "the pages moved and the model was not told, so its content authority \
+         for them stays on the pages the guest has already rewired"
+    );
+
+    // A reference the guest's list has no entry at stops one step earlier, and
+    // that is a re-point with nothing behind it rather than a lost one.
+    let unlisted = super::repointed_storage(&state, &host, task, 4000)
+        .expect_err("nothing is listed at that reference");
+    assert!(
+        !unlisted.leaves_authority_stale(),
+        "there is no storage for authority to be stale about"
+    );
+    assert_ne!(
+        unlisted.route(),
+        refusal.route(),
+        "and the two are counted apart, which is the whole reason for the enum"
+    );
+}
+
+/// The object-list walk's per-object translation: what the semantic model is
+/// told each constructed object's storage is.
+///
+/// Three answers, and the third is the one the model could not represent at all
+/// until the namespace learned that a name may own no memory. Most of a guest's
+/// list is that third answer.
+#[test]
+fn a_constructed_object_becomes_the_storage_the_model_is_declared_with() {
+    use reims_vgpu_core::access::ByteRange;
+    use reims_vgpu_core::lifecycle::Storage;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+
+    let list_entry = lookup_list_entry(&state, &host, task, buffer).expect("listed");
+    let bytes = read_descriptor(&state, &host, task, &list_entry).expect("descriptor");
+    assert_eq!(
+        super::declared_storage(&state, task, buffer, &list_entry, &bytes),
+        Ok(Storage::Dedicated {
+            backing: super::backing_id(&state, &host, task, buffer).expect("a buffer has one"),
+            extent: ByteRange {
+                offset: 0,
+                length: 0x3000,
+            },
+        }),
+        "a buffer is its allocation, and the declaration carries the identity \
+         of the storage and the object's own window of it"
+    );
+
+    // The fixture's reference 1 is a mapper-ref texture over mapping 9. Its
+    // storage is the mapping's and has an identity; which plane of that surface
+    // the texture is does not come from this record.
+    let t11 = lookup_list_entry(&state, &host, task, 1).expect("listed");
+    let t11_bytes = read_descriptor(&state, &host, task, &t11).expect("descriptor");
+    assert!(state.map_surface(9));
+    assert_eq!(
+        super::declared_storage(&state, task, 1, &t11, &t11_bytes),
+        Err(super::StorageRefusal::ExtentUnrecovered { object_type: 11 }),
+        "until the mapping publishes a device descriptor, nothing says which \
+         part of its surface this texture is — and the identity being there is \
+         a different fact from the extent being there, which must not read as \
+         one"
+    );
+
+    // The mapping publishes its surface. The texture is 64x32 at format 0x50
+    // (BGRA8, four bytes a pixel), so its plane is 64*4 to a row and the whole
+    // of it is this texture's.
+    let mut device_desc = vec![0u8; crate::protocol::iosurface_pages::DEVICE_DESC_LEN];
+    st64(
+        &mut device_desc[crate::protocol::iosurface_pages::DEVICE_DESC_DIMS..],
+        (64u64 << 8) | (32u64 << 40),
+    );
+    st32(
+        &mut device_desc[crate::protocol::iosurface_pages::DEVICE_DESC_BPR..],
+        64 * 4,
+    );
+    assert!(state.set_mapping_device_desc(9, &device_desc));
+    assert_eq!(
+        super::declared_storage(&state, task, 1, &t11, &t11_bytes),
+        Ok(Storage::Dedicated {
+            backing: super::mapping_backing_id(&state, 9).expect("a mapped surface"),
+            extent: ByteRange {
+                offset: 0,
+                length: 64 * 4 * 32,
+            },
+        }),
+        "the storage is the mapping's and the extent is this texture's plane of \
+         it — the surface's own bytes, not an allocation of the texture's own"
+    );
+
+    // The case the offset is load-bearing in: a two-plane surface where this
+    // texture is the *second* plane. Its bytes start past the surface base, and
+    // an extent anchored at zero would claim the first plane's pixels as this
+    // texture's content.
+    use crate::protocol::iosurface_pages::{
+        DEVICE_DESC_PLANES, DEVICE_DESC_PLANE_COUNT, DEVICE_PLANE_BPE, DEVICE_PLANE_BPR,
+        DEVICE_PLANE_DESC_LEN, DEVICE_PLANE_DIMS, DEVICE_PLANE_OFFSET,
+    };
+    const PLANE1_AT: u64 = 0x1_0000;
+    device_desc[DEVICE_DESC_PLANE_COUNT] = 2;
+    for (i, (w, h, bpe, at)) in [(128u32, 64u32, 4u16, 0u32), (64, 32, 4, PLANE1_AT as u32)]
+        .into_iter()
+        .enumerate()
+    {
+        let base = DEVICE_DESC_PLANES + i * DEVICE_PLANE_DESC_LEN;
+        st32(&mut device_desc[base + DEVICE_PLANE_OFFSET..], at);
+        st64(
+            &mut device_desc[base + DEVICE_PLANE_DIMS..],
+            (u64::from(w) << 8) | (u64::from(h) << 40),
+        );
+        st32(
+            &mut device_desc[base + DEVICE_PLANE_BPR..],
+            w * u32::from(bpe),
+        );
+        st16(&mut device_desc[base + DEVICE_PLANE_BPE..], bpe);
+    }
+    assert!(state.set_mapping_device_desc(9, &device_desc));
+    assert_eq!(
+        super::declared_storage(&state, task, 1, &t11, &t11_bytes),
+        Ok(Storage::Dedicated {
+            backing: super::mapping_backing_id(&state, 9).expect("a mapped surface"),
+            extent: ByteRange {
+                offset: PLANE1_AT,
+                length: 64 * 4 * 32,
+            },
+        }),
+        "the second plane's bytes start past the surface base, and an extent \
+         anchored at zero would claim the first plane's pixels"
+    );
+}
+
+/// The stale-resolution witness says what it examined, not only what it found.
+///
+/// Its report is `first_sight`-gated, so a boot with no line is a boot where
+/// the guest never overwrote a slot **or** a boot where the witness never
+/// compared anything, and those are opposite facts about one silence. The
+/// denominator is what tells them apart — and it decides the cutover's
+/// declaration discipline, because a guest that replaces objects in place needs
+/// the device to redeclare and one that does not needs no such path.
+#[test]
+fn the_stale_resolution_witness_counts_what_it_compared() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+
+    let write_desc = |host: &mut FakeHost, at: u64, size: u64| {
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&size.to_le_bytes());
+        desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + at, &desc);
+    };
+    let write_entry = |host: &mut FakeHost, desc_gva: u64| {
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+    };
+    write_desc(&mut host, 0x100, 0x3000);
+    write_entry(&mut host, 0x100);
+    resolve_resource(&state, &host, task, buffer).expect("constructs");
+
+    // A steady retrieval: examined, and in agreement.
+    let examined = store_route_count("task_resource_reexamined");
+    let rewritten = store_route_count("task_resource_descriptor_rewritten");
+    let repointed = store_route_count("task_resource_slot_repointed");
+    resolve_resource(&state, &host, task, buffer).expect("retrieves");
+    assert_eq!(
+        store_route_count("task_resource_reexamined"),
+        examined + 1,
+        "a cache hit is a comparison, and the agreement rate is only readable \
+         against the number of them"
+    );
+    assert_eq!(
+        store_route_count("task_resource_descriptor_rewritten"),
+        rewritten,
+        "nothing disagreed"
+    );
+
+    // The serializer rewrites the descriptor in place: same entry, same
+    // address, different object.
+    write_desc(&mut host, 0x100, 0x9000);
+    resolve_resource(&state, &host, task, buffer).expect("retrieves");
+    assert_eq!(
+        store_route_count("task_resource_descriptor_rewritten"),
+        rewritten + 1,
+        "the bytes at the address the entry names changed, which the entry \
+         comparison alone would have called agreement"
+    );
+    assert_eq!(
+        store_route_count("task_resource_slot_repointed"),
+        repointed,
+        "and it is not the other disagreement: the slot still points where it did"
+    );
+
+    // The guest points the slot at a different descriptor.
+    write_desc(&mut host, 0x180, 0x9000);
+    write_entry(&mut host, 0x180);
+    resolve_resource(&state, &host, task, buffer).expect("retrieves");
+    assert_eq!(
+        store_route_count("task_resource_slot_repointed"),
+        repointed + 1,
+        "the guest replaced the object with no packet, which is the event the \
+         model's redeclaration exists for"
+    );
+}
+
+/// The other half of the reply-destination question, asked of a page frame.
+///
+/// `CmdGetDeviceInfo` replies into a bare guest page frame, which lies in no
+/// task's address space, so the allocation scan above cannot be pointed at it.
+/// The frame can still be part of a **mapping's** surface, and that is the
+/// collision that matters: the reply write and every access to that surface
+/// would come out over two backings and never be ordered against each other.
+///
+/// Both driven rails read `device_info_reply_after_an_identity = 1`, so the
+/// mint-count arm never closes on a real guest and this is the arm that has to.
+#[test]
+fn a_device_info_reply_frame_is_measured_against_the_mappings_this_device_holds() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+
+    fn pte(pfn: u32) -> u32 {
+        (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+    }
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    const HELD: u32 = 0x40;
+    const FREE: u32 = 0x41;
+
+    // Before anything is minted the closing arm answers, and it answers without
+    // looking at a mapping at all — which is why it cannot be the only arm.
+    let before = store_route_count("device_info_reply_before_any_identity");
+    super::note_device_info_reply_destination(&state, HELD);
+    assert_eq!(
+        store_route_count("device_info_reply_before_any_identity"),
+        before + 1
+    );
+
+    // One identity handed out, so the mint count can no longer close anything.
+    let _ = state.frame_backing_identity(0xdead);
+    assert!(state.backing_identities_minted() > 0);
+
+    state.mappings.insert(
+        7,
+        crate::model::MappingEntry {
+            mapped: true,
+            page_entries: vec![pte(0x10), pte(HELD), pte(0x11)],
+            ..Default::default()
+        },
+    );
+    // An unmapped entry's page list names pages it no longer holds, so it is
+    // not live storage and must not produce a finding.
+    state.mappings.insert(
+        8,
+        crate::model::MappingEntry {
+            mapped: false,
+            page_entries: vec![pte(FREE)],
+            ..Default::default()
+        },
+    );
+
+    let inside = store_route_count("device_info_reply_frame_in_a_mapping");
+    let outside = store_route_count("device_info_reply_frame_in_no_mapping");
+
+    super::note_device_info_reply_destination(&state, HELD);
+    assert_eq!(
+        store_route_count("device_info_reply_frame_in_a_mapping"),
+        inside + 1,
+        "the reply page is one of a live mapping's surface pages"
+    );
+
+    super::note_device_info_reply_destination(&state, FREE);
+    assert_eq!(
+        store_route_count("device_info_reply_frame_in_no_mapping"),
+        outside + 1,
+        "an unmapped mapping's stale page list is not storage anything holds"
+    );
+
+    super::note_device_info_reply_destination(&state, 0x99);
+    assert_eq!(
+        store_route_count("device_info_reply_frame_in_no_mapping"),
+        outside + 2,
+        "and a page no mapping ever named is the closing answer"
+    );
+}
+
+/// A query's reply buffer is either part of an allocation this device
+/// identifies or it is not, and the instrument says which — with the number it
+/// examined.
+///
+/// The two answers demand different things of the cutover. A reply inside an
+/// allocation that got a backing of its own would leave the reply write
+/// unordered against every access to that object; one outside every allocation
+/// that was resolved to one anyway would be ordered against memory it does not
+/// touch. Only a driven guest can say which error is available, and only if the
+/// instrument can tell "nothing overlapped" from "nothing was examined".
+#[test]
+fn a_query_reply_destination_is_measured_against_the_allocations_this_device_holds() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+    // Allocation base 0x20 << 14, one page long.
+    const BASE: u64 = 0x20u64 << PAGE_SHIFT_ARM64E;
+    const SIZE: u64 = 0x1000;
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&SIZE.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+    resolve_resource(&state, &host, task, buffer).expect("constructs");
+
+    let scanned = store_route_count("query_reply_scanned");
+    let outside = store_route_count("query_reply_outside_every_allocation");
+    assert_eq!(
+        super::note_query_reply_destination(&state, task, BASE + 0x10, 64),
+        Some(buffer),
+        "a reply buffer inside the allocation names the reference that holds it"
+    );
+    assert_eq!(
+        store_route_count("query_reply_scanned"),
+        scanned + 1,
+        "the denominator moves whatever the answer is"
+    );
+
+    assert_eq!(
+        super::note_query_reply_destination(&state, task, BASE + SIZE, 64),
+        None,
+        "one byte past the end is outside, because the window is half open"
+    );
+    assert_eq!(
+        store_route_count("query_reply_outside_every_allocation"),
+        outside + 1
+    );
+    assert_eq!(
+        super::note_query_reply_destination(&state, task, BASE - 8, 8),
+        None,
+        "and a buffer that ends exactly where the allocation starts is outside too"
+    );
+    assert_eq!(
+        super::note_query_reply_destination(&state, task, BASE - 8, 16),
+        Some(buffer),
+        "but one that straddles the boundary is inside: it writes bytes the \
+         allocation owns, and an identity of its own would leave those bytes \
+         unordered"
+    );
+    assert_eq!(
+        store_route_count("query_reply_scanned"),
+        scanned + 4,
+        "every ask is counted, including the ones that found nothing"
+    );
+}
+
+/// A declaration into a task no definition opened is refused, and one into a
+/// live task is not.
+///
+/// The resource-lifecycle group's equivalent of the channel gate G1 had to
+/// answer, and it is no longer a census: `Lifecycle::create_resource` refuses
+/// `NoSuchTask`, this device holds no namespace of its own to create on demand,
+/// and the refusal is the answer the declaration door returns. A driven boot of
+/// 3902 declarations read zero of them before the move.
+#[test]
+fn a_declaration_into_an_undefined_task_is_told_apart_from_one_into_a_live_task() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    // `setup_task_with_list` defines task 1 and binds its object list.
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x1000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+
+    let defined = store_route_count("object_declared_into_a_defined_task");
+    let undefined = store_route_count("object_declared_into_an_undefined_task");
+    resolve_resource(&state, &host, task, buffer).expect("constructs");
+    assert_eq!(
+        (
+            store_route_count("object_declared_into_a_defined_task"),
+            store_route_count("object_declared_into_an_undefined_task"),
+        ),
+        (defined + 1, undefined),
+        "a live task is the case the lifecycle owner also admits"
+    );
+
+    // The same declaration in a task nothing defined. The owner refuses it,
+    // and the door says so with the rung below `no_list_entry`: the reference is
+    // a slot in no namespace at all.
+    let undescribable = store_route_count("object_declared_with_undescribable_storage");
+    assert_eq!(
+        super::declare_object_name(&state, 99, 7, None),
+        Err(super::LadderRung::NoTaskSpace),
+        "a task nothing defined has no address space for a name to live in"
+    );
+    assert_eq!(
+        store_route_count("object_declared_with_undescribable_storage"),
+        undescribable + 1,
+        "and storage it could not describe is still counted rather than claimed as \
+         `NoBytes` without a word — the refusal is about the task, not the bytes"
+    );
+    assert_eq!(
+        (
+            store_route_count("object_declared_into_a_defined_task"),
+            store_route_count("object_declared_into_an_undefined_task"),
+        ),
+        (defined + 1, undefined + 1),
+        "and the refusal is on the same counter the census read zero on"
+    );
+    assert_eq!(
+        state.object_name(99, 7),
+        None,
+        "nothing was named, which is the difference the census was measuring"
+    );
+}
+
+/// A task redefinition reads whether its root moved from the model, not from a
+/// second copy of the previous directory.
+///
+/// The two routes decide how bad a redefinition is: at the same root the task
+/// re-declares the space it already had, and at a different one everything the
+/// guest published into the old space reads back as whatever the new pages
+/// hold. `DeviceState::define_task` used to answer that from
+/// `TaskEntry::directory_pfn` — its own record, beside the owner's — and this
+/// asserts it now answers from `Redefinition::root_moved`.
+#[test]
+fn a_task_redefinition_reads_its_root_move_from_the_model() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let same = store_route_count("define_task_redefined_live_same_root");
+    let moved = store_route_count("define_task_redefined_live_new_root");
+
+    // A first definition is not a redefinition: there is no previous space for
+    // a root to have moved from.
+    state.define_task(4, 0x1000, 0x20);
+    assert_eq!(
+        (
+            store_route_count("define_task_redefined_live_same_root"),
+            store_route_count("define_task_redefined_live_new_root"),
+        ),
+        (same, moved),
+        "a first definition replaces nothing"
+    );
+
+    state.define_task(4, 0x1000, 0x20);
+    assert_eq!(
+        (
+            store_route_count("define_task_redefined_live_same_root"),
+            store_route_count("define_task_redefined_live_new_root"),
+        ),
+        (same + 1, moved),
+        "the same root re-declares the space the task already had"
+    );
+
+    state.define_task(4, 0x1000, 0x21);
+    assert_eq!(
+        (
+            store_route_count("define_task_redefined_live_same_root"),
+            store_route_count("define_task_redefined_live_new_root"),
+        ),
+        (same + 1, moved + 1),
+        "and a different root is a different address space under one id"
+    );
+}
+
+/// A name is retired by the model, and the teardown the device routes on is the
+/// model's answer.
+///
+/// Two facts in one test because they are one event. `DeviceState::delete_object`
+/// asks the owner what the departing name owed, and the owner is also what
+/// stops the reference resolving — so a device that kept its own namespace
+/// beside it could route on one answer while resolving against the other.
+#[test]
+fn a_deleted_name_stops_resolving_and_its_teardown_is_the_models() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_core::lifecycle::Storage;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    state.define_task(6, 0x1000, 0x30);
+
+    // An object that owns no memory: the owner answers `NoStorage`, which is
+    // its own teardown variant and not a `Now` over a placeholder backing.
+    let no_bytes = state
+        .declare_object(6, 3, Storage::NoBytes)
+        .expect("task 6 is defined")
+        .id;
+    assert_eq!(state.object_name(6, 3), Some(no_bytes));
+    let none = store_route_count("object_teardown_no_storage");
+    // The return value is "did a memo or a decoded object go with it", and a
+    // name with neither answers `false`. What moved is the name, which is what
+    // the two assertions below are about.
+    let _ = state.delete_object(6, 3);
+    assert_eq!(
+        store_route_count("object_teardown_no_storage"),
+        none + 1,
+        "a name over no bytes owes no teardown, and says so in its own variant"
+    );
+    assert_eq!(
+        state.object_name(6, 3),
+        None,
+        "and the reference resolves to nothing afterwards"
+    );
+
+    // One that owns its own pages: nothing else names them, so the teardown is
+    // `Now` and the storage is the caller's to free.
+    let dedicated = state
+        .declare_object(
+            6,
+            4,
+            Storage::Dedicated {
+                backing: reims_vgpu_core::access::BackingId(0x55),
+                extent: reims_vgpu_core::access::ByteRange {
+                    offset: 0,
+                    length: 0x1000,
+                },
+            },
+        )
+        .expect("task 6 is defined")
+        .id;
+    let now = store_route_count("object_teardown_now");
+    let _ = state.delete_object(6, 4);
+    assert_eq!(
+        store_route_count("object_teardown_now"),
+        now + 1,
+        "its own pages, named by nothing else, are free the moment the name goes"
+    );
+    assert_eq!(state.object_name(6, 4), None);
+    let _ = dedicated;
+}
+
+/// A reply destination is identified in the space its own question uses, and
+/// the three spaces cannot collide.
+///
+/// The collision is the whole risk. A reply buffer inside an allocation this
+/// device identifies must take *that* allocation's identity — given one of its
+/// own, the reply write and every access to the object come out over different
+/// backings and the hazard edge between them is never drawn. A page frame, which
+/// no task's address space names, must take an identity that can equal no
+/// window's and no mapping's; it does, because every route interns on one
+/// monotone counter.
+#[test]
+fn a_reply_destination_is_identified_in_its_own_space_and_collides_with_no_other() {
+    use reims_vgpu_core::query::{Destinations as _, QueryKind};
+    use reims_vgpu_protocol::fifo::COMPUTE_INFO_REQUEST_LEN;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+    const BASE: u64 = 0x20u64 << PAGE_SHIFT_ARM64E;
+    const SIZE: u64 = 0x1000;
+
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&SIZE.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+    let allocation = super::backing_id(&state, &host, task, buffer).expect("the buffer identifies");
+
+    let compute = |gva: u64| {
+        // The compute-info request's six words, in the order its decoder reads
+        // them: task, pipeline, key-table length, pair capacity, then the reply
+        // address as two halves.
+        let mut payload = vec![0u8; COMPUTE_INFO_REQUEST_LEN];
+        st32(&mut payload[0..], task);
+        st32(&mut payload[4..], 3);
+        st32(&mut payload[8..], 5);
+        st32(&mut payload[12..], 8);
+        st32(&mut payload[16..], gva as u32);
+        st32(&mut payload[20..], (gva >> 32) as u32);
+        payload
+    };
+    let names = super::TaskNames::new(&state, &host);
+
+    // Inside the allocation: the allocation's identity, at the offset the reply
+    // lies at within it.
+    let inside = names
+        .destination(QueryKind::ComputeInfo, &compute(BASE + 0x40))
+        .expect("a reply address resolves");
+    assert_eq!(
+        inside.backing, allocation,
+        "a reply inside an allocation must not be given an identity of its own"
+    );
+    assert_eq!(inside.bytes.offset, 0x40);
+
+    // Outside every allocation: storage all the same, identified as the window
+    // it is, and never equal to the allocation's.
+    let outside = names
+        .destination(QueryKind::ComputeInfo, &compute(BASE + SIZE + 0x8000))
+        .expect("a reply address outside every allocation still names storage");
+    assert_ne!(outside.backing, allocation);
+
+    // A page frame, in the third key space. Two asks for one frame are one
+    // identity, and it equals neither window identity.
+    let device_info = |pfn: u32| {
+        use reims_vgpu_protocol::fifo::DeviceInfoForm;
+        let form = DeviceInfoForm::WithKeyLimit;
+        let mut payload = vec![0u8; 64];
+        st32(&mut payload[form.reply_pfn_offset()..], pfn);
+        st32(&mut payload[form.pair_capacity_offset()..], 512);
+        payload
+    };
+    let frame = names
+        .destination(QueryKind::DeviceInfo, &device_info(0x1a7dc))
+        .expect("a page frame is storage");
+    assert_eq!(
+        frame.backing,
+        names
+            .destination(QueryKind::DeviceInfo, &device_info(0x1a7dc))
+            .expect("asked twice")
+            .backing,
+        "one frame is one identity"
+    );
+    assert_ne!(frame.backing, allocation);
+    assert_ne!(frame.backing, outside.backing);
+    assert_ne!(
+        frame.backing,
+        names
+            .destination(QueryKind::DeviceInfo, &device_info(0x1a7dd))
+            .expect("a second frame")
+            .backing,
+        "two frames are two identities"
+    );
+}
+
+/// The device-info reply census tells "before any identity was minted" from
+/// "after one was", and moves its denominator either way.
+///
+/// The distinction is the whole instrument. `CmdGetDeviceInfo`'s destination is
+/// a guest page frame that can only be given a minted identity, and whether
+/// that is sound turns on the identity being equal to nothing else. A census
+/// that recorded only the safe case would read identically on a boot where the
+/// guest never asked at all, and the term would look closed by silence.
+///
+/// The population it counts is deliberately the mint counter and not the task
+/// or resource tables: a driven boot found one live task and zero resources at
+/// reply time, and a census keyed on either would have called that the open
+/// case. A task is a namespace and has interned nothing.
+#[test]
+fn the_device_info_reply_census_separates_a_mint_free_device_from_one_that_has_minted() {
+    use crate::runtime::drain::store_route_count;
+
+    let scanned = store_route_count("device_info_reply_scanned");
+    let before = store_route_count("device_info_reply_before_any_identity");
+    let after = store_route_count("device_info_reply_after_an_identity");
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    super::note_device_info_reply_destination(&state, 0x20);
+    assert_eq!(
+        (
+            store_route_count("device_info_reply_scanned"),
+            store_route_count("device_info_reply_before_any_identity"),
+            store_route_count("device_info_reply_after_an_identity"),
+        ),
+        (scanned + 1, before + 1, after),
+        "a device that has minted nothing has nothing a fresh identity could \
+         equal, and says so"
+    );
+
+    // A task on its own interns nothing, so the answer must not move. This is
+    // the reading a driven boot falsified for the population census that came
+    // before this one.
+    setup_task_with_list(&mut host, &mut state);
+    super::note_device_info_reply_destination(&state, 0x21);
+    assert_eq!(
+        (
+            store_route_count("device_info_reply_before_any_identity"),
+            store_route_count("device_info_reply_after_an_identity"),
+        ),
+        (before + 2, after),
+        "a live task is a namespace, not storage: nothing has been interned and \
+         the closing answer still holds"
+    );
+
+    // One constructed resource, which is what actually mints.
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, buffer) = (1u32, 2u32);
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&0x1000u64.to_le_bytes());
+    desc[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + 0x100, &desc);
+    let mut entry = [0u8; 12];
+    st32(
+        &mut entry[0..],
+        u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+    );
+    entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+    let _ = host.write_gpa(data_gpa + u64::from(buffer) * 12, &entry);
+    resolve_resource(&state, &host, task, buffer).expect("constructs");
+    assert!(
+        state.backing_identities_minted() > 0,
+        "the fixture must actually mint, or the arm below asserts nothing"
+    );
+
+    super::note_device_info_reply_destination(&state, 0x22);
+    assert_eq!(
+        (
+            store_route_count("device_info_reply_scanned"),
+            store_route_count("device_info_reply_before_any_identity"),
+            store_route_count("device_info_reply_after_an_identity"),
+        ),
+        (scanned + 3, before + 2, after + 1),
+        "with an identity handed out the answer is the open one, and the \
+         denominator moved for all three asks"
+    );
+}
+
+/// The device answers the model's mapping resolver, and it answers with the
+/// same identity the mapping route mints.
+///
+/// Two facts, and the second is the one worth a test: the trait is the model's
+/// door into the mapping namespace, and a door that answered with a *different*
+/// number from the one the device's own callers get would give the dependency
+/// compiler a backing nothing else in the device shares.
+#[test]
+fn the_device_answers_the_models_mapping_resolver_with_the_identity_it_mints() {
+    use reims_vgpu_core::identity::MappingId;
+    use reims_vgpu_core::resolve::MappingResolver as _;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    assert_eq!(
+        state.backing(MappingId(9)),
+        None,
+        "a mapping id this device lists nothing for names no live surface"
+    );
+
+    assert!(state.set_mapping_geom(9, 64, 32, 0x50));
+    assert_eq!(
+        state.backing(MappingId(9)),
+        None,
+        "and an entry a geometry declaration created, with no surface mapped \
+         into it, still names none"
+    );
+
+    assert!(state.map_surface(9));
+    let minted = super::mapping_backing_id(&state, 9).expect("a mapped surface is storage");
+    assert_eq!(
+        state.backing(MappingId(9)),
+        Some(minted),
+        "the model gets the identity the device's own callers get, not a \
+         second number for one piece of storage"
+    );
+
+    let e = state.mappings.get_mut(&9).expect("mapped");
+    DeviceState::bump_map_generation(e);
+    assert_ne!(
+        state.backing(MappingId(9)),
+        Some(minted),
+        "and it moves with the page list, because that is what the identity is"
+    );
+}
+
+/// A guest reference reaches this device's retained bytes only through the name
+/// the namespace issued, and a slot the guest reuses is a different name.
+///
+/// This is the invariant the memo's key exists for. A cache keyed by the slot
+/// number outlives the object it was built for — the guest replaces an object by
+/// writing over its own object-list record, with no packet — and a stale hit
+/// binds the bytes of whatever used to live there, which is a wrong texture
+/// rather than a missing one. Keyed by a name whose generation advances on every
+/// declaration, the stale entry cannot be spelled.
+#[test]
+fn a_reference_reaches_its_bytes_only_through_the_name_the_namespace_issued() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let (task, ref_) = (1u32, 1u32);
+
+    assert_eq!(
+        state.object_name(task, ref_),
+        None,
+        "a reference this device has never constructed names nothing"
+    );
+    assert!(
+        state.constructed_object(task, ref_).is_none(),
+        "and there is no door to the memo that does not go through a name"
+    );
+
+    let built = resolve_resource(&state, &host, task, ref_).expect("construction");
+    let first = state
+        .object_name(task, ref_)
+        .expect("construction names it");
+    assert!(
+        std::sync::Arc::ptr_eq(&state.constructed_object(task, ref_).expect("memo"), &built),
+        "the memo answers under the name the declaration issued"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(
+            &resolve_resource(&state, &host, task, ref_).expect("retrieval"),
+            &built
+        ),
+        "and a second resolution retrieves it rather than constructing again"
+    );
+
+    // The guest deletes the object. The name stops resolving, so the retained
+    // bytes are unreachable — not because they were removed, but because
+    // nothing can name them.
+    assert!(state.delete_object(task, ref_));
+    assert_eq!(state.object_name(task, ref_), None);
+    assert!(state.constructed_object(task, ref_).is_none());
+    assert!(
+        state.task_resources.get(task, first).is_none(),
+        "the memo goes with the name, which is prompt rather than load-bearing"
+    );
+
+    // The slot is used again. It is a different name, and the generation is
+    // what says so.
+    let rebuilt = resolve_resource(&state, &host, task, ref_).expect("reconstruction");
+    let second = state.object_name(task, ref_).expect("named again");
+    assert_ne!(
+        second, first,
+        "a reused slot is a new generation, which is the whole reason the memo \
+         is not keyed by the slot"
+    );
+    assert_eq!(second.slot, first.slot, "and the same slot");
+    assert!(
+        !std::sync::Arc::ptr_eq(&rebuilt, &built),
+        "the second occupant is its own object"
+    );
+
+    // A task teardown ends every name in it.
+    assert!(state.delete_task(task));
+    assert_eq!(
+        state.object_name(task, ref_),
+        None,
+        "the address space ended, and every name in it with it"
+    );
+}
+
+/// The peer question the hot per-reference state asks is answered from the
+/// construction cache, and answers nothing when the reference is the only name
+/// for its storage.
+///
+/// `cached_window_peer` decides whether a `(task, reference)` key may go on
+/// standing for storage. Getting it wrong in the quiet direction would say a
+/// keying is sound when it is not, so each assertion is one way it could go
+/// quiet: a reference with no construction, a construction with no window, and
+/// a genuine neighbour over a different allocation.
+#[test]
+fn the_peer_question_answers_only_for_a_shared_allocation() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let (task, named, peer, elsewhere, unbuilt) = (1u32, 2u32, 3u32, 4u32, 5u32);
+
+    let write_object = |host: &mut FakeHost, ref_: u32, desc_gva: u64, handle: u64| {
+        let mut desc = [0u8; 16];
+        desc[0..8].copy_from_slice(&0x3000u64.to_le_bytes());
+        desc[8..16].copy_from_slice(&handle.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + desc_gva, &desc);
+        let mut entry = [0u8; 12];
+        st32(
+            &mut entry[0..],
+            u32::from(OBJECT_TYPE_BUFFER) | (16u32 << 8),
+        );
+        entry[4..12].copy_from_slice(&desc_gva.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(ref_) * 12, &entry);
+    };
+    write_object(&mut host, named, 0x100, 0x20);
+    write_object(&mut host, elsewhere, 0x140, 0x30);
+    write_object(&mut host, unbuilt, 0x160, 0x20);
+
+    // Only the constructed references count. `unbuilt` is listed over the very
+    // same allocation as `named` and is deliberately never resolved, because
+    // the caches this question is asked on behalf of hold nothing for a
+    // reference the device has not constructed.
+    for ref_ in [named, elsewhere] {
+        assert!(resolve_resource(&state, &host, task, ref_).is_ok());
+    }
+    assert_eq!(
+        super::cached_window_peer(&state, task, named),
+        None,
+        "a listed-but-unconstructed reference over the same allocation is not a \
+         second name for anything this device is keeping state under"
+    );
+
+    // Now a second constructed reference over the same allocation.
+    write_object(&mut host, peer, 0x120, 0x20);
+    assert!(resolve_resource(&state, &host, task, peer).is_ok());
+    assert_eq!(
+        super::cached_window_peer(&state, task, named),
+        Some(peer),
+        "two constructed references over one allocation is the reading that says \
+         a per-reference key has stopped standing for storage"
+    );
+    assert_eq!(
+        super::cached_window_peer(&state, task, peer),
+        Some(named),
+        "the question is symmetric, so neither name is privileged"
+    );
+    assert_eq!(
+        super::cached_window_peer(&state, task, elsewhere),
+        None,
+        "a reference over its own allocation is the only name for it"
+    );
+
+    // The fixture's mapper-ref texture at reference 1 reaches its storage
+    // through a mapping and has no window at all, so it is nobody's peer and
+    // has none -- rather than matching every other windowless object.
+    assert!(resolve_resource(&state, &host, task, 1).is_ok());
+    assert_eq!(
+        super::cached_window_peer(&state, task, 1),
+        None,
+        "an object with no window of its own must not pair off with another"
+    );
+}
+
+/// A heap-placed texture has no window of its own, and its record must be
+/// recognised before its bytes are decoded as an allocation.
+///
+/// A placement arrives under the ordinary texture object type. The texture
+/// decoder reads the allocation size and handle at fixed offsets, and on a
+/// placement record those offsets hold the record's own opcode, length and heap
+/// reference — so it answers with a window that is a number and not an address.
+/// A backing identity built on it would be false equality with whatever else
+/// landed on the same number, which is the direction that hands storage back
+/// under a live reader.
+///
+/// **The wide form is the one that gets through**, and it is why the check is
+/// on the bytes rather than on the length: at 68 bytes it is exactly the
+/// texture decoder's minimum, so nothing about its size refuses it. The narrow
+/// form is 60 and would be refused by length alone — testing only that would
+/// have passed with the guard deleted.
+#[test]
+fn a_heap_placement_is_refused_an_identity_rather_than_given_a_number() {
+    use crate::runtime::decode::resource::{
+        descriptor_is_heap_placement, HEAP_TEXTURE_WIDE_LEN, HEAP_TEXTURE_WIDE_OPCODE,
+        OBJECT_TYPE_TEXTURE,
+    };
+
+    // A wide placement record: its own opcode, length and heap reference where
+    // a plain texture descriptor keeps its allocation size and handle.
+    let mut placement = vec![0u8; HEAP_TEXTURE_WIDE_LEN];
+    st32(&mut placement[0..], HEAP_TEXTURE_WIDE_OPCODE);
+    st32(&mut placement[4..], HEAP_TEXTURE_WIDE_LEN as u32);
+    st32(&mut placement[8..], 6565);
+    assert!(
+        descriptor_is_heap_placement(&placement),
+        "the record names itself, and that is the only thing that can tell it \
+         apart from an allocation of its own"
+    );
+
+    let entry = ListObjectEntry {
+        object_type: OBJECT_TYPE_TEXTURE,
+        descriptor_length: HEAP_TEXTURE_WIDE_LEN as u32,
+        descriptor_gva: 0x1000,
+    };
+    // The bogus answer this refuses, stated so the test is about the guard and
+    // not about the decoder happening to fail: without the check the decode
+    // succeeds and the heap reference becomes a page handle.
+    assert!(
+        crate::runtime::decode::resource::decode_descriptor(entry.object_type, &placement)
+            .is_ok_and(|decoded| decoded.backing_window(PAGE_SHIFT_X86).is_some()),
+        "the wide placement decodes as a texture, which is exactly why the \
+         record has to be recognised before the decode is trusted"
+    );
+    assert_eq!(
+        super::backing_window(PAGE_SHIFT_X86, &entry, &placement),
+        None,
+        "a placement names storage inside a heap, and the bytes at the offsets \
+         an allocation would use are its own header"
+    );
+}
+
+/// The device answers the model's object resolver, per task, and two tasks
+/// holding the same reference number get two different answers.
+///
+/// The trait resolves `object_ref` and nothing else, so the whole question this
+/// test exists for is whether the *right* namespace answered. Two tasks reusing
+/// one reference number is the ordinary case on this interface — a reference is
+/// an index into the task's own object list — and a resolver that let one task's
+/// list answer for another's would hand the dependency compiler a `ResourceId`
+/// for storage the asking task cannot reach.
+#[test]
+fn the_device_answers_the_models_object_resolver_from_the_bound_tasks_namespace() {
+    use super::TaskRefResolver;
+    use reims_vgpu_core::resolve::RefResolver as _;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let (task, ref_) = (1u32, 1u32);
+
+    assert_eq!(
+        TaskRefResolver::new(&state, task).resource(ref_),
+        None,
+        "a slot nothing has been constructed into names nothing"
+    );
+
+    resolve_resource(&state, &host, task, ref_).expect("construction");
+    let name = state
+        .object_name(task, ref_)
+        .expect("construction names it");
+    assert_eq!(
+        TaskRefResolver::new(&state, task).resource(ref_),
+        Some(name),
+        "the model gets the name the device's own callers get, not a second \
+         identity for one object"
+    );
+
+    // A task that has never been defined has no namespace, and a reference
+    // number it shares with a live task must not reach into that task's list.
+    assert_eq!(
+        TaskRefResolver::new(&state, task + 1).resource(ref_),
+        None,
+        "the binding is what decides which namespace answers, and an unbound \
+         task's namespace is empty rather than the neighbouring task's"
+    );
+    assert_eq!(
+        TaskRefResolver::new(&state, task + 1).task_id(),
+        task + 1,
+        "and the binding says which task it is, so a caller can check"
+    );
+
+    // The device is also the *source* of namespaces, in the shape the lifecycle
+    // joins want — and it must answer the same thing, or a lifetime packet and a
+    // command-stream walk would resolve one ref two ways.
+    {
+        use reims_vgpu_core::identity::TaskId;
+        use reims_vgpu_core::resolve::TaskNamespaces;
+        let names = super::TaskNames::new(&state, &host);
+        assert_eq!(
+            TaskNamespaces::resource(&names, TaskId(task), ref_),
+            Some(name),
+            "both doors into one namespace answer with one name"
+        );
+        assert_eq!(
+            TaskNamespaces::resource(&names, TaskId(task + 1), ref_),
+            None,
+            "and the source routes by task rather than resolving in whichever \
+             namespace it reached first"
+        );
+    }
+
+    // The name stops resolving when the object does, through the trait as
+    // through every other door.
+    assert!(state.delete_object(task, ref_));
+    assert_eq!(TaskRefResolver::new(&state, task).resource(ref_), None);
+    {
+        use reims_vgpu_core::identity::TaskId;
+        use reims_vgpu_core::resolve::TaskNamespaces;
+        // Deleted, and the guest's list still holds the entry — so the source
+        // names it again, with a new generation. That is the namespace's rule
+        // for a reused slot, and it is why the memo is keyed by a name.
+        let names = super::TaskNames::new(&state, &host);
+        let after = TaskNamespaces::resource(&names, TaskId(task), ref_);
+        assert!(after.is_some());
+        assert_ne!(after, Some(name), "a reused slot is a different name");
+    }
+}
+
+/// The lifetime-ref census counts what it asked as well as what it found, and
+/// prices the refusal per packet rather than per ref.
+///
+/// The denominator is the point of the test. A boot in which every list packet
+/// resolved and a boot in which no list packet arrived produce the same zero on
+/// `lifetime_ref_unnamed`, and those are opposite facts about the same silence —
+/// the first says lazy declaration holds on this rail, the second says nothing
+/// at all.
+#[test]
+fn the_lifetime_ref_census_counts_what_it_asked_and_prices_the_packet() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    let (task, ref_) = (1u32, 1u32);
+    // One past the list's declared count, so the guest's own table cannot name
+    // it and no populated namespace could have either.
+    const EMPTY_SLOT: u32 = 8;
+
+    let asked = store_route_count("lifetime_ref_asked");
+    let named = store_route_count("lifetime_ref_already_named");
+    let unnamed = store_route_count("lifetime_ref_unnameable");
+    let on_demand = store_route_count("lifetime_ref_named_on_demand");
+    let lists = store_route_count("lifetime_ref_list_asked");
+    let refusing = store_route_count("lifetime_ref_list_would_refuse");
+
+    // Nothing constructed yet. Ref 1 is a live slot in the guest's list, so the
+    // on-demand door names it; the slot above it is empty, and no populated
+    // namespace could have answered for it either.
+    super::note_lifetime_refs_named(&state, &host, task, &[ref_, EMPTY_SLOT]);
+    assert_eq!(store_route_count("lifetime_ref_asked"), asked + 2);
+    assert_eq!(
+        store_route_count("lifetime_ref_already_named"),
+        named,
+        "neither had been constructed, so neither was already named"
+    );
+    assert_eq!(
+        store_route_count("lifetime_ref_named_on_demand"),
+        on_demand + 1,
+        "the guest's own object list is what names it, without constructing it"
+    );
+    assert_eq!(store_route_count("lifetime_ref_unnameable"), unnamed + 1);
+    assert_eq!(store_route_count("lifetime_ref_list_asked"), lists + 1);
+    assert_eq!(
+        store_route_count("lifetime_ref_list_would_refuse"),
+        refusing + 1,
+        "one packet, priced once, however many of its refs were unnameable"
+    );
+
+    // Naming did not construct: the memo is still empty, and the name is the one
+    // a later construction takes rather than a second generation.
+    let name = state.object_name(task, ref_).expect("named on demand");
+    assert!(
+        state.constructed_object(task, ref_).is_none(),
+        "naming is the cheap half — no descriptor snapshot, no host object"
+    );
+    let built = resolve_resource(&state, &host, task, ref_).expect("construction");
+    assert_eq!(
+        state.object_name(task, ref_),
+        Some(name),
+        "constructing an already-named reference keeps its name, or the slot \
+         would get a second generation and displace an object the guest never \
+         deleted"
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &state.constructed_object(task, ref_).expect("memo"),
+        &built
+    ));
+    assert_eq!(store_route_count("object_declared_over_a_live_name"), 0);
+
+    // A second sighting of a named ref is the cheap arm.
+    super::note_lifetime_refs_named(&state, &host, task, &[ref_]);
+    assert_eq!(store_route_count("lifetime_ref_already_named"), named + 1);
+    assert_eq!(
+        store_route_count("lifetime_ref_named_on_demand"),
+        on_demand + 1
+    );
+
+    // Deleting the object takes the name back — and the guest's list still holds
+    // the entry, so the door names it again. That is the namespace's rule, not a
+    // leak: a reused slot is a new generation.
+    assert!(state.delete_object(task, ref_));
+    super::note_lifetime_refs_named(&state, &host, task, &[ref_]);
+    assert_eq!(
+        store_route_count("lifetime_ref_named_on_demand"),
+        on_demand + 2
+    );
+    assert_ne!(
+        state.object_name(task, ref_),
+        Some(name),
+        "the second occupant of the slot is a different name"
     );
 }

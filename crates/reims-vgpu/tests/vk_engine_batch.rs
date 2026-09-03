@@ -10,12 +10,21 @@
 
 #![cfg(feature = "backend-vulkan")]
 
+/// This binary measures allocator trips on the live warm-draw path, so it owns
+/// the process's allocator. Counting is per thread and off unless
+/// [`reims_vgpu_testkit::allocations::measure`] turns it on, so every other test
+/// in this file pays one relaxed thread-local read per allocation and nothing
+/// else.
+#[global_allocator]
+static ALLOCATOR: reims_vgpu_testkit::allocations::Counting =
+    reims_vgpu_testkit::allocations::Counting::new();
+
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
     self, BufferContent, DepthState, DrawRequest, GuestRun, GuestRunSource, IndexType,
     IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
     SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
-    TargetIdentity,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -29,6 +38,24 @@ const SURFACE_TEST_FORMAT: ash::vk::Format =
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+
+/// The device every engine call in this file is made against.
+///
+/// One per process, like the engine it drives. The object caches this suite
+/// measures — `create_*`/`alloc_*` at zero on a warm draw — live in a device's
+/// own rail slot now, so a fresh device per call would present a cold cache to
+/// every draw and no warm assertion in this file could hold. Each test's cold
+/// start comes from `engine_test_session`'s reset, exactly as it did when the
+/// caches were the engine's.
+fn engine_device() -> &'static reims_vgpu::model::DeviceState {
+    static DEVICE: OnceLock<reims_vgpu::model::DeviceState> = OnceLock::new();
+    DEVICE.get_or_init(|| {
+        reims_vgpu::model::DeviceState::new(
+            reims_vgpu::model::DeviceId(1),
+            reims_vgpu_protocol::gva::PAGE_SHIFT_X86,
+        )
+    })
+}
 
 fn engine_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -123,7 +150,7 @@ fn heartbeat_retires_a_guest_alias_after_its_fence_without_another_draw() {
         format: SURFACE_TEST_FORMAT,
     };
     let req = batch_req(&vert, &frag, &identity, false, half_scissor(true));
-    if let Err(error) = engine::execute_draw_request(&req) {
+    if let Err(error) = engine::execute_draw_request(engine_device(), &req) {
         let message = error.to_string();
         if skip_if_no_gpu(&message) {
             eprintln!("skipping: {message}");
@@ -234,7 +261,7 @@ fn batched_draws_compose_and_flush_on_read() {
 
     let before = engine::counter_snapshot();
     let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
-    match engine::execute_draw_request(&opener) {
+    match engine::execute_draw_request(engine_device(), &opener) {
         Ok(out) => assert!(out.pixels.is_empty(), "skip_readback returns no pixels"),
         Err(e) => {
             let msg = e.to_string();
@@ -246,7 +273,7 @@ fn batched_draws_compose_and_flush_on_read() {
         }
     }
     let joiner = batch_req(&vert, &frag, &identity, true, half_scissor(false));
-    engine::execute_draw_request(&joiner).expect("joiner draw");
+    engine::execute_draw_request(engine_device(), &joiner).expect("joiner draw");
     let mid = engine::counter_snapshot().delta_since(&before);
     assert_eq!(mid.batch_opens, 1, "first draw opens the batch");
     assert_eq!(mid.batch_joins, 1, "second draw joins the open CB");
@@ -303,7 +330,7 @@ fn one_metal_encoder_continues_one_vulkan_render_pass() {
     let before = engine::counter_snapshot();
     let mut first = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     first.render_pass_continues = true;
-    match engine::execute_draw_request(&first) {
+    match engine::execute_draw_request(engine_device(), &first) {
         Ok(_) => {}
         Err(e) => {
             let msg = e.to_string();
@@ -317,7 +344,7 @@ fn one_metal_encoder_continues_one_vulkan_render_pass() {
 
     let mut second = batch_req(&vert, &frag, &identity, true, half_scissor(false));
     second.continues_render_pass = true;
-    engine::execute_draw_request(&second).expect("encoder second draw");
+    engine::execute_draw_request(engine_device(), &second).expect("encoder second draw");
 
     let px = engine::read_target(&identity)
         .expect("flush continued pass")
@@ -362,7 +389,7 @@ fn one_multisample_encoder_resolves_after_its_last_draw() {
     first.color_sample_count = 4;
     first.multisample_resolve = true;
     first.render_pass_continues = true;
-    match engine::execute_draw_request(&first) {
+    match engine::execute_draw_request(engine_device(), &first) {
         Ok(_) => {}
         Err(e) => {
             let msg = e.to_string();
@@ -379,7 +406,8 @@ fn one_multisample_encoder_resolves_after_its_last_draw() {
     second.color_sample_count = 4;
     second.multisample_resolve = true;
     second.continues_render_pass = true;
-    engine::execute_draw_request(&second).expect("multisample encoder second draw");
+    engine::execute_draw_request(engine_device(), &second)
+        .expect("multisample encoder second draw");
 
     let px = engine::read_target(&identity)
         .expect("close and resolve the multisample encoder")
@@ -436,7 +464,7 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
         load: false,
         stencil: None,
     });
-    match engine::execute_draw_request(&first) {
+    match engine::execute_draw_request(engine_device(), &first) {
         Ok(out) => assert!(
             out.pixels.is_empty(),
             "stored multisample target stays GPU-resident"
@@ -464,7 +492,8 @@ fn stored_multisample_target_survives_for_a_later_encoder() {
         load: true,
         stencil: None,
     });
-    engine::execute_draw_request(&second).expect("later encoder loads multisample resident");
+    engine::execute_draw_request(engine_device(), &second)
+        .expect("later encoder loads multisample resident");
     assert!(engine::resident_content_ready(&identity));
 }
 
@@ -501,7 +530,7 @@ fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
 
     let before = engine::counter_snapshot();
     let opener = batch_req(&vert, &frag, &a, false, half_scissor(true));
-    match engine::execute_draw_request(&opener) {
+    match engine::execute_draw_request(engine_device(), &opener) {
         Ok(_) => {}
         Err(e) => {
             let msg = e.to_string();
@@ -516,7 +545,7 @@ fn cross_target_draws_share_one_command_buffer_and_land_in_their_own_images() {
     // passes were not independent, whichever image lost would read as its own
     // half cleared and the other half painted.
     let other = batch_req(&vert, &frag, &b, false, half_scissor(false));
-    engine::execute_draw_request(&other).expect("cross-target draw");
+    engine::execute_draw_request(engine_device(), &other).expect("cross-target draw");
     let mid = engine::counter_snapshot().delta_since(&before);
     assert_eq!(mid.batch_opens, 1, "one batch carries both targets");
     assert_eq!(mid.batch_joins, 1, "the second target joined it");
@@ -574,7 +603,7 @@ fn prefetch_arm_flushes_open_batch() {
 
     let before = engine::counter_snapshot();
     let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
-    match engine::execute_draw_request(&opener) {
+    match engine::execute_draw_request(engine_device(), &opener) {
         Ok(_) => {}
         Err(e) => {
             let msg = e.to_string();
@@ -588,6 +617,325 @@ fn prefetch_arm_flushes_open_batch() {
     let mid = engine::counter_snapshot().delta_since(&before);
     assert_eq!(mid.batch_opens, 1, "draw opened a batch");
     assert_eq!(mid.batch_flushes, 0, "batch still open before the arm");
+}
+
+/// The window publish submits the guest's open batch before it vouches for a
+/// resident, so a resolution never names pixels that exist only in a command
+/// buffer nobody has ended.
+///
+/// This flush used to be the presenter's, one lock hold before its own blit. It
+/// had to move for two reasons that are one reason: the batch is the drain's and
+/// the publish *is* the drain, so the window thread was submitting a whole
+/// tranche of guest work on the display's latency path; and a flush at present
+/// time also submits every draw recorded *after* the publish, so the frame that
+/// reached the screen was not the frame the publish vouched for.
+///
+/// Asserted through `batch_flushes` at the publish rather than through a frame,
+/// because the frame is what this cannot see from here — the property is that
+/// the submission happens inside this transaction, and the counter is where that
+/// is visible.
+#[test]
+fn the_window_publish_flushes_the_open_batch_before_it_vouches() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_501,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let before = engine::counter_snapshot();
+    let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    match engine::execute_draw_request(engine_device(), &opener) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("opener draw: {msg}");
+        }
+    }
+    let mid = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(mid.batch_opens, 1, "the draw opened a batch: {mid:?}");
+    assert_eq!(
+        mid.batch_flushes, 0,
+        "and nothing has flushed it yet: {mid:?}"
+    );
+
+    // Whether the publish accepts this resident is not what is being asserted:
+    // the flush is ahead of the decision, so it happens on both arms. Taking
+    // the result keeps a future refactor that moved the flush behind the
+    // decision from passing this test on the accepting arm alone.
+    let decision = engine::prepare_window_resident_present(&identity, W, H);
+    let after = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        after.batch_flushes,
+        1,
+        "the publish submitted the batch it is vouching for (decision {:?}): {after:?}",
+        decision.as_ref().err()
+    );
+    assert_eq!(
+        after.batch_opens, 1,
+        "and opened no batch of its own: {after:?}"
+    );
+}
+
+/// A warm repeat draw enters the heap allocator zero times.
+///
+/// # This is one of the plan's structural zeros, on the live path
+///
+/// "Heap allocations per steady-state draw" is a required value in the
+/// replacement architecture's structural-zero table, not a target.
+/// `reims-vgpu-core` has met it for the semantic model since
+/// `a_warm_path_stops_allocating`; nothing measured the live executor, and the
+/// instrument's own doc says why that matters — a helper returning a `Vec` on a
+/// per-draw path costs one `malloc` a draw and shows up as a percent or two of
+/// drain duty spread evenly across a profile, so no single line got slower and
+/// nobody bisects to it.
+///
+/// When this test was first written the answer was **1 trip, 16 bytes**, every
+/// time: `exec::clear_values` returned a `Vec` whose first `push` allocated, on
+/// the overwhelmingly common draw of one colour target with no secondaries and
+/// no depth. It is an array now, and the answer is zero.
+///
+/// # What is measured, and what is deliberately outside the region
+///
+/// One repeat of an already-warm draw: same pipeline, same target, same
+/// scissor, joining an open batch. The `DrawRequest` is built once outside the
+/// region — it owns two `Arc<Vec<u32>>` of SPIR-V and a `Vec` of scissors, and
+/// measuring its construction would measure the harness. Warm-up runs the same
+/// request enough times that first-use growth in every cache behind it has
+/// happened, and stays far enough below `batch_max_draws` that the measured draw
+/// cannot be the one that flushes — a flush ends and submits a command buffer
+/// and is not a steady-state draw.
+#[test]
+fn a_warm_repeat_draw_does_not_enter_the_allocator() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_601,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    match engine::execute_draw_request(engine_device(), &opener) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("opener draw: {msg}");
+        }
+    }
+
+    // One request, reused: the joiner the steady state actually repeats.
+    let joiner = batch_req(&vert, &frag, &identity, true, half_scissor(true));
+    let cap = engine::batch_max_draws();
+    assert!(
+        cap > 24,
+        "the warm-up and the measured draw must both fit in one batch, and the \
+         cap is {cap}"
+    );
+    for n in 1..=8 {
+        engine::execute_draw_request(engine_device(), &joiner)
+            .unwrap_or_else(|e| panic!("warm-up draw #{n}: {e}"));
+    }
+
+    let before = engine::counter_snapshot();
+    let (result, cost) = reims_vgpu_testkit::allocations::measure_cost(|| {
+        engine::execute_draw_request(engine_device(), &joiner)
+    });
+    let trips = cost.trips;
+    result.expect("the measured draw is the ninth repeat of one that succeeded");
+    // A zero is only a reading if a draw happened inside the region. An early
+    // return — a request rejected at validation, a batch already closed — would
+    // also allocate nothing, and would pass this for the wrong reason.
+    let during = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        during.batch_joins, 1,
+        "the measured region recorded exactly one joining draw: {during:?}"
+    );
+    assert_eq!(
+        during.batch_flushes, 0,
+        "and did not flush, which is not a steady-state draw: {during:?}"
+    );
+    // "No host GPU wait for an ordinary command" is a structural zero of its
+    // own, and the ring is the only place a steady-state draw could take one:
+    // a wrapped ring waits the slot's fence before reusing it. Asserted here
+    // rather than in a test of its own because the measured region is already
+    // exactly one steady-state draw.
+    assert_eq!(
+        (during.ring_retire_blocks, during.fence_timeouts),
+        (0, 0),
+        "the measured draw waited on the GPU: {during:?}"
+    );
+
+    assert_eq!(
+        trips, 0,
+        "a warm repeat draw took {trips} trips into the allocator. This is a \
+         structural zero, so the question is not how many are acceptable but \
+         which per-draw path started allocating"
+    );
+}
+
+/// The same measurement for a draw that binds a descriptor, which is the shape
+/// a real guest sends and the one the zero above does not reach.
+///
+/// A descriptor-free draw builds its binding list with `Vec::with_capacity(0)`
+/// and its pipeline key holds two empty vectors, and none of that allocates —
+/// so the zero above was a true statement about a narrow shape. One storage
+/// buffer was enough to leave it, and this test was recorded as a **ceiling of
+/// six** rather than a zero, on the argument that a gate which fails on arrival
+/// gets weakened or ignored.
+///
+/// It is a zero now. Six went to zero in four steps, and the trace list is kept
+/// because the shape they shared is the point: every one was a list built fresh
+/// per draw, for the length of one draw, out of data the draw already had.
+///
+/// * 104 B, `validate_v1`'s duplicate-binding `BTreeSet` — became a scan over
+///   the lists the draw already owns.
+/// * 24 B and 256 B, a `Vec<vk::DescriptorBufferInfo>` and a
+///   `Vec<vk::WriteDescriptorSet>`. This test is what caught them: it prints
+///   `descriptor_pushes`, `descriptor_set_binds` and `descriptor_set_updates`
+///   beside the count, all three were **zero**, and the draw was building
+///   Vulkan's write structures every time on the way to sending none of them.
+/// * 48 B, `BufferGatherRoles::of` — the table is gone; the three call sites
+///   scan the request it was built from.
+/// * 128 B, the storage-bind list, and the vertex-bind list beside it — both
+///   live in the command buffer's graphics scratch now.
+/// * 16 B and 16 B, the `Vec<BindingSig>` and its clone into the pipeline key.
+///   These were the two the ceiling existed for, and closing them was the
+///   change the ceiling predicted: the layout cache is looked up by a *slice*
+///   and `PipelineKey` carries a `Copy` `LayoutId`.
+///
+/// * one more `Vec<AttrKey>`, `PipelineKey::attrs`. This one the fixture could
+///   not see at all until it grew vertex attributes: it draws three now, with
+///   their locations deliberately out of binding order, because a draw without
+///   attributes leaves that vector empty and an empty vector does not allocate.
+///   A guest draw has attributes — the boot behind `f819d513` bound 162 246
+///   vertex slots — so a zero measured without them was a zero about a shape no
+///   guest sends. Attribute sets are interned the way layouts are.
+///
+/// # What the zero rests on
+///
+/// Bytes are asserted with trips, and the counters with both. A trip count
+/// alone cannot say whether a zero is the path's or the fixture's, so the test
+/// also asserts that the measured draw joined a batch, did not flush, and bound
+/// its three vertex slots — a fixture that quietly stopped doing any of those
+/// would report the same zero for the wrong reason.
+#[test]
+fn a_warm_repeat_draw_that_binds_descriptors_and_vertex_buffers_does_not_allocate() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_701,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    // Three attributes, whose location order deliberately disagrees with their
+    // binding order, so the draw pays the normalization a guest draw pays.
+    let attributes = || {
+        [(0u32, 2u32), (1, 0), (2, 1)].map(|(location, binding)| VertexAttributeResource {
+            location,
+            binding,
+            format: VertexAttributeFormat::Float2,
+            offset: 0,
+            stride: 8,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 24])),
+        })
+    };
+
+    let mut opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    opener.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 64])),
+    });
+    opener.vertex_attributes.extend(attributes());
+    match engine::execute_draw_request(engine_device(), &opener) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("opener draw: {msg}");
+        }
+    }
+
+    let mut joiner = batch_req(&vert, &frag, &identity, true, half_scissor(true));
+    joiner.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 64])),
+    });
+    joiner.vertex_attributes.extend(attributes());
+    for n in 1..=8 {
+        engine::execute_draw_request(engine_device(), &joiner)
+            .unwrap_or_else(|e| panic!("warm-up draw #{n}: {e}"));
+    }
+
+    let before = engine::counter_snapshot();
+    let (result, cost) = reims_vgpu_testkit::allocations::measure_cost(|| {
+        engine::execute_draw_request(engine_device(), &joiner)
+    });
+    let trips = cost.trips;
+    result.expect("the measured draw is the ninth repeat of one that succeeded");
+    let during = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        during.batch_joins, 1,
+        "the measured region recorded exactly one joining draw: {during:?}"
+    );
+    assert_eq!(
+        during.batch_flushes, 0,
+        "and did not flush, which is not a steady-state draw: {during:?}"
+    );
+    // "No host GPU wait for an ordinary command" is a structural zero of its
+    // own, and the ring is the only place a steady-state draw could take one:
+    // a wrapped ring waits the slot's fence before reusing it. Asserted here
+    // rather than in a test of its own because the measured region is already
+    // exactly one steady-state draw.
+    assert_eq!(
+        (during.ring_retire_blocks, during.fence_timeouts),
+        (0, 0),
+        "the measured draw waited on the GPU: {during:?}"
+    );
+    // A zero is only about the paths the draw took, so the draw has to be shown
+    // to have taken them. Without this, a fixture that stopped binding vertex
+    // buffers would report the same zero for a different reason.
+    assert_eq!(
+        during.vertex_buffer_bind_slots, 3,
+        "the measured draw bound its three vertex attributes: {during:?}"
+    );
+
+    assert_eq!(
+        (trips, cost.bytes),
+        (0, 0),
+        "a warm repeat draw binding one storage buffer entered the allocator; \
+         the plan's value for this is 0 and it has been 0 since `LayoutId`"
+    );
+    eprintln!(
+        "warm repeat draw, one storage buffer + three vertex attributes: \
+         {trips} allocator trips, {} bytes, \
+         descriptor_pushes={} descriptor_set_binds={} descriptor_set_updates={}",
+        cost.bytes,
+        during.descriptor_pushes,
+        during.descriptor_set_binds,
+        during.descriptor_set_updates
+    );
 }
 
 /// A batch refuses joiners at `BATCH_MAX_DRAWS`: the draw after a full batch
@@ -612,7 +960,7 @@ fn batch_length_cap_flushes_and_reopens() {
 
     let before = engine::counter_snapshot();
     let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
-    match engine::execute_draw_request(&opener) {
+    match engine::execute_draw_request(engine_device(), &opener) {
         Ok(_) => {}
         Err(e) => {
             let msg = e.to_string();
@@ -629,7 +977,8 @@ fn batch_length_cap_flushes_and_reopens() {
     let cap = engine::batch_max_draws();
     for n in 1..=cap + 1 {
         let joiner = batch_req(&vert, &frag, &identity, true, half_scissor(n % 2 == 0));
-        engine::execute_draw_request(&joiner).unwrap_or_else(|e| panic!("draw #{n}: {e}"));
+        engine::execute_draw_request(engine_device(), &joiner)
+            .unwrap_or_else(|e| panic!("draw #{n}: {e}"));
     }
     let d = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -685,7 +1034,7 @@ fn batched_guest_runs_buffer_snapshots_at_record() {
             direct_image: None,
         }),
     });
-    match engine::execute_draw_request(&opener) {
+    match engine::execute_draw_request(engine_device(), &opener) {
         Ok(out) => assert!(out.pixels.is_empty(), "skip_readback returns no pixels"),
         Err(e) => {
             let msg = e.to_string();
@@ -822,10 +1171,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         width: 2,
         height: 2,
         layers: 1,
-        arrayed: false,
-        volume: false,
-        cube: false,
-        one_dim: false,
+        kind: reims_vgpu_core::texture_shape::TextureKind::D2,
         multisampled: false,
         source: SampledSource::GuestRuns(
             GuestRunSource {
@@ -851,7 +1197,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
     });
     req.samplers.push(SamplerResource::normalized_default(160));
 
-    let outcome = engine::execute_draw_request(&req);
+    let outcome = engine::execute_draw_request(engine_device(), &req);
     if let Err(e) = &outcome {
         if skip_if_no_gpu(&e.to_string()) {
             eprintln!("skipping: {e}");
@@ -931,7 +1277,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
     // what a `GuestRamImport` must be built against — so one draw has to run
     // before the window can be described at all.
     let warm = batch_req(&vert, &frag, &identity, false, half_scissor(true));
-    if let Err(e) = engine::execute_draw_request(&warm) {
+    if let Err(e) = engine::execute_draw_request(engine_device(), &warm) {
         let msg = e.to_string();
         if skip_if_no_gpu(&msg) {
             eprintln!("skipping: {msg}");
@@ -1002,7 +1348,7 @@ fn a_scattered_guest_buffer_window_is_gathered_by_the_gpu_in_one_region_per_stre
             direct_image: None,
         }),
     });
-    engine::execute_draw_request(&req).expect("the gathered draw");
+    engine::execute_draw_request(engine_device(), &req).expect("the gathered draw");
     // Flush the batch this draw opened, so the copies and the pass it recorded
     // are actually submitted and waited before anything is claimed about them.
     engine::read_target(&identity).expect("read_target flushes the batch");
@@ -1153,7 +1499,7 @@ void main() {{
     // draw has to run before the window can be described at all.
     let (warm_vert, warm_frag) = triangle_spirv();
     let warm = batch_req(&warm_vert, &warm_frag, &identity, false, half_scissor(true));
-    if let Err(e) = engine::execute_draw_request(&warm) {
+    if let Err(e) = engine::execute_draw_request(engine_device(), &warm) {
         let msg = e.to_string();
         if skip_if_no_gpu(&msg) {
             eprintln!("skipping: {msg}");
@@ -1232,7 +1578,7 @@ void main() {{
             direct_image: None,
         }),
     });
-    engine::execute_draw_request(&req).expect("the gathered draw");
+    engine::execute_draw_request(engine_device(), &req).expect("the gathered draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
         .into_rgba8()
@@ -1335,7 +1681,7 @@ void main() {{
 
     let (warm_vert, warm_frag) = triangle_spirv();
     let warm = batch_req(&warm_vert, &warm_frag, &identity, false, half_scissor(true));
-    if let Err(e) = engine::execute_draw_request(&warm) {
+    if let Err(e) = engine::execute_draw_request(engine_device(), &warm) {
         let msg = e.to_string();
         if skip_if_no_gpu(&msg) {
             eprintln!("skipping: {msg}");
@@ -1413,7 +1759,7 @@ void main() {{
             direct_image: None,
         }),
     });
-    engine::execute_draw_request(&req).expect("the fallback draw");
+    engine::execute_draw_request(engine_device(), &req).expect("the fallback draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
         .into_rgba8()
@@ -1509,7 +1855,7 @@ void main() {{
 
     let (warm_vert, warm_frag) = triangle_spirv();
     let warm = batch_req(&warm_vert, &warm_frag, &identity, false, half_scissor(true));
-    if let Err(e) = engine::execute_draw_request(&warm) {
+    if let Err(e) = engine::execute_draw_request(engine_device(), &warm) {
         let msg = e.to_string();
         if skip_if_no_gpu(&msg) {
             eprintln!("skipping: {msg}");
@@ -1575,7 +1921,7 @@ void main() {{
             direct_image: None,
         }),
     });
-    engine::execute_draw_request(&req).expect("the in-place draw");
+    engine::execute_draw_request(engine_device(), &req).expect("the in-place draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the batch")
         .into_rgba8()
@@ -1628,7 +1974,7 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
     };
 
     let warm = batch_req(&vert, &frag, &identity, false, half_scissor(true));
-    if let Err(e) = engine::execute_draw_request(&warm) {
+    if let Err(e) = engine::execute_draw_request(engine_device(), &warm) {
         let msg = e.to_string();
         if skip_if_no_gpu(&msg) {
             eprintln!("skipping: {msg}");
@@ -1691,8 +2037,8 @@ fn an_index_window_is_bound_in_place_without_a_cpu_copy() {
         vertex_offset: 0,
         content: BufferContent::GuestRuns(source),
     });
-    engine::execute_draw_request(&req).expect("indexed draw");
-    engine::execute_draw_request(&req).expect("repeated indexed draw");
+    engine::execute_draw_request(engine_device(), &req).expect("indexed draw");
+    engine::execute_draw_request(engine_device(), &req).expect("repeated indexed draw");
     let px = engine::read_target(&identity)
         .expect("read_target flushes the indexed draw")
         .into_rgba8()

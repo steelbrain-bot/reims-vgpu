@@ -35,6 +35,29 @@ use crate::transaction::{classify, DeviceTransaction, Payload, PayloadClass};
 use reims_vgpu_protocol::packets::{find, Channel};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// What ending a pipeline's life did.
+///
+/// # Why `took` is a field and not the emptiness of the list
+///
+/// Both doors that end a pipeline used to answer `Vec::new()` for two
+/// different facts: the step was not a legal one, or it was and nothing was
+/// parked on the pipeline. A driven boot made the cost of that concrete —
+/// 170 retirements against 116 the table actually took, a difference of 54
+/// readable only by subtracting an occupancy line from a route counter and
+/// knowing to. The 54 are ordinary: a guest deleting a render pipeline this
+/// device never drew with names a slot the table has no entry for. Ordinary is
+/// exactly what has to be *nameable*, or the day it stops being ordinary looks
+/// like nothing at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use = "work stranded by a pipeline ending holds its channel's publication head until it is withdrawn"]
+pub struct Ended {
+    /// Whether the table took the step.
+    pub took: bool,
+    /// The transactions that can therefore never be ready. Always empty when
+    /// `took` is false: a step the table refused released nothing.
+    pub stranded: Vec<IngressOrdinal>,
+}
+
 /// Why a packet did not become a transaction.
 ///
 /// Each variant is one check, never shared, so a reader can tell which one
@@ -162,6 +185,14 @@ pub enum FreeRefusal {
     NotOpen(Refusal),
     /// The channel still owes publication the guest is waiting on.
     Owed(RetireRefusal),
+    /// The command named the root domain, whose lifetime is the device's.
+    ///
+    /// [`ChannelId::ROOT`] is opened by [`SessionModel::new`] because there is
+    /// no packet that could open it — it is the domain a `CmdDefineFifo`
+    /// arrives *on*. Freeing it would leave the model with no domain for the
+    /// commands that open every other one, and the guest with a device that
+    /// stops answering the FIFO it is still writing to.
+    IsRoot,
 }
 
 impl FreeRefusal {
@@ -171,6 +202,7 @@ impl FreeRefusal {
         match self {
             Self::NotOpen(refusal) => refusal.slug(),
             Self::Owed(refusal) => refusal.slug(),
+            Self::IsRoot => "session_root_channel_not_freeable",
         }
     }
 }
@@ -334,7 +366,13 @@ impl SessionModel {
             epoch: DeviceEpoch::FIRST,
             device: DeviceState::Live,
             next_ingress: IngressOrdinal::default().next(),
-            open_channels: BTreeSet::new(),
+            // The root domain, open from the start. See [`ChannelId::ROOT`]:
+            // every other domain is opened by a command the guest sends on this
+            // one, so a model that required a command for this one would refuse
+            // the command that opens the rest — along with every task
+            // definition, object-list bind and device query the root FIFO
+            // carries.
+            open_channels: BTreeSet::from([ChannelId::ROOT]),
             channel_sequence: BTreeMap::new(),
             graph: DependencyGraph::new(),
             rebuilding: Vec::new(),
@@ -510,6 +548,29 @@ impl SessionModel {
     }
 
     /// Turn a packet into a transaction, or refuse it.
+    ///
+    /// # A refused packet still owes its completion word, and the caller owes it
+    ///
+    /// Nothing is mutated on a refusal, which is what makes the orders readable
+    /// — and it is also why **nothing in this model will ever publish a refused
+    /// packet's stamp.** The publisher is not told about it, so it holds no
+    /// position for it; [`Self::complete`] and [`Self::withdraw`] both name an
+    /// ingress ordinal that was never issued.
+    ///
+    /// The guest does not know about admission. It wrote a completion word into
+    /// the packet header and it waits on that word, so a packet this model
+    /// declines is a packet whose caller must stamp
+    /// [`Packet::completion`] itself — exactly as it would for a packet the
+    /// model accepted and published. A caller that treats a refusal as "nothing
+    /// happened" hangs the channel on the first unestablished opcode a real
+    /// guest sends, and hangs it *silently*, because a fence that never advances
+    /// produces no event.
+    ///
+    /// This is what makes an honest ledger row affordable. A command the model
+    /// has no contract for is [`Refusal::UnestablishedContract`], the work does
+    /// not happen, and the guest's fence still moves — so refusing costs the
+    /// work and not the channel. It is the difference between a feature this
+    /// device does not implement and a device that stops.
     ///
     /// # Errors
     ///
@@ -797,6 +858,10 @@ impl SessionModel {
     /// them would drop the completion words the guest is waiting on, so the
     /// caller drains first.
     pub fn retire_channel(&mut self, domain: ChannelId) -> Result<(), FreeRefusal> {
+        if domain == ChannelId::ROOT {
+            self.refusals += 1;
+            return Err(FreeRefusal::IsRoot);
+        }
         if !self.open_channels.remove(&domain) {
             self.refusals += 1;
             return Err(FreeRefusal::NotOpen(Refusal::ChannelNotOpen {
@@ -883,6 +948,16 @@ impl SessionModel {
     /// compile that finishes after the guest deleted the pipeline, which must
     /// not resurrect it — and must not release work either, since that work
     /// cannot be admitted against a retired pipeline in the first place.
+    /// The pipeline table, read-only.
+    ///
+    /// The read half of [`Self::pipelines`], so a caller that only asks — the
+    /// walk's usage source — does not need `&mut SessionModel` and cannot step
+    /// a pipeline's state by accident.
+    #[must_use]
+    pub fn pipelines_ref(&self) -> &crate::pipeline::PipelineTable {
+        &self.pipelines
+    }
+
     pub fn pipeline_ready(&mut self, pipeline: ResourceId) -> bool {
         if !self
             .pipelines
@@ -902,17 +977,21 @@ impl SessionModel {
     /// hold their channel's publication head forever. The caller withdraws each
     /// one — see [`Self::withdraw`] — and says why on its failure channel.
     ///
-    /// Empty when the refusal was not a legal step, for
-    /// [`Self::pipeline_ready`]'s reason.
+    /// [`Ended::took`] says whether the refusal was a legal step, for
+    /// [`Self::pipeline_ready`]'s reason — an illegal one strands nothing and
+    /// must not read as a legal one that happened to strand nothing.
     pub fn pipeline_refused(
         &mut self,
         pipeline: ResourceId,
         reason: crate::pipeline::RefusalReason,
-    ) -> Vec<IngressOrdinal> {
+    ) -> Ended {
         if !self.pipelines.refuse(pipeline, reason) {
-            return Vec::new();
+            return Ended::default();
         }
-        self.scheduler.pipeline_refused(pipeline)
+        Ended {
+            took: true,
+            stranded: self.scheduler.pipeline_refused(pipeline),
+        }
     }
 
     /// The guest deleted a pipeline: retire it, and name the transactions that
@@ -935,13 +1014,51 @@ impl SessionModel {
     ///
     /// They come back rather than being dropped, for
     /// [`Self::pipeline_refused`]'s reason, and the caller withdraws each.
-    /// Empty when the retirement was not a legal step.
-    #[must_use = "work stranded by a delete holds its channel's publication head until it is withdrawn"]
-    pub fn pipeline_retired(&mut self, pipeline: ResourceId) -> Vec<IngressOrdinal> {
+    /// [`Ended::took`] says whether the retirement was a legal step — and a
+    /// guest deleting a render pipeline this device never drew with makes that
+    /// `false` on a real boot, which is ordinary and is why it is named.
+    pub fn pipeline_retired(&mut self, pipeline: ResourceId) -> Ended {
         if !self.pipelines.retire(pipeline) {
-            return Vec::new();
+            return Ended::default();
         }
-        self.scheduler.pipeline_refused(pipeline)
+        Ended {
+            took: true,
+            stranded: self.scheduler.pipeline_refused(pipeline),
+        }
+    }
+
+    /// A completion word became readable: record the value the timeline now
+    /// stands at, and release whatever was waiting for it.
+    ///
+    /// **The guest advances timelines this model does not own.** A device that
+    /// published only from its own completions would hold packets against a
+    /// value already written — see [`crate::ready::Scheduler::publish`] — so
+    /// the publication has to arrive from whoever writes the word, which is
+    /// the drain and not this plane.
+    ///
+    /// Nothing comes back. The released transactions join the ready list and
+    /// leave it through [`Self::take_ready`], which is the one place work is
+    /// taken; a door that returned them here would be a second one, and a
+    /// caller using both would run the same transaction twice.
+    ///
+    /// The value is not necessarily the one that lands: a slot only ever moves
+    /// *later* on its wrapping timeline, so a word written behind the slot is
+    /// recorded as no movement at all. Ask [`Self::published_stamp`] for what
+    /// the slot actually holds — the two disagreeing is a fence going
+    /// backwards, which unsatisfies waits the guest has already been told are
+    /// met.
+    pub fn stamp_published(&mut self, stamp: CompletionStamp) {
+        self.scheduler.publish(stamp);
+    }
+
+    /// What a slot's timeline stands at, or `None` if nothing ever published
+    /// to it.
+    #[must_use]
+    pub fn published_stamp(
+        &self,
+        slot: crate::identity::StampSlot,
+    ) -> Option<crate::identity::StampValue> {
+        self.scheduler.published_value(slot)
     }
 
     /// Transactions that have become ready since the last call.
@@ -1022,6 +1139,78 @@ mod tests {
             completion: None,
             payload: empty_payload(Channel::Child, opcode),
         }
+    }
+
+    /// **A refused packet's completion word is never published by this model,
+    /// so its caller owes it.**
+    ///
+    /// The counterpart to [`Self::admit`]'s "nothing is mutated on a refusal".
+    /// Nothing mutated means the publisher was never told, which means no
+    /// position exists to publish and no ingress ordinal exists to name in
+    /// [`SessionModel::complete`] or [`SessionModel::withdraw`]. The stamp is
+    /// unreachable from inside the model — not withheld, absent.
+    ///
+    /// The guest is not party to admission. It wrote a completion word into the
+    /// packet header and it waits on that word, so a caller reading a refusal as
+    /// "nothing happened" hangs the channel on the first unestablished opcode a
+    /// real guest sends, and hangs it silently — a fence that never advances
+    /// produces no event. This test is the claim in a form a cutover cannot
+    /// quietly drop: two admitted packets on either side of a refused one, and
+    /// what the channel publishes is exactly their two stamps.
+    #[test]
+    fn a_refused_packet_publishes_no_stamp_and_the_channel_skips_its_value() {
+        let mut s = SessionModel::new(SessionId(1));
+        s.open_channel(ChannelId(2)).expect("fresh");
+
+        let stamped = |value: u32, opcode: u16| {
+            let mut p = packet(opcode);
+            p.completion = Some(CompletionStamp {
+                slot: StampSlot(2),
+                value: StampValue(value),
+            });
+            p
+        };
+
+        let first = s.admit(&stamped(1, 0x37)).expect("an established opcode");
+
+        // The guest's next packet: an opcode whose contract the ledger has not
+        // settled. It carries stamp 2, and the guest is waiting on 2.
+        let unestablished = stamped(2, 0xffff);
+        let refusal = s.admit(&unestablished).expect_err("no such command");
+        assert!(
+            matches!(
+                refusal,
+                Refusal::UnknownCommand { .. } | Refusal::UnestablishedContract { .. }
+            ),
+            "the refusal a ledger row that is not settled produces, got {refusal:?}"
+        );
+        assert_eq!(
+            s.publisher().outstanding(ChannelId(2)),
+            1,
+            "the refused packet took no position, so there is none to publish"
+        );
+
+        let third = s.admit(&stamped(3, 0x37)).expect("an established opcode");
+
+        let mut published = Vec::new();
+        for admitted in [first, third] {
+            for release in s
+                .complete(DeviceEpoch::FIRST, admitted.transaction.identity.ingress)
+                .expect("the live incarnation")
+            {
+                published.extend(release.stamp);
+            }
+        }
+        assert_eq!(
+            published
+                .iter()
+                .map(|stamp| stamp.value.0)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "value 2 is nowhere in what the channel published, and the guest is \
+             waiting on it — whoever holds the refusal is the only thing that \
+             can move that word"
+        );
     }
 
     /// **A refused admission takes nothing.**
@@ -1386,7 +1575,10 @@ mod tests {
 
         assert_eq!(
             s.pipeline_retired(pipeline),
-            vec![admitted.transaction.identity.ingress]
+            Ended {
+                took: true,
+                stranded: vec![admitted.transaction.identity.ingress]
+            }
         );
         assert!(
             !s.pipeline_ready(pipeline),
@@ -1394,8 +1586,10 @@ mod tests {
         );
         assert!(s.take_ready().is_empty(), "and releases nobody");
 
-        // A second delete is not a legal step and names nobody twice.
-        assert!(s.pipeline_retired(pipeline).is_empty());
+        // A second delete is not a legal step and names nobody twice — and
+        // says which of the two it is, rather than answering an empty list for
+        // both.
+        assert_eq!(s.pipeline_retired(pipeline), Ended::default());
     }
 
     /// A reset ends the pipeline's *name*, and a transaction waiting for one
@@ -1520,7 +1714,10 @@ mod tests {
         let reason = crate::pipeline::RefusalReason::CompilationFailed("out of registers");
         assert_eq!(
             s.pipeline_refused(pipeline, reason),
-            vec![admitted.transaction.identity.ingress]
+            Ended {
+                took: true,
+                stranded: vec![admitted.transaction.identity.ingress]
+            }
         );
         // And the next packet binding it is refused at ingress rather than
         // admitted into a wait that cannot resolve.
@@ -1549,9 +1746,12 @@ mod tests {
         let err = s.admit(&leased).expect_err("nothing declared it");
         assert_eq!(
             err,
-            Refusal::PipelineUnusable(crate::pipeline::LeaseRefusal::Absent { pipeline })
+            Refusal::PipelineUnusable(crate::pipeline::LeaseRefusal::Absent {
+                pipeline,
+                because: crate::pipeline::AbsentBecause::Undeclared,
+            })
         );
-        assert_eq!(err.slug(), "pipeline_absent");
+        assert_eq!(err.slug(), "pipeline_absent_undeclared");
         // The refusal consumed no ordinal, like every other one here.
         let gen = s.generation();
         s.pipelines().declare(pipeline, gen);
@@ -1634,7 +1834,7 @@ mod tests {
         );
         assert_eq!(
             s.pipelines().lease(deleted, gen),
-            Lease::Absent,
+            Lease::Absent(crate::pipeline::AbsentBecause::Retired),
             "and a deleted object is not resurrected by a new device"
         );
 
@@ -2046,16 +2246,32 @@ mod tests {
     /// held the channels, and nothing joined them, so a correct guest that
     /// defined a FIFO and used it got `ChannelNotOpen` on every packet.
     ///
-    /// The bootstrap door is deliberately not used here. Only the root domain
-    /// is opened by hand, which is what a real session does — the ring exists
-    /// before the guest can name anything — and everything after that is the
-    /// guest's own bytes.
+    /// The bootstrap door is deliberately not used here. The root domain is
+    /// open because a session has one — the ring exists before the guest can
+    /// name anything, and the command that opens every other domain arrives on
+    /// it — and everything after that is the guest's own bytes.
     #[test]
     fn a_guests_channel_commands_open_and_end_the_domain_it_then_submits_on() {
         const DEFINE: u16 = 0x30;
         const FREE: u16 = 0x31;
         let mut s = SessionModel::new(SessionId(1));
-        s.open_channel(ChannelId(0)).expect("the root ring");
+        assert!(
+            s.channel_open(ChannelId::ROOT),
+            "a session with no root domain has nowhere for a channel definition to arrive"
+        );
+        assert_eq!(
+            s.open_channel(ChannelId::ROOT),
+            Err(Refusal::ChannelAlreadyOpen {
+                channel: ChannelId::ROOT
+            }),
+            "and it is open once, not opened again by a bootstrap that ran twice"
+        );
+        assert_eq!(
+            s.retire_channel(ChannelId::ROOT),
+            Err(FreeRefusal::IsRoot),
+            "the root FIFO's publication lifetime is the device's, not a \
+             guest command's"
+        );
 
         let domain = ChannelId(2).0.to_le_bytes();
         let define = crate::control::resolve(Channel::Root, DEFINE, &domain).expect("a definition");
@@ -2523,8 +2739,14 @@ mod tests {
             "and none of the four can ever be named again, so none of them stays"
         );
         for p in [declared, translating, ready, refused] {
-            assert_eq!(s.pipelines().lease(p, gen), Lease::Absent);
-            assert_eq!(s.pipelines().lease(p, reset.generation), Lease::Absent);
+            assert_eq!(
+                s.pipelines().lease(p, gen),
+                Lease::Absent(crate::pipeline::AbsentBecause::Undeclared)
+            );
+            assert_eq!(
+                s.pipelines().lease(p, reset.generation),
+                Lease::Absent(crate::pipeline::AbsentBecause::Undeclared)
+            );
         }
 
         // The next generation declares its own, and a second reset takes only
@@ -2767,6 +2989,14 @@ mod tests {
                                 assert_eq!(refusal, Refusal::ChannelNotOpen { channel: d });
                                 assert_eq!(live, 0);
                                 channel_frees_unopened += 1;
+                            }
+                            // The sweep names only child domains, so the root
+                            // refusal is unreachable from here — spelled out
+                            // rather than defaulted so that a sweep that grew
+                            // the root domain would fail here instead of
+                            // counting a refusal as an unopened free.
+                            Err(FreeRefusal::IsRoot) => {
+                                panic!("seed {seed}: the sweep named the root domain")
                             }
                         }
                     }

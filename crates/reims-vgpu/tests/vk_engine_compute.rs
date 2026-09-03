@@ -15,9 +15,34 @@ use reims_vgpu::backend::vulkan::engine::{
     ComputeStorageResidency, StorageImageFormat,
 };
 use reims_vgpu::model::ComputeStorageResidencyKey;
+
+/// The allocation counter the two structural-zero gates at the foot of this
+/// file measure with. Every other test here pays one relaxed thread-local read
+/// per allocation and nothing else.
+#[global_allocator]
+static ALLOCATOR: reims_vgpu_testkit::allocations::Counting =
+    reims_vgpu_testkit::allocations::Counting::new();
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+
+/// The device every engine call in this file is made against.
+///
+/// One per process, like the engine it drives. The object caches this suite
+/// measures — `create_*`/`alloc_*` at zero on a warm draw — live in a device's
+/// own rail slot now, so a fresh device per call would present a cold cache to
+/// every draw and no warm assertion in this file could hold. Each test's cold
+/// start comes from `engine_test_session`'s reset, exactly as it did when the
+/// caches were the engine's.
+fn engine_device() -> &'static reims_vgpu::model::DeviceState {
+    static DEVICE: OnceLock<reims_vgpu::model::DeviceState> = OnceLock::new();
+    DEVICE.get_or_init(|| {
+        reims_vgpu::model::DeviceState::new(
+            reims_vgpu::model::DeviceId(1),
+            reims_vgpu_protocol::gva::PAGE_SHIFT_X86,
+        )
+    })
+}
 
 /// Acquire the process-global engine lock **and** reset the engine, in that
 /// order. Every engine-touching test must start from a fresh context:
@@ -38,7 +63,7 @@ fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
         })
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    engine::test_reset_engine(engine_device());
     guard
 }
 
@@ -268,7 +293,7 @@ fn translate_kernel(name: &str) -> Option<Vec<u32>> {
 }
 
 fn engine_or_skip(label: &str, req: &ComputeRequest) -> Option<engine::ComputeOutput> {
-    match engine::execute_compute_request(req) {
+    match engine::execute_compute_request(engine_device(), req) {
         Ok(o) => Some(o),
         Err(e) => {
             let s = e.to_string();
@@ -557,7 +582,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
             seed_skipped: false,
         }],
     };
-    let hit = engine::execute_compute_request(&hit_req).expect("resident compute hit");
+    let hit =
+        engine::execute_compute_request(engine_device(), &hit_req).expect("resident compute hit");
     assert_eq!(
         hit.images[0]
             .bytes()
@@ -596,7 +622,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
             seed_skipped: false,
         }],
     };
-    let mismatch = engine::execute_compute_request(&mismatch_req).expect("generation mismatch");
+    let mismatch = engine::execute_compute_request(engine_device(), &mismatch_req)
+        .expect("generation mismatch");
     assert!(
         mismatch.images[0]
             .bytes()
@@ -701,7 +728,7 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     // vacuous pass this call removes.
     engine::note_resident_storage_copied_out(&identity(0));
     for i in 1..ADMITS {
-        engine::execute_compute_request(&request(i, 1)).expect("filler dispatch");
+        engine::execute_compute_request(engine_device(), &request(i, 1)).expect("filler dispatch");
         engine::note_resident_storage_copied_out(&identity(i));
     }
 
@@ -709,7 +736,8 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     // sweep that happened to spare the identity it was asked about.
     for i in 0..ADMITS {
         engine::reset_draw_counters();
-        engine::execute_compute_request(&request(i, 2)).expect("resident re-dispatch");
+        engine::execute_compute_request(engine_device(), &request(i, 2))
+            .expect("resident re-dispatch");
         assert_eq!(
             engine::counter_snapshot().compute_storage_seed_uploads,
             0,
@@ -863,7 +891,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     // Skip dispatch: one texel, zero-placeholder bytes, matching generation.
     // Untouched texels staying red prove the placeholder was never seeded.
     engine::reset_draw_counters();
-    let skip = engine::execute_compute_request(&make([1, 1, 1], 2, 3, true))
+    let skip = engine::execute_compute_request(engine_device(), &make([1, 1, 1], 2, 3, true))
         .expect("seed-skip resident hit");
     for p in skip.images[0]
         .bytes()
@@ -882,7 +910,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     // Lost resident: evicting guest state must turn the same skip request
     // into the named failure, never a silent zero seed.
     engine::reset_guest_state();
-    let err = engine::execute_compute_request(&make([1, 1, 1], 3, 4, true))
+    let err = engine::execute_compute_request(engine_device(), &make([1, 1, 1], 3, 4, true))
         .expect_err("lost resident must fail");
     assert!(
         err.to_string()
@@ -987,7 +1015,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     // Resident hit: the sampled image is seeded device-locally from the red
     // resident; the zero placeholder never uploads.
     engine::reset_draw_counters();
-    let hit = engine::execute_compute_request(&make_fetch(2)).expect("resident sample hit");
+    let hit = engine::execute_compute_request(engine_device(), &make_fetch(2))
+        .expect("resident sample hit");
     let got: Vec<u32> = hit.buffers[0]
         .bytes
         .chunks_exact(4)
@@ -1010,8 +1039,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     assert_eq!(snap.compute_sampled_resident_copy_bytes, (w * h * 4) as u64);
 
     // Stale generation must fail visibly, never seed the placeholder.
-    let err =
-        engine::execute_compute_request(&make_fetch(9)).expect_err("stale generation must fail");
+    let err = engine::execute_compute_request(engine_device(), &make_fetch(9))
+        .expect_err("stale generation must fail");
     assert!(
         err.to_string()
             .contains("vk_compute_exec_resident_sample_generation_mismatch"),
@@ -1020,7 +1049,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
 
     // Evicted resident must fail visibly too.
     engine::reset_guest_state();
-    let err = engine::execute_compute_request(&make_fetch(2)).expect_err("lost resident must fail");
+    let err = engine::execute_compute_request(engine_device(), &make_fetch(2))
+        .expect_err("lost resident must fail");
     assert!(
         err.to_string()
             .contains("vk_compute_exec_resident_sample_absent"),
@@ -1284,7 +1314,7 @@ fn compute_storage_image_r16float_if_supported() {
             seed_skipped: false,
         }],
     };
-    match engine::execute_compute_request(&req) {
+    match engine::execute_compute_request(engine_device(), &req) {
         Ok(out) => {
             assert_eq!(out.images.len(), 1);
             assert_eq!(
@@ -1532,7 +1562,7 @@ fn compute_sampled_resident_bind_refuses_a_pyramid() {
         samplers: vec![],
         storage_images: vec![],
     };
-    let err = engine::execute_compute_request(&req)
+    let err = engine::execute_compute_request(engine_device(), &req)
         .expect_err("a resident source cannot answer for a pyramid");
     let text = err.to_string();
     if skip_if_no_gpu(&text) {
@@ -1605,4 +1635,75 @@ fn compute_sampled_a8unorm_arrives_in_alpha() {
         "alpha: got {}, want {want_alpha}",
         got[3]
     );
+}
+
+// ---------------------------------------------------------------------------
+// The compute stall watchdog's two structural zeros.
+//
+// These live here rather than beside the watchdog's own unit tests for one
+// reason: the allocation counter is a `#[global_allocator]`, and the library's
+// unit-test binary does not install one. A `measure` there would report zero
+// trips for every path, including a path that allocates — a gate that cannot
+// fail. This binary installs the counter above, so the zero it reports is the
+// path's, not the harness's.
+// ---------------------------------------------------------------------------
+
+use reims_vgpu::runtime::compute_exec::stall_watchdog::arm_compute_engine_stall_watchdog;
+
+fn stall_request() -> ComputeRequest {
+    ComputeRequest {
+        spirv: vec![0x0723_0203],
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
+        ..Default::default()
+    }
+}
+
+/// A call that returns inside its threshold must leave nothing behind — no
+/// report, and no thread. The report half is what the watchdog always promised;
+/// the thread half is the structural zero it used to violate, one thread per
+/// dispatch, each sleeping the whole threshold whether or not anything stalled.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_watched_dispatch_that_returns_creates_no_thread_of_its_own() {
+    fn live_threads() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("/proc/self/task")
+            .count()
+    }
+
+    let pipe = 0xf100_0000 | (std::process::id() & 0x0fff_ffff);
+    let req = stall_request();
+    let far = std::time::Duration::from_secs(600);
+    // The first arm starts the one thread this subsystem owns, so the baseline
+    // is taken after it, not before: the claim under test is per dispatch.
+    drop(arm_compute_engine_stall_watchdog(pipe, &req, far));
+    let before = live_threads();
+    for _ in 0..64 {
+        drop(arm_compute_engine_stall_watchdog(pipe, &req, far));
+    }
+    assert_eq!(
+        live_threads(),
+        before,
+        "64 watched dispatches created threads; the watchdog is per-dispatch again"
+    );
+}
+
+/// The other structural zero the per-dispatch thread violated: it cloned the
+/// kernel's whole SPIR-V module on every arm, and held the copy alive for the
+/// threshold. A slot refills its buffers in place, so a repeat dispatch through
+/// a warm slot reaches the allocator zero times.
+#[test]
+fn a_repeat_arm_through_a_warm_slot_does_not_enter_the_allocator() {
+    let pipe = 0xf200_0000 | (std::process::id() & 0x0fff_ffff);
+    let req = stall_request();
+    let far = std::time::Duration::from_secs(600);
+    // Warm: the thread, the table, and the first slot's two buffers.
+    for _ in 0..4 {
+        drop(arm_compute_engine_stall_watchdog(pipe, &req, far));
+    }
+    let (_, trips) = reims_vgpu_testkit::allocations::measure(|| {
+        drop(arm_compute_engine_stall_watchdog(pipe, &req, far));
+    });
+    assert_eq!(trips, 0, "arming a warm slot allocated {trips} time(s)");
 }

@@ -241,8 +241,8 @@ fn execute_icb_command(
     icb_ref: u32,
     location: u64,
     length: u64,
-) -> crate::runtime::decode::compute::Command {
-    use crate::runtime::decode::compute::{Command, Kind};
+) -> crate::runtime::decode::compute_spi::Command {
+    use crate::runtime::decode::compute_spi::{Command, Kind};
     Command {
         kind: Kind::ExecuteCommandsInBuffer,
         indirect_command_buffer_ref: icb_ref,
@@ -1076,7 +1076,9 @@ fn fill_and_execute_mul3add1_writeback() {
     assert_eq!(icb_a.size(), 1);
 
     // Product execute 0xe4 range [0,1] on a compute session + writeback.
-    let mut session = MetalBackend.open_compute_session(0).expect("session");
+    let mut session = MetalBackend
+        .open_compute_session(reims_vgpu_protocol::compute::DispatchType::Serial)
+        .expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(
@@ -2111,7 +2113,9 @@ fn buffer_backed_fill_execute_mul3add1() {
     assert_eq!(mem.gva, cmd_mem_gva);
     assert_eq!(mem.byte_len, layout.command_size as u64);
 
-    let mut session = MetalBackend.open_compute_session(0).expect("session");
+    let mut session = MetalBackend
+        .open_compute_session(reims_vgpu_protocol::compute::DispatchType::Serial)
+        .expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(
@@ -4571,7 +4575,9 @@ fn fill_compute_barrier_and_tg_memory_execute() {
     )
     .expect("fill with barrier+tg");
 
-    let mut session = MetalBackend.open_compute_session(0).expect("session");
+    let mut session = MetalBackend
+        .open_compute_session(reims_vgpu_protocol::compute::DispatchType::Serial)
+        .expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(
@@ -4660,7 +4666,9 @@ fn inherit_buffers_encoder_kernel_mul3add1() {
         has_attribute_stride: false,
     });
 
-    let mut session = MetalBackend.open_compute_session(0).expect("session");
+    let mut session = MetalBackend
+        .open_compute_session(reims_vgpu_protocol::compute::DispatchType::Serial)
+        .expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
@@ -4741,7 +4749,9 @@ fn inherit_pipeline_encoder_kernel_mul3add1() {
     let mut acc = ComputeAccum::default();
     acc.set_pipeline(6);
 
-    let mut session = MetalBackend.open_compute_session(0).expect("session");
+    let mut session = MetalBackend
+        .open_compute_session(reims_vgpu_protocol::compute::DispatchType::Serial)
+        .expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
@@ -4932,7 +4942,9 @@ fn icb_parent_encoder_texture_and_sampler_binds() {
         has_lod_clamp: false,
     });
 
-    let mut session = MetalBackend.open_compute_session(0).expect("session");
+    let mut session = MetalBackend
+        .open_compute_session(reims_vgpu_protocol::compute::DispatchType::Serial)
+        .expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
@@ -5048,7 +5060,9 @@ fn icb_argument_buffer_storage_texture_xyplane() {
         texture_ref: 11,
     });
 
-    let mut session = MetalBackend.open_compute_session(0).expect("session");
+    let mut session = MetalBackend
+        .open_compute_session(reims_vgpu_protocol::compute::DispatchType::Serial)
+        .expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),
@@ -5190,7 +5204,9 @@ fn icb_argument_buffer_sample_and_write() {
         has_lod_clamp: false,
     });
 
-    let mut session = MetalBackend.open_compute_session(0).expect("session");
+    let mut session = MetalBackend
+        .open_compute_session(reims_vgpu_protocol::compute::DispatchType::Serial)
+        .expect("session");
     let cmd = execute_icb_command(9, 0, 1);
     assert_eq!(
         session.encode_icb(&mut state, &mut host, 1, &cmd, &acc),

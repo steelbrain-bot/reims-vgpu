@@ -6,8 +6,6 @@
 //! at the wrong generation, or is not yet content-ready.
 
 use super::compute_execution::residency_fields;
-use super::draw_execution::identity_fields;
-use super::types::TargetIdentity;
 use crate::model::ComputeStorageResidencyKey;
 use crate::observe::Decline;
 
@@ -23,9 +21,14 @@ pub enum EngineFacadeDecline {
         actual_generation: u32,
         expected_generation: u32,
     },
-    WindowSourceDisappearedBeforePin {
-        identity: TargetIdentity,
-    },
+    /// The device's rail slot is held by a different rail, so this rail's
+    /// object caches for it cannot be reached.
+    ///
+    /// Unreachable in any live build — `backend::select` latches one rail per
+    /// process — and refused by name anyway, because the alternative is a
+    /// second cache owning handles the first one also owns. A caller that fell
+    /// back to one would be running two owners of the same `VkPipeline`.
+    DeviceCachesUnreachable,
 }
 
 impl Decline for EngineFacadeDecline {
@@ -36,9 +39,7 @@ impl Decline for EngineFacadeDecline {
             Self::StorageReadGenerationMismatch { .. } => {
                 "vk_engine_storage_read_generation_mismatch"
             }
-            Self::WindowSourceDisappearedBeforePin { .. } => {
-                "vk_engine_window_source_disappeared_before_pin"
-            }
+            Self::DeviceCachesUnreachable => "vk_engine_device_caches_unreachable",
         }
     }
 
@@ -58,7 +59,7 @@ impl Decline for EngineFacadeDecline {
                 ]);
                 fields
             }
-            Self::WindowSourceDisappearedBeforePin { identity } => identity_fields(identity),
+            Self::DeviceCachesUnreachable => Vec::new(),
         }
     }
 }
@@ -83,16 +84,6 @@ mod tests {
         }
     }
 
-    fn identity() -> TargetIdentity {
-        TargetIdentity::Surface {
-            id: 7,
-            width: 64,
-            height: 32,
-            generation: 9,
-            format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
-        }
-    }
-
     fn all() -> Vec<EngineFacadeDecline> {
         vec![
             EngineFacadeDecline::WindowPresenterNotAttached,
@@ -103,9 +94,6 @@ mod tests {
                 identity: residency(),
                 actual_generation: 8,
                 expected_generation: 9,
-            },
-            EngineFacadeDecline::WindowSourceDisappearedBeforePin {
-                identity: identity(),
             },
         ]
     }
@@ -124,7 +112,7 @@ mod tests {
         slugs.sort_unstable();
         let before = slugs.len();
         slugs.dedup();
-        assert_eq!(before, 4, "the engine façade reason census moved");
+        assert_eq!(before, 3, "the engine façade reason census moved");
         assert_eq!(before, slugs.len(), "duplicate engine façade slug");
     }
 
@@ -141,31 +129,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The identity fields are what a reader needs to find the resident a
-    /// window-source pin missed, so they must all reach the line.
-    #[test]
-    fn a_window_source_decline_names_the_whole_identity() {
-        let decline = EngineFacadeDecline::WindowSourceDisappearedBeforePin {
-            identity: identity(),
-        };
-        assert_eq!(
-            decline.fields(),
-            vec![
-                ("identity_kind", "surface".into()),
-                ("identity_id", "7".into()),
-                ("identity_width", "64".into()),
-                ("identity_height", "32".into()),
-                ("identity_generation", "9".into()),
-                (
-                    "identity_format",
-                    format!(
-                        "{:?}",
-                        crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT
-                    )
-                ),
-            ]
-        );
     }
 }

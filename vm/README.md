@@ -23,6 +23,42 @@ vm/boot-x86.sh --device reims-vgpu-pci --testing --rail macos-11   # a specific 
 ```
 
 Both scripts use a snapshot-revert lifecycle (testing vs interactive classes; testing hard kill).
+
+## Driving a guest, and sweeping every rail
+
+A boot that sits at an idle Finder produces no rates, and almost every reading
+this project takes is a rate. Two scripts supply the workload and the sweep:
+
+```bash
+vm/drive-desktop.sh          # host-driven workload against a guest already up
+vm/rail-sweep.sh             # all six provisioned x86 rails, boot + drive + read
+vm/rail-sweep.sh macos-15 macos-26        # or just these
+```
+
+`drive-desktop.sh` is the "three rounds of launching and quitting five
+applications over ssh" that every validation row in
+`crates/reims-vgpu/src/dead/README.md` names. It is committed rather than
+described because a rate is only comparable across boots if the workload is.
+`ROUNDS` and `APPS` override it.
+
+`rail-sweep.sh` boots each rail with `--testing`, drives it, snapshots
+`/tmp/reims-vgpu-fail.log` to `/tmp/sweep-<rail>-fail.log`, and prints the same
+presence list and route sums for each. A defect found on one guest OS line is
+not a defect found on the pathway — `AGENTS.md` says not to generalise between
+rails — so a regression sweep means all six.
+
+Two things it will not do. It **refuses to start** while another boot or its
+QEMU is live, or while host port 2222 is bound: QEMU's ssh `hostfwd` is a single
+port, a second boot dies instantly on it, and the sweep would then wait out its
+whole first-frame timeout and report a rail that never presented. Note that
+`boot-x86.sh` outlives its own QEMU, so killing QEMU alone does not free the
+port. And it does **not** rebuild between rails, because `boot-x86.sh` does:
+editing source during a sweep gives the rails different binaries and destroys
+the comparison the sweep exists for.
+
+Add a route to the script's `KEYS`/`SUMS` when it becomes part of what a sweep
+has to answer, so that every later sweep answers it too.
+
 QMP is a per-boot unix socket under the run dir for that pathway (`scripts/qmp/qmp.py`).
 
 **Networking** is typically QEMU SLIRP with SSH hostfwd. Guest disks, IPSWs, OpenCore blobs, and

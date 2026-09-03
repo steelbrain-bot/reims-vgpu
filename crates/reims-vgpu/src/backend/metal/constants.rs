@@ -88,7 +88,7 @@ pub const REIMS_VGPU_METAL_MAX_COLOR_RTS: usize = 8;
 // extra attachments to that clamp with nothing said — a multi-target draw missing
 // its last render target. Pinned here rather than left to the clamp to notice.
 const _: () = assert!(
-    REIMS_VGPU_METAL_MAX_COLOR_RTS == crate::runtime::decode::render::PASS_MAX_COLOR_ATTACHMENTS
+    REIMS_VGPU_METAL_MAX_COLOR_RTS == crate::runtime::render_pass::PASS_MAX_COLOR_ATTACHMENTS
 );
 
 /// Metal `MTLBufferLayoutStrideDynamic` == `NSUIntegerMax`.

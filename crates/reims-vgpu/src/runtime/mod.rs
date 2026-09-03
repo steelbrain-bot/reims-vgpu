@@ -108,6 +108,9 @@ pub mod mtlb;
 pub mod node_guard;
 /// Object-list lookup and mapper-ref-texture registration.
 pub mod objects;
+/// The bytes an admitted packet is executed from, held while the model decides
+/// when it runs.
+pub mod parked;
 pub mod plan;
 /// Whether a range's page-table entries are in the state the guest's own next
 /// edit of them requires — the direction that is ordered is the map.
@@ -115,6 +118,7 @@ pub mod range_coverage;
 pub mod released_pages;
 /// Transfer a host-resident render frame into guest pages when synchronization
 /// or a guest-memory reader makes the bytes observable.
+pub mod render_pass;
 pub mod render_writeback;
 /// A rail's own name for a resident render target, opaque to the layers that
 /// carry it. See the module doc for the ledger this exists for.

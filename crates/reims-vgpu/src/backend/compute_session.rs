@@ -9,7 +9,7 @@
 
 use crate::model::DeviceState;
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus};
-use crate::runtime::decode::compute::Command as ComputeCommand;
+use crate::runtime::decode::compute_spi::Command as ComputeCommand;
 use crate::runtime::host::{HostMemory, HostOps};
 
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]

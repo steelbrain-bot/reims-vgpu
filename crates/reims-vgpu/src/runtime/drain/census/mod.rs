@@ -872,7 +872,7 @@ impl ExecPhase {
 /// which one costs, which is exactly the shape `RegsOp` was added for after the
 /// same mistake.
 ///
-/// The three sum to `preflight_us`, so the identity is checkable on the line.
+/// The two sum to `preflight_us`, so the identity is checkable on the line.
 /// It reads ~0.95 rather than 1.00 because the `extract_air` calls that sit
 /// between the `Air` and `Cache` spans are outside both.
 ///
@@ -885,9 +885,15 @@ impl ExecPhase {
 /// pipes/s  12 650 / 12 786
 /// ```
 ///
-/// `Refs` — the second full decode of the stream, the part most obviously
-/// redundant since `walk_stream` decodes the same records straight afterwards —
-/// is **8 %**. The cost is `Air`, and *within* `Air` it is the three
+/// A third part, `refs`, used to be charged here: the second full decode of the
+/// stream, the part most obviously redundant since `walk_stream` decodes the
+/// same records straight afterwards. It measured **8 %** and it is now **gone**
+/// rather than zero — both arms of the pre-scan take the walk's own answer, so
+/// there is no second decode to charge. It is not a variant with nothing in it,
+/// because a column that is always zero reads as "this part is free" when what
+/// happened is that the part no longer exists.
+///
+/// The cost that is left is `Air`, and *within* `Air` it is the three
 /// guest-memory resolves rather than the AIR copies: removing both copies moved
 /// `air_us/pipe` by only 4.7 %.
 ///
@@ -910,11 +916,6 @@ impl ExecPhase {
 /// Design the invalidation against the deletion paths before taking the memo.
 #[derive(Clone, Copy)]
 pub enum PreflightPart {
-    /// Collecting the distinct pipeline refs: `iter_segments` and a full
-    /// `render::decode` / `compute::decode` of every record in the stream — the
-    /// *same* walk `walk_stream` is about to make, done a second time because
-    /// the answer has to be complete before any record runs.
-    Refs,
     /// `load_render_air_pair` and its compute counterpart: resolving each
     /// pipeline's AIR out of guest memory.
     Air,
@@ -928,25 +929,19 @@ impl PreflightPart {
     /// How many parts there are. The census arrays are sized from this, so a new
     /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
     /// overflowing an array at report time.
-    pub(crate) const COUNT: usize = 3;
+    pub(crate) const COUNT: usize = 2;
 
-    const ALL: [PreflightPart; Self::COUNT] = [
-        PreflightPart::Refs,
-        PreflightPart::Air,
-        PreflightPart::Cache,
-    ];
+    const ALL: [PreflightPart; Self::COUNT] = [PreflightPart::Air, PreflightPart::Cache];
 
     const fn index(self) -> usize {
         match self {
-            PreflightPart::Refs => 0,
-            PreflightPart::Air => 1,
-            PreflightPart::Cache => 2,
+            PreflightPart::Air => 0,
+            PreflightPart::Cache => 1,
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
-            PreflightPart::Refs => "refs",
             PreflightPart::Air => "air",
             PreflightPart::Cache => "cache",
         }
@@ -1146,19 +1141,23 @@ pub enum PostSweep {
     ReleasedPages,
     /// `bound_buffers::note_registry_levels`, Vulkan only.
     BindLevels,
+    /// `DeviceState::pipeline_occupancy_census` — self-gated to a one-second
+    /// cadence, and quiet until the guest declares a pipeline.
+    PipelineTable,
 }
 
 impl PostSweep {
     /// How many sweeps there are. The census array is sized from this, so a new
     /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
     /// overflowing an array at report time.
-    pub(crate) const COUNT: usize = 4;
+    pub(crate) const COUNT: usize = 5;
 
     const ALL: [PostSweep; Self::COUNT] = [
         PostSweep::CacheLevels,
         PostSweep::SlotRecheck,
         PostSweep::ReleasedPages,
         PostSweep::BindLevels,
+        PostSweep::PipelineTable,
     ];
 
     const fn index(self) -> usize {
@@ -1167,6 +1166,7 @@ impl PostSweep {
             PostSweep::SlotRecheck => 1,
             PostSweep::ReleasedPages => 2,
             PostSweep::BindLevels => 3,
+            PostSweep::PipelineTable => 4,
         }
     }
 
@@ -1176,6 +1176,7 @@ impl PostSweep {
             PostSweep::SlotRecheck => "slotre",
             PostSweep::ReleasedPages => "relpg",
             PostSweep::BindLevels => "bindlv",
+            PostSweep::PipelineTable => "pipetbl",
         }
     }
 }
@@ -2798,6 +2799,7 @@ pub fn note_drain_setup(ns: u64) {
 
 /// Accumulate one completed drain tranche; emits at most once per second.
 pub fn note_drain_tranche(
+    state: &crate::model::DeviceState,
     host: &dyn crate::runtime::host::HostOps,
     drain_us: u64,
     publish_us: u64,
@@ -2854,9 +2856,12 @@ pub fn note_drain_tranche(
         }
         // Under `window_publish`, which says how many frames were offered but
         // not why fewer reached the screen.
-        rail.emit_census(CensusSite::Serialization {
-            win_ms: DRAIN_DUTY.last_window_ms(),
-        });
+        rail.emit_census(
+            state,
+            CensusSite::Serialization {
+                win_ms: DRAIN_DUTY.last_window_ms(),
+            },
+        );
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
@@ -2880,8 +2885,8 @@ pub fn note_drain_tranche(
         for line in crate::observe::footprint::census_lines(crate::observe::elapsed_ms() as u64) {
             crate::observe::off(line);
         }
-        rail.emit_census(CensusSite::WorkingSet);
-        rail.emit_census(CensusSite::Throughput);
+        rail.emit_census(state, CensusSite::WorkingSet);
+        rail.emit_census(state, CensusSite::Throughput);
         emit_alias_pressure(host);
         // After `CensusSite::Throughput`, which is where a rail emits its own
         // phase split: the two divide against each other and reading them in the
@@ -2889,7 +2894,7 @@ pub fn note_drain_tranche(
         // which is the misreading this line exists to correct. Not asked of the
         // rail — the timer is runtime-side and either rail is measured by it.
         emit_chain_phase();
-        rail.emit_census(CensusSite::Levels);
+        rail.emit_census(state, CensusSite::Levels);
     }
 }
 
@@ -3023,9 +3028,9 @@ pub fn note_drain_lock_wait(us: u64) {
 
 /// Time one post-tranche sweep and attribute it, returning what it returned.
 ///
-/// A wrapper rather than a `started`/`note` pair at each call site: these four
-/// sit in one straight run of statements, and a pair spelled four times is four
-/// chances to time the wrong one.
+/// A wrapper rather than a `started`/`note` pair at each call site: they sit in
+/// one straight run of statements, and a pair spelled once per sweep is one
+/// chance per sweep to time the wrong one.
 pub fn post_sweep<T>(sweep: PostSweep, run: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
     let out = run();
@@ -3287,12 +3292,12 @@ mod drain_gap_tests {
         // divide the whole process lifetime into one tranche — so the window
         // under test has to be opened before anything is accumulated into it.
         assert!(c.note(0, 0, 1).is_none(), "the first call arms the window");
-        // Six entries on a fixed stride, each: 40 idle, 10 lock, 30 drain, 5 publish, 16 post — 16
-        // so the four-way sweep split divides it whole and the shortfall check below reads
-        // truncation as nothing. Times are microseconds on the crate clock. The first entry's idle
+        // Six entries on a fixed stride, each: 40 idle, 10 lock, 30 drain, 5 publish, 80 post — 80
+        // so the sweep split divides it whole for any `PostSweep::COUNT` up to five, and the
+        // shortfall check below reads truncation as nothing. Times are microseconds on the crate clock. The first entry's idle
         // is the one span that cannot be measured — there is no previous exit to measure it from —
         // so it lies before `t0` and is not part of what has to tile.
-        let (idle, lock, drain, publish, post) = (40u64, 10u64, 30u64, 5u64, 16u64);
+        let (idle, lock, drain, publish, post) = (40u64, 10u64, 30u64, 5u64, 80u64);
         let stride = idle + lock + drain + publish + post;
         let entries = 6u64;
         let t0 = 1_000u64;
@@ -3302,7 +3307,7 @@ mod drain_gap_tests {
             c.note_gap_lock(lock);
             let busy_end = entry + lock + drain + publish;
             assert!(c.note(drain, publish, 1).is_none(), "the window is not due");
-            // The four sweeps that make up `post`, in nanoseconds. They tile it
+            // The sweeps that make up `post`, in nanoseconds. They tile it
             // exactly here, which is what the shortfall check below is for: on a
             // real tranche the wrapper's own `Instant` reads sit outside them.
             for sweep in PostSweep::ALL {
@@ -3336,9 +3341,13 @@ mod drain_gap_tests {
         assert_eq!(field("gap_post_us"), post * entries);
         // The split has to add up to the total it divides, so a sweep that gains
         // a call site and no timer reads as a shortfall rather than as noise.
-        let post_split: u64 = ["cachelv", "slotre", "relpg", "bindlv"]
+        // From `PostSweep::ALL` rather than a transcription of it: a new sweep
+        // that this list forgot would leave its own time out of the split and
+        // read as the shortfall this assertion is *for*, which is a test
+        // failing about the wrong thing.
+        let post_split: u64 = PostSweep::ALL
             .into_iter()
-            .map(|s| field(&format!("post_{s}_us")))
+            .map(|s| field(&format!("post_{}_us", s.label())))
             .sum();
         assert_eq!(post_split, post * entries);
         assert_eq!(field("gap_skip_us"), skip_us);

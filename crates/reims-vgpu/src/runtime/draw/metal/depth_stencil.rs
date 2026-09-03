@@ -8,16 +8,16 @@
 //!
 //! The two copies had already drifted. Both tested `level` and `resolve_texture_ref` and neither
 //! tested `slice` or `depth_plane`, while the owning rule they were copies of
-//! ([`attachment_subresource_is_bindable`](crate::runtime::decode::render::attachment_subresource_is_bindable))
+//! ([`attachment_subresource_is_bindable`](crate::runtime::render_pass::attachment_subresource_is_bindable))
 //! tests all four; and both refused in silence, so an attachment this rail could not carry vanished
 //! with nothing in the log.
 
 use super::{degrade_log_first, load_linear_raw, DeviceState, DrawEncodeRequest};
-use crate::runtime::decode::render::{
+use crate::runtime::host::HostMemory;
+use crate::runtime::render_pass::{
     attachment_subresource_is_bindable, AttachSubresource, DepthAttachment, LevelSupport,
     StencilAttachment,
 };
-use crate::runtime::host::HostMemory;
 use crate::runtime::{mapper, mapping_write, objects, HostOps};
 use reims_vgpu_protocol::pass_action::{
     is_declared_load_action, is_declared_store_action, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,

@@ -1,18 +1,19 @@
-// Only the compute-preflight test names these opcodes, and that test is
-// Vulkan-only — this device compiles no compute preflight without it.
-#[cfg(feature = "backend-vulkan")]
-use reims_vgpu_wire::ops::compute as wire_compute;
-
+// A wire constant, and so the same on every rail. It was gated on
+// `backend-vulkan` while the only test naming it was the Vulkan-only compute
+// preflight; the exec-walk suites now name it 103 times outside any such
+// region, and the gate made the Metal arm's test build fail with 103
+// `cannot find value` errors that no `--features backend-vulkan` build could
+// see. A `cfg` on a wire constant has no correct arm.
 use reims_vgpu_wire::OP_HEADER_LEN;
 
 use super::*;
 use crate::model::{DeviceId, PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
 use crate::protocol::endian::{st16, st32, st64};
-use crate::runtime::decode::render::{
+use crate::runtime::host::FakeHost;
+use crate::runtime::render_pass::{
     PASS_ATTACH_CLEAR_COLOR, PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
     PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE,
 };
-use crate::runtime::host::FakeHost;
 use reims_vgpu_protocol::pass_action::{MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_STORE};
 
 #[test]
@@ -61,9 +62,13 @@ fn chain_abandon_reports_how_many_draws_were_lost() {
 
 #[test]
 fn short_payload_noop() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let mut host = FakeHost::new();
-    let r = process_exec_indirect2(&mut state, &mut host, &[0u8; 4]);
+    let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let (submission, r) = read_exec_submission(&state, &host, &[0u8; 4]);
+    assert!(
+        submission.is_none(),
+        "four bytes are not a submission header"
+    );
     assert_eq!(r.streams_loaded, 0);
 }
 
@@ -84,7 +89,7 @@ fn short_payload_noop() {
 #[test]
 fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
+    let host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
     assert!(state.tasks[3].active);
     assert!(
@@ -96,7 +101,7 @@ fn an_exec_packet_naming_a_dead_slot_is_refused_not_aimed_at_its_neighbour() {
     st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 6);
     st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
 
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let (_submission, r) = read_exec_submission(&state, &host, &payload);
     assert_eq!(
         r.task_id, 6,
         "the refusal must name the word the guest sent, not the slot we \
@@ -120,7 +125,7 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
         CHILD_EXEC_RESOURCE_OBJECT_ID, CHILD_EXEC_RESOURCE_TAIL, CHILD_EXEC_RESOURCE_VALIDITY_OPS,
     };
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
+    let host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
 
     const N_RES: u32 = 2;
@@ -167,7 +172,24 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
     );
 
     let cap = crate::observe::sink::FailCapture::start();
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    // The resource table is consumed by the *execution* half, so this goes
+    // through the one execution door: read at arrival, run at release. The
+    // resolved work is empty because the command buffers are unreadable, which
+    // is what this fixture is about — there are no records for the model to
+    // have resolved.
+    let mut host = host;
+    let (submission, r) = read_exec_submission(&state, &host, &payload);
+    let submission = submission.expect("the header parses");
+    let resolved = reims_vgpu_core::exec::ExecWork::default();
+    let r = execute_planned(
+        &mut state,
+        &mut host,
+        RetainedInputs {
+            submission: &submission,
+            resolved: &resolved,
+        },
+        r,
+    );
     assert_eq!(r.task_id, 3);
     assert_eq!(r.streams_loaded, 0, "no page table backs the cmdbuf gva");
     let line = cap.one("exec_res_table");
@@ -179,7 +201,7 @@ fn a_resource_record_that_populates_its_unrecovered_tail_says_so() {
 /// One segment header whose declared length runs `overshoot` bytes past the
 /// buffer, followed by `tail` bytes of would-be records.
 fn truncated_segment(type_: u8, overshoot: usize, tail: usize) -> Vec<u8> {
-    use crate::runtime::decode::stream::SEGMENT_HEADER_LEN;
+    use reims_vgpu_protocol::segment::SEGMENT_HEADER_LEN;
     let mut stream = vec![0u8; SEGMENT_HEADER_LEN + tail];
     st32(
         &mut stream[0..4],
@@ -195,7 +217,7 @@ fn sink_body() -> String {
 
 #[test]
 fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
-    use crate::runtime::decode::stream::SEGMENT_TYPE_RENDER;
+    use reims_vgpu_protocol::segment::SegmentKind;
     // The defect this pins: `walk_stream` opened with `Err(_) => return`, so a
     // stream the framing decoder rejected executed zero records and produced
     // zero log lines — byte-for-byte indistinguishable at the sink from an
@@ -212,9 +234,10 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
         &mut state,
         &mut host,
         task_id,
-        &truncated_segment(SEGMENT_TYPE_RENDER, 64, 0),
+        &truncated_segment(SegmentKind::Render.wire_type(), 64, 0),
         &mut out,
         &mut acc,
+        None,
     );
     let added = sink_body()[before..].to_string();
     assert!(
@@ -222,9 +245,10 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
         "a stream that will not frame must reach the always-on sink, got:\n{added}"
     );
     assert!(
-        added.contains("reason=stream_seg_len_past_buffer_end"),
+        added.contains("reason=framing_segment_length_past_stream_end"),
         "the line must name which framing check refused, not just that one \
-         did — 17 checks shared `ErrBadLength`. got:\n{added}"
+         did — 17 checks shared `ErrBadLength` in the framer this replaced. \
+         got:\n{added}"
     );
     assert!(
         added.contains(&format!("task={task_id}")),
@@ -232,67 +256,77 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
     );
 }
 
+/// A well-formed segment carrying a record that overruns it names the check
+/// rather than looking like end-of-records.
+///
+/// `Err(_) => break` in the walker this replaced treated a self-inconsistent
+/// segment exactly like `Done`: the remaining records went unexecuted with
+/// nothing logged.
+///
+/// The *segment*-level half of that defect is no longer expressible. The framer
+/// this device carried handed the record walker an already-parsed `Segment`
+/// whose `command_offset`/`command_length` could name bytes the buffer did not
+/// hold, and `validate_segment` re-checked them on every record — sixteen
+/// re-validation refusals for a state a caller should not have been able to
+/// construct. `FramedSegment` carries the command window as a slice, so a
+/// segment cannot claim bytes that are not there and the whole re-validation
+/// family is gone with the state it guarded.
+///
+/// What is left is the record's own length, which is still the guest's, and
+/// that is what this drives.
 #[test]
-fn a_truncated_segment_names_the_check_rather_than_looking_like_end_of_records() {
-    use crate::runtime::decode::stream::{
-        segment_type_name, Segment, SEGMENT_HEADER_LEN, SEGMENT_TYPE_INFO,
-    };
-    // `Err(_) => break` treated a self-inconsistent segment exactly like
-    // `Done`: the remaining records went unexecuted with nothing logged.
-    let stream = vec![0u8; SEGMENT_HEADER_LEN + 4];
-    // A segment claiming a longer body than the buffer holds, handed straight
-    // to the record walker — the shape `iter_segments` would have rejected but
-    // that an already-parsed `Segment` can still carry.
-    let seg = Segment {
-        offset: 0,
-        length: (SEGMENT_HEADER_LEN + 64) as u32,
-        type_: SEGMENT_TYPE_INFO,
-        command_offset: SEGMENT_HEADER_LEN as u32,
-        command_length: 64,
-        ..Segment::default()
-    };
+fn a_record_overrunning_its_segment_names_the_check_rather_than_ending_quietly() {
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    // Two records in an info segment: one well formed, then one whose declared
+    // length runs past the window it sits in.
+    let mut commands = Vec::new();
+    for (opcode, length) in [(0x1d1u32, 8u32), (0x1d1, 64)] {
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], opcode);
+        st32(&mut hdr[4..8], length);
+        commands.extend_from_slice(&hdr);
+    }
     let before = sink_body().len();
     let mut handled = 0usize;
-    walk_segment_records(&stream, &seg, |_, _| handled += 1);
+    walk_segment_records(
+        SegmentKind::Info,
+        SEGMENT_HEADER_LEN as u32,
+        &commands,
+        |_, _| handled += 1,
+    );
     let added = sink_body()[before..].to_string();
-    assert_eq!(handled, 0, "the malformed segment yields no records");
+    assert_eq!(handled, 1, "the well-formed record ahead of it still ran");
     assert!(
         added.contains("stream_record_fail"),
         "dropping a segment's records must reach the sink, got:\n{added}"
     );
     assert!(
-        added.contains("reason=stream_reval_span_oob"),
-        "the line must name the failing re-validation check, got:\n{added}"
+        added.contains("reason=stream_rec_bad_length") && added.contains("length=64"),
+        "the line must name the check and the length the guest declared, \
+         got:\n{added}"
     );
     assert!(
-        added.contains(&format!(
-            "seg={}",
-            segment_type_name(u32::from(SEGMENT_TYPE_INFO))
-        )),
+        added.contains("seg=info"),
         "the line must say which segment family lost its records, got:\n{added}"
     );
 }
 
 #[test]
 fn walking_a_well_formed_segment_to_its_end_logs_nothing() {
-    use crate::runtime::decode::stream::{iter_segments, SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
-    // The other half of the obligation: `Done` is how every segment ends, so
-    // if it produced a line the sink would carry one per segment per frame.
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    // The other half of the obligation: every segment ends, so if the end
+    // produced a line the sink would carry one per segment per frame.
     let mut records = [0u8; 8];
     st32(&mut records[0..4], 0x190);
     st32(&mut records[4..8], 8);
-    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
-    st32(
-        &mut stream[0..4],
-        (SEGMENT_HEADER_LEN + records.len()) as u32,
-    );
-    stream[4] = SEGMENT_TYPE_EVENT;
-    stream.extend_from_slice(&records);
-
-    let segs = iter_segments(&stream).expect("a well-formed stream frames");
     let before = sink_body().len();
     let mut handled = 0usize;
-    walk_segment_records(&stream, &segs[0], |_, _| handled += 1);
+    walk_segment_records(
+        SegmentKind::Event,
+        SEGMENT_HEADER_LEN as u32,
+        &records,
+        |_, _| handled += 1,
+    );
     let added = sink_body()[before..].to_string();
     assert_eq!(handled, 1, "the one record is handed over");
     assert!(
@@ -301,105 +335,102 @@ fn walking_a_well_formed_segment_to_its_end_logs_nothing() {
     );
 }
 
+/// An unknown segment family stops the walk and says so; the type-5 envelope is
+/// skipped in silence.
+///
+/// The walker this replaced ended in `_ => {}`, which gave one silence to two
+/// very different things: a protection envelope is a contract-correct skip, and
+/// an unrecognised type is wire format this host has never seen.
+///
+/// **The unknown case now ends the stream rather than being stepped over, and
+/// that is a behaviour change.** `FramingRefusal::UnknownType` states the
+/// reason: a family whose record framing is unknown can only be skipped on its
+/// declared length, and skipping on that hands the next segment an encoder
+/// state derived from bytes nothing here understands. The reference host
+/// rejects a non-continuation type it has no decoder for rather than stepping
+/// over it. So the segments before the unknown one execute, the ones after it
+/// do not, and the line says how many ran.
 #[test]
-fn an_unknown_segment_family_is_refused_and_the_type_5_envelope_is_not() {
-    use crate::observe::Refusal;
-    use crate::runtime::decode::stream::{
-        segment_disposition, SegmentDisposition, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_PROTECTION_OPTIONS,
+fn an_unknown_segment_family_ends_the_walk_and_the_envelope_does_not() {
+    use crate::model::FENCE_DOMAIN_EVENT;
+    use reims_vgpu_protocol::segment::{
+        segment_role, SegmentKind, SegmentRole, SEGMENT_HEADER_LEN, SEGMENT_TYPE_PROTECTION_OPTIONS,
     };
-    // `walk_stream` ended in `_ => {}`, which gave one silence to two very
-    // different things. Ref-texture is a contract-correct skip; function is wire
-    // format the host has never seen.
+
     assert_eq!(
-        segment_disposition(SEGMENT_TYPE_PROTECTION_OPTIONS),
-        SegmentDisposition::Envelope
+        segment_role(SEGMENT_TYPE_PROTECTION_OPTIONS),
+        Some(SegmentRole::ProtectionEnvelope)
+    );
+    assert_eq!(segment_role(6), None, "6 is not a family this host knows");
+    assert_eq!(segment_role(0xff), None);
+
+    // A protection envelope, then an event segment that signals, then an
+    // unknown family, then a second event segment that must not run.
+    let push = |stream: &mut Vec<u8>, type_: u8, body: &[u8]| {
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], (SEGMENT_HEADER_LEN + body.len()) as u32);
+        hdr[4] = type_;
+        stream.extend_from_slice(&hdr);
+        stream.extend_from_slice(body);
+    };
+    let signal = |event_ref: u32, value: u64| {
+        let mut rec = vec![0u8; 0x14];
+        st32(&mut rec[0..4], 0x191);
+        st32(&mut rec[4..8], 0x14);
+        st32(&mut rec[8..12], event_ref);
+        st64(&mut rec[12..20], value);
+        rec
+    };
+    let mut stream = Vec::new();
+    push(&mut stream, SEGMENT_TYPE_PROTECTION_OPTIONS, &[0u8; 8]);
+    push(&mut stream, SegmentKind::Event.wire_type(), &signal(21, 4));
+    push(&mut stream, 6, &[0u8; 8]);
+    push(&mut stream, SegmentKind::Event.wire_type(), &signal(22, 9));
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let task_id = 0x5731_0002;
+    let cap = crate::observe::FailCapture::start();
+    walk_stream(
+        &mut state, &mut host, task_id, &stream, &mut out, &mut acc, None,
+    );
+    let lines = cap.lines();
+
+    assert_eq!(
+        state.fence_generation(task_id, FENCE_DOMAIN_EVENT, 21),
+        Some(4),
+        "the segments ahead of the unknown family still execute — and the \
+         envelope ahead of them is skipped, not walked as records"
     );
     assert_eq!(
-        segment_disposition(SEGMENT_TYPE_PROTECTION_OPTIONS).refusal(),
+        state.fence_generation(task_id, FENCE_DOMAIN_EVENT, 22),
         None,
-        "the envelope arrives on healthy frames; a line here is a flood"
+        "the walk stops at the unknown family"
     );
-    assert_eq!(
-        segment_disposition(SEGMENT_TYPE_BLIT),
-        SegmentDisposition::Walk
+    assert!(
+        lines.iter().any(|l| l.contains("stream_frame_fail")
+            && l.contains("reason=framing_segment_type_unknown")
+            && l.contains("wire_type=0x6")
+            && l.contains("segments_before=2")),
+        "the line must name the type and how many segments ran: {lines:?}"
     );
-    assert_eq!(
-        segment_disposition(6).refusal(),
-        Some("stream_segment_type_unknown")
-    );
-    assert_eq!(
-        segment_disposition(0xff).refusal(),
-        Some("stream_segment_type_unknown")
-    );
-}
-
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn render_preflight_collects_content_pipelines_without_duplicates() {
-    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
-    use wire_render::OPCODE_SET_RENDER_PIPELINE_STATE;
-
-    let mut records = Vec::new();
-    for pipeline in [41u32, 77, 41] {
-        let mut cmd = [0u8; 12];
-        st32(&mut cmd[0..4], OPCODE_SET_RENDER_PIPELINE_STATE);
-        st32(&mut cmd[4..8], 12);
-        st32(&mut cmd[8..12], pipeline);
-        records.extend_from_slice(&cmd);
-    }
-    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
-    let stream_len = stream.len() + records.len();
-    st32(&mut stream[0..4], stream_len as u32);
-    stream[4] = SEGMENT_TYPE_RENDER;
-    stream.extend_from_slice(&records);
-
-    assert_eq!(super::vulkan::render_pipeline_refs(&stream), vec![41, 77]);
-}
-
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
-    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_COMPUTE};
-
-    let mut records = Vec::new();
-    let mut pipeline = [0u8; 12];
-    st32(&mut pipeline[0..4], wire_compute::OPCODE_SET_PIPELINE_STATE);
-    st32(&mut pipeline[4..8], 12);
-    st32(&mut pipeline[8..12], 20);
-    records.extend_from_slice(&pipeline);
-    for opcode in [
-        wire_compute::OPCODE_DISPATCH_THREADGROUPS,
-        wire_compute::OPCODE_DISPATCH_THREADGROUPS,
-        wire_compute::OPCODE_DISPATCH_THREADS,
-    ] {
-        let mut dispatch = [0u8; 56];
-        st32(&mut dispatch[0..4], opcode);
-        st32(&mut dispatch[4..8], 56);
-        st64(&mut dispatch[8..16], 6);
-        st64(&mut dispatch[16..24], 11);
-        st64(&mut dispatch[24..32], 1);
-        st64(&mut dispatch[32..40], 16);
-        st64(&mut dispatch[40..48], 16);
-        st64(&mut dispatch[48..56], 1);
-        records.extend_from_slice(&dispatch);
-    }
-    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
-    let stream_len = stream.len() + records.len();
-    st32(&mut stream[0..4], stream_len as u32);
-    stream[4] = SEGMENT_TYPE_COMPUTE;
-    stream.extend_from_slice(&records);
-
-    assert_eq!(
-        super::vulkan::compute_translation_inputs(&stream),
-        vec![(20, [16, 16, 1])]
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("framing_envelope_window_not_payload")),
+        "an eight-byte envelope window is the payload and must not refuse: {lines:?}"
     );
 }
 
 #[test]
 fn event_segment_signal_wait_in_stream() {
     use crate::model::FENCE_DOMAIN_EVENT;
-    use crate::runtime::decode::event::SIGNAL_WAIT_PAYLOAD_LEN;
-    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_EVENT};
+    use reims_vgpu_protocol::sync::{OPCODE_SIGNAL_EVENT, OPCODE_WAIT_EVENT};
+    // The record's own body, from the crate that owns its layout.
+    let signal_wait_payload_len = core::mem::size_of::<reims_vgpu_wire::ops::event::SignalWait>();
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
 
     fn push_segment(buf: &mut Vec<u8>, type_: u8, payload: &[u8]) {
         let len = (SEGMENT_HEADER_LEN + payload.len()) as u32;
@@ -409,30 +440,30 @@ fn event_segment_signal_wait_in_stream() {
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(payload);
     }
-    fn push_event_record(buf: &mut Vec<u8>, opcode: u32, event_ref: u32, value: u64) {
-        let mut payload = [0u8; SIGNAL_WAIT_PAYLOAD_LEN];
+    let push_event_record = |buf: &mut Vec<u8>, opcode: u32, event_ref: u32, value: u64| {
+        let mut payload = vec![0u8; signal_wait_payload_len];
         st32(&mut payload[0..4], event_ref);
         st64(&mut payload[4..12], value);
-        let len = (OP_HEADER_LEN + SIGNAL_WAIT_PAYLOAD_LEN) as u32;
+        let len = (OP_HEADER_LEN + signal_wait_payload_len) as u32;
         let mut hdr = [0u8; 8];
         st32(&mut hdr[0..4], opcode);
         st32(&mut hdr[4..8], len);
         buf.extend_from_slice(&hdr);
         buf.extend_from_slice(&payload);
-    }
+    };
 
     let mut records = Vec::new();
-    push_event_record(&mut records, event_decode::OP_SIGNAL_EVENT, 11, 7);
-    push_event_record(&mut records, event_decode::OP_WAIT_EVENT, 11, 7);
-    push_event_record(&mut records, event_decode::OP_WAIT_EVENT, 11, 8); // pending
+    push_event_record(&mut records, OPCODE_SIGNAL_EVENT, 11, 7);
+    push_event_record(&mut records, OPCODE_WAIT_EVENT, 11, 7);
+    push_event_record(&mut records, OPCODE_WAIT_EVENT, 11, 8); // pending
     let mut stream = Vec::new();
-    push_segment(&mut stream, SEGMENT_TYPE_EVENT, &records);
+    push_segment(&mut stream, SegmentKind::Event.wire_type(), &records);
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None);
 
     // The signal landed, and the pending wait for 8 left it alone. The
     // three per-op counters this used to assert had no product reader; the
@@ -440,9 +471,69 @@ fn event_segment_signal_wait_in_stream() {
     assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 11), Some(7));
 }
 
+/// The bounded event wait is refused, says so, and moves no generation.
+///
+/// `waitForEvent:value:timeoutMS:` is a settled row: this device runs no clock
+/// against the guest's, so executing it as the unbounded wait it resembles
+/// turns a guest's timeout into a hang. The refusal used to live in the
+/// planner, one arm past a decoder that had lifted the record — so a reader
+/// found it as a gap in the planner rather than as a decision about the wire,
+/// and the settled row was refused in two places.
+///
+/// It is refused at the lift now, and this is the check that the refusal still
+/// *reaches* the guest-visible failure channel from the segment walk. The row's
+/// own name is what the line carries, so a reader lands on the ledger.
+#[test]
+fn a_bounded_event_wait_is_refused_by_contract_and_leaves_the_generation_alone() {
+    use crate::model::FENCE_DOMAIN_EVENT;
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    use reims_vgpu_protocol::sync::{OPCODE_SIGNAL_EVENT, OPCODE_WAIT_EVENT_TIMEOUT};
+
+    // The bounded wait's own body: the signal/wait pair plus its timeout word.
+    let body = core::mem::size_of::<reims_vgpu_wire::ops::event::SignalWait>() + 4;
+    let mut records = Vec::new();
+    for (opcode, value) in [(OPCODE_SIGNAL_EVENT, 5u64), (OPCODE_WAIT_EVENT_TIMEOUT, 9)] {
+        let mut payload = vec![0u8; body];
+        st32(&mut payload[0..4], 3);
+        st64(&mut payload[4..12], value);
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], opcode);
+        st32(&mut hdr[4..8], (OP_HEADER_LEN + body) as u32);
+        records.extend_from_slice(&hdr);
+        records.extend_from_slice(&payload);
+    }
+    let mut stream = Vec::new();
+    let len = (SEGMENT_HEADER_LEN + records.len()) as u32;
+    let mut hdr = [0u8; 8];
+    st32(&mut hdr[0..4], len);
+    hdr[4] = SegmentKind::Event.wire_type();
+    stream.extend_from_slice(&hdr);
+    stream.extend_from_slice(&records);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let cap = crate::observe::FailCapture::start();
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None);
+    let lines = cap.lines();
+
+    assert!(
+        lines.iter().any(|l| l.starts_with("event_record ")
+            && l.contains("reason=decode_opcode_refused_by_contract")
+            && l.contains("opcode=0x192")),
+        "a bounded wait must be refused by name, not dropped: {lines:?}"
+    );
+    // The signal ahead of it still landed — the refusal is the one record's and
+    // not the segment's — and the wait moved nothing.
+    assert_eq!(state.fence_generation(1, FENCE_DOMAIN_EVENT, 3), Some(5));
+}
+
 #[test]
 fn multi_attachment_decode_in_pass() {
-    let mut payload = vec![0u8; PASS_COLOR_ATTACH_OFF + PASS_COLOR_ATTACH_STRIDE * 2];
+    // The record's own length: a descriptor short of `RenderPassBody` is
+    // refused now rather than read at the offsets that fit.
+    let mut payload = vec![0u8; wire_pass::RENDER_PASS_TOTAL_LEN as usize - OP_HEADER_LEN];
     for (i, tex) in [(0u32, 41u32), (1u32, 42u32)] {
         let slot = PASS_COLOR_ATTACH_OFF + i as usize * PASS_COLOR_ATTACH_STRIDE;
         st32(&mut payload[slot + PASS_ATTACH_TEXREF..], tex);
@@ -471,17 +562,26 @@ fn multi_attachment_decode_in_pass() {
             1.0f64.to_bits(),
         );
     }
-    let a0 = decode_color_attachment(&payload, 0);
-    let a1 = decode_color_attachment(&payload, 1);
+    let a0 = render_pass::decode_color_attachment(&payload, 0);
+    let a1 = render_pass::decode_color_attachment(&payload, 1);
     assert_eq!(a0.texture_ref, 41);
     assert_eq!(a1.texture_ref, 42);
     let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
     st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
     st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
     cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
-    let c = render::decode(&cmd).unwrap();
-    assert_eq!(c.kind, RenderKind::RenderPass);
-    assert_eq!(c.color0.texture_ref, 41);
+    // The record's own lift, which is what production reads. Slot 0's ref
+    // arrives through `RenderPassBody::color[0]` rather than through a
+    // separately decoded `color0` field — the two used to be lifted apart and
+    // could disagree.
+    let framed = reims_vgpu_protocol::decode::op(&cmd, 0).expect("the record frames");
+    let reims_vgpu_protocol::decode::render::RenderRecord::WriteDescriptor(d) =
+        reims_vgpu_protocol::decode::render::decode(&framed).expect("the descriptor lifts")
+    else {
+        panic!("0x1a lifted as something other than a pass descriptor");
+    };
+    assert_eq!(d.descriptor.color[0].prefix.texture_ref.get(), 41);
+    assert_eq!(d.descriptor.color[1].prefix.texture_ref.get(), 42);
 }
 
 /// An indexed draw whose record named no index buffer says so.
@@ -565,12 +665,16 @@ fn an_indexed_draw_with_no_index_buffer_is_named() {
 /// behaviour) and the refusal is now named.
 #[test]
 fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
-    use crate::runtime::decode::render::{
+    use crate::runtime::render_pass::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
         PASS_ATTACH_TEXREF, PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF,
     };
     let pass = |level: u16, resolve: u32| {
-        let mut payload = vec![0u8; 0x200];
+        // The record's own length. A pass descriptor shorter than
+        // `RenderPassBody` is refused now rather than read at whichever offsets
+        // fit, so a fixture that was 0x200 bytes was testing a record Apple's
+        // serializer does not emit.
+        let mut payload = vec![0u8; wire_pass::RENDER_PASS_TOTAL_LEN as usize - OP_HEADER_LEN];
         st32(
             &mut payload[PASS_DEPTH_ATTACH_OFF + PASS_ATTACH_TEXREF..],
             77,
@@ -720,7 +824,7 @@ fn an_unsupported_depth_attachment_is_named_not_just_dropped() {
 #[test]
 fn a_pass_declaring_more_array_layers_than_this_device_draws_refuses_the_draws() {
     use crate::protocol::endian::st32;
-    use crate::runtime::decode::render::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
+    use crate::runtime::render_pass::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
 
     // A full-length record, not the `PASS_MIN_PAYLOAD` one the arms below use:
     // the array length is read only from the whole `RenderPassBody`, and a
@@ -1002,13 +1106,14 @@ fn a_pass_declaring_a_raster_sample_count_this_device_cannot_rasterize_refuses_t
 #[test]
 fn a_colour_attachment_naming_a_subresource_this_device_cannot_bind_refuses_the_draws() {
     use crate::protocol::endian::st32;
-    use crate::runtime::decode::render::{
+    use crate::runtime::render_pass::{
         PASS_ATTACH_DEPTH_PLANE, PASS_ATTACH_LEVEL, PASS_ATTACH_RESOLVEREF, PASS_ATTACH_SLICE,
-        PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF, PASS_MIN_PAYLOAD,
+        PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF,
     };
 
     let pass_resolving = |level: u16, slice: u16, plane: u16, resolve: u32| {
-        let total = OP_HEADER_LEN + PASS_MIN_PAYLOAD;
+        // Full length: see `an_unsupported_depth_attachment_is_named_not_just_dropped`.
+        let total = wire_pass::RENDER_PASS_TOTAL_LEN as usize;
         let mut cmd = vec![0u8; total];
         st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
         st32(&mut cmd[4..], total as u32);
@@ -1199,17 +1304,15 @@ fn the_pass_extent_census_scores_either_resolve_arm() {
     use crate::runtime::drain::store_route_count;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-    let cmd = crate::runtime::decode::render::Command {
-        pass_render_target_width: 960,
-        pass_render_target_height: 540,
-        ..Default::default()
-    };
+    // The pass's stated extent, which is the only thing the census reads off
+    // the record — the two numbers rather than a whole decoded command.
+    let extent = (960u64, 540u64);
     // One mapping, reached by the id either arm would hand over.
     assert!(state.map_surface(7));
     let _ = state.set_mapping_geom(7, 1920, 1080, 0);
 
     let before = store_route_count("pass_extent_le25");
-    note_pass_extent_for_slot(&state, 1, 0, 7, &cmd);
+    note_pass_extent_for_slot(&state, 1, 0, 7, extent);
     assert_eq!(
         store_route_count("pass_extent_le25"),
         before + 1,
@@ -1221,8 +1324,8 @@ fn the_pass_extent_census_scores_either_resolve_arm() {
     // the census is defined on slot 0, the second because there is no
     // fraction to take.
     let before: u64 = PASS_EXTENT_SLUGS.iter().map(|s| store_route_count(s)).sum();
-    note_pass_extent_for_slot(&state, 1, 1, 7, &cmd);
-    note_pass_extent_for_slot(&state, 1, 0, 4242, &cmd);
+    note_pass_extent_for_slot(&state, 1, 1, 7, extent);
+    note_pass_extent_for_slot(&state, 1, 0, 4242, extent);
     assert_eq!(
         PASS_EXTENT_SLUGS
             .iter()
@@ -1645,14 +1748,13 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
 
     apply_binds(
-        &[crate::runtime::decode::render::DecodedBufferBind {
-            buffer_ref: 77,
-            offset: 0,
-            attribute_stride: None,
-        }],
+        // A bare entry, declared here: `apply_binds` is generic over the entry
+        // type precisely so it takes whichever wire shape a record carries, and
+        // this test is about the walk rather than about any one of them.
+        &[(77u32, 0u64)],
         0,
         BindTarget {
-            stage: Stage::Vertex,
+            stage: ShaderStage::Vertex,
             class: BindClass::Buffer,
         },
         BindTables {
@@ -1661,12 +1763,11 @@ fn a_bind_after_a_draw_does_not_rewrite_that_draws_snapshot() {
             refused: &mut acc.unrepresentable,
         },
         |b| b.index,
-        |index, b: crate::runtime::decode::render::DecodedBufferBind| {
+        |index, (buffer_ref, offset): &(u32, u64)| {
             Some(BufferBind {
                 index,
-                buffer_ref: b.buffer_ref,
-                offset: b.offset,
-                attribute_stride: b.attribute_stride,
+                buffer_ref: *buffer_ref,
+                offset: *offset,
                 ..Default::default()
             })
         },
@@ -1709,12 +1810,12 @@ fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse(
     };
     put_buffer(&mut host, &state, 5, 0x1000);
 
-    let total = OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
+    let total = OP_HEADER_LEN + render_pass::BIND_ENTRIES + render_pass::BUFFER_BIND_ENTRY_SIZE;
     let mut bind = vec![0u8; total];
     st32(&mut bind, wire_render::OPCODE_SET_VERTEX_BUFFER);
     st32(&mut bind[4..], total as u32);
-    st32(&mut bind[OP_HEADER_LEN + render::BIND_COUNT..], 1);
-    st32(&mut bind[OP_HEADER_LEN + render::BIND_ENTRIES..], 7);
+    st32(&mut bind[OP_HEADER_LEN + render_pass::BIND_COUNT..], 1);
+    st32(&mut bind[OP_HEADER_LEN + render_pass::BIND_ENTRIES..], 7);
     let mut out = ExecResult::default();
     let mut acc = StreamAccum {
         pipeline_ref: 61,
@@ -1734,12 +1835,12 @@ fn a_recorded_buffer_bind_retains_its_object_across_offset_change_and_ref_reuse(
         .clone()
         .expect("setter retain");
 
-    let offset_total = OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
+    let offset_total = OP_HEADER_LEN + render_pass::BUFFER_OFFSET_PAYLOAD_LEN;
     let mut offset = vec![0u8; offset_total];
     st32(&mut offset, wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET);
     st32(&mut offset[4..], offset_total as u32);
     st64(
-        &mut offset[OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+        &mut offset[OP_HEADER_LEN + render_pass::BUFFER_OFFSET_VALUE..],
         0x80,
     );
     handle_render_record(
@@ -1784,17 +1885,24 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
+    // Published through the namespace, because that is the only issuer of the
+    // name the memo is keyed by.
+    state.define_task(1, 0x1000, 1);
+    let name = state
+        .declare_object(1, 9, reims_vgpu_core::lifecycle::Storage::NoBytes)
+        .expect("task 1 is defined")
+        .id;
     let first = state.task_resources.register(
         1,
-        9,
+        name,
         Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
     );
-    let total = OP_HEADER_LEN + render::BIND_ENTRIES + 4;
+    let total = OP_HEADER_LEN + render_pass::BIND_ENTRIES + 4;
     let mut command = vec![0u8; total];
     st32(&mut command, wire_render::OPCODE_SET_FRAGMENT_TEXTURE);
     st32(&mut command[4..], total as u32);
-    st32(&mut command[OP_HEADER_LEN + render::BIND_COUNT..], 1);
-    st32(&mut command[OP_HEADER_LEN + render::BIND_ENTRIES..], 9);
+    st32(&mut command[OP_HEADER_LEN + render_pass::BIND_COUNT..], 1);
+    st32(&mut command[OP_HEADER_LEN + render_pass::BIND_ENTRIES..], 9);
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
     handle_render_record(
@@ -1811,10 +1919,17 @@ fn a_texture_slot_replaces_object_identity_only_on_a_later_setter() {
         &first
     ));
 
-    assert!(state.task_resources.delete(1, 9));
+    assert!(state.task_resources.delete(1, name));
+    // A second declaration into the same slot, which is a new name: the
+    // generation is what tells the replacement from what it replaced.
+    let replacement_name = state
+        .declare_object(1, 9, reims_vgpu_core::lifecycle::Storage::NoBytes)
+        .expect("task 1 is defined")
+        .id;
+    assert_ne!(replacement_name, name);
     let replacement = state.task_resources.register(
         1,
-        9,
+        replacement_name,
         Arc::new(TaskResource::new(ListObjectEntry::default(), Arc::from([]))),
     );
     assert!(Arc::ptr_eq(
@@ -1851,12 +1966,27 @@ fn accepted_render_without_executor_is_fail_visible() {
     };
     let task_id = 0xfeed;
     let mut command = vec![0u8; OP_HEADER_LEN];
-    // An opcode inside the encoder's range that no arm claims, found rather than named. It used to
-    // be `wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE`, which stopped working the moment
-    // that bound was corrected to `0xa6` -- because `0xa6` is a record this rail now decodes.
-    // `0x99` was the replacement and lasted one commit, until `setVertexAmplificationMode:value:`
-    // turned out to be that number. The catch-all is what is under test, not any literal.
-    let op = render::unclaimed_accepted_opcode();
+    // An opcode no decoder on this rail claims, found rather than named. It has
+    // been three different literals over this test's life — each stopped working
+    // the moment that number turned out to be a record — so it is searched for
+    // against the two predicates that decide the routing: no `RenderKind` names
+    // it and `render_spi` does not own it.
+    //
+    // What is under test is the `ErrUnknownOpcode` arm, which is the successor
+    // to the decoder's `OtherAccepted` catch-all and keeps its line and its wire
+    // capture. The old `unclaimed_accepted_opcode` searched inside an "accepted
+    // window" that no longer exists.
+    let op = (0x00..0x400u32)
+        .find(|op| {
+            reims_vgpu_protocol::render::RenderKind::of_opcode(*op).is_none()
+                && !crate::runtime::decode::render_spi::is_unsettled(*op)
+                && reims_vgpu_protocol::closure::find(
+                    reims_vgpu_protocol::closure::Rail::Render,
+                    *op,
+                )
+                .is_none()
+        })
+        .expect("some opcode in the render space is claimed by no decoder");
     st32(&mut command[0..], op);
     st32(&mut command[4..], OP_HEADER_LEN as u32);
     handle_render_record(&mut state, &host, task_id, op, &command, &mut out, &mut acc);
@@ -2057,8 +2187,8 @@ fn clear_only_backing_surface_writes_guest_pages() {
     use crate::protocol::endian::{st32, st64};
     use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
     use crate::protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
+    use crate::runtime::render_pass::ColorAttachment;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2137,7 +2267,7 @@ fn clear_only_backing_surface_writes_guest_pages() {
 /// keep CLEAR as private Metal seed (no pre-draw guest clear).
 #[test]
 fn finish_stream_clear_only_branch_without_draws() {
-    use crate::runtime::decode::render::ColorAttachment;
+    use crate::runtime::render_pass::ColorAttachment;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
@@ -2338,8 +2468,8 @@ fn clear_only_rg16uint_publishes_native_linear_gva_rows() {
 
 #[test]
 fn finish_stream_with_draws_skips_guest_clear_prelude() {
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
+    use crate::runtime::render_pass::ColorAttachment;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
@@ -2407,9 +2537,9 @@ fn finish_stream_with_draws_skips_guest_clear_prelude() {
 fn nometal_draw_falls_back_to_backing_clear() {
     use crate::protocol::endian::{st32, st64};
     use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
-    use crate::runtime::decode::render::ColorAttachment;
     use crate::runtime::draw::BufferBind;
     use crate::runtime::objects::{self, OBJECT_TYPE_BACKING};
+    use crate::runtime::render_pass::ColorAttachment;
 
     let mut host = FakeHost::new();
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2786,8 +2916,8 @@ fn a_store_action_override_reaches_the_slot_it_names() {
 /// the wrong one cannot pass.
 #[test]
 fn a_depth_or_stencil_store_action_override_reaches_its_own_attachment() {
-    use crate::runtime::decode::render::StencilAttachment;
     use crate::runtime::drain::store_route_count;
+    use crate::runtime::render_pass::StencilAttachment;
     use reims_vgpu_protocol::pass_action::MTL_STORE_ACTION_DONT_CARE;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -2918,8 +3048,8 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
     ];
     let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
     let total = reims_vgpu_wire::OP_HEADER_LEN
-        + render::SCISSOR_RECTS_COUNT_LEN
-        + rects.len() * render::SCISSOR_PAYLOAD_LEN;
+        + render_pass::SCISSOR_RECTS_COUNT_LEN
+        + rects.len() * render_pass::SCISSOR_PAYLOAD_LEN;
     let mut command = vec![0u8; total];
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
@@ -2927,9 +3057,9 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
         &mut command[reims_vgpu_wire::OP_HEADER_LEN..],
         rects.len() as u64,
     );
-    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
+    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render_pass::SCISSOR_RECTS_COUNT_LEN;
     for (n, r) in rects.iter().enumerate() {
-        let at = e0 + n * render::SCISSOR_PAYLOAD_LEN;
+        let at = e0 + n * render_pass::SCISSOR_PAYLOAD_LEN;
         for (i, val) in [r.x, r.y, r.width, r.height].into_iter().enumerate() {
             st64(&mut command[at + i * 8..], u64::from(val));
         }
@@ -2944,7 +3074,7 @@ fn a_plural_scissor_record_reaches_the_accumulator_whole() {
 
     // The singular opcode is the same record at length one, and replaces the
     // array rather than appending to it.
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_PAYLOAD_LEN;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::SCISSOR_PAYLOAD_LEN;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_SCISSOR;
     st32(&mut command[0..], op);
@@ -2994,17 +3124,17 @@ fn an_empty_rect_in_a_plural_scissor_record_keeps_the_previous_state() {
     // Two rects, the second of them zero-width.
     let op = wire_render::OPCODE_SET_SCISSOR_RECTS;
     let total = reims_vgpu_wire::OP_HEADER_LEN
-        + render::SCISSOR_RECTS_COUNT_LEN
-        + 2 * render::SCISSOR_PAYLOAD_LEN;
+        + render_pass::SCISSOR_RECTS_COUNT_LEN
+        + 2 * render_pass::SCISSOR_PAYLOAD_LEN;
     let mut command = vec![0u8; total];
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st64(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 2);
-    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render::SCISSOR_RECTS_COUNT_LEN;
+    let e0 = reims_vgpu_wire::OP_HEADER_LEN + render_pass::SCISSOR_RECTS_COUNT_LEN;
     for (i, val) in [11u64, 22, 33, 44].into_iter().enumerate() {
         st64(&mut command[e0 + i * 8..], val);
     }
-    let e1 = e0 + render::SCISSOR_PAYLOAD_LEN;
+    let e1 = e0 + render_pass::SCISSOR_PAYLOAD_LEN;
     for (i, val) in [55u64, 66, 0, 88].into_iter().enumerate() {
         st64(&mut command[e1 + i * 8..], val);
     }
@@ -3042,29 +3172,36 @@ fn a_bind_past_the_last_table_slot_reports_what_it_dropped() {
 
     // Past Apple's own table, which is the only way to reach this bound now.
     const COUNT: u32 = MAX_TEXTURE_BIND_SLOTS + 9;
-    let entry = render::REF_BIND_ENTRY_SIZE;
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
+    let entry = render_pass::REF_BIND_ENTRY_SIZE;
+    let total =
+        reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + (COUNT as usize) * entry;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         0,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         COUNT,
     );
     for i in 0..COUNT as usize {
-        let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
+        let at = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + i * entry;
         st32(&mut command[at..], 0x4000 + i as u32);
     }
 
-    // The record itself must survive decode; a cap that refused it whole is
+    // The record itself must survive the lift; a cap that refused it whole is
     // what this counter exists to distinguish from.
-    let c = render::decode(&command).expect("an over-table texture run must decode");
-    assert_eq!(c.ref_binds.len(), COUNT as usize);
+    let framed = reims_vgpu_protocol::decode::op(&command, 0).expect("the record frames");
+    let reims_vgpu_protocol::decode::render::RenderRecord::BindTextures(bind) =
+        reims_vgpu_protocol::decode::render::decode(&framed)
+            .expect("an over-table texture run must lift")
+    else {
+        panic!("a texture bind lifted as another record");
+    };
+    assert_eq!(bind.entries.len(), COUNT as usize);
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let host = FakeHost::new();
@@ -3117,7 +3254,7 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
         "render_bind_overflow",
         &BindSlotPastTable {
             class: BindClass::Texture,
-            stage: render::Stage::Vertex,
+            stage: ShaderStage::Vertex,
             index: MAX_TEXTURE_BIND_SLOTS,
             slots: 9,
         },
@@ -3135,7 +3272,7 @@ fn a_bind_past_the_table_renders_a_fail_line_naming_the_table() {
         "render_bind_overflow",
         &BindSlotPastTable {
             class: BindClass::Buffer,
-            stage: render::Stage::Fragment,
+            stage: ShaderStage::Fragment,
             index: MAX_BUFFER_BIND_SLOTS,
             slots: 1,
         },
@@ -3168,22 +3305,22 @@ fn a_sampler_above_apples_table_but_inside_ours_still_binds() {
     const FIRST: u32 = 20;
     const { assert!(FIRST >= bind_limit::SAMPLER && FIRST < MAX_SAMPLER_BIND_SLOTS) };
 
-    let entry = render::REF_BIND_ENTRY_SIZE;
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + entry;
+    let entry = render_pass::REF_BIND_ENTRY_SIZE;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + entry;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_VERTEX_SAMPLER;
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         FIRST,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         1,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES..],
         0x3333,
     );
 
@@ -3234,22 +3371,23 @@ fn a_texture_bind_past_the_old_band_binds_and_keeps_its_own_descriptor() {
     const COUNT: u32 = 4;
     const { assert!(FIRST >= 32 && FIRST + COUNT <= bind_limit::TEXTURE) };
 
-    let entry = render::REF_BIND_ENTRY_SIZE;
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (COUNT as usize) * entry;
+    let entry = render_pass::REF_BIND_ENTRY_SIZE;
+    let total =
+        reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + (COUNT as usize) * entry;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         FIRST,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         COUNT,
     );
     for i in 0..COUNT as usize {
-        let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
+        let at = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + i * entry;
         st32(&mut command[at..], 0x9000 + i as u32);
     }
 
@@ -3300,21 +3438,22 @@ fn the_last_texture_slot_binds_where_the_same_buffer_slot_does_not() {
     const { assert!(LAST_TEXTURE >= MAX_BUFFER_BIND_SLOTS) };
 
     let one_bind = |op: u32, first: u32, obj: u32| {
-        let total =
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE;
+        let total = reims_vgpu_wire::OP_HEADER_LEN
+            + render_pass::BIND_ENTRIES
+            + render_pass::REF_BIND_ENTRY_SIZE;
         let mut command = vec![0u8; total];
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
             first,
         );
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
             1,
         );
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES..],
             obj,
         );
         command
@@ -3384,23 +3523,23 @@ fn every_bind_record_lands_in_one_reach_band_and_the_top_one_reconciles() {
     use reims_vgpu_wire::ops::bind_limit;
 
     let texture_record = |first: u32, count: u32| {
-        let entry = render::REF_BIND_ENTRY_SIZE;
+        let entry = render_pass::REF_BIND_ENTRY_SIZE;
         let total =
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + (count as usize) * entry;
+            reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + (count as usize) * entry;
         let mut command = vec![0u8; total];
         let op = wire_render::OPCODE_SET_VERTEX_TEXTURE;
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
             first,
         );
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
             count,
         );
         for i in 0..count as usize {
-            let at = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + i * entry;
+            let at = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + i * entry;
             st32(&mut command[at..], 0x4000 + i as u32);
         }
         (op, command)
@@ -3576,15 +3715,15 @@ fn a_sampler_bind_carries_its_own_lod_clamps_per_slot() {
     let head = OP_HEADER_LEN;
 
     // Head (first, count) then two 12-byte entries: ref, lodMin, lodMax.
-    let entry = render::SAMPLER_LOD_BIND_ENTRY_SIZE;
-    let total = head + render::BIND_ENTRIES + 2 * entry;
+    let entry = render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE;
+    let total = head + render_pass::BIND_ENTRIES + 2 * entry;
     let op = wire_render::OPCODE_SET_FRAGMENT_SAMPLER_LOD;
     let mut command = vec![0u8; total];
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
-    st32(&mut command[head + render::BIND_FIRST..], 2);
-    st32(&mut command[head + render::BIND_COUNT..], 2);
-    let e0 = head + render::BIND_ENTRIES;
+    st32(&mut command[head + render_pass::BIND_FIRST..], 2);
+    st32(&mut command[head + render_pass::BIND_COUNT..], 2);
+    let e0 = head + render_pass::BIND_ENTRIES;
     st32(&mut command[e0..], 0x51);
     st32(&mut command[e0 + 4..], 0.25f32.to_bits());
     st32(&mut command[e0 + 8..], 0.75f32.to_bits());
@@ -3619,14 +3758,14 @@ fn a_sampler_bind_carries_its_own_lod_clamps_per_slot() {
     // The plain bind carries no clamps, and `None` there is not `(0.0, 0.0)`:
     // it means the sampler object's own range stands.
     let mut acc = StreamAccum::default();
-    let total = head + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE;
+    let total = head + render_pass::BIND_ENTRIES + render_pass::REF_BIND_ENTRY_SIZE;
     let op = wire_render::OPCODE_SET_FRAGMENT_SAMPLER;
     let mut command = vec![0u8; total];
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
-    st32(&mut command[head + render::BIND_FIRST..], 0);
-    st32(&mut command[head + render::BIND_COUNT..], 1);
-    st32(&mut command[head + render::BIND_ENTRIES..], 0x51);
+    st32(&mut command[head + render_pass::BIND_FIRST..], 0);
+    st32(&mut command[head + render_pass::BIND_COUNT..], 1);
+    st32(&mut command[head + render_pass::BIND_ENTRIES..], 0x51);
     handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
     let binds: Vec<_> = acc.fragment_samplers.as_ref().clone();
     assert_eq!(binds.len(), 1);
@@ -3934,17 +4073,17 @@ fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
     // index:u32 @0, offset:u64 @4 — a different payload shape from the plural
     // binds, which is why it takes its own offsets rather than `BIND_*`.
     let offset_record = |index: u32| {
-        let total = reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_PAYLOAD_LEN;
+        let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BUFFER_OFFSET_PAYLOAD_LEN;
         let mut command = vec![0u8; total];
         let op = wire_render::OPCODE_SET_VERTEX_BUFFER_OFFSET;
         st32(&mut command[0..], op);
         st32(&mut command[4..], total as u32);
         st32(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_INDEX..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BUFFER_OFFSET_INDEX..],
             index,
         );
         st64(
-            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BUFFER_OFFSET_VALUE..],
+            &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BUFFER_OFFSET_VALUE..],
             0x5555,
         );
         (op, command)
@@ -3974,70 +4113,6 @@ fn a_buffer_offset_that_lands_on_nothing_reports_which_way_it_missed() {
         1,
         "a slot past the table is not also an unbound slot inside it"
     );
-}
-
-/// The records this rail answers by doing nothing still say they arrived.
-///
-/// `UseResource`, `UseHeap` and `Barrier` all reached the dispatch's
-/// catch-all, so a guest's residency declaration and its barriers were
-/// indistinguishable from a record that had been executed — the arm they
-/// fell into was shared with `Kind::Unknown` and with every guarded arm's
-/// else-case. Doing nothing is still the answer; being silent about it is
-/// not, and a counter nobody reads back cannot show it is wired up.
-#[test]
-fn a_residency_or_barrier_record_is_counted_rather_than_dropped_in_silence() {
-    use crate::runtime::drain::store_route_count;
-
-    for (op, route, payload_len) in [
-        // A zero-filled `useResource` declares residency with no access at
-        // all, which is its own class: it is not the read case, and reporting
-        // it as one would let the reading that confirms the no-op absorb a
-        // shape the argument does not describe.
-        (
-            wire_render::OPCODE_USE_RESOURCE,
-            "render_residency_empty",
-            render::USE_RESOURCE_REFS + 4,
-        ),
-        // `useHeap:` carries no usage argument, so its zero is a property of
-        // the selector rather than a guest declaration.
-        (
-            wire_render::OPCODE_USE_HEAP,
-            "render_residency_heap",
-            render::USE_HEAP_REFS + 4,
-        ),
-        (
-            wire_render::OPCODE_MEMORY_BARRIER_RESOURCES,
-            "render_noop_barrier",
-            0,
-        ),
-        (
-            wire_render::OPCODE_MEMORY_BARRIER_SCOPE,
-            "render_noop_barrier",
-            0,
-        ),
-    ] {
-        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
-        let host = FakeHost::new();
-        let mut out = ExecResult::default();
-        let mut acc = StreamAccum::default();
-
-        let total = reims_vgpu_wire::OP_HEADER_LEN + payload_len;
-        let mut command = vec![0u8; total];
-        st32(&mut command[0..], op);
-        st32(&mut command[4..], total as u32);
-        if payload_len > 0 {
-            // One resource named, so the count-led extent is satisfied.
-            st32(&mut command[reims_vgpu_wire::OP_HEADER_LEN..], 1);
-        }
-
-        let before = store_route_count(route);
-        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
-        assert_eq!(
-            store_route_count(route),
-            before + 1,
-            "op {op:#x} did not reach {route}"
-        );
-    }
 }
 
 /// The three ICB blit records are told apart rather than refused as one.
@@ -4275,8 +4350,8 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
     use crate::protocol::endian::st64;
 
     let total = reims_vgpu_wire::OP_HEADER_LEN
-        + render::BIND_ENTRIES
-        + render::BUFFER_STRIDE_BIND_ENTRY_SIZE;
+        + render_pass::BIND_ENTRIES
+        + render_pass::BUFFER_STRIDE_BIND_ENTRY_SIZE;
     let mut command = vec![0u8; total];
     st32(
         &mut command[0..],
@@ -4284,14 +4359,14 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
     );
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         4,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         1,
     );
-    let e = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES;
+    let e = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES;
     st32(&mut command[e..], 5151);
     st64(&mut command[e + 4..], 0x2345);
     st64(&mut command[e + 12..], 0x3456);
@@ -4329,17 +4404,18 @@ fn a_strided_vertex_bind_lands_in_the_table_carrying_its_stride() {
     // The plain bind carries no stride table, and `None` is not `Some(0)`: a
     // zero stride is a legal Metal request that fetches every vertex from one
     // address, so the two cannot share a spelling.
-    let plain_total =
-        reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE;
+    let plain_total = reims_vgpu_wire::OP_HEADER_LEN
+        + render_pass::BIND_ENTRIES
+        + render_pass::BUFFER_BIND_ENTRY_SIZE;
     let mut plain = vec![0u8; plain_total];
     st32(&mut plain[0..], wire_render::OPCODE_SET_VERTEX_BUFFER);
     st32(&mut plain[4..], plain_total as u32);
     st32(
-        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         1,
     );
     st32(
-        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+        &mut plain[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES..],
         5151,
     );
     handle_render_record(
@@ -4417,8 +4493,8 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         (
             wire_render::OPCODE_SET_VERTEX_AMPLIFICATION_COUNT,
             reims_vgpu_wire::OP_HEADER_LEN
-                + render::AMPLIFICATION_COUNT_LEN
-                + 2 * render::AMPLIFICATION_MAPPING_SIZE,
+                + render_pass::AMPLIFICATION_COUNT_LEN
+                + 2 * render_pass::AMPLIFICATION_MAPPING_SIZE,
             // Two views. One is Metal's default and means no amplification,
             // so the default arm below asks for one and must not count.
             |p| st32(p, 2),
@@ -4443,10 +4519,12 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         // arm would have to have accepted the wrong length first.
         (
             wire_tile::OPCODE_SET_TILE_BUFFER,
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::BUFFER_BIND_ENTRY_SIZE,
+            reims_vgpu_wire::OP_HEADER_LEN
+                + render_pass::BIND_ENTRIES
+                + render_pass::BUFFER_BIND_ENTRY_SIZE,
             |p| {
-                st32(&mut p[render::BIND_FIRST..], 3);
-                st32(&mut p[render::BIND_COUNT..], 1);
+                st32(&mut p[render_pass::BIND_FIRST..], 3);
+                st32(&mut p[render_pass::BIND_COUNT..], 1);
             },
             None,
             "render_tile_buffer_bind_dropped",
@@ -4463,20 +4541,24 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         ),
         (
             wire_tile::OPCODE_SET_TILE_TEXTURE,
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+            reims_vgpu_wire::OP_HEADER_LEN
+                + render_pass::BIND_ENTRIES
+                + render_pass::REF_BIND_ENTRY_SIZE,
             |p| {
-                st32(&mut p[render::BIND_FIRST..], 2);
-                st32(&mut p[render::BIND_COUNT..], 1);
+                st32(&mut p[render_pass::BIND_FIRST..], 2);
+                st32(&mut p[render_pass::BIND_COUNT..], 1);
             },
             None,
             "render_tile_texture_bind_dropped",
         ),
         (
             wire_tile::OPCODE_SET_TILE_SAMPLER,
-            reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + render::REF_BIND_ENTRY_SIZE,
+            reims_vgpu_wire::OP_HEADER_LEN
+                + render_pass::BIND_ENTRIES
+                + render_pass::REF_BIND_ENTRY_SIZE,
             |p| {
-                st32(&mut p[render::BIND_FIRST..], 4);
-                st32(&mut p[render::BIND_COUNT..], 1);
+                st32(&mut p[render_pass::BIND_FIRST..], 4);
+                st32(&mut p[render_pass::BIND_COUNT..], 1);
             },
             None,
             "render_tile_sampler_bind_dropped",
@@ -4484,11 +4566,11 @@ fn every_decoded_but_unapplied_render_state_reaches_its_own_counter() {
         (
             wire_tile::OPCODE_SET_TILE_SAMPLER_LOD,
             reims_vgpu_wire::OP_HEADER_LEN
-                + render::BIND_ENTRIES
-                + render::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                + render_pass::BIND_ENTRIES
+                + render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE,
             |p| {
-                st32(&mut p[render::BIND_FIRST..], 5);
-                st32(&mut p[render::BIND_COUNT..], 1);
+                st32(&mut p[render_pass::BIND_FIRST..], 5);
+                st32(&mut p[render_pass::BIND_COUNT..], 1);
             },
             None,
             "render_tile_sampler_bind_dropped",
@@ -4825,7 +4907,7 @@ fn a_line_width_reaches_the_stream_state_and_a_draw() {
 fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
     const N_CB: u32 = 33;
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
+    let host = FakeHost::new();
     state.define_task(3, 0x1_0000, 2);
 
     let mut payload = vec![
@@ -4851,7 +4933,7 @@ fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
     }
 
     let cap = crate::observe::sink::FailCapture::start();
-    let r = process_exec_indirect2(&mut state, &mut host, &payload);
+    let (_submission, r) = read_exec_submission(&state, &host, &payload);
     assert_eq!(r.task_id, 3);
     let visited: Vec<String> = cap
         .lines()
@@ -4871,6 +4953,105 @@ fn every_declared_command_buffer_is_visited_not_just_the_first_sixteen() {
             .any(|l| l.contains(&format!("i={}", N_CB - 1))),
         "the final declared command buffer was never reached: {visited:?}"
     );
+}
+
+/// The command-stream reader returns the buffers it could read and drops the
+/// ones it could not, so its length is the loaded count and not the declared
+/// one.
+///
+/// The two are different numbers and the difference is guest-visible draws:
+/// a descriptor the reader skips is a command buffer whose records never run,
+/// and a caller that took `cmdbuf_count` for the answer would report a full
+/// submission. Every other test of this loop drives it through
+/// `process_exec_indirect2` with nothing readable behind the GVAs, so the
+/// **successful** read is what this adds.
+#[test]
+fn the_command_stream_reader_returns_what_it_read_and_not_what_was_declared() {
+    use crate::model::PAGE_SHIFT_ARM64E;
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+
+    // A one-level page table for task 3: GVA page 0 resolves to data pfn 4.
+    let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+    let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    state.define_task(3, 0x1_0000, 2);
+    let _ = host.write_gpa(data_gpa, &[0xa5u8; 16]);
+
+    // Three descriptors: one readable, one declaring zero bytes, one whose GVA
+    // does not walk. The first is the case no other test reaches.
+    const N_CB: u32 = 3;
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + N_CB as usize * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 3);
+    st32(
+        &mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..],
+        N_CB,
+    );
+    let desc = |i: usize| {
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize + i * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    };
+    st64(
+        &mut payload[desc(0) + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+        0,
+    );
+    st64(
+        &mut payload[desc(0) + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+        16,
+    );
+    // Descriptor 1 keeps length 0.
+    st64(
+        &mut payload[desc(2) + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+        0xdead_0000,
+    );
+    st64(
+        &mut payload[desc(2) + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+        32,
+    );
+
+    let cap = crate::observe::sink::FailCapture::start();
+    let streams = super::load_command_streams(
+        &state,
+        &host,
+        3,
+        &payload,
+        u64::from(CHILD_EXEC_INDIRECT_HEADER_LEN),
+        N_CB,
+    );
+    assert_eq!(
+        streams.len(),
+        1,
+        "three declared, one readable — the result is the loaded count"
+    );
+    assert_eq!(
+        streams[0],
+        vec![0xa5u8; 16],
+        "and it is the guest's bytes, at the length the descriptor declared"
+    );
+    // Each loss says which it was, rather than one merged line: a zero-length
+    // descriptor and a GVA that does not walk are different guest problems.
+    let lines: Vec<String> = cap
+        .lines()
+        .into_iter()
+        .filter(|l| l.split_whitespace().next() == Some("exec_cmdbuf"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("len=0")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("gva_fail")), "{lines:?}");
 }
 
 /// A bind the stream's tables could not hold refuses the draws that read it,
@@ -4927,22 +5108,22 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
     assert!(acc.bind_snapshot().is_ok());
 
     // One buffer bind whose whole run sits past the table.
-    let entry = render::BUFFER_BIND_ENTRY_SIZE;
-    let total = reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES + entry;
+    let entry = render_pass::BUFFER_BIND_ENTRY_SIZE;
+    let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES + entry;
     let mut command = vec![0u8; total];
     let op = wire_render::OPCODE_SET_VERTEX_BUFFER;
     st32(&mut command[0..], op);
     st32(&mut command[4..], total as u32);
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_FIRST..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_FIRST..],
         FIRST,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_COUNT..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_COUNT..],
         1,
     );
     st32(
-        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render::BIND_ENTRIES..],
+        &mut command[reims_vgpu_wire::OP_HEADER_LEN + render_pass::BIND_ENTRIES..],
         0x4444,
     );
     {
@@ -4997,8 +5178,8 @@ fn a_bind_past_the_table_refuses_the_draws_that_would_read_it() {
 /// be wrong. So this drives the case the reasoning does not cover.
 #[test]
 fn a_buffer_offset_past_the_table_refuses_the_stream() {
-    use crate::runtime::decode::render::{BUFFER_OFFSET_INDEX, BUFFER_OFFSET_PAYLOAD_LEN};
     use crate::runtime::drain::store_route_count;
+    use crate::runtime::render_pass::{BUFFER_OFFSET_INDEX, BUFFER_OFFSET_PAYLOAD_LEN};
 
     const FIRST: u32 = MAX_BUFFER_BIND_SLOTS + 1;
 
@@ -5043,7 +5224,7 @@ fn a_buffer_offset_past_the_table_refuses_the_stream() {
     let line = crate::observe::Emit::decline(
         "render_buffer_offset",
         &BufferOffsetSlotPastTable {
-            stage: render::Stage::Vertex,
+            stage: ShaderStage::Vertex,
             index: FIRST,
         },
     )
@@ -5270,7 +5451,7 @@ fn a_visibility_count_lands_at_the_guest_offset_the_pass_named() {
 #[test]
 fn a_render_encoder_fence_reaches_the_render_fence_domain() {
     use crate::model::{FENCE_DOMAIN_BLIT, FENCE_DOMAIN_RENDER};
-    use crate::runtime::decode::stream::{SEGMENT_HEADER_LEN, SEGMENT_TYPE_RENDER};
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
     use reims_vgpu_wire::ops::render as wire_render;
 
     const FENCE_REF: u32 = 6464;
@@ -5295,14 +5476,14 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
     let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
     let stream_len = stream.len() + records.len();
     st32(&mut stream[0..4], stream_len as u32);
-    stream[4] = SEGMENT_TYPE_RENDER;
+    stream[4] = SegmentKind::Render.wire_type();
     stream.extend_from_slice(&records);
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None);
 
     // Two updates: the first seeds the generation, the second advances it. A
     // dropped fence leaves `None` here, which is what this used to read.
@@ -5339,7 +5520,7 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
 /// without restoring the seed leaves the original bug.
 #[test]
 fn a_clear_seeds_the_pass_for_any_store_action_and_publishes_only_for_store() {
-    use crate::runtime::decode::render::{
+    use crate::runtime::render_pass::{
         PASS_ATTACH_LOAD_ACTION, PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF,
         PASS_COLOR_ATTACH_OFF,
     };
@@ -5754,7 +5935,6 @@ fn a_ledger_row_the_rail_cannot_honour_reports_the_disagreement() {
 /// right number of views into the wrong slice.
 #[test]
 fn a_view_mapping_that_offsets_a_view_is_named_apart_from_a_count_above_one() {
-    use crate::runtime::decode::render;
     use crate::runtime::drain::store_route_count;
 
     let record = |count: u32, viewport: u32, render_target: u32| {
@@ -5779,7 +5959,8 @@ fn a_view_mapping_that_offsets_a_view_is_named_apart_from_a_count_above_one() {
         let host = FakeHost::new();
         let mut out = ExecResult::default();
         let mut acc = StreamAccum::default();
-        render::decode(&command).expect("a well-formed amplification count decodes");
+        crate::runtime::decode::render_spi::decode(&command)
+            .expect("a well-formed amplification count decodes");
         handle_render_record(
             &mut state,
             &host,
@@ -5849,9 +6030,8 @@ fn a_view_mapping_that_offsets_a_view_is_named_apart_from_a_count_above_one() {
 /// axis the regression ran along.
 #[test]
 fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one() {
-    use crate::runtime::decode::render;
     use crate::runtime::drain::store_route_count;
-    use reims_vgpu_protocol::residency::ResourceUsage;
+    use crate::runtime::render_pass;
 
     // Each form's refs start at its own offset — the heads are three different
     // sizes — so the record is built from the decoder's own constants rather
@@ -5862,7 +6042,7 @@ fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one(
         st32(&mut v[0..], op);
         st32(&mut v[4..], total as u32);
         st32(
-            &mut v[reims_vgpu_wire::OP_HEADER_LEN + render::RESIDENCY_COUNT..],
+            &mut v[reims_vgpu_wire::OP_HEADER_LEN + render_pass::RESIDENCY_COUNT..],
             1,
         );
         v
@@ -5871,33 +6051,48 @@ fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one(
     let forms = [
         (
             wire_render::OPCODE_USE_RESOURCE,
-            render::USE_RESOURCE_REFS,
+            render_pass::USE_RESOURCE_REFS,
             "render_residency_empty",
         ),
         (
             wire_render::OPCODE_USE_HEAP,
-            render::USE_HEAP_REFS,
+            render_pass::USE_HEAP_REFS,
             "render_residency_heap",
         ),
         (
             wire_render::OPCODE_USE_RESOURCES_NO_STAGES,
-            render::USE_RESOURCES_NO_STAGES_REFS,
+            render_pass::USE_RESOURCES_NO_STAGES_REFS,
             "render_residency_empty",
         ),
         (
             wire_render::OPCODE_USE_HEAPS_NO_STAGES,
-            render::USE_HEAPS_NO_STAGES_REFS,
+            render_pass::USE_HEAPS_NO_STAGES_REFS,
             "render_residency_heap",
         ),
     ];
 
     for (op, refs_at, route) in forms {
         let command = record(op, refs_at);
-        let decoded = render::decode(&command).unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
-        assert_eq!(
-            decoded.residency_usage,
-            ResourceUsage(0),
-            "op {op:#x}: the fixture declares no usage"
+        let framed = reims_vgpu_protocol::decode::op(&command, 0)
+            .unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
+        // `lift`, not `decode`: every residency row is unsettled, so `decode`
+        // refuses it on principle and the layout question is this one.
+        let decoded = reims_vgpu_protocol::decode::residency::lift(
+            reims_vgpu_protocol::closure::Rail::Render,
+            &framed,
+        )
+        .unwrap_or_else(|e| panic!("op {op:#x}: {e:?}"));
+        // The `useResource` forms carry a usage argument and this fixture
+        // writes zero into it; the `useHeap` forms carry none at all. Those are
+        // different records and `Option` is what keeps them apart — which is
+        // the whole point of the field, so the assertion is written to allow
+        // both rather than to pick one.
+        assert!(
+            decoded
+                .usage
+                .is_none_or(|u| u == reims_vgpu_protocol::residency::ResourceUsage(0)),
+            "op {op:#x}: the fixture declares no usage and the lift read {:?}",
+            decoded.usage
         );
 
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -5934,14 +6129,14 @@ fn every_residency_form_reaches_a_residency_route_and_not_the_unimplemented_one(
 /// case additionally reaches the always-on channel with the declaration on it.
 #[test]
 fn a_residency_write_declaration_is_named_rather_than_counted_with_the_reads() {
-    use crate::runtime::decode::render;
     use crate::runtime::drain::store_route_count;
+    use crate::runtime::render_pass;
     use reims_vgpu_protocol::residency::{RenderStages, ResourceUsage};
 
     // `useResource:usage:stages:`: count at +0, usage and stages as two u16
     // sharing the word at +4, refs from +8.
     let record = |usage: u16, stages: u16| {
-        let total = reims_vgpu_wire::OP_HEADER_LEN + render::USE_RESOURCE_REFS + 4;
+        let total = reims_vgpu_wire::OP_HEADER_LEN + render_pass::USE_RESOURCE_REFS + 4;
         let mut v = vec![0u8; total];
         st32(&mut v[0..], wire_render::OPCODE_USE_RESOURCE);
         st32(&mut v[4..], total as u32);
@@ -5953,21 +6148,20 @@ fn a_residency_write_declaration_is_named_rather_than_counted_with_the_reads() {
         v
     };
 
-    let decoded = render::decode(&record(
-        ResourceUsage::WRITE as u16,
-        RenderStages::FRAGMENT as u16,
-    ))
-    .expect("a well-formed useResource decodes");
+    let bytes = record(ResourceUsage::WRITE as u16, RenderStages::FRAGMENT as u16);
+    let framed = reims_vgpu_protocol::decode::op(&bytes, 0).expect("the record frames");
+    let decoded = reims_vgpu_protocol::decode::residency::lift(
+        reims_vgpu_protocol::closure::Rail::Render,
+        &framed,
+    )
+    .expect("a well-formed useResource lifts");
     assert_eq!(
-        decoded.residency_usage,
-        ResourceUsage(ResourceUsage::WRITE),
-        "the usage half must survive decode — it is what decides whether \
+        decoded.usage,
+        Some(ResourceUsage(ResourceUsage::WRITE)),
+        "the usage half must survive the lift — it is what decides whether \
          answering by doing nothing is sound"
     );
-    assert_eq!(
-        decoded.residency_stages,
-        RenderStages(RenderStages::FRAGMENT)
-    );
+    assert_eq!(decoded.stages, Some(RenderStages(RenderStages::FRAGMENT)));
 
     let run = |usage: u16, stages: u16| {
         let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
@@ -6027,5 +6221,1942 @@ fn a_residency_write_declaration_is_named_rather_than_counted_with_the_reads() {
         store_route_count("render_residency_read") - before_read,
         1,
         "and it must not also count as one"
+    );
+}
+
+/// The three compute-rail classes the closure ledger now routes each reach a
+/// counter that names them, and none of them reaches another's.
+///
+/// Before the ledger answered the class, all three were arms of this device's
+/// own `compute::Kind`, decoded in the same pass that read the fields — so a
+/// record's class and its layout were one verdict and a misclassification read
+/// fields at the wrong offsets. The routing is what this asserts, in both
+/// directions: a barrier must not be counted as a residency declaration and a
+/// residency declaration must not be counted as a barrier, because the first is
+/// ordering this device argues it already provides and the second is a hint it
+/// argues it does not need. One bucket for both would make a driven boot's
+/// reading unusable for checking either argument.
+#[test]
+fn each_ledger_routed_compute_class_reaches_a_counter_that_names_which_one_it_is() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::compute as wire_c;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    // `count` refs and nothing else — the shape of both the resource barrier
+    // and the unqualified heap declaration.
+    let counted = |op: u32, refs: &[u32]| {
+        let total = (OP_HEADER_LEN + 4 + refs.len() * 4) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        st32(&mut v[OP_HEADER_LEN..], refs.len() as u32);
+        for (i, r) in refs.iter().enumerate() {
+            st32(&mut v[OP_HEADER_LEN + 4 + i * 4..], *r);
+        }
+        v
+    };
+    // `useResources:count:usage:` puts its usage word between the count and the
+    // refs; the heap form has no such word at all.
+    let use_resources = |usage: u32, refs: &[u32]| {
+        let total = (OP_HEADER_LEN + 8 + refs.len() * 4) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], wire_r::OPCODE_USE_RESOURCES_NO_STAGES);
+        st32(&mut v[4..], total);
+        st32(&mut v[OP_HEADER_LEN..], refs.len() as u32);
+        st32(&mut v[OP_HEADER_LEN + 4..], usage);
+        for (i, r) in refs.iter().enumerate() {
+            st32(&mut v[OP_HEADER_LEN + 8 + i * 4..], *r);
+        }
+        v
+    };
+    let bare = |op: u32, payload_len: usize| {
+        let total = (OP_HEADER_LEN + payload_len) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v
+    };
+
+    let mut scope = bare(
+        wire_c::OPCODE_MEMORY_BARRIER_SCOPE,
+        wire_c::MEMORY_BARRIER_SCOPE_TOTAL_LEN as usize - OP_HEADER_LEN,
+    );
+    st16(&mut scope[OP_HEADER_LEN..], 3);
+
+    const BARRIER: &str = "compute_noop_barrier";
+    const FLUSH: &str = "compute_noop_flush_compressed_reinterpretation";
+    const HEAP: &str = "compute_residency_heap";
+    const READ: &str = "compute_residency_read";
+    const WRITE: &str = "compute_residency_write";
+    const ALL: [&str; 5] = [BARRIER, FLUSH, HEAP, READ, WRITE];
+
+    for (op, command, route) in [
+        (
+            wire_c::OPCODE_MEMORY_BARRIER_RESOURCES,
+            counted(wire_c::OPCODE_MEMORY_BARRIER_RESOURCES, &[5151, 4343]),
+            BARRIER,
+        ),
+        (wire_c::OPCODE_MEMORY_BARRIER_SCOPE, scope, BARRIER),
+        (
+            wire_c::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH,
+            bare(wire_c::OPCODE_INSERT_COMPRESSED_TEXTURE_FLUSH, 0),
+            FLUSH,
+        ),
+        (
+            wire_r::OPCODE_USE_HEAPS_NO_STAGES,
+            counted(wire_r::OPCODE_USE_HEAPS_NO_STAGES, &[77]),
+            HEAP,
+        ),
+        (
+            wire_r::OPCODE_USE_RESOURCES_NO_STAGES,
+            use_resources(
+                reims_vgpu_protocol::residency::ResourceUsage::READ,
+                &[88, 99],
+            ),
+            READ,
+        ),
+        (
+            wire_r::OPCODE_USE_RESOURCES_NO_STAGES,
+            use_resources(reims_vgpu_protocol::residency::ResourceUsage::WRITE, &[88]),
+            WRITE,
+        ),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+        let before: Vec<u64> = ALL.iter().map(|r| store_route_count(r)).collect();
+        handle_compute_record(&mut state, &mut host, 1, op, &command, &mut out, &mut seg);
+        for (name, was) in ALL.iter().zip(before) {
+            let now = store_route_count(name);
+            let want = was + u64::from(*name == route);
+            assert_eq!(
+                now, want,
+                "{op:#x} should have been counted once as {route} and {name} moved from {was} to \
+                 {now}"
+            );
+        }
+        // None of the three owns anything: the accumulator, the session and the
+        // sequencing block are what separates them from the rest of the rail,
+        // and a record that touched one of them would not be separable.
+        assert!(
+            seg.session.is_none()
+                && seg.block.is_none()
+                && seg.acc.pipeline_ref == 0
+                && seg.acc.buffers.is_empty()
+                && seg.acc.textures.is_empty()
+                && seg.acc.samplers.is_empty()
+                && seg.acc.threadgroup_memory.is_empty()
+                && seg.acc.stage_in_region.is_none()
+                && seg.acc.stage_in_region_indirect.is_none()
+                && seg.acc.imageblock.is_none()
+                && seg.acc.dispatch_type == reims_vgpu_protocol::compute::DispatchType::Serial,
+            "{op:#x} moved segment state it does not own"
+        );
+    }
+}
+
+/// A ledger-routed compute record whose body does not frame is declined under
+/// its own name rather than silently doing nothing.
+///
+/// The three no-op classes are still decoded, and this is why: the day one of
+/// their no-op arguments stops holding, the shape is what has to be read, and a
+/// route that counted on the opcode alone would have been recording a decode
+/// that never happened.
+#[test]
+fn a_ledger_routed_compute_record_short_of_its_body_is_declined_and_not_counted() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    // `count` says two refs and the record carries none of them.
+    let total = (OP_HEADER_LEN + 4) as u32;
+    let mut command = vec![0u8; total as usize];
+    st32(&mut command[0..], wire_r::OPCODE_USE_HEAPS_NO_STAGES);
+    st32(&mut command[4..], total);
+    st32(&mut command[OP_HEADER_LEN..], 2);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+    let before = store_route_count("compute_residency_heap");
+    handle_compute_record(
+        &mut state,
+        &mut host,
+        1,
+        wire_r::OPCODE_USE_HEAPS_NO_STAGES,
+        &command,
+        &mut out,
+        &mut seg,
+    );
+    assert_eq!(
+        store_route_count("compute_residency_heap"),
+        before,
+        "a declaration whose refs are not there was priced as one that was"
+    );
+}
+
+/// An `MTLDispatchType` the contract does not declare refuses its record, is
+/// counted, and leaves the pass's type where it was.
+///
+/// This is the one place the compute cutover changed what a guest gets, and it
+/// is the ordinal rule moving to the crate that owns closed ordinals. The
+/// device used to store `writeDescriptor`'s word unbounded and narrow it at the
+/// far end of the rail — `if x == CONCURRENT { CONCURRENT } else { SERIAL }`,
+/// inside `execute_dispatch_metal`, on the one arm that read the field at all —
+/// so an unrecognised ordinal silently became `Serial` and, on the Vulkan arm,
+/// was stored and read by nobody. `reims_vgpu_protocol` refuses it at the lift
+/// instead, which is what makes `ComputeAccum::dispatch_type` a total type.
+///
+/// The census the old substitution raised is kept, because what it was for —
+/// deciding whether an unrecognised ordinal is a guest asking for something new
+/// or this device reading the wrong offset — is still exactly what a firing
+/// would mean.
+///
+/// The three claims are separate on purpose. That the record is refused is not
+/// the same as that the counter moved, and neither says the pass kept the type
+/// a *previous* record set — which is the half the substitution used to get
+/// wrong in the other direction, by overwriting `Concurrent` with `Serial`.
+#[test]
+fn an_undeclared_dispatch_type_refuses_its_record_and_leaves_the_pass_type_alone() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::compute::DispatchType;
+    use reims_vgpu_wire::ops::compute as wire_c;
+
+    let descriptor = |word: u32| {
+        let total = (OP_HEADER_LEN + 4) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], wire_c::OPCODE_WRITE_DESCRIPTOR);
+        st32(&mut v[4..], total);
+        st32(&mut v[OP_HEADER_LEN..], word);
+        v
+    };
+    let run = |seg: &mut crate::runtime::compute_session::ComputeSegment, word: u32| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let mut host = FakeHost::new();
+        let mut out = ExecResult::default();
+        handle_compute_record(
+            &mut state,
+            &mut host,
+            7,
+            wire_c::OPCODE_WRITE_DESCRIPTOR,
+            &descriptor(word),
+            &mut out,
+            seg,
+        );
+    };
+
+    let mut seg = crate::runtime::compute_session::ComputeSegment::default();
+    let before = store_route_count("compute_dispatch_type_unknown");
+
+    // The two the contract declares cross untouched and spend no line.
+    let cap = crate::observe::FailCapture::start();
+    run(&mut seg, 1);
+    assert_eq!(seg.acc.dispatch_type, DispatchType::Concurrent);
+    run(&mut seg, 0);
+    assert_eq!(seg.acc.dispatch_type, DispatchType::Serial);
+    assert!(
+        cap.lines().is_empty(),
+        "a declared dispatch type must spend no line: {:?}",
+        cap.lines()
+    );
+    assert_eq!(
+        store_route_count("compute_dispatch_type_unknown"),
+        before,
+        "a declared dispatch type is not an unknown one"
+    );
+    drop(cap);
+
+    // An ordinal outside the pair: refused by name, counted every time, and the
+    // pass keeps the type the guest last actually stated.
+    run(&mut seg, 1);
+    assert_eq!(seg.acc.dispatch_type, DispatchType::Concurrent);
+    let cap = crate::observe::FailCapture::start();
+    for _ in 0..3 {
+        run(&mut seg, 0x5e01);
+    }
+    assert_eq!(
+        seg.acc.dispatch_type,
+        DispatchType::Concurrent,
+        "a refused descriptor must not quietly reset the pass to Serial"
+    );
+    let line = cap.one("compute_record");
+    assert!(
+        line.contains("undefined_ordinal") || line.contains("dispatch_type"),
+        "the refusal must name the field the ordinal was in: {line}"
+    );
+    assert_eq!(
+        store_route_count("compute_dispatch_type_unknown"),
+        before + 3,
+        "the line is deduped; the count is not"
+    );
+}
+
+/// The three render-rail classes the closure ledger now routes each reach a
+/// counter that names them, and none of them reaches another's.
+///
+/// Before the ledger answered the class, all three were arms of this device's
+/// own `render::Kind`, decoded in the same pass that read the fields. The
+/// routing is what this asserts, in both directions — a barrier must not be
+/// counted as a residency declaration and a residency declaration must not be
+/// counted as a barrier, because the first is ordering this device argues it
+/// already provides and the second is a hint it argues it does not need.
+///
+/// It also pins the claim that makes this group a group: none of the three
+/// touches `StreamAccum`. The indirect-command executions look equally
+/// self-contained and are not — they push onto `acc.execute_icb` — which is why
+/// they stayed behind.
+#[test]
+fn each_ledger_routed_render_class_reaches_a_counter_that_names_which_one_it_is() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let head_then_refs = |op: u32, head: &[u8], refs: &[u32]| {
+        let total = (OP_HEADER_LEN + head.len() + refs.len() * 4) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v[OP_HEADER_LEN..OP_HEADER_LEN + head.len()].copy_from_slice(head);
+        for (i, r) in refs.iter().enumerate() {
+            st32(&mut v[OP_HEADER_LEN + head.len() + i * 4..], *r);
+        }
+        v
+    };
+    // `useResource:usage:stages:` — count, then a 16-bit usage and a 16-bit
+    // stages sharing one word.
+    let use_resource = |usage: u16, stages: u16, refs: &[u32]| {
+        let mut head = vec![0u8; 8];
+        st32(&mut head[0..], refs.len() as u32);
+        st16(&mut head[4..], usage);
+        st16(&mut head[6..], stages);
+        head_then_refs(wire_r::OPCODE_USE_RESOURCE, &head, refs)
+    };
+    // `useHeap:stages:` — no usage at all, so `stages` sits alone at `+4` and
+    // the refs begin at `+6`.
+    let use_heap = |stages: u16, refs: &[u32]| {
+        let mut head = vec![0u8; 6];
+        st32(&mut head[0..], refs.len() as u32);
+        st16(&mut head[4..], stages);
+        head_then_refs(wire_r::OPCODE_USE_HEAP, &head, refs)
+    };
+    let bare = |op: u32, total: u32| {
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v
+    };
+
+    const BARRIER: &str = "render_noop_barrier";
+    const HEAP: &str = "render_residency_heap";
+    const EMPTY: &str = "render_residency_empty";
+    const READ: &str = "render_residency_read";
+    const WRITE: &str = "render_residency_write";
+    const ALL: [&str; 5] = [BARRIER, HEAP, EMPTY, READ, WRITE];
+
+    let mut resources_head = vec![0u8; 8];
+    st32(&mut resources_head[0..], 2);
+    let barrier_resources = head_then_refs(
+        wire_r::OPCODE_MEMORY_BARRIER_RESOURCES,
+        &resources_head,
+        &[5151, 4343],
+    );
+
+    for (op, command, route) in [
+        (
+            wire_r::OPCODE_MEMORY_BARRIER_RESOURCES,
+            barrier_resources,
+            BARRIER,
+        ),
+        (
+            wire_r::OPCODE_MEMORY_BARRIER_SCOPE,
+            bare(
+                wire_r::OPCODE_MEMORY_BARRIER_SCOPE,
+                wire_r::MEMORY_BARRIER_SCOPE_TOTAL_LEN,
+            ),
+            BARRIER,
+        ),
+        (
+            wire_r::OPCODE_TEXTURE_BARRIER,
+            bare(
+                wire_r::OPCODE_TEXTURE_BARRIER,
+                wire_r::TEXTURE_BARRIER_TOTAL_LEN,
+            ),
+            BARRIER,
+        ),
+        (wire_r::OPCODE_USE_HEAP, use_heap(1, &[77]), HEAP),
+        // A `useResource` declaring no access at all is its own class: it is
+        // not the read case, and reporting it as one would let the reading
+        // that confirms the no-op absorb a shape the argument does not
+        // describe.
+        (
+            wire_r::OPCODE_USE_RESOURCE,
+            use_resource(0, 1, &[88]),
+            EMPTY,
+        ),
+        (
+            wire_r::OPCODE_USE_RESOURCE,
+            use_resource(
+                reims_vgpu_protocol::residency::ResourceUsage::READ as u16,
+                1,
+                &[88, 99],
+            ),
+            READ,
+        ),
+        (
+            wire_r::OPCODE_USE_RESOURCE,
+            use_resource(
+                reims_vgpu_protocol::residency::ResourceUsage::WRITE as u16,
+                1,
+                &[88],
+            ),
+            WRITE,
+        ),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let before: Vec<u64> = ALL.iter().map(|r| store_route_count(r)).collect();
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        for (name, was) in ALL.iter().zip(before) {
+            let now = store_route_count(name);
+            let want = was + u64::from(*name == route);
+            assert_eq!(
+                now, want,
+                "{op:#x} should have been counted once as {route} and {name} moved from {was} to \
+                 {now}"
+            );
+        }
+        assert!(
+            acc.pipeline_ref == 0 && acc.execute_icb.is_empty() && acc.viewports.is_empty(),
+            "{op:#x} moved stream state it does not own"
+        );
+    }
+}
+
+/// A render fence's direction comes from the same answer that says it is a
+/// fence, so a fence that is neither an update nor a wait is unrepresentable.
+///
+/// The arm this replaces read the opcode a second time to pick the direction
+/// and carried a third case for neither — a state
+/// `reims_vgpu_protocol::sync::fence_kind` cannot produce, because the same
+/// function decides both that this is a fence and which side of one it is.
+#[test]
+fn a_render_fence_orders_in_the_direction_its_own_opcode_names() {
+    use crate::runtime::plan::event_sync::Domain;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let fence = |op: u32, fence_ref: u32| {
+        let mut v = vec![0u8; wire_r::FENCE_TOTAL_LEN as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], wire_r::FENCE_TOTAL_LEN);
+        st32(&mut v[OP_HEADER_LEN..], fence_ref);
+        v
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+
+    // An update lands on the render domain's generation; the wait that follows
+    // it is satisfied by that update rather than left pending, which is the
+    // only way to tell the two directions apart from outside.
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_r::OPCODE_UPDATE_FENCE,
+        &fence(wire_r::OPCODE_UPDATE_FENCE, 4242),
+        &mut out,
+        &mut acc,
+    );
+    let after_update = fence_exec::execute_fence(
+        &mut state,
+        1,
+        Domain::RenderFence,
+        4242,
+        crate::runtime::plan::event_sync::FenceAction::Wait,
+    );
+    assert!(
+        !matches!(
+            after_update,
+            crate::runtime::fence_exec::FenceStatus::Missing
+        ),
+        "the update must have reached the render domain: {after_update:?}"
+    );
+    assert!(
+        acc.pipeline_ref == 0 && acc.execute_icb.is_empty(),
+        "a fence moves no stream state"
+    );
+}
+
+/// Each ledger-settled render-encoder state record writes the one accumulator
+/// field it names, and nothing else in the accumulator moves.
+///
+/// **This is the group's disjointness claim, made structurally rather than
+/// argued.** W8 and W10 could say "this record touches no stream state at all";
+/// the encoder's own records all land in `StreamAccum`, so that test separates
+/// nothing here. What separates these fifteen is that each is the *sole writer*
+/// of its field — so the fingerprint below is destructured out of the whole
+/// accumulator (a field added to `StreamAccum` fails to compile until it is
+/// named here) and exactly one entry is allowed to differ per record.
+///
+/// It replaces the per-arm assertions that moved with the legacy decoder's
+/// state arms, and is stronger than they were: those checked that the field
+/// they cared about got the right value, and none of them could see whether the
+/// record had also moved a field belonging to a different class.
+#[test]
+fn each_render_state_record_writes_the_one_field_it_names_and_no_other() {
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    /// Every field of `StreamAccum`, as text, in declaration order.
+    ///
+    /// Destructured rather than field-accessed so this cannot fall behind the
+    /// struct: a new field is a compile error here, which is the point.
+    fn fingerprint(acc: &StreamAccum) -> Vec<(&'static str, String)> {
+        let StreamAccum {
+            pipeline_ref,
+            clears,
+            color_slots,
+            color_targets,
+            draws,
+            saw_draw,
+            execute_icb,
+            vertex_buffers,
+            fragment_buffers,
+            vertex_textures,
+            fragment_textures,
+            vertex_samplers,
+            fragment_samplers,
+            viewports,
+            scissors,
+            indexed,
+            blend_color,
+            cull_mode,
+            front_facing,
+            fill_mode,
+            depth_clip_mode,
+            line_width,
+            depth_bias,
+            depth_stencil_ref,
+            stencil_ref,
+            depth_attach,
+            stencil_attach,
+            visibility_buffer_ref,
+            visibility,
+            dropped_no_pipeline,
+            dropped_zero_count,
+            unrepresentable,
+        } = acc;
+        vec![
+            ("pipeline_ref", format!("{pipeline_ref:?}")),
+            ("clears", format!("{clears:?}")),
+            ("color_slots", format!("{color_slots:?}")),
+            ("color_targets", format!("{color_targets:?}")),
+            ("draws", format!("{draws:?}")),
+            ("saw_draw", format!("{saw_draw:?}")),
+            ("execute_icb", format!("{execute_icb:?}")),
+            ("vertex_buffers", format!("{vertex_buffers:?}")),
+            ("fragment_buffers", format!("{fragment_buffers:?}")),
+            ("vertex_textures", format!("{vertex_textures:?}")),
+            ("fragment_textures", format!("{fragment_textures:?}")),
+            ("vertex_samplers", format!("{vertex_samplers:?}")),
+            ("fragment_samplers", format!("{fragment_samplers:?}")),
+            ("viewports", format!("{viewports:?}")),
+            ("scissors", format!("{scissors:?}")),
+            ("indexed", format!("{indexed:?}")),
+            ("blend_color", format!("{blend_color:?}")),
+            ("cull_mode", format!("{cull_mode:?}")),
+            ("front_facing", format!("{front_facing:?}")),
+            ("fill_mode", format!("{fill_mode:?}")),
+            ("depth_clip_mode", format!("{depth_clip_mode:?}")),
+            ("line_width", format!("{line_width:?}")),
+            ("depth_bias", format!("{depth_bias:?}")),
+            ("depth_stencil_ref", format!("{depth_stencil_ref:?}")),
+            ("stencil_ref", format!("{stencil_ref:?}")),
+            ("depth_attach", format!("{depth_attach:?}")),
+            ("stencil_attach", format!("{stencil_attach:?}")),
+            (
+                "visibility_buffer_ref",
+                format!("{visibility_buffer_ref:?}"),
+            ),
+            ("visibility", format!("{visibility:?}")),
+            ("dropped_no_pipeline", format!("{dropped_no_pipeline:?}")),
+            ("dropped_zero_count", format!("{dropped_zero_count:?}")),
+            ("unrepresentable", format!("{unrepresentable:?}")),
+        ]
+    }
+
+    let record = |op: u32, total: u32, body: &[u8]| {
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v[OP_HEADER_LEN..OP_HEADER_LEN + body.len()].copy_from_slice(body);
+        v
+    };
+    let word = |value: u64| value.to_le_bytes().to_vec();
+    let f32s = |vals: &[f32]| -> Vec<u8> {
+        vals.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>()
+    };
+    // The singular viewport is six `f64`; the singular scissor is four `u64`.
+    let viewport_bytes =
+        |v: [f64; 6]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>() };
+    let scissor_bytes =
+        |r: [u64; 4]| -> Vec<u8> { r.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>() };
+
+    let mut vis = Vec::new();
+    vis.extend_from_slice(&0x1234u64.to_le_bytes());
+    vis.extend_from_slice(&2u64.to_le_bytes());
+
+    // Two viewports and two scissors behind their plural heads, to prove the
+    // plural forms reach the same field as the singular ones rather than a
+    // second slot.
+    let mut viewports_body = 2u32.to_le_bytes().to_vec();
+    viewports_body.extend(viewport_bytes([1.0, 2.0, 3.0, 4.0, 0.0, 1.0]));
+    viewports_body.extend(viewport_bytes([5.0, 6.0, 7.0, 8.0, 0.0, 1.0]));
+    let mut scissors_body = 2u64.to_le_bytes().to_vec();
+    scissors_body.extend(scissor_bytes([1, 2, 3, 4]));
+    scissors_body.extend(scissor_bytes([5, 6, 7, 8]));
+
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+        (
+            "setRenderPipelineState:",
+            record(
+                wire_r::OPCODE_SET_RENDER_PIPELINE_STATE,
+                wire_r::SET_STATE_TOTAL_LEN,
+                &7171u32.to_le_bytes(),
+            ),
+            "pipeline_ref",
+        ),
+        (
+            "setDepthStencilState:",
+            record(
+                wire_r::OPCODE_SET_DEPTH_STENCIL_STATE,
+                wire_r::SET_STATE_TOTAL_LEN,
+                &6161u32.to_le_bytes(),
+            ),
+            "depth_stencil_ref",
+        ),
+        (
+            "setStencilFrontReferenceValue:backReferenceValue:",
+            record(
+                wire_r::OPCODE_SET_STENCIL_REFERENCE,
+                wire_r::SET_STENCIL_REFERENCE_TOTAL_LEN,
+                &[11u32.to_le_bytes(), 22u32.to_le_bytes()].concat(),
+            ),
+            "stencil_ref",
+        ),
+        (
+            "setBlendColorRed:green:blue:alpha:",
+            record(
+                wire_r::OPCODE_SET_BLEND_COLOR,
+                wire_r::SET_BLEND_COLOR_TOTAL_LEN,
+                &f32s(&[0.25, 0.5, 0.75, 1.0]),
+            ),
+            "blend_color",
+        ),
+        (
+            "setCullMode:",
+            record(
+                wire_r::OPCODE_SET_CULL_MODE,
+                wire_r::SET_MODE_TOTAL_LEN,
+                &word(2),
+            ),
+            "cull_mode",
+        ),
+        (
+            "setFrontFacingWinding:",
+            record(
+                wire_r::OPCODE_SET_FRONT_FACING,
+                wire_r::SET_MODE_TOTAL_LEN,
+                &word(1),
+            ),
+            "front_facing",
+        ),
+        (
+            "setDepthClipMode:",
+            record(
+                wire_r::OPCODE_SET_DEPTH_CLIP_MODE,
+                wire_r::SET_MODE_TOTAL_LEN,
+                &word(1),
+            ),
+            "depth_clip_mode",
+        ),
+        (
+            "setTriangleFillMode:",
+            record(
+                wire_r::OPCODE_SET_TRIANGLE_FILL_MODE,
+                wire_r::SET_MODE_TOTAL_LEN,
+                &word(1),
+            ),
+            "fill_mode",
+        ),
+        (
+            "setDepthBias:slopeScale:clamp:",
+            record(
+                wire_r::OPCODE_SET_DEPTH_BIAS,
+                wire_r::SET_DEPTH_BIAS_TOTAL_LEN,
+                &f32s(&[0.25, 1.5, 2.25]),
+            ),
+            "depth_bias",
+        ),
+        (
+            "setLineWidth:",
+            record(
+                wire_r::OPCODE_SET_LINE_WIDTH,
+                wire_r::SET_FLOAT_TOTAL_LEN,
+                &f32s(&[3.5]),
+            ),
+            "line_width",
+        ),
+        (
+            "setViewport:",
+            record(
+                wire_r::OPCODE_SET_VIEWPORT,
+                wire_r::SET_VIEWPORT_TOTAL_LEN,
+                &viewport_bytes([1.0, 2.0, 3.0, 4.0, 0.0, 1.0]),
+            ),
+            "viewports",
+        ),
+        (
+            "setViewports:count:",
+            record(
+                wire_r::OPCODE_SET_VIEWPORTS,
+                (OP_HEADER_LEN + viewports_body.len()) as u32,
+                &viewports_body,
+            ),
+            "viewports",
+        ),
+        (
+            "setScissorRect:",
+            record(
+                wire_r::OPCODE_SET_SCISSOR,
+                wire_r::SET_SCISSOR_TOTAL_LEN,
+                &scissor_bytes([1, 2, 3, 4]),
+            ),
+            "scissors",
+        ),
+        (
+            "setScissorRects:count:",
+            record(
+                wire_r::OPCODE_SET_SCISSOR_RECTS,
+                (OP_HEADER_LEN + scissors_body.len()) as u32,
+                &scissors_body,
+            ),
+            "scissors",
+        ),
+        (
+            "setVisibilityResultMode:offset:",
+            record(
+                wire_r::OPCODE_SET_VISIBILITY_RESULT_MODE,
+                wire_r::SET_VISIBILITY_RESULT_MODE_TOTAL_LEN,
+                &vis,
+            ),
+            "visibility",
+        ),
+    ];
+
+    for (selector, command, field) in cases {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        let before = fingerprint(&acc);
+        let opcode = ld32(&command[0..]);
+        handle_render_record(&mut state, &host, 1, opcode, &command, &mut out, &mut acc);
+        let after = fingerprint(&acc);
+        for ((name, was), (_, now)) in before.iter().zip(after.iter()) {
+            if *name == field {
+                assert_ne!(
+                    was, now,
+                    "{selector} ({opcode:#x}) left {name} at {was}, so the record reached no field"
+                );
+            } else {
+                assert_eq!(
+                    was, now,
+                    "{selector} ({opcode:#x}) moved {name} from {was} to {now}, which belongs to \
+                     another record class"
+                );
+            }
+        }
+    }
+}
+
+/// A plural viewport or scissor record of count zero keeps the previous state.
+///
+/// The singular form is the plural at length one, so an empty array can only be
+/// the plural — and it is the one shape where "replace the state" and "the guest
+/// bound none" are the same assignment for opposite reasons. The legacy decoder
+/// refused it as `ErrBadLength`, a reading this keeps and names.
+#[test]
+fn a_plural_viewport_or_scissor_of_count_zero_keeps_what_the_stream_already_bound() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let record = |op: u32, body: &[u8]| {
+        let total = (OP_HEADER_LEN + body.len()) as u32;
+        let mut v = vec![0u8; total as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total);
+        v[OP_HEADER_LEN..].copy_from_slice(body);
+        v
+    };
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    acc.viewports.push([1.0, 2.0, 3.0, 4.0, 0.0, 1.0]);
+    acc.scissors.push(ScissorRect {
+        x: 1,
+        y: 2,
+        width: 3,
+        height: 4,
+    });
+
+    for (op, body, route) in [
+        (
+            wire_r::OPCODE_SET_VIEWPORTS,
+            0u32.to_le_bytes().to_vec(),
+            "render_viewport_count_zero",
+        ),
+        (
+            wire_r::OPCODE_SET_SCISSOR_RECTS,
+            0u64.to_le_bytes().to_vec(),
+            "render_scissor_count_zero",
+        ),
+    ] {
+        let before = store_route_count(route);
+        let command = record(op, &body);
+        handle_render_record(&mut state, &host, 1, op, &command, &mut out, &mut acc);
+        assert_eq!(
+            store_route_count(route),
+            before + 1,
+            "{op:#x} should have been counted as {route}"
+        );
+    }
+    assert_eq!(acc.viewports.len(), 1, "the bound viewport must stand");
+    assert_eq!(acc.scissors.len(), 1, "the bound scissor must stand");
+}
+
+/// Each of the twelve bind rows writes the one argument table its opcode names,
+/// and none of the other five.
+///
+/// **The stage is the opcode and nothing else.** No wire field carries it, so a
+/// record routed by layout rather than by kind would find no stage and bind
+/// into whichever table it reached — which is the defect this asserts against
+/// rather than describes. Six tables and twelve rows, so a single misrouted
+/// arm shows up as a texture in the sampler table or a vertex bind in the
+/// fragment one, both of which bind nothing the shader asked for and refuse
+/// nothing either.
+///
+/// The two offset rows write a slot an earlier bind established, so the
+/// accumulator is seeded before them: an offset naming an unbound slot lands on
+/// nothing by design, and would make this test pass for the wrong reason.
+#[test]
+fn each_render_bind_row_writes_the_one_argument_table_its_opcode_names() {
+    use reims_vgpu_wire::ops::render as wire_r;
+    use reims_vgpu_wire::OP_HEADER_LEN as HEAD;
+
+    // `first`, `count`, then `count` entries of `entry_len` bytes.
+    let bind = |op: u32, first: u32, entry_len: usize, entry: &[u8]| {
+        let total = HEAD + render_pass::BIND_ENTRIES + entry_len;
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total as u32);
+        st32(&mut v[HEAD + render_pass::BIND_FIRST..], first);
+        st32(&mut v[HEAD + render_pass::BIND_COUNT..], 1);
+        v[HEAD + render_pass::BIND_ENTRIES..HEAD + render_pass::BIND_ENTRIES + entry.len()]
+            .copy_from_slice(entry);
+        v
+    };
+    let flat = |op: u32, body: &[u8]| {
+        let total = HEAD + body.len();
+        let mut v = vec![0u8; total];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], total as u32);
+        v[HEAD..].copy_from_slice(body);
+        v
+    };
+
+    let buffer_entry = {
+        let mut e = vec![0u8; render_pass::BUFFER_BIND_ENTRY_SIZE];
+        st32(&mut e[0..], 5151);
+        st64(&mut e[4..], 0x100);
+        e
+    };
+    let buffer_stride_entry = {
+        let mut e = vec![0u8; render_pass::BUFFER_STRIDE_BIND_ENTRY_SIZE];
+        st32(&mut e[0..], 5151);
+        st64(&mut e[4..], 0x100);
+        st64(&mut e[12..], 0x20);
+        e
+    };
+    let ref_entry = {
+        let mut e = vec![0u8; render_pass::REF_BIND_ENTRY_SIZE];
+        st32(&mut e[0..], 0x51);
+        e
+    };
+    let sampler_lod_entry = {
+        let mut e = vec![0u8; render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE];
+        st32(&mut e[0..], 0x51);
+        st32(&mut e[4..], 0.5f32.to_bits());
+        st32(&mut e[8..], 4.0f32.to_bits());
+        e
+    };
+    // `index`, then a 64-bit offset — and the strided form's stride after it.
+    let offset_body = {
+        let mut b = vec![0u8; 12];
+        st32(&mut b[0..], 0);
+        st64(&mut b[4..], 0x900);
+        b
+    };
+    let offset_stride_body = {
+        let mut b = vec![0u8; 20];
+        st32(&mut b[0..], 0);
+        st64(&mut b[4..], 0x900);
+        st64(&mut b[12..], 0x30);
+        b
+    };
+
+    const VB: &str = "vertex_buffers";
+    const FB: &str = "fragment_buffers";
+    const VT: &str = "vertex_textures";
+    const FT: &str = "fragment_textures";
+    const VS: &str = "vertex_samplers";
+    const FS: &str = "fragment_samplers";
+    const ALL: [&str; 6] = [VB, FB, VT, FT, VS, FS];
+
+    let tables = |acc: &StreamAccum| -> Vec<(&'static str, String)> {
+        vec![
+            (VB, format!("{:?}", acc.vertex_buffers)),
+            (FB, format!("{:?}", acc.fragment_buffers)),
+            (VT, format!("{:?}", acc.vertex_textures)),
+            (FT, format!("{:?}", acc.fragment_textures)),
+            (VS, format!("{:?}", acc.vertex_samplers)),
+            (FS, format!("{:?}", acc.fragment_samplers)),
+        ]
+    };
+
+    for (selector, command, table, seed) in [
+        (
+            "setVertexBuffers:offsets:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_BUFFER,
+                0,
+                render_pass::BUFFER_BIND_ENTRY_SIZE,
+                &buffer_entry,
+            ),
+            VB,
+            false,
+        ),
+        (
+            "setVertexBuffers:offsets:attributeStrides:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_BUFFER_STRIDE,
+                0,
+                render_pass::BUFFER_STRIDE_BIND_ENTRY_SIZE,
+                &buffer_stride_entry,
+            ),
+            VB,
+            false,
+        ),
+        (
+            "setFragmentBuffers:offsets:withRange:",
+            bind(
+                wire_r::OPCODE_SET_FRAGMENT_BUFFER,
+                0,
+                render_pass::BUFFER_BIND_ENTRY_SIZE,
+                &buffer_entry,
+            ),
+            FB,
+            false,
+        ),
+        (
+            "setVertexTextures:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_TEXTURE,
+                0,
+                render_pass::REF_BIND_ENTRY_SIZE,
+                &ref_entry,
+            ),
+            VT,
+            false,
+        ),
+        (
+            "setFragmentTextures:withRange:",
+            bind(
+                wire_r::OPCODE_SET_FRAGMENT_TEXTURE,
+                0,
+                render_pass::REF_BIND_ENTRY_SIZE,
+                &ref_entry,
+            ),
+            FT,
+            false,
+        ),
+        (
+            "setVertexSamplerStates:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_SAMPLER,
+                0,
+                render_pass::REF_BIND_ENTRY_SIZE,
+                &ref_entry,
+            ),
+            VS,
+            false,
+        ),
+        (
+            "setFragmentSamplerStates:withRange:",
+            bind(
+                wire_r::OPCODE_SET_FRAGMENT_SAMPLER,
+                0,
+                render_pass::REF_BIND_ENTRY_SIZE,
+                &ref_entry,
+            ),
+            FS,
+            false,
+        ),
+        (
+            "setVertexSamplerStates:lodMinClamps:lodMaxClamps:withRange:",
+            bind(
+                wire_r::OPCODE_SET_VERTEX_SAMPLER_LOD,
+                0,
+                render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                &sampler_lod_entry,
+            ),
+            VS,
+            false,
+        ),
+        (
+            "setFragmentSamplerStates:lodMinClamps:lodMaxClamps:withRange:",
+            bind(
+                wire_r::OPCODE_SET_FRAGMENT_SAMPLER_LOD,
+                0,
+                render_pass::SAMPLER_LOD_BIND_ENTRY_SIZE,
+                &sampler_lod_entry,
+            ),
+            FS,
+            false,
+        ),
+        (
+            "setVertexBufferOffset:atIndex:",
+            flat(wire_r::OPCODE_SET_VERTEX_BUFFER_OFFSET, &offset_body),
+            VB,
+            true,
+        ),
+        (
+            "setVertexBufferOffset:attributeStride:atIndex:",
+            flat(
+                wire_r::OPCODE_SET_VERTEX_BUFFER_OFFSET_STRIDE,
+                &offset_stride_body,
+            ),
+            VB,
+            true,
+        ),
+        (
+            "setFragmentBufferOffset:atIndex:",
+            flat(wire_r::OPCODE_SET_FRAGMENT_BUFFER_OFFSET, &offset_body),
+            FB,
+            true,
+        ),
+    ] {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        if seed {
+            // The slot the offset record moves. Both stages are seeded, so a
+            // fragment offset reaching the vertex table would still be caught.
+            let occupant = BufferBind {
+                index: 0,
+                buffer_ref: 5151,
+                offset: 0x100,
+                ..Default::default()
+            };
+            Arc::make_mut(&mut acc.vertex_buffers).push(occupant.clone());
+            Arc::make_mut(&mut acc.fragment_buffers).push(occupant);
+        }
+        let before = tables(&acc);
+        let opcode = ld32(&command[0..]);
+        handle_render_record(&mut state, &host, 1, opcode, &command, &mut out, &mut acc);
+        let after = tables(&acc);
+        for ((name, was), (_, now)) in before.iter().zip(after.iter()) {
+            if *name == table {
+                assert_ne!(
+                    was, now,
+                    "{selector} ({opcode:#x}) left {name} at {was}, so the record reached no table"
+                );
+            } else {
+                assert_eq!(
+                    was, now,
+                    "{selector} ({opcode:#x}) moved {name} from {was} to {now}, which its opcode \
+                     does not name"
+                );
+            }
+        }
+        assert!(
+            ALL.contains(&table),
+            "the expected table must be one of the six"
+        );
+        assert!(
+            acc.unrepresentable.is_none(),
+            "{selector} ({opcode:#x}) refused the stream's draws"
+        );
+    }
+}
+
+/// A pass descriptor shorter than the record refuses instead of reading the
+/// attachments that happen to fit.
+///
+/// **This is the reading W11c changed, and it is asserted in both directions.**
+/// The legacy decoder accepted anything from depth + stencil + one colour slot
+/// and answered the other seven slots as unattached — which is exactly what a
+/// guest attaching one slot also produces, so a truncated descriptor and a
+/// one-attachment pass were the same state. Apple's serializer writes all 592
+/// bytes. The short form is now named under the row's own opcode and moves no
+/// pass state; the full-length record with the same first attachment is
+/// honoured, which is what says the refusal is about the length and not about
+/// the bytes.
+#[test]
+fn a_pass_descriptor_short_of_its_record_is_refused_rather_than_read_at_the_offsets_that_fit() {
+    use crate::runtime::render_pass::{PASS_ATTACH_TEXREF, PASS_COLOR_ATTACH_OFF};
+
+    let pass = |payload_len: usize| {
+        let mut payload = vec![0u8; payload_len];
+        st32(
+            &mut payload[PASS_COLOR_ATTACH_OFF + PASS_ATTACH_TEXREF..],
+            4242,
+        );
+        let mut cmd = vec![0u8; OP_HEADER_LEN + payload.len()];
+        st32(&mut cmd[0..], wire_pass::OPCODE_RENDER_PASS);
+        st32(&mut cmd[4..], (OP_HEADER_LEN + payload.len()) as u32);
+        cmd[OP_HEADER_LEN..].copy_from_slice(&payload);
+        cmd
+    };
+    let run = |cmd: &[u8]| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        handle_render_record(
+            &mut state,
+            &host,
+            1,
+            wire_pass::OPCODE_RENDER_PASS,
+            cmd,
+            &mut out,
+            &mut acc,
+        );
+        acc
+    };
+
+    let full = wire_pass::RENDER_PASS_TOTAL_LEN as usize - OP_HEADER_LEN;
+    let honoured = run(&pass(full));
+    assert_eq!(
+        honoured.color_slots.len(),
+        1,
+        "the full-length record's colour slot 0 must still reach the slot list"
+    );
+
+    // One byte short of the record. Every offset this attachment lives at is
+    // still inside the buffer, which is precisely why the old reading could not
+    // tell the two apart.
+    let short = run(&pass(full - 1));
+    assert!(
+        short.color_slots.is_empty()
+            && short.clears.is_empty()
+            && short.color_targets.is_empty()
+            && short.depth_attach.is_none()
+            && short.stencil_attach.is_none(),
+        "a short pass descriptor moved pass state: {short:?}"
+    );
+}
+
+/// Each store-action override lands on the attachment its own target names.
+///
+/// The record's target is a `StoreActionTarget` and not an opcode read a second
+/// time, so the fourth case the legacy arm carried — a store action for none of
+/// the three — is unrepresentable. What is still worth asserting is that the
+/// three that do exist do not reach each other: a colour override landing on the
+/// depth attachment, or on the wrong colour slot, changes what the pass
+/// publishes to guest pages with nothing on any channel to say so.
+#[test]
+fn each_store_action_override_reaches_the_attachment_its_target_names() {
+    use crate::runtime::render_pass::{PASS_ATTACH_STORE_ACTION, PASS_ATTACH_TEXREF};
+    use crate::runtime::render_pass::{PASS_COLOR_ATTACH_OFF, PASS_COLOR_ATTACH_STRIDE};
+    use crate::runtime::render_pass::{PASS_DEPTH_ATTACH_OFF, PASS_STENCIL_ATTACH_OFF};
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    // A pass declaring colour slots 0 and 3, a depth and a stencil attachment,
+    // every one of them `DontCare` so an override to `Store` is visible.
+    let mut payload = vec![0u8; wire_pass::RENDER_PASS_TOTAL_LEN as usize - OP_HEADER_LEN];
+    for (base, texture_ref) in [
+        (PASS_DEPTH_ATTACH_OFF, 44u32),
+        (PASS_STENCIL_ATTACH_OFF, 55),
+        (PASS_COLOR_ATTACH_OFF, 41),
+        (PASS_COLOR_ATTACH_OFF + 3 * PASS_COLOR_ATTACH_STRIDE, 43),
+    ] {
+        st32(&mut payload[base + PASS_ATTACH_TEXREF..], texture_ref);
+        st16(&mut payload[base + PASS_ATTACH_STORE_ACTION..], 0);
+    }
+    let mut descriptor = vec![0u8; OP_HEADER_LEN + payload.len()];
+    st32(&mut descriptor[0..], wire_pass::OPCODE_RENDER_PASS);
+    st32(&mut descriptor[4..], (OP_HEADER_LEN + payload.len()) as u32);
+    descriptor[OP_HEADER_LEN..].copy_from_slice(&payload);
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_pass::OPCODE_RENDER_PASS,
+        &descriptor,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(acc.color_slots.len(), 2, "the pass declared slots 0 and 3");
+    assert!(acc.depth_attach.is_some() && acc.stencil_attach.is_some());
+
+    // `setColorStoreAction:atIndex:` — a 32-bit action then the slot index.
+    let colour = |action: u32, index: u32| {
+        let mut v = vec![0u8; wire_r::SET_COLOR_STORE_ACTION_TOTAL_LEN as usize];
+        st32(&mut v[0..], wire_r::OPCODE_SET_COLOR_STORE_ACTION);
+        st32(&mut v[4..], wire_r::SET_COLOR_STORE_ACTION_TOTAL_LEN);
+        st32(&mut v[OP_HEADER_LEN..], action);
+        st32(&mut v[OP_HEADER_LEN + 4..], index);
+        v
+    };
+    // The depth and stencil forms carry no index: one 64-bit action.
+    let bare = |op: u32, action: u64| {
+        let mut v = vec![0u8; wire_r::SET_MODE_TOTAL_LEN as usize];
+        st32(&mut v[0..], op);
+        st32(&mut v[4..], wire_r::SET_MODE_TOTAL_LEN);
+        st64(&mut v[OP_HEADER_LEN..], action);
+        v
+    };
+
+    // `setColorStoreAction:atIndex:` naming slot 3, then the depth and stencil
+    // forms — all three against one pass that declares all four attachments, so
+    // an override reaching the wrong one is visible rather than merely absent.
+    for command in [
+        colour(MTL_STORE_ACTION_STORE.into(), 3),
+        bare(
+            wire_r::OPCODE_SET_DEPTH_STORE_ACTION,
+            MTL_STORE_ACTION_STORE.into(),
+        ),
+        bare(
+            wire_r::OPCODE_SET_STENCIL_STORE_ACTION,
+            MTL_STORE_ACTION_STORE.into(),
+        ),
+    ] {
+        let opcode = ld32(&command[0..]);
+        handle_render_record(&mut state, &host, 1, opcode, &command, &mut out, &mut acc);
+    }
+
+    let slot0 = acc.color_slots.iter().find(|(s, _)| *s == 0).unwrap().1;
+    let slot3 = acc.color_slots.iter().find(|(s, _)| *s == 3).unwrap().1;
+    assert_eq!(
+        slot0.store_action, 0,
+        "the colour override named slot 3 and reached slot 0"
+    );
+    assert_eq!(
+        slot3.store_action, MTL_STORE_ACTION_STORE,
+        "the colour override did not reach the slot its index names"
+    );
+    assert_eq!(
+        acc.depth_attach.unwrap().store_action,
+        MTL_STORE_ACTION_STORE,
+        "the depth override did not reach the depth attachment"
+    );
+    assert_eq!(
+        acc.stencil_attach.unwrap().store_action,
+        MTL_STORE_ACTION_STORE,
+        "the stencil override did not reach the stencil attachment"
+    );
+}
+
+/// A draw that carries no instance-count argument and one that carries zero are
+/// different draws.
+///
+/// **This is the reading W11d changed.** `drawPrimitives:vertexStart:vertexCount:`
+/// has no `instanceCount:` argument at all, and Metal's default for it is one
+/// instance — so one is what the guest asked for. `instanceCount:0` is a guest
+/// that wrote the argument and wrote zero, which draws nothing; that is also
+/// what it asked for, and it reaches the backend.
+///
+/// The `.max(1)` this replaces sat in the decoder and applied to both, so the
+/// two were one number by the time anything downstream saw them. Three arms of
+/// this device disagreed about the zero — `backend::metal::render` refuses it by
+/// name, a refusal the clamp made unreachable, and `runtime::icb` passed the
+/// same argument to Metal unclamped — so the clamp could not have been
+/// describing the contract. The census survives at the lift and is asserted
+/// here, because a zero reaching a backend is exactly the event worth a line.
+#[test]
+fn a_draw_with_no_instance_count_and_one_asking_for_zero_are_not_the_same_draw() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    acc.pipeline_ref = 7171;
+
+    // `drawPrimitives:vertexStart:vertexCount:` — primitive first at 32 bits,
+    // then two 16-bit counts. No instance count on the wire at all.
+    let mut plain = vec![0u8; wire_r::DRAW_TOTAL_LEN as usize];
+    st32(&mut plain[0..], wire_r::OPCODE_DRAW);
+    st32(&mut plain[4..], wire_r::DRAW_TOTAL_LEN);
+    st32(&mut plain[OP_HEADER_LEN..], 3);
+    st16(&mut plain[OP_HEADER_LEN + 4..], 0);
+    st16(&mut plain[OP_HEADER_LEN + 6..], 6);
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_r::OPCODE_DRAW,
+        &plain,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(acc.draws.len(), 1, "the plain draw was not recorded");
+    assert_eq!(
+        acc.draws[0].draw.instance_count, 1,
+        "a selector with no instanceCount: argument draws one instance"
+    );
+
+    // `drawPrimitives:vertexStart:vertexCount:instanceCount:` with the argument
+    // written as zero.
+    let mut zero = vec![0u8; wire_r::DRAW_INSTANCED_TOTAL_LEN as usize];
+    st32(&mut zero[0..], wire_r::OPCODE_DRAW_INSTANCED);
+    st32(&mut zero[4..], wire_r::DRAW_INSTANCED_TOTAL_LEN);
+    st16(&mut zero[OP_HEADER_LEN..], 0);
+    st16(&mut zero[OP_HEADER_LEN + 2..], 6);
+    st16(&mut zero[OP_HEADER_LEN + 4..], 0);
+    st16(&mut zero[OP_HEADER_LEN + 6..], 3);
+    let before = store_route_count("draw_instance_count_zero");
+    handle_render_record(
+        &mut state,
+        &host,
+        1,
+        wire_r::OPCODE_DRAW_INSTANCED,
+        &zero,
+        &mut out,
+        &mut acc,
+    );
+    assert_eq!(
+        store_route_count("draw_instance_count_zero"),
+        before + 1,
+        "a written zero instance count was not counted"
+    );
+    assert_eq!(
+        acc.draws.len(),
+        2,
+        "the zero-instance draw was not recorded"
+    );
+    assert_eq!(
+        acc.draws[1].draw.instance_count, 0,
+        "a guest that wrote instanceCount:0 had its argument overruled"
+    );
+}
+
+/// The compact and wide encodings of one draw shape reach the same record.
+///
+/// Six selectors arrive in two encodings — 16-bit counts and 64-bit ones — with
+/// different field orders, and that is an encoding rather than a meaning. Both
+/// must produce the same `PendingDraw`, or a guest whose count crossed 65535
+/// would draw different geometry than the same guest below it. The one field
+/// where they genuinely disagree, `base_vertex`, is not exercised here: the
+/// compact form's is truncated to sixteen bits by Apple's serializer upstream of
+/// this device, so equal inputs are not the right comparison for it.
+#[test]
+fn a_compact_draw_and_its_wide_encoding_record_the_same_draw() {
+    use reims_vgpu_wire::ops::render as wire_r;
+
+    let run = |command: &[u8]| {
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+        let host = FakeHost::new();
+        let mut out = ExecResult::default();
+        let mut acc = StreamAccum::default();
+        acc.pipeline_ref = 7171;
+        let opcode = ld32(&command[0..]);
+        handle_render_record(&mut state, &host, 1, opcode, command, &mut out, &mut acc);
+        acc.draws.first().map(|d| d.draw)
+    };
+
+    // Compact: primitive at 32 bits, then `vertexStart` and `vertexCount` at 16.
+    let mut compact = vec![0u8; wire_r::DRAW_TOTAL_LEN as usize];
+    st32(&mut compact[0..], wire_r::OPCODE_DRAW);
+    st32(&mut compact[4..], wire_r::DRAW_TOTAL_LEN);
+    st32(&mut compact[OP_HEADER_LEN..], 3);
+    st16(&mut compact[OP_HEADER_LEN + 4..], 12);
+    st16(&mut compact[OP_HEADER_LEN + 6..], 900);
+
+    // Wide: the same three fields, the counts at 64 bits.
+    let mut wide = vec![0u8; wire_r::DRAW_WIDE_TOTAL_LEN as usize];
+    st32(&mut wide[0..], wire_r::OPCODE_DRAW_WIDE);
+    st32(&mut wide[4..], wire_r::DRAW_WIDE_TOTAL_LEN);
+    st32(&mut wide[OP_HEADER_LEN..], 3);
+    st64(&mut wide[OP_HEADER_LEN + 4..], 12);
+    st64(&mut wide[OP_HEADER_LEN + 12..], 900);
+
+    let a = run(&compact).expect("the compact draw was not recorded");
+    let b = run(&wide).expect("the wide draw was not recorded");
+    assert_eq!(
+        a, b,
+        "the two encodings of one draw shape produced different draws"
+    );
+    assert_eq!(
+        (a.primitive_type, a.first_vertex, a.vertex_count),
+        (3, 12, 900)
+    );
+    assert_eq!(
+        a.instance_count, 1,
+        "neither encoding carries an instance count, so both draw one"
+    );
+}
+
+/// A sink whose segment pairing is broken names the loss instead of absorbing
+/// it.
+///
+/// The two cases here are unreachable from `walk_stream`, which pairs its own
+/// calls — and that is exactly why they are worth a test. The sink exists so
+/// that a *different* walker can drive it, and the first thing a different
+/// walker can get wrong is the pairing. Both losses are whole compute
+/// dispatches, so neither may be silent.
+#[test]
+fn a_compute_record_with_no_segment_open_is_a_named_loss() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let task_id = 0x5731_0101;
+    let before = sink_body().len();
+    let mut sink = StreamSink {
+        state: &mut state,
+        host: &mut host,
+        task_id,
+        out: &mut out,
+        acc: &mut acc,
+        compute: None,
+    };
+    // No `begin_segment`. The record's bytes are never read, because the sink
+    // refuses before reaching the handler.
+    sink.record(SegmentKind::Compute, 0x1234, &[0u8; OP_HEADER_LEN]);
+    let added = sink_body().split_off(before);
+    assert!(
+        added.contains("exec_compute_record_unopened")
+            && added.contains(&format!("task={task_id}")),
+        "a compute record with no open segment must name the lost dispatch: {added}"
+    );
+}
+
+#[test]
+fn a_segment_opened_over_an_open_compute_segment_commits_it_and_says_so() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let task_id = 0x5731_0102;
+    let before = sink_body().len();
+    let mut sink = StreamSink {
+        state: &mut state,
+        host: &mut host,
+        task_id,
+        out: &mut out,
+        acc: &mut acc,
+        compute: None,
+    };
+    sink.begin_segment(SegmentKind::Compute);
+    assert!(sink.compute.is_some(), "a compute segment opens an encoder");
+    sink.begin_segment(SegmentKind::Render);
+    assert!(
+        sink.compute.is_none(),
+        "the unended compute segment is committed rather than carried into the render one"
+    );
+    let added = sink_body().split_off(before);
+    assert!(
+        added.contains("exec_segment_unended") && added.contains(&format!("task={task_id}")),
+        "opening a segment over an open compute segment must be named: {added}"
+    );
+}
+
+/// A submission is executed from the buffers it was read with.
+///
+/// **The property the replacement architecture's parking rests on.** An
+/// admitted packet may be held — behind a pipeline still compiling, or behind a
+/// completion word another packet owes — and run later. If execution re-read
+/// the command buffers out of guest memory at that point, it would run whatever
+/// the guest had written there in the meantime, which is neither the stream the
+/// device judged nor a stream the guest asked to run twice.
+///
+/// The test states it the only way that distinguishes the two: the guest's page
+/// is overwritten with zeroes between the read and the execution. A device that
+/// re-read would signal nothing.
+#[test]
+fn a_submission_executes_the_streams_it_was_read_with_and_not_guest_memory_again() {
+    use crate::model::FENCE_DOMAIN_EVENT;
+    use crate::protocol::fifo::{
+        CHILD_EXEC_INDIRECT_CMDBUF_GVA, CHILD_EXEC_INDIRECT_CMDBUF_LENGTH,
+    };
+    use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+
+    // One event segment carrying one signal: the smallest record whose effect
+    // is a value this test can read back out of the model.
+    let (event_ref, value) = (21u32, 4u64);
+    let mut record = vec![0u8; 0x14];
+    st32(&mut record[0..4], 0x191);
+    st32(&mut record[4..8], 0x14);
+    st32(&mut record[8..12], event_ref);
+    st64(&mut record[12..20], value);
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+    st32(
+        &mut stream[0..4],
+        (SEGMENT_HEADER_LEN + record.len()) as u32,
+    );
+    stream[4] = SegmentKind::Event.wire_type();
+    stream.extend_from_slice(&record);
+
+    let stream_gva = 8u64 << PAGE_SHIFT_ARM64E;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], stream_gva, &stream);
+
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 1);
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+    let cb = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+    st64(
+        &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+        stream_gva,
+    );
+    st64(
+        &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+        stream.len() as u64,
+    );
+
+    let mut out = ExecResult::default();
+    let mut measured_ns = 0u64;
+    let submission = read_submission(&state, &host, &payload, &mut out, &mut measured_ns)
+        .expect("the packet names a live task and one command buffer");
+    assert_eq!(
+        submission.streams.len(),
+        1,
+        "the header declares one command buffer and it is read here, once"
+    );
+    assert_eq!(out.streams_loaded, 1);
+    assert_eq!(
+        state.fence_generation(1, FENCE_DOMAIN_EVENT, event_ref),
+        None,
+        "reading a submission runs none of it"
+    );
+
+    // The guest reuses the page under a packet this device is still holding,
+    // and the read-back is what keeps this test from passing vacuously: a
+    // silently ineffective overwrite would leave the original stream in guest
+    // memory and both readings would signal.
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        stream_gva,
+        &vec![0u8; stream.len()],
+    );
+    let mut readback = vec![0xffu8; stream.len()];
+    crate::runtime::gva_mem::read_task_gva_by_id(
+        &host,
+        &state.tasks,
+        1,
+        stream_gva,
+        &mut readback,
+        PAGE_SHIFT_ARM64E,
+    )
+    .expect("the page is mapped");
+    assert!(
+        readback.iter().all(|b| *b == 0),
+        "the overwrite must have landed, or this test proves nothing"
+    );
+
+    execute_submission(
+        &mut state,
+        &mut host,
+        &submission,
+        None,
+        &mut out,
+        &mut measured_ns,
+    );
+    assert_eq!(
+        state.fence_generation(1, FENCE_DOMAIN_EVENT, event_ref),
+        Some(value),
+        "the signal the read submission carries is the one that runs, whatever \
+         the guest has since written where it came from"
+    );
+}
+
+/// The plan step answers `false` for a pipeline whose inputs this device cannot
+/// load, because a missing plan input is deterministic and not asynchronous
+/// work.
+///
+/// **What "plan" means, asserted at the seam.** `preflight_submission` is the
+/// middle of read / plan / execute and it exists as its own step because it is
+/// the only one a caller may run at a moment of its own choosing — it takes a
+/// shared `&DeviceState`, mutates nothing the guest can see, and is a function
+/// of bytes the submission already holds. `true` therefore has exactly one
+/// meaning: *a translation is running and will finish*. A pipeline whose AIR
+/// cannot be loaded at all is not that — normal execution reports it precisely
+/// — and answering `true` for one would defer the packet forever.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    use wire_render::OPCODE_SET_RENDER_PIPELINE_STATE;
+
+    let mut records = [0u8; 12];
+    st32(&mut records[0..4], OPCODE_SET_RENDER_PIPELINE_STATE);
+    st32(&mut records[4..8], 12);
+    st32(&mut records[8..12], 41);
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+    let stream_len = stream.len() + records.len();
+    st32(&mut stream[0..4], stream_len as u32);
+    stream[4] = SegmentKind::Render.wire_type();
+    stream.extend_from_slice(&records);
+
+    let state = DeviceState::new(crate::model::DeviceId(1), 12);
+    let host = crate::runtime::host::FakeHost::new();
+    let submission = super::ExecSubmission::stated(1, vec![stream]);
+    let mut measured_ns = 0u64;
+    // The transaction the walk would have built for that record, stated here
+    // because this test drives the rail directly rather than through admission.
+    let mut builder = reims_vgpu_core::exec::ExecBuilder::new();
+    builder
+        .begin_encoder(
+            reims_vgpu_protocol::segment::SegmentKind::Render,
+            reims_vgpu_protocol::segment::SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("a fresh encoder");
+    builder
+        .record(
+            reims_vgpu_core::exec::ResolvedOperation::Render(
+                reims_vgpu_core::render::RenderOp::SetPipeline {
+                    pipeline: reims_vgpu_core::identity::ResourceId {
+                        slot: reims_vgpu_core::identity::ObjectListRef(41),
+                        generation: reims_vgpu_core::identity::SlotGeneration(1),
+                    },
+                },
+            ),
+            &mut |_: &reims_vgpu_core::access::Participation| {
+                unreachable!("setting a pipeline names no memory")
+            },
+        )
+        .expect("the record places");
+    builder.end_segment().expect("the encoder ends");
+    let resolved = builder.finish().expect("the transaction finishes");
+    assert_eq!(resolved.render_pipeline_leases().len(), 1);
+
+    assert!(
+        super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns)
+            .is_empty(),
+        "no object list, so pipeline 41 has no AIR to await"
+    );
+    // And it is a function of its inputs: asked again, the same answer.
+    assert!(
+        super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns)
+            .is_empty()
+    );
+}
+
+/// The two walks over one stream reach the same records in the same order.
+///
+/// This is the whole of [`ResolvedCursor`]'s claim, and it is worth a test
+/// rather than a comment: the model resolves a packet's records at ingress and
+/// this executor walks the same bytes again when the model releases it, so
+/// "the *n*th record here is the *n*th record there" is the only thing that
+/// lets the second walk stop decoding. A framer that counted a protection
+/// envelope, a segment continuation or a refused record differently on one side
+/// than the other would put the cursor off by one, and every later record would
+/// be read as the wrong operation rather than as a refusal.
+///
+/// A mixed stream on purpose — three encoder families, a continuation and an
+/// envelope — because a stream of one family could not see a divergence that
+/// only a boundary produces.
+#[test]
+fn the_executing_walk_and_the_resolving_walk_reach_the_same_records() {
+    use reims_vgpu_core::access::{AccessRefusal, BackingId, Participation, ResourceKey};
+    use reims_vgpu_core::identity::{ChannelId, ObjectListRef, ResourceId, SlotGeneration};
+    use reims_vgpu_core::resolve::RefResolver;
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    use reims_vgpu_protocol::sync::{OPCODE_SIGNAL_EVENT, OPCODE_WAIT_EVENT};
+
+    struct Everything;
+    impl RefResolver for Everything {
+        fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+            Some(ResourceId {
+                slot: ObjectListRef(object_ref),
+                generation: SlotGeneration(1),
+            })
+        }
+    }
+
+    fn record(buf: &mut Vec<u8>, opcode: u32, payload: &[u8]) {
+        let len = (OP_HEADER_LEN + payload.len()) as u32;
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], opcode);
+        st32(&mut hdr[4..8], len);
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(payload);
+    }
+
+    /// The two encoder-lifetime bytes are written from both ends of the edge,
+    /// exactly as the serializer writes them: the segment that continues sets
+    /// `continues_previous`, and the one it continues sets `continues_into_next`
+    /// — a continuation whose predecessor did not say so is refused, which is
+    /// how this fixture first found out it was writing only one of the two.
+    fn segment(buf: &mut Vec<u8>, type_: u8, lifetime: (bool, bool), payload: &[u8]) {
+        let len = (SEGMENT_HEADER_LEN + payload.len()) as u32;
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], len);
+        hdr[4] = type_;
+        hdr[5] = u8::from(lifetime.0);
+        hdr[6] = u8::from(lifetime.1);
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(payload);
+    }
+
+    let mut blit = Vec::new();
+    record(
+        &mut blit,
+        reims_vgpu_wire::ops::blit::OPCODE_GENERATE_MIPMAPS,
+        &7u32.to_le_bytes(),
+    );
+    record(
+        &mut blit,
+        reims_vgpu_wire::ops::blit::OPCODE_GENERATE_MIPMAPS,
+        &9u32.to_le_bytes(),
+    );
+
+    let event_body = core::mem::size_of::<reims_vgpu_wire::ops::event::SignalWait>();
+    let mut events = Vec::new();
+    for (opcode, value) in [(OPCODE_SIGNAL_EVENT, 7u64), (OPCODE_WAIT_EVENT, 7)] {
+        let mut payload = vec![0u8; event_body];
+        st32(&mut payload[0..4], 11);
+        st64(&mut payload[4..12], value);
+        record(&mut events, opcode, &payload);
+    }
+
+    let mut stream = Vec::new();
+    segment(
+        &mut stream,
+        SegmentKind::Blit.wire_type(),
+        (false, true),
+        &blit,
+    );
+    // A continuation: one encoder across two segments, which the model records
+    // into a single `ResolvedStream` and this executor visits as two segments.
+    // The flat order is what has to agree, and this is the case that proves it
+    // is the flat order and not a per-segment index.
+    segment(
+        &mut stream,
+        SegmentKind::Blit.wire_type(),
+        (true, false),
+        &blit,
+    );
+    segment(
+        &mut stream,
+        SegmentKind::Event.wire_type(),
+        (false, false),
+        &events,
+    );
+
+    let mut source = |part: &Participation| -> Result<_, AccessRefusal> {
+        Ok(part.resolve(
+            ChannelId(2),
+            ResourceKey {
+                backing: BackingId(u64::from(part.resource.slot.0)),
+                heap: None,
+            },
+            None,
+            None,
+        ))
+    };
+    let work = reims_vgpu_core::walk::exec(
+        &stream,
+        &Everything,
+        &mut source,
+        reims_vgpu_core::exec::ExecBuilder::new(),
+    )
+    .expect("every record in the fixture resolves");
+    assert_eq!(work.record_count(), 6, "the fixture's own record count");
+
+    // The executor's walk, driven for its opcodes only: what is under test is
+    // the correspondence, and running the handlers would need a whole host.
+    let mut cursor = ResolvedCursor::new(&work);
+    let mut seen = Vec::new();
+    for framed in
+        reims_vgpu_protocol::segment::SegmentStream::new(&stream).expect("the fixture frames")
+    {
+        let framed = framed.expect("the fixture frames");
+        let reims_vgpu_protocol::segment::SegmentBody::Encoder { kind, commands } = framed.body
+        else {
+            continue;
+        };
+        for op in reims_vgpu_wire::op::OpStream::new(commands) {
+            let op = op.expect("the fixture frames");
+            seen.push(
+                cursor
+                    .step(kind, op.opcode())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "record {} of the executing walk found no resolved twin",
+                            seen.len()
+                        )
+                    })
+                    .class(),
+            );
+        }
+        cursor.end_segment();
+    }
+
+    use reims_vgpu_core::operation::OperationClass;
+    assert_eq!(
+        seen,
+        vec![
+            OperationClass::Blit,
+            OperationClass::Blit,
+            OperationClass::Blit,
+            OperationClass::Blit,
+            OperationClass::Event,
+            OperationClass::Event,
+        ],
+        "the order agrees across the continuation and the family boundary"
+    );
+
+    // A transaction missing one record reads as **one** absent twin and not as
+    // a shift. This is the whole reason the cursor is keyed by position: a
+    // count-based cursor would hand every record after the gap its
+    // predecessor's answer, and the last one would fall off the end — six
+    // wrong readings from one omission, each of them plausible.
+    let mut gapped = work.clone();
+    let removed = gapped.streams[0].records.remove(1);
+    assert_eq!(
+        removed.at,
+        reims_vgpu_core::stream::StreamPosition {
+            segment: 0,
+            record: 1,
+        },
+    );
+    let mut cursor = ResolvedCursor::new(&gapped);
+    let mut found = Vec::new();
+    for framed in
+        reims_vgpu_protocol::segment::SegmentStream::new(&stream).expect("the fixture frames")
+    {
+        let framed = framed.expect("the fixture frames");
+        let reims_vgpu_protocol::segment::SegmentBody::Encoder { kind, commands } = framed.body
+        else {
+            continue;
+        };
+        for op in reims_vgpu_wire::op::OpStream::new(commands) {
+            let op = op.expect("the fixture frames");
+            found.push(cursor.step(kind, op.opcode()).is_some());
+        }
+        cursor.end_segment();
+    }
+    assert_eq!(
+        found,
+        vec![true, false, true, true, true, true],
+        "exactly the removed record has no twin; everything after it still finds its own"
+    );
+}
+
+/// A submission's bytes are framed once per stream, and the plan step frames
+/// none of them.
+///
+/// Seam 6's "zero re-scans of already resolved EXEC bytes" was unmeasured for
+/// as long as nothing counted the framings. The violation it names had a
+/// specific shape on this rail: two pre-scans walked every stream through the
+/// same framer looking for `SetPipeline` records before execution walked it
+/// again, so a boot's segment census read three times the truth and the
+/// leases the rail was asked about were a different set from the ones
+/// admission readied. `preflight_submission` answers from
+/// `reims_vgpu_core::exec::ExecWork` now — the walk's own answer — so the
+/// measurable statement is that it adds no framing at all.
+///
+/// Two streams rather than one, because a per-*submission* framer would pass a
+/// one-stream fixture and be a re-scan on every real packet.
+#[test]
+fn a_submission_frames_each_stream_once_and_preflight_frames_none() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    use reims_vgpu_protocol::sync::OPCODE_SIGNAL_EVENT;
+
+    // One event segment carrying one signal: enough to be walked, and no rail
+    // work at all, so the count is about the framer and not about a backend.
+    let signal_len = core::mem::size_of::<reims_vgpu_wire::ops::event::SignalWait>();
+    let event_stream = |event_ref: u32, value: u64| {
+        let mut records = vec![0u8; OP_HEADER_LEN + signal_len];
+        st32(&mut records[0..4], OPCODE_SIGNAL_EVENT);
+        st32(&mut records[4..8], (OP_HEADER_LEN + signal_len) as u32);
+        st32(&mut records[OP_HEADER_LEN..], event_ref);
+        st64(&mut records[OP_HEADER_LEN + 4..], value);
+        let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+        st32(
+            &mut stream[0..4],
+            (SEGMENT_HEADER_LEN + records.len()) as u32,
+        );
+        stream[4] = SegmentKind::Event.wire_type();
+        stream.extend_from_slice(&records);
+        stream
+    };
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let submission = ExecSubmission::stated(9, vec![event_stream(11, 7), event_stream(12, 3)]);
+    let resolved = reims_vgpu_core::exec::ExecWork::default();
+
+    let before = store_route_count("exec_stream_framed");
+    let mut measured_ns = 0u64;
+    let pending = preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns);
+    assert!(pending.is_empty(), "the fixture resolves no leases");
+    assert_eq!(
+        store_route_count("exec_stream_framed"),
+        before,
+        "the plan step answers from the resolved work, never from the packet's bytes"
+    );
+
+    // The task id rides `ExecResult` from the *read* half, which this fixture
+    // states rather than performs, so what says the run happened is the two
+    // generations below and not a field nothing here set.
+    let _ = execute_planned(
+        &mut state,
+        &mut host,
+        RetainedInputs {
+            submission: &submission,
+            resolved: &resolved,
+        },
+        ExecResult::default(),
+    );
+    assert_eq!(
+        store_route_count("exec_stream_framed") - before,
+        2,
+        "two streams, framed once each: one more is a re-scan"
+    );
+    // Both signals landed, so the two framings were two executions and not one
+    // execution counted twice.
+    assert_eq!(
+        state.fence_generation(9, crate::model::FENCE_DOMAIN_EVENT, 11),
+        Some(7)
+    );
+    assert_eq!(
+        state.fence_generation(9, crate::model::FENCE_DOMAIN_EVENT, 12),
+        Some(3)
     );
 }

@@ -201,7 +201,7 @@ fn lock_for_drain(slot: &BoundDevice) -> parking_lot::MutexGuard<'_, DeviceInner
     // Here rather than only inside `drain_pending`, because this is the one
     // point every entry to the drain passes through. `device_drain` returns
     // before `drain_pending` when the device has no host ops, and
-    // `publish_stranded_fifos` re-publishes from `active_child_mask` — a ring
+    // `publish_stranded_fifos` re-publishes from the open-domain set — a ring
     // left unfolded would be invisible to both.
     crate::runtime::drain::fold_rung_child_doorbells(&mut inner.device.state);
     inner
@@ -416,7 +416,7 @@ pub fn device_gfx_write(id: u64, offset: u64, data: u64, size: u32) -> bool {
         // It is the one register that can be served this way, because it
         // carries no state the decode depends on — its effect is to say a
         // channel has work. `fold_rung_child_doorbells` turns the bit into
-        // `active_child_mask` / `pending.child_mask`, which is exactly what the
+        // the open-domain set / `pending.child_mask`, which is exactly what the
         // locked handler in `crate::runtime::mmio` does for the same register.
         //
         // The channel-number check mirrors that handler rather than trusting
@@ -565,7 +565,7 @@ pub fn device_drain(id: u64) -> bool {
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
-    crate::backend::selected().flush_deferred_submissions();
+    crate::backend::selected().flush_deferred_submissions(&device.state);
     let tail_us = tail_started.elapsed().as_micros() as u64;
     let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
@@ -577,6 +577,7 @@ pub fn device_drain(id: u64) -> bool {
     #[cfg(feature = "host-window")]
     window_publish::publish_window_frame(&slot, &mut device.state);
     crate::runtime::drain::note_drain_tranche(
+        &device.state,
         &host,
         drain_us,
         publish_started.elapsed().as_micros() as u64,
@@ -597,6 +598,17 @@ pub fn device_drain(id: u64) -> bool {
     // is watched, which is every tranche on every rail but macos-26.
     post_sweep(PostSweep::SlotRecheck, || {
         crate::runtime::objects::slot_recheck::sweep(&device.state, &host)
+    });
+    // The ordering plane's own residue, on the same one-second cadence as the
+    // levels above and for the reason `backing_outstanding_census` is emitted
+    // beside `store_routes`: the routes count what *happened* to a pipeline and
+    // a pipeline that was declared and never advanced is counted once and never
+    // again, so a table accumulating builds nobody is running reads exactly like
+    // a healthy one. `pending` is the pipelines a transaction can be waiting on.
+    post_sweep(PostSweep::PipelineTable, || {
+        if let Some(line) = device.state.pipeline_occupancy_census() {
+            crate::observe::off(line);
+        }
     });
     // Beside it and on the same cadence: a page the guest released is judged
     // against the write census, which only moves when this device writes. Also
@@ -675,7 +687,7 @@ pub fn device_poll(id: u64) -> bool {
     };
     let DeviceInner { device, actions } = &mut *d;
     let mut host = QemuHost::new(&ops, actions, &slot.prompt_actions);
-    // Before the rescue reads `active_child_mask`, which is the mask a
+    // Before the rescue reads the open-domain set, which is the mask a
     // lock-free ring lands in only once folded. Without this the Dekker rescue
     // could not see the very channels the doorbell rail is responsible for.
     crate::runtime::drain::fold_rung_child_doorbells(&mut device.state);

@@ -29,9 +29,11 @@ use crate::backend::Backend as _;
 use crate::model::DeviceState;
 use crate::protocol::endian::ld32;
 use crate::protocol::pixel_format;
-use crate::runtime::decode::compute::{
-    BufferBinding, Command as ComputeCommand, Kind, RefBinding, SamplerBinding,
-};
+// This device's own decoder, kept for the rows the closure ledger has not
+// settled: the fence pair, the seven control-flow records and the two indirect
+// command executions. The seventeen it has settled arrive as a
+// `reims_vgpu_protocol::decode::compute::ComputeRecord`.
+use crate::runtime::decode::compute_spi::Command as ComputeCommand;
 use crate::runtime::decode::resource::{
     decode_heap_texture, decode_serializer_object_descriptor, decode_texture_descriptor,
     texture_view_opcode, ComputeStageInputDescriptor, Descriptor as ResourceDescriptor,
@@ -47,6 +49,8 @@ use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
+use reims_vgpu_protocol::compute::DispatchType;
+use reims_vgpu_protocol::decode::compute::{ComputeRecord, DispatchRecord, Extent as RecordExtent};
 
 /// Cap on Metal compute buffer slots (matches backend `REIMS_VGPU_METAL_MAX_BUFFERS`).
 pub const MAX_COMPUTE_BUFFER_SLOTS: u32 = 31;
@@ -186,6 +190,81 @@ impl crate::observe::Decline for ComputeBindOverflow {
     }
 }
 
+/// One buffer bind entry, whichever record carried it.
+///
+/// Five records bind into this encoder's argument tables and only two shapes of
+/// buffer entry reach them: `setBuffers:offsets:withRange:` writes a ref and an
+/// offset, and `setBuffers:offsets:attributeStrides:withRange:` writes a stride
+/// beside them. What turns an entry into a slot is the same either way, so it
+/// is stated once and the entry types answer for their own layout.
+///
+/// **A stride is `Option`, and that is the point.** The device decoder used to
+/// hand the accumulator a flat entry with an `attribute_stride` and a
+/// `has_attribute_stride` beside it, so "the record carried no stride field"
+/// and "the record carried a stride of zero" were two spellings of the same
+/// bytes and only the flag told them apart. Here the record with no stride
+/// field cannot produce a `Some`.
+pub trait BufferBindEntry {
+    fn buffer_ref(&self) -> u32;
+    fn offset(&self) -> u64;
+    fn stride(&self) -> Option<u64>;
+}
+
+/// One texture or sampler bind entry, whichever record carried it.
+///
+/// The plain form is a bare ref; `setSamplers:lodMinClamps:lodMaxClamps:` adds
+/// a clamp pair. The clamps are carried as bit patterns because that is what
+/// this device binds with — the wire's `f32` becomes bits once, here, rather
+/// than at each of the two producers.
+pub trait ObjectBindEntry {
+    fn object_ref(&self) -> u32;
+    fn lod_clamp(&self) -> Option<(u32, u32)> {
+        None
+    }
+}
+
+impl BufferBindEntry for reims_vgpu_wire::ops::render::BufferBind {
+    fn buffer_ref(&self) -> u32 {
+        self.buffer_ref.get()
+    }
+    fn offset(&self) -> u64 {
+        self.offset.get()
+    }
+    fn stride(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl BufferBindEntry for reims_vgpu_wire::ops::render::BufferStrideBind {
+    fn buffer_ref(&self) -> u32 {
+        self.buffer_ref.get()
+    }
+    fn offset(&self) -> u64 {
+        self.offset.get()
+    }
+    fn stride(&self) -> Option<u64> {
+        Some(self.attribute_stride.get())
+    }
+}
+
+impl ObjectBindEntry for reims_vgpu_wire::ops::render::RefBind {
+    fn object_ref(&self) -> u32 {
+        self.object_ref.get()
+    }
+}
+
+impl ObjectBindEntry for reims_vgpu_wire::ops::render::SamplerLodBind {
+    fn object_ref(&self) -> u32 {
+        self.sampler_ref.get()
+    }
+    fn lod_clamp(&self) -> Option<(u32, u32)> {
+        Some((
+            self.lod_min_clamp.get().to_bits(),
+            self.lod_max_clamp.get().to_bits(),
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ComputeBufferBind {
     pub index: u32,
@@ -253,8 +332,16 @@ pub struct ComputeAccum {
     pub stage_in_region_indirect: Option<StageInRegionIndirect>,
     /// Last `0xd8` imageblock dimensions.
     pub imageblock: Option<ImageblockDimensions>,
-    /// Last decoded `0xdb` dispatch type (Metal serial/concurrent); 0 = serial.
-    pub dispatch_type: u32,
+    /// The pass's dispatch type, as `writeDescriptor` last stated it.
+    ///
+    /// A total type rather than the ordinal: `reims_vgpu_protocol` refuses a
+    /// word outside `MTLDispatchType` at the lift, so the accumulator cannot
+    /// hold a value no encoder can be opened with. It used to hold the raw
+    /// `u32`, and the narrowing sat at the far end of the rail inside
+    /// `execute_dispatch_metal` as an `if == CONCURRENT` — which silently read
+    /// every unrecognised value as `Serial` on the one arm that looked, and on
+    /// the Vulkan arm was stored and read by nobody.
+    pub dispatch_type: DispatchType,
     /// A bind this accumulator could not hold, and so did not record.
     ///
     /// The three bind walks skip an index past their argument table — there is
@@ -299,10 +386,11 @@ impl ComputeAccum {
         }
     }
 
-    pub fn bind_buffers(&mut self, first: u32, entries: &[BufferBinding]) {
+    pub fn bind_buffers<E: BufferBindEntry>(&mut self, first: u32, entries: &[E]) {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
-            if e.ref_ == 0 {
+            let entry_ref = e.buffer_ref();
+            if entry_ref == 0 {
                 // A nil entry clears the slot. Retaining the previous bind
                 // instead is not a stale read but a write: the retained buffer
                 // is staged again on the next dispatch, and reflection calling
@@ -318,19 +406,20 @@ impl ComputeAccum {
             if index >= MAX_COMPUTE_BUFFER_SLOTS {
                 let over = ComputeBindOverflow::Buffer {
                     index,
-                    arg: e.ref_,
+                    arg: entry_ref,
                     cap: MAX_COMPUTE_BUFFER_SLOTS,
                 };
                 over.emit();
                 self.refused_bind.get_or_insert(over);
                 continue;
             }
+            let stride = e.stride();
             let bind = ComputeBufferBind {
                 index,
-                buffer_ref: e.ref_,
-                offset: e.offset,
-                attribute_stride: e.attribute_stride,
-                has_attribute_stride: e.has_attribute_stride,
+                buffer_ref: entry_ref,
+                offset: e.offset(),
+                attribute_stride: stride.unwrap_or_default(),
+                has_attribute_stride: stride.is_some(),
             };
             if let Some(slot) = self.buffers.iter_mut().find(|b| b.index == index) {
                 *slot = bind;
@@ -350,10 +439,11 @@ impl ComputeAccum {
         }
     }
 
-    pub fn bind_textures(&mut self, first: u32, entries: &[RefBinding]) {
+    pub fn bind_textures<E: ObjectBindEntry>(&mut self, first: u32, entries: &[E]) {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
-            if e.ref_ == 0 {
+            let entry_ref = e.object_ref();
+            if entry_ref == 0 {
                 // Clears the slot; see `bind_buffers`. A retained texture is
                 // the sharper case of the two, because `writeback_texture`
                 // lands the dispatch's result in the guest surface behind it.
@@ -365,7 +455,7 @@ impl ComputeAccum {
             if index >= MAX_COMPUTE_TEXTURE_SLOTS {
                 let over = ComputeBindOverflow::Texture {
                     index,
-                    arg: e.ref_,
+                    arg: entry_ref,
                     cap: MAX_COMPUTE_TEXTURE_SLOTS,
                 };
                 over.emit();
@@ -374,7 +464,7 @@ impl ComputeAccum {
             }
             let bind = ComputeTextureBind {
                 index,
-                texture_ref: e.ref_,
+                texture_ref: entry_ref,
             };
             if let Some(slot) = self.textures.iter_mut().find(|t| t.index == index) {
                 *slot = bind;
@@ -384,10 +474,11 @@ impl ComputeAccum {
         }
     }
 
-    pub fn bind_samplers(&mut self, first: u32, entries: &[SamplerBinding]) {
+    pub fn bind_samplers<E: ObjectBindEntry>(&mut self, first: u32, entries: &[E]) {
         for (i, e) in entries.iter().enumerate() {
             let index = first.saturating_add(i as u32);
-            if e.ref_ == 0 {
+            let entry_ref = e.object_ref();
+            if entry_ref == 0 {
                 // Clears the slot; see `bind_buffers`.
                 self.samplers.retain(|s| s.index != index);
                 self.clear_refusal_at(index);
@@ -397,19 +488,20 @@ impl ComputeAccum {
             if index >= MAX_COMPUTE_SAMPLER_SLOTS {
                 let over = ComputeBindOverflow::Sampler {
                     index,
-                    arg: e.ref_,
+                    arg: entry_ref,
                     cap: MAX_COMPUTE_SAMPLER_SLOTS,
                 };
                 over.emit();
                 self.refused_bind.get_or_insert(over);
                 continue;
             }
+            let clamp = e.lod_clamp();
             let bind = ComputeSamplerBind {
                 index,
-                sampler_ref: e.ref_,
-                lod_min_bits: e.lod_min_bits,
-                lod_max_bits: e.lod_max_bits,
-                has_lod_clamp: e.has_lod_clamp,
+                sampler_ref: entry_ref,
+                lod_min_bits: clamp.map_or(0, |(min, _)| min),
+                lod_max_bits: clamp.map_or(0, |(_, max)| max),
+                has_lod_clamp: clamp.is_some(),
             };
             if let Some(slot) = self.samplers.iter_mut().find(|s| s.index == index) {
                 *slot = bind;
@@ -697,145 +789,107 @@ pub fn apply_record<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &ComputeCommand,
+    record: &ComputeRecord<'_>,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> Option<ComputeStatus> {
     let started = std::time::Instant::now();
-    let out = apply_record_inner(state, host, task_id, cmd, seg);
+    let out = apply_record_inner(state, host, task_id, record, seg);
     crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Compute, started);
     out
 }
 
-/// The `MTLDispatchType` the guest declared, or `Serial` with the substitution
-/// named in the always-on log.
+/// Apply one sequencing record the closure ledger has not settled.
 ///
-/// `WRITE_DESCRIPTOR` carries this ordinal straight off the wire and nothing
-/// bounds it: the decoder stores `d.dispatch_type.get()` unexamined, and the
-/// accumulator used to store that. The narrowing lived at the far end of the
-/// rail instead — inside `execute_dispatch_metal`, as
-/// `if acc.dispatch_type == CONCURRENT { CONCURRENT } else { SERIAL }` — which
-/// is `Serial` for every value the device does not recognise, chosen silently.
-///
-/// Three things were wrong with it being there, and all three are why the rule
-/// now lives here, beside the field it constrains:
-///
-/// - **It was invisible.** A guest asking for a dispatch type this device has no
-///   contract for got a *serial* encoder and no line anywhere. Serial and
-///   concurrent differ in whether Metal may overlap the dispatches in a segment,
-///   so the substitution is a real change to what the guest asked for.
-/// - **It made a written refusal unreachable.** `backend::metal::compute`'s
-///   `mtl_dispatch_type` returns `None` for an unrecognised ordinal and its
-///   caller declines with `metal_compute_dispatch_type_invalid` — a typed
-///   refusal that could never fire, because the only producer feeding it had
-///   already replaced every unrecognised value with `Serial`.
-/// - **It only ran on one arm.** `execute_dispatch_metal` is
-///   `backend-metal`-gated, so on a Vulkan host the field was accepted, stored
-///   and then read by nobody. The value is a *guest contract* fact, not a
-///   backend one, so both arms now score it the same way and the check runs on
-///   the pathway this repository can boot.
-///
-/// The substitution is kept rather than turned into a decline, deliberately. The
-/// Metal SDK's `MTLDispatchType` has exactly `Serial` and `Concurrent`, so an
-/// out-of-range ordinal here is far more likely to be *this device* reading the
-/// wrong wire offset than a guest asking for something new — and declining the
-/// dispatch would turn a decode bug into lost guest work on a pathway no boot
-/// available here can exercise. So it is reported and counted first. If
-/// `compute_dispatch_type_unknown` is ever seen, the evidence to decide arrives
-/// before the behaviour change does.
-fn accepted_dispatch_type(task_id: u32, declared: u32) -> u32 {
-    use crate::protocol::dispatch::{
-        is_declared_dispatch_type, MTL_DISPATCH_TYPE_CONCURRENT, MTL_DISPATCH_TYPE_SERIAL,
-    };
-    if is_declared_dispatch_type(declared) {
-        return declared;
-    }
-    // Counted per occurrence, reported once per value: the magnitude belongs to
-    // the counter, and a second line for the same ordinal says nothing the first
-    // did not.
-    crate::runtime::drain::note_store_route("compute_dispatch_type_unknown");
-    if crate::observe::first_sight("compute_dispatch_type_unknown", u64::from(declared)) {
-        crate::observe::fail(format!(
-            "compute_dispatch_type reason=compute_dispatch_type_unknown task={task_id} \
-             declared={declared} (the segment is encoded Serial; MTLDispatchType has only \
-             Serial={MTL_DISPATCH_TYPE_SERIAL} and \
-             Concurrent={MTL_DISPATCH_TYPE_CONCURRENT})"
-        ));
-    }
-    MTL_DISPATCH_TYPE_SERIAL
+/// The control-flow SPI and the two indirect-command executions open and drive
+/// the segment's multi-record encoder, and this device decodes them itself
+/// because the ledger has no contract for them to lift against. They are kept
+/// out of [`apply_record`] rather than folded into it: a settled record and an
+/// unsettled one are different claims, and a single entry point taking both
+/// would be the place a reader stops being able to tell which is which.
+pub fn apply_sequencing_record<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    cmd: &ComputeCommand,
+    seg: &mut crate::runtime::compute_session::ComputeSegment,
+) -> ComputeStatus {
+    let started = std::time::Instant::now();
+    let out = crate::runtime::compute_session::apply_sequencing(state, host, task_id, cmd, seg);
+    crate::runtime::drain::note_drain_phase(crate::runtime::drain::DrainPhase::Compute, started);
+    out
 }
 
 fn apply_record_inner<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    cmd: &ComputeCommand,
+    record: &ComputeRecord<'_>,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) -> Option<ComputeStatus> {
-    match cmd.kind {
-        Kind::Pipeline => {
-            seg.acc.set_pipeline(cmd.pipeline_ref);
+    match record {
+        ComputeRecord::SetPipeline(r) => {
+            seg.acc.set_pipeline(r.pipeline_ref);
             None
         }
-        Kind::BufferBind | Kind::BufferBindAttributeStride => {
-            seg.acc.bind_buffers(cmd.first, &cmd.buffers);
+        // The two plural buffer binds reach one setter because the accumulator
+        // owns what an entry becomes; the stride's presence rides in the entry
+        // type rather than in a flag beside it.
+        ComputeRecord::BindBuffers(r) => {
+            seg.acc.bind_buffers(r.first, r.entries);
             None
         }
-        Kind::BufferOffset => {
-            seg.acc
-                .set_buffer_offset(cmd.first, cmd.buffer_offset, None);
+        ComputeRecord::BindBuffersWithStride(r) => {
+            seg.acc.bind_buffers(r.first, r.entries);
             None
         }
-        Kind::BufferOffsetAttributeStride => {
-            seg.acc
-                .set_buffer_offset(cmd.first, cmd.buffer_offset, Some(cmd.attribute_stride));
+        // One arm for both rebind forms: `stride` is `None` on the record that
+        // carries no stride field, which is exactly the argument the setter
+        // takes.
+        ComputeRecord::RebindBufferOffset(r) => {
+            seg.acc.set_buffer_offset(r.index, r.offset, r.stride);
             None
         }
-        Kind::TextureBind => {
-            seg.acc.bind_textures(cmd.first, &cmd.textures);
+        ComputeRecord::BindTextures(r) => {
+            seg.acc.bind_textures(r.first, r.entries);
             None
         }
-        Kind::SamplerBind | Kind::SamplerLod => {
-            seg.acc.bind_samplers(cmd.first, &cmd.samplers);
+        ComputeRecord::BindSamplers(r) => {
+            seg.acc.bind_samplers(r.first, r.entries);
             None
         }
-        Kind::DispatchType => {
-            seg.acc.dispatch_type = accepted_dispatch_type(task_id, cmd.dispatch_type);
+        ComputeRecord::BindSamplersWithLod(r) => {
+            seg.acc.bind_samplers(r.first, r.entries);
             None
         }
-        Kind::StageInRegion => {
+        ComputeRecord::WriteDescriptor(r) => {
+            seg.acc.dispatch_type = r.dispatch_type;
+            None
+        }
+        ComputeRecord::SetStageInRegion(r) => {
             seg.acc.set_stage_in_region(StageInRegion {
-                origin_x: cmd.stage_in_region.origin.x,
-                origin_y: cmd.stage_in_region.origin.y,
-                origin_z: cmd.stage_in_region.origin.z,
-                size_x: cmd.stage_in_region.size.x,
-                size_y: cmd.stage_in_region.size.y,
-                size_z: cmd.stage_in_region.size.z,
+                origin_x: r.origin.x,
+                origin_y: r.origin.y,
+                origin_z: r.origin.z,
+                size_x: r.size.width,
+                size_y: r.size.height,
+                size_z: r.size.depth,
             });
             None
         }
-        Kind::StageInRegionIndirect => {
-            seg.acc.set_stage_in_region_indirect(
-                cmd.stage_in_indirect_buffer_ref,
-                cmd.stage_in_indirect_buffer_offset,
-            );
-            None
-        }
-        Kind::ThreadgroupMemory => {
-            seg.acc.set_threadgroup_memory(
-                cmd.threadgroup_memory_index,
-                cmd.threadgroup_memory_length,
-            );
-            None
-        }
-        Kind::ImageblockDimensions => {
+        ComputeRecord::SetStageInRegionIndirect(r) => {
             seg.acc
-                .set_imageblock(cmd.imageblock_width, cmd.imageblock_height);
+                .set_stage_in_region_indirect(r.source.buffer_ref, r.source.offset);
             None
         }
-        Kind::DispatchThreadgroups
-        | Kind::DispatchThreads
-        | Kind::DispatchThreadgroupsIndirect
-        | Kind::DispatchThreadsIndirect => {
+        ComputeRecord::SetThreadgroupMemory(r) => {
+            seg.acc.set_threadgroup_memory(r.index, r.length);
+            None
+        }
+        ComputeRecord::SetImageblockSize(r) => {
+            seg.acc.set_imageblock(r.width, r.height);
+            None
+        }
+        ComputeRecord::Dispatch(dispatch) => {
             if seg.block.is_some() {
                 return Some(ComputeStatus::Unsupported("dispatch_in_sequencing_block"));
             }
@@ -843,86 +897,14 @@ fn apply_record_inner<M: HostMemory + HostOps>(
             if let Some(sess) = seg.session.as_mut() {
                 return Some(
                     crate::backend::selected()
-                        .execute_dispatch_nested(state, host, task_id, &seg.acc, cmd, sess),
+                        .execute_dispatch_nested(state, host, task_id, &seg.acc, dispatch, sess),
                 );
             }
-            Some(crate::backend::selected().execute_dispatch(state, host, task_id, &seg.acc, cmd))
+            Some(
+                crate::backend::selected()
+                    .execute_dispatch(state, host, task_id, &seg.acc, dispatch),
+            )
         }
-        // Five kinds the product answers by doing nothing, each counted
-        // separately. `None` here is also what every state-accumulating record
-        // above returns, so a no-op and a drop are the same silence — and these
-        // are the records where the difference matters, because unlike a
-        // `BufferBind` they carry ordering the guest expects us to honour.
-        //
-        // The barrier group is a deliberate no-op and the reason is structural:
-        // the product submits one dispatch at a time and waits, so every
-        // resource and scope barrier the guest asks for is already implied by
-        // the boundary between two records. `UseHeaps`/`UseResources` are
-        // residency hints for a driver that pages resources; we resolve every
-        // binding per dispatch, so there is nothing for them to keep resident.
-        // These counters exist to price that argument, not to doubt it — if
-        // they are large, the per-record submit is what they are the cost of.
-        //
-        // That argument is load-bearing in a way it did not look, and the
-        // capture now says how much traffic rests on it. Under
-        // `-setSupportsComputePassDescriptorDispatchType:` Apple's serializer
-        // emits a scope barrier — `0xd7`, `Buffers|Textures` — after **every**
-        // dispatch and every ICB execution of a serial pass, measured on all six
-        // selectors (`reims_vgpu_wire::ops::compute::OPCODE_MEMORY_BARRIER_SCOPE`, and
-        // `reims_vgpu_wire::ops::compute::MemoryBarrierScope` carries the
-        // derivation). So a guest that negotiates that flag doubles this rail's
-        // record count and every second record lands here. The no-op stays
-        // right, and on the Vulkan arm it is stronger than "pass granularity":
-        // `backend::vulkan::engine::exec_compute::execute_compute_inner` begins,
-        // ends and submits one command buffer per dispatch, so consecutive
-        // dispatches are separated by a queue submission rather than by a
-        // barrier inside one. `compute_noop_barrier` reading high is that
-        // capability being on, not a defect.
-        //
-        // The fence pair has no such argument and never had one; it sat in the
-        // barrier group's arm without sharing its comment. An `MTLFence` update
-        // or wait inside a compute encoder is ordering the guest stated
-        // explicitly, and nothing else in the crate handles these two kinds —
-        // `fence_exec` serves the event rail, not this one. If either counter
-        // is non-zero, that is guest-stated ordering we are discarding, and it
-        // wants a contract answer rather than another counter.
-        Kind::UpdateFence => {
-            crate::runtime::drain::note_store_route("compute_noop_update_fence");
-            None
-        }
-        Kind::WaitFence => {
-            crate::runtime::drain::note_store_route("compute_noop_wait_fence");
-            None
-        }
-        Kind::BarrierResources | Kind::BarrierScope => {
-            crate::runtime::drain::note_store_route("compute_noop_barrier");
-            None
-        }
-        Kind::UseHeaps | Kind::UseResources => {
-            note_residency_declaration(
-                cmd.kind == Kind::UseHeaps,
-                cmd.opcode,
-                cmd.count,
-                cmd.resource_usage,
-            );
-            None
-        }
-        Kind::CompressedTextureFlush => {
-            crate::runtime::drain::note_store_route("compute_noop_compressed_flush");
-            None
-        }
-        Kind::ControlStartDoWhile
-        | Kind::ControlEndDoWhile
-        | Kind::ControlStartWhile
-        | Kind::ControlEndWhile
-        | Kind::ControlStartIf
-        | Kind::ControlStartElse
-        | Kind::ControlEndIf
-        | Kind::ExecuteCommandsInBuffer
-        | Kind::ExecuteCommandsInBufferIndirect => Some(
-            crate::runtime::compute_session::apply_sequencing(state, host, task_id, cmd, seg),
-        ),
-        Kind::Unknown => None,
     }
 }
 
@@ -1004,6 +986,19 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
     };
     match decoded {
         ResourceDescriptor::ComputePipeline(cp) if cp.kernel_func_ref != 0 => {
+            // The slot holds a compute pipeline, so the model can hold its name
+            // — and its destroy arrives after the guest has cleared the slot,
+            // which makes this the only moment. Inside the arm that has decided
+            // what the descriptor *is*: a serializer object of some other
+            // subtype is not this kind and must not be named as one.
+            crate::runtime::objects::note_named_at_construction(
+                state,
+                host,
+                task_id,
+                pipeline_ref,
+                "compute_pipeline_model_named",
+                "compute_pipeline_model_unnamed",
+            );
             // A descriptor that named more entries than the decoder kept refuses
             // the whole pipeline. Dropping only the stage-input is not "failing
             // closed": `stage_input: None` is what a kernel declaring no
@@ -1142,9 +1137,9 @@ pub(crate) fn stage_buffer_with_extent<M: HostMemory + HostOps>(
                 )),
                 match rung {
                     objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        String::new()
-                    }
+                    objects::LadderRung::NoListEntry
+                    | objects::LadderRung::DescRead { .. }
+                    | objects::LadderRung::NoTaskSpace => String::new(),
                 },
             )
         }
@@ -2388,9 +2383,9 @@ pub(crate) fn stage_texture_raw<R: RailStage, M: HostMemory + HostOps>(
                 )),
                 match rung {
                     objects::LadderRung::WrongType { got } => format!("ot={got}"),
-                    objects::LadderRung::NoListEntry | objects::LadderRung::DescRead { .. } => {
-                        String::new()
-                    }
+                    objects::LadderRung::NoListEntry
+                    | objects::LadderRung::DescRead { .. }
+                    | objects::LadderRung::NoTaskSpace => String::new(),
                 },
             );
         }
@@ -3344,6 +3339,8 @@ use reims_vgpu_protocol::extent::Extent3;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub mod metal;
 #[cfg(feature = "backend-vulkan")]
+pub mod stall_watchdog;
+#[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
 // The two constructors are free functions here rather than an inherent `impl`
@@ -3352,13 +3349,13 @@ pub mod vulkan;
 // rule says so. The extent type stays shared; only the narrowing that produces
 // it from *this* device's wire belongs to this decoder.
 
-/// An [`Extent3`] from a decoded wire `Size3`, refusing each component out of
+/// An [`Extent3`] from a lifted record extent, refusing each component out of
 /// range.
-fn extent_from_wire(s: crate::runtime::decode::compute::Size3) -> Result<Extent3, ComputeStatus> {
+fn extent_from_wire(s: RecordExtent) -> Result<Extent3, ComputeStatus> {
     Ok(Extent3 {
-        x: u32_dim(s.x)?,
-        y: u32_dim(s.y)?,
-        z: u32_dim(s.z)?,
+        x: u32_dim(s.width)?,
+        y: u32_dim(s.height)?,
+        z: u32_dim(s.depth)?,
     })
 }
 
@@ -3394,7 +3391,7 @@ fn resolve_dispatch_dims_reported<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    cmd: &ComputeCommand,
+    dispatch: &DispatchRecord,
     acc: &ComputeAccum,
 ) -> Result<DispatchDims, ComputeStatus> {
     // A bind the accumulator could not hold refuses the dispatch here, before
@@ -3408,7 +3405,7 @@ fn resolve_dispatch_dims_reported<M: HostMemory + HostOps>(
     if let Some(over) = acc.refused_bind {
         let (index, arg, cap) = over.parts();
         crate::observe::Emit::decline("compute_dispatch", &over)
-            .field("kind", format!("{:?}", cmd.kind))
+            .field("kind", format!("{:?}", dispatch_kind(dispatch)))
             .field("refused_index", index)
             .field("refused_arg", arg)
             .field("table", cap)
@@ -3417,64 +3414,86 @@ fn resolve_dispatch_dims_reported<M: HostMemory + HostOps>(
             "compute_dispatch_bind_past_table",
         ));
     }
-    resolve_dispatch_dims(state, host, task_id, cmd).inspect_err(|e| {
+    resolve_dispatch_dims(state, host, task_id, dispatch).inspect_err(|e| {
+        // The extents come from whichever the record actually carries. An
+        // indirect dispatch states no grid, and the flat command reported one
+        // anyway — three zeroes that read as a grid the guest asked for.
+        let (grid, threadgroup) = match dispatch {
+            DispatchRecord::Threadgroups(r) => (Some(r.groups), Some(r.threads_per_group)),
+            DispatchRecord::Threads(r) => (Some(r.threads), Some(r.threads_per_group)),
+            DispatchRecord::ThreadgroupsIndirect(r) => (None, Some(r.threads_per_group)),
+            DispatchRecord::ThreadsIndirect(_) => (None, None),
+        };
+        let extent = |e: Option<RecordExtent>| {
+            e.map_or_else(
+                || "from-buffer".to_string(),
+                |e| format!("[{},{},{}]", e.width, e.height, e.depth),
+            )
+        };
         crate::observe::line(format!(
-            "compute_resolve_dims fail {e:?} kind={:?} grid=[{},{},{}] tg=[{},{},{}] ntex={}",
-            cmd.kind,
-            cmd.grid.x,
-            cmd.grid.y,
-            cmd.grid.z,
-            cmd.threads_per_threadgroup.x,
-            cmd.threads_per_threadgroup.y,
-            cmd.threads_per_threadgroup.z,
+            "compute_resolve_dims fail {e:?} kind={:?} grid={} tg={} ntex={}",
+            dispatch_kind(dispatch),
+            extent(grid),
+            extent(threadgroup),
             acc.textures.len()
         ));
     })
 }
 
+/// Which of the four dispatches this is, for a line that reports one.
+fn dispatch_kind(dispatch: &DispatchRecord) -> reims_vgpu_protocol::compute::ComputeKind {
+    ComputeRecord::Dispatch(*dispatch).kind()
+}
+
 /// Resolve grid/threadgroup dims for direct or indirect dispatches.
+///
+/// Total over the four dispatches: there is no "not a dispatch" arm left to
+/// refuse, because a record that is not one cannot be passed. `DispatchRecord`
+/// carries exactly the fields its own form has — the fully indirect dispatch
+/// has no threadgroup extent at all, where the flat command carried a zeroed
+/// one — so no arm reads a field the record did not state.
 fn resolve_dispatch_dims<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    cmd: &ComputeCommand,
+    dispatch: &DispatchRecord,
 ) -> Result<DispatchDims, ComputeStatus> {
-    match cmd.kind {
+    match dispatch {
         // Every dimension comes from the wire. `u32_dim` refuses `0` and
         // anything past `u32::MAX` with `BadGrid("compute_grid_dim_range")`, so
         // a malformed grid is a named refusal rather than a substitution.
-        Kind::DispatchThreadgroups => Ok(DispatchDims {
-            grid: extent_from_wire(cmd.grid)?,
-            threadgroup: extent_from_wire(cmd.threads_per_threadgroup)?,
+        DispatchRecord::Threadgroups(r) => Ok(DispatchDims {
+            grid: extent_from_wire(r.groups)?,
+            threadgroup: extent_from_wire(r.threads_per_group)?,
             dispatch_threads: false,
         }),
-        Kind::DispatchThreads => Ok(DispatchDims {
-            grid: extent_from_wire(cmd.grid)?,
-            threadgroup: extent_from_wire(cmd.threads_per_threadgroup)?,
+        DispatchRecord::Threads(r) => Ok(DispatchDims {
+            grid: extent_from_wire(r.threads)?,
+            threadgroup: extent_from_wire(r.threads_per_group)?,
             dispatch_threads: true,
         }),
-        Kind::DispatchThreadgroupsIndirect => {
+        DispatchRecord::ThreadgroupsIndirect(r) => {
             let raw = read_buffer_window(
                 state,
                 host,
                 task_id,
-                cmd.indirect_buffer_ref,
-                cmd.indirect_buffer_offset,
+                r.source.buffer_ref,
+                r.source.offset,
                 INDIRECT_THREADGROUPS_ARGS_LEN,
             )?;
             Ok(DispatchDims {
                 grid: extent_from_indirect(&raw, 0)?,
-                threadgroup: extent_from_wire(cmd.threads_per_threadgroup)?,
+                threadgroup: extent_from_wire(r.threads_per_group)?,
                 dispatch_threads: false,
             })
         }
-        Kind::DispatchThreadsIndirect => {
+        DispatchRecord::ThreadsIndirect(r) => {
             let raw = read_buffer_window(
                 state,
                 host,
                 task_id,
-                cmd.indirect_buffer_ref,
-                cmd.indirect_buffer_offset,
+                r.source.buffer_ref,
+                r.source.offset,
                 INDIRECT_THREADS_ARGS_LEN,
             )?;
             // MTLDispatchThreadsIndirectArguments: threadsPerGrid[3], threadsPerThreadgroup[3].
@@ -3484,80 +3503,8 @@ fn resolve_dispatch_dims<M: HostMemory + HostOps>(
                 dispatch_threads: true,
             })
         }
-        _ => Err(ComputeStatus::Unsupported("resolve_dims_unknown_kind")),
     }
 }
 
 #[cfg(test)]
 mod tests;
-
-/// A compute residency declaration whose usage the no-op argument does not
-/// cover.
-///
-/// The reasoning and the vocabulary are the render rail's — see
-/// `runtime::exec::report::ResidencyWriteDeclared`, which carries it — with one
-/// difference this rail owns. The compute encoder inherits only the
-/// **unqualified** residency selectors, so no record here carries a stage
-/// argument and there is no stage half to report; the usage half is the whole
-/// declaration, and it is the half that decides whether answering by doing
-/// nothing is sound.
-struct ComputeResidencyDeclared {
-    opcode: u32,
-    count: u32,
-    usage: reims_vgpu_protocol::residency::ResourceUsage,
-}
-
-impl crate::observe::Decline for ComputeResidencyDeclared {
-    fn slug(&self) -> &'static str {
-        use reims_vgpu_protocol::residency::UsageClass;
-        match self.usage.classify() {
-            UsageClass::Undeclared => "compute_residency_usage_undeclared",
-            _ => "compute_residency_write_dropped",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        vec![
-            ("op", format!("{:#x}", self.opcode)),
-            ("count", self.count.to_string()),
-            ("usage", format!("{:#x}", self.usage.0)),
-            (
-                "undeclared_usage",
-                format!("{:#x}", self.usage.undeclared_bits()),
-            ),
-        ]
-    }
-}
-
-/// Price one compute residency declaration by what it declared.
-fn note_residency_declaration(
-    is_heap: bool,
-    opcode: u32,
-    count: u32,
-    usage: reims_vgpu_protocol::residency::ResourceUsage,
-) {
-    use reims_vgpu_protocol::residency::UsageClass;
-    let class = usage.classify();
-    crate::runtime::drain::note_store_route(match (is_heap, class) {
-        // The heap form carries no usage argument, so there is no class to
-        // report — the route says only that a heap was declared.
-        (true, _) => "compute_residency_heap",
-        (false, UsageClass::Empty) => "compute_residency_empty",
-        (false, UsageClass::ReadOnly) => "compute_residency_read",
-        (false, UsageClass::Writes) => "compute_residency_write",
-        (false, UsageClass::Undeclared) => "compute_residency_undeclared",
-    });
-    if is_heap || matches!(class, UsageClass::Empty | UsageClass::ReadOnly) {
-        return;
-    }
-    // A dispatch writing through a path this rail did not bind loses content
-    // the guest expects to read back, which is not what a residency *hint*
-    // costs. Latched on the declaration: the same kernel asks for the same
-    // thing every frame, and a second shape is the event.
-    let decline = ComputeResidencyDeclared {
-        opcode,
-        count,
-        usage,
-    };
-    crate::observe::Emit::decline("compute_residency", &decline).fail_once(u64::from(usage.0));
-}

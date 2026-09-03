@@ -1,6 +1,22 @@
 use super::*;
 
 use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86, PAGE_SIZE_ARM64E};
+
+/// `process_child_packet` as a caller holding the packet at its ring position
+/// calls it: with no submission read ahead of time, so the exec arm reads its
+/// own.
+///
+/// Shadows the glob-imported one on purpose. Every test in this file is about
+/// what an arm does with a packet's bytes, and none is about where the command
+/// buffers came from — spelling `None` seventy times would say the opposite.
+fn process_child_packet<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    channel_id: u32,
+    packet: &Packet,
+) -> ChildPacketDisposition {
+    super::process_child_packet(state, host, channel_id, packet, None)
+}
 use crate::protocol::fifo::{
     DeviceInfoForm, CHILD_SHARED_STATE_INDEX, CHILD_SHARED_STATE_LEN, CHILD_SHARED_STATE_PFN,
     DEFINE_TASK_LEN, SET_OBJECT_LIST_LEN,
@@ -1048,7 +1064,7 @@ fn translation_deferred_holds_sibling_unmap_head_and_stamp() {
     host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
     state.gfx.root_page = root_pfn;
     state.gfx.fifo_base_page = stamp_pfn;
-    state.active_child_mask = producer_bit | sibling_bit;
+    state.open_child_domains_for_test(producer_bit | sibling_bit);
     state.pending.child_mask = sibling_bit;
     state.translation_deferred_mask = producer_bit;
 
@@ -1171,7 +1187,7 @@ fn define_fifo_forgets_the_previous_occupants_translation_state() {
         },
     );
 
-    assert_eq!(state.active_child_mask & bit, bit, "the channel is open");
+    assert!(state.child_domain_open(1), "the channel is open");
     assert_eq!(state.translation_deferred_mask & bit, 0);
     assert_eq!(state.translation_order_hold_mask & bit, 0);
     assert_eq!(state.present_translation_hold_mask & bit, 0);
@@ -1182,6 +1198,475 @@ fn define_fifo_forgets_the_previous_occupants_translation_state() {
     );
 }
 
+/// A channel-lifetime command naming a domain this device has no FIFO for says
+/// so.
+///
+/// Dropped in silence before: the arm gated on [`is_child_channel`] with an
+/// `Ok(_) => {}` beside it, so a guest opening channel 0 or channel 32 set no
+/// mask bit, got no ring drained, and was never told. Every packet it then
+/// queued there carries a completion word nothing will publish, which is a hang
+/// the log had nothing in it about — the same defect
+/// `channel_id_or_refusal` was written to close at the doorbell handlers, on the
+/// one path that still had it.
+#[test]
+fn a_channel_lifetime_outside_the_channel_range_is_reported() {
+    // The root FIFO's own number and the first above the bound: `0` is not a
+    // child and `MAX_CHANNELS` is one past the last, so both are ids the guest
+    // can write and this device cannot drain.
+    for channel in [0u32, crate::model::MAX_CHANNELS as u32] {
+        for opcode in [ROOT_OP_DEFINE_FIFO, ROOT_OP_FREE_FIFO] {
+            let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+            let mut host = FakeHost::new();
+            let before = state.open_child_mask();
+            let cap = crate::observe::FailCapture::start();
+            process_root_packet(
+                &mut state,
+                &mut host,
+                &Packet {
+                    opcode,
+                    stamp_waits: Vec::new(),
+                    total_size: PACKET_HEADER_LEN + 4,
+                    completion_stamp: 0,
+                    payload: channel.to_le_bytes().to_vec(),
+                    next_head: 0,
+                },
+            );
+            let lines = cap.lines();
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("channel_lifetime_out_of_range")
+                        && l.contains(&format!("channel={channel}"))),
+                "channel {channel} on {opcode:#x} said nothing: {lines:?}"
+            );
+            assert_eq!(
+                state.open_child_mask(),
+                before,
+                "an out-of-range id must move no mask bit"
+            );
+        }
+    }
+}
+
+/// A channel definition opens the domain in the semantic model, and nothing
+/// else on this device does.
+///
+/// The cutover's own assertion. Openness used to be a `DeviceState` field that
+/// three events wrote — a definition, a locked doorbell register write, and a
+/// lock-free ring — and the two doorbell events wrote it for a different
+/// question. Each of the three is driven here and only the definition may move
+/// the answer; the doorbells must move the pending-work mask instead, which is
+/// the question they actually answer.
+#[test]
+fn a_definition_opens_the_domain_in_the_model_and_a_doorbell_does_not() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let channel = 4u32;
+    let bit = 1u32 << channel;
+
+    // A lock-free ring.
+    state
+        .gfx
+        .child_doorbell_rung
+        .store(bit, std::sync::atomic::Ordering::Release);
+    crate::runtime::drain::fold_rung_child_doorbells(&mut state);
+    assert_eq!(
+        state.pending.child_mask & bit,
+        bit,
+        "a ring is work waiting on the domain"
+    );
+    assert!(
+        !state.child_domain_open(channel),
+        "and it is not a claim that the guest defined one"
+    );
+    assert_eq!(
+        state.drainable_child_mask() & bit,
+        bit,
+        "the union the drain walks still holds it, which is what a ring is for"
+    );
+
+    // The definition, which is the model's one event for openness.
+    let transition = |state: &mut DeviceState, host: &mut FakeHost, opcode| {
+        process_root_packet(
+            state,
+            host,
+            &Packet {
+                opcode,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN + 4,
+                completion_stamp: 0,
+                payload: channel.to_le_bytes().to_vec(),
+                next_head: 0,
+            },
+        );
+    };
+    transition(&mut state, &mut host, ROOT_OP_DEFINE_FIFO);
+    assert!(state.child_domain_open(channel));
+    assert_eq!(state.open_child_mask() & bit, bit);
+
+    // The free takes it back, and takes the pending bit with it — an open is
+    // not a claim that nothing is pending, but a free is.
+    transition(&mut state, &mut host, ROOT_OP_FREE_FIFO);
+    assert!(!state.child_domain_open(channel));
+    assert_eq!(state.pending.child_mask & bit, 0);
+    assert_eq!(state.drainable_child_mask() & bit, 0);
+}
+
+/// The two channel transitions the replacement model refuses and this device
+/// performs are counted apart from the ones it agrees with.
+///
+/// Neither refusal withholds a completion word, so neither is a hang. Each is an
+/// effect that would not happen — a redefinition that does not reset the
+/// channel, a free that leaves the domain open — and whether this guest sends
+/// either is the term the first group's cutover turns on.
+#[test]
+fn the_channel_transitions_the_model_would_refuse_are_counted_apart() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let channel = 2u32;
+    let transition = |state: &mut DeviceState, host: &mut FakeHost, opcode| {
+        process_root_packet(
+            state,
+            host,
+            &Packet {
+                opcode,
+                stamp_waits: Vec::new(),
+                total_size: PACKET_HEADER_LEN + 4,
+                completion_stamp: 0,
+                payload: channel.to_le_bytes().to_vec(),
+                next_head: 0,
+            },
+        );
+    };
+
+    let agrees = store_route_count("channel_transition_model_agrees");
+    let reopen = store_route_count("channel_open_of_open_domain");
+    let orphan_free = store_route_count("channel_free_of_undefined_domain");
+
+    // A free before any definition: the model has nothing to remove.
+    transition(&mut state, &mut host, ROOT_OP_FREE_FIFO);
+    assert_eq!(
+        (
+            store_route_count("channel_transition_model_agrees"),
+            store_route_count("channel_free_of_undefined_domain"),
+        ),
+        (agrees, orphan_free + 1),
+    );
+
+    // The first definition is the one both agree on.
+    transition(&mut state, &mut host, ROOT_OP_DEFINE_FIFO);
+    assert_eq!(
+        store_route_count("channel_transition_model_agrees"),
+        agrees + 1,
+    );
+
+    // The second, over a domain still open, is the one the model refuses —
+    // while this device resets the channel through `forget_child_channel`.
+    transition(&mut state, &mut host, ROOT_OP_DEFINE_FIFO);
+    assert_eq!(
+        (
+            store_route_count("channel_transition_model_agrees"),
+            store_route_count("channel_open_of_open_domain"),
+        ),
+        (agrees + 1, reopen + 1),
+    );
+
+    // And the free that follows a definition is agreed on again.
+    transition(&mut state, &mut host, ROOT_OP_FREE_FIFO);
+    assert_eq!(
+        (
+            store_route_count("channel_transition_model_agrees"),
+            store_route_count("channel_open_of_open_domain"),
+            store_route_count("channel_free_of_undefined_domain"),
+        ),
+        (agrees + 2, reopen + 1, orphan_free + 1),
+    );
+}
+
+/// Every packet this device dispatches is counted under the class the model
+/// would read it as, and an unclassifiable one is counted apart.
+///
+/// The last group's denominator. `SessionModel::admit` refuses `UnknownCommand`
+/// and `UnestablishedContract`, and both are `classify` answering `None` — so a
+/// boot's reading on `packet_class_unclassified` is how many whole packets the
+/// ordering group would refuse where this device acts.
+#[test]
+fn every_dispatched_packet_is_counted_under_the_class_the_model_reads_it_as() {
+    use crate::model::{CHILD_OP_NOP, ROOT_OP_DEFINE_FIFO};
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+
+    let control = store_route_count("packet_class_control");
+    let unclassified = store_route_count("packet_class_unclassified");
+
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEFINE_FIFO,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 4,
+            completion_stamp: 0,
+            payload: 1u32.to_le_bytes().to_vec(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        (
+            store_route_count("packet_class_control"),
+            store_route_count("packet_class_unclassified"),
+        ),
+        (control + 1, unclassified),
+        "a channel definition is control, and the model reads it as such"
+    );
+
+    // An opcode the ledger has no row for. The model would refuse the whole
+    // packet; this device reaches its own unknown-opcode arm.
+    let _ = process_child_packet(
+        &mut state,
+        &mut host,
+        1,
+        &Packet {
+            opcode: 0x0fff,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN,
+            completion_stamp: 0,
+            payload: Vec::new(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        (
+            store_route_count("packet_class_control"),
+            store_route_count("packet_class_unclassified"),
+        ),
+        (control + 1, unclassified + 1),
+        "and an opcode with no row is counted apart rather than into a class"
+    );
+
+    // A no-op is classified, which is what makes the counter above a finding
+    // rather than the default for anything this test did not set up.
+    let nop = store_route_count("packet_class_control");
+    let _ = process_child_packet(
+        &mut state,
+        &mut host,
+        1,
+        &Packet {
+            opcode: CHILD_OP_NOP,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN,
+            completion_stamp: 0,
+            payload: Vec::new(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        store_route_count("packet_class_control"),
+        nop + 1,
+        "an acknowledged no-op is a control command and not an unknown one"
+    );
+}
+
+/// A lifetime command names a task, and the census tells a defined one from a
+/// task this device made up on the spot.
+///
+/// The group's remaining gate. `Lifecycle::apply` refuses `NoSuchTask` for
+/// eleven of the twelve commands, and the refusal loses the whole packet — so
+/// what a driven boot has to say is that the guest never sends one. The unmap
+/// below is the case that has no ref to resolve, which is why it is the one that
+/// can reach the refusal at all: the eight commands that resolve something do it
+/// through the same namespace the apply reads.
+#[test]
+fn a_lifetime_command_on_an_undefined_task_is_told_apart_from_one_on_a_defined_task() {
+    use crate::model::{CHILD_OP_UNMAP_MEMORY, ROOT_OP_DEFINE_TASK2};
+    use crate::protocol::fifo;
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    const TASK: u32 = 3;
+
+    let mut notice = vec![0u8; fifo::MAP_MEMORY_LEN];
+    notice[fifo::MAP_MEMORY_TASK_ID..fifo::MAP_MEMORY_TASK_ID + 4]
+        .copy_from_slice(&TASK.to_le_bytes());
+    notice[fifo::MAP_MEMORY_GVA..fifo::MAP_MEMORY_GVA + 8]
+        .copy_from_slice(&0x0000_7f12_3456_1000u64.to_le_bytes());
+    notice[fifo::MAP_MEMORY_LENGTH..fifo::MAP_MEMORY_LENGTH + 8]
+        .copy_from_slice(&0x1000u64.to_le_bytes());
+    let unmap = Packet {
+        opcode: CHILD_OP_UNMAP_MEMORY,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN + u32::try_from(notice.len()).expect("small"),
+        completion_stamp: 0,
+        payload: notice,
+        next_head: 0,
+    };
+
+    let defined = store_route_count("lifetime_command_in_a_defined_task");
+    let undefined = store_route_count("lifetime_command_in_an_undefined_task");
+    let _ = process_child_packet(&mut state, &mut host, 1, &unmap);
+    assert_eq!(
+        (
+            store_route_count("lifetime_command_in_a_defined_task"),
+            store_route_count("lifetime_command_in_an_undefined_task"),
+        ),
+        (defined, undefined + 1),
+        "no definition opened this task, so the lifecycle owner would refuse the packet"
+    );
+
+    let mut define = vec![0u8; fifo::DEFINE_TASK_LEN];
+    define[..4].copy_from_slice(
+        &fifo::DefineTaskId {
+            task_id: TASK,
+            kernel: false,
+        }
+        .to_raw()
+        .to_le_bytes(),
+    );
+    define[fifo::DEFINE_TASK_DIRECTORY_PFN..fifo::DEFINE_TASK_DIRECTORY_PFN + 4]
+        .copy_from_slice(&0x1000u32.to_le_bytes());
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEFINE_TASK2,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + u32::try_from(define.len()).expect("small"),
+            completion_stamp: 0,
+            payload: define,
+            next_head: 0,
+        },
+    );
+    assert!(state.tasks.is_active(TASK), "the definition opened it");
+    // The definition itself is not counted: it is the event that makes the task
+    // hold, so asking whether it already held would count every first
+    // definition as a refusal of a packet the model accepts.
+    assert_eq!(
+        (
+            store_route_count("lifetime_command_in_a_defined_task"),
+            store_route_count("lifetime_command_in_an_undefined_task"),
+        ),
+        (defined, undefined + 1),
+        "a task definition is not a command against a task"
+    );
+
+    let _ = process_child_packet(&mut state, &mut host, 1, &unmap);
+    assert_eq!(
+        (
+            store_route_count("lifetime_command_in_a_defined_task"),
+            store_route_count("lifetime_command_in_an_undefined_task"),
+        ),
+        (defined + 1, undefined + 1),
+        "and now the same packet names a task the model holds"
+    );
+}
+
+/// A doorbell makes a domain live and a definition makes it *defined*, and the
+/// census tells the two apart on a device where one mask holds both.
+///
+/// The distinction is the whole reason the field exists. `SessionModel::admit`
+/// gates on the definition alone, so a boot that put work on doorbell-only
+/// domains would be a boot this cutover hangs. The old `active_child_mask`
+/// is the union of three events and cannot answer that after the fact.
+#[test]
+fn a_packet_on_a_doorbell_only_domain_is_told_apart_from_one_on_a_defined_domain() {
+    use crate::runtime::drain::store_route_count;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let channel = 1u32;
+    let bit = 1u32 << channel;
+
+    // The lock-free ring: the domain becomes live with no definition anywhere.
+    state
+        .gfx
+        .child_doorbell_rung
+        .store(bit, std::sync::atomic::Ordering::Release);
+    crate::runtime::drain::fold_rung_child_doorbells(&mut state);
+    assert_eq!(
+        state.pending.child_mask & bit,
+        bit,
+        "a ring makes the domain drainable"
+    );
+    assert_eq!(
+        u32::from(state.child_domain_open(channel)) * bit,
+        0,
+        "and says nothing about a definition"
+    );
+
+    let defined = store_route_count("child_packet_domain_defined");
+    let undefined = store_route_count("child_packet_domain_undefined");
+    let nop = Packet {
+        opcode: CHILD_OP_NOP,
+        stamp_waits: Vec::new(),
+        total_size: PACKET_HEADER_LEN,
+        completion_stamp: 0,
+        payload: Vec::new(),
+        next_head: 0,
+    };
+    let _ = process_child_packet(&mut state, &mut host, channel, &nop);
+    assert_eq!(
+        (
+            store_route_count("child_packet_domain_defined"),
+            store_route_count("child_packet_domain_undefined"),
+        ),
+        (defined, undefined + 1),
+        "the model would have refused this packet, and the census says so"
+    );
+
+    // Now the definition packet for the same domain.
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_DEFINE_FIFO,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 4,
+            completion_stamp: 0,
+            payload: channel.to_le_bytes().to_vec(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        u32::from(state.child_domain_open(channel)) * bit,
+        bit,
+        "a definition is the one event the model's open-channel set has"
+    );
+    let _ = process_child_packet(&mut state, &mut host, channel, &nop);
+    assert_eq!(
+        (
+            store_route_count("child_packet_domain_defined"),
+            store_route_count("child_packet_domain_undefined"),
+        ),
+        (defined + 1, undefined + 1),
+        "and now the same packet on the same domain is one the model admits"
+    );
+
+    // A free takes the definition back, because the model's set has that event
+    // too: a domain whose positions have drained stops being nameable.
+    process_root_packet(
+        &mut state,
+        &mut host,
+        &Packet {
+            opcode: ROOT_OP_FREE_FIFO,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + 4,
+            completion_stamp: 0,
+            payload: channel.to_le_bytes().to_vec(),
+            next_head: 0,
+        },
+    );
+    assert_eq!(
+        u32::from(state.child_domain_open(channel)) * bit,
+        0,
+        "a free is not a definition that stands"
+    );
+}
+
 /// FIFO redefine/free retires scheduler ownership so a removed producer
 /// cannot strand later display transactions behind a stale bit.
 #[test]
@@ -1189,7 +1674,7 @@ fn free_fifo_clears_translation_scheduler_state() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
     let bit = 1 << 1;
-    state.active_child_mask = bit;
+    state.open_child_domains_for_test(bit);
     state.pending.child_mask = bit;
     state.translation_deferred_mask = bit;
     state.translation_order_hold_mask = bit;
@@ -1208,7 +1693,7 @@ fn free_fifo_clears_translation_scheduler_state() {
         },
     );
 
-    assert_eq!(state.active_child_mask & bit, 0);
+    assert!(!state.child_domain_open(1));
     assert_eq!(state.pending.child_mask & bit, 0);
     assert_eq!(state.translation_deferred_mask & bit, 0);
     assert_eq!(state.translation_order_hold_mask & bit, 0);
@@ -1498,22 +1983,32 @@ fn display_swap_entry_gated_when_unpainted_at_cap() {
     );
 }
 
+/// One starvation episode per held present, and the present is named by its
+/// ordering position rather than by a ring head — a declined present has no
+/// ring position, because the head moved past it when it arrived.
 #[test]
-fn present_action_starvation_proxy_is_once_per_held_head() {
+fn present_action_starvation_proxy_is_once_per_held_position() {
+    use reims_vgpu_core::identity::IngressOrdinal;
+
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
     state.present.unpainted_presents = MAX_UNPAINTED_PRESENTS;
 
-    note_present_backpressure_hold(&mut state, 5, 464, 592);
-    note_present_backpressure_hold(&mut state, 5, 464, 592);
+    note_present_backpressure_hold(&mut state, 5, IngressOrdinal(464));
+    note_present_backpressure_hold(&mut state, 5, IngressOrdinal(464));
     assert_eq!(state.present.backpressure_hold_count, 1);
 
     note_present_paint_consumed(&mut state);
     state.present.unpainted_presents = MAX_UNPAINTED_PRESENTS;
-    note_present_backpressure_hold(&mut state, 5, 464, 592);
+    note_present_backpressure_hold(&mut state, 5, IngressOrdinal(464));
     assert_eq!(
         state.present.backpressure_hold_count, 2,
         "a later hold after paint is a distinct starvation episode"
     );
+    // And a different position is a different episode without any paint
+    // between, which a head-keyed record could not say for two presents that
+    // arrived at the same ring offset on different laps.
+    note_present_backpressure_hold(&mut state, 5, IngressOrdinal(465));
+    assert_eq!(state.present.backpressure_hold_count, 3);
 }
 
 #[test]
@@ -1556,7 +2051,7 @@ fn child_drain_yields_after_present_for_display_consumer() {
     host.put_u32(regs_gpa + CHILD_REG_BASE_PFN, list_pfn);
     state.gfx.root_page = root_pfn;
     state.gfx.fifo_base_page = stamp_pfn;
-    state.active_child_mask = 1u32 << channel;
+    state.open_child_domains_for_test(1u32 << channel);
     state.pending.child_mask = 1u32 << channel;
 
     drain_pending(&mut state, &mut host);
@@ -1629,7 +2124,7 @@ fn set_mapping_geom_size_change_resets_content_generation() {
 fn drain_other_child_fifos_is_a_safe_noop_without_rings() {
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
     let mut host = FakeHost::new();
-    state.active_child_mask = (1 << 1) | (1 << 4);
+    state.open_child_domains_for_test((1 << 1) | (1 << 4));
     state.pending.child_mask = 1 << 1;
     state.gfx.control_fifo = 1;
     // No root_page / rings: the drain returns immediately.
@@ -1650,7 +2145,7 @@ fn poll_rescue_only_publishes_work_for_async_drain() {
         .fifo_read
         .store(3, std::sync::atomic::Ordering::Release);
     state.gfx.fifo_written = 4;
-    state.active_child_mask = (1 << 2) | (1 << 5);
+    state.open_child_domains_for_test((1 << 2) | (1 << 5));
 
     assert!(publish_stranded_fifos(&mut state, &mut host));
     assert!(state.pending.main_drain);
@@ -4573,7 +5068,7 @@ fn a_short_compute_info_request_is_reported_and_not_answered() {
     let lines = cap.lines();
     let line = lines
         .iter()
-        .find(|l| l.contains("reason=get_compute_info_short"))
+        .find(|l| l.contains("reason=compute_info_short"))
         .unwrap_or_else(|| panic!("a short compute-info said nothing: {lines:?}"));
     assert!(
         line.contains("need=24") && line.contains("plen=23"),
@@ -4913,7 +5408,7 @@ fn every_short_control_packet_names_itself() {
         next_head: 0,
     };
 
-    let before_mask = state.active_child_mask;
+    let before_mask = state.open_child_mask();
     for (opcode, need) in [
         (ROOT_OP_DEVICE_INFO_TAHOE, TAHOE.reply_pfn_offset() + 4),
         (
@@ -4928,7 +5423,8 @@ fn every_short_control_packet_names_itself() {
         process_root_packet(&mut state, &mut host, &short(opcode, need - 1));
     }
     assert_eq!(
-        state.active_child_mask, before_mask,
+        state.open_child_mask(),
+        before_mask,
         "a short DEFINE_FIFO must not open a channel"
     );
 
@@ -4970,10 +5466,16 @@ fn every_short_control_packet_names_itself() {
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     for reason in [
-        "reason=device_info_tahoe_short site=root",
-        "reason=device_info_monterey_short site=root",
-        "reason=define_fifo_short site=root",
-        "reason=free_fifo_short site=root",
+        // The question's name, not the opcode's: `reims_vgpu_core::query`
+        // names the two device-info questions, and the drain no longer has a
+        // slug of its own to disagree with it.
+        "reason=device_info_short site=root",
+        "reason=device_info_legacy_short site=root",
+        // The kind's name, as with the two device-info questions above: the
+        // slug is `reims_vgpu_core::control::ControlKind`'s and the drain has
+        // none of its own to disagree with it.
+        "reason=define_channel_short site=root",
+        "reason=free_channel_short site=root",
         "reason=set_object_list_short site=root",
         "reason=define_task2_short site=root",
         "reason=set_object_list_short site=ch4",
@@ -5091,7 +5593,7 @@ fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
 /// that never held. The measured workload is 44 % held, so a release that never
 /// fires is a hang rather than a slow path.
 #[test]
-fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
+fn a_packet_whose_stamp_wait_is_unmet_is_parked_until_the_slot_reaches_it() {
     use crate::model::DeviceId;
     use crate::runtime::host::FakeHost;
 
@@ -5110,11 +5612,14 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
     state.gfx.fifo_start = page_size as u32;
     state.gfx.fifo_length = 2 * page_size as u32;
 
-    // One root packet carrying a single wait record, and nothing else: the
-    // payload is empty so the only thing that can move is the head.
-    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
+    // One root packet carrying a single wait record. The opcode has to be one
+    // the model has a class for — an unknown one is refused at admission and
+    // never parks — so this is a channel definition, whose payload is a zeroed
+    // block long enough for its own layout.
+    const BODY: u32 = 64;
+    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN + BODY;
     let mut packet = vec![0u8; total as usize];
-    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_OPCODE..], ROOT_OP_DEFINE_FIFO);
     st16(&mut packet[PACKET_STAMP_COUNT..], 1);
     st32(&mut packet[PACKET_TOTAL_SIZE..], total);
     st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
@@ -5138,14 +5643,18 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
     // Slot 5 stands at 0, so the wait is seven short of satisfied.
     drain_main_fifo(&mut state, &mut host);
 
+    // **The head moves and the work does not.** That is the switch: the ring
+    // position is free the moment the bytes are out of it, and what holds the
+    // packet is an ordering position in the model. The old shape left the head
+    // where it was, which stopped every packet behind this one on a wait that
+    // had nothing to do with them.
     assert_eq!(
         state
             .gfx
             .fifo_read
             .load(std::sync::atomic::Ordering::Acquire),
-        0,
-        "the head must not move past a packet the device has not run, or the \
-         retry would skip it entirely"
+        total,
+        "the ring position is released at arrival, whatever the model then decides"
     );
     assert_eq!(
         read_slot(&host, 0),
@@ -5153,27 +5662,22 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
         "and no completion stamp may be written, or the guest is told a packet \
          finished that never started"
     );
-    assert_ne!(
-        state.stamp_deferred_mask & ROOT_FIFO_BIT,
-        0,
-        "the hold has to be recorded, or nothing re-offers this timeline"
+    assert_eq!(
+        state.parked.len(),
+        1,
+        "the packet is held as a position, with its bytes"
     );
     assert!(
         state.pending.main_drain,
-        "a held root head is unfinished work: clearing the flag would leave the \
+        "a parked position is unfinished work: clearing the flag would leave the \
          retry to whichever later doorbell happened to set it again"
     );
 
-    // A second drain with nothing changed must hold again rather than give up.
+    // A second drain with nothing changed finds an empty ring and must not run
+    // the parked packet, invent a completion, or lose it.
     drain_main_fifo(&mut state, &mut host);
-    assert_eq!(
-        state
-            .gfx
-            .fifo_read
-            .load(std::sync::atomic::Ordering::Acquire),
-        0,
-        "a retry that still cannot satisfy the wait holds again"
-    );
+    assert_eq!(read_slot(&host, 0), 0, "still nothing ran");
+    assert_eq!(state.parked.len(), 1, "and the position is still held");
 
     // Another timeline publishes the awaited stamp.
     gpa_map::write_u32(&mut host, slot_gpa(AWAITED_SLOT), AWAITED_VALUE, page_size)
@@ -5181,26 +5685,18 @@ fn a_packet_whose_stamp_wait_is_unmet_is_held_until_the_slot_reaches_it() {
     drain_main_fifo(&mut state, &mut host);
 
     assert_eq!(
-        state
-            .gfx
-            .fifo_read
-            .load(std::sync::atomic::Ordering::Acquire),
-        total,
-        "once the slot reaches the awaited value the same packet runs"
-    );
-    assert_eq!(
         read_slot(&host, 0),
         ROOT_STAMP,
-        "and its completion stamp lands exactly once, from the run that happened"
+        "once the slot reaches the awaited value the parked packet runs, and its \
+         completion stamp lands exactly once"
     );
-    assert_eq!(
-        state.stamp_deferred_mask & ROOT_FIFO_BIT,
-        0,
-        "the hold bit describes the last drain, so a drain that ran clears it"
+    assert!(
+        state.parked.is_empty(),
+        "the position is gone, because it completed"
     );
     assert!(
         !state.pending.main_drain,
-        "and a drained ring is not pending work"
+        "and a device holding no positions is not pending work"
     );
 }
 
@@ -5237,9 +5733,10 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
     );
 
     const ROOT_STAMP: u32 = 0xFEED;
-    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
+    const BODY: u32 = 64;
+    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN + BODY;
     let mut packet = vec![0u8; total as usize];
-    st16(&mut packet[PACKET_OPCODE..], 0);
+    st16(&mut packet[PACKET_OPCODE..], ROOT_OP_DEFINE_FIFO);
     st16(&mut packet[PACKET_STAMP_COUNT..], 1);
     st32(&mut packet[PACKET_TOTAL_SIZE..], total);
     st32(&mut packet[PACKET_COMPLETION_STAMP..], ROOT_STAMP);
@@ -5264,37 +5761,10 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
         "an undecidable wait must not stop the timeline, because nothing will \
          ever decide it"
     );
-    assert_eq!(
-        state.stamp_deferred_mask & ROOT_FIFO_BIT,
-        0,
-        "and no hold is recorded, so nothing re-offers a packet that already ran"
-    );
-
-    // A packet carrying both an ordinary unmet wait and an undecidable one still
-    // runs: holding for the first would park the timeline forever on the second.
-    let mut both = vec![0u8; (PACKET_HEADER_LEN + 2 * PACKET_STAMP_LEN) as usize];
-    st16(&mut both[PACKET_OPCODE..], 0);
-    st16(&mut both[PACKET_STAMP_COUNT..], 2);
-    st32(
-        &mut both[PACKET_TOTAL_SIZE..],
-        PACKET_HEADER_LEN + 2 * PACKET_STAMP_LEN,
-    );
-    st32(&mut both[PACKET_HEADER_LEN as usize..], 6);
-    st32(&mut both[PACKET_HEADER_LEN as usize + 4..], 0x99);
-    st32(
-        &mut both[(PACKET_HEADER_LEN + PACKET_STAMP_LEN) as usize..],
-        bad_slot,
-    );
-    st32(
-        &mut both[(PACKET_HEADER_LEN + PACKET_STAMP_LEN) as usize + 4..],
-        1,
-    );
-    let decoded = decode_packet(&both, 0, both.len() as u32, RING).expect("two records decode");
-    assert_eq!(
-        note_packet_stamp_waits(&state, &host, None, &decoded, None),
-        StampVerdict::Unevaluable,
-        "Unevaluable outranks Hold, or the packet parks forever on the wait that \
-         cannot clear while waiting for the one that could"
+    assert!(
+        state.parked.is_empty(),
+        "and nothing is parked on it, because a position waiting on a slot no \
+         drain writes would hold its channel's publication head forever"
     );
 }
 
@@ -5374,64 +5844,6 @@ fn the_stamp_ledger_separates_a_held_word_from_one_already_published() {
         ledger.classify(wait(bad, 1)),
         UnmetSource::Absent,
         "a slot outside the stamp page is refused by both recorders"
-    );
-}
-
-/// `retry_stamp_held_timelines` stops when a round publishes no stamp, so a wait
-/// nothing in the ring can satisfy costs one extra round and not a spin.
-///
-/// This is the property that lets the loop have no iteration cap. A cap would be
-/// a bound on how far ordering is honoured; the progress condition is not, and
-/// this pins that it actually terminates.
-#[test]
-fn a_stamp_hold_nothing_can_satisfy_costs_one_round_and_returns() {
-    use crate::model::DeviceId;
-    use crate::runtime::host::FakeHost;
-
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    let mut host = FakeHost::new();
-    let page_size = 1usize << PAGE_SHIFT_X86;
-
-    let fifo_pfn = 0x40u32;
-    let fifo_gpa = (fifo_pfn as u64) << PAGE_SHIFT_X86;
-    host.map_range(fifo_gpa, 3 * page_size, 0);
-    state.gfx.fifo_base_page = fifo_pfn;
-    state.gfx.fifo_start = page_size as u32;
-    state.gfx.fifo_length = 2 * page_size as u32;
-
-    // The awaited slot is one this ring's only packet cannot advance, because
-    // the packet is the one waiting on it.
-    let total = PACKET_HEADER_LEN + PACKET_STAMP_LEN;
-    let mut packet = vec![0u8; total as usize];
-    st16(&mut packet[PACKET_OPCODE..], 0);
-    st16(&mut packet[PACKET_STAMP_COUNT..], 1);
-    st32(&mut packet[PACKET_TOTAL_SIZE..], total);
-    st32(&mut packet[PACKET_HEADER_LEN as usize..], 9);
-    st32(&mut packet[PACKET_HEADER_LEN as usize + 4..], 0x1000);
-    gpa_map::write_bytes(&mut host, fifo_gpa + page_size as u64, &packet, page_size)
-        .expect("seed the root ring");
-    state
-        .gfx
-        .fifo_read
-        .store(0, std::sync::atomic::Ordering::Release);
-    state.gfx.fifo_written = total;
-
-    state.stamp_deferred_mask = ROOT_FIFO_BIT;
-    let seq_before = state.completion_stamp_seq;
-
-    // Terminating at all is the assertion: a loop without the progress
-    // condition never returns from here.
-    retry_stamp_held_timelines(&mut state, &mut host);
-
-    assert_eq!(
-        state.completion_stamp_seq, seq_before,
-        "nothing ran, so no fence moved"
-    );
-    assert_ne!(
-        state.stamp_deferred_mask & ROOT_FIFO_BIT,
-        0,
-        "and the timeline is handed back still held, which is what a later \
-         doorbell re-offers rather than a drop"
     );
 }
 
@@ -5758,6 +6170,106 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
     }
 }
 
+/// A destroy whose ref names an object of another kind retires no pipeline.
+///
+/// **A pipeline table entry is a tombstone, so one wrong retirement is
+/// permanent.** `PipelineTable::declare` refuses an id it already holds and
+/// `peek` answers `AbsentBecause::Retired` for ever after, so a transaction that
+/// binds the real pipeline is refused at admission from then on — the whole
+/// packet, not the draw.
+///
+/// It was measured on a guest. A driven macos-26 boot answered `TypeDiffers` for
+/// **34 of the 36** destroys that reached this arm, and refused **914 exec
+/// packets** with `pipeline_absent_retired`; the macos-15 boot beside it deletes
+/// four pipelines and refuses none. The census that says which ref space the
+/// destroy's number belongs to already ran two blocks earlier; this is that
+/// answer being acted on instead of only counted.
+#[test]
+fn a_pipeline_destroy_whose_ref_names_another_kind_retires_no_pipeline() {
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::resource::{OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE};
+    use reims_vgpu_core::pipeline::PipelineState;
+    use reims_vgpu_wire::ops::destroy::{DELETE_TOTAL_LEN, OPCODE_DELETE_RENDER_PIPELINE_STATE};
+
+    const TASK: u32 = 2;
+    const REF: u32 = 3;
+
+    // One flat page table, GVA page 0 → data pfn 4, exactly as the object-list
+    // fixtures build it: the list entry is read *through the task's own page
+    // table*, so a raw GPA write would leave the census reading nothing and the
+    // gate untested.
+    let mut host = FakeHost::new();
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    state.define_task(TASK, 0x1000, 2);
+    assert!(state.set_object_list(TASK, 0, 8));
+
+    // The slot holds a **texture**, which is not what a render-pipeline destroy
+    // names. Its descriptor is never read: the gate is the entry's type.
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut entry, u32::from(OBJECT_TYPE_TEXTURE) | (4u32 << 8));
+    entry[4..].copy_from_slice(&0x40u64.to_le_bytes());
+    let _ = host.write_gpa(
+        data_gpa + u64::from(REF) * OBJECT_LIST_ENTRY_LEN as u64,
+        &entry,
+    );
+
+    // The name the ref already has, declared directly so the test's subject is
+    // the destroy and not the descriptor read. `name_resource` answers from
+    // `DeviceState::object_name` before the guest's list, so this is exactly the
+    // name the destroy would resolve to and retire.
+    assert_eq!(
+        crate::runtime::objects::probe_list_entry(&state, &host, TASK, REF).map(|e| e.object_type),
+        Some(OBJECT_TYPE_TEXTURE),
+        "the fixture's list entry is what the census reads"
+    );
+    let name = state
+        .declare_object(TASK, REF, reims_vgpu_core::lifecycle::Storage::NoBytes)
+        .expect("the task is open")
+        .id;
+    assert!(state.declare_pipeline(name), "declared for the first time");
+    state.advance_pipeline(name, PipelineState::Translating);
+    state.advance_pipeline(name, PipelineState::Compiling);
+    assert!(state.ready_pipeline(name));
+
+    let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+    st32(&mut payload[0..], TASK);
+    st32(&mut payload[4..], OPCODE_DELETE_RENDER_PIPELINE_STATE);
+    st32(&mut payload[8..], DELETE_TOTAL_LEN);
+    st32(&mut payload[12..], REF);
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert!(
+        state.pipeline_is_ready(name),
+        "the destroy's ref is a number in another space; retiring the object \
+         that merely shares it tombstones a pipeline the guest still binds"
+    );
+}
+
 /// `CmdDeleteObject` must not retire an object-table entry, however exactly its
 /// record's ref matches one.
 ///
@@ -5947,10 +6459,12 @@ fn a_delete_object_never_retires_an_object_table_entry_its_ref_collides_with() {
 ///
 /// The kind lives in the record's own opcode and nowhere else, so a counter that
 /// did not read it there would be counting the packet rather than the object.
-/// The distribution across kinds is the open question this arm leaves behind —
-/// one merged counter cannot say whether a guest is retiring the one kind this
-/// device holds by ref (fences) or the kinds it holds by content (samplers,
-/// pipeline states) — so the split is the measurement, not decoration.
+/// The distribution across kinds was the open question this arm left behind, and
+/// the split is what answered it: a driven boot reads 2148 sampler states, 4
+/// depth-stencil states, 4 render pipeline states and 2 fences, against 5
+/// functions and 3 compute pipeline states this device retains nothing by ref
+/// for. One merged counter could not have said that, which is why the split is
+/// the measurement and not decoration.
 #[test]
 fn a_delete_object_counts_the_kind_its_record_names() {
     use crate::runtime::drain::store_route_count;
@@ -5997,8 +6511,10 @@ fn a_delete_object_counts_the_kind_its_record_names() {
         "a sampler-state record must not move another kind's counter"
     );
 
-    // The one kind this device holds anything by ref for. Its counter reading
-    // above zero on a boot is the signal that would justify a handler.
+    // The one kind this device holds anything by ref for, and now the one whose
+    // delete retires it — see
+    // `a_fence_delete_forgets_every_generation_its_ref_held` for the hazard and
+    // the boot that established the ref space.
     process_child_packet(
         &mut state,
         &mut host,
@@ -6012,6 +6528,198 @@ fn a_delete_object_counts_the_kind_its_record_names() {
     );
 }
 
+/// A fence delete forgets every generation its ref held, so a reused ref does
+/// not start life already signalled.
+///
+/// The hazard the retirement removes: a wait is satisfied when the stored
+/// generation is at or past its target, so a generation that outlives its fence
+/// makes the *next* fence to get that ref pass its first wait with nothing
+/// behind it. The census is kept as the denominator — a driven boot answered
+/// `delete_fence_ref_live=2`, `delete_fence_ref_absent=0`, which is what
+/// established that the serializer's fence ref space and a fence record's are
+/// one — and `_absent` climbing is what would put this arm back in doubt.
+#[test]
+fn a_fence_delete_forgets_every_generation_its_ref_held() {
+    use crate::model::{FENCE_DOMAIN_BLIT, FENCE_DOMAIN_RENDER};
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::destroy::{DELETE_TOTAL_LEN, OPCODE_DELETE_FENCE};
+
+    let mut host = FakeHost::new();
+    let destroy_packet = |object_ref: u32| {
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 2);
+        st32(&mut payload[4..], OPCODE_DELETE_FENCE);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], object_ref);
+        Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    state.define_task(2, 0x2000, 9);
+
+    let live = store_route_count("delete_fence_ref_live");
+    let absent = store_route_count("delete_fence_ref_absent");
+
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(40));
+    assert_eq!(
+        (
+            store_route_count("delete_fence_ref_live"),
+            store_route_count("delete_fence_ref_absent"),
+        ),
+        (live, absent + 1),
+        "no generation is held for this ref, so the delete names nothing here"
+    );
+
+    // The same ref, now holding a generation in two of the four encoder domains
+    // this device splits one guest fence into. Both are that object's and both
+    // go.
+    state.set_fence_generation(2, FENCE_DOMAIN_BLIT, 40, 3);
+    state.set_fence_generation(2, FENCE_DOMAIN_RENDER, 40, 9);
+    // A neighbour under a different ref, to say the retirement is keyed and not
+    // a sweep of the task.
+    state.set_fence_generation(2, FENCE_DOMAIN_RENDER, 41, 5);
+    let domains = store_route_count("delete_fence_ref_live_domains");
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(40));
+    assert_eq!(
+        (
+            store_route_count("delete_fence_ref_live"),
+            store_route_count("delete_fence_ref_absent"),
+        ),
+        (live + 1, absent + 1),
+        "and now it names one, which is what the boot's reading established"
+    );
+    assert_eq!(
+        store_route_count("delete_fence_ref_live_domains"),
+        domains + 2,
+        "both domains held it, and the count is how many rather than whether"
+    );
+    assert_eq!(
+        state.fence_generation(2, FENCE_DOMAIN_BLIT, 40),
+        None,
+        "the deleted fence keeps no generation in any domain"
+    );
+    assert_eq!(state.fence_generation(2, FENCE_DOMAIN_RENDER, 40), None);
+    assert_eq!(
+        state.fence_generation(2, FENCE_DOMAIN_RENDER, 41),
+        Some(5),
+        "and a fence the guest did not delete is untouched"
+    );
+
+    // The reuse this exists for: the ref comes back and its first wait must not
+    // be satisfied by the dead fence's progress.
+    assert_eq!(
+        state.fence_generation(2, FENCE_DOMAIN_RENDER, 40),
+        None,
+        "a reused ref starts unsignalled"
+    );
+}
+
+/// A destroy of a kind this device retains nothing for says what its ref names
+/// in the guest's object list, which is what decides whether a retirement could
+/// ever be keyed on it.
+///
+/// The integer resolving proves little: the object table's own boot found 22
+/// sampler-delete refs live under a *different* task, which is a collision. The
+/// type agreeing is the evidence, so the census reports the pair and not the
+/// hit.
+#[test]
+fn a_destroy_this_device_cannot_retire_says_what_its_ref_names_in_the_object_list() {
+    use crate::runtime::decode::resource::{OBJECT_TYPE_FUNCTION, OBJECT_TYPE_SERIALIZER_OBJECT};
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_wire::ops::destroy::{DELETE_TOTAL_LEN, OPCODE_DELETE_FUNCTION};
+
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_ARM64E);
+    // One task, a one-level page table mapping GVA page 0 to data pfn 4, and an
+    // object list of eight slots at GVA 0. Stated here rather than shared,
+    // because the slots this test fills are its own.
+    let dir_gpa = 2u64 << PAGE_SHIFT_ARM64E;
+    let root_gpa = 3u64 << PAGE_SHIFT_ARM64E;
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+    state.define_task(1, 0x1000, 2);
+    assert!(state.set_object_list(1, 0, 8));
+
+    let destroy_packet = |object_ref: u32| {
+        let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+        st32(&mut payload[0..], 1);
+        st32(&mut payload[4..], OPCODE_DELETE_FUNCTION);
+        st32(&mut payload[8..], DELETE_TOTAL_LEN);
+        st32(&mut payload[12..], object_ref);
+        Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        }
+    };
+    let put_entry = |host: &mut FakeHost, slot: u32, object_type: u8| {
+        let mut entry = [0u8; 12];
+        st32(&mut entry[0..], u32::from(object_type) | (16u32 << 8));
+        entry[4..12].copy_from_slice(&0x100u64.to_le_bytes());
+        let _ = host.write_gpa(data_gpa + u64::from(slot) * 12, &entry);
+    };
+
+    let absent = store_route_count("delete_object_ref_no_list_entry");
+    let agrees = store_route_count("delete_object_ref_type_agrees");
+    let differs = store_route_count("delete_object_ref_type_differs");
+
+    // Slot 4 holds nothing.
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(4));
+    assert_eq!(
+        (
+            store_route_count("delete_object_ref_no_list_entry"),
+            store_route_count("delete_object_ref_type_agrees"),
+            store_route_count("delete_object_ref_type_differs"),
+        ),
+        (absent + 1, agrees, differs),
+        "an empty slot is neither an agreement nor a disagreement"
+    );
+
+    // Slot 5 holds a serializer object, which a function destroy does not name.
+    put_entry(&mut host, 5, OBJECT_TYPE_SERIALIZER_OBJECT);
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(5));
+    assert_eq!(
+        (
+            store_route_count("delete_object_ref_type_agrees"),
+            store_route_count("delete_object_ref_type_differs"),
+        ),
+        (agrees, differs + 1),
+        "a live entry of the wrong type is a collision and says the spaces differ"
+    );
+
+    // Slot 6 holds a function, which is the pairing that would say one space.
+    put_entry(&mut host, 6, OBJECT_TYPE_FUNCTION);
+    process_child_packet(&mut state, &mut host, 4, &destroy_packet(6));
+    assert_eq!(
+        (
+            store_route_count("delete_object_ref_type_agrees"),
+            store_route_count("delete_object_ref_type_differs"),
+        ),
+        (agrees + 1, differs + 1),
+        "and the type agreeing is the evidence a retirement could be keyed here"
+    );
+}
+
 /// The host's retired slots are reported as retired, not as undecodable.
 ///
 /// Fifteen opcodes share one deprecated handler on the reference host: it
@@ -6020,12 +6728,26 @@ fn a_delete_object_counts_the_kind_its_record_names() {
 /// something this device cannot decode — and the two used to produce the same
 /// record.
 ///
-/// Driven off [`CHILD_DEPRECATED_OPS`] rather than a second list, so a slot
-/// added there cannot be left without an arm.
+/// Driven off the closure ledger — the rows `reims_vgpu_core::control` calls
+/// [`ControlKind::RetiredSlot`] — rather than a list beside the arm, so a slot
+/// the ledger judges retired cannot be left without one. This device used to
+/// keep its own transcription of the fifteen and drive this test off that, so
+/// the test and the arm shared a source and neither could catch the other being
+/// wrong about which numbers they are.
 #[test]
 fn a_retired_slot_is_reported_as_retired_and_not_as_undecodable() {
     let mut host = FakeHost::new();
-    for opcode in CHILD_DEPRECATED_OPS {
+    let retired: Vec<u16> = reims_vgpu_protocol::packets::LEDGER
+        .iter()
+        .filter(|p| p.channel == crate::protocol::packets::Channel::Child)
+        .filter(|p| {
+            reims_vgpu_core::control::ControlKind::of(p.channel, p.opcode)
+                == Some(reims_vgpu_core::control::ControlKind::RetiredSlot)
+        })
+        .map(|p| p.opcode)
+        .collect();
+    assert_eq!(retired.len(), 15, "the reference host's retired slots");
+    for opcode in retired {
         let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
         let pkt = Packet {
             opcode,
@@ -6617,97 +7339,207 @@ fn the_map_interval_audit_counts_a_clean_pairing_and_not_only_a_finding() {
     );
 }
 
-/// The coalesced stamp keeps the **greatest** value a drain latched, in the same
-/// wrapping-signed order a wait is compared in.
+/// Handing a completion word to a rail leaves the device's ledger, and does
+/// **not** move the ordering plane's timeline; putting it where the guest can
+/// read it does.
 ///
-/// Not "the last one seen". For a well-formed guest the two agree, and the whole
-/// point of taking the maximum is that a regressing stamp arriving from the
-/// guest cannot make this device publish a slot going backwards — which would
-/// unsatisfy a wait the guest had already been told was met.
+/// The regression this pins is one that shipped. Publishing at `write_stamp`
+/// looked right on every counter it emitted, and a driven boot priced it
+/// exactly: `stamp_wait_model_ahead = 12 824` against `stamp_unmet_queued =
+/// 12 824`, the same number twice. `write_stamp` hands the word to the
+/// GPU-ordered rail; the word lands when that rail's submission retires. Every
+/// wait in between is one the plane called satisfied while the guest could
+/// still read the old value — so a cutover publishing there would release,
+/// twelve thousand times a boot, work ordered behind GPU work that had not
+/// finished. Submission is not completion, and this is the assertion that says
+/// so in the two directions that matter.
 #[test]
-fn a_coalesced_stamp_keeps_the_latest_value_across_the_u32_wrap() {
-    let mut pending = PendingStamp::default();
+fn owing_a_word_is_not_publishing_it_and_only_the_landing_moves_the_plane() {
+    use reims_vgpu_core::identity::StampSlot;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+
+    super::note_stamp_no_longer_owed(&mut state, 0, 7);
     assert_eq!(
-        pending.owed(),
+        state
+            .stamp_ledger
+            .classify(super::StampWait { index: 0, value: 7 }),
+        super::UnmetSource::Queued,
+        "the device's ledger has it: `Queued` is its name for a word that has \
+         been through the write door and is with a rail"
+    );
+    assert_eq!(
+        state.published_completion_stamp(StampSlot(0)),
         None,
-        "a drain that stamped nothing owes nothing"
+        "and the ordering plane must not: the guest cannot read it yet"
     );
 
-    pending.latch(7);
-    pending.latch(9);
-    assert_eq!(pending.owed(), Some(9), "the later of two ascending stamps");
-
-    pending.latch(8);
+    super::note_stamp_visible(&state, 0, 7, "stamp_visible_inline");
     assert_eq!(
-        pending.owed(),
-        Some(9),
-        "a stamp behind the one held must not pull the slot backwards"
+        state.published_completion_stamp(StampSlot(0)).map(|v| v.0),
+        Some(7),
+        "the landing is the plane's event, and the root slot is the one \
+         `write_stamp` never reaches"
     );
 
-    // Across the wrap: 0xffff_fff0 then 4. The signed difference is +20, so 4 is
-    // *later*, and a plain `>=` would keep 0xffff_fff0 and stall every wait on
-    // the far side of the wrap.
-    let mut wrapped = PendingStamp::default();
-    wrapped.latch(0xffff_fff0);
-    wrapped.latch(4);
+    super::note_stamp_visible(&state, 3, 4, "stamp_visible_observed");
     assert_eq!(
-        wrapped.owed(),
-        Some(4),
-        "the wrap is a signed difference, not a magnitude comparison"
+        state.published_completion_stamp(StampSlot(3)).map(|v| v.0),
+        Some(4)
+    );
+    assert_eq!(
+        state.published_completion_stamp(StampSlot(0)).map(|v| v.0),
+        Some(7),
+        "slots are independent timelines"
     );
 }
 
-/// A wait on the slot the drain is holding is answered from the latch.
-///
-/// Without this the packet reads the stale word out of guest RAM, returns
-/// `Hold`, and parks the channel against a stamp this device is itself sitting
-/// on — a deadlock introduced by the coalescing rather than by the guest.
-#[test]
-fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
-    const SLOT: u32 = 3;
-    let mut pending = PendingStamp::default();
-    pending.latch(20);
+/// [`arrival`] — the step both drain loops used to spell for themselves.
+mod arrivals {
+    use super::*;
+    use crate::runtime::host::FakeHost;
 
-    let met = StampWait {
-        index: SLOT,
-        value: 20,
-    };
-    assert!(
-        pending.discharges(SLOT, met),
-        "a wait at exactly the latched value is discharged"
-    );
-    assert!(
-        pending.discharges(
-            SLOT,
-            StampWait {
-                index: SLOT,
-                value: 12
-            }
-        ),
-        "and so is one behind it"
-    );
-    assert!(
-        !pending.discharges(
-            SLOT,
-            StampWait {
-                index: SLOT,
-                value: 21
-            }
-        ),
-        "a wait past the latched value is not discharged by it"
-    );
-    assert!(
-        !pending.discharges(
-            SLOT,
-            StampWait {
-                index: SLOT + 1,
-                value: 1
-            }
-        ),
-        "a wait on another slot is not this drain's to answer"
-    );
-    assert!(
-        !PendingStamp::default().discharges(SLOT, met),
-        "a drain that has latched nothing discharges nothing"
-    );
+    /// Two guest pages: enough for a child ring's page list to be a list.
+    const PAGE: u64 = 4096;
+    const ROOT_BASE: u64 = 0x10_0000;
+    const CHILD_PAGE_0: u64 = 0x20_0000;
+    const CHILD_PAGE_1: u64 = 0x21_0000;
+    const CAPACITY: u32 = 2 * PAGE as u32;
+
+    /// A host with a root ring and a child ring, both holding `bytes` at
+    /// offset zero.
+    fn host_with(bytes: &[u8]) -> FakeHost {
+        let mut host = FakeHost::new();
+        for base in [ROOT_BASE, CHILD_PAGE_0, CHILD_PAGE_1] {
+            host.map_range(base, PAGE as usize, 0);
+        }
+        host.map_range(ROOT_BASE + PAGE, PAGE as usize, 0);
+        host.write_gpa(ROOT_BASE, bytes).expect("mapped");
+        host.write_gpa(CHILD_PAGE_0, bytes).expect("mapped");
+        host
+    }
+
+    fn root() -> Ring<'static> {
+        Ring::Root {
+            base_gpa: ROOT_BASE,
+            capacity: CAPACITY,
+        }
+    }
+
+    const CHILD_PAGES: [u64; 2] = [CHILD_PAGE_0, CHILD_PAGE_1];
+
+    fn child() -> Ring<'static> {
+        Ring::Child {
+            page_gpas: &CHILD_PAGES,
+            capacity: CAPACITY,
+            page_shift: PAGE_SHIFT_X86,
+        }
+    }
+
+    /// The two rings take the same bytes to the same packet.
+    ///
+    /// **This is what the extraction is for.** One span and one page list are
+    /// two ways of reaching bytes, not two definitions of what a packet is —
+    /// and the two copies of header-snapshot-decode had already drifted once,
+    /// which `packet_snapshot_len`'s own doc records.
+    #[test]
+    fn both_rings_take_the_same_bytes_to_the_same_packet() {
+        let bytes = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
+        let host = host_with(&bytes);
+        let tail = bytes.len() as u32;
+
+        let (Arrival::Packet(from_root), Arrival::Packet(from_child)) = (
+            arrival(&root(), &host, 0, tail),
+            arrival(&child(), &host, 0, tail),
+        ) else {
+            panic!("a whole published packet arrives from either ring");
+        };
+        assert_eq!(from_root, from_child);
+        assert_eq!(from_root.opcode, ROOT_OP_DEFINE_FIFO);
+        assert_eq!(from_root.completion_stamp, 7);
+        assert_eq!(from_root.next_head, tail);
+    }
+
+    /// A head that has caught its tail is nothing, and is not a read.
+    #[test]
+    fn a_head_that_has_caught_the_tail_is_nothing() {
+        let host = FakeHost::new();
+        assert!(matches!(arrival(&root(), &host, 12, 12), Arrival::Nothing));
+    }
+
+    /// A producer mid-write is nothing, on both rings and at both stages: too
+    /// few bytes for a header, and a header whose packet is not all there.
+    ///
+    /// Neither reaches the always-on channel, which is the carve-out
+    /// [`PacketError::fault`] makes mechanical and the reason `Nothing` is one
+    /// answer rather than three.
+    #[test]
+    fn a_producer_mid_write_is_nothing_on_either_ring() {
+        let bytes = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
+        let host = host_with(&bytes);
+
+        for ring in [root(), child()] {
+            assert!(
+                matches!(
+                    arrival(&ring, &host, 0, PACKET_HEADER_LEN - 1),
+                    Arrival::Nothing
+                ),
+                "fewer bytes published than a header"
+            );
+            assert!(
+                matches!(
+                    arrival(&ring, &host, 0, PACKET_HEADER_LEN),
+                    Arrival::Nothing
+                ),
+                "a header published and its payload not yet"
+            );
+        }
+    }
+
+    /// A tail behind its head is a fault, on either ring.
+    #[test]
+    fn a_desynced_head_and_tail_is_a_fault() {
+        let host = FakeHost::new();
+        for ring in [root(), child()] {
+            assert!(matches!(
+                arrival(&ring, &host, 8, CAPACITY + 64),
+                Arrival::Fault(PacketFault::DesyncedHeadTail)
+            ));
+        }
+    }
+
+    /// A declared size the ring itself could never hold is the guest's error,
+    /// and comes back as the fault its own ring reports.
+    #[test]
+    fn a_size_past_the_ring_is_a_fault_from_either_ring() {
+        let mut bytes = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
+        bytes[PACKET_TOTAL_SIZE..PACKET_TOTAL_SIZE + 4]
+            .copy_from_slice(&(CAPACITY + 1).to_le_bytes());
+        let host = host_with(&bytes);
+
+        for ring in [root(), child()] {
+            assert!(matches!(
+                arrival(&ring, &host, 0, CAPACITY),
+                Arrival::Fault(PacketFault::BadSize)
+            ));
+        }
+    }
+
+    /// Each ring reports a failed read under its own name, which is what the
+    /// two drains' `FailEvent` variants are keyed on.
+    #[test]
+    fn a_read_that_fails_is_named_by_the_ring_it_failed_on() {
+        // No RAM at all, so the header read cannot land.
+        let mut host = FakeHost::new();
+        host.mark_non_ram(0, u64::MAX);
+
+        assert!(matches!(
+            arrival(&root(), &host, 0, CAPACITY),
+            Arrival::Fault(PacketFault::RootHeaderRead)
+        ));
+        assert!(matches!(
+            arrival(&child(), &host, 0, CAPACITY),
+            Arrival::Fault(PacketFault::ChildHeaderRead)
+        ));
+    }
 }

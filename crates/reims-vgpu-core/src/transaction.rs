@@ -99,7 +99,9 @@ pub fn classify(channel: Channel, opcode: u16) -> Option<PayloadClass> {
         (Root, 0x20) | (Child, 0x20) => ResourceLifecycle,
         (Root, 0x33) | (Child, 0x33) => ResourceLifecycle,
         (Root, 0x38) | (Child, 0x38) => ResourceLifecycle,
-        (Child, 0x22 | 0x25 | 0x34 | 0x35 | 0x36 | 0x39 | 0x3c | 0x3e | 0x3f) => ResourceLifecycle,
+        (Child, 0x22 | 0x25 | 0x28 | 0x34 | 0x35 | 0x36 | 0x39 | 0x3c | 0x3e | 0x3f) => {
+            ResourceLifecycle
+        }
 
         // Questions with reply destinations.
         (Root, 0x2d | 0x3a) => Query,
@@ -638,7 +640,8 @@ mod tests {
     fn a_single_resource_operation_names_that_resource() {
         let one = crate::lifecycle::LifecycleOp::DeleteResource {
             task: crate::identity::TaskId(1),
-            resource: resource(4),
+            object_ref: 4,
+            resource: Some(resource(4)),
         };
         assert_eq!(one.resources(), &[resource(4)]);
         assert_eq!(
@@ -917,8 +920,8 @@ mod tests {
         }
         assert_eq!(
             counts,
-            [1, 15, 4, 3, 23],
-            "one EXEC, fifteen lifecycle rows, four queries, three presents,              and twenty-three control packets. A change here is a change to              what the guest may send, not a table edit."
+            [1, 16, 4, 3, 23],
+            "one EXEC, sixteen lifecycle rows, four queries, three presents,              and twenty-three control packets. A change here is a change to              what the guest may send, not a table edit."
         );
     }
 }

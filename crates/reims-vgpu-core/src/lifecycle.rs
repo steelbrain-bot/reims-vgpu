@@ -52,8 +52,8 @@
 //! been invalidated would have no way to describe the state it was left in.
 
 use crate::access::{
-    AccessIntent, AccessRefusal, AccessSource, BackingId, ByteRange, GuestSpan, Participation,
-    ParticipationExtent, ResourceKey,
+    AccessIntent, AccessMode, AccessRefusal, AccessSource, BackingId, ByteRange, GuestSpan,
+    Participation, ParticipationExtent, ResourceKey,
 };
 use crate::content::{ContentLedger, Replica, Transfer};
 use crate::heap::{self, HeapPlacement, Heaps, Retirement};
@@ -82,6 +82,12 @@ pub enum LifecycleKind {
     SynchronizeAndDiscard,
     Discard,
     DeleteBacking,
+    /// The serializer's per-kind destroy, carried in its own packet.
+    ///
+    /// The odd one of the thirteen: its payload is a task word followed by a
+    /// self-describing record, so *which* object ends is in the record's opcode
+    /// and not in this kind. See [`object_destroy`].
+    DeleteObject,
 }
 
 impl LifecycleKind {
@@ -109,6 +115,7 @@ impl LifecycleKind {
             (Child, 0x3e) => Self::SynchronizeAndDiscard,
             (Child, 0x3f) => Self::Discard,
             (Child, 0x36) => Self::DeleteBacking,
+            (Child, 0x28) => Self::DeleteObject,
             _ => return None,
         })
     }
@@ -147,7 +154,8 @@ impl LifecycleKind {
             | Self::MapMemory
             | Self::UnmapMemory
             | Self::ReplacePhysical
-            | Self::DeleteBacking => None,
+            | Self::DeleteBacking
+            | Self::DeleteObject => None,
         }
     }
 
@@ -166,6 +174,7 @@ impl LifecycleKind {
             Self::SynchronizeAndDiscard => "synchronize_and_discard",
             Self::Discard => "discard",
             Self::DeleteBacking => "delete_backing",
+            Self::DeleteObject => "delete_object",
         }
     }
 }
@@ -181,6 +190,23 @@ pub enum Storage {
     /// A window of a heap, at an offset the guest chose. The resource does not
     /// own storage; see [`crate::heap`].
     Placed { heap: u64, offset: u64, length: u64 },
+    /// The object has no bytes of its own at all: a sampler, a function, a
+    /// pipeline state, a depth-stencil state, a view over another object's
+    /// bytes.
+    ///
+    /// **Most of an object list is this**, and the walk that produces these
+    /// operations sees every slot, not only the ones that own memory. Such a
+    /// name still resolves, still carries a generation and still stops
+    /// resolving when the guest deletes it — see [`crate::namespace`], where a
+    /// slot's backing is optional for this reason — but it has no residency, no
+    /// heap window and no content authority, because there are no bytes for any
+    /// of the three to be about.
+    ///
+    /// Not expressible as a `Dedicated` with an empty extent: that would put a
+    /// [`BackingId`] on an object that owns no storage, and the only place such
+    /// an id could come from is the object's own name — the one derivation
+    /// [`crate::access::BackingId`] rules out.
+    NoBytes,
 }
 
 /// One resolved resource-lifecycle operation.
@@ -222,6 +248,32 @@ pub enum LifecycleOp {
     DeleteTask {
         task: TaskId,
     },
+    /// The guest has said where this task's object list is and how many slots
+    /// it has.
+    ///
+    /// **The operation is the binding, not the walk, and that is a correction a
+    /// measurement forced.** This command used to have no operation at all:
+    /// A refusal named `NeedsGuestTable` said the operation was "the
+    /// per-entry result of reading the table", which is a walk of guest memory
+    /// this crate cannot address. A driven boot then measured what such a walk
+    /// would cost — every `SetObjectList` in it declares **1 048 576** entries,
+    /// eighteen times over a boot, and about twelve hundred slots are ever
+    /// named. The count is the table's capacity and not its population, so the
+    /// walk was never the operation: it was a gigabyte of reads to find what a
+    /// resolution finds one slot at a time.
+    ///
+    /// So the binding is the operation, and [`Self::CreateResource`] stays what
+    /// it always was — one slot's declaration, produced when something names
+    /// that slot rather than when the table is bound.
+    ///
+    /// A rebind does **not** end the objects already declared in the task. That
+    /// is the contract this device implements and it is deliberate: a new table
+    /// changes what an *unresolved* reference will construct, and typed objects
+    /// already built keep their own delete and their task's lifetime.
+    BindObjectList {
+        task: TaskId,
+        list: ObjectList,
+    },
     /// The object-list walk's per-object result: this slot now holds a
     /// resource with this storage.
     CreateResource {
@@ -229,9 +281,31 @@ pub enum LifecycleOp {
         slot: ObjectListRef,
         storage: Storage,
     },
+    /// The guest is ending one object-list slot's resource.
+    ///
+    /// # The name is optional for the reason a destroy's is
+    ///
+    /// This carried a bare `ResourceId` and an unresolvable reference refused
+    /// the whole packet, which is the same wrong answer
+    /// [`Self::DeleteObject::resource`] records and for the same reason: the
+    /// guest clears its own object-list slot *before* it sends the delete, so a
+    /// slot this device never named answers nothing when the delete arrives.
+    /// A driven macos-15 boot refused 25 packets of guest work on it.
+    ///
+    /// A refusal there loses more than the name. Every rail's teardown for this
+    /// command — the resolution memo, the GVA resource, the bound-buffer
+    /// retirement — is keyed by `(task, ref)` and not by a name, so refusing
+    /// the packet leaves the device holding the very state the delete came to
+    /// drop. So the reference travels beside the name, exactly as a destroy's
+    /// does, and `None` orders the operation against nothing: a resource this
+    /// model cannot name is one no other operation in it can name either.
     DeleteResource {
         task: TaskId,
-        resource: ResourceId,
+        /// The guest's own number, which the rail's `(task, ref)`-keyed
+        /// teardown needs whether or not the model has a name.
+        object_ref: u32,
+        /// The name, when the object namespace has one.
+        resource: Option<ResourceId>,
     },
     /// The guest has given an interval of this task's GPU virtual address
     /// space pages, and says so after it has already applied the change to its
@@ -278,9 +352,76 @@ pub enum LifecycleOp {
         resources: Vec<ResourceId>,
     },
     /// Retire a backing and the resources that named it.
+    /// The guest is retiring one surface's host backing, and with it every
+    /// resource that named those bytes.
+    ///
+    /// # The backing is optional for the reason a delete's name is
+    ///
+    /// The record's first word is a **mapping** id, and a mapping that no
+    /// longer resolves is one this model never had a backing for — so there is
+    /// nothing here to retire, and there never was. Refusing on it threw away
+    /// the packet, which is the same wrong answer
+    /// [`Self::DeleteResource::resource`] records: a driven macos-15 boot
+    /// refused one a boot that way, and the rail's own mapping-keyed teardown
+    /// was the half with work left.
+    ///
+    /// The mapping travels beside the backing so that half has what it needs
+    /// whether or not this model can name anything.
     DeleteBacking {
         task: TaskId,
-        backing: BackingId,
+        /// The guest's own mapping id, which the rail's teardown is keyed by.
+        mapping: crate::identity::MappingId,
+        /// The bytes, when the mapping still resolves to some.
+        backing: Option<BackingId>,
+    },
+    /// End one serializer object: the name stops resolving, and the rail drops
+    /// whatever it holds for that kind.
+    ///
+    /// # Why the kind travels and `DeleteResource` was not reused
+    ///
+    /// The name half is identical — a slot stops resolving, and
+    /// [`crate::namespace`] owns that either way. What is not identical is what
+    /// the executor owes: a sampler destroy drops a task-local sampler
+    /// registry entry, a fence destroy drops the generations a wait is decided
+    /// against, and a function destroy drops nothing at all because that kind
+    /// is held by content. An operation that lost the kind would leave the
+    /// executor to re-derive it from bytes the model no longer carries.
+    ///
+    /// They are also two different commands on the wire — `0x25` names
+    /// `{task, object}` in the packet and this one carries a record — so
+    /// folding them would be one kind with two payload layouts, which
+    /// [`LifecycleKind::of`] could not tell apart.
+    DeleteObject {
+        task: TaskId,
+        /// The guest's own number, which is what every rail's retirement is
+        /// keyed by — `(task, ref)`, not a name.
+        ///
+        /// Carried beside the name rather than derived from it because for one
+        /// measured kind there *is* no name: a fence comes into being when an
+        /// exec stream first signals it, so no path reads a fence out of the
+        /// guest's object list and the namespace has nothing to give.
+        object_ref: u32,
+        /// The name, when the object namespace has one.
+        ///
+        /// # `None` is an answer, not a failure
+        ///
+        /// This used to be a `ResourceId` and an unresolvable reference
+        /// refused the whole packet. That is wrong for a *destroy*, and a
+        /// driven boot priced it: seven a boot arrive with neither a name in
+        /// the model nor a live entry in the guest's list —
+        /// `delete_unnamed_and_unresolvable`, of which two are fences. Refusing
+        /// those loses the retirement, and for a fence that is a wrong answer
+        /// rather than a dropped one: `retire_fence` clears the stored
+        /// generation, and a generation outliving its fence makes the next
+        /// fence to reuse that reference start life already signalled.
+        ///
+        /// Nothing is lost by ordering it against nothing. A resource the
+        /// namespace cannot name is one no other operation in this model can
+        /// name either, so there is no access for this delete to conflict with
+        /// — see [`Self::resources`], which returns an empty slice for exactly
+        /// this case.
+        resource: Option<ResourceId>,
+        kind: reims_vgpu_protocol::destroy::DestroyKind,
     },
 }
 
@@ -290,7 +431,9 @@ impl LifecycleOp {
         match self {
             Self::DefineTask { .. } => LifecycleKind::DefineTask,
             Self::DeleteTask { .. } => LifecycleKind::DeleteTask,
-            Self::CreateResource { .. } => LifecycleKind::SetObjectList,
+            Self::BindObjectList { .. } | Self::CreateResource { .. } => {
+                LifecycleKind::SetObjectList
+            }
             Self::DeleteResource { .. } => LifecycleKind::DeleteResource,
             Self::MapMemory { .. } => LifecycleKind::MapMemory,
             Self::UnmapMemory { .. } => LifecycleKind::UnmapMemory,
@@ -300,6 +443,7 @@ impl LifecycleOp {
             Self::SynchronizeAndDiscard { .. } => LifecycleKind::SynchronizeAndDiscard,
             Self::Discard { .. } => LifecycleKind::Discard,
             Self::DeleteBacking { .. } => LifecycleKind::DeleteBacking,
+            Self::DeleteObject { .. } => LifecycleKind::DeleteObject,
         }
     }
 
@@ -323,18 +467,96 @@ impl LifecycleOp {
             | Self::Synchronize { resources, .. }
             | Self::SynchronizeAndDiscard { resources, .. }
             | Self::Discard { resources, .. } => resources,
-            Self::DeleteResource { resource, .. } | Self::ReplacePhysical { resource, .. } => {
-                std::slice::from_ref(resource)
+            Self::ReplacePhysical { resource, .. } => std::slice::from_ref(resource),
+            // Empty when the namespace has no name for it, which is the honest
+            // answer rather than a missing one: a resource this model cannot
+            // name is one nothing else in it names, so a delete of it conflicts
+            // with nothing.
+            Self::DeleteObject { resource, .. } | Self::DeleteResource { resource, .. } => {
+                resource.as_slice()
             }
             // A task's own lifetime, an address interval, a slot declaration
             // and a backing retirement each name something that is not a
             // resource id.
             Self::DefineTask { .. }
             | Self::DeleteTask { .. }
+            | Self::BindObjectList { .. }
             | Self::CreateResource { .. }
             | Self::MapMemory { .. }
             | Self::UnmapMemory { .. }
             | Self::DeleteBacking { .. } => &[],
+        }
+    }
+
+    /// What every resource this operation names is subject to, or `None` when
+    /// it names none.
+    ///
+    /// # Why a mode per operation and not per resource
+    ///
+    /// A lifecycle command's resource list is a list of *operands of one verb*:
+    /// a synchronise synchronises all of them, a discard discards all of them.
+    /// Nothing on this wire distinguishes the operands from one another, so a
+    /// per-resource mode would be a field with one value repeated, and the first
+    /// caller to fill it differently would be inventing a distinction the packet
+    /// does not carry.
+    ///
+    /// # `Unknown` is the answer for three of them, deliberately
+    ///
+    /// [`AccessMode::Unknown`] exists so that "conservative because nobody
+    /// knows" is countable and therefore narrowable, and that is exactly what
+    /// three of these are. It orders identically to `ReadWrite`, so nothing is
+    /// under-ordered by saying it; what it buys is that a census can say how
+    /// many of this device's lifecycle edges are bought with imprecision, and a
+    /// later closure can show the number falling.
+    ///
+    /// The split, and what each side rests on:
+    ///
+    /// * `Invalidate`, `Synchronize` and `SynchronizeAndDiscard` are
+    ///   [`AccessMode::Write`], and that is established rather than assumed. A
+    ///   synchronise stores rendered content **into the resource's own guest
+    ///   pages**, and an invalidate is the guest declaring it CPU-authored those
+    ///   pages — content authority moving, outside the GPU timeline. Both
+    ///   produce content on the memory the operation names; neither reads it.
+    /// * `Discard` releases the transfer staging of the resources it names while
+    ///   preserving their identity and host texture. Which memory that is a
+    ///   statement about is *not* established: the resource's guest bytes are
+    ///   not what it touches, and the model has no key for a transfer staging.
+    ///   So the direction is unestablished over the memory the access is keyed
+    ///   on, which is what `Unknown` says.
+    /// * `DeleteResource` and `ReplacePhysical` end or re-point the storage the
+    ///   name answered for. [`crate::namespace`] already owns the *name* half —
+    ///   deletion stops resolution, teardown waits for the last accepted use —
+    ///   so what is left here is only the hazard edge against work still
+    ///   touching those bytes. That edge must exist in both directions and the
+    ///   operation reads nothing, so neither `Read` nor `Write` is the term;
+    ///   `Unknown` orders it and says the term is open.
+    ///
+    /// # It is `None` exactly when [`Self::resources`] is empty
+    ///
+    /// Same arms, same file, one screen apart, and
+    /// `an_operation_declares_an_access_exactly_when_it_names_resources` holds
+    /// them to it — because a mode without a resource orders against memory the
+    /// operation never named, and a resource without a mode is a packet
+    /// [`crate::transaction::LifecyclePayload`] refuses.
+    #[must_use]
+    pub const fn declared_access(&self) -> Option<AccessMode> {
+        match self {
+            Self::Invalidate { .. }
+            | Self::Synchronize { .. }
+            | Self::SynchronizeAndDiscard { .. } => Some(AccessMode::Write),
+            Self::Discard { .. }
+            | Self::DeleteResource { .. }
+            | Self::ReplacePhysical { .. }
+            | Self::DeleteObject { .. } => Some(AccessMode::Unknown),
+            // Each names something that is not a resource, so there is no
+            // per-resource claim for a mode to be about.
+            Self::DefineTask { .. }
+            | Self::DeleteTask { .. }
+            | Self::BindObjectList { .. }
+            | Self::CreateResource { .. }
+            | Self::MapMemory { .. }
+            | Self::UnmapMemory { .. }
+            | Self::DeleteBacking { .. } => None,
         }
     }
 
@@ -343,6 +565,7 @@ impl LifecycleOp {
         match self {
             Self::DefineTask { task, .. }
             | Self::DeleteTask { task }
+            | Self::BindObjectList { task, .. }
             | Self::CreateResource { task, .. }
             | Self::DeleteResource { task, .. }
             | Self::MapMemory { task, .. }
@@ -352,7 +575,8 @@ impl LifecycleOp {
             | Self::Synchronize { task, .. }
             | Self::SynchronizeAndDiscard { task, .. }
             | Self::Discard { task, .. }
-            | Self::DeleteBacking { task, .. } => *task,
+            | Self::DeleteBacking { task, .. }
+            | Self::DeleteObject { task, .. } => *task,
         }
     }
 }
@@ -514,20 +738,46 @@ pub enum ResolveRefusal {
     /// the guest re-points a resource at host frames it has already wired, at
     /// the *same* GPU-VA — so the new backing and extent are not on the wire at
     /// all. They come from whatever holds the object's storage, which is a
-    /// registry this crate does not yet have. Named rather than approximated,
+    /// registry this crate does not have. Named rather than approximated,
     /// because an operation carrying the *old* backing would re-point nothing
     /// while reporting success.
-    NeedsStorage { kind: LifecycleKind },
+    ///
+    /// **It carries the half that did resolve.** The task and the resource were
+    /// settled before this refusal was reached — the ref is looked up in its own
+    /// task's namespace and a dead one refuses as [`Self::UnknownRef`] — so a
+    /// caller that can supply the storage has everything else already, and does
+    /// not have to re-decode the packet or resolve the ref a second time to use
+    /// it. That matters because the second resolution is the one that could
+    /// disagree: a caller pairing *its* idea of which resource the packet names
+    /// with the model's storage would build an operation about a resource the
+    /// packet does not name, and nothing downstream could tell.
+    NeedsStorage {
+        kind: LifecycleKind,
+        task: TaskId,
+        resource: ResourceId,
+    },
     /// The command is not a backing retirement, so there is nothing for
     /// [`backing_retirement`] to read.
     NotABackingRetirement { kind: LifecycleKind },
-    /// The retirement names a mapping the mapper holds no surface for.
+    /// The command is not a serializer destroy, so there is nothing for
+    /// [`object_destroy`] to read.
+    NotAnObjectDestroy { kind: LifecycleKind },
+    /// The bytes inside a destroy command are not a destroy record.
     ///
-    /// Carries the guest's number for [`Self::UnknownRef`]'s reason, and is a
-    /// *different* refusal from it: the two numbers come from namespaces that
-    /// overlap, so a log that spelled them the same way would send a reader to
-    /// the object list to look for a mapping.
-    UnknownMapping { mapping: u32 },
+    /// Carried whole from the layer that judged them, which already tells a
+    /// number in the destroy span that nothing has measured from a record of
+    /// some other family entirely.
+    Destroy(reims_vgpu_protocol::destroy::DestroyRefusal),
+    /// The record is a destroy of a kind whose ledger row is not settled.
+    ///
+    /// Five of the eleven kinds have never been observed on a driven boot, and
+    /// acting on one would be acting on no evidence. The refusal is per
+    /// *packet* rather than per class, which is the difference between holding
+    /// five unobserved kinds out of the model and holding 5.5% of a real
+    /// guest's stream out of it.
+    UnsettledDestroy {
+        kind: reims_vgpu_protocol::destroy::DestroyKind,
+    },
     /// The command is not a map-or-unmap notice, so there is no interval for
     /// [`map_notice`] to read. [`NotAResourceList`](Self::NotAResourceList)'s
     /// sibling, and a caller asking the wrong question rather than a malformed
@@ -544,16 +794,6 @@ pub enum ResolveRefusal {
     NotATaskLifetime { kind: LifecycleKind },
     /// The notice's payload cannot hold its three fields.
     ShortNotice(fifo::ShortPayload),
-    /// The record resolved, and the operation is the result of walking a table
-    /// in guest memory this crate cannot address.
-    ///
-    /// `SetObjectList` is the case. Its packet says where a task's object list
-    /// is and how many entries it has; the operation is the per-entry result of
-    /// reading it, and every byte of it lives in pages the memory bound owns.
-    /// Named rather than approximated, for [`Self::NeedsStorage`]'s reason: an
-    /// operation built from the packet alone would rebind nothing while
-    /// reporting that it had.
-    NeedsGuestTable { kind: LifecycleKind },
     /// An `Invalidate` record asks for a content-authority transition this
     /// device has no established meaning for.
     ///
@@ -581,12 +821,13 @@ impl ResolveRefusal {
             Self::NotAnObjectReference { .. } => "lifecycle_not_an_object_reference",
             Self::NeedsStorage { .. } => "lifecycle_needs_storage",
             Self::NotABackingRetirement { .. } => "lifecycle_not_a_backing_retirement",
-            Self::UnknownMapping { .. } => "lifecycle_unknown_mapping",
             Self::NotAMapNotice { .. } => "lifecycle_not_a_map_notice",
             Self::NotATaskLifetime { .. } => "lifecycle_not_a_task_lifetime",
             Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
-            Self::NeedsGuestTable { .. } => "lifecycle_needs_guest_table",
             Self::UnestablishedValidityOps { .. } => "lifecycle_unestablished_validity_ops",
+            Self::NotAnObjectDestroy { .. } => "lifecycle_not_an_object_destroy",
+            Self::Destroy(inner) => inner.reason(),
+            Self::UnsettledDestroy { .. } => "lifecycle_unsettled_destroy",
         }
     }
 }
@@ -611,7 +852,7 @@ impl ResolveRefusal {
 pub fn resource_list(
     kind: LifecycleKind,
     payload: &[u8],
-    resolver: &impl crate::resolve::RefResolver,
+    namespaces: &(impl crate::resolve::TaskNamespaces + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     let Some(record_len) = kind.resource_list_record_len() else {
         return Err(ResolveRefusal::NotAResourceList { kind });
@@ -642,15 +883,19 @@ pub fn resource_list(
         (cmd.task_id, cmd.object_ids)
     };
 
+    // The namespace is bound to the task this packet just named, not to one a
+    // caller chose. Refs are per-task slot numbers, so another task's namespace
+    // would not refuse — it would resolve, and the operation would name
+    // somebody else's resources.
+    let task = TaskId(task);
+    let resolver = crate::resolve::InTask::new(namespaces, task);
     let mut resources = Vec::with_capacity(refs.len());
     for object_ref in refs {
-        let resolved = resolver
-            .resource(object_ref)
+        let resolved = crate::resolve::RefResolver::resource(&resolver, object_ref)
             .ok_or(ResolveRefusal::UnknownRef { object_ref })?;
         resources.push(resolved);
     }
 
-    let task = TaskId(task);
     Ok(match kind {
         LifecycleKind::Invalidate => LifecycleOp::Invalidate { task, resources },
         LifecycleKind::Synchronize => LifecycleOp::Synchronize { task, resources },
@@ -699,10 +944,15 @@ pub fn resource_list(
 /// naming nothing live.
 pub fn exec_resource_table(
     payload: &[u8],
-    resolver: &impl crate::resolve::RefResolver,
+    namespaces: &(impl crate::resolve::TaskNamespaces + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     let header = fifo::decode_exec_header(payload).map_err(ResolveRefusal::ShortNotice)?;
     let table = fifo::decode_exec_resource_table(payload).map_err(ResolveRefusal::Payload)?;
+    // The header's task, bound here rather than chosen by the caller — which is
+    // what this function's own contract says and what its signature used to
+    // leave to discipline.
+    let task = TaskId(header.task_id);
+    let resolver = crate::resolve::InTask::new(namespaces, task);
     let mut resources = Vec::new();
     for record in &table {
         if record.ops == fifo::InvalidateValidityOps::default() {
@@ -715,17 +965,14 @@ pub fn exec_resource_table(
             });
         }
         resources.push(
-            resolver
-                .resource(record.object_id)
-                .ok_or(ResolveRefusal::UnknownRef {
+            crate::resolve::RefResolver::resource(&resolver, record.object_id).ok_or(
+                ResolveRefusal::UnknownRef {
                     object_ref: record.object_id,
-                })?,
+                },
+            )?,
         );
     }
-    Ok(LifecycleOp::Invalidate {
-        task: TaskId(header.task_id),
-        resources,
-    })
+    Ok(LifecycleOp::Invalidate { task, resources })
 }
 
 /// Turn any lifecycle packet's payload into the operation it names.
@@ -748,17 +995,22 @@ pub fn exec_resource_table(
 /// why [`crate::resolve::RefResolver`] and
 /// [`crate::resolve::MappingResolver`] are two traits.
 ///
+/// The object side is a [`crate::resolve::TaskNamespaces`] and not one
+/// namespace: which task's namespace a lifecycle packet resolves in is stated in
+/// the packet, and only the join that decoded it knows. See that trait for why a
+/// caller-chosen namespace is a wrong answer rather than a refusal.
+///
 /// # Errors
 ///
-/// [`ResolveRefusal`] from the join that owns the kind, or — for the two
-/// commands that resolve and still cannot become an operation —
-/// [`ResolveRefusal::NeedsStorage`] and [`ResolveRefusal::NeedsGuestTable`],
-/// which name what is missing rather than approximating it.
+/// [`ResolveRefusal`] from the join that owns the kind, or — for the one
+/// command that resolves and still cannot become an operation —
+/// [`ResolveRefusal::NeedsStorage`], which names what is missing rather than
+/// approximating it.
 pub fn operation(
     kind: LifecycleKind,
     payload: &[u8],
-    objects: &impl crate::resolve::RefResolver,
-    mappings: &impl crate::resolve::MappingResolver,
+    objects: &(impl crate::resolve::TaskNamespaces + ?Sized),
+    mappings: &(impl crate::resolve::MappingResolver + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     match kind {
         LifecycleKind::DefineTask | LifecycleKind::DeleteTask => task_lifetime(kind, payload),
@@ -771,10 +1023,127 @@ pub fn operation(
         | LifecycleKind::Synchronize
         | LifecycleKind::SynchronizeAndDiscard
         | LifecycleKind::Discard => resource_list(kind, payload, objects),
-        // The one command whose operation is not in its packet. See
-        // `ResolveRefusal::NeedsGuestTable`.
-        LifecycleKind::SetObjectList => Err(ResolveRefusal::NeedsGuestTable { kind }),
+        LifecycleKind::SetObjectList => object_list_bind(kind, payload),
+        LifecycleKind::DeleteObject => object_destroy(kind, payload, objects),
     }
+}
+
+/// Which task a lifecycle packet names, without resolving anything in it.
+///
+/// **The half of [`operation`] that needs no namespace, and the term
+/// [`Refusal::NoSuchTask`] is decided on.** Every one of the twelve commands
+/// carries its task in its own record, and eight of them carry nothing else
+/// that has to resolve — so "would the lifecycle owner hold this task" is
+/// answerable from the packet's bytes alone, before the owner is production
+/// state and before any ref is looked up. That is what a device measuring the
+/// group's cutover floor needs: an operation it cannot build yet still names a
+/// task, and a task the model does not hold is a refusal of the whole packet
+/// whatever the refs do.
+///
+/// It is not a second decode table. Each arm calls the same
+/// [`reims_vgpu_protocol::fifo`] decoder [`operation`]'s join for that kind
+/// calls, so the offsets have one owner; what is dropped is the resolution, not
+/// the layout. `task_named_agrees_with_the_operation_it_would_build` holds the
+/// two to the same answer over every kind.
+///
+/// # Errors
+///
+/// [`ResolveRefusal::ShortNotice`] or [`ResolveRefusal::Payload`] when the
+/// payload is too short to hold the record its kind names. There is no
+/// resolver-shaped refusal here, which is the point.
+pub fn task_named(kind: LifecycleKind, payload: &[u8]) -> Result<TaskId, ResolveRefusal> {
+    let id = match kind {
+        LifecycleKind::DefineTask => {
+            fifo::decode_define_task(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .id
+                .task_id
+        }
+        LifecycleKind::DeleteTask => {
+            fifo::decode_delete_task(payload).map_err(ResolveRefusal::ShortNotice)?
+        }
+        LifecycleKind::DeleteResource | LifecycleKind::ReplacePhysical => {
+            fifo::decode_task_object(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .task_id
+        }
+        LifecycleKind::MapMemory | LifecycleKind::UnmapMemory => {
+            fifo::decode_map_memory(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .task_id
+        }
+        LifecycleKind::DeleteBacking => {
+            fifo::decode_delete_backing(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .task_id
+        }
+        LifecycleKind::SetObjectList => {
+            fifo::decode_set_object_list(payload)
+                .map_err(ResolveRefusal::ShortNotice)?
+                .task_id
+        }
+        // The task word is the command's, ahead of a record whose framing this
+        // question does not need: a destroy that is too short to hold a record
+        // still names the task it would have acted in.
+        LifecycleKind::DeleteObject => {
+            fifo::decode_delete_object(payload)
+                .map_err(|error| ResolveRefusal::ShortNotice(error.short()))?
+                .task_id
+        }
+        // The two record lengths, told apart by the same question
+        // [`resource_list`] asks: the eight-byte record is the validity quad's
+        // and the four-byte one is refs alone, and the task word is not at the
+        // same place in the two headers.
+        LifecycleKind::Invalidate => {
+            fifo::decode_invalidate_resources(payload)
+                .map_err(ResolveRefusal::Payload)?
+                .task_id
+        }
+        LifecycleKind::Synchronize
+        | LifecycleKind::SynchronizeAndDiscard
+        | LifecycleKind::Discard => {
+            fifo::decode_synchronize_resources(payload)
+                .map_err(ResolveRefusal::Payload)?
+                .task_id
+        }
+    };
+    Ok(TaskId(id))
+}
+
+/// Turn a `SetObjectList` packet's payload into the binding it names.
+///
+/// Takes no resolver, as [`task_lifetime`] does not: the packet carries a task
+/// id, a page frame and a count, and nothing about any of the three is a name
+/// device state could answer differently.
+///
+/// **This used to be a `NeedsGuestTable` refusal**, on the reading that
+/// the operation was the per-entry result of walking the table. See
+/// [`LifecycleOp::BindObjectList`] for the measurement that overturned it: the
+/// count is the table's capacity, a driven boot declares 1 048 576 of them
+/// eighteen times, and about twelve hundred slots are ever named. The walk was
+/// never the operation.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a kind that is not `SetObjectList`, or a payload too
+/// short for the three words. A short one is refused rather than defaulted,
+/// because a zeroed page frame is a valid frame number and a zeroed task id is
+/// the kernel task.
+pub fn object_list_bind(
+    kind: LifecycleKind,
+    payload: &[u8],
+) -> Result<LifecycleOp, ResolveRefusal> {
+    if kind != LifecycleKind::SetObjectList {
+        return Err(ResolveRefusal::NotATaskLifetime { kind });
+    }
+    let command = fifo::decode_set_object_list(payload).map_err(ResolveRefusal::ShortNotice)?;
+    Ok(LifecycleOp::BindObjectList {
+        task: TaskId(command.task_id),
+        list: ObjectList {
+            page: DirectoryFrame(command.pfn),
+            capacity: command.count,
+        },
+    })
 }
 
 /// Turn a task-lifetime packet's payload into the operation it names.
@@ -834,7 +1203,7 @@ pub fn task_lifetime(kind: LifecycleKind, payload: &[u8]) -> Result<LifecycleOp,
 pub fn object_reference(
     kind: LifecycleKind,
     payload: &[u8],
-    resolver: &impl crate::resolve::RefResolver,
+    namespaces: &(impl crate::resolve::TaskNamespaces + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     if !matches!(
         kind,
@@ -843,19 +1212,106 @@ pub fn object_reference(
         return Err(ResolveRefusal::NotAnObjectReference { kind });
     }
     let command = fifo::decode_task_object(payload).map_err(ResolveRefusal::ShortNotice)?;
+    // The record's own task names the namespace its object ref is a slot in.
+    let task = TaskId(command.task_id);
+    let resolver = crate::resolve::InTask::new(namespaces, task);
     // The ref is resolved before the kind is judged, so a re-point naming a
     // dead object refuses as a dead object rather than as unfinished work here.
-    let resource = resolver
-        .resource(command.object_id)
-        .ok_or(ResolveRefusal::UnknownRef {
-            object_ref: command.object_id,
-        })?;
-    let task = TaskId(command.task_id);
+    // The two kinds differ in what an unresolvable one *means*, which is why the
+    // refusal is each arm's and not this line's: a delete whose slot the guest
+    // already cleared is ordinary, and a re-point with no resource to re-point
+    // is not a re-point.
+    let resource = crate::resolve::RefResolver::resource(&resolver, command.object_id);
     match kind {
-        LifecycleKind::DeleteResource => Ok(LifecycleOp::DeleteResource { task, resource }),
-        // `ReplacePhysical`, and nothing else reaches here.
-        other => Err(ResolveRefusal::NeedsStorage { kind: other }),
+        LifecycleKind::DeleteResource => Ok(LifecycleOp::DeleteResource {
+            task,
+            object_ref: command.object_id,
+            resource,
+        }),
+        // `ReplacePhysical`, and nothing else reaches here. The two terms it
+        // did resolve travel with the refusal; see `NeedsStorage`.
+        other => Err(match resource {
+            Some(resource) => ResolveRefusal::NeedsStorage {
+                kind: other,
+                task,
+                resource,
+            },
+            None => ResolveRefusal::UnknownRef {
+                object_ref: command.object_id,
+            },
+        }),
     }
+}
+
+/// Turn a serializer destroy packet's payload into the operation it names.
+///
+/// # The kind is in the record and the task is in the command
+///
+/// `CmdDeleteObject`'s payload is a task word followed by one self-describing
+/// destroy record, so this is the one lifetime join that reads two layers:
+/// [`reims_vgpu_protocol::fifo::decode_delete_object`] frames the record inside
+/// the payload, and [`reims_vgpu_protocol::destroy::decode`] says which of the
+/// eleven kinds it is and which reference it names.
+///
+/// # An unsettled kind refuses, and that is what makes the row affordable
+///
+/// The eleven kinds do not share a closure. Six are settled on their own
+/// serializer ledger rows; five — buffer, texture, heap, rasterization rate map
+/// and indirect command buffer — have never been observed on any driven boot
+/// and are unresolved. Refusing the whole *packet class* on their account was
+/// what held 5.5% of a real guest's stream out of the model; refusing the
+/// individual packet is the same honesty at 1/2000 the cost, and it costs the
+/// channel nothing because a refused packet's completion word is
+/// [`crate::session::SessionModel::admit`]'s caller's to stamp.
+///
+/// # The reference is an object-list name
+///
+/// Measured, not assumed. A sampler is constructed by looking this same number
+/// up in the guest's object list and requiring a serializer-object entry there.
+/// A driven boot finding that most destroys resolve to no *live* entry is a
+/// fact about time, not about namespaces — the guest clears its slot before it
+/// sends the destroy, and the name the device took at construction outlives the
+/// slot. That is why this resolves through [`crate::resolve::TaskNamespaces`]
+/// like every other object reference, and why it can.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a kind that is not a destroy command, a payload too
+/// short for the record, a record that is not a destroy, or a kind the ledger
+/// has not settled.
+///
+/// **Not** a reference naming nothing live. That used to refuse here and it
+/// was wrong for a destroy: the effect is keyed by `(task, ref)` and the
+/// reference is right there, so refusing loses a retirement this device can
+/// still perform. See [`LifecycleOp::DeleteObject::resource`].
+pub fn object_destroy(
+    kind: LifecycleKind,
+    payload: &[u8],
+    namespaces: &(impl crate::resolve::TaskNamespaces + ?Sized),
+) -> Result<LifecycleOp, ResolveRefusal> {
+    if kind != LifecycleKind::DeleteObject {
+        return Err(ResolveRefusal::NotAnObjectDestroy { kind });
+    }
+    let command = fifo::decode_delete_object(payload)
+        .map_err(|error| ResolveRefusal::ShortNotice(error.short()))?;
+    let record =
+        reims_vgpu_protocol::destroy::decode(command.record).map_err(ResolveRefusal::Destroy)?;
+    if !record.kind.settled() {
+        return Err(ResolveRefusal::UnsettledDestroy { kind: record.kind });
+    }
+    let task = TaskId(command.task_id);
+    let resolver = crate::resolve::InTask::new(namespaces, task);
+    // Not `ok_or(UnknownRef)`. A destroy is the one lifecycle command whose
+    // effect must not be lost to an unresolvable reference — see
+    // [`LifecycleOp::DeleteObject::resource`] — and the reference itself is
+    // carried so the executor's `(task, ref)`-keyed retirement runs either way.
+    let resource = crate::resolve::RefResolver::resource(&resolver, record.object_ref);
+    Ok(LifecycleOp::DeleteObject {
+        task,
+        object_ref: record.object_ref,
+        resource,
+        kind: record.kind,
+    })
 }
 
 /// Turn a backing-retirement packet's payload into the operation it names.
@@ -879,20 +1335,21 @@ pub fn object_reference(
 pub fn backing_retirement(
     kind: LifecycleKind,
     payload: &[u8],
-    resolver: &impl crate::resolve::MappingResolver,
+    resolver: &(impl crate::resolve::MappingResolver + ?Sized),
 ) -> Result<LifecycleOp, ResolveRefusal> {
     if kind != LifecycleKind::DeleteBacking {
         return Err(ResolveRefusal::NotABackingRetirement { kind });
     }
     let command = fifo::decode_delete_backing(payload).map_err(ResolveRefusal::ShortNotice)?;
     let mapping = crate::identity::MappingId(command.object_id);
-    let backing = resolver
-        .backing(mapping)
-        .ok_or(ResolveRefusal::UnknownMapping {
-            mapping: command.object_id,
-        })?;
+    // Not `ok_or(UnknownMapping)`. A retirement's effect must not be lost to a
+    // mapping this model never held — see [`LifecycleOp::DeleteBacking`] — and
+    // the mapping itself is carried so the executor's own teardown runs either
+    // way.
+    let backing = resolver.backing(mapping);
     Ok(LifecycleOp::DeleteBacking {
         task: TaskId(command.task_id),
+        mapping,
         backing,
     })
 }
@@ -1045,15 +1502,39 @@ struct Task {
     /// The page frame its page table is rooted at. See
     /// [`crate::identity::DirectoryFrame`].
     directory: DirectoryFrame,
+    /// Where this task's object list lives and how many slots it has, once a
+    /// `SetObjectList` has said so.
+    ///
+    /// `None` until then, which is a real state and not a default: a task whose
+    /// list is unbound has no table for a reference to be an index into, so
+    /// every ref in it names nothing — and that is different from a bound list
+    /// whose slot happens to be empty.
+    object_list: Option<ObjectList>,
     namespace: Namespace,
     heaps: Heaps,
     resident: HashMap<ResourceId, Resident>,
+}
+
+/// Where a task's object list is and how big the guest said it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectList {
+    /// The guest page frame the table starts at.
+    pub page: DirectoryFrame,
+    /// How many slots the table has room for.
+    ///
+    /// **Capacity, not population, and the difference is not academic.** A
+    /// driven boot's `SetObjectList` declares 1 048 576 entries eighteen times
+    /// over, and about twelve hundred of them are ever named. An owner that
+    /// treated this as the number of objects to walk would read a gigabyte of
+    /// guest memory per bind to find them.
+    pub capacity: u32,
 }
 
 impl Task {
     fn new(directory: DirectoryFrame) -> Self {
         Self {
             directory,
+            object_list: None,
             namespace: Namespace::new(),
             heaps: Heaps::default(),
             resident: HashMap::new(),
@@ -1254,15 +1735,21 @@ impl Lifecycle {
         t.namespace
             .resolve(participation.resource)
             .map_err(|refusal| Refusal::Namespace { task, refusal })?;
-        let resident = *t
-            .resident
-            .get(&participation.resource)
-            .ok_or(Refusal::Namespace {
-                task,
-                refusal: namespace::Refusal::NotDeclared {
-                    slot: participation.resource.slot,
-                },
-            })?;
+        // The name resolved a line above, so an absent residency is not "no
+        // such slot" — it is exactly and only a declaration of
+        // `Storage::NoBytes`, which is the one arm of `create_resource` that
+        // inserts nothing here. This used to answer `NotDeclared` for it, which
+        // was a lie about a live name and refused the whole transaction: an
+        // indirect command buffer is such an object, so one ICB record refused
+        // every draw in its packet.
+        //
+        // What a resource with no bytes participates as is
+        // `AccessKey::DomainOnly` — see `Participation::resolve_no_bytes`. It
+        // over-orders and never under-orders, and it is the same vocabulary an
+        // unresolvable present target already uses.
+        let Some(&resident) = t.resident.get(&participation.resource) else {
+            return Ok(participation.resolve_no_bytes(domain));
+        };
         let key = ResourceKey {
             backing: resident.backing(),
             heap: match resident {
@@ -1278,17 +1765,47 @@ impl Lifecycle {
                 Resident::Dedicated { .. } => None,
             },
         };
+        // The whole of this resource, in whichever vocabulary its storage shape
+        // uses. Named once because two arms below need it: a participation that
+        // says "the whole thing" and one whose window this resource cannot hold.
+        let whole = match resident {
+            Resident::Dedicated { .. } => ParticipationExtent::Whole,
+            Resident::Placed(p) => ParticipationExtent::Range(p.region),
+        };
         let extent = match participation.extent {
-            ParticipationExtent::Range(range) => ParticipationExtent::Range(
-                resident
-                    .window(range.offset, range.length)
-                    .map_err(|refusal| Refusal::Heap { task, refusal })?,
-            ),
+            // **A window that does not fit widens; it does not refuse.**
+            //
+            // A record's `Range` is an *upper bound on what the record touches*
+            // and not an assertion that those bytes exist.
+            // `ImagePitch::span_bytes` says so in its own doc — it multiplies a
+            // pitch by a height or a depth and its caller widens to the whole
+            // buffer rather than guess a packed layout, "because a packed guess
+            // is a shorter span than the copy really touches and a short span is
+            // a missed hazard edge". A bound built to err long, checked as if it
+            // were exact, refuses the copies it was made safe for.
+            //
+            // It was measured. A driven macos-15 boot refused seven exec packets
+            // a boot here, every one of them a `0x12c`
+            // `copyFromBuffer:…toTexture:…` reading its source buffer:
+            // `offset=65536 length=196608` of a resource whose whole extent is
+            // 196 608 bytes, the span being `bytes_per_row × height` over a
+            // sub-rect that starts partway in. Each refusal threw away a whole
+            // packet of guest work.
+            //
+            // So the answer is the one three lines up, for the same reason:
+            // widening over-orders and never under-orders, exactly as
+            // `resolve_no_bytes`' `AccessKey::DomainOnly` does. Narrowing —
+            // clamping the window to the extent — is the one answer that is
+            // wrong, because it claims fewer bytes than the record may touch and
+            // a short claim is an edge that does not get built.
+            //
+            // The caller can see it happened: it asked with a `Range` and got a
+            // key that is not one.
+            ParticipationExtent::Range(range) => resident
+                .window(range.offset, range.length)
+                .map_or(whole, ParticipationExtent::Range),
             ParticipationExtent::Subresource(range) => ParticipationExtent::Subresource(range),
-            ParticipationExtent::Whole => match resident {
-                Resident::Dedicated { .. } => ParticipationExtent::Whole,
-                Resident::Placed(p) => ParticipationExtent::Range(p.region),
-            },
+            ParticipationExtent::Whole => whole,
         };
         let bytes = match extent {
             ParticipationExtent::Range(range) => Some(range),
@@ -1325,14 +1842,20 @@ impl Lifecycle {
                 task, directory, ..
             } => self.define_task(*task, *directory),
             LifecycleOp::DeleteTask { task } => self.delete_task(*task),
+            LifecycleOp::BindObjectList { task, list } => self.bind_object_list(*task, *list),
             LifecycleOp::CreateResource {
                 task,
                 slot,
                 storage,
             } => self.create_resource(*task, *slot, *storage),
-            LifecycleOp::DeleteResource { task, resource } => {
-                self.delete_resource(*task, *resource)
-            }
+            LifecycleOp::DeleteResource { task, resource, .. } => match resource {
+                Some(resource) => self.delete_resource(*task, *resource),
+                // The same `None` [`LifecycleOp::DeleteObject`]'s arm answers,
+                // for the same reason: this model never named the slot, so it
+                // holds nothing to retire, and the rail's `(task, ref)`-keyed
+                // teardown is the half with work left.
+                None => Ok(Effects::default()),
+            },
             LifecycleOp::MapMemory { task, span } => self.remap(*task, *span, true),
             LifecycleOp::UnmapMemory { task, span } => self.remap(*task, *span, false),
             LifecycleOp::ReplacePhysical {
@@ -1349,7 +1872,25 @@ impl Lifecycle {
                 self.synchronize(*task, resources, true)
             }
             LifecycleOp::Discard { task, resources } => self.discard(*task, resources),
-            LifecycleOp::DeleteBacking { task, backing } => self.delete_backing(*task, *backing),
+            LifecycleOp::DeleteBacking { task, backing, .. } => match backing {
+                Some(backing) => self.delete_backing(*task, *backing),
+                // No bytes were ever named for this mapping, so no resource in
+                // this model can be resident on them. The rail's mapping-keyed
+                // teardown is the half with work left.
+                None => Ok(Effects::default()),
+            },
+            // The name half, which is the only half this model owns. Which
+            // per-kind registry the rail drops is the executor's, and it is
+            // carried on the operation so the executor does not have to
+            // re-derive it from bytes the model no longer holds.
+            LifecycleOp::DeleteObject { task, resource, .. } => match resource {
+                Some(resource) => self.delete_resource(*task, *resource),
+                // Nothing in this model was ever named for it, so there is
+                // nothing here to drop. The rail's own `(task, ref)`-keyed
+                // retirement is the half that still has work to do, and it has
+                // the reference.
+                None => Ok(Effects::default()),
+            },
         }
     }
 
@@ -1494,6 +2035,29 @@ impl Lifecycle {
         Ok(effects)
     }
 
+    /// Bind a task's object list.
+    ///
+    /// Nothing is retired here, and that is the contract rather than an
+    /// omission. A new table changes what an *unresolved* reference will
+    /// construct; the objects already declared in this task keep their own
+    /// deletes and their task's lifetime, which is what the device this models
+    /// does. Entries whose construction input is no longer valid are the
+    /// caller's to retire — they are host caches and resolved windows, neither
+    /// of which is a name.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NoSuchTask`] for a list bound into a task no definition
+    /// opened. Refused rather than creating the task, because a table with no
+    /// page directory has no address space its page frame means anything in.
+    fn bind_object_list(&mut self, task: TaskId, list: ObjectList) -> Result<Effects, Refusal> {
+        let Some(t) = self.tasks.get_mut(&task) else {
+            return Err(Refusal::NoSuchTask { task });
+        };
+        t.object_list = Some(list);
+        Ok(Effects::default())
+    }
+
     fn delete_task(&mut self, task: TaskId) -> Result<Effects, Refusal> {
         if !self.tasks.contains_key(&task) {
             return Err(Refusal::NoSuchTask { task });
@@ -1543,7 +2107,7 @@ impl Lifecycle {
         // the displaced occupant's teardown on an error path that carries no
         // effects at all.
         let backing = match storage {
-            Storage::Dedicated { backing, .. } => backing,
+            Storage::Dedicated { backing, .. } => Some(backing),
             Storage::Placed {
                 heap,
                 offset,
@@ -1552,10 +2116,14 @@ impl Lifecycle {
                 t.heaps
                     .admits(heap, offset, length)
                     .map_err(|refusal| Refusal::Heap { task, refusal })?;
-                t.heaps
-                    .backing_of(heap)
-                    .map_err(|refusal| Refusal::Heap { task, refusal })?
+                Some(
+                    t.heaps
+                        .backing_of(heap)
+                        .map_err(|refusal| Refusal::Heap { task, refusal })?,
+                )
             }
+            // Nothing to admit and nothing to look up: the object owns no bytes.
+            Storage::NoBytes => None,
         };
         let crate::namespace::Declared { id, displaced } = t.namespace.declare(slot, backing);
         // The guest wrote over a slot that still held an object. There is no
@@ -1592,6 +2160,13 @@ impl Lifecycle {
                     .write(placement.backing, placement.region, Replica::GuestPages);
                 Resident::Placed(placement)
             }
+            // No residency entry at all, rather than an empty one. `Resident`
+            // answers "where are this name's bytes", and every reader of the
+            // table — `resolve_all`, the validity quad, `retire_resident` —
+            // already treats an absent entry as "this name has none", which is
+            // exactly the truth here. An entry standing for no bytes would make
+            // those readers ask a question with no answer.
+            Storage::NoBytes => return Ok(displaced.unwrap_or_default()),
         };
         let t = self.tasks.get_mut(&task).expect("resolved above");
         t.resident.insert(id, resident);
@@ -1667,7 +2242,15 @@ impl Lifecycle {
                 // Someone else still answers for these bytes. Forgetting here
                 // would drop the content authority out from under a reader or
                 // a live name.
-                Teardown::WhenUsesRetire { .. } | Teardown::HeldByAnotherName { .. } => {}
+                // `NoStorage` cannot arrive on this arm — a dedicated resident
+                // is a name the namespace holds a backing for — and it is
+                // grouped here rather than asserted, because the two ways of
+                // being wrong are not equal: an unreachable arm that fires
+                // does nothing, and a panic in the model's own teardown path
+                // takes the session down over a name that owns nothing.
+                Teardown::WhenUsesRetire { .. }
+                | Teardown::HeldByAnotherName { .. }
+                | Teardown::NoStorage => {}
             },
             None => {}
         }
@@ -1729,8 +2312,11 @@ impl Lifecycle {
                 let _ = self.forget_backing(old);
             }
             // The old bytes are still read by accepted work, or still named by
-            // another slot. Either way their authority is not ours to drop.
-            Teardown::WhenUsesRetire { .. } | Teardown::HeldByAnotherName { .. } => {}
+            // another slot, or there were no old bytes at all. In none of the
+            // three is there an authority here to drop.
+            Teardown::WhenUsesRetire { .. }
+            | Teardown::HeldByAnotherName { .. }
+            | Teardown::NoStorage => {}
         }
         Ok(Effects {
             teardowns: vec![teardown],
@@ -1833,6 +2419,69 @@ impl Lifecycle {
     }
 }
 
+/// The lifecycle owner answering what a guest reference names.
+///
+/// # Why the owner and not the namespace
+///
+/// `Namespace` already implements [`crate::resolve::RefResolver`], and one
+/// namespace is one task. A caller that has not yet decoded which task a packet
+/// is about cannot pick one — which is the whole reason
+/// [`crate::resolve::TaskNamespaces`] exists — and the holder of *every* task's
+/// namespace is this type. So the routing lives here, and it is routing and
+/// nothing else: the generation in the answer is the namespace's, and nothing
+/// on this path mints, leases or retires.
+///
+/// A task this owner does not hold answers `None`, which is the same answer a
+/// slot holding nothing gives and is correct for both: a reference into an
+/// address space that does not exist names nothing.
+impl crate::resolve::TaskNamespaces for Lifecycle {
+    fn resource(&self, task: TaskId, object_ref: u32) -> Option<ResourceId> {
+        use crate::resolve::RefResolver as _;
+        self.tasks.get(&task)?.namespace.resource(object_ref)
+    }
+}
+
+/// The lifecycle owner answering where a named resource's bytes are.
+///
+/// # It can carry the heap term, and nothing else can
+///
+/// [`crate::access::ResourceKey`] holds a backing *and* the heap it was
+/// allocated from, so that a heap-use record and a member's access have
+/// something to compare — without it the coarser rung silently orders against
+/// nothing. A device that mints identities from an allocation base has no heap
+/// term at all and must answer `None`; this owner placed the resource itself, so
+/// it has the placement and the heap's membership generation, and answers with
+/// them.
+///
+/// The membership generation is asked for at the moment of the question rather
+/// than stored in the placement, because that is what a `HeapId` is: two
+/// accesses to one heap taken either side of a placement are not comparable, and
+/// a key carrying a stale generation would say they were.
+///
+/// `None` when the task is not held, the name does not resolve in it, or the
+/// name resolves and owns no bytes. All three are "there is no key for this",
+/// which is what the trait asks; a caller turns it into
+/// `AccessKey::DomainOnly` rather than dropping the access.
+impl crate::resolve::ResourceStorage for Lifecycle {
+    fn storage(&self, task: TaskId, resource: ResourceId) -> Option<ResourceKey> {
+        use crate::resolve::RefResolver as _;
+        let t = self.tasks.get(&task)?;
+        // The name must still be the slot's own, at its own generation: a stale
+        // name whose slot has been redeclared would otherwise be keyed onto the
+        // new occupant's storage.
+        if t.namespace.resource(resource.slot.0) != Some(resource) {
+            return None;
+        }
+        Some(match *t.resident.get(&resource)? {
+            Resident::Dedicated { backing, .. } => ResourceKey {
+                backing,
+                heap: None,
+            },
+            Resident::Placed(placement) => placement.key(t.heaps.membership(placement.heap).ok()?),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1889,6 +2538,280 @@ mod tests {
         }
     }
 
+    /// One operation of every kind, so a sweep over the vocabulary is a sweep
+    /// over values and not over a second list of kinds.
+    fn one_of_every_kind() -> Vec<LifecycleOp> {
+        let span = GuestSpan {
+            base: 0x1000,
+            length: 0x1000,
+        };
+        vec![
+            LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+                directory: DirectoryFrame(0x1000),
+            },
+            LifecycleOp::DeleteTask { task: TASK },
+            LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(0),
+                storage: dedicated(10, 0x100),
+            },
+            LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 0,
+                resource: Some(name(0)),
+            },
+            LifecycleOp::MapMemory { task: TASK, span },
+            LifecycleOp::UnmapMemory { task: TASK, span },
+            LifecycleOp::ReplacePhysical {
+                task: TASK,
+                resource: name(0),
+                backing: BackingId(11),
+                extent: range(0, 0x100),
+            },
+            LifecycleOp::Invalidate {
+                task: TASK,
+                resources: vec![name(0)],
+            },
+            LifecycleOp::Synchronize {
+                task: TASK,
+                resources: vec![name(0)],
+            },
+            LifecycleOp::SynchronizeAndDiscard {
+                task: TASK,
+                resources: vec![name(0)],
+            },
+            LifecycleOp::Discard {
+                task: TASK,
+                resources: vec![name(0)],
+            },
+            LifecycleOp::DeleteBacking {
+                task: TASK,
+                mapping: crate::identity::MappingId(10),
+                backing: Some(BackingId(10)),
+            },
+            LifecycleOp::DeleteObject {
+                task: TASK,
+                object_ref: 0,
+                resource: Some(name(0)),
+                kind: reims_vgpu_protocol::destroy::DestroyKind::SamplerState,
+            },
+        ]
+    }
+
+    /// The sweep is over kinds and not over the vector's length, so a
+    /// thirteenth operation added without a row here fails rather than being
+    /// silently absent from every assertion the vector feeds.
+    #[test]
+    fn the_kind_sweep_covers_the_whole_vocabulary() {
+        let mut kinds: Vec<LifecycleKind> =
+            one_of_every_kind().iter().map(LifecycleOp::kind).collect();
+        let total = kinds.len();
+        kinds.sort_by_key(|k| format!("{k:?}"));
+        kinds.dedup();
+        assert_eq!(
+            kinds.len(),
+            total,
+            "two operations in the sweep have the same kind, so one kind is unswept"
+        );
+        for p in LEDGER {
+            if let Some(kind) = LifecycleKind::of(p.channel, p.opcode) {
+                assert!(
+                    kinds.contains(&kind),
+                    "{kind:?} is a lifecycle command with no operation in the sweep"
+                );
+            }
+        }
+    }
+
+    /// `LifecycleOp::declared_access` and `LifecycleOp::resources` are two
+    /// matches over one enum, and this is what stops them drifting.
+    ///
+    /// Either direction is a defect and neither is caught by the compiler: a
+    /// mode with no resource orders the operation against memory it never
+    /// named, and a resource with no mode is a packet
+    /// `crate::transaction::LifecyclePayload` refuses outright — which is a
+    /// whole command class silently lost rather than a wrong edge.
+    #[test]
+    fn an_operation_declares_an_access_exactly_when_it_names_resources() {
+        for op in one_of_every_kind() {
+            assert_eq!(
+                op.declared_access().is_some(),
+                !op.resources().is_empty(),
+                "{:?} disagrees with itself about whether it names resources",
+                op.kind()
+            );
+        }
+    }
+
+    /// No lifecycle command may declare a pure read of the resources it names.
+    ///
+    /// Not a restatement of the table: it is the property the table has to have.
+    /// Every one of these either produces content on the memory it names or
+    /// ends it, so a mode that did not order against a concurrent reader would
+    /// let a synchronise publish over bytes a draw is still sampling. `Read` is
+    /// the one mode that would do that, and `AccessMode::writes` is the
+    /// question the dependency compiler actually asks.
+    #[test]
+    fn no_lifecycle_operation_declares_a_pure_read() {
+        for op in one_of_every_kind() {
+            if let Some(mode) = op.declared_access() {
+                assert!(
+                    mode.writes(),
+                    "{:?} declares {} of the resources it names, which orders against no reader",
+                    op.kind(),
+                    mode.name()
+                );
+            }
+        }
+    }
+
+    /// The owner answers both of the model's read doors, and answers them about
+    /// the same object.
+    ///
+    /// Two traits and one test, because the failure worth catching is not either
+    /// answer alone: it is the pair disagreeing about which object a reference
+    /// names. A `TaskNamespaces` that resolved a slot and a `ResourceStorage`
+    /// that keyed a *different* generation's bytes would build a hazard edge
+    /// against memory the packet did not name, and each door read on its own
+    /// would look right.
+    #[test]
+    fn the_owner_answers_a_reference_and_its_storage_about_one_object() {
+        use crate::resolve::{ResourceStorage as _, TaskNamespaces as _};
+
+        let (l, name) = with_one_resource(0x100);
+        assert_eq!(l.resource(TASK, name.slot.0), Some(name));
+        assert_eq!(
+            l.storage(TASK, name),
+            Some(ResourceKey {
+                backing: BackingId(10),
+                heap: None,
+            }),
+            "a dedicated allocation carries no heap term, because it is in no heap"
+        );
+
+        // A task nobody defined, and a slot nothing was declared into: both
+        // doors say nothing rather than defaulting.
+        assert_eq!(l.resource(TaskId(9), 0), None);
+        assert_eq!(l.storage(TaskId(9), name), None);
+        assert_eq!(l.resource(TASK, 5), None);
+    }
+
+    /// A name the slot no longer holds is keyed to nothing, not to its
+    /// successor.
+    ///
+    /// The redeclaration case `Namespace::declare` exists for. A guest that
+    /// writes over an object-list slot moves the name to a new generation, and a
+    /// storage door that keyed the *old* name would hand an access the new
+    /// occupant's bytes — the wrong surface, ordered against the wrong work.
+    #[test]
+    fn a_stale_name_is_keyed_to_nothing_rather_than_to_the_slots_new_occupant() {
+        use crate::resolve::ResourceStorage as _;
+
+        let (mut l, first) = with_one_resource(0x100);
+        let effects = l
+            .apply(&LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(0),
+                storage: dedicated(11, 0x200),
+            })
+            .expect("a live slot may be redeclared");
+        assert!(
+            !effects.teardowns.is_empty(),
+            "the displaced occupant's teardown is owed, or this test is not \
+             exercising a redeclaration"
+        );
+        assert_eq!(
+            l.storage(TASK, first),
+            None,
+            "the previous generation's name keys nothing"
+        );
+    }
+
+    /// A rebind changes what an unresolved reference will construct and ends
+    /// nothing already declared.
+    ///
+    /// The half a walk-shaped operation could not have expressed. `SetObjectList`
+    /// arrives eighteen times a boot on this interface, each declaring a
+    /// million-entry capacity; if a bind retired the task's objects, every one
+    /// of those would tear down a namespace the guest still holds names in.
+    #[test]
+    fn rebinding_a_tasks_object_list_leaves_its_declared_names_alone() {
+        let (mut l, name) = with_one_resource(0x100);
+        let list = ObjectList {
+            page: DirectoryFrame(0x9000),
+            capacity: 1 << 20,
+        };
+        apply_inert(&mut l, &LifecycleOp::BindObjectList { task: TASK, list });
+        apply_inert(
+            &mut l,
+            &LifecycleOp::BindObjectList {
+                task: TASK,
+                list: ObjectList {
+                    page: DirectoryFrame(0xA000),
+                    capacity: 1 << 20,
+                },
+            },
+        );
+        assert_eq!(
+            l.tasks[&TASK].namespace.live_names(),
+            vec![name],
+            "two binds and the name declared before them both still answers"
+        );
+    }
+
+    /// A bind into a task no definition opened is refused rather than creating
+    /// one: a table's page frame means nothing without an address space.
+    #[test]
+    fn binding_an_object_list_into_an_undefined_task_is_refused() {
+        let mut l = Lifecycle::new();
+        assert_eq!(
+            l.apply(&LifecycleOp::BindObjectList {
+                task: TaskId(9),
+                list: ObjectList {
+                    page: DirectoryFrame(0x9000),
+                    capacity: 4,
+                },
+            }),
+            Err(Refusal::NoSuchTask { task: TaskId(9) })
+        );
+    }
+
+    /// The bind carries the packet's own three words, at the protocol's
+    /// offsets, and the count is carried as the capacity it is.
+    #[test]
+    fn an_object_list_bind_carries_the_packets_own_words() {
+        use reims_vgpu_protocol::fifo::{
+            SET_OBJECT_LIST_COUNT, SET_OBJECT_LIST_LEN, SET_OBJECT_LIST_PFN,
+            SET_OBJECT_LIST_TASK_ID,
+        };
+        let mut payload = vec![0u8; SET_OBJECT_LIST_LEN];
+        payload[SET_OBJECT_LIST_TASK_ID..SET_OBJECT_LIST_TASK_ID + 4]
+            .copy_from_slice(&7u32.to_le_bytes());
+        payload[SET_OBJECT_LIST_PFN..SET_OBJECT_LIST_PFN + 4]
+            .copy_from_slice(&0x1234u32.to_le_bytes());
+        payload[SET_OBJECT_LIST_COUNT..SET_OBJECT_LIST_COUNT + 4]
+            .copy_from_slice(&(1u32 << 20).to_le_bytes());
+        assert_eq!(
+            object_list_bind(LifecycleKind::SetObjectList, &payload),
+            Ok(LifecycleOp::BindObjectList {
+                task: TaskId(7),
+                list: ObjectList {
+                    page: DirectoryFrame(0x1234),
+                    capacity: 1 << 20,
+                },
+            })
+        );
+        // One byte short of the record is refused, not defaulted: a zeroed page
+        // frame is a valid frame and a zeroed task id is the kernel task.
+        payload.pop();
+        assert!(matches!(
+            object_list_bind(LifecycleKind::SetObjectList, &payload),
+            Err(ResolveRefusal::ShortNotice(_))
+        ));
+    }
+
     /// The claim the module docs make and cannot check by being read: the
     /// vocabulary is total over the payload class.
     #[test]
@@ -1915,7 +2838,7 @@ mod tests {
         seen.dedup();
         assert_eq!(
             seen.len(),
-            12,
+            13,
             "every kind is a packet the ledger judged, and every judged \
              lifecycle packet is a kind"
         );
@@ -2675,7 +3598,8 @@ mod tests {
         let effects = l
             .apply(&LifecycleOp::DeleteBacking {
                 task: TASK,
-                backing: BackingId(10),
+                mapping: crate::identity::MappingId(10),
+                backing: Some(BackingId(10)),
             })
             .expect("live task");
         assert_eq!(effects.teardowns.len(), 2, "and only those two");
@@ -2705,27 +3629,40 @@ mod tests {
             backing_retirement(LifecycleKind::DeleteBacking, &payload, &EveryMapping),
             Ok(LifecycleOp::DeleteBacking {
                 task: TaskId(4),
-                backing: BackingId(1_009),
+                mapping: crate::identity::MappingId(9),
+                backing: Some(BackingId(1_009)),
             })
         );
     }
 
-    /// A mapping the mapper holds no surface for refuses under its own name.
+    /// A mapping the mapper holds no surface for still retires.
     ///
-    /// Not `UnknownRef`: that one names an object-list ref, and the two number
-    /// spaces overlap, so one slug for both would send a reader to the object
-    /// list to look for a mapping.
+    /// **A retirement is never refused for a name nothing resolves**, which is
+    /// the rule [`LifecycleOp::DeleteObject`] established and
+    /// [`LifecycleOp::DeleteResource`] joined. This is the third command under
+    /// it, and the one whose id is a *mapping*: a mapping this model holds no
+    /// surface for is one no resource in it can be resident on, so there is
+    /// nothing to retire here and never was — while the rail's own
+    /// mapping-keyed teardown still has work, and only the mapping id can
+    /// reach it.
     #[test]
-    fn a_retirement_naming_no_live_surface_refuses_as_a_mapping() {
+    fn a_retirement_naming_no_live_surface_still_retires() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&9u32.to_le_bytes());
         payload.extend_from_slice(&4u32.to_le_bytes());
-        let refusal = backing_retirement(LifecycleKind::DeleteBacking, &payload, &NoMapping)
-            .expect_err("no live surface");
-        assert_eq!(refusal, ResolveRefusal::UnknownMapping { mapping: 9 });
-        assert_ne!(
-            refusal.slug(),
-            ResolveRefusal::UnknownRef { object_ref: 9 }.slug()
+        let op = backing_retirement(LifecycleKind::DeleteBacking, &payload, &NoMapping)
+            .expect("a retirement is not lost to an unheld mapping");
+        assert_eq!(
+            op,
+            LifecycleOp::DeleteBacking {
+                task: TaskId(4),
+                mapping: crate::identity::MappingId(9),
+                backing: None,
+            }
+        );
+        assert!(
+            op.resources().is_empty(),
+            "no backing, so no resource of this model's is named"
         );
     }
 
@@ -2824,13 +3761,16 @@ mod tests {
             object_reference(LifecycleKind::DeleteResource, &payload, &Everything),
             Ok(LifecycleOp::DeleteResource {
                 task: TASK,
-                resource,
+                object_ref: 7,
+                resource: Some(resource),
             })
         );
         assert_eq!(
             object_reference(LifecycleKind::ReplacePhysical, &payload, &Everything),
             Err(ResolveRefusal::NeedsStorage {
                 kind: LifecycleKind::ReplacePhysical,
+                task: TASK,
+                resource,
             })
         );
     }
@@ -2846,7 +3786,7 @@ mod tests {
     #[test]
     fn a_delete_resolves_against_the_namespace_that_declared_the_object() {
         let mut names = crate::namespace::Namespace::new();
-        let declared = names.declare(ObjectListRef(7), crate::access::BackingId(10));
+        let declared = names.declare(ObjectListRef(7), Some(crate::access::BackingId(10)));
         assert_eq!(declared.displaced, None, "a free slot");
         let id = declared.id;
         let mut payload = Vec::new();
@@ -2857,12 +3797,13 @@ mod tests {
             operation(
                 LifecycleKind::DeleteResource,
                 &payload,
-                &names,
+                &crate::resolve::SameForEveryTask(&names),
                 &EveryMapping
             ),
             Ok(LifecycleOp::DeleteResource {
                 task: TASK,
-                resource: id,
+                object_ref: 7,
+                resource: Some(id),
             })
         );
 
@@ -2880,13 +3821,18 @@ mod tests {
             operation(
                 LifecycleKind::DeleteResource,
                 &payload,
-                &names,
+                &crate::resolve::SameForEveryTask(&names),
                 &EveryMapping
             ),
-            Err(ResolveRefusal::UnknownRef { object_ref: 7 }),
-            "a deleted slot stops resolving"
+            Ok(LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 7,
+                resource: None,
+            }),
+            "a deleted slot stops *naming* — and the delete is still the \
+             operation, because the rail's teardown is keyed by the reference"
         );
-        let redeclared = names.declare(ObjectListRef(7), crate::access::BackingId(11));
+        let redeclared = names.declare(ObjectListRef(7), Some(crate::access::BackingId(11)));
         assert_eq!(
             redeclared.displaced, None,
             "the slot's occupant was deleted above, so this declaration displaces nothing"
@@ -2897,32 +3843,164 @@ mod tests {
             operation(
                 LifecycleKind::DeleteResource,
                 &payload,
-                &names,
+                &crate::resolve::SameForEveryTask(&names),
                 &EveryMapping
             ),
             Ok(LifecycleOp::DeleteResource {
                 task: TASK,
-                resource: again,
+                object_ref: 7,
+                resource: Some(again),
             })
         );
     }
 
-    /// A ref naming nothing live refuses on the ref, for both kinds — the
-    /// object is judged before the operation is.
+    /// A destroy names the kind that ends, and an unsettled kind refuses the
+    /// packet rather than the class.
+    ///
+    /// The whole reason this join reads two layers. Six of the eleven kinds are
+    /// settled on their own serializer rows and five have never been observed;
+    /// holding the *class* out of the model on their account kept 5.5% of a
+    /// real guest's stream from ever reaching it, which is what
+    /// `CmdDeleteObject`'s packet row said and what it stopped saying.
     #[test]
-    fn an_object_reference_naming_nothing_refuses_on_the_ref() {
+    fn a_destroy_carries_its_kind_and_an_unsettled_kind_refuses_this_packet_alone() {
+        use crate::resolve::TaskNamespaces as _;
+        use reims_vgpu_protocol::destroy::DestroyKind;
+
+        let payload = |kind_opcode: u32, object_ref: u32| {
+            let rec = fifo::DELETE_OBJECT_RECORD;
+            let mut out = vec![0u8; rec + 12];
+            out[fifo::DELETE_OBJECT_TASK_ID..fifo::DELETE_OBJECT_TASK_ID + 4]
+                .copy_from_slice(&TASK.0.to_le_bytes());
+            out[rec..rec + 4].copy_from_slice(&kind_opcode.to_le_bytes());
+            out[rec + 4..rec + 8].copy_from_slice(&12u32.to_le_bytes());
+            out[rec + 8..rec + 12].copy_from_slice(&object_ref.to_le_bytes());
+            out
+        };
+
+        // A settled kind. The operation carries it, because which per-kind
+        // registry the rail drops is not re-derivable from a model that kept
+        // only the name.
+        assert_eq!(
+            object_destroy(
+                LifecycleKind::DeleteObject,
+                &payload(DestroyKind::SamplerState.opcode(), 9),
+                &Everything
+            ),
+            Ok(LifecycleOp::DeleteObject {
+                task: TASK,
+                object_ref: 9,
+                resource: Some(Everything.resource(TASK, 9).expect("everything resolves")),
+                kind: DestroyKind::SamplerState,
+            })
+        );
+
+        // A reference nothing names. **Not refused**: a destroy is the one
+        // lifecycle command whose effect must not be lost to an unresolvable
+        // reference, because every rail's retirement is keyed by `(task, ref)`
+        // and the reference is right there. A driven macos-15 boot sends seven
+        // of these — `delete_unnamed_and_unresolvable`, of which two are fences
+        // — and losing a fence's retirement is a *wrong answer* rather than a
+        // dropped one: the stored generation outlives the fence and the next
+        // fence to reuse that reference starts life already signalled.
+        assert_eq!(
+            object_destroy(
+                LifecycleKind::DeleteObject,
+                &payload(DestroyKind::Fence.opcode(), 9),
+                &Nothing
+            ),
+            Ok(LifecycleOp::DeleteObject {
+                task: TASK,
+                object_ref: 9,
+                resource: None,
+                kind: DestroyKind::Fence,
+            })
+        );
+        // And it is ordered against nothing, which is the honest answer: a
+        // resource this model cannot name is one no other operation in it names
+        // either, so there is no access for the delete to conflict with.
+        let unnamed = LifecycleOp::DeleteObject {
+            task: TASK,
+            object_ref: 9,
+            resource: None,
+            kind: DestroyKind::Fence,
+        };
+        assert!(unnamed.resources().is_empty());
+        assert_eq!(unnamed.task(), TASK);
+
+        // An unsettled one. Refused by name, and by *its* name rather than the
+        // packet's — a reader has to be able to tell which of the eleven is
+        // holding the row open.
+        assert_eq!(
+            object_destroy(
+                LifecycleKind::DeleteObject,
+                &payload(DestroyKind::Heap.opcode(), 9),
+                &Everything
+            ),
+            Err(ResolveRefusal::UnsettledDestroy {
+                kind: DestroyKind::Heap
+            }),
+            "a kind no driven boot has ever sent must not be acted on"
+        );
+
+        // Bytes that are not a destroy at all keep the decoder's own reason,
+        // which already separates a number inside the destroy span that nothing
+        // has measured from a record of another family.
+        assert_eq!(
+            object_destroy(LifecycleKind::DeleteObject, &payload(1, 9), &Everything),
+            Err(ResolveRefusal::Destroy(
+                reims_vgpu_protocol::destroy::DestroyRefusal::NotADestroy { opcode: 1 }
+            ))
+        );
+
+        // And the join refuses a kind that is not its own, like every other.
+        assert_eq!(
+            object_destroy(
+                LifecycleKind::DeleteResource,
+                &payload(DestroyKind::SamplerState.opcode(), 9),
+                &Everything
+            ),
+            Err(ResolveRefusal::NotAnObjectDestroy {
+                kind: LifecycleKind::DeleteResource
+            })
+        );
+    }
+
+    /// A ref naming nothing live is a refusal for the re-point and an answer
+    /// for the delete, and the two kinds share one record.
+    ///
+    /// **The asymmetry is the point.** A re-point with no resource to re-point
+    /// is not a re-point: the operation's whole content is moving one named
+    /// resource's storage, so an unresolvable ref leaves nothing to carry. A
+    /// delete's effect is keyed by the reference — every rail's teardown for it
+    /// is `(task, ref)` and not a name — and the guest clears its own
+    /// object-list slot before sending the delete, so refusing on the name
+    /// throws away the packet for the ordinary case. See
+    /// [`LifecycleOp::DeleteResource::resource`], and
+    /// [`LifecycleOp::DeleteObject::resource`] for the destroy that established
+    /// this shape.
+    #[test]
+    fn an_unnamed_ref_refuses_a_repoint_and_still_deletes() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&TASK.0.to_le_bytes());
         payload.extend_from_slice(&7u32.to_le_bytes());
-        for kind in [
-            LifecycleKind::DeleteResource,
-            LifecycleKind::ReplacePhysical,
-        ] {
-            assert_eq!(
-                object_reference(kind, &payload, &Nothing),
-                Err(ResolveRefusal::UnknownRef { object_ref: 7 })
-            );
-        }
+        assert_eq!(
+            object_reference(LifecycleKind::ReplacePhysical, &payload, &Nothing),
+            Err(ResolveRefusal::UnknownRef { object_ref: 7 })
+        );
+        let deleted = object_reference(LifecycleKind::DeleteResource, &payload, &Nothing);
+        assert_eq!(
+            deleted,
+            Ok(LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 7,
+                resource: None,
+            })
+        );
+        // And it orders against nothing, which is what makes admitting it safe:
+        // a resource this model cannot name is one no other operation in it can
+        // name either.
+        assert!(deleted.expect("an operation").resources().is_empty());
     }
 
     /// Each join refuses every kind that is not its own, and the kinds that
@@ -2947,17 +4025,25 @@ mod tests {
         named.sort_unstable();
         assert_eq!(classified, named);
 
-        // Long enough for any of the records, so a refusal is about the kind
-        // and never about the length.
+        // Each kind's own well-formed payload, so a join that refuses refuses
+        // on the *kind* and not on bytes that happen not to be its record. A
+        // single all-zero buffer used to serve here, and it stopped serving
+        // when a command arrived whose payload contains a second framed record:
+        // zeros are a valid `{task, object}` and are not a valid destroy, so
+        // the sweep would have read "no join" where the join exists and the
+        // fixture was wrong.
         let payload = vec![0u8; 64];
         let mut unjoined = Vec::new();
         for kind in ALL_KINDS {
+            let own = one_payload_per_kind(kind);
             let joins = [
-                task_lifetime(kind, &payload).is_ok(),
-                object_reference(kind, &payload, &Everything).is_ok(),
-                map_notice(kind, &payload).is_ok(),
-                backing_retirement(kind, &payload, &EveryMapping).is_ok(),
-                resource_list(kind, &payload, &Everything).is_ok(),
+                task_lifetime(kind, &own).is_ok(),
+                object_reference(kind, &own, &Everything).is_ok(),
+                map_notice(kind, &own).is_ok(),
+                backing_retirement(kind, &own, &EveryMapping).is_ok(),
+                resource_list(kind, &own, &Everything).is_ok(),
+                object_list_bind(kind, &own).is_ok(),
+                object_destroy(kind, &own, &Everything).is_ok(),
             ];
             let reached = joins.iter().filter(|ok| **ok).count();
             assert!(
@@ -2972,12 +4058,14 @@ mod tests {
         assert_eq!(
             unjoined,
             vec![
-                // Its packet says where a task's object list is and how long;
-                // the operation is the per-entry walk's result, and the walk
-                // reads guest memory this crate does not address.
-                LifecycleKind::SetObjectList,
-                // Its record resolves and its operation still needs storage the
-                // wire does not carry — see `ResolveRefusal::NeedsStorage`.
+                // The last one. Its record resolves and its operation still
+                // needs storage the wire does not carry — see
+                // `ResolveRefusal::NeedsStorage`.
+                //
+                // `SetObjectList` left this list when its operation stopped
+                // being the table's walk and became the table's *binding*; see
+                // `LifecycleOp::BindObjectList` for the measurement that
+                // decided it.
                 LifecycleKind::ReplacePhysical,
             ],
             "the lifecycle commands that still cannot become an operation"
@@ -3011,26 +4099,25 @@ mod tests {
         // above says no kind is read by two joins; this says which one each is
         // read by, which is the half no caller could answer for itself.
         for kind in ALL_KINDS {
+            let own = one_payload_per_kind(kind);
             let direct = [
-                task_lifetime(kind, &payload),
-                object_reference(kind, &payload, &Everything),
-                map_notice(kind, &payload),
-                backing_retirement(kind, &payload, &EveryMapping),
-                resource_list(kind, &payload, &Everything),
+                task_lifetime(kind, &own),
+                object_reference(kind, &own, &Everything),
+                map_notice(kind, &own),
+                backing_retirement(kind, &own, &EveryMapping),
+                resource_list(kind, &own, &Everything),
+                object_list_bind(kind, &own),
+                object_destroy(kind, &own, &Everything),
             ]
             .into_iter()
             .find(Result::is_ok);
-            let through = operation(kind, &payload, &Everything, &EveryMapping);
+            let through = operation(kind, &own, &Everything, &EveryMapping);
             match direct {
                 Some(op) => assert_eq!(through, op, "{}", kind.name()),
-                // The two with no join name what is missing rather than
+                // The one with no join names what is missing rather than
                 // reaching a join that would read another command's offsets.
                 None => assert!(
-                    matches!(
-                        through,
-                        Err(ResolveRefusal::NeedsStorage { .. }
-                            | ResolveRefusal::NeedsGuestTable { .. })
-                    ),
+                    matches!(through, Err(ResolveRefusal::NeedsStorage { .. })),
                     "{} became {through:?}",
                     kind.name()
                 ),
@@ -3300,7 +4387,7 @@ mod tests {
     /// `every_lifecycle_kind_reaches_at_most_one_join`, which requires every
     /// kind the packet ledger classifies to appear here — so a thirteenth kind
     /// cannot quietly skip a join test.
-    const ALL_KINDS: [LifecycleKind; 12] = [
+    const ALL_KINDS: [LifecycleKind; 13] = [
         LifecycleKind::DefineTask,
         LifecycleKind::DeleteTask,
         LifecycleKind::SetObjectList,
@@ -3313,7 +4400,138 @@ mod tests {
         LifecycleKind::SynchronizeAndDiscard,
         LifecycleKind::Discard,
         LifecycleKind::DeleteBacking,
+        LifecycleKind::DeleteObject,
     ];
+
+    /// One well-formed payload per kind, each naming task [`TASK_UNDER_TEST`].
+    ///
+    /// Written per kind rather than once, because the task word is not at one
+    /// offset: a definition doubles it and puts a class bit under it, and a
+    /// backing retirement carries `{object, task}` while a delete carries
+    /// `{task, object}` in the same two `u32`s. A single builder would be the
+    /// second decode table `task_named` exists not to be.
+    fn one_payload_per_kind(kind: LifecycleKind) -> Vec<u8> {
+        let task = TASK_UNDER_TEST;
+        match kind {
+            LifecycleKind::DefineTask => {
+                let mut out = vec![0u8; fifo::DEFINE_TASK_LEN];
+                out[..4].copy_from_slice(
+                    &fifo::DefineTaskId {
+                        task_id: task,
+                        kernel: false,
+                    }
+                    .to_raw()
+                    .to_le_bytes(),
+                );
+                out
+            }
+            LifecycleKind::DeleteTask => task.to_le_bytes().to_vec(),
+            // A task word, then a whole destroy record — the one payload here
+            // with a second layer inside it. The kind is the record's opcode, so
+            // the fixture picks a settled one; an unsettled kind is a refusal
+            // this payload deliberately does not exercise.
+            LifecycleKind::DeleteObject => {
+                use reims_vgpu_protocol::destroy::DestroyKind;
+                let mut out = vec![0u8; fifo::DELETE_OBJECT_RECORD + 12];
+                out[fifo::DELETE_OBJECT_TASK_ID..fifo::DELETE_OBJECT_TASK_ID + 4]
+                    .copy_from_slice(&task.to_le_bytes());
+                let record = fifo::DELETE_OBJECT_RECORD;
+                out[record..record + 4]
+                    .copy_from_slice(&DestroyKind::SamplerState.opcode().to_le_bytes());
+                out[record + 4..record + 8].copy_from_slice(&12u32.to_le_bytes());
+                out[record + 8..record + 12].copy_from_slice(&7u32.to_le_bytes());
+                out
+            }
+            LifecycleKind::SetObjectList => {
+                let mut out = vec![0u8; fifo::SET_OBJECT_LIST_LEN];
+                out[fifo::SET_OBJECT_LIST_TASK_ID..fifo::SET_OBJECT_LIST_TASK_ID + 4]
+                    .copy_from_slice(&task.to_le_bytes());
+                out
+            }
+            LifecycleKind::DeleteResource | LifecycleKind::ReplacePhysical => {
+                let mut out = Vec::new();
+                out.extend_from_slice(&task.to_le_bytes());
+                out.extend_from_slice(&7u32.to_le_bytes());
+                out
+            }
+            LifecycleKind::MapMemory | LifecycleKind::UnmapMemory => {
+                let mut out = vec![0u8; fifo::MAP_MEMORY_LEN];
+                out[fifo::MAP_MEMORY_TASK_ID..fifo::MAP_MEMORY_TASK_ID + 4]
+                    .copy_from_slice(&task.to_le_bytes());
+                out
+            }
+            LifecycleKind::DeleteBacking => {
+                let mut out = vec![0u8; fifo::DELETE_BACKING_LEN];
+                out[fifo::DELETE_BACKING_TASK_ID..fifo::DELETE_BACKING_TASK_ID + 4]
+                    .copy_from_slice(&task.to_le_bytes());
+                out
+            }
+            LifecycleKind::Invalidate => list_bytes(task, &[7], fifo::CHILD_INVALIDATE_RECORD_LEN),
+            LifecycleKind::Synchronize
+            | LifecycleKind::SynchronizeAndDiscard
+            | LifecycleKind::Discard => list_bytes(task, &[7], 4),
+        }
+    }
+
+    /// The task a packet names is the task the operation it would build names.
+    ///
+    /// `task_named` drops the resolution and keeps the layout, and the failure
+    /// that matters is it keeping the *wrong* layout — a retirement read at the
+    /// delete's offsets answers the object id as a task, and every arm of the
+    /// census built on it would then ask whether a task numbered like a surface
+    /// was defined. One task id, every kind, both readers.
+    ///
+    /// `ReplacePhysical` is here too, and it is the reason this function exists
+    /// separately at all: its operation refuses for want of storage the wire
+    /// does not carry, and its *task* is on the wire like everyone else's.
+    #[test]
+    fn task_named_agrees_with_the_operation_it_would_build() {
+        for kind in ALL_KINDS {
+            let payload = one_payload_per_kind(kind);
+            let named = task_named(kind, &payload)
+                .unwrap_or_else(|refusal| panic!("{} names a task: {refusal:?}", kind.name()));
+            assert_eq!(
+                named,
+                TaskId(TASK_UNDER_TEST),
+                "{} read its task word from the wrong offset",
+                kind.name()
+            );
+            match operation(kind, &payload, &Everything, &EveryMapping) {
+                Ok(op) => assert_eq!(
+                    op.task(),
+                    named,
+                    "{} builds an operation about a different task than it names",
+                    kind.name()
+                ),
+                // The one kind with no operation. Its task is still answered
+                // above, which is the whole point — and the refusal now carries
+                // that same task, so the caller that supplies the storage never
+                // has to resolve it a second time.
+                Err(ResolveRefusal::NeedsStorage {
+                    kind: refused_kind,
+                    task,
+                    ..
+                }) => {
+                    assert_eq!(
+                        (kind, refused_kind),
+                        (
+                            LifecycleKind::ReplacePhysical,
+                            LifecycleKind::ReplacePhysical
+                        )
+                    );
+                    assert_eq!(
+                        task, named,
+                        "the refusal carries a different task than the packet names"
+                    );
+                }
+                Err(other) => panic!("{} refused as {other:?}", kind.name()),
+            }
+        }
+    }
+
+    /// A number no kind's other field carries, so an arm reading the wrong
+    /// offset answers something else and the test above sees it.
+    const TASK_UNDER_TEST: u32 = 5;
 
     /// A resolver that answers every ref, so a resolution test is about the
     /// list and not about whether the objects exist.
@@ -3356,6 +4574,107 @@ mod tests {
         fn resource(&self, _object_ref: u32) -> Option<ResourceId> {
             None
         }
+    }
+
+    // These two stand for every task, and say so: a suite about list framing or
+    // record stride has one namespace and no routing question in it.
+    impl crate::resolve::TaskNamespaces for Nothing {
+        fn resource(&self, _task: TaskId, _object_ref: u32) -> Option<ResourceId> {
+            None
+        }
+    }
+
+    impl crate::resolve::TaskNamespaces for Everything {
+        fn resource(&self, _task: TaskId, object_ref: u32) -> Option<ResourceId> {
+            crate::resolve::RefResolver::resource(self, object_ref)
+        }
+    }
+
+    /// Two tasks' namespaces, in which one ref number names a different
+    /// resource in each — which is the ordinary case, since a ref is an index
+    /// into the naming task's own object list.
+    ///
+    /// The generation carries the task that answered, so a test can say *which*
+    /// namespace resolved a ref rather than only that one did.
+    struct PerTask;
+
+    impl crate::resolve::TaskNamespaces for PerTask {
+        fn resource(&self, task: TaskId, object_ref: u32) -> Option<ResourceId> {
+            Some(ResourceId {
+                slot: ObjectListRef(object_ref),
+                generation: SlotGeneration(u64::from(task.0) + 1),
+            })
+        }
+    }
+
+    /// A lifecycle packet's refs resolve in the namespace of the task the packet
+    /// names, and the caller does not get to choose.
+    ///
+    /// **The wrong namespace does not refuse.** Object-list refs are per-task
+    /// slot numbers, so resolving ref 7 in another task's list succeeds and
+    /// returns another task's resource — and the operation then retires,
+    /// invalidates or synchronizes storage the packet never named. Nothing
+    /// downstream can catch that: by then it is a well-formed operation over a
+    /// live resource.
+    ///
+    /// So the binding is not a caller's discipline. The join decodes the task
+    /// and binds the namespace itself, and this asserts that the answer moves
+    /// with the packet's task word.
+    #[test]
+    fn a_lifecycle_packets_refs_resolve_in_the_task_the_packet_names() {
+        const REF: u32 = 7;
+        let named = |task: u32| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&task.to_le_bytes());
+            payload.extend_from_slice(&REF.to_le_bytes());
+            object_reference(LifecycleKind::DeleteResource, &payload, &PerTask)
+                .expect("well formed")
+        };
+
+        assert_eq!(
+            named(5),
+            LifecycleOp::DeleteResource {
+                task: TaskId(5),
+                object_ref: REF,
+                resource: Some(ResourceId {
+                    slot: ObjectListRef(REF),
+                    generation: SlotGeneration(6),
+                }),
+            }
+        );
+        assert_eq!(
+            named(9),
+            LifecycleOp::DeleteResource {
+                task: TaskId(9),
+                object_ref: REF,
+                resource: Some(ResourceId {
+                    slot: ObjectListRef(REF),
+                    generation: SlotGeneration(10),
+                }),
+            },
+            "the same ref number, a different packet task, a different resource \u{2014}              which is what makes a caller-chosen namespace a wrong answer rather              than a refusal"
+        );
+
+        // The same, through the counted-list join, whose task word is in a
+        // different place in a different record.
+        let mut list = Vec::new();
+        list.extend_from_slice(&11u32.to_le_bytes());
+        list.extend_from_slice(&1u32.to_le_bytes());
+        list.extend_from_slice(&REF.to_le_bytes());
+        let LifecycleOp::Synchronize { task, resources } =
+            resource_list(LifecycleKind::Synchronize, &list, &PerTask).expect("well formed")
+        else {
+            panic!("a synchronize builds a synchronize");
+        };
+        assert_eq!(task, TaskId(11));
+        assert_eq!(
+            resources,
+            vec![ResourceId {
+                slot: ObjectListRef(REF),
+                generation: SlotGeneration(12),
+            }],
+            "the list's refs resolve in the list's own task"
+        );
     }
 
     /// A payload too short to hold even a resource-list header.
@@ -3782,7 +5101,8 @@ mod tests {
         let effects = l
             .apply(&LifecycleOp::DeleteResource {
                 task: TASK,
-                resource: first,
+                object_ref: first.slot.0,
+                resource: Some(first),
             })
             .expect("resolves");
         assert_eq!(
@@ -3840,7 +5160,8 @@ mod tests {
         let effects = l
             .apply(&LifecycleOp::DeleteBacking {
                 task: TASK,
-                backing: BackingId(10),
+                mapping: crate::identity::MappingId(10),
+                backing: Some(BackingId(10)),
             })
             .expect("resolves");
         assert_eq!(effects.teardowns.len(), 1);
@@ -4111,7 +5432,8 @@ mod tests {
                         };
                         LifecycleOp::DeleteResource {
                             task: h.task,
-                            resource: h.id,
+                            object_ref: h.id.slot.0,
+                            resource: Some(h.id),
                         }
                     }
                     14..=16 => {
@@ -4125,7 +5447,11 @@ mod tests {
                             extent: range(0, RESOURCE_LENGTH),
                         }
                     }
-                    17 => LifecycleOp::DeleteBacking { task, backing },
+                    17 => LifecycleOp::DeleteBacking {
+                        task,
+                        mapping: crate::identity::MappingId(backing.0 as u32),
+                        backing: Some(backing),
+                    },
                     18 => LifecycleOp::MapMemory {
                         task,
                         span: GuestSpan {
@@ -4321,13 +5647,32 @@ mod tests {
                         census.placed += 1;
                         storage[task][heap]
                     }
+                    // Not generated by this history. It is about content
+                    // authority and teardown across tasks, and a name that owns
+                    // no bytes has neither — `namespace`'s own randomized
+                    // history is where those are driven. The arm is spelled out
+                    // rather than defaulted so that growing one here is a
+                    // compile-time decision, instead of a storage-less name
+                    // landing in `live` where a later step could pick it as a
+                    // re-point target with no memory to re-point.
+                    Storage::NoBytes => unreachable!("no storage-less names in this history"),
                 };
                 live.entry(*task).or_default().insert(*slot, (id, backing));
                 handed.push(Handed { task: *task, id });
             }
-            LifecycleOp::DeleteResource { task, resource } => {
+            LifecycleOp::DeleteResource { task, resource, .. } => {
                 census.deletes += 1;
-                live.entry(*task).or_default().remove(&resource.slot);
+                if let Some(resource) = resource {
+                    live.entry(*task).or_default().remove(&resource.slot);
+                }
+            }
+            // A destroy the namespace could not name removes nothing from this
+            // history, because nothing named it was ever put in.
+            LifecycleOp::DeleteObject { task, resource, .. } => {
+                census.deletes += 1;
+                if let Some(resource) = resource {
+                    live.entry(*task).or_default().remove(&resource.slot);
+                }
             }
             LifecycleOp::ReplacePhysical {
                 task,
@@ -4340,13 +5685,21 @@ mod tests {
                     entry.1 = *backing;
                 }
             }
-            LifecycleOp::DeleteBacking { task, backing } => {
+            LifecycleOp::DeleteBacking { task, backing, .. } => {
                 census.retired_backings += 1;
-                live.entry(*task)
-                    .or_default()
-                    .retain(|_, (_, b)| b != backing);
+                if let Some(backing) = backing {
+                    live.entry(*task)
+                        .or_default()
+                        .retain(|_, (_, b)| b != backing);
+                }
             }
-            LifecycleOp::MapMemory { .. }
+            // A bind changes what an unresolved reference will construct and
+            // ends nothing already declared, so the shadow of live names does
+            // not move. Listed by name rather than swept into a wildcard: an
+            // operation that *did* move names and reached this arm silently
+            // would make the shadow agree with the model by not looking.
+            LifecycleOp::BindObjectList { .. }
+            | LifecycleOp::MapMemory { .. }
             | LifecycleOp::UnmapMemory { .. }
             | LifecycleOp::Invalidate { .. }
             | LifecycleOp::Synchronize { .. }
@@ -4427,5 +5780,177 @@ mod tests {
                 knew.remove(&b);
             }
         }
+    }
+    /// A resource the guest declared with no bytes participates, and does not
+    /// refuse.
+    ///
+    /// **The sharpest case is the indirect command buffer.** Its create
+    /// descriptor names no allocation and no window — its commands are
+    /// device-side storage the guest never addresses — so it is declared
+    /// `Storage::NoBytes`, and `IcbOp::participations` claims a participation
+    /// on it. Answering `NotDeclared` refused the whole exec transaction, which
+    /// is every draw in the packet, for a name that resolves perfectly well.
+    #[test]
+    fn a_participation_over_a_resource_with_no_bytes_is_domain_only() {
+        let mut l = Lifecycle::new();
+        apply_inert(
+            &mut l,
+            &LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+                directory: DirectoryFrame(0x1000),
+            },
+        );
+        apply_inert(
+            &mut l,
+            &LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(0),
+                storage: Storage::NoBytes,
+            },
+        );
+
+        let intent = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name(0),
+                    extent: ParticipationExtent::Whole,
+                    mode: AccessMode::ReadWrite,
+                    api_stages: 0,
+                },
+            )
+            .expect("a live name with no bytes is not an undeclared slot");
+
+        assert_eq!(intent.key, crate::access::AccessKey::DomainOnly);
+        assert_eq!(intent.domain, ChannelId(2));
+        assert_eq!(intent.mode, AccessMode::ReadWrite);
+        // No bytes, so nothing to version on either side. A write here that
+        // reserved a version would be authority over memory that does not
+        // exist.
+        assert_eq!(intent.input_content_version, None);
+        assert_eq!(intent.output_content_version, None);
+    }
+
+    /// It over-orders rather than under-orders: the key meets every other
+    /// access, so nothing the record might really have touched slips past it.
+    #[test]
+    fn a_no_bytes_access_meets_everything_in_its_domain() {
+        let (mut l, dedicated_name) = with_one_resource(0x1000);
+        apply_inert(
+            &mut l,
+            &LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(1),
+                storage: Storage::NoBytes,
+            },
+        );
+
+        let bytes = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: dedicated_name,
+                    extent: ParticipationExtent::Whole,
+                    mode: AccessMode::Write,
+                    api_stages: 0,
+                },
+            )
+            .expect("a dedicated resource");
+        let none = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name(1),
+                    extent: ParticipationExtent::Whole,
+                    mode: AccessMode::Read,
+                    api_stages: 0,
+                },
+            )
+            .expect("a resource with no bytes");
+
+        assert!(none.key.may_alias(bytes.key));
+        assert!(bytes.key.may_alias(none.key));
+        assert_eq!(none.key.rung(), 3, "and the imprecision is priced");
+    }
+
+    /// A window past the resource's end widens to the whole of it and still
+    /// meets every access over it.
+    ///
+    /// **The claim is a bound, not an assertion.** A record's `Range` is the
+    /// most bytes it could touch — `ImagePitch::span_bytes` builds one by
+    /// multiplying a pitch by a height, deliberately long — so checking it as if
+    /// it were exact refuses the copies the long side was for. A driven macos-15
+    /// boot threw away seven whole exec packets a boot on it, every one a
+    /// `0x12c` `copyFromBuffer:…toTexture:…` reading `offset=65536
+    /// length=196608` of a 196 608-byte source buffer.
+    ///
+    /// The widened access is compared against an exact one over the same
+    /// resource, because the property that makes widening safe is not that it is
+    /// coarse — it is that it still *meets*. A clamped window would be finer and
+    /// wrong: it would claim fewer bytes than the record may touch, and the edge
+    /// that does not get built is a race.
+    #[test]
+    fn a_window_past_the_extent_widens_to_the_whole_resource() {
+        let (mut l, name) = with_one_resource(0x1000);
+        let over = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name,
+                    // One byte longer than the resource, from its own start.
+                    extent: ParticipationExtent::Range(range(0, 0x1001)),
+                    mode: AccessMode::Read,
+                    api_stages: 0,
+                },
+            )
+            .expect("a bound past the end is not a refusal");
+        assert!(
+            !matches!(over.key, crate::access::AccessKey::Range(..)),
+            "the window this model could not hold is not reported as one: {:?}",
+            over.key
+        );
+
+        let inside = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name,
+                    extent: ParticipationExtent::Range(range(0x40, 0x40)),
+                    mode: AccessMode::Write,
+                    api_stages: 0,
+                },
+            )
+            .expect("a window inside the extent");
+        assert!(
+            over.key.may_alias(inside.key) && inside.key.may_alias(over.key),
+            "widening must not lose the edge the record's own bytes would have drawn"
+        );
+    }
+
+    /// A slot nothing declared still refuses, which is what the absent
+    /// residency used to be mistaken for.
+    #[test]
+    fn a_slot_nothing_declared_still_refuses_the_transaction() {
+        let (mut l, _) = with_one_resource(0x1000);
+
+        let refusal = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name(9),
+                    extent: ParticipationExtent::Whole,
+                    mode: AccessMode::Read,
+                    api_stages: 0,
+                },
+            )
+            .expect_err("slot 9 was never declared");
+        assert!(matches!(refusal, Refusal::Namespace { .. }));
     }
 }

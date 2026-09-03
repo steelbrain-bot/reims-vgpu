@@ -30,14 +30,14 @@ use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
 /// [`DeviceTransaction`] has to choose them somewhere. Choosing them here, once,
 /// keeps every suite from re-deriving the pairing and keeps the choice visible
 /// as a test's.
-pub(crate) struct At {
-    builder: crate::exec::ExecBuilder,
+pub(crate) struct At<'u> {
+    builder: crate::exec::ExecBuilder<'u>,
     identity: crate::identity::TransactionIdentity,
     stamp_waits: Vec<crate::identity::StampWait>,
     completion: Option<crate::identity::CompletionStamp>,
 }
 
-impl At {
+impl<'u> At<'u> {
     pub(crate) fn new(domain: u32, ingress: u64) -> Self {
         Self {
             builder: crate::exec::ExecBuilder::new(),
@@ -69,14 +69,14 @@ impl At {
     }
 }
 
-impl core::ops::Deref for At {
-    type Target = crate::exec::ExecBuilder;
+impl<'u> core::ops::Deref for At<'u> {
+    type Target = crate::exec::ExecBuilder<'u>;
     fn deref(&self) -> &Self::Target {
         &self.builder
     }
 }
 
-impl core::ops::DerefMut for At {
+impl<'u> core::ops::DerefMut for At<'u> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.builder
     }

@@ -104,6 +104,9 @@ macro_rules! ladder_slug {
     ("", desc_decode) => {
         "desc_decode"
     };
+    ("", no_task_space) => {
+        "no_task_space"
+    };
     // The guest put nothing under this ref. Expected while the guest is still
     // populating a task's list, which is why several rails resolve it quietly.
     ($role:literal, no_list_entry) => {
@@ -122,6 +125,11 @@ macro_rules! ladder_slug {
     ($role:literal, desc_decode) => {
         concat!($role, "_desc_decode")
     };
+    // The task's address space does not exist, so the ref is a slot in no
+    // namespace at all — the rung below `no_list_entry`.
+    ($role:literal, no_task_space) => {
+        concat!($role, "_no_task_space")
+    };
 }
 
 /// The slug one role gives each rung of
@@ -133,7 +141,7 @@ macro_rules! ladder_slug {
 ///
 /// ```ignore
 /// objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
-///     .map_err(|rung| br(BlitStatus::MissingResource, ladder_slugs!("buf")(rung)))?
+///     .map_err(|rung| br(BlitFailure::MissingResource, ladder_slugs!("buf")(rung)))?
 /// ```
 ///
 /// The match is exhaustive over the rungs, so adding one to the enum breaks
@@ -167,6 +175,9 @@ macro_rules! ladder_slugs {
                 }
                 $crate::runtime::objects::LadderRung::DescRead { .. } => {
                     $crate::observe::ladder_slug!($role, desc_read)
+                }
+                $crate::runtime::objects::LadderRung::NoTaskSpace => {
+                    $crate::observe::ladder_slug!($role, no_task_space)
                 }
             }
         }
@@ -211,6 +222,9 @@ impl RungReport {
             LadderRung::NoListEntry => String::new(),
             LadderRung::WrongType { got } => format!("ot={got}"),
             LadderRung::DescRead { declared_len } => format!("desc_len={declared_len}"),
+            // No datum: the statement is about the task, and the task id is
+            // already a field of every line this reports on.
+            LadderRung::NoTaskSpace => String::new(),
         };
         self.reason(task_id, ref_, ladder_slugs!("")(rung), &detail);
     }

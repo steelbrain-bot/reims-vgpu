@@ -25,19 +25,9 @@ use crate::protocol::fifo::{
 use crate::protocol::pixel_format::{self, ClearImageEncoding};
 use crate::runtime::blit_exec::{self, BlitStatus};
 use crate::runtime::compute_exec::{self, ComputeStatus};
-use crate::runtime::decode::blit::{self, Kind as BlitKind};
-use crate::runtime::decode::compute::{self, Kind as ComputeKind};
-use crate::runtime::decode::event as event_decode;
-use crate::runtime::decode::render::{
-    self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
-    decode_color_attachment, decode_depth_attachment, decode_stencil_attachment, ColorAttachment,
-    DepthAttachment, Kind as RenderKind, LevelSupport, ScissorRect, Stage, StencilAttachment,
-    PASS_MAX_COLOR_ATTACHMENTS,
-};
-use crate::runtime::decode::stream::{
-    self, decode_first_record, decode_next_record, SEGMENT_TYPE_BLIT, SEGMENT_TYPE_COMPUTE,
-    SEGMENT_TYPE_EVENT, SEGMENT_TYPE_INFO, SEGMENT_TYPE_RENDER,
-};
+use crate::runtime::decode::blit_spi;
+use crate::runtime::decode::compute_spi::{self, Kind as ComputeKind};
+use crate::runtime::decode::render_spi::{self, Kind as SpiKind};
 use crate::runtime::draw::{
     self, BindTable, BufferBind, EncodeStatus, IndexedDrawInfo, SamplerBind, TextureBind,
     MAX_BUFFER_BIND_SLOTS, MAX_SAMPLER_BIND_SLOTS, MAX_TEXTURE_BIND_SLOTS,
@@ -49,12 +39,23 @@ use crate::runtime::mapping_write;
 use crate::runtime::mipmap::{self, MipmapStatus};
 use crate::runtime::objects;
 use crate::runtime::plan::event_sync::{Domain as FenceDomain, FenceAction};
+use crate::runtime::render_pass::{
+    self, attachment_subresource_is_bindable, color_attachment_subresource_is_bindable,
+    ColorAttachment, DepthAttachment, LevelSupport, ScissorRect, StencilAttachment,
+};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use reims_vgpu_core::operation::{OperationClass, OperationHome};
+use reims_vgpu_protocol::closure::Rail;
+use reims_vgpu_protocol::decode::blit::BlitRecord;
+use reims_vgpu_protocol::decode::sync::SyncRecord;
 use reims_vgpu_protocol::pass_action::{
     store_action_publishes_single_sample, MTL_LOAD_ACTION_CLEAR, MTL_LOAD_ACTION_LOAD,
     MTL_STORE_ACTION_MULTISAMPLE_RESOLVE, MTL_STORE_ACTION_STORE,
     MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE,
 };
+use reims_vgpu_protocol::render::{RenderKind as ProtoRenderKind, ShaderStage};
+use reims_vgpu_protocol::resource_state::ContentDirective;
+use reims_vgpu_protocol::segment::{SegmentBody, SegmentKind, SegmentLifetime, SegmentStream};
 use reims_vgpu_wire::ops::blit as wire_blit;
 use reims_vgpu_wire::ops::render as wire_render;
 use reims_vgpu_wire::ops::render_pass as wire_pass;
@@ -609,71 +610,94 @@ pub struct ExecResult {
     pub total_us: u64,
 }
 
-pub fn process_exec_indirect2<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
-    payload: &[u8],
-) -> ExecResult {
-    let exec_started = std::time::Instant::now();
-    let mut out = ExecResult::default();
-    if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
-        return out;
-    }
-    let raw_task = ld32(&payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..]);
-    // The resolver guarantees a live slot or nothing, so there is no second
-    // liveness check here. The refusal is always-on: an exec packet the crate
-    // drops is a whole command stream of guest work lost, and it used to leave
-    // no line at all.
-    let Some(task_id) = resolve_task_word(&state.tasks, TaskWordSite::ExecIndirect2, raw_task)
-    else {
-        out.task_id = raw_task;
-        crate::observe::fail(format!(
-            "exec_indirect2 no_such_task task={raw_task} tasks={} plen={}",
-            state.tasks.live_count(),
-            payload.len()
-        ));
-        return out;
-    };
-    out.task_id = task_id;
-
-    let resource_count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
-    let cmdbuf_count = ld32(&payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..]);
-    let resources_len = resource_count as u64 * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as u64;
-    let cbufs_off = CHILD_EXEC_INDIRECT_HEADER_LEN as u64 + resources_len;
-    let need = cbufs_off + cmdbuf_count as u64 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as u64;
-    if need > payload.len() as u64 {
-        crate::observe::fail(format!(
-            "exec_indirect2 short_payload task={task_id} res={resource_count} cbufs={cmdbuf_count} need={need} plen={}",
-            payload.len()
-        ));
-        return out;
-    }
-    if cmdbuf_count == 0 {
-        crate::observe::fail(format!(
-            "exec_indirect2 zero_cbufs task={task_id} res={resource_count} plen={}",
-            payload.len()
-        ));
-        return out;
-    }
-
-    // The guest declares, per resource this submission touches, who owns the
-    // authoritative bytes afterwards. `need` above already proved the table fits,
-    // so a refusal here means the header and the decoder disagree about the
-    // layout — which is a fail line, never a silent empty table.
-    let resource_descs = decode_exec_resource_table(payload).unwrap_or_else(|refusal| {
-        crate::observe::fail(format!(
-            "exec_res_table {} task={task_id} res={resource_count} plen={}",
-            refusal.slug(),
-            payload.len()
-        ));
-        Vec::new()
+/// How many command buffers one exec packet carried, in buckets.
+///
+/// **Asked because the semantic model's walk takes one buffer and this wire
+/// carries a table of them.** `reims_vgpu_core::walk::exec` consumes an
+/// `ExecBuilder` and finishes it, so a caller with two command buffers has one
+/// transaction and no way to walk both into it — and whether that matters is
+/// exactly this distribution. A stream of single-buffer submissions makes the
+/// signature adequate; a tail above one makes it short of the wire, and the
+/// tail is what a mean would hide.
+///
+/// It is not a hypothetical tail. The ceiling this loop used to carry truncated
+/// at sixteen, and the submission that exposed it declared **seventeen** — see
+/// `every_declared_command_buffer_is_visited_not_just_the_first_sixteen`. What
+/// is missing is a current number, on the guest and workload the replacement
+/// architecture is being cut over against.
+///
+/// Counted after the load, so the bucket is buffers this device could read
+/// rather than buffers the header declared. The two differ exactly when a
+/// descriptor was skipped, and `exec_cmdbuf` says which.
+///
+/// # What a driven boot answered
+///
+/// x86 Vulkan, macos-15, three rounds of five applications:
+/// **`exec_cmdbufs_1=20 006` and every other bucket silent**, against
+/// `packet_class_exec=20 006`. Every exec packet this guest sends carries
+/// exactly one command buffer.
+///
+/// So `reims_vgpu_core::walk::exec`'s one-buffer signature is adequate for the
+/// guest the cutover is being measured against, and the bridge that eventually
+/// builds a `Payload::Exec` has one stream to hand it. That is a reading and not
+/// a contract: the seventeen-buffer submission this loop's removed ceiling
+/// truncated is in this repository's history, so the multi-buffer path is real
+/// and `walk::command_buffer` is what it walks through. A bucket above `_1`
+/// appearing is the day a caller must use it.
+fn note_command_stream_count(loaded: usize) {
+    // The denominator for `exec_stream_framed`: how many streams this device
+    // was handed, against how many times it framed one. The bands below say
+    // how a submission is shaped; this says how much there was to walk, and a
+    // ratio above one is a re-scan.
+    crate::runtime::drain::note_store_route_n("exec_streams_loaded", loaded as u64);
+    crate::runtime::drain::note_store_route(match loaded {
+        0 => "exec_cmdbufs_0",
+        1 => "exec_cmdbufs_1",
+        2..=4 => "exec_cmdbufs_2_4",
+        5..=16 => "exec_cmdbufs_5_16",
+        17..=64 => "exec_cmdbufs_17_64",
+        _ => "exec_cmdbufs_over_64",
     });
+}
 
-    // Every command buffer the header declares, because `need` above already
-    // bounded how many there can be: the guest cannot claim a table longer than
-    // the descriptors it actually supplied, so `cmdbuf_count` is capped by
-    // `payload.len() / CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN` and `with_capacity`
-    // below cannot be talked into an allocation the payload does not back.
+/// Read every command buffer an `EXEC_INDIRECT2` payload's descriptor table
+/// names out of the task's address space.
+///
+/// **The exec class's third input, as a value.** The payload carries a header, a
+/// resource table and `cmdbuf_count` descriptors of `{gva, length}`; the streams
+/// themselves live in the guest's own address space, so producing them is a page
+/// table walk per buffer and not a slice of the packet. That is the input
+/// [`crate::runtime::ingress::ExecStreams::streams`] takes, and the reason the
+/// exec class cannot cross that bridge as a function of the drained packet the
+/// way the other four do — it is a function of the drained packet *and these
+/// bytes*. Named here so that whoever hands the bridge the streams calls one
+/// function rather than restating this loop, and so the loop has a test of its
+/// own.
+///
+/// `cbufs_off` and `cmdbuf_count` are the caller's because the caller has
+/// already proved the table fits — `need = cbufs_off + count * DESC_LEN` against
+/// `payload.len()`. Re-deriving them here would be a second bound that could
+/// disagree with the one the caller returned on.
+///
+/// A buffer that cannot be read is **skipped and reported**, never fatal: a
+/// zero-length descriptor, a length the host process cannot address, and a GVA
+/// that does not walk are three different guest-visible losses and each says
+/// which. The result is therefore shorter than the table whenever one happens,
+/// and the caller's `streams_loaded` against `cmdbuf_count` is where that shows.
+fn load_command_streams<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    payload: &[u8],
+    cbufs_off: u64,
+    cmdbuf_count: u32,
+) -> Vec<Vec<u8>> {
+    // Every command buffer the header declares, because the caller's `need`
+    // already bounded how many there can be: the guest cannot claim a table
+    // longer than the descriptors it actually supplied, so `cmdbuf_count` is
+    // capped by `payload.len() / CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN` and
+    // `with_capacity` cannot be talked into an allocation the payload does not
+    // back.
     //
     // A fixed ceiling used to sit here and truncate with `.min()`, above the
     // check that already bounded the same number. Nothing derived it — a
@@ -683,16 +707,12 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     let n_cb = cmdbuf_count as usize;
     let page_shift = state.page_shift;
     let mut streams = Vec::with_capacity(n_cb);
-    // This call's measured spans, summed, so `Header` can be the leftover. The
-    // census's own totals cover the whole window and cannot answer for one call.
-    let mut measured_ns = 0u64;
-    let load_started = std::time::Instant::now();
     for i in 0..n_cb {
-        // `need` already pinned the whole table: i < n_cb <= cmdbuf_count, so
-        // off + DESC_LEN = cbufs_off + (i + 1) * DESC_LEN <= need <=
-        // payload.len(). The bounds check that stood here could not fire, and
-        // its `break` would have dropped every remaining command buffer with no
-        // line if it ever had.
+        // The caller's `need` already pinned the whole table: i < n_cb <=
+        // cmdbuf_count, so off + DESC_LEN = cbufs_off + (i + 1) * DESC_LEN <=
+        // need <= payload.len(). The bounds check that stood here could not
+        // fire, and its `break` would have dropped every remaining command
+        // buffer with no line if it ever had.
         let off = (cbufs_off + i as u64 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as u64) as usize;
         let gva = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..]);
         let length = ld64(&payload[off + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..]);
@@ -721,66 +741,379 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             ));
             continue;
         }
-        out.streams_loaded += 1;
         streams.push(stream);
     }
+    streams
+}
+
+/// One `CmdExecIndirect2` packet, read.
+///
+/// **The seam between deciding and doing.** Everything above it is a function
+/// of the packet's bytes and guest memory: which task, what the resource table
+/// declares, and the command buffers themselves. Everything below it is host
+/// work. The replacement architecture puts an admission decision between the
+/// two — a packet may be judged and then *parked*, and executed later — so the
+/// two halves cannot be one straight line through a single function, and the
+/// buffers have to be a value that outlives the reading.
+///
+/// That is also why there is no separate double-load to remove: the streams are
+/// loaded once, here, and whoever executes them is handed the same `Vec`.
+#[derive(Debug)]
+pub struct ExecSubmission {
+    task_id: u32,
+    /// Per resource this submission touches, who owns the authoritative bytes
+    /// afterwards. Applied by [`consume_resource_table`] *before* any of the
+    /// submission's work runs.
+    resource_descs: Vec<ExecResourceDesc>,
+    /// The command buffers the header declares, in the order it declares them.
+    streams: Vec<Vec<u8>>,
+}
+
+impl ExecSubmission {
+    /// The task whose object list the refs inside these streams index.
+    ///
+    /// From the exec header and not from the FIFO — see
+    /// `crate::runtime::ingress::ExecStreams::task`.
+    #[must_use]
+    pub const fn task_id(&self) -> u32 {
+        self.task_id
+    }
+
+    /// The command buffers, in the order the header declares them.
+    #[must_use]
+    pub fn streams(&self) -> &[Vec<u8>] {
+        &self.streams
+    }
+
+    /// A submission stated outright rather than read out of a packet.
+    ///
+    /// For the suites that are about what a *read* submission does downstream
+    /// — parking, admission, execution — where reaching them through
+    /// [`read_submission`] would mean building a guest page table and an exec
+    /// header to state two command buffers. The reading has its own tests;
+    /// this is for everything the reading feeds.
+    #[cfg(test)]
+    pub(crate) fn stated(task_id: u32, streams: Vec<Vec<u8>>) -> Self {
+        Self {
+            task_id,
+            resource_descs: Vec::new(),
+            streams,
+        }
+    }
+
+    /// Host bytes this submission is holding, for a caller accounting for what
+    /// a parked position retains.
+    ///
+    /// The command buffers, which are the allocation: the resource
+    /// descriptors are bounded by the table the header declares and are one
+    /// small `Vec` beside megabytes of stream.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.streams.iter().map(Vec::len).sum()
+    }
+}
+
+/// Read one `CmdExecIndirect2` packet into the submission it describes.
+///
+/// `None` for every reason the packet does not describe one, each of which is
+/// already on the always-on channel where it is refused. `measured_ns`
+/// accumulates this call's own spans so [`note_exec_header`] can derive the
+/// leftover; see that function for why the header phase is a subtraction.
+fn read_submission<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    payload: &[u8],
+    out: &mut ExecResult,
+    measured_ns: &mut u64,
+) -> Option<ExecSubmission> {
+    if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
+        return None;
+    }
+    let raw_task = ld32(&payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..]);
+    // The resolver guarantees a live slot or nothing, so there is no second
+    // liveness check here. The refusal is always-on: an exec packet the crate
+    // drops is a whole command stream of guest work lost, and it used to leave
+    // no line at all.
+    let Some(task_id) = resolve_task_word(&state.tasks, TaskWordSite::ExecIndirect2, raw_task)
+    else {
+        out.task_id = raw_task;
+        crate::observe::fail(format!(
+            "exec_indirect2 no_such_task task={raw_task} tasks={} plen={}",
+            state.tasks.live_count(),
+            payload.len()
+        ));
+        return None;
+    };
+    out.task_id = task_id;
+
+    let resource_count = ld32(&payload[CHILD_EXEC_INDIRECT_RESOURCE_COUNT as usize..]);
+    let cmdbuf_count = ld32(&payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..]);
+    let resources_len = resource_count as u64 * CHILD_EXEC_INDIRECT_RESOURCE_DESC_LEN as u64;
+    let cbufs_off = CHILD_EXEC_INDIRECT_HEADER_LEN as u64 + resources_len;
+    let need = cbufs_off + cmdbuf_count as u64 * CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as u64;
+    if need > payload.len() as u64 {
+        crate::observe::fail(format!(
+            "exec_indirect2 short_payload task={task_id} res={resource_count} cbufs={cmdbuf_count} need={need} plen={}",
+            payload.len()
+        ));
+        return None;
+    }
+    if cmdbuf_count == 0 {
+        crate::observe::fail(format!(
+            "exec_indirect2 zero_cbufs task={task_id} res={resource_count} plen={}",
+            payload.len()
+        ));
+        return None;
+    }
+
+    // The guest declares, per resource this submission touches, who owns the
+    // authoritative bytes afterwards. `need` above already proved the table fits,
+    // so a refusal here means the header and the decoder disagree about the
+    // layout — which is a fail line, never a silent empty table.
+    let resource_descs = decode_exec_resource_table(payload).unwrap_or_else(|refusal| {
+        crate::observe::fail(format!(
+            "exec_res_table {} task={task_id} res={resource_count} plen={}",
+            refusal.slug(),
+            payload.len()
+        ));
+        Vec::new()
+    });
+
+    // This call's measured spans, summed, so `Header` can be the leftover. The
+    // census's own totals cover the whole window and cannot answer for one call.
+    let load_started = std::time::Instant::now();
+    let streams = load_command_streams(state, host, task_id, payload, cbufs_off, cmdbuf_count);
+    out.streams_loaded += u32::try_from(streams.len()).unwrap_or(u32::MAX);
+    note_command_stream_count(streams.len());
     let load_ns = load_started.elapsed().as_nanos() as u64;
-    measured_ns += load_ns;
+    *measured_ns += load_ns;
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Load, load_ns);
 
-    // Plan before execute: cold AIR translation is immutable CPU work and can
-    // run without protocol ownership. Keep the packet unconsumed until every
-    // referenced render stage is ready, so replay cannot duplicate clears,
-    // fences, compute dispatches, or guest writeback.
-    let translation_pending = {
-        let preflight_started = std::time::Instant::now();
-        let pending =
-            crate::backend::selected().preflight_translations(state, host, task_id, &streams);
-        // Timed on this side of the seam, and unconditionally: the phase is the
-        // drain's own accounting of where an exec call's time went, and a rail
-        // that preflights nothing has to show as the zero it costs rather than
-        // as an absent column the leftover `Header` silently absorbs.
-        let preflight_ns = preflight_started.elapsed().as_nanos() as u64;
-        measured_ns += preflight_ns;
-        crate::runtime::drain::note_exec_phase(
-            crate::runtime::drain::ExecPhase::Preflight,
-            preflight_ns,
-        );
-        pending
-    };
-    if translation_pending {
-        out.deferred = true;
-        note_exec_header(exec_started, measured_ns);
-        return out;
-    }
+    Some(ExecSubmission {
+        task_id,
+        resource_descs,
+        streams,
+    })
+}
+
+/// Start every cold translation this submission needs, and say whether any is
+/// still running.
+///
+/// **The middle of read / plan / execute**, and the reason the three are three.
+/// Cold AIR translation is immutable CPU work over bytes the submission already
+/// holds: it needs no protocol ownership, it mutates no guest state, and it can
+/// therefore run at a moment of the caller's choosing. Execution cannot — it
+/// consumes the resource table and encodes draws.
+///
+/// `true` means a referenced render stage is still translating. The caller must
+/// then run *nothing* of this submission: the packet stays unconsumed so the
+/// guest replays it, and replay must not duplicate clears, fences, dispatches
+/// or guest writeback.
+///
+/// Every stream is scanned, not just up to the first pending one, so the
+/// translations proceed in parallel and the submission is retried once rather
+/// than once per stream. That is the rail's own contract — see
+/// `crate::backend::Backend::preflight_translations` — and it is the property
+/// that makes calling this early worth anything.
+/// `resolved` is the walk's own answer about this packet, and its render
+/// pipeline leases are the same names admission readies on this function's
+/// verdict. Passing it rather than letting the rail rescan the bytes is what
+/// makes "nothing is pending" a statement about exactly the leases it will be
+/// used for — see [`vulkan::preflight_render_translations`].
+pub fn preflight_submission<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    submission: &ExecSubmission,
+    resolved: &reims_vgpu_core::exec::ExecWork,
+    measured_ns: &mut u64,
+) -> Vec<u32> {
+    let preflight_started = std::time::Instant::now();
+    // The render half of the packet's leases, and the guest's own ref, which is
+    // the slot half of the name: the generation is the model's business and no
+    // MTLB is keyed by it. Compute leases are held back because the compute
+    // pre-scan takes its own inputs — a compute ref handed to the render arm
+    // would fail to load a render MTLB pair and be counted as an unloadable
+    // one, which is a real reading this would fill with a benign population.
+    let refs: Vec<u32> = resolved
+        .render_pipeline_leases()
+        .iter()
+        .map(|lease| lease.slot.0)
+        .collect();
+    // The compute half, from the same walk. A kernel is keyed by its
+    // threadgroup size as well as its ref, which is why this is a pair list
+    // and the render half is not; both are the model's answer rather than a
+    // rescan of the packet's bytes.
+    let dispatches: Vec<(u32, [u32; 3])> = resolved
+        .compute_dispatch_translations()
+        .into_iter()
+        .filter_map(|(pipeline, size)| {
+            let extent = [
+                u32::try_from(size.width).ok()?,
+                u32::try_from(size.height).ok()?,
+                u32::try_from(size.depth).ok()?,
+            ];
+            // A grid with a zero edge dispatches nothing, and the translator
+            // has no local size to key on. The model states the extent the
+            // guest stated; deciding it is not a translation input is this
+            // rail's business.
+            (extent.iter().all(|d| *d != 0)).then_some((pipeline.slot.0, extent))
+        })
+        .collect();
+    let pending = crate::backend::selected().preflight_translations(
+        state,
+        host,
+        submission.task_id,
+        &refs,
+        &dispatches,
+    );
+    // Timed unconditionally: the phase is the drain's own accounting of where
+    // an exec call's time went, and a rail that preflights nothing has to show
+    // as the zero it costs rather than as an absent column the leftover
+    // `Header` silently absorbs.
+    let preflight_ns = preflight_started.elapsed().as_nanos() as u64;
+    *measured_ns += preflight_ns;
+    crate::runtime::drain::note_exec_phase(
+        crate::runtime::drain::ExecPhase::Preflight,
+        preflight_ns,
+    );
+    pending
+}
+
+/// Run one read and planned submission's host work.
+///
+/// Everything here mutates something the guest can see, which is what makes it
+/// the third step rather than part of the second: the resource table is
+/// consumed before the first record, and the records encode.
+fn execute_submission<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    submission: &ExecSubmission,
+    resolved: Option<&reims_vgpu_core::exec::ExecWork>,
+    out: &mut ExecResult,
+    measured_ns: &mut u64,
+) {
+    let ExecSubmission {
+        task_id,
+        resource_descs,
+        streams,
+    } = submission;
+    let task_id = *task_id;
 
     // Before any of this submission's work runs. Each record states what was
     // true of its resource *before* the submission, so a pending window holding
     // pixels the guest has since overwritten has to go now — landing it later
     // would replace the guest's own bytes with a frame the guest has declared
     // stale.
-    consume_resource_table(state, task_id, &resource_descs);
+    consume_resource_table(state, task_id, resource_descs);
+
+    // One cursor for the whole packet, not one per buffer: a packet's
+    // command-buffer table is one submission and the model resolved all of it
+    // into one flat record order, so a cursor that restarted per buffer would
+    // compare the second buffer's records against the first buffer's answers.
+    let mut resolved = resolved.map(ResolvedCursor::new);
 
     for stream in streams {
         let mut acc = StreamAccum::default();
         let walk_started = std::time::Instant::now();
-        walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
+        walk_stream(
+            state,
+            host,
+            task_id,
+            stream,
+            out,
+            &mut acc,
+            resolved.as_mut(),
+        );
         let walk_ns = walk_started.elapsed().as_nanos() as u64;
-        measured_ns += walk_ns;
+        *measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
         let finish_started = std::time::Instant::now();
-        finish_stream(state, host, task_id, &mut out, &acc);
+        finish_stream(state, host, task_id, out, &acc);
         let finish_ns = finish_started.elapsed().as_nanos() as u64;
-        measured_ns += finish_ns;
+        *measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
     }
-    note_exec_header(exec_started, measured_ns);
-    out.total_us = elapsed_us(exec_started);
+}
+
+/// Run one submission whose plan step has already answered, from the inputs it
+/// was admitted with.
+///
+/// **The only door into execution.** The door for a caller that planned
+/// earlier — which is every admitted packet, because whether its translations
+/// are done is what decided it could run at all. Planning again here would be
+/// asking a question already answered and paying for it once per pipeline on
+/// the hottest path this device has.
+///
+/// The caller owes the answer: a submission run without its plan step having
+/// said `false` may encode against a shader that is still being translated.
+///
+/// # The tiling closes over two clocks, and it has to
+///
+/// [`ExecPhase::Header`] is a leftover — a span's worth of time minus the
+/// phases that measured themselves — and it used to be derived from one clock
+/// because reading and running were one call. They are not: a parked packet is
+/// read when it arrives and run when the model releases it, and a single clock
+/// spanning both would charge `Header` with the whole of the wait.
+///
+/// So each half closes its own leftover. The four measured phases are still
+/// counted exactly once and `Header` is still everything else, which is the
+/// property that made the tiling worth having; what changed is that it is now
+/// the sum of two leftovers rather than one. `total_us` is this half's, which
+/// is the half `sync_exec_stalled` is about.
+pub fn execute_planned<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    inputs: RetainedInputs<'_>,
+    mut out: ExecResult,
+) -> ExecResult {
+    let started = std::time::Instant::now();
+    let mut measured_ns = 0u64;
+    // Read, plan, execute. The plan step is separate because it is the only one
+    // of the three that a caller may run at a moment of its own choosing: it is
+    // pure CPU work over bytes the submission already holds, where the read
+    // walks the guest's page tables and the execution consumes the resource
+    // table.
+    execute_submission(
+        state,
+        host,
+        inputs.submission,
+        Some(inputs.resolved),
+        &mut out,
+        &mut measured_ns,
+    );
+    note_exec_header(started, measured_ns);
+    if !out.deferred {
+        out.total_us = elapsed_us(started);
+    }
     out
 }
 
-/// Close the [`ExecPhase`] tiling of `process_exec_indirect2` at one of its
-/// return points.
+/// Read one `CmdExecIndirect2` packet's submission and nothing more.
+///
+/// The half a drain performs at *arrival*: the streams live in the task's
+/// address space and the guest may reuse that memory once the ring head has
+/// advanced past the packet, so whoever runs the submission later has to have
+/// been handed these bytes rather than reading them again.
+///
+/// It closes its own `ExecPhase::Header` leftover, because the running half
+/// happens at a different moment and one clock across both would charge the
+/// leftover with the wait — see [`execute_planned`].
+#[must_use]
+pub fn read_exec_submission<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    payload: &[u8],
+) -> (Option<ExecSubmission>, ExecResult) {
+    let started = std::time::Instant::now();
+    let mut out = ExecResult::default();
+    let mut measured_ns = 0u64;
+    let submission = read_submission(state, host, payload, &mut out, &mut measured_ns);
+    note_exec_header(started, measured_ns);
+    (submission, out)
+}
+
+/// Close the [`ExecPhase`] tiling of one exec half at one of its return
+/// points.
 ///
 /// [`ExecPhase::Header`] is the **leftover**, not a span: it is the function's
 /// own elapsed time minus the four that measured themselves, so the five sum to
@@ -913,6 +1246,121 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
+/// The two inputs an admitted packet was retained with.
+///
+/// One type rather than two arguments, because they are one fact: the command
+/// buffers are what the packet was admitted *against* and the resolved records
+/// are what it was admitted *as*, both taken at arrival before the guest could
+/// rewrite either. A caller holding one without the other would be running
+/// bytes its records never named.
+#[derive(Clone, Copy)]
+pub struct RetainedInputs<'a> {
+    pub submission: &'a ExecSubmission,
+    pub resolved: &'a reims_vgpu_core::exec::ExecWork,
+}
+
+/// Where an executing walk stands in the records the model already resolved
+/// this packet into.
+///
+/// **The walks are the same walk.** Both this device's executor and
+/// `reims_vgpu_core::walk` frame a command buffer with
+/// `reims_vgpu_protocol::segment::SegmentStream` and its records with
+/// `reims_vgpu_wire::op::OpStream`, step a protection envelope over without
+/// opening an encoder for it, and visit every framed record of every buffer in
+/// table order. So the two agree about *where* a record is, and
+/// [`reims_vgpu_core::stream::StreamPosition`] is that agreement written down:
+/// a segment ordinal that counts encoder segments across the whole packet, and
+/// a record ordinal that restarts at each segment boundary.
+///
+/// **Keyed by position, not by arrival count.** A flat "nth record here is the
+/// nth record there" cursor holds today — measured at 275 782 records with no
+/// disagreement on a driven macos-15 boot, and 182 820 on macos-26 — but it
+/// holds only while the two walks admit exactly the same records. A transaction
+/// that one day omits a record the executor still reaches would put every later
+/// record off by one, and each would be read as the wrong operation rather than
+/// as a gap. A position lookup reads that as one absent twin and nothing else,
+/// which is the difference between a gap and a corruption.
+///
+/// The class the ledger gives the opcode is compared against the class the
+/// model resolved at every step. A disagreement is counted by name rather than
+/// acted on: until that count is a measured zero, nothing here decides
+/// anything.
+struct ResolvedCursor<'a> {
+    /// Ascending by position, which is the order [`ExecWork::records`] yields
+    /// and therefore needs no sort.
+    records: Vec<&'a reims_vgpu_core::exec::StreamRecord>,
+    at: reims_vgpu_core::stream::StreamPosition,
+}
+
+impl<'a> ResolvedCursor<'a> {
+    fn new(work: &'a reims_vgpu_core::exec::ExecWork) -> Self {
+        Self {
+            records: work.records().collect(),
+            at: reims_vgpu_core::stream::StreamPosition {
+                segment: 0,
+                record: 0,
+            },
+        }
+    }
+
+    /// A segment's records are over.
+    ///
+    /// The segment ordinal advances and the record ordinal restarts, which is
+    /// `reims_vgpu_core::stream`'s own rule: an encoder spanning three segments
+    /// still gives its records three distinct segment indices, because where a
+    /// record was written is not the same question as which encoder ran it. A
+    /// protection envelope opens no encoder and so is not a segment here — the
+    /// walk steps over it without reaching this.
+    fn end_segment(&mut self) {
+        self.at.segment += 1;
+        self.at.record = 0;
+    }
+
+    /// The resolved operation standing where this walk is, if the two agree
+    /// about what it is.
+    ///
+    /// Advances whatever the answer, because the walks advance together.
+    fn step(
+        &mut self,
+        kind: SegmentKind,
+        opcode: u32,
+    ) -> Option<&'a reims_vgpu_core::exec::ResolvedOperation> {
+        let at = self.at;
+        self.at.record += 1;
+        let Ok(index) = self.records.binary_search_by_key(&at, |record| record.at) else {
+            crate::runtime::drain::note_store_route("resolved_walk_no_record");
+            return None;
+        };
+        let record = self.records[index];
+        let Some(expected) = stream_class(kind, opcode) else {
+            // The ledger has not settled this opcode as a stream record, so
+            // this walk has no class to compare against and says so rather than
+            // reporting the model's answer as wrong.
+            crate::runtime::drain::note_store_route("resolved_walk_unjudged");
+            return None;
+        };
+        if record.op.class() != expected {
+            crate::runtime::drain::note_store_route("resolved_walk_class_differs");
+            return None;
+        }
+        crate::runtime::drain::note_store_route("resolved_walk_aligned");
+        Some(&record.op)
+    }
+}
+
+/// The stream class an opcode belongs to on the rail its segment names.
+///
+/// The ledger's own answer, through the same two steps
+/// `reims_vgpu_core::resolve::operation` takes, so "which class is this record"
+/// has one owner and this is a reader of it rather than a second table.
+fn stream_class(kind: SegmentKind, opcode: u32) -> Option<OperationClass> {
+    let row = reims_vgpu_protocol::closure::find(kind.rail(), opcode)?;
+    match reims_vgpu_core::operation::classify(row) {
+        Some(reims_vgpu_core::operation::OperationHome::Stream(class)) => Some(class),
+        Some(reims_vgpu_core::operation::OperationHome::ObjectLifecycle) | None => None,
+    }
+}
+
 /// Walk every record in one segment, handing each handler its opcode and its
 /// command bytes.
 ///
@@ -941,50 +1389,272 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
 /// simply sending that many. Counted per segment family, because a blit record
 /// and a render record cost nothing like the same and the mix is what says which
 /// of the two the wall clock belongs to.
-fn walk_segment_records(stream: &[u8], seg: &stream::Segment, mut handle: impl FnMut(u32, &[u8])) {
-    let mut cursor = 0usize;
+fn walk_segment_records(
+    kind: SegmentKind,
+    commands_offset: u32,
+    commands: &[u8],
+    mut handle: impl FnMut(u32, &[u8]),
+) {
     let mut records = 0u64;
-    let mut next = decode_first_record(stream, seg, &mut cursor);
-    let (route, route_us) = match seg.type_ {
-        SEGMENT_TYPE_RENDER => ("walk_records_render", "walk_render_us"),
-        SEGMENT_TYPE_BLIT => ("walk_records_blit", "walk_blit_us"),
-        SEGMENT_TYPE_COMPUTE => ("walk_records_compute", "walk_compute_us"),
-        _ => ("walk_records_other", "walk_other_us"),
+    let (route, route_us) = match kind {
+        SegmentKind::Render => ("walk_records_render", "walk_render_us"),
+        SegmentKind::Blit => ("walk_records_blit", "walk_blit_us"),
+        SegmentKind::Compute => ("walk_records_compute", "walk_compute_us"),
+        SegmentKind::Event | SegmentKind::Info => ("walk_records_other", "walk_other_us"),
     };
     // One clock pair per *segment*, not per record. A stream carries at most a
     // handful of segments and tens of thousands of records, so this splits
     // `exec_phase walk_us` by family for a cost that does not show up, where
     // per-record timing would cost more than the handlers it measured.
     let started = std::time::Instant::now();
-    loop {
+    let mut ops = reims_vgpu_wire::op::OpStream::new(commands);
+    let mut refusal = None;
+    for next in ops.by_ref() {
         match next {
-            Ok(rec) => {
+            Ok(op) => {
                 records += 1;
-                let start = rec.bytes_offset as usize;
-                handle(rec.opcode, &stream[start..start + rec.length as usize]);
-                next = decode_next_record(stream, seg, &mut cursor);
+                let start = op.offset;
+                handle(op.opcode(), &commands[start..start + op.length() as usize]);
             }
-            // `Done` is end-of-segment and yields `None` here, so the normal exit
-            // path stays silent; anything else names the check that refused.
-            Err(status) => {
-                crate::runtime::drain::note_store_route_n(route, records);
-                crate::runtime::drain::note_store_route_us(
-                    route_us,
-                    started.elapsed().as_micros() as u64,
+            // The iterator stops after yielding a refusal, so this is the last
+            // item and the loop ends with it.
+            Err(e) => refusal = Some(RecordFraming::from(e)),
+        }
+    }
+    crate::runtime::drain::note_store_route_n(route, records);
+    crate::runtime::drain::note_store_route_us(route_us, started.elapsed().as_micros() as u64);
+    if let Some(status) = refusal {
+        if let Some(e) = crate::observe::Emit::refusal("stream_record_fail", &status) {
+            // Latch per segment family: a guest re-submitting a malformed
+            // stream sends it on every frame and the second line carries
+            // nothing the first did not. Keying on the family still tells
+            // a broken blit segment from a broken render one, which
+            // keying on the reason alone would hide.
+            e.field("seg", kind.name())
+                .field("seg_cmd_off", commands_offset)
+                .field("seg_cmd_len", commands.len())
+                .field("cursor", ops.consumed())
+                .fail_once(u64::from(kind.wire_type()));
+        }
+    }
+}
+
+/// Why a segment's records stopped framing.
+///
+/// **The name is this device's; the fact is `reims_vgpu_wire`'s.** That crate
+/// has no dependencies on purpose, so it cannot carry a `Decline`, and the
+/// device is the layer that has to say which check stopped a walk. Everything
+/// numeric a reader needs is on the emitted line, so this is a name and not a
+/// second reading of the bytes.
+///
+/// The two length refusals the device's own framer had — "below its own header"
+/// and "past the segment's end" — are one variant here, because
+/// [`reims_vgpu_wire::op::op`] makes one check of both. Which of the two it was
+/// is still legible: `length` under eight is the first and `length` over
+/// `remaining` is the second, and both are on the line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordFraming {
+    ShortHeader {
+        need: usize,
+        have: usize,
+    },
+    BadLength {
+        opcode: u32,
+        length: u32,
+        remaining: usize,
+    },
+    /// Neither is reachable from a record walk — `op` views at offset zero of a
+    /// slice and counts nothing — and both are named rather than folded into a
+    /// catch-all, so a walk that started producing one would say so instead of
+    /// borrowing another check's name.
+    OutOfRange {
+        offset: usize,
+        len: usize,
+    },
+    CountOverflow {
+        count: usize,
+        elem: usize,
+    },
+}
+
+impl From<reims_vgpu_wire::WireError> for RecordFraming {
+    fn from(e: reims_vgpu_wire::WireError) -> Self {
+        use reims_vgpu_wire::WireError as W;
+        match e {
+            W::Short { need, have } => Self::ShortHeader { need, have },
+            W::BadLength {
+                opcode,
+                length,
+                remaining,
+            } => Self::BadLength {
+                opcode,
+                length,
+                remaining,
+            },
+            W::OutOfRange { offset, len } => Self::OutOfRange { offset, len },
+            W::CountOverflow { count, elem } => Self::CountOverflow { count, elem },
+        }
+    }
+}
+
+impl crate::observe::Refusal for RecordFraming {
+    fn refusal(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::ShortHeader { .. } => "stream_rec_short_header",
+            Self::BadLength { .. } => "stream_rec_bad_length",
+            Self::OutOfRange { .. } => "stream_rec_view_out_of_range",
+            Self::CountOverflow { .. } => "stream_rec_count_overflow",
+        })
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        match *self {
+            Self::ShortHeader { need, have } => {
+                vec![("need", need.to_string()), ("have", have.to_string())]
+            }
+            Self::BadLength {
+                opcode,
+                length,
+                remaining,
+            } => vec![
+                ("opcode", format!("{opcode:#x}")),
+                ("length", length.to_string()),
+                ("remaining", remaining.to_string()),
+            ],
+            Self::OutOfRange { offset, len } => {
+                vec![("offset", offset.to_string()), ("len", len.to_string())]
+            }
+            Self::CountOverflow { count, elem } => {
+                vec![("count", count.to_string()), ("elem", elem.to_string())]
+            }
+        }
+    }
+}
+
+/// The per-record work an exec stream's segments cause, separated from whoever
+/// walks the stream.
+///
+/// `walk_stream` used to hold both halves: the framing loop, and inside each of
+/// its five arms the handler call plus — for compute — the segment-spanning
+/// encoder that one record opens and the segment's end commits. They are two
+/// different things. `reims_vgpu_core::walk` frames and records the same
+/// segments from the same `reims_vgpu_protocol::segment::SegmentStream`, and a
+/// device driven from that walk needs this half without this loop.
+///
+/// Splitting them here is what makes the walker substitutable rather than
+/// duplicated. `walk.rs`'s own module documentation names the class of defect
+/// that matters: two walks over one stream are two chances to disagree about
+/// where a record was, and the dispatch is the part that would have had to be
+/// written twice for them to disagree at all.
+///
+/// The sink owns exactly the state that spans records — the open compute
+/// segment — and nothing that spans streams.
+struct StreamSink<'a, M: HostMemory + HostOps> {
+    state: &'a mut DeviceState,
+    host: &'a mut M,
+    task_id: u32,
+    out: &'a mut ExecResult,
+    acc: &'a mut StreamAccum,
+    /// `Some` between the [`Self::begin_segment`] and [`Self::end_segment`] of a
+    /// compute segment, and `None` everywhere else. A compute record arriving
+    /// while this is `None` is a walker that skipped the opening, which is a
+    /// loss and is named rather than absorbed.
+    compute: Option<crate::runtime::compute_session::ComputeSegment>,
+}
+
+impl<'a, M: HostMemory + HostOps> StreamSink<'a, M> {
+    /// A segment of `kind` is about to deliver its records.
+    fn begin_segment(&mut self, kind: SegmentKind) {
+        if self.compute.is_some() {
+            // The previous segment's encoder was never committed. Committing it
+            // here is the only reading that does not drop the work the guest
+            // already recorded into it, and the line says the walker paired its
+            // calls wrongly rather than leaving that silent.
+            crate::observe::fail(format!(
+                "exec_segment_unended task={} opening={} (a segment opened while a compute \
+                 segment was still open, so its encoder had not been committed)",
+                self.task_id,
+                kind.name()
+            ));
+            self.end_segment();
+        }
+        if matches!(kind, SegmentKind::Compute) {
+            self.compute = Some(crate::runtime::compute_session::ComputeSegment::default());
+        }
+    }
+
+    /// One record of the open segment.
+    ///
+    /// `kind` is the segment's, which is the only defensible source for the
+    /// rail a record is read on — the same rule `reims_vgpu_core::walk` states
+    /// for `resolve::operation`, and the reason it is a parameter here rather
+    /// than something this method could derive from the opcode.
+    fn record(&mut self, kind: SegmentKind, opcode: u32, cmd: &[u8]) {
+        match kind {
+            SegmentKind::Render => handle_render_record(
+                self.state,
+                self.host,
+                self.task_id,
+                opcode,
+                cmd,
+                self.out,
+                self.acc,
+            ),
+            SegmentKind::Blit => {
+                handle_blit_record(self.state, self.host, self.task_id, opcode, cmd)
+            }
+            SegmentKind::Compute => {
+                let Some(compute) = self.compute.as_mut() else {
+                    crate::observe::fail(format!(
+                        "exec_compute_record_unopened task={} op={opcode:#x} len={} (a compute \
+                         record arrived with no compute segment open, so its dispatch is lost)",
+                        self.task_id,
+                        cmd.len()
+                    ));
+                    return;
+                };
+                handle_compute_record(
+                    self.state,
+                    self.host,
+                    self.task_id,
+                    opcode,
+                    cmd,
+                    self.out,
+                    compute,
                 );
-                if let Some(e) = crate::observe::Emit::refusal("stream_record_fail", &status) {
-                    // Latch per segment family: a guest re-submitting a malformed
-                    // stream sends it on every frame and the second line carries
-                    // nothing the first did not. Keying on the family still tells
-                    // a broken blit segment from a broken render one, which
-                    // keying on the reason alone would hide.
-                    e.field("seg", stream::segment_type_name(u32::from(seg.type_)))
-                        .field("seg_off", seg.offset)
-                        .field("seg_len", seg.length)
-                        .field("cursor", cursor)
-                        .fail_once(u64::from(seg.type_));
-                }
-                return;
+            }
+            SegmentKind::Event => handle_event_record(self.state, self.task_id, cmd),
+            SegmentKind::Info => {
+                handle_info_record(self.state, self.host, self.task_id, opcode, cmd);
+            }
+        }
+    }
+
+    /// The open segment has delivered its last record.
+    ///
+    /// Only compute has anything to do here, and it is a commit rather than a
+    /// teardown: the session's whole multi-record encoder is the work, so a
+    /// failure at this point loses all of it and is the one thing this method
+    /// reports.
+    fn end_segment(&mut self) {
+        let Some(mut segment) = self.compute.take() else {
+            return;
+        };
+        let Some(status) = crate::runtime::compute_session::finish_session(
+            &mut segment.session,
+            self.state,
+            self.host,
+            self.task_id,
+        ) else {
+            return;
+        };
+        if !matches!(status, ComputeStatus::Ok) {
+            self.out.compute_control_fail += 1;
+            // Segment-end commit: the whole multi-record session's work is
+            // gone, and this counter was its only trace.
+            if let Some(e) = crate::observe::Emit::refusal("compute_session_finish", &status) {
+                e.field("task", self.task_id)
+                    .fail_once(u64::from(self.task_id));
             }
         }
     }
@@ -997,80 +1667,126 @@ fn walk_stream<M: HostMemory + HostOps>(
     stream: &[u8],
     out: &mut ExecResult,
     acc: &mut StreamAccum,
+    mut resolved: Option<&mut ResolvedCursor<'_>>,
 ) {
-    let segs = match stream::iter_segments(stream) {
-        Ok(s) => s,
-        Err(status) => {
-            // The outermost frame in the crate. A stream that will not frame
-            // executes *nothing* — and until now that was indistinguishable from
-            // an idle guest: no records, no work, no line.
-            if let Some(e) = crate::observe::Emit::refusal("stream_frame_fail", &status) {
-                e.field("task", task_id)
-                    .field("bytes", stream.len())
-                    .fail_once(u64::from(task_id));
-            }
+    // **The one place this crate frames an exec stream, counted.** Seam 6 asks
+    // for zero re-scans of already resolved EXEC bytes, and the shape the
+    // violation took here was two rail pre-scans walking the same stream
+    // through the same framer before execution walked it a third time. So the
+    // measurable form of that zero is "one framing per stream per submission",
+    // and this is the number it is read off — on a boot, against
+    // `exec_streams_loaded`; off the VM, by
+    // fn `a_submission_frames_each_stream_once_and_preflight_frames_none`.
+    crate::runtime::drain::note_store_route("exec_stream_framed");
+    // The outermost frame in the crate, and it is
+    // `reims_vgpu_protocol::segment`'s. This device had its own segment framer
+    // whose per-segment index was found by re-walking the stream from zero — a
+    // quadratic scan over a stream a driven boot puts ninety-five thousand
+    // segments in. `SegmentStream` counts the index it already knows.
+    let mut segments = match SegmentStream::new(stream) {
+        Ok(segments) => segments,
+        Err(refusal) => {
+            // A stream that will not frame executes *nothing*, and that used to
+            // be indistinguishable from an idle guest: no records, no work, no
+            // line.
+            crate::observe::Emit::decline("stream_frame_fail", &refusal)
+                .field("task", task_id)
+                .field("bytes", stream.len())
+                .fail_once(u64::from(task_id));
             return;
         }
     };
-    for seg in segs {
-        if let Some(e) =
-            crate::observe::Emit::refusal("stream_segment", &stream::segment_disposition(seg.type_))
-        {
-            e.field("seg_type", seg.type_)
-                .field("seg_off", seg.offset)
-                .field("seg_len", seg.length)
-                .fail_once(u64::from(seg.type_));
-            continue;
-        }
-        match seg.type_ {
-            SEGMENT_TYPE_RENDER => {
-                walk_segment_records(stream, &seg, |op, cmd| {
-                    handle_render_record(state, host, task_id, op, cmd, out, acc)
-                });
+    let mut sink = StreamSink {
+        state,
+        host,
+        task_id,
+        out,
+        acc,
+        compute: None,
+    };
+    for framed in segments.by_ref() {
+        let framed = match framed {
+            Ok(framed) => framed,
+            // **The iterator stops here, and every later segment goes
+            // unexecuted.** That is `reims_vgpu_protocol::segment`'s reading and
+            // it is stricter than the framer it replaces, which reported an
+            // unknown segment type and then walked on to the next one. Its
+            // reason is on `FramingRefusal::UnknownType`: a family whose record
+            // framing is unknown can be skipped only on its declared length,
+            // and skipping on that hands the following segment an encoder state
+            // derived from bytes nothing here understands. The reference host
+            // rejects a non-continuation type it has no decoder for rather than
+            // stepping over it.
+            Err(refusal) => {
+                crate::observe::Emit::decline("stream_frame_fail", &refusal)
+                    .field("task", task_id)
+                    .field("bytes", stream.len())
+                    .field("segments_before", segments.segments())
+                    .fail_once(u64::from(task_id));
+                return;
             }
-            SEGMENT_TYPE_BLIT => {
-                walk_segment_records(stream, &seg, |op, cmd| {
-                    handle_blit_record(state, host, task_id, op, cmd)
-                });
+        };
+        let (kind, commands) = match framed.body {
+            SegmentBody::Encoder { kind, commands } => (kind, commands),
+            // `-beginSegment:protectionOptions:` emits a segment-level envelope
+            // before the real segment, and skipping it is contract-correct — so
+            // it is control flow and stays silent, where a line would land in
+            // the sink on every healthy frame that carries one. This device
+            // implements no protection domain, so nothing acts on the value;
+            // that it is *read* rather than stepped over is what lets that
+            // sentence be a choice rather than a limitation.
+            SegmentBody::ProtectionEnvelope { .. } => continue,
+        };
+        // The encoder-lifetime census, counted once per segment. The two
+        // pre-scans on the Vulkan rail used to walk the same stream through the
+        // same framer, so every segment of every stream was counted three times
+        // on that rail and the reading was a rail-dependent multiple of the
+        // truth.
+        crate::runtime::drain::note_store_route(segment_chain_route(framed.lifetime));
+        sink.begin_segment(kind);
+        walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
+            // Stepped for every record this walk reaches, whether or not the
+            // arm below has anything to do with the answer: the two walks stay
+            // in correspondence by advancing together, and a step taken only
+            // for the classes that consume it would be a cursor that means
+            // something different in every segment.
+            if let Some(cursor) = resolved.as_deref_mut() {
+                let _ = cursor.step(kind, op);
             }
-            SEGMENT_TYPE_COMPUTE => {
-                let mut compute = crate::runtime::compute_session::ComputeSegment::default();
-                walk_segment_records(stream, &seg, |op, cmd| {
-                    handle_compute_record(state, host, task_id, op, cmd, out, &mut compute)
-                });
-                if let Some(st) = crate::runtime::compute_session::finish_session(
-                    &mut compute.session,
-                    state,
-                    host,
-                    task_id,
-                ) {
-                    if !matches!(st, ComputeStatus::Ok) {
-                        out.compute_control_fail += 1;
-                        // Segment-end commit: the whole multi-record session's
-                        // work is gone, and this counter was its only trace.
-                        if let Some(e) =
-                            crate::observe::Emit::refusal("compute_session_finish", &st)
-                        {
-                            e.field("task", task_id).fail_once(u64::from(task_id));
-                        }
-                    }
-                }
-            }
-            SEGMENT_TYPE_EVENT => {
-                walk_segment_records(stream, &seg, |_op, cmd| {
-                    handle_event_record(state, task_id, cmd)
-                });
-            }
-            SEGMENT_TYPE_INFO => {
-                walk_segment_records(stream, &seg, |op, cmd| {
-                    handle_info_record(state, host, task_id, op, cmd)
-                });
-            }
-            // Unreachable: `segment_disposition` already answered `Walk` for
-            // exactly the five families above, and `continue`d on the rest.
-            _ => {}
+            sink.record(kind, op, cmd);
+        });
+        sink.end_segment();
+        if let Some(cursor) = resolved.as_deref_mut() {
+            cursor.end_segment();
         }
     }
+}
+
+/// Every census route [`segment_chain_route`] can answer, in the order
+/// `(continues_previous, continues_into_next)` counts up.
+///
+/// Exported so a reading is over a named set rather than over whichever names a
+/// grep of the log happened to find, and so the four cannot be spelled twice.
+pub const SEGMENT_CHAIN_ROUTES: [&str; 4] = [
+    "seg_chain_none",
+    "seg_chain_next",
+    "seg_chain_prev",
+    "seg_chain_both",
+];
+
+/// Which of [`SEGMENT_CHAIN_ROUTES`] a segment's encoder lifetime selects.
+///
+/// Takes the [`SegmentLifetime`] rather than two bytes side by side. The edge is
+/// recorded from both ends of it — the serializer writes the `beginSegment:`
+/// `BOOL` into the header it opens and reaches back to mark the preceding one —
+/// so a caller handed the two halves separately could carry one and drop the
+/// other. The `!= 0` reading of each byte is the protocol crate's and is not
+/// repeated here.
+#[must_use]
+pub fn segment_chain_route(lifetime: SegmentLifetime) -> &'static str {
+    let index =
+        usize::from(lifetime.continues_previous) << 1 | usize::from(lifetime.continues_into_next);
+    SEGMENT_CHAIN_ROUTES[index]
 }
 
 fn handle_info_record<M: HostMemory + HostOps>(
@@ -1124,25 +1840,77 @@ fn handle_info_record<M: HostMemory + HostOps>(
     note_info_record_unanswered(task_id, opcode, bytes.len());
 }
 
+/// One event-segment record, lifted by the protocol crate and executed here.
+///
+/// **The lift is `reims_vgpu_protocol::decode::sync`'s now.** This device
+/// carried its own event decoder, which framed the same three opcodes and
+/// carried its own copy of the blit encoder's fence numbers in order to refuse
+/// them. That is the wire's question with a contract answer, and the protocol
+/// crate is where it is answered for every rail at once — so the boundary
+/// probes, the cross-encoder refusals and the three-opcode window stop being
+/// this crate's to keep true.
+///
+/// **`waitForEvent:value:timeoutMS:` is refused at the lift and not after it.**
+/// The row is settled: this device runs no clock against the guest's, so
+/// executing the bounded wait as the unbounded one it resembles turns a guest's
+/// timeout into a hang. `event_kind` gives it no kind and the lift refuses it
+/// `RefusedByContract`. The old path decoded it, planned it, and refused it at
+/// the end — one settled row refused in two places, and the one further from
+/// the ledger was the one a reader found first.
 fn handle_event_record(state: &mut DeviceState, task_id: u32, cmd_bytes: &[u8]) {
-    let cmd = match event_decode::decode(cmd_bytes) {
-        Ok(c) => c,
-        Err(status) => {
-            // A malformed event record drops a guest signal or wait outright.
-            // The `Err(_)` here used to feed a counter nothing read, so the loss
-            // left no line at all; the decoder's own typed refusal names which
-            // of its five checks rejected the bytes.
-            if let Some(e) = crate::observe::Emit::refusal("event_decode", &status) {
-                e.field("task", task_id)
-                    .field("len", cmd_bytes.len())
-                    .fail();
-            }
+    let refuse = |decline: &dyn crate::observe::Decline| {
+        // A malformed or refused event record drops a guest signal or wait
+        // outright, so the loss is named rather than counted. The record's
+        // own refusal says which check refused it, on which rail, at which
+        // opcode.
+        crate::observe::Emit::decline("event_record", decline)
+            .field("task", task_id)
+            .field("len", cmd_bytes.len())
+            .fail();
+    };
+    let op = match reims_vgpu_protocol::decode::op(cmd_bytes, 0) {
+        Ok(op) => op,
+        Err(_) => {
+            // The header itself did not frame. `walk_segment_records` has
+            // already framed this record once to hand it over, so this is
+            // unreachable rather than a guest case — and reported, because a
+            // frame that stopped agreeing with itself between two reads is not
+            // something to pass over.
+            crate::observe::fail(format!(
+                "event_record_unframed task={task_id} len={} (the segment walk framed this record                  and the op header did not)",
+                cmd_bytes.len()
+            ));
+            return;
+        }
+    };
+    let record = match reims_vgpu_protocol::decode::sync::decode(
+        reims_vgpu_protocol::closure::Rail::Event,
+        &op,
+    ) {
+        Ok(reims_vgpu_protocol::decode::sync::SyncRecord::Event(record)) => record,
+        Ok(other) => {
+            // The event rail lifts one record class. A fence or a barrier here
+            // would mean `decode::sync` and `event_kind` disagree about which
+            // rail owns which opcode.
+            crate::observe::fail(format!(
+                "event_record_not_an_event task={task_id} op={:#x} kind={} (the event rail lifted                  a record that is not an event)",
+                op.opcode(),
+                match other {
+                    reims_vgpu_protocol::decode::sync::SyncRecord::Fence(_) => "fence",
+                    reims_vgpu_protocol::decode::sync::SyncRecord::Barrier(_) => "barrier",
+                    reims_vgpu_protocol::decode::sync::SyncRecord::Event(_) => "event",
+                }
+            ));
+            return;
+        }
+        Err(refusal) => {
+            refuse(&refusal);
             return;
         }
     };
     // Refusals are emitted by `execute_event` itself, against the ref that
     // failed; there is nothing left for this caller to report.
-    fence_exec::execute_event(state, task_id, &cmd);
+    fence_exec::execute_event(state, task_id, &record);
 }
 
 fn handle_compute_record<M: HostMemory + HostOps>(
@@ -1154,7 +1922,101 @@ fn handle_compute_record<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     seg: &mut crate::runtime::compute_session::ComputeSegment,
 ) {
-    let cmd = match compute::decode(cmd_bytes) {
+    // **Which class of record this is, is the closure ledger's answer.** The
+    // compute *rail* carries six: the encoder's own records, the fence pair,
+    // the barriers, the content-representation flush, the sequencing SPI
+    // (control flow and indirect-command execution), and the residency
+    // declarations it inherits from the shared encoder base class. This device
+    // answered all six with one `Kind`, decoded in the same pass that read the
+    // fields — so a record's class and its layout were one verdict.
+    //
+    // Three of the six are answered here, and they are the three that own
+    // nothing: the barriers and the flush are proven no-ops, and the residency
+    // pair is declined. None of them touches `seg.acc`, `seg.session` or
+    // `seg.block`, which is what makes them separable from the rest of the rail
+    // rather than merely convenient to move first. The encoder's records, the
+    // fence pair and the sequencing SPI all still go through this device's own
+    // decoder below: the first because its executor takes the flat
+    // `compute::Command`, and the other two because the ledger has not settled
+    // them and the protocol crate will not lift a row it has not settled.
+    match reims_vgpu_protocol::closure::find(Rail::Compute, opcode)
+        .and_then(reims_vgpu_core::operation::classify)
+    {
+        // `memoryBarrierWithResources:` and `memoryBarrierWithScope:`.
+        Some(OperationHome::Stream(OperationClass::Barrier)) => {
+            return note_compute_barrier(task_id, opcode, cmd_bytes);
+        }
+        // `insertCompressedTextureReinterpretationFlush`, the compute rail's
+        // one content-representation directive.
+        Some(OperationHome::Stream(OperationClass::ResourceState)) => {
+            return note_compute_content_directive(task_id, opcode, cmd_bytes);
+        }
+        // `None` is a row the ledger has not settled, and the compute rail has
+        // thirteen. Two of them are the unqualified `useHeaps:count:` and
+        // `useResources:count:usage:` inherited from the serializer's encoder
+        // base class, and they are declined rather than executed — so their
+        // layout can come from `decode::residency::lift`, which answers what
+        // the guest wrote without claiming the row is settled. The other eleven
+        // feed live executors and stay below.
+        None if reims_vgpu_protocol::decode::residency::is_residency(Rail::Compute, opcode) => {
+            return note_compute_residency(task_id, opcode, cmd_bytes);
+        }
+        _ => {}
+    }
+    // The seventeen records the ledger has settled. `classify` put them here
+    // and `protocol::decode::compute` owns their layout, so the class and the
+    // fields are two answers from two owners instead of one `Kind` assigned
+    // while the fields were being read.
+    if matches!(
+        reims_vgpu_protocol::closure::find(Rail::Compute, opcode)
+            .and_then(reims_vgpu_core::operation::classify),
+        Some(OperationHome::Stream(OperationClass::Compute))
+    ) {
+        let Some(framed) = frame_compute_record(task_id, opcode, cmd_bytes) else {
+            return;
+        };
+        match reims_vgpu_protocol::decode::compute::decode(&framed) {
+            Ok(record) => {
+                let pipeline_ref = seg.acc.pipeline_ref;
+                match compute_exec::apply_record(state, host, task_id, &record, seg) {
+                    // `None` is an accumulator-only record, not a loss: the
+                    // record was applied, `apply_record` simply had no
+                    // execution status to report for it.
+                    None | Some(ComputeStatus::Ok) => {}
+                    Some(st) => note_compute_refusal(st, task_id, pipeline_ref, &record.kind()),
+                }
+            }
+            Err(refusal) => {
+                // The pass's dispatch type is the one enumerated field on this
+                // encoder, and a word outside `MTLDispatchType` is refused at
+                // the lift rather than folded onto its nearest neighbour. The
+                // census slug the device used to raise when it substituted
+                // `Serial` is kept, because what that counter was for — the
+                // evidence that decides whether an unrecognised ordinal is a
+                // guest asking for something new or this device reading the
+                // wrong offset — is still exactly what a firing would mean.
+                if matches!(
+                    refusal,
+                    reims_vgpu_protocol::decode::DecodeRefusal::UndefinedOrdinal {
+                        field: "dispatch_type",
+                        ..
+                    }
+                ) {
+                    crate::runtime::drain::note_store_route("compute_dispatch_type_unknown");
+                }
+                note_compute_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+            }
+        }
+        return;
+    }
+    // What is left is the eleven rows the ledger has **not** settled — the
+    // fence pair, the seven control-flow records and the two indirect-command
+    // executions — and this device decodes them itself. They are not declines
+    // like the blit rail's unsettled four: each one drives real work, on
+    // evidence this project gathered outside the ledger, and holding them back
+    // is what keeps a settled record and an unsettled one from sharing a
+    // decoder.
+    let cmd = match compute_spi::decode(cmd_bytes) {
         Ok(c) => c,
         // Same silent drop as the render path above.
         Err(status) => {
@@ -1184,43 +2046,6 @@ fn handle_compute_record<M: HostMemory + HostOps>(
                 action,
             );
         }
-        ComputeKind::BufferBind | ComputeKind::BufferBindAttributeStride => {
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-        }
-        ComputeKind::TextureBind => {
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-        }
-        ComputeKind::SamplerBind | ComputeKind::SamplerLod => {
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-        }
-        ComputeKind::Pipeline
-        | ComputeKind::BufferOffset
-        | ComputeKind::BufferOffsetAttributeStride
-        | ComputeKind::DispatchType
-        | ComputeKind::StageInRegion
-        | ComputeKind::StageInRegionIndirect
-        | ComputeKind::ThreadgroupMemory
-        | ComputeKind::ImageblockDimensions
-        | ComputeKind::BarrierResources
-        | ComputeKind::BarrierScope
-        | ComputeKind::UseHeaps
-        | ComputeKind::UseResources
-        | ComputeKind::CompressedTextureFlush => {
-            let _ = compute_exec::apply_record(state, host, task_id, &cmd, seg);
-        }
-        ComputeKind::DispatchThreadgroups
-        | ComputeKind::DispatchThreads
-        | ComputeKind::DispatchThreadgroupsIndirect
-        | ComputeKind::DispatchThreadsIndirect => {
-            let pipeline_ref = seg.acc.pipeline_ref;
-            match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
-                // `None` is an accumulator-only record kind, not a loss: the
-                // record was applied, `apply_record` simply had no execution
-                // status to report for it.
-                None | Some(ComputeStatus::Ok) => {}
-                Some(st) => note_compute_refusal(st, task_id, pipeline_ref, cmd.kind),
-            }
-        }
         ComputeKind::ControlStartDoWhile
         | ComputeKind::ControlEndDoWhile
         | ComputeKind::ControlStartWhile
@@ -1235,27 +2060,256 @@ fn handle_compute_record<M: HostMemory + HostOps>(
             // whether it is dead or perfect.
             crate::runtime::drain::note_store_route("compute_ctrl_seen");
             let pipeline_ref = seg.acc.pipeline_ref;
-            match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
-                None | Some(ComputeStatus::Ok) => {}
-                Some(st) => {
+            match compute_exec::apply_sequencing_record(state, host, task_id, &cmd, seg) {
+                ComputeStatus::Ok => {}
+                st => {
                     out.compute_control_fail += 1;
-                    note_compute_refusal(st, task_id, pipeline_ref, cmd.kind);
+                    note_compute_refusal(st, task_id, pipeline_ref, &cmd.kind);
                 }
             }
         }
         ComputeKind::ExecuteCommandsInBuffer | ComputeKind::ExecuteCommandsInBufferIndirect => {
             crate::runtime::drain::note_store_route("compute_icb_seen");
             let pipeline_ref = seg.acc.pipeline_ref;
-            match compute_exec::apply_record(state, host, task_id, &cmd, seg) {
-                None | Some(ComputeStatus::Ok) => {}
-                Some(st) => {
+            match compute_exec::apply_sequencing_record(state, host, task_id, &cmd, seg) {
+                ComputeStatus::Ok => {}
+                st => {
                     out.compute_icb_fail += 1;
-                    note_compute_refusal(st, task_id, pipeline_ref, cmd.kind);
+                    note_compute_refusal(st, task_id, pipeline_ref, &cmd.kind);
                 }
             }
         }
-        _ => {}
+        // A settled row reaching this decoder is the routing above disagreeing
+        // with the ledger, not a guest case.
+        other => crate::observe::fail(format!(
+            "compute_record_misrouted task={task_id} opcode={opcode:#x} kind={other:?} (the \
+             ledger settled this row and it reached the unsettled decoder)"
+        )),
     }
+}
+
+/// Frame one compute record for a protocol decoder, or say the frame disagreed
+/// with itself.
+///
+/// `walk_segment_records` framed this record to hand it over, so a header that
+/// does not frame here is two reads of one header disagreeing rather than a
+/// guest case — which is why it is a `fail` and not a decline.
+fn frame_compute_record<'a>(
+    task_id: u32,
+    opcode: u32,
+    cmd_bytes: &'a [u8],
+) -> Option<reims_vgpu_wire::op::Op<'a>> {
+    match reims_vgpu_protocol::decode::op(cmd_bytes, 0) {
+        Ok(framed) => Some(framed),
+        Err(_) => {
+            crate::observe::fail(format!(
+                "compute_record_unframed task={task_id} opcode={opcode:#x} len={} (the segment \
+                 walk framed this record and the op header did not)",
+                cmd_bytes.len()
+            ));
+            None
+        }
+    }
+}
+
+/// Count and report one compute record a protocol decoder refused.
+///
+/// Latched, because the guest re-encodes the same stream every frame and an
+/// unliftable record would otherwise be one line per segment. The token is the
+/// opcode, widened by the offending value when the refusal names one: two
+/// different undeclared dispatch types are two different questions about the
+/// contract, and collapsing them onto the opcode would answer only the first.
+///
+/// The refusal renders its own rail and opcode, so neither is repeated here.
+fn note_compute_record_refused(
+    task_id: u32,
+    opcode: u32,
+    len: usize,
+    refusal: &reims_vgpu_protocol::decode::DecodeRefusal,
+) {
+    use reims_vgpu_protocol::decode::DecodeRefusal;
+    let token = match refusal {
+        DecodeRefusal::UndefinedOrdinal { value, .. } => {
+            u64::from(opcode) | (u64::from(*value) << 32)
+        }
+        _ => u64::from(opcode),
+    };
+    crate::observe::Emit::decline("compute_record", refusal)
+        .field("task", task_id)
+        .field("len", len)
+        .fail_once(token);
+}
+
+/// Price one compute-encoder barrier, which this device answers by doing
+/// nothing.
+///
+/// The no-op is sound at pass granularity and stronger than that on the Vulkan
+/// rail, where `backend::vulkan::engine::exec_compute::execute_compute_inner`
+/// begins, ends and submits one command buffer per dispatch — so consecutive
+/// dispatches are separated by a queue submission rather than by a barrier
+/// inside one. Under `-setSupportsComputePassDescriptorDispatchType:` Apple's
+/// serializer emits a scope barrier after **every** dispatch and every ICB
+/// execution of a serial pass, so this counter reading high is that capability
+/// being on rather than a defect.
+///
+/// It is still decoded rather than skipped on the opcode: the barrier's shape
+/// is what would have to be read the day the no-op stops being sound, and a
+/// record whose body does not frame is a different event from one that does.
+fn note_compute_barrier(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let Some(framed) = frame_compute_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    match reims_vgpu_protocol::decode::sync::decode(Rail::Compute, &framed) {
+        // One slug for both shapes, as before the ledger answered the class:
+        // the claim being priced is "this device ordered nothing here", and it
+        // is the same claim for a resource list and for a scope word.
+        Ok(SyncRecord::Barrier(_)) => {
+            crate::runtime::drain::note_store_route("compute_noop_barrier");
+        }
+        // `barrier_kind` answers for exactly the two barrier opcodes on this
+        // rail, so the class and the lift agreeing is the protocol crate's
+        // invariant. Unreachable, and named rather than ignored.
+        Ok(_) => crate::observe::fail(format!(
+            "compute_barrier_not_a_barrier task={task_id} opcode={opcode:#x} (the ledger calls \
+             this a barrier and the lift produced another ordering record)"
+        )),
+        Err(refusal) => note_compute_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
+/// Price the compute rail's one content-representation directive.
+///
+/// `insertCompressedTextureReinterpretationFlush` names no resource and takes
+/// no argument. It is a proven no-op here because this device never
+/// materialises Apple's lossless-compression metadata, so there is no second
+/// representation for the flush to make visible.
+fn note_compute_content_directive(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let Some(framed) = frame_compute_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    match reims_vgpu_protocol::decode::resource_state::decode(Rail::Compute, &framed) {
+        Ok(record) => crate::runtime::drain::note_store_route(match record.directive {
+            ContentDirective::FlushCompressedReinterpretation => {
+                "compute_noop_flush_compressed_reinterpretation"
+            }
+            // The four directives that name a resource; they are the blit
+            // rail's and do not arrive here. Healthy zeroes, kept apart from
+            // the flush so a reading cannot mistake one for the other.
+            ContentDirective::Synchronize => "compute_noop_synchronize",
+            ContentDirective::OptimizeForCpu => "compute_noop_optimize_for_cpu",
+            ContentDirective::OptimizeForGpu => "compute_noop_optimize_for_gpu",
+            ContentDirective::InvalidateCompressed => "compute_noop_invalidate_compressed",
+        }),
+        Err(refusal) => note_compute_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
+/// A compute residency declaration whose usage the no-op argument does not
+/// cover.
+///
+/// The reasoning and the vocabulary are the render rail's — see
+/// [`report::ResidencyWriteDeclared`], which carries it — with one difference
+/// this rail owns. The compute encoder inherits only the **unqualified** residency selectors,
+/// so no record here carries a stage argument and there is no stage half to
+/// report; the usage half is the whole declaration, and it is the half that
+/// decides whether answering by doing nothing is sound.
+struct ComputeResidencyDeclared {
+    opcode: u32,
+    count: usize,
+    usage: reims_vgpu_protocol::residency::ResourceUsage,
+}
+
+impl crate::observe::Decline for ComputeResidencyDeclared {
+    fn slug(&self) -> &'static str {
+        use reims_vgpu_protocol::residency::UsageClass;
+        match self.usage.classify() {
+            UsageClass::Undeclared => "compute_residency_usage_undeclared",
+            _ => "compute_residency_write_dropped",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("op", format!("{:#x}", self.opcode)),
+            ("count", self.count.to_string()),
+            ("usage", format!("{:#x}", self.usage.0)),
+            (
+                "undeclared_usage",
+                format!("{:#x}", self.usage.undeclared_bits()),
+            ),
+        ]
+    }
+}
+
+/// Price one compute residency declaration by what it declared.
+///
+/// This device resolves every binding per dispatch, so there is nothing for a
+/// residency hint to keep resident and the answer is to do nothing. That
+/// argument is load-bearing, and the census is what prices it: a declaration
+/// that only reads is free to drop, while a dispatch writing through a path
+/// this rail did not bind loses content the guest expects to read back, which
+/// is not what a *hint* costs.
+///
+/// **The heap form carries no usage and the resource form always does**, and
+/// that is now the record's own shape rather than a convention: the heap
+/// selector has no usage argument at all, so there is no class to report and
+/// nothing to weigh. It used to arrive as a zero in a `resource_usage` field
+/// the decoder filled in for it, which made "declared nothing" and "declared
+/// no usage" the same word.
+fn note_compute_residency(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    use reims_vgpu_protocol::decode::residency::ResidencySubject;
+    use reims_vgpu_protocol::residency::UsageClass;
+
+    let Some(framed) = frame_compute_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    // `lift` rather than `decode`: the row is unresolved, so `decode` refuses
+    // it on principle and is right to. What this arm wants is the layout
+    // question answered on its own — it is a census, not a claim that the
+    // contract is settled.
+    let record = match reims_vgpu_protocol::decode::residency::lift(Rail::Compute, &framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            note_compute_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+            return;
+        }
+    };
+    let usage = match (record.subject, record.usage) {
+        (ResidencySubject::Heaps, _) => {
+            crate::runtime::drain::note_store_route("compute_residency_heap");
+            return;
+        }
+        (ResidencySubject::Resources, Some(usage)) => usage,
+        // Unreachable on this rail: both of its residency selectors are
+        // unqualified, and the resource form of that pair carries a usage word.
+        // Named rather than folded onto an empty usage, which would report a
+        // declaration the guest did not make.
+        (ResidencySubject::Resources, None) => {
+            crate::observe::fail(format!(
+                "compute_residency_without_usage task={task_id} opcode={opcode:#x} (a resource \
+                 residency declaration on this rail carries a usage word and this one did not)"
+            ));
+            return;
+        }
+    };
+    let class = usage.classify();
+    crate::runtime::drain::note_store_route(match class {
+        UsageClass::Empty => "compute_residency_empty",
+        UsageClass::ReadOnly => "compute_residency_read",
+        UsageClass::Writes => "compute_residency_write",
+        UsageClass::Undeclared => "compute_residency_undeclared",
+    });
+    if matches!(class, UsageClass::Empty | UsageClass::ReadOnly) {
+        return;
+    }
+    // Latched on the declaration: the same kernel asks for the same thing every
+    // frame, and a second shape is the event.
+    let decline = ComputeResidencyDeclared {
+        opcode,
+        count: record.refs.len(),
+        usage,
+    };
+    crate::observe::Emit::decline("compute_residency", &decline).fail_once(u64::from(usage.0));
 }
 
 /// An indirect-command-buffer record this rail decoded and did not apply.
@@ -1294,18 +2348,13 @@ impl crate::observe::Decline for IcbRecordDropped {
 /// this device does not have; the bytes form needs the staging buffer read and
 /// the pattern tiled across the region, and nothing converted. A single count
 /// could not tell which of those a driven boot is asking for.
-struct TextureFillDropped(blit::FillSource);
+struct TextureFillDropped(blit_spi::FillSource);
 
 impl crate::observe::Decline for TextureFillDropped {
     fn slug(&self) -> &'static str {
         match self.0 {
-            blit::FillSource::Color => "blit_fill_texture_color_dropped",
-            blit::FillSource::Bytes => "blit_fill_texture_bytes_dropped",
-            // Unreachable while both decode arms set the source: `FillSource`
-            // defaults to `None` and only a `Kind::FillTexture` gets here. A
-            // firing means a third fill form reached this kind without naming
-            // where its value comes from. A healthy zero.
-            blit::FillSource::None => "blit_fill_texture_source_unset",
+            blit_spi::FillSource::Color => "blit_fill_texture_color_dropped",
+            blit_spi::FillSource::Bytes => "blit_fill_texture_bytes_dropped",
         }
     }
 
@@ -1332,97 +2381,408 @@ fn handle_blit_record<M: HostMemory + HostOps>(
     // Timed at the closure `walk_segment_records` calls, so decode is inside the
     // span and no arm can leave without being charged.
     let record_started = std::time::Instant::now();
-    let cmd = match blit::decode(cmd_bytes) {
-        Ok(c) => c,
-        // Was `Err(_) => return`: a decoded blit record dropped with no line at
-        // all, which on a live boot is indistinguishable from a segment that
-        // carried no blit work. The status names which of the four checks
-        // refused.
-        Err(status) => {
-            if let Some(e) = crate::observe::Emit::refusal("blit_decode", &status) {
-                e.field("opcode", format!("{:#x}", opcode))
-                    .field("len", cmd_bytes.len())
-                    .fail();
-            }
+    // **Which class of record this is, is the closure ledger's answer.** The
+    // blit *rail* carries five: transfers, fences, indirect-command mutations,
+    // content-representation directives, and the mipmap generation that sits
+    // with the transfers. This device answered it with its own `Kind`, decoded
+    // in the same pass that read the fields — so a record's class and its
+    // layout were one verdict and a misclassification read fields at the wrong
+    // offsets. `reims_vgpu_core::operation::classify` answers the class from
+    // the ledger row, and each class is then lifted by the protocol decoder
+    // that owns its layout.
+    //
+    // Three of the five are lifted that way here. The transfers still go
+    // through this device's own decoder: their executor takes the flat
+    // `blit::Command` and moving it to `BlitRecord` is its own step.
+    let framed = match reims_vgpu_protocol::decode::op(cmd_bytes, 0) {
+        Ok(framed) => framed,
+        Err(_) => {
+            // `walk_segment_records` framed this record to hand it over, so a
+            // header that does not frame here is a frame disagreeing with
+            // itself between two reads rather than a guest case.
+            crate::observe::fail(format!(
+                "blit_record_unframed task={task_id} opcode={opcode:#x} len={} (the segment walk \
+                 framed this record and the op header did not)",
+                cmd_bytes.len()
+            ));
             return;
         }
     };
-    match cmd.kind {
-        BlitKind::Resource if cmd.opcode == wire_blit::OPCODE_GENERATE_MIPMAPS => {
-            match mipmap::generate_mipmaps_linear(state, host, task_id, cmd.resource) {
-                MipmapStatus::Ok => {}
-                st => {
-                    // Was `st={st:?}` with no `reason=` at all, so none of the
-                    // eight outcomes was greppable and the Debug spelling was
-                    // the only handle on which check refused.
-                    if let Some(e) = crate::observe::Emit::refusal("blit_generate_mipmaps", &st) {
-                        e.field("resource", cmd.resource).fail();
-                    }
+    let class = reims_vgpu_protocol::closure::find(Rail::Blit, opcode)
+        .and_then(reims_vgpu_core::operation::classify);
+    let record_class = match class {
+        Some(OperationHome::Stream(class)) => Some(class),
+        // The blit rail has no object-lifecycle records — that home is the root
+        // rail's whole side — and `None` is a row the ledger has not settled.
+        // Both fall to the unclassified arm below rather than being read as
+        // some class they are not.
+        Some(OperationHome::ObjectLifecycle) | None => None,
+    };
+    match record_class {
+        // The content-representation directives: optimize for CPU or GPU,
+        // synchronize, invalidate the compression metadata. Nine opcodes across
+        // the rails and three payload shapes between them, and
+        // `reims_vgpu_protocol::resource_state::content_request` is the one
+        // place that maps an opcode to a directive and a target.
+        //
+        // Every one is a no-op on this device and each for a stated reason, so
+        // what this arm owes is a census that keeps them apart. It used to be
+        // keyed on this device's `Kind`, which folded the four directives into
+        // two variants — `Resource` and `Image` — plus a third arm for the
+        // compressed invalidate; the directive's own name is the key now, so a
+        // reading can say which directive a workload issues rather than which
+        // wire shape it used.
+        Some(OperationClass::ResourceState) => {
+            match reims_vgpu_protocol::decode::resource_state::decode(Rail::Blit, &framed) {
+                Ok(record) => {
+                    // `optimize*`/`synchronize*` are protocol no-ops on the
+                    // unified-memory path: this device writes the guest's pages
+                    // directly, so there is no second representation to move
+                    // content between. `invalidateCompressedTexture:` is the
+                    // same statement about Apple's lossless-compression
+                    // metadata, which this device never materialises.
+                    crate::runtime::drain::note_store_route(match record.directive {
+                        ContentDirective::Synchronize => "blit_noop_synchronize",
+                        ContentDirective::OptimizeForCpu => "blit_noop_optimize_for_cpu",
+                        ContentDirective::OptimizeForGpu => "blit_noop_optimize_for_gpu",
+                        ContentDirective::InvalidateCompressed => "blit_noop_invalidate_compressed",
+                        // The compute encoder's flush; it names no resource and
+                        // does not arrive on this rail. A healthy zero.
+                        ContentDirective::FlushCompressedReinterpretation => {
+                            "blit_noop_flush_compressed_reinterpretation"
+                        }
+                    });
+                }
+                Err(refusal) => {
+                    note_blit_record_refused(task_id, opcode, cmd_bytes.len(), &refusal)
                 }
             }
         }
-        // optimize*/synchronize* are protocol no-ops on the unified-memory path.
-        BlitKind::Resource | BlitKind::Image => {}
+        Some(OperationClass::Fence) => {
+            match reims_vgpu_protocol::decode::sync::decode(Rail::Blit, &framed) {
+                Ok(SyncRecord::Fence(record)) => {
+                    // Log from the *blit* status, before the remap. The remap
+                    // folds two meanings into `FenceStatus::Missing` — an absent
+                    // object and a zero fence ref — and only the blit rail's own
+                    // reason can tell them apart.
+                    let blit_st = blit_exec::execute_blit_fence(state, task_id, &record);
+                    if let Some(e) = crate::observe::Emit::refusal("blit_fence_fail", &blit_st) {
+                        e.field("opcode", format!("{opcode:#x}")).fail();
+                    }
+                }
+                // `fence_kind` answers for exactly the two fence opcodes on this
+                // rail, so the class and the lift agreeing is the protocol
+                // crate's invariant. Unreachable, and named rather than ignored.
+                Ok(_) => crate::observe::fail(format!(
+                    "blit_fence_not_a_fence task={task_id} opcode={opcode:#x} (the ledger calls \
+                     this a fence and the lift produced another ordering record)"
+                )),
+                Err(refusal) => {
+                    note_blit_record_refused(task_id, opcode, cmd_bytes.len(), &refusal)
+                }
+            }
+        }
         // The three indirect-command-buffer records. All three used to be
         // refused before decode under one shared reason, which said three
         // different things with one word — and only two of them are losses.
         //
         // `optimizeIndirectCommandBuffer:` is Metal's hint that a range will be
         // reused, so skipping it is semantically correct and costs speed alone;
-        // it joins the no-ops above and is counted so the census still shows the
-        // traffic. The other two change what a later `executeCommandsInBuffer:`
-        // will run: a reset the device drops leaves commands live that the guest
-        // retired, and a copy it drops leaves the destination holding whatever it
-        // held before. Both are stale commands executing, which is worse than a
-        // dropped one, so they stay fail-visible as well as counted.
+        // it is counted so the census still shows the traffic. The other two
+        // change what a later `executeCommandsInBuffer:` will run: a reset the
+        // device drops leaves commands live that the guest retired, and a copy
+        // it drops leaves the destination holding whatever it held before. Both
+        // are stale commands executing, which is worse than a dropped one, so
+        // they stay fail-visible as well as counted.
         //
         // Counted rather than executed on purpose. `runtime::icb` materializes
         // host ICBs on the Metal arm only, and it reads 0.00% on a driven x86
         // boot — so the count is what says whether an executor is worth building,
         // and for which of the two.
-        BlitKind::IcbRange if cmd.opcode == wire_blit::OPCODE_OPTIMIZE_ICB => {
-            crate::runtime::drain::note_store_route("blit_noop_icb_optimize");
+        Some(OperationClass::IndirectCommand) => {
+            match reims_vgpu_protocol::decode::icb::decode(Rail::Blit, &framed) {
+                Ok(record) => note_blit_icb_dropped(task_id, opcode, &record),
+                Err(refusal) => {
+                    note_blit_record_refused(task_id, opcode, cmd_bytes.len(), &refusal)
+                }
+            }
         }
-        BlitKind::IcbRange | BlitKind::IcbCopy => {
-            use crate::observe::Decline as _;
-            let decline = IcbRecordDropped(cmd.opcode);
+        // The transfers, and — deliberately in the same arm — the rows the
+        // ledger has **not settled**.
+        //
+        // `classify` answers `None` for an unresolved row, because a model that
+        // promises ordering and completion for everything in its vocabulary may
+        // not admit an operation it cannot describe. This device is not that
+        // model: it decodes those records and *declines* them, and the decline's
+        // count is the evidence that will settle the row. So an unsettled row
+        // goes to this rail's own decoder, which is the only thing that can
+        // name it — routing it to a generic line instead would delete the
+        // instrument that says how much of it a workload issues.
+        //
+        // The two are one arm because they share one decoder. Which of them a
+        // record is, is still asked: the decline arms inside are exactly the
+        // unresolved rows.
+        // The transfers. Nine records lifted by the protocol decoder that owns
+        // their layouts, and executed from the enum — the record's class and
+        // its field offsets are no longer one verdict.
+        Some(OperationClass::Blit) => handle_blit_transfer_record(
+            state,
+            host,
+            task_id,
+            opcode,
+            &framed,
+            cmd_bytes.len(),
+            record_started,
+        ),
+        // The rows the ledger has **not settled**.
+        //
+        // `classify` answers `None` for an unresolved row, because a model that
+        // promises ordering and completion for everything in its vocabulary may
+        // not admit an operation it cannot describe. This device is not that
+        // model: it decodes those records and *declines* them, and the decline's
+        // count is the evidence that will settle the row. So an unsettled row
+        // goes to this rail's own decoder, which is the only thing that can
+        // name it — routing it to a generic line instead would delete the
+        // instrument that says how much of it a workload issues.
+        None => handle_blit_unsettled_record(task_id, opcode, cmd_bytes),
+        // A class the blit rail does not carry at all. `classify` maps this
+        // rail's settled opcodes onto four classes and this is none of them, so
+        // reaching here means `classify` and this dispatch disagree about which
+        // records the rail carries.
+        Some(other) => {
+            crate::observe::fail(format!(
+                "blit_record_wrong_class task={task_id} opcode={opcode:#x} len={} class={} (the \
+                 ledger gives this record a class the blit rail does not carry, so no decoder \
+                 here owns its layout)",
+                cmd_bytes.len(),
+                other.name()
+            ));
+        }
+    }
+    if !matches!(record_class, Some(OperationClass::Blit)) {
+        // The transfer arm charges its own clock inside
+        // `handle_blit_transfer_record`, which is the only arm whose bucket
+        // depends on which record it lifted.
+        let route = match record_class {
+            Some(OperationClass::Fence) => "blitrec_fence_us",
+            Some(OperationClass::ResourceState) => "blitrec_noop_us",
+            _ => "blitrec_other_us",
+        };
+        crate::runtime::drain::note_store_route_us(
+            route,
+            record_started.elapsed().as_micros() as u64,
+        );
+        crate::runtime::drain::note_store_route(match record_class {
+            Some(OperationClass::Fence) => "blitrec_fence_n",
+            Some(OperationClass::ResourceState) => "blitrec_noop_n",
+            _ => "blitrec_other_n",
+        });
+    }
+}
+
+/// Report a blit-rail record whose bytes are not the record its class names.
+///
+/// One site, because every class above loses the same thing when its lift
+/// refuses — the guest's command, with no line unless one is written here — and
+/// the refusal itself already says which check refused, on which rail, at which
+/// opcode.
+fn note_blit_record_refused(
+    task_id: u32,
+    opcode: u32,
+    len: usize,
+    refusal: &reims_vgpu_protocol::decode::DecodeRefusal,
+) {
+    crate::observe::Emit::decline("blit_record", refusal)
+        .field("task", task_id)
+        .field("opcode", format!("{opcode:#x}"))
+        .field("len", len)
+        .fail();
+}
+
+/// Count and report one indirect-command-buffer record this rail did not apply.
+fn note_blit_icb_dropped(
+    task_id: u32,
+    opcode: u32,
+    record: &reims_vgpu_protocol::decode::icb::IcbRecord,
+) {
+    use crate::observe::Decline as _;
+    use reims_vgpu_protocol::decode::icb::IcbRecord;
+    // The hint is semantically free to skip; the two mutations are not.
+    if matches!(record, IcbRecord::Optimize { .. }) {
+        crate::runtime::drain::note_store_route("blit_noop_icb_optimize");
+        return;
+    }
+    let decline = IcbRecordDropped(opcode);
+    crate::runtime::drain::note_store_route(decline.slug());
+    crate::observe::Emit::decline("blit_icb", &decline)
+        .field("task", task_id)
+        .field("record", format!("{record:?}"))
+        .fail_once(u64::from(opcode));
+}
+
+/// The transfers: nine records that move bytes, lifted by the layer that owns
+/// their layouts.
+///
+/// The nine field orders do not rhyme — a buffer copy puts both refs first, a
+/// texture-to-buffer copy narrows its options word to sixteen bits where its
+/// sibling uses thirty-two, and the region copy's `options:` form is a
+/// different opcode at a different length. None of that is derivable from the
+/// selector, so all of it belongs to `reims_vgpu_protocol::decode::blit`, whose
+/// fields come from the pinned wire views. What is left here is the routing:
+/// which executor a lifted record reaches, and what is said when one refuses.
+///
+/// `generateMipmapsForTexture:` is a transfer by opcode and a filter chain by
+/// execution, so it is answered here and not by `execute_blit` — the record
+/// names one texture and `runtime::mipmap` owns the chain.
+fn handle_blit_transfer_record<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    task_id: u32,
+    opcode: u32,
+    framed: &reims_vgpu_wire::op::Op<'_>,
+    cmd_len: usize,
+    record_started: std::time::Instant,
+) {
+    let record = match reims_vgpu_protocol::decode::blit::decode(framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            note_blit_record_refused(task_id, opcode, cmd_len, &refusal);
+            return;
+        }
+    };
+    if let BlitRecord::GenerateMipmaps(m) = record {
+        match mipmap::generate_mipmaps_linear(state, host, task_id, m.texture_ref) {
+            MipmapStatus::Ok => {}
+            st => {
+                // Was `st={st:?}` with no `reason=` at all, so none of the
+                // eight outcomes was greppable and the Debug spelling was
+                // the only handle on which check refused.
+                if let Some(e) = crate::observe::Emit::refusal("blit_generate_mipmaps", &st) {
+                    e.field("resource", m.texture_ref).fail();
+                }
+            }
+        }
+    } else {
+        match blit_exec::execute_blit(state, host, task_id, &record) {
+            BlitStatus::Ok | BlitStatus::ZeroExtent => {}
+            st => {
+                // Icon/upload path often uses blit copies; fail-visible for RE.
+                // The reason names the specific failing site inside blit_exec
+                // that produced the coarse `st` — 177 checks collapse into six
+                // classes, so the class alone says almost nothing. It rides in
+                // the value: `BlitStatus::Failed` has nowhere to put a refusal
+                // that did not name its check, so there is no site here that
+                // can render a bare `reason=`.
+                //
+                // The endpoints and extents are the record's own Debug rather
+                // than a hand-picked list of fields: the fields a record has
+                // are the fields it has, and a list written here could name one
+                // the record does not carry.
+                let (src_ref, dst_ref) = record.refs();
+                let object_type = |r: Option<u32>| {
+                    r.and_then(|r| objects::lookup_list_entry(state, host, task_id, r))
+                        .map_or(0, |e| e.object_type)
+                };
+                let src_ty = object_type(src_ref);
+                let dst_ty = object_type(dst_ref);
+                if let Some(e) = crate::observe::Emit::refusal("blit_fail", &st) {
+                    e.field("st", format!("{st:?}"))
+                        .field("kind", format!("{:?}", record.kind()))
+                        .field("opcode", format!("{opcode:#x}"))
+                        .field("src_ty", src_ty)
+                        .field("dst_ty", dst_ty)
+                        .field("record", format!("{record:?}"))
+                        .fail();
+                }
+            }
+        }
+    }
+    crate::runtime::drain::note_store_route_us(
+        transfer_route(record.kind(), "us"),
+        record_started.elapsed().as_micros() as u64,
+    );
+    crate::runtime::drain::note_store_route(transfer_route(record.kind(), "n"));
+}
+
+/// The census bucket a lifted transfer is charged to.
+///
+/// One function for the microsecond clock and the count, because the two used
+/// to be written as two matches over the same tag and a record could be counted
+/// in one bucket and timed in another.
+fn transfer_route(kind: reims_vgpu_protocol::blit::BlitKind, suffix: &str) -> &'static str {
+    use reims_vgpu_protocol::blit::BlitKind;
+    match (kind, suffix) {
+        (BlitKind::FillBuffer | BlitKind::FillBufferPattern4, "us") => "blitrec_fill_us",
+        (BlitKind::FillBuffer | BlitKind::FillBufferPattern4, _) => "blitrec_fill_n",
+        (BlitKind::GenerateMipmaps, "us") => "blitrec_noop_us",
+        (BlitKind::GenerateMipmaps, _) => "blitrec_noop_n",
+        (_, "us") => "blitrec_copy_us",
+        (_, _) => "blitrec_copy_n",
+    }
+}
+
+/// The rows the closure ledger has **not settled**, which this device decodes
+/// for itself and declines.
+///
+/// This is not a wiring step waiting to happen. An unresolved row has no
+/// established contract, so no layer above the wire may give it a shape — and
+/// this device's decline of it, counted per record, is the measurement that
+/// settles it. The indirect-command-buffer reset and copy and the two texture
+/// fills are here for that reason and not because nothing has got round to
+/// them.
+fn handle_blit_unsettled_record(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let cmd = match blit_spi::decode(cmd_bytes) {
+        Ok(c) => c,
+        // Was `Err(_) => return`: a decoded blit record dropped with no line at
+        // all, which on a live boot is indistinguishable from a segment that
+        // carried no blit work. The status names which of the checks refused.
+        Err(status) => {
+            if let Some(e) = crate::observe::Emit::refusal("blit_decode", &status) {
+                e.field("opcode", format!("{opcode:#x}"))
+                    .field("len", cmd_bytes.len())
+                    .fail();
+            }
+            return;
+        }
+    };
+    use crate::observe::Decline as _;
+    match cmd {
+        // The indirect-command-buffer records the ledger has not settled: the
+        // reset and the copy. Both change what a later `executeCommandsInBuffer:`
+        // will run — a reset the device drops leaves commands live that the
+        // guest retired, and a copy it drops leaves the destination holding
+        // whatever it held before. Both are stale commands executing, which is
+        // worse than a dropped one, so they are fail-visible as well as
+        // counted.
+        //
+        // `optimizeIndirectCommandBuffer:` is not here: its row *is* settled —
+        // a proven no-op, because the hint costs speed alone — so the caller
+        // lifts it through `reims_vgpu_protocol::decode::icb` and counts it
+        // there.
+        //
+        // Counted rather than executed on purpose. `runtime::icb` materializes
+        // host ICBs on the Metal arm only, and it reads 0.00% on a driven x86
+        // boot — so the count is what says whether an executor is worth building,
+        // and for which of the two.
+        blit_spi::UnsettledRecord::IcbMutation {
+            range_location,
+            range_length,
+            ..
+        } => {
+            let decline = IcbRecordDropped(opcode);
             crate::runtime::drain::note_store_route(decline.slug());
             crate::observe::Emit::decline("blit_icb", &decline)
                 .field("task", task_id)
-                .field("range_loc", cmd.range_location)
-                .field("range_len", cmd.range_length)
-                .fail_once(cmd.opcode as u64);
+                .field("range_loc", range_location)
+                .field("range_len", range_length)
+                .fail_once(u64::from(opcode));
         }
-        BlitKind::Fence => {
-            // Log from the *blit* status, before the remap. The remap folds two
-            // meanings into `FenceStatus::Missing` — an absent object and a zero
-            // fence ref — and only the blit rail's own reason can tell them
-            // apart; `Refusal for BlitStatus` reproduces this site's previous
-            // log condition exactly.
-            let blit_st = blit_exec::execute_blit_fence(state, task_id, &cmd);
-            if let Some(e) = crate::observe::Emit::refusal("blit_fence_fail", &blit_st) {
-                e.field("opcode", format!("{:#x}", cmd.opcode)).fail();
-            }
-        }
-        // `invalidateCompressedTexture:` and its `slice:level:` form. Apple's
-        // lossless-compression metadata is a property of a *host* texture's
-        // backing, and this device writes the guest's pages directly — there is
-        // no compressed representation here to mark stale, so skipping it is
-        // semantically correct and it joins the `optimize*`/`synchronize*`
-        // no-ops. It is counted rather than folded into them because the two
-        // records share the `Ref` and `RefSliceLevel` wire shapes with those
-        // selectors: without its own route a compressed-texture invalidate
-        // would be indistinguishable from a synchronize that genuinely needed
-        // nothing done, and "this workload issues none" would be unprovable.
-        BlitKind::InvalidateCompressedTexture => {
-            crate::runtime::drain::note_store_route("blit_noop_invalidate_compressed");
-        }
-        // `fillTexture:…:color:` and `fillTexture:…:bytes:length:`. Unlike the
-        // invalidate above these are writes the guest expects to land, so a
-        // dropped one leaves the region holding what it held before and the
-        // guest reads back content it believes it just wrote. Counted and
-        // fail-visible, with the extent named, because the extent is what
-        // decides whether an executor is worth building.
+        // `fillTexture:…:color:` and `fillTexture:…:bytes:length:`. These are
+        // writes the guest expects to land, so a dropped one leaves the region
+        // holding what it held before and the guest reads back content it
+        // believes it just wrote. Counted and fail-visible, with the extent
+        // named, because the extent is what decides whether an executor is
+        // worth building.
         //
         // Not executed here on purpose. A texture fill needs the destination
         // resolved through the backing/5/11 rails, the region walked per row,
@@ -1430,95 +2790,435 @@ fn handle_blit_record<M: HostMemory + HostOps>(
         // texture's pixel format, which is a converter this device does not
         // have. The count is what says whether to build one, and for which of
         // the two sources.
-        BlitKind::FillTexture => {
-            use crate::observe::Decline as _;
-            let decline = TextureFillDropped(cmd.fill_source);
+        blit_spi::UnsettledRecord::TextureFill {
+            source,
+            texture,
+            level,
+            slice,
+            size,
+            ..
+        } => {
+            let decline = TextureFillDropped(source);
             crate::runtime::drain::note_store_route(decline.slug());
             crate::observe::Emit::decline("blit_fill_texture", &decline)
                 .field("task", task_id)
-                .field("texture", cmd.texture)
-                .field("level", cmd.level)
-                .field("slice", cmd.slice)
+                .field("texture", texture)
+                .field("level", level)
+                .field("slice", slice)
                 .field(
                     "extent",
-                    format!(
-                        "{}x{}x{}",
-                        cmd.fill_size.width, cmd.fill_size.height, cmd.fill_size.depth
-                    ),
+                    format!("{}x{}x{}", size.width, size.height, size.depth),
                 )
-                .fail_once(cmd.opcode as u64);
-        }
-        BlitKind::FillBuffer | BlitKind::FillBufferPattern4 | BlitKind::Copy => {
-            match blit_exec::execute_blit(state, host, task_id, &cmd) {
-                BlitStatus::Ok | BlitStatus::ZeroExtent => {}
-                st => {
-                    // Icon/upload path often uses blit copies; fail-visible for RE.
-                    // The reason names the specific failing site inside blit_exec
-                    // that produced the coarse `st` — 177 checks collapse into
-                    // eight statuses, so the status alone says almost nothing.
-                    // `Refusal` supplies it, and an uninstrumented site now reads
-                    // `blit_unattributed` rather than rendering a bare `reason=`.
-                    let src_ty = objects::lookup_list_entry(state, host, task_id, cmd.source)
-                        .map(|e| e.object_type)
-                        .unwrap_or(0);
-                    let dst_ty = objects::lookup_list_entry(state, host, task_id, cmd.destination)
-                        .map(|e| e.object_type)
-                        .unwrap_or(0);
-                    if let Some(e) = crate::observe::Emit::refusal("blit_fail", &st) {
-                        e.field("st", format!("{st:?}"))
-                            .field("kind", format!("{:?}", cmd.kind))
-                            .field("opcode", format!("{:#x}", cmd.opcode))
-                            .field("src", cmd.source)
-                            .field("src_ty", src_ty)
-                            .field("dst", cmd.destination)
-                            .field("dst_ty", dst_ty)
-                            .field("off", cmd.source_offset)
-                            .field(
-                                "lvl",
-                                format!("{}/{}", cmd.destination_level, cmd.source_level),
-                            )
-                            .field(
-                                "size",
-                                format!(
-                                    "{}x{}x{}",
-                                    cmd.source_size.width,
-                                    cmd.source_size.height,
-                                    cmd.source_size.depth
-                                ),
-                            )
-                            .fail();
-                    }
-                }
-            }
-        }
-        BlitKind::Unknown => {
-            crate::observe::fail(format!(
-                "blit unknown opcode={:#x} len={}",
-                cmd.opcode,
-                cmd_bytes.len()
-            ));
+                .fail_once(u64::from(opcode));
         }
     }
-    crate::runtime::drain::note_store_route_us(
-        match cmd.kind {
-            BlitKind::Fence => "blitrec_fence_us",
-            BlitKind::Copy => "blitrec_copy_us",
-            BlitKind::FillBuffer | BlitKind::FillBufferPattern4 => "blitrec_fill_us",
-            BlitKind::Resource | BlitKind::Image => "blitrec_noop_us",
-            _ => "blitrec_other_us",
-        },
-        record_started.elapsed().as_micros() as u64,
-    );
-    crate::runtime::drain::note_store_route(match cmd.kind {
-        BlitKind::Fence => "blitrec_fence_n",
-        BlitKind::Copy => "blitrec_copy_n",
-        BlitKind::FillBuffer | BlitKind::FillBufferPattern4 => "blitrec_fill_n",
-        BlitKind::Resource | BlitKind::Image => "blitrec_noop_n",
-        _ => "blitrec_other_n",
-    });
 }
 
-fn handle_render_record<M: HostMemory + HostOps>(
+/// Frame one render record for a protocol decoder, or say the frame disagreed
+/// with itself.
+fn frame_render_record<'a>(
+    task_id: u32,
+    opcode: u32,
+    cmd_bytes: &'a [u8],
+) -> Option<reims_vgpu_wire::op::Op<'a>> {
+    match reims_vgpu_protocol::decode::op(cmd_bytes, 0) {
+        Ok(framed) => Some(framed),
+        Err(_) => {
+            crate::observe::fail(format!(
+                "render_record_unframed task={task_id} opcode={opcode:#x} len={} (the segment \
+                 walk framed this record and the op header did not)",
+                cmd_bytes.len()
+            ));
+            None
+        }
+    }
+}
+
+/// Count and report one render record a protocol decoder refused.
+///
+/// Latched on the opcode: the guest re-encodes the same stream every frame, and
+/// this rail is the hottest in the crate.
+fn note_render_record_refused(
+    task_id: u32,
+    opcode: u32,
+    len: usize,
+    refusal: &reims_vgpu_protocol::decode::DecodeRefusal,
+) {
+    crate::observe::Emit::decline("render_record", refusal)
+        .field("task", task_id)
+        .field("len", len)
+        .fail_once(u64::from(opcode));
+}
+
+/// Order one render-encoder fence.
+///
+/// The encoder numbers its own fences and the three rails' pairs are nowhere
+/// near each other, so the rail is what says which pair an opcode belongs to.
+/// This arm used to read the direction from the opcode a second time and carry
+/// an `_ =>` for the case where a record classed as a fence was neither an
+/// update nor a wait — a state `reims_vgpu_protocol::sync::fence_kind` makes
+/// unrepresentable, because the same function decides both that this *is* a
+/// fence and which side of one it is.
+fn handle_render_fence(state: &mut DeviceState, task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    match reims_vgpu_protocol::decode::sync::decode(Rail::Render, &framed) {
+        Ok(SyncRecord::Fence(record)) => {
+            // `updateFence:afterStages:` is what a guest uses to order work
+            // inside one render encoder against a later one, so a dropped one
+            // is lost encoder synchronisation on every pass that asked for it.
+            let action = match record.kind {
+                reims_vgpu_protocol::sync::FenceKind::Update => FenceAction::Update,
+                reims_vgpu_protocol::sync::FenceKind::Wait => FenceAction::Wait,
+            };
+            fence_exec::execute_fence(
+                state,
+                task_id,
+                FenceDomain::RenderFence,
+                record.fence_ref,
+                action,
+            );
+        }
+        // `fence_kind` answers for exactly the two fence opcodes on this rail,
+        // so the class and the lift agreeing is the protocol crate's invariant.
+        // Unreachable, and named rather than ignored.
+        Ok(_) => crate::observe::fail(format!(
+            "render_fence_not_a_fence task={task_id} opcode={opcode:#x} (the ledger calls this a \
+             fence and the lift produced another ordering record)"
+        )),
+        Err(refusal) => note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
+/// Price one render-encoder barrier, which this device answers by doing
+/// nothing.
+///
+/// One slug for all three shapes, as before the ledger answered the class: the
+/// claim being priced is "this device ordered nothing here", and it is the same
+/// claim for a resource list, a scope word and `textureBarrier`.
+fn note_render_barrier(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    match reims_vgpu_protocol::decode::sync::decode(Rail::Render, &framed) {
+        Ok(SyncRecord::Barrier(_)) => {
+            crate::runtime::drain::note_store_route("render_noop_barrier");
+        }
+        Ok(_) => crate::observe::fail(format!(
+            "render_barrier_not_a_barrier task={task_id} opcode={opcode:#x} (the ledger calls \
+             this a barrier and the lift produced another ordering record)"
+        )),
+        Err(refusal) => note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
+/// Price one render residency declaration by what it declared.
+///
+/// **A heap declaration carries no usage and a stage-less form carries no
+/// stages**, and both are now the record's own shape rather than zeros the
+/// decoder filled in. The flat command had a `residency_usage` and a
+/// `residency_stages` on every record, so "the guest declared nothing" and "the
+/// selector has no such argument" were the same word on the counters whose
+/// whole job is telling them apart — and this rail has all four forms, the
+/// qualified pair that carries stages and the unqualified pair inherited from
+/// the encoder base class that does not.
+fn note_render_residency(task_id: u32, opcode: u32, cmd_bytes: &[u8]) {
+    use reims_vgpu_protocol::decode::residency::ResidencySubject;
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    // `lift` rather than `decode`: every residency row is unresolved, so
+    // `decode` refuses them on principle and is right to. This arm wants the
+    // layout question answered on its own — it is a census, not a claim that
+    // the contract is settled.
+    match reims_vgpu_protocol::decode::residency::lift(Rail::Render, &framed) {
+        Ok(record) => note_residency_declaration(
+            task_id,
+            matches!(record.subject, ResidencySubject::Heaps),
+            opcode,
+            record.refs.len(),
+            record.usage,
+            record.stages,
+        ),
+        Err(refusal) => note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal),
+    }
+}
+
+/// Whether this record's whole effect is one field of [`StreamAccum`] that no
+/// other record class writes.
+///
+/// **This is the group's disjointness claim, and it is a claim about
+/// `StreamAccum` rather than about the wire.** The render encoder's records all
+/// land in one accumulator, so "touches no stream state" — the test W8 and W10
+/// could apply to their classes — cannot separate anything here. What separates
+/// these is that each is the *sole writer* of the field it sets: nothing else
+/// on the rail assigns `pipeline_ref`, `cull_mode`, `viewports`, `visibility`
+/// or the rest, so the record's decoder can change without any other record
+/// class being able to disagree with it about a value. `bind_snapshot` reads
+/// them all and reads the same value whichever decoder produced it.
+///
+/// The store actions fail that test and are not here: `SetStoreAction` mutates
+/// `color_slots`, `depth_attach` and `stencil_attach`, which the pass
+/// descriptor writes, so those three move as one group with the descriptor.
+/// The binds write the six bind tables and `unrepresentable`, and the draws
+/// read the whole accumulator and push onto `draws`; both are later groups.
+///
+/// Exhaustive rather than `_ => false`, so a kind added to the contract has to
+/// be classified here instead of silently joining the legacy path.
+const fn is_render_stream_state(kind: ProtoRenderKind) -> bool {
+    use ProtoRenderKind as K;
+    match kind {
+        K::SetRenderPipelineState
+        | K::SetDepthStencilState
+        | K::SetStencilReference
+        | K::SetBlendColor
+        | K::SetCullMode
+        | K::SetFrontFacingWinding
+        | K::SetDepthClipMode
+        | K::SetTriangleFillMode
+        | K::SetDepthBias
+        | K::SetLineWidth
+        | K::SetViewport
+        | K::SetViewports
+        | K::SetScissorRect
+        | K::SetScissorRects
+        | K::SetVisibilityResultMode => true,
+
+        K::Draw
+        | K::DrawWide
+        | K::DrawInstanced
+        | K::DrawInstancedWide
+        | K::DrawInstancedBase
+        | K::DrawInstancedBaseWide
+        | K::DrawIndexed
+        | K::DrawIndexedWide
+        | K::DrawIndexedInstanced
+        | K::DrawIndexedInstancedWide
+        | K::DrawIndexedInstancedBase
+        | K::DrawIndexedInstancedBaseWide
+        | K::DrawIndirect
+        | K::DrawIndexedIndirect
+        | K::WriteDescriptor
+        | K::SetColorStoreAction
+        | K::SetDepthStoreAction
+        | K::SetStencilStoreAction
+        | K::SetVertexBuffers
+        | K::SetVertexBuffersWithStride
+        | K::SetVertexBufferOffset
+        | K::SetVertexBufferOffsetStride
+        | K::SetVertexSamplers
+        | K::SetVertexSamplersWithLod
+        | K::SetVertexTextures
+        | K::SetFragmentBuffers
+        | K::SetFragmentBufferOffset
+        | K::SetFragmentSamplers
+        | K::SetFragmentSamplersWithLod
+        | K::SetFragmentTextures => false,
+    }
+}
+
+/// Apply one render-encoder state record, lifted by the protocol crate.
+///
+/// Every arm here is an assignment to one accumulator field, which is what
+/// [`is_render_stream_state`] selected on. The three ordinals this device does
+/// not parse — cull mode, winding, depth-clip and fill mode — stay raw for the
+/// reason they always have: only the running rail knows whether it can spell
+/// the answer, so only the rail can refuse one by name.
+fn handle_render_stream_state(task_id: u32, opcode: u32, cmd_bytes: &[u8], acc: &mut StreamAccum) {
+    use reims_vgpu_protocol::decode::render::RenderRecord;
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    let record = match reims_vgpu_protocol::decode::render::decode(&framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            return note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+        }
+    };
+    // The ordinal a raw state record carries, narrowed the way this device has
+    // always narrowed them: `u32::MAX` for a word that does not fit, so a wide
+    // value reaches the backend as an out-of-contract number that says its own
+    // name rather than as its own low half — which for a multiple of 2^32 would
+    // be the *default*, the one answer that renders with nothing in the log.
+    let narrow = |mode: u64| u32::try_from(mode).unwrap_or(u32::MAX);
+
+    match record {
+        RenderRecord::SetPipeline(r) => {
+            // Applied whatever the ref, ref 0 included: `acc.pipeline_ref == 0`
+            // is a state the draw arm knows and declines under
+            // `dropped_no_pipeline`, where dropping the record would leave the
+            // *previous* pipeline latched and encode the next draw against it.
+            if r.pipeline_ref == 0 && crate::observe::first_sight("render_set_pipeline_zero", 0) {
+                crate::observe::fail(
+                    "stream_set_pipeline reason=render_set_pipeline_zero_ref \
+                     (a render pipeline was set to ref 0; the pass is now unbound \
+                     and its draws decline as dropped_no_pipeline)",
+                );
+            }
+            acc.pipeline_ref = r.pipeline_ref;
+        }
+        RenderRecord::SetDepthStencilState(r) => acc.depth_stencil_ref = r.state_ref,
+        RenderRecord::SetStencilReference(r) => acc.stencil_ref = Some((r.front, r.back)),
+        RenderRecord::SetBlendColor(r) => {
+            acc.blend_color = Some([
+                f32::from_bits(r.red_bits),
+                f32::from_bits(r.green_bits),
+                f32::from_bits(r.blue_bits),
+                f32::from_bits(r.alpha_bits),
+            ]);
+        }
+        RenderRecord::SetCullMode(r) => acc.cull_mode = Some(narrow(r.mode)),
+        RenderRecord::SetFrontFacingWinding(r) => acc.front_facing = Some(narrow(r.winding)),
+        RenderRecord::SetDepthClipMode(r) => acc.depth_clip_mode = Some(narrow(r.mode)),
+        RenderRecord::SetTriangleFillMode(r) => acc.fill_mode = Some(narrow(r.mode)),
+        RenderRecord::SetDepthBias(r) => {
+            acc.depth_bias = Some([
+                f32::from_bits(r.bias_bits),
+                f32::from_bits(r.slope_scale_bits),
+                f32::from_bits(r.clamp_bits),
+            ]);
+        }
+        // `setLineWidth:` alone. `setTessellationFactorScale:` shares this wire
+        // form and *not* this record — the ledger has not settled it, so it has
+        // no `RenderKind` and never reaches here. It stays on this device's own
+        // decoder with its own census, which is exactly the split the two
+        // selectors deserve: one is state a rail may be able to carry, the other
+        // has no carrier on either.
+        RenderRecord::SetLineWidth(r) => acc.line_width = Some(f32::from_bits(r.width_bits)),
+        RenderRecord::SetViewports(ports) => {
+            // A plural record of count zero. The singular form is this slice at
+            // length one, so an empty one can only be the plural, and it is the
+            // one shape where "replace the state" and "the guest bound none"
+            // are the same assignment for opposite reasons. The previous state
+            // stands and the record is named, which is the reading the legacy
+            // decoder's `ErrBadLength` had without saying which record it was.
+            if ports.is_empty() {
+                return note_empty_viewport_or_scissor(task_id, "viewport", opcode);
+            }
+            acc.viewports.clear();
+            acc.viewports
+                .extend(ports.iter().map(render_pass::viewport_from_wire));
+        }
+        RenderRecord::SetScissorRects(rects) => {
+            if rects.is_empty() {
+                return note_empty_viewport_or_scissor(task_id, "scissor", opcode);
+            }
+            // All-or-nothing on an empty rect: `setScissorRects:count:` replaces
+            // the state atomically and slot order is what a shader's
+            // `[[viewport_array_index]]` selects, so an array cannot be adopted
+            // with the empty slots left out, and adopting them as written would
+            // make exactly those slots clip however the backend reads a zero
+            // rect.
+            let lifted: Vec<ScissorRect> =
+                rects.iter().map(render_pass::scissor_from_wire).collect();
+            match lifted.iter().find(|r| r.is_empty()) {
+                Some(empty) => note_empty_scissor(task_id, *empty),
+                None => acc.scissors = lifted,
+            }
+        }
+        RenderRecord::SetVisibilityResultMode(r) => {
+            // `MTLVisibilityResultModeDisabled` is 0, and it is the guest
+            // disarming the query rather than an unknown value: subsequent draws
+            // simply carry none.
+            acc.visibility = (r.mode != 0).then(|| draw::VisibilityArming {
+                mode: narrow(r.mode),
+                offset: r.offset,
+            });
+        }
+        // `is_render_stream_state` selected these fifteen kinds and
+        // `decode::render` maps each of them to the arm above. Arriving here is
+        // the two disagreeing rather than a guest case, so it is named instead
+        // of being answered a second time.
+        other => crate::observe::fail(format!(
+            "render_state_record_not_state task={task_id} opcode={opcode:#x} \
+             (the rail routed this row to the stream-state arm and the lift \
+             produced {other:?})"
+        )),
+    }
+}
+
+/// Whether this record binds into one of the six argument tables, or moves an
+/// offset inside one.
+///
+/// The second group of the render encoder's cutover. Its fields are the six
+/// bind tables and `unrepresentable` — and `unrepresentable` is shared with the
+/// pass descriptor, which is why the claim here is not the sole-writer one
+/// [`is_render_stream_state`] makes. It is the weaker one that still forbids a
+/// disagreement: `unrepresentable` is a **first-wins latch** whose insert order
+/// is the stream's own record order, which no change of decoder can alter, so
+/// two writers cannot produce two answers the way two writers of a value could.
+///
+/// Exhaustive over `RenderKind` for the reason [`is_render_stream_state`] is.
+const fn is_render_bind(kind: ProtoRenderKind) -> bool {
+    use ProtoRenderKind as K;
+    match kind {
+        K::SetVertexBuffers
+        | K::SetVertexBuffersWithStride
+        | K::SetVertexBufferOffset
+        | K::SetVertexBufferOffsetStride
+        | K::SetVertexTextures
+        | K::SetVertexSamplers
+        | K::SetVertexSamplersWithLod
+        | K::SetFragmentBuffers
+        | K::SetFragmentBufferOffset
+        | K::SetFragmentTextures
+        | K::SetFragmentSamplers
+        | K::SetFragmentSamplersWithLod => true,
+
+        K::Draw
+        | K::DrawWide
+        | K::DrawInstanced
+        | K::DrawInstancedWide
+        | K::DrawInstancedBase
+        | K::DrawInstancedBaseWide
+        | K::DrawIndexed
+        | K::DrawIndexedWide
+        | K::DrawIndexedInstanced
+        | K::DrawIndexedInstancedWide
+        | K::DrawIndexedInstancedBase
+        | K::DrawIndexedInstancedBaseWide
+        | K::DrawIndirect
+        | K::DrawIndexedIndirect
+        | K::WriteDescriptor
+        | K::SetColorStoreAction
+        | K::SetDepthStoreAction
+        | K::SetStencilStoreAction
+        | K::SetRenderPipelineState
+        | K::SetDepthStencilState
+        | K::SetStencilReference
+        | K::SetBlendColor
+        | K::SetCullMode
+        | K::SetFrontFacingWinding
+        | K::SetDepthClipMode
+        | K::SetTriangleFillMode
+        | K::SetDepthBias
+        | K::SetLineWidth
+        | K::SetViewport
+        | K::SetViewports
+        | K::SetScissorRect
+        | K::SetScissorRects
+        | K::SetVisibilityResultMode => false,
+    }
+}
+
+/// Apply one render-encoder bind or offset record, lifted by the protocol
+/// crate.
+///
+/// **The stage is no longer a field this device fills in.** It comes from
+/// `RenderKind::bind_stage`, which is total over the bind rows, so a bind whose
+/// stage is neither vertex nor fragment cannot be constructed — the state the
+/// flat command reached as `Stage::Unknown`, and which `apply_binds` answered
+/// by counting a clear against a table it could not name.
+///
+/// **A `None` from `make` is the wire's zero ref and nothing else.** Each of
+/// the five entry shapes says which field carries that ref, so a record with no
+/// stride field cannot produce a stride of zero and one with no LOD clamp
+/// cannot produce a clamp of zero — the two states the flat command's
+/// `has_attribute_stride`/`has_lod_clamp` flags stood beside.
+fn handle_render_binds<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
@@ -1527,67 +3227,24 @@ fn handle_render_record<M: HostMemory + HostOps>(
     out: &mut ExecResult,
     acc: &mut StreamAccum,
 ) {
-    let cmd = match render::decode(cmd_bytes) {
-        Ok(c) => c,
-        // Was `Err(_) => return`: a malformed render command dropped with no
-        // line, on the hottest path in the crate. Indistinguishable from a
-        // segment that simply carried no render work.
-        Err(status) => {
-            if let Some(e) = crate::observe::Emit::refusal("render_decode", &status) {
-                // Latched per (reason, opcode): the guest re-encodes the same
-                // stream every frame, so an unclassified opcode would arrive
-                // once per draw. Magnitude is the encoder's fail counter's job.
-                e.field("opcode", format!("{:#x}", opcode))
-                    .field("len", cmd_bytes.len())
-                    .fail_once(opcode as u64);
-            }
-            return;
+    use reims_vgpu_protocol::decode::render::RenderRecord;
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    let record = match reims_vgpu_protocol::decode::render::decode(&framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            return note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
         }
     };
-    match cmd.kind {
-        RenderKind::SetPipeline => {
-            // Apply what the record decoded, ref 0 included. This used to be
-            // guarded `if cmd.pipeline_ref != 0`, and the match's last arm is a
-            // bare `_ => {}`, so a zero ref left the *previous* pipeline latched
-            // and the next draw encoded against it — a wrong frame with nothing
-            // on any channel. Dropping the record is not the neutral choice it
-            // looks like: `acc.pipeline_ref == 0` is already a state the draw arm
-            // knows, where it declines as `dropped_no_pipeline` and says so. Letting
-            // the zero through routes this into that named decline instead of
-            // into a stale bind.
-            //
-            // A healthy zero: `setRenderPipelineState:` takes a non-null
-            // pipeline, so Apple's serializer has no reason to emit this record
-            // with ref 0. That is what makes applying the decoded value safe — on
-            // a stream that never sends it, the two behaviors are identical — and
-            // it is why a firing is worth a line rather than a silent drop.
-            //
-            // Measured zero on a driven x86/PCI boot (Ventura guest, 25 s Safari
-            // window drag, ~500 host-window draws), which is the reading that
-            // makes this arm's removal of the old `if cmd.pipeline_ref != 0`
-            // guard inert on that workload rather than merely argued. One boot on
-            // one pathway: it does not prove the arm never fires, it says the
-            // desktop compositor does not take it.
-            if cmd.pipeline_ref == 0 && crate::observe::first_sight("render_set_pipeline_zero", 0) {
-                crate::observe::fail(
-                    "stream_set_pipeline reason=render_set_pipeline_zero_ref \
-                     (a render pipeline was set to ref 0; the pass is now unbound \
-                     and its draws decline as dropped_no_pipeline)",
-                );
-            }
-            acc.pipeline_ref = cmd.pipeline_ref;
-        }
-        RenderKind::SetBuffer => {
-            // Slots first..first+n from the archive layout's entry array.
-            // `render::decode` refuses `count == 0` with `ErrBadLength`, and
-            // sets `cmd.buffer_ref` from `buffer_binds.first()`, so a decoded
-            // SetBuffer always carries at least one entry and there is no
-            // single-entry wire form to fall back to.
+    match record {
+        RenderRecord::BindBuffers(r) => {
             let cleared = apply_binds(
-                &cmd.buffer_binds,
-                cmd.first,
+                r.entries,
+                r.first,
                 BindTarget {
-                    stage: cmd.stage,
+                    stage: r.stage,
                     class: BindClass::Buffer,
                 },
                 BindTables {
@@ -1596,86 +3253,56 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     refused: &mut acc.unrepresentable,
                 },
                 |b| b.index,
-                |index, b| {
-                    (b.buffer_ref != 0).then_some(BufferBind {
+                |index, e| {
+                    let buffer_ref = e.buffer_ref.get();
+                    (buffer_ref != 0).then_some(BufferBind {
                         index,
-                        buffer_ref: b.buffer_ref,
-                        resource: objects::resolve_resource(state, host, task_id, b.buffer_ref)
-                            .ok(),
-                        offset: b.offset,
-                        attribute_stride: b.attribute_stride,
+                        buffer_ref,
+                        resource: objects::resolve_resource(state, host, task_id, buffer_ref).ok(),
+                        offset: e.offset.get(),
+                        // The record with no stride field cannot state one. The
+                        // slot keeps whatever an earlier strided bind left.
+                        attribute_stride: None,
                     })
                 },
             );
             out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
         }
-        RenderKind::SetBufferOffset => {
-            // Archive apply_buffer_offset: update offset on an already-bound slot.
-            if cmd.first >= BindClass::Buffer.table() {
-                // The slot is outside the table, so the bind that would have
-                // occupied it was already dropped by `apply_binds` and counted
-                // under `render_buffer_bind_slot_past_table`. This is the
-                // *second* record the guest spends on that slot. Counted
-                // separately rather than folded in, because these are different
-                // records.
-                //
-                // In a conforming stream the bind came first and already refused
-                // the draws — Metal requires a buffer bound at the index before
-                // `setVertexBufferOffset:atIndex:`. This does not rely on that:
-                // an offset record naming a slot this device has no table entry
-                // for is on its own a record it cannot carry, and a stream where
-                // the bind did *not* come first is exactly the one where relying
-                // on it would be wrong.
-                crate::runtime::drain::note_store_route("render_buffer_offset_slot_past_table");
-                let over = BufferOffsetSlotPastTable {
-                    stage: cmd.stage,
-                    index: cmd.first,
-                };
-                crate::observe::Emit::decline("render_buffer_offset", &over)
-                    .fail_once((u64::from(cmd.stage as u32) << 32) | u64::from(cmd.first));
-                acc.unrepresentable
-                    .get_or_insert(StreamRefusal::BufferOffset(over));
-                return;
-            }
-            let list = match cmd.stage {
-                Stage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
-                Stage::Fragment => Arc::make_mut(&mut acc.fragment_buffers),
-                // An offset update names a slot in a table; with no stage
-                // there is no table, and inventing one would move somebody
-                // else's binding.
-                Stage::Unknown => return,
-            };
-            match list.iter_mut().find(|b| b.index == cmd.first) {
-                Some(b) => {
-                    b.offset = cmd.buffer_offset;
-                    // Only when this record carried one.
-                    // `setVertexBufferOffset:atIndex:` and its strided sibling
-                    // are different opcodes, and the plain one must not clear a
-                    // stride an earlier bind established.
-                    if let Some(stride) = cmd.attribute_stride {
-                        b.attribute_stride = Some(stride);
-                    }
-                }
-                // A healthy zero, and a sharp one. Metal requires a buffer
-                // already bound at the index before
-                // `setVertexBufferOffset:atIndex:`, and a render encoder's bind
-                // state does not outlive the encoder, so the guest and this
-                // table should agree on which slots are live. A firing means
-                // they do not — a bind this device dropped, refused or never
-                // decoded — and the offset lands on nothing.
-                None => {
-                    crate::runtime::drain::note_store_route("render_buffer_offset_slot_unbound")
-                }
-            }
-        }
-        RenderKind::SetTexture => {
-            // As for SetBuffer: `ref_binds` is never empty on a decoded record,
-            // and the clone the removed fallback needed went with it.
+        RenderRecord::BindBuffersWithStride(r) => {
             let cleared = apply_binds(
-                &cmd.ref_binds,
-                cmd.first,
+                r.entries,
+                r.first,
                 BindTarget {
-                    stage: cmd.stage,
+                    // No fragment form exists: the API has no fragment attribute
+                    // stride, which is why the payload names no stage.
+                    stage: ShaderStage::Vertex,
+                    class: BindClass::Buffer,
+                },
+                BindTables {
+                    vertex: &mut acc.vertex_buffers,
+                    fragment: &mut acc.fragment_buffers,
+                    refused: &mut acc.unrepresentable,
+                },
+                |b| b.index,
+                |index, e| {
+                    let buffer_ref = e.buffer_ref.get();
+                    (buffer_ref != 0).then_some(BufferBind {
+                        index,
+                        buffer_ref,
+                        resource: objects::resolve_resource(state, host, task_id, buffer_ref).ok(),
+                        offset: e.offset.get(),
+                        attribute_stride: Some(e.attribute_stride.get()),
+                    })
+                },
+            );
+            out.buffer_unbinds = out.buffer_unbinds.saturating_add(cleared);
+        }
+        RenderRecord::BindTextures(r) => {
+            let cleared = apply_binds(
+                r.entries,
+                r.first,
+                BindTarget {
+                    stage: r.stage,
                     class: BindClass::Texture,
                 },
                 BindTables {
@@ -1684,7 +3311,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     refused: &mut acc.unrepresentable,
                 },
                 |b| b.index,
-                |index, texture_ref| {
+                |index, e| {
+                    let texture_ref = e.object_ref.get();
                     if texture_ref == 0 {
                         return None;
                     }
@@ -1712,24 +3340,12 @@ fn handle_render_record<M: HostMemory + HostOps>(
             );
             out.texture_unbinds = out.texture_unbinds.saturating_add(cleared);
         }
-        RenderKind::SetSampler => {
-            // The two LOD forms carry a clamp pair per entry; the plain forms
-            // carry none, and `sampler_lod_binds` is empty for them. Zipped
-            // rather than indexed into inside the builder, so a record whose
-            // two lists ever disagreed in length binds the slots it has refs
-            // for and clamps only those it has clamps for, instead of
-            // panicking or pairing a slot with another slot's clamp.
-            let entries: Vec<(u32, Option<(u32, u32)>)> = cmd
-                .ref_binds
-                .iter()
-                .enumerate()
-                .map(|(i, &r)| (r, cmd.sampler_lod_binds.get(i).copied()))
-                .collect();
+        RenderRecord::BindSamplers(r) => {
             let cleared = apply_binds(
-                &entries,
-                cmd.first,
+                r.entries,
+                r.first,
                 BindTarget {
-                    stage: cmd.stage,
+                    stage: r.stage,
                     class: BindClass::Sampler,
                 },
                 BindTables {
@@ -1738,66 +3354,219 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     refused: &mut acc.unrepresentable,
                 },
                 |b| b.index,
-                |index, (sampler_ref, lod_clamp)| {
+                |index, e| {
+                    let sampler_ref = e.object_ref.get();
                     (sampler_ref != 0).then_some(SamplerBind {
                         index,
                         sampler_ref,
-                        lod_clamp,
+                        // The record carries no clamp pair, so the slot gets
+                        // none. This used to be a zero beside a `has_lod_clamp`
+                        // flag, which made "unclamped" and "clamped to zero"
+                        // the same slot.
+                        lod_clamp: None,
                     })
                 },
             );
             out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
         }
-        RenderKind::SetViewport => {
-            // The whole array, in the guest's order. `setViewports:count:`
-            // replaces the viewport state rather than adding to it, so this
-            // assigns rather than extends — a record of two after a record of
-            // five leaves two, which is what Metal does.
-            acc.viewports.clone_from(&cmd.viewports);
+        RenderRecord::BindSamplersWithLod(r) => {
+            let cleared = apply_binds(
+                r.entries,
+                r.first,
+                BindTarget {
+                    stage: r.stage,
+                    class: BindClass::Sampler,
+                },
+                BindTables {
+                    vertex: &mut acc.vertex_samplers,
+                    fragment: &mut acc.fragment_samplers,
+                    refused: &mut acc.unrepresentable,
+                },
+                |b| b.index,
+                |index, e| {
+                    let sampler_ref = e.sampler_ref.get();
+                    // The clamp pair travels with the ref in one entry, so a
+                    // slot can no longer be paired with another slot's clamp —
+                    // the flat command carried two lists and zipped them.
+                    (sampler_ref != 0).then_some(SamplerBind {
+                        index,
+                        sampler_ref,
+                        lod_clamp: Some((
+                            e.lod_min_clamp.get().to_bits(),
+                            e.lod_max_clamp.get().to_bits(),
+                        )),
+                    })
+                },
+            );
+            out.sampler_unbinds = out.sampler_unbinds.saturating_add(cleared);
         }
-        RenderKind::SetScissor => {
-            // All-or-nothing on an empty rect, which is the singular arm's rule
-            // read at array width. `setScissorRects:count:` replaces the state
-            // atomically and slot order is meaningful — it is what a shader's
-            // `[[viewport_array_index]]` selects — so an array cannot be adopted
-            // with the empty slots left out, and adopting them as written would
-            // make exactly those slots clip however the backend reads a zero
-            // rect. Neither is expressible here, so the record is refused whole
-            // and the previous state stands, as one empty rect always has.
-            if let Some(empty) = cmd.scissors.iter().find(|r| r.is_empty()) {
-                note_empty_scissor(task_id, *empty);
-            } else {
-                acc.scissors.clone_from(&cmd.scissors);
+        RenderRecord::RebindBufferOffset(r) => {
+            if r.index >= BindClass::Buffer.table() {
+                // The slot is outside the table, so the bind that would have
+                // occupied it was already dropped by `apply_binds` and counted
+                // under `render_buffer_bind_slot_past_table`. This is the
+                // *second* record the guest spends on that slot, counted
+                // separately because these are different records.
+                crate::runtime::drain::note_store_route("render_buffer_offset_slot_past_table");
+                let over = BufferOffsetSlotPastTable {
+                    stage: r.stage,
+                    index: r.index,
+                };
+                crate::observe::Emit::decline("render_buffer_offset", &over)
+                    .fail_once((u64::from(r.stage as u32) << 32) | u64::from(r.index));
+                acc.unrepresentable
+                    .get_or_insert(StreamRefusal::BufferOffset(over));
+                return;
+            }
+            let list = match r.stage {
+                ShaderStage::Vertex => Arc::make_mut(&mut acc.vertex_buffers),
+                ShaderStage::Fragment => Arc::make_mut(&mut acc.fragment_buffers),
+            };
+            match list.iter_mut().find(|b| b.index == r.index) {
+                Some(b) => {
+                    b.offset = r.offset;
+                    // Only when this record carried one. The plain and strided
+                    // rebinds are different opcodes, and the plain one must not
+                    // clear a stride an earlier bind established — which is what
+                    // `stride: Option<u64>` says where a flag beside a zero did
+                    // not.
+                    if let Some(stride) = r.stride {
+                        b.attribute_stride = Some(stride);
+                    }
+                }
+                // A healthy zero, and a sharp one. Metal requires a buffer
+                // already bound at the index before
+                // `setVertexBufferOffset:atIndex:`, and a render encoder's bind
+                // state does not outlive the encoder, so the guest and this
+                // table should agree on which slots are live. A firing means
+                // they do not, and the offset lands on nothing.
+                None => {
+                    crate::runtime::drain::note_store_route("render_buffer_offset_slot_unbound")
+                }
             }
         }
-        // No `if cmd.has_blend_color` on these five. Each of the five kinds has
-        // exactly one producer in `decode::render`, which sets the kind and the
-        // flag in the same block, so the flag was true whenever the arm was
-        // reached and the guard could not fail. It was not free: the match's last
-        // arm is a bare `_ => {}`, so the shape said a guest could set a cull mode
-        // this device then discarded, when no such loss was possible. A record
-        // too short to hold
-        // the field never gets here at all — the wire view refuses it and
-        // `decode` returns `ErrShort` before a kind is assigned.
-        RenderKind::SetBlendColor => {
-            acc.blend_color = Some(cmd.blend_color);
+        // `is_render_bind` selected these twelve kinds and `decode::render`
+        // maps each of them to an arm above. Arriving here is the two
+        // disagreeing rather than a guest case.
+        other => crate::observe::fail(format!(
+            "render_bind_record_not_a_bind task={task_id} opcode={opcode:#x} \
+             (the rail routed this row to the bind arm and the lift produced {other:?})"
+        )),
+    }
+}
+
+/// Whether this record states the pass's attachments, or overrides one
+/// attachment's store action.
+///
+/// The third group. Its fields are `clears`, `color_slots`, `color_targets`,
+/// `depth_attach`, `stencil_attach` and `visibility_buffer_ref` — and the three
+/// store-action rows are *in* the group rather than beside it precisely because
+/// they mutate `color_slots`, `depth_attach` and `stencil_attach`, which the
+/// descriptor writes. Splitting them would put two decoders on one attachment's
+/// `store_action`, which is the disagreement the plan forbids.
+///
+/// `unrepresentable` is shared with the bind group and is a first-wins latch, as
+/// [`is_render_bind`] records.
+///
+/// Exhaustive over `RenderKind` for the reason [`is_render_stream_state`] is.
+const fn is_render_pass_state(kind: ProtoRenderKind) -> bool {
+    use ProtoRenderKind as K;
+    match kind {
+        K::WriteDescriptor
+        | K::SetColorStoreAction
+        | K::SetDepthStoreAction
+        | K::SetStencilStoreAction => true,
+
+        K::Draw
+        | K::DrawWide
+        | K::DrawInstanced
+        | K::DrawInstancedWide
+        | K::DrawInstancedBase
+        | K::DrawInstancedBaseWide
+        | K::DrawIndexed
+        | K::DrawIndexedWide
+        | K::DrawIndexedInstanced
+        | K::DrawIndexedInstancedWide
+        | K::DrawIndexedInstancedBase
+        | K::DrawIndexedInstancedBaseWide
+        | K::DrawIndirect
+        | K::DrawIndexedIndirect
+        | K::SetVertexBuffers
+        | K::SetVertexBuffersWithStride
+        | K::SetVertexBufferOffset
+        | K::SetVertexBufferOffsetStride
+        | K::SetVertexSamplers
+        | K::SetVertexSamplersWithLod
+        | K::SetVertexTextures
+        | K::SetFragmentBuffers
+        | K::SetFragmentBufferOffset
+        | K::SetFragmentSamplers
+        | K::SetFragmentSamplersWithLod
+        | K::SetFragmentTextures
+        | K::SetRenderPipelineState
+        | K::SetDepthStencilState
+        | K::SetStencilReference
+        | K::SetBlendColor
+        | K::SetCullMode
+        | K::SetFrontFacingWinding
+        | K::SetDepthClipMode
+        | K::SetTriangleFillMode
+        | K::SetDepthBias
+        | K::SetLineWidth
+        | K::SetViewport
+        | K::SetViewports
+        | K::SetScissorRect
+        | K::SetScissorRects
+        | K::SetVisibilityResultMode => false,
+    }
+}
+
+/// Apply the pass descriptor or one store-action override, lifted by the
+/// protocol crate.
+///
+/// **The descriptor is one wire view now, not three offset computations.**
+/// `decode_{depth,stencil,color}_attachment` each re-derived the section's base
+/// from `size_of` sums this module also wrote down; the record's own
+/// `RenderPassBody` carries `depth`, `stencil` and a `[ColorAttachmentBody; 8]`,
+/// so the eight slots are an iteration and the offsets are not restated.
+///
+/// **Carries one behaviour change.** A pass record shorter than
+/// `RenderPassBody` is refused rather than read at the offsets that happen to
+/// fit. The legacy decoder accepted anything from `PASS_MIN_PAYLOAD` — depth,
+/// stencil and one colour slot — and answered the other seven slots as
+/// unattached, which is indistinguishable from a guest that attached one. Apple's
+/// serializer writes all 592 bytes; the short form was a tolerance for this
+/// repo's own fixtures, and a truncated descriptor read as a shorter one is a
+/// pass rendered with attachments the guest did not retire. `render_record`
+/// names it under the row's own opcode.
+fn handle_render_pass_state<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    opcode: u32,
+    cmd_bytes: &[u8],
+    out: &mut ExecResult,
+    acc: &mut StreamAccum,
+) {
+    use reims_vgpu_protocol::decode::render::RenderRecord;
+    use reims_vgpu_protocol::render::StoreActionTarget;
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    let record = match reims_vgpu_protocol::decode::render::decode(&framed) {
+        Ok(record) => record,
+        Err(refusal) => {
+            return note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
         }
-        RenderKind::SetCullMode => {
-            acc.cull_mode = Some(cmd.cull_mode);
-        }
-        RenderKind::SetFrontFacing => {
-            acc.front_facing = Some(cmd.front_facing);
-        }
-        RenderKind::SetDepthBias => {
-            acc.depth_bias = Some(cmd.depth_bias);
-        }
-        RenderKind::SetDepthStencil => {
-            acc.depth_stencil_ref = cmd.depth_stencil_ref;
-        }
-        RenderKind::SetStencilReference => {
-            acc.stencil_ref = Some((cmd.stencil_ref_front, cmd.stencil_ref_back));
-        }
-        RenderKind::RenderPass => {
+    };
+    match record {
+        RenderRecord::WriteDescriptor(r) => {
+            let descriptor = r.descriptor;
+            let target_extent = (
+                descriptor.render_target_width.get(),
+                descriptor.render_target_height.get(),
+            );
             // The pass's own tail, decoded and not applied. Four counters
             // rather than one, because they name four different losses and one
             // of them is not a loss at all when it is zero.
@@ -1825,25 +3594,25 @@ fn handle_render_record<M: HostMemory + HostOps>(
             // its occlusion counts land in, and `finish_stream` writes them
             // there. `0` is a pass that named none, which leaves the arming
             // below with nowhere to write.
-            acc.visibility_buffer_ref = cmd.pass_visibility_result_buffer_ref;
+            acc.visibility_buffer_ref = descriptor.visibility_result_buffer_ref.get();
             // Refused rather than drawn into layer 0, the decision the colour
             // subresource arm below already made for the same shape of loss:
             // the layer a draw selects is a coordinate the pass did not name,
             // so rendering anyway lands geometry meant for one layer on top of
             // another's correct content.
-            if cmd.pass_render_target_array_length > 1 {
+            if descriptor.render_target_array_length.get() > 1 {
                 let drop = note_pass_array_length_unsupported(
                     task_id,
-                    cmd.pass_render_target_array_length,
+                    descriptor.render_target_array_length.get(),
                 );
                 acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
             }
-            if cmd.pass_render_target_width != 0 || cmd.pass_render_target_height != 0 {
+            if descriptor.render_target_width.get() != 0
+                || descriptor.render_target_height.get() != 0
+            {
                 note_pass_target_extent();
             }
-            // Full multi-attachment: re-decode all color slots from payload.
-            if cmd_bytes.len() >= 8 {
-                let payload = &cmd_bytes[8..];
+            {
                 // A depth or stencil attachment this device cannot bind used to
                 // be left out and the pass run without it, which turns depth
                 // testing off for every draw in it: the near geometry stops
@@ -1853,7 +3622,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 // content written over right content, and nothing downstream can
                 // tell because a pass with no depth attachment is exactly what a
                 // guest that wanted none also produces.
-                let depth = decode_depth_attachment(payload);
+                let depth = render_pass::depth_from_wire(&descriptor.depth);
                 if depth.texture_ref != 0 {
                     if attachment_subresource_is_bindable(depth.into(), LevelSupport::LevelZeroOnly)
                     {
@@ -1863,7 +3632,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
                 }
-                let stencil = decode_stencil_attachment(payload);
+                let stencil = render_pass::stencil_from_wire(&descriptor.stencil);
                 if stencil.texture_ref != 0 {
                     if attachment_subresource_is_bindable(
                         stencil.into(),
@@ -1876,8 +3645,8 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
                     }
                 }
-                for i in 0..PASS_MAX_COLOR_ATTACHMENTS {
-                    let att = decode_color_attachment(payload, i);
+                for (i, slot_body) in descriptor.color.iter().enumerate() {
+                    let att = render_pass::color_from_wire(slot_body);
                     if att.texture_ref == 0 {
                         continue;
                     }
@@ -1939,7 +3708,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     if let Some(m) =
                         objects::resolve_mapper_ref_texture(state, host, task_id, published_ref)
                     {
-                        note_pass_extent_for_slot(state, task_id, slot, m, &cmd);
+                        note_pass_extent_for_slot(state, task_id, slot, m, target_extent);
                         if !out.mapper_ref_texture_mappings.contains(&m) {
                             out.mapper_ref_texture_mappings.push(m);
                         }
@@ -1947,7 +3716,13 @@ fn handle_render_record<M: HostMemory + HostOps>(
                         // A backing attachment is its own mapping id — the arm
                         // below pushes `att.texture_ref` where the mapper-ref-texture arm
                         // pushes the id it resolved to.
-                        note_pass_extent_for_slot(state, task_id, slot, published_ref, &cmd);
+                        note_pass_extent_for_slot(
+                            state,
+                            task_id,
+                            slot,
+                            published_ref,
+                            target_extent,
+                        );
                         if !out.mapper_ref_texture_mappings.contains(&published_ref) {
                             out.mapper_ref_texture_mappings.push(published_ref);
                         }
@@ -1974,90 +3749,388 @@ fn handle_render_record<M: HostMemory + HostOps>(
                     }
                 }
             }
-            // Also keep color0 from command for convenience.
-            if cmd.color0.texture_ref != 0
-                && cmd.color0.load_action == MTL_LOAD_ACTION_CLEAR
-                && store_action_publishes_single_sample(cmd.color0.store_action)
-                && !acc
-                    .clears
-                    .iter()
-                    .any(|a| a.texture_ref == cmd.color0.texture_ref)
-            {
-                acc.clears.push(cmd.color0);
+            // The `color0` block that stood here is gone with the second reading it
+            // needed. It re-pushed slot 0 onto `clears` from a field the decoder had
+            // lifted separately, guarded by "it is not already there" — and the loop
+            // above pushes exactly that attachment under exactly that condition, so the
+            // guard could never pass. It was reachable only when the loop and the field
+            // disagreed about slot 0, which is a state one wire view cannot be in.
+        }
+        RenderRecord::SetStoreAction(r) => {
+            // The store action is a `u16` in every attachment struct, so a mode
+            // that does not fit is not narrowed into a different action; it is
+            // left alone and named.
+            let Ok(action) = u16::try_from(r.action) else {
+                crate::runtime::drain::note_store_route("render_store_action_out_of_range");
+                crate::observe::fail(format!(
+                    "render_store_action fail reason=render_store_action_out_of_range \
+                     op={opcode:#x} mode={} target={:?}",
+                    r.action, r.target
+                ));
+                return;
+            };
+            match r.target {
+                // By pass slot, which is what the record's index names and what
+                // `color_slots` is keyed by — not by position, since a pass
+                // declaring slots 0 and 3 has two entries.
+                StoreActionTarget::Color(index) => {
+                    match acc.color_slots.iter_mut().find(|(slot, _)| *slot == index) {
+                        Some((_, att)) => att.store_action = action,
+                        // A slot the pass never declared. The override has
+                        // nothing to override and inventing an attachment for it
+                        // would give the draw a target the guest did not ask
+                        // for, so it is named instead.
+                        None => {
+                            crate::runtime::drain::note_store_route(
+                                "render_store_action_slot_undeclared",
+                            );
+                            crate::observe::fail(format!(
+                                "render_store_action fail \
+                                 reason=render_store_action_slot_undeclared \
+                                 index={index} declared={}",
+                                acc.color_slots.len()
+                            ));
+                        }
+                    }
+                }
+                // Neither of these carries an index: there is one depth and one
+                // stencil attachment, so the record names only the action. The
+                // fourth case the opcode match used to carry — a store action
+                // for none of the three — is gone with `StoreActionTarget`,
+                // which is total over the three rows.
+                StoreActionTarget::Depth => match acc.depth_attach.as_mut() {
+                    Some(d) => d.store_action = action,
+                    None => note_store_action_no_attachment("depth", action),
+                },
+                StoreActionTarget::Stencil => match acc.stencil_attach.as_mut() {
+                    Some(s) => s.store_action = action,
+                    None => note_store_action_no_attachment("stencil", action),
+                },
             }
         }
-        RenderKind::Draw => {
-            if cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_WIDE {
-                crate::observe::line(format!(
-                    "render_wide_indexed task={task_id} target_refs={:?} pipeline={} prim={} index_type={} index_ref={} count={} offset={:#x}",
-                    acc.color_targets,
-                    acc.pipeline_ref,
-                    cmd.primitive_type,
-                    cmd.index_type,
-                    cmd.index_buffer_ref,
-                    cmd.index_count,
-                    cmd.index_buffer_offset
+        // `is_render_pass_state` selected these four kinds and `decode::render`
+        // maps each of them to an arm above.
+        other => crate::observe::fail(format!(
+            "render_pass_record_not_pass_state task={task_id} opcode={opcode:#x} \
+             (the rail routed this row to the pass arm and the lift produced {other:?})"
+        )),
+    }
+}
+
+/// Whether this record is a draw.
+///
+/// The fourth and last of the render encoder's groups, and the one that decides
+/// pixels. Its fields are `draws`, `saw_draw`, `indexed`, `dropped_no_pipeline`
+/// and `dropped_zero_count`; it *reads* everything the other three groups
+/// wrote, through `bind_snapshot`, which is why it moves last — a reader can
+/// only be trusted once every writer it reads is settled.
+///
+/// Exhaustive over `RenderKind` for the reason [`is_render_stream_state`] is.
+const fn is_render_draw(kind: ProtoRenderKind) -> bool {
+    kind.draw_shape().is_some()
+}
+
+/// The count a draw record carries, at the width `DrawArgs` holds.
+///
+/// The wide encodings exist because the guest had a value above 16 bits, not
+/// above 32: a vertex or index count of four billion is not a draw any GPU
+/// completes. Truncating one would draw the wrong geometry in silence, so it is
+/// refused by name instead.
+fn draw_count(task_id: u32, opcode: u32, what: &str, value: u64) -> Option<u32> {
+    match u32::try_from(value) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            crate::runtime::drain::note_store_route("render_draw_count_out_of_range");
+            if crate::observe::first_sight("render_draw_count_out_of_range", u64::from(opcode)) {
+                crate::observe::fail(format!(
+                    "render_draw fail reason=render_draw_count_out_of_range \
+                     task={task_id} op={opcode:#x} field={what} value={value}"
                 ));
             }
-            acc.saw_draw = true;
-            out.saw_draw = true;
-            let count = if cmd.index_count != 0 {
-                cmd.index_count
-            } else {
-                cmd.vertex_count
-            };
-            if cmd.index_count != 0 && cmd.index_buffer_ref != 0 {
-                acc.indexed = Some(IndexedDrawInfo {
-                    index_type: cmd.index_type,
-                    index_count: cmd.index_count,
-                    index_buffer_ref: cmd.index_buffer_ref,
-                    index_buffer_offset: cmd.index_buffer_offset,
-                    base_vertex: cmd.base_vertex,
-                });
-            } else {
-                // An indexed opcode whose record named no index buffer falls
-                // through to a *non-indexed* draw of `index_count` vertices,
-                // because `count` above took `index_count` and `indexed` is
-                // None. That is not a form Metal has:
-                // `drawIndexedPrimitives` takes its index buffer as an
-                // argument and there is no bound-index-buffer state for a zero
-                // ref to mean, so the record is malformed and this is the
-                // device inventing a different draw call from it.
+            None
+        }
+    }
+}
+
+/// How many instances a draw record asked for.
+///
+/// **`None` and `Some(0)` are different answers and this is the single site that
+/// says so.** `None` is the plain selector, which carries no `instanceCount:`
+/// argument at all — Metal's own default is one instance, so one is what the
+/// guest asked for. `Some(0)` is a guest that wrote the argument and wrote zero,
+/// which draws nothing; that is the draw it asked for, and it is passed through.
+///
+/// The `.max(1)` this replaces did not distinguish them. It sat in the decoder,
+/// applied to both, and three arms of this device disagreed with it and with
+/// each other: `backend::metal::render` refuses a zero by name — a refusal the
+/// clamp made unreachable — and `runtime::icb` decodes the same argument out of
+/// an ICB slot and hands it straight to Metal with no clamp at all, so the
+/// device already shipped a zero instance count on the path that did not come
+/// through here.
+///
+/// **The clamp read zero.** Driven x86/Vulkan boots, Ventura desktop, Safari
+/// window drag: `draw_instance_count_zero` never fired in the thousands. So this
+/// changes nothing on a measured workload and stops the three arms disagreeing
+/// on an unmeasured one. The census survives, at the lift rather than in a
+/// decoder.
+fn draw_instances(instances: reims_vgpu_protocol::decode::render::Instancing) -> Option<u32> {
+    let Some(count) = instances.count else {
+        return Some(1);
+    };
+    if count == 0 {
+        crate::runtime::drain::note_store_route("draw_instance_count_zero");
+    }
+    u32::try_from(count).ok()
+}
+
+/// Record one draw, lifted by the protocol crate.
+fn handle_render_draw<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    kind: ProtoRenderKind,
+    opcode: u32,
+    cmd_bytes: &[u8],
+    out: &mut ExecResult,
+    acc: &mut StreamAccum,
+) {
+    use reims_vgpu_protocol::decode::render::{DrawRecord, RenderRecord};
+
+    let Some(framed) = frame_render_record(task_id, opcode, cmd_bytes) else {
+        return;
+    };
+    let record = match reims_vgpu_protocol::decode::render::decode(&framed) {
+        Ok(RenderRecord::Draw(draw)) => draw,
+        Ok(other) => {
+            return crate::observe::fail(format!(
+                "render_draw_record_not_a_draw task={task_id} opcode={opcode:#x} \
+                 (the rail routed this row to the draw arm and the lift produced {other:?})"
+            ));
+        }
+        Err(refusal) => {
+            return note_render_record_refused(task_id, opcode, cmd_bytes.len(), &refusal);
+        }
+    };
+
+    // The wide-encoding census. `RenderKind` is what carries it — the record
+    // widens both encodings' counts to one width on purpose, so the encoding is
+    // a question only the kind can answer, and the kind is the same answer that
+    // said this row is a draw.
+    if kind.is_wide_encoding() {
+        if let DrawRecord::Indexed(d) = &record {
+            crate::observe::line(format!(
+                "render_wide_indexed task={task_id} target_refs={:?} pipeline={} prim={} \
+                 index_type={} index_ref={} count={} offset={:#x}",
+                acc.color_targets,
+                acc.pipeline_ref,
+                d.primitive,
+                d.index.index_type.ordinal(),
+                d.index.buffer_ref,
+                d.index_count,
+                d.index.offset
+            ));
+        }
+    }
+
+    match record {
+        DrawRecord::PrimitivesIndirect(_) | DrawRecord::IndexedIndirect(_) => {
+            return execute_indirect_draw(state, host, task_id, opcode, &record, acc);
+        }
+        _ => {}
+    }
+
+    acc.saw_draw = true;
+    out.saw_draw = true;
+
+    let (primitive, count, first_vertex, instances) = match &record {
+        DrawRecord::Primitives(d) => {
+            // Not `None`-by-omission: a non-indexed draw arriving after an
+            // indexed one in the same stream must not inherit its index buffer.
+            acc.indexed = None;
+            (d.primitive, d.vertex_count, d.vertex_start, d.instances)
+        }
+        DrawRecord::Indexed(d) => {
+            if d.index.buffer_ref == 0 {
+                // An indexed record naming no index buffer.
+                // `drawIndexedPrimitives:` takes its index buffer as an argument
+                // and there is no bound-index-buffer state for a zero ref to
+                // mean, so the record is malformed.
                 //
-                // Named rather than declined, deliberately. Declining is the
-                // contract-faithful answer, but `index_buffer_ref` is read at a
-                // payload offset that differs per draw form, so if any of those
-                // offsets is wrong the ref reads 0 and declining would turn a
-                // decode fault into a blank frame. This counter says first
-                // whether the cell is reached at all.
-                if cmd.index_count != 0 && is_indexed_draw_opcode(opcode) {
-                    note_indexed_draw_without_buffer(task_id, opcode, cmd.index_count);
+                // Still named rather than declined, and the reason has changed:
+                // it used to be that `index_buffer_ref` was read at an offset
+                // this device computed per draw form, so a wrong offset would
+                // read 0 and declining would turn a decode fault into a blank
+                // frame. The offsets are the wire crate's now, fixture-derived
+                // and shared by both encodings, so that risk is gone — but the
+                // counter has never fired, and a decline is a frame this device
+                // stops drawing. The reading is what would argue for it.
+                // A zero count is not this case: an indexed draw of no indices
+                // names no buffer because it reads none.
+                if d.index_count != 0 {
+                    note_indexed_draw_without_buffer(
+                        task_id,
+                        opcode,
+                        u32::try_from(d.index_count).unwrap_or(u32::MAX),
+                    );
                 }
                 acc.indexed = None;
-            }
-            // Snapshot bind state for this draw (archive multi-draw job).
-            if acc.pipeline_ref == 0 {
-                acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
-            } else if count == 0 {
-                acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
             } else {
-                match acc.bind_snapshot() {
-                    Ok(snapshot) => acc.draws.push(PendingDraw {
-                        pipeline_ref: acc.pipeline_ref,
-                        draw: DrawArgs {
-                            vertex_count: count,
-                            instance_count: cmd.instance_count,
-                            primitive_type: cmd.primitive_type,
-                            first_vertex: cmd.vertex_start,
-                            base_instance: cmd.base_instance,
-                        },
-                        ..snapshot
-                    }),
-                    Err(over) => note_draw_refused(over, acc.pipeline_ref, "draw"),
-                }
+                let Some(index_count) = draw_count(task_id, opcode, "index_count", d.index_count)
+                else {
+                    return;
+                };
+                acc.indexed = Some(IndexedDrawInfo {
+                    index_type: d.index.index_type.ordinal(),
+                    index_count,
+                    index_buffer_ref: d.index.buffer_ref,
+                    index_buffer_offset: d.index.offset,
+                    base_vertex: d.base_vertex,
+                });
             }
+            (d.primitive, d.index_count, 0, d.instances)
         }
-        RenderKind::ExecuteCommands => {
+        // Taken above.
+        DrawRecord::PrimitivesIndirect(_) | DrawRecord::IndexedIndirect(_) => return,
+    };
+
+    let Some(count) = draw_count(task_id, opcode, "count", count) else {
+        return;
+    };
+    let Some(first_vertex) = draw_count(task_id, opcode, "vertex_start", first_vertex) else {
+        return;
+    };
+    let Some(instance_count) = draw_instances(instances) else {
+        return;
+    };
+    let Some(base_instance) = draw_count(task_id, opcode, "base_instance", instances.base) else {
+        return;
+    };
+
+    if acc.pipeline_ref == 0 {
+        acc.dropped_no_pipeline = acc.dropped_no_pipeline.saturating_add(1);
+    } else if count == 0 {
+        acc.dropped_zero_count = acc.dropped_zero_count.saturating_add(1);
+    } else {
+        match acc.bind_snapshot() {
+            Ok(snapshot) => acc.draws.push(PendingDraw {
+                pipeline_ref: acc.pipeline_ref,
+                draw: DrawArgs {
+                    vertex_count: count,
+                    instance_count,
+                    primitive_type: primitive,
+                    first_vertex,
+                    base_instance,
+                },
+                ..snapshot
+            }),
+            Err(over) => note_draw_refused(over, acc.pipeline_ref, "draw"),
+        }
+    }
+}
+
+fn handle_render_record<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &M,
+    task_id: u32,
+    opcode: u32,
+    cmd_bytes: &[u8],
+    out: &mut ExecResult,
+    acc: &mut StreamAccum,
+) {
+    // **Which class of record this is, is the closure ledger's answer.** The
+    // render rail carries the widest set on this device: the encoder's own
+    // records, the fence pair, the barriers, the indirect-command executions,
+    // the residency declarations inherited from the encoder base class, and
+    // twenty-six rows the ledger has not settled. This device answered all of
+    // them with one `Kind`, decoded in the same pass that read the fields, so a
+    // record's class and its layout were one verdict.
+    //
+    // Three are answered here, and they are the three that own nothing on this
+    // rail. The fences reach `fence_exec`, which keeps its own generations; the
+    // barriers and the residency declarations are counted. **None of them
+    // touches `StreamAccum`**, which is what makes them separable from the rest
+    // of the rail rather than merely convenient to move first — the
+    // indirect-command executions look equally self-contained and are not,
+    // because they push onto `acc.execute_icb`.
+    match reims_vgpu_protocol::closure::find(Rail::Render, opcode)
+        .and_then(reims_vgpu_core::operation::classify)
+    {
+        Some(OperationHome::Stream(OperationClass::Fence)) => {
+            return handle_render_fence(state, task_id, opcode, cmd_bytes);
+        }
+        Some(OperationHome::Stream(OperationClass::Barrier)) => {
+            return note_render_barrier(task_id, opcode, cmd_bytes);
+        }
+        // `None` is a row the ledger has not settled. The four residency
+        // declarations are among them and are *declined* rather than executed,
+        // so their layout can come from `decode::residency::lift` — which
+        // answers what the guest wrote without claiming the row is settled.
+        // The other twenty-two unsettled rows drive work or are counted from
+        // fields this device reads itself, and stay below.
+        None if reims_vgpu_protocol::decode::residency::is_residency(Rail::Render, opcode) => {
+            return note_render_residency(task_id, opcode, cmd_bytes);
+        }
+        _ => {}
+    }
+    // **The encoder's own state records.** Fifteen rows whose whole effect is
+    // one field of `StreamAccum` that no other record class writes — see
+    // [`is_render_stream_state`], which is where that claim lives and what
+    // makes this group separable from the binds, the draws and the pass
+    // descriptor still below.
+    //
+    // Routed on the kind rather than on `classify`, because every encoder
+    // record on this rail is one `OperationClass::Render` and the class cannot
+    // tell fifteen of them from the other thirty. `RenderKind::of_opcode`
+    // answering at all is the ledger's settlement: the rows it does not name
+    // are the ones the contract has not closed, and they keep this device's own
+    // decoder below.
+    if let Some(kind) = ProtoRenderKind::of_opcode(opcode) {
+        if is_render_stream_state(kind) {
+            return handle_render_stream_state(task_id, opcode, cmd_bytes, acc);
+        }
+        // **The encoder's argument tables.** Twelve rows writing the six bind
+        // tables and the `unrepresentable` latch — see [`is_render_bind`] for
+        // why a latch two classes insert into is still a group boundary the
+        // rest of the rail cannot disagree across.
+        if is_render_bind(kind) {
+            return handle_render_binds(state, host, task_id, opcode, cmd_bytes, out, acc);
+        }
+        // **The pass descriptor and its three store-action overrides.** One
+        // group because the overrides mutate attachments the descriptor writes
+        // — see [`is_render_pass_state`].
+        if is_render_pass_state(kind) {
+            return handle_render_pass_state(state, host, task_id, opcode, cmd_bytes, out, acc);
+        }
+        // **The draws.** The group that reads what the other three wrote, which
+        // is why it moves last — see [`is_render_draw`].
+        if is_render_draw(kind) {
+            return handle_render_draw(state, host, task_id, kind, opcode, cmd_bytes, out, acc);
+        }
+    }
+    let cmd = match render_spi::decode(cmd_bytes) {
+        Ok(c) => c,
+        // `ErrUnknownOpcode` keeps the deduped fail-visible line *and the wire
+        // capture* the legacy decoder's `OtherAccepted` catch-all gave it: an
+        // opcode no render row names is the one case where the bytes are the
+        // whole diagnostic, and a typed refusal alone would say a record
+        // arrived and nothing about its layout.
+        Err(render_spi::DecodeStatus::ErrUnknownOpcode) => {
+            note_unimplemented_render_opcode(opcode, cmd_bytes, task_id, acc);
+            return;
+        }
+        Err(status) => {
+            if let Some(e) = crate::observe::Emit::refusal("render_decode", &status) {
+                // Latched per (reason, opcode): the guest re-encodes the same
+                // stream every frame, and this is the hottest rail in the crate.
+                e.field("opcode", format!("{:#x}", opcode))
+                    .field("len", cmd_bytes.len())
+                    .fail_once(opcode as u64);
+            }
+            return;
+        }
+    };
+    match cmd.kind {
+        SpiKind::ExecuteCommands => {
             if cmd.indirect_command_buffer_ref == 0 {
                 note_unnamed_icb_execute(task_id, &cmd);
                 return;
@@ -2070,50 +4143,6 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 args_buffer_ref: cmd.icb_args_buffer_ref,
                 args_buffer_offset: cmd.icb_args_buffer_offset,
             });
-        }
-        RenderKind::Fence => {
-            // The render encoder's own fence opcodes, not the blit encoder's.
-            // Each encoder numbers its selectors in its own space and the two
-            // fence pairs are nowhere near each other, so matching a render
-            // opcode against `wire_blit`'s constants never succeeded and sent
-            // every render fence to the arm below. `updateFence:afterStages:`
-            // is what a guest uses to order work inside one render encoder
-            // against a later one, so what it dropped was encoder
-            // synchronisation on every pass that asked for it.
-            let action = match cmd.opcode {
-                wire_render::OPCODE_UPDATE_FENCE => FenceAction::Update,
-                wire_render::OPCODE_WAIT_FOR_FENCE => FenceAction::Wait,
-                opcode => {
-                    // A render fence record whose opcode is neither update nor
-                    // wait drops the guest's encoder synchronisation. The
-                    // counter that stood here had no reader, so this was silent.
-                    crate::observe::fail(format!(
-                        "render_fence_opcode reason=render_fence_opcode_unknown \
-                         task={task_id} opcode={opcode:#x} fence={}",
-                        cmd.fence_ref
-                    ));
-                    return;
-                }
-            };
-            fence_exec::execute_fence(
-                state,
-                task_id,
-                FenceDomain::RenderFence,
-                cmd.fence_ref,
-                action,
-            );
-        }
-        RenderKind::OtherAccepted => {
-            // An undecoded render opcode: the decoder accepts it (catch-all)
-            // but no executor exists, so the guest command is effectively
-            // dropped. That MUST stay fail-visible — but a per-draw op such as
-            // 0x7c fires thousands of times per app render, so emitting per
-            // record floods /tmp/reims-vgpu-fail.log (measured ~2620 lines from six
-            // app launches). Dedup to ONE line per distinct opcode (the set is
-            // tiny and boot-stable) and capture the raw wire on first sighting
-            // so the layout can be decoded offline. Unknown wire stays unknown;
-            // we never invent semantics for it.
-            note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
         }
         // Two kinds the product answers by doing nothing, counted separately.
         // They used to fall into the catch-all below, which made them
@@ -2147,131 +4176,27 @@ fn handle_render_record<M: HostMemory + HostOps>(
         // and nothing about whether any of them mattered.
         //
         // `SetRasterState` was two of them and is no longer here: the counters
-        // it raised are what argued for plumbing it, and both halves now reach
-        // a backend.
-        RenderKind::SetRasterState => {
-            // Two selectors share the one-`NSUInteger` record; the opcode says
-            // which. Both are latched whatever the value, including the Metal
-            // default — a stream that sets Lines and then sets Fill again is
-            // asking for Fill, and dropping the second record would leave the
-            // rest of the pass wireframed.
-            //
-            // The ordinal is carried raw and translated per backend, the way
-            // `cull_mode` and `front_facing` beside it are: only the backend
-            // knows whether the host can spell the answer, so only the backend
-            // can refuse by name.
-            let slot = match cmd.opcode {
-                wire_render::OPCODE_SET_TRIANGLE_FILL_MODE => &mut acc.fill_mode,
-                _ => &mut acc.depth_clip_mode,
-            };
-            // The record's field is 64-bit and the ordinals are small, but a
-            // guest writes what it likes. `u32::MAX` is not a value of either
-            // Metal enum, so a wide word reaches the backend as an
-            // out-of-contract value that says its own name, rather than as its
-            // own low half — which for a multiple of 2^32 would be the
-            // *default*, the one answer that renders with nothing in the log.
-            *slot = Some(u32::try_from(cmd.mode).unwrap_or(u32::MAX));
-        }
-        RenderKind::SetFloatState => {
-            // Two selectors share the one-`float` record; the opcode says
-            // which.
-            //
-            // `setLineWidth:` is latched whatever the value, including the
-            // Metal default — a stream that widens a line and then narrows it
-            // again is asking for the narrow one, and dropping the second
-            // record would leave the rest of the pass thick. Latched unparsed
-            // for the reason the four raster ordinals beside it are: only the
-            // running rail knows whether it can spell the width, and only the
-            // Vulkan rail additionally knows whether *this draw* rasterizes
-            // any lines to apply it to.
+        // it raised are what argued for plumbing it, both halves now reach a
+        // backend, and the row itself has since moved to
+        // `handle_render_stream_state`.
+        SpiKind::SetTessellationFactorScale => {
+            // `setLineWidth:` shared this wire form and does not share its
+            // settlement: the line width has a `RenderKind` and reaches
+            // `handle_render_stream_state`, and this does not and reaches here.
+            // The two selectors are two modules now, which is the whole reason
+            // the opcode no longer has to be read a second time to tell them
+            // apart.
             //
             // The tessellation factor scale has no carrier on either rail. Its
-            // loss is still counted here, and only where the value is not the
-            // 1.0 default — compared exactly rather than with a tolerance,
-            // because the guest wrote a literal and the question is whether it
-            // wrote *the* literal.
-            if cmd.opcode == wire_render::OPCODE_SET_LINE_WIDTH {
-                acc.line_width = Some(cmd.float_value);
-            } else if cmd.float_value != 1.0 {
+            // loss is counted only where the value is not the 1.0 default —
+            // compared exactly rather than with a tolerance, because the guest
+            // wrote a literal and the question is whether it wrote *the*
+            // literal.
+            if cmd.float_value != 1.0 {
                 crate::runtime::drain::note_store_route("render_tessellation_scale_dropped");
             }
         }
-        RenderKind::SetStoreAction => {
-            // `setColorStoreAction:atIndex:` and its depth and stencil siblings
-            // replace what the render-pass descriptor declared for one
-            // attachment. All three of those declared actions are honoured —
-            // colour in `encode_draw_chain`'s writeback loop, depth and stencil
-            // through `draw::depth_stencil` — so dropping the override was a
-            // real loss in both directions, and the expensive one is a pass
-            // declared `DontCare` and overridden to `Store`: content the guest
-            // asked to keep and never got back.
-            //
-            // The store action is a `u16` in every attachment struct, so a mode
-            // that does not fit is not narrowed into a different action; it is
-            // left alone and named, the same reading `SetIntState` takes of its
-            // own low half.
-            let Ok(action) = u16::try_from(cmd.mode) else {
-                crate::runtime::drain::note_store_route("render_store_action_out_of_range");
-                crate::observe::fail(format!(
-                    "render_store_action fail reason=render_store_action_out_of_range \
-                     op={:#x} mode={} index={}",
-                    cmd.opcode, cmd.mode, cmd.first
-                ));
-                return;
-            };
-            match cmd.opcode {
-                wire_render::OPCODE_SET_COLOR_STORE_ACTION => {
-                    // By pass slot, which is what the record's index names and
-                    // what `color_slots` is keyed by — not by position, since a
-                    // pass declaring slots 0 and 3 has two entries.
-                    match acc
-                        .color_slots
-                        .iter_mut()
-                        .find(|(slot, _)| *slot == cmd.first)
-                    {
-                        Some((_, att)) => att.store_action = action,
-                        // A slot the pass never declared. The override has
-                        // nothing to override and inventing an attachment for it
-                        // would give the draw a target the guest did not ask
-                        // for, so it is named instead.
-                        None => {
-                            crate::runtime::drain::note_store_route(
-                                "render_store_action_slot_undeclared",
-                            );
-                            crate::observe::fail(format!(
-                                "render_store_action fail \
-                                 reason=render_store_action_slot_undeclared \
-                                 index={} declared={}",
-                                cmd.first,
-                                acc.color_slots.len()
-                            ));
-                        }
-                    }
-                }
-                // Neither of these carries an index: there is one depth and one
-                // stencil attachment, so the record names only the action.
-                wire_render::OPCODE_SET_DEPTH_STORE_ACTION => match acc.depth_attach.as_mut() {
-                    Some(d) => d.store_action = action,
-                    None => note_store_action_no_attachment("depth", action),
-                },
-                wire_render::OPCODE_SET_STENCIL_STORE_ACTION => match acc.stencil_attach.as_mut() {
-                    Some(s) => s.store_action = action,
-                    None => note_store_action_no_attachment("stencil", action),
-                },
-                // Not a catch-all standing in for the stencil arm: the decoder
-                // maps exactly three opcodes to this kind, so a fourth reaching
-                // here means the decoder grew an arm this one did not, and the
-                // guest's store action lands on nothing.
-                op => {
-                    crate::runtime::drain::note_store_route("render_store_action_opcode_unknown");
-                    crate::observe::fail(format!(
-                        "render_store_action fail reason=render_store_action_opcode_unknown \
-                         op={op:#x} action={action}"
-                    ));
-                }
-            }
-        }
-        RenderKind::SetVertexAmplification => {
+        SpiKind::SetVertexAmplification => {
             // Amplification makes one vertex invocation produce several views,
             // so a dropped record renders one view where the guest asked for
             // many. Both forms have an API default that means "no
@@ -2302,40 +4227,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 );
             }
         }
-        RenderKind::SetVisibilityResultMode => {
-            // `MTLVisibilityResultModeDisabled` is 0, and it is the guest
-            // disarming the query rather than an unknown value: subsequent draws
-            // simply carry none. The record's field is 64-bit and the ordinals
-            // are small, but a guest writes what it likes — a wide word reaches
-            // the backend as an out-of-contract value that says its own name,
-            // the same treatment `fill_mode` gives its ordinal, rather than as
-            // its own low half.
-            acc.visibility = (cmd.mode != 0).then(|| draw::VisibilityArming {
-                mode: u32::try_from(cmd.mode).unwrap_or(u32::MAX),
-                offset: cmd.visibility_result_offset,
-            });
-        }
-        RenderKind::DrawIndirect => {
-            execute_indirect_draw(state, host, task_id, &cmd, acc);
-        }
-        RenderKind::UseResource | RenderKind::UseHeap => {
-            note_residency_declaration(
-                task_id,
-                cmd.kind == RenderKind::UseHeap,
-                cmd.opcode,
-                cmd.count,
-                cmd.residency_usage,
-                cmd.residency_stages,
-            );
-        }
-        RenderKind::Barrier => {
-            crate::runtime::drain::note_store_route("render_noop_barrier");
-        }
-        // The tile-shader family. Nine opcodes that used to reach
-        // `OtherAccepted` together, split here into the three different things
-        // they actually are — because "a tile record arrived" is not a
-        // measurement anyone can act on.
-        RenderKind::TileBind => {
+        SpiKind::TileBind => {
             // A bind against the tile argument tables. There is no default a
             // bind could be sitting at, so this counts unconditionally: it is
             // an upper bound on tile resources the guest attached and this rail
@@ -2364,7 +4256,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 _ => "render_tile_sampler_bind_dropped",
             });
         }
-        RenderKind::TileDispatch => {
+        SpiKind::TileDispatch => {
             // A tile shader the guest asked to run. Like an indirect draw and
             // unlike the unapplied states, this is work rather than state, so
             // it keeps the deduped fail-visible line as well as the count.
@@ -2378,7 +4270,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
             }
         }
-        RenderKind::SetStoreActionOptions => {
+        SpiKind::SetStoreActionOptions => {
             // The options sibling of the store action beside it, which *is*
             // applied. `MTLStoreActionOptions` declares exactly one flag,
             // `CustomSamplePositions`, asking that a multisample resolve use
@@ -2417,7 +4309,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 acc.unrepresentable.get_or_insert(StreamRefusal::Pass(drop));
             }
         }
-        RenderKind::DrawPatches => {
+        SpiKind::DrawPatches => {
             // A tessellated draw. Geometry the guest asked for and did not get,
             // so it counts unconditionally and keeps the deduped fail-visible
             // line, on the same footing as the indirect draws — there is no
@@ -2436,14 +4328,14 @@ fn handle_render_record<M: HostMemory + HostOps>(
             });
             note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
         }
-        RenderKind::SetTessellationFactorBuffer => {
+        SpiKind::SetTessellationFactorBuffer => {
             // The state half of a tessellated draw. Unapplied like the draws
             // themselves, so this should track `render_draw_patches_dropped`;
             // the two being far apart would mean one of the two arms is wrong
             // rather than that the guest is doing something unusual.
             crate::runtime::drain::note_store_route("render_tessellation_factor_buffer_dropped");
         }
-        RenderKind::RenderPassProperty => {
+        SpiKind::RenderPassProperty => {
             // One of the six records `writeDescriptor` emits beside the pass
             // descriptor. Every one is behind a serializer capability that
             // defaults off, so these are healthy zeros: a non-zero reading is
@@ -2494,7 +4386,7 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 note_unimplemented_render_opcode(cmd.opcode, cmd_bytes, task_id, acc);
             }
         }
-        RenderKind::TileDimensionsQuery => {
+        SpiKind::TileDimensionsQuery => {
             // Not a dropped command — a *wrong answer*. The guest handed over a
             // buffer for this device to write the tile width and height into
             // and will read it back regardless of whether anything was written,
@@ -2510,7 +4402,9 @@ fn handle_render_record<M: HostMemory + HostOps>(
                 cmd.buffer_ref, cmd.buffer_offset
             ));
         }
-        _ => {}
+        // `decode` never produces it — it is the `Default` a caller builds a
+        // command from — so this arm is the type's shape rather than a record.
+        SpiKind::Unknown => {}
     }
 }
 
@@ -2693,7 +4587,7 @@ impl BindClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BindSlotPastTable {
     class: BindClass,
-    stage: Stage,
+    stage: ShaderStage,
     /// The first slot the walk refused — the guest's own index, not the
     /// position within the record, so it can be read against the table size.
     index: u32,
@@ -2709,15 +4603,7 @@ impl crate::observe::Decline for BindSlotPastTable {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         vec![
-            (
-                "stage",
-                match self.stage {
-                    Stage::Vertex => "vertex",
-                    Stage::Fragment => "fragment",
-                    Stage::Unknown => "unknown",
-                }
-                .to_string(),
-            ),
+            ("stage", self.stage.name().to_string()),
             ("index", self.index.to_string()),
             ("slots", self.slots.to_string()),
             ("table", self.class.table().to_string()),
@@ -2815,7 +4701,7 @@ const _: () = assert!(
 /// lost it.
 #[derive(Clone, Copy, Debug)]
 struct BindTarget {
-    stage: Stage,
+    stage: ShaderStage,
     class: BindClass,
 }
 
@@ -2874,7 +4760,7 @@ enum StreamRefusal {
 /// The counter stays and says how much; this says which slot, once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BufferOffsetSlotPastTable {
-    stage: Stage,
+    stage: ShaderStage,
     /// The slot the record named. `cmd.first` is the whole of it — this wire
     /// form updates one slot, so there is no run to report a length for.
     index: u32,
@@ -2887,15 +4773,7 @@ impl crate::observe::Decline for BufferOffsetSlotPastTable {
 
     fn fields(&self) -> Vec<(&'static str, String)> {
         vec![
-            (
-                "stage",
-                match self.stage {
-                    Stage::Vertex => "vertex",
-                    Stage::Fragment => "fragment",
-                    Stage::Unknown => "unknown",
-                }
-                .to_string(),
-            ),
+            ("stage", self.stage.name().to_string()),
             ("index", self.index.to_string()),
             ("table", BindClass::Buffer.table().to_string()),
             ("apple_table", BindClass::Buffer.apple_table().to_string()),
@@ -2933,13 +4811,13 @@ struct BindTables<'a, B> {
 /// texture arm's mapper-ref-texture mapping list — with the caller. The clear count comes
 /// back as a return value rather than through an `&mut` counter so `make` can
 /// hold the rest of `ExecResult`.
-fn apply_binds<T: Copy, B: Clone>(
+fn apply_binds<T, B: Clone>(
     entries: &[T],
     first: u32,
     target: BindTarget,
     tables: BindTables<'_, B>,
     slot: impl Fn(&B) -> u32,
-    mut make: impl FnMut(u32, T) -> Option<B>,
+    mut make: impl FnMut(u32, &T) -> Option<B>,
 ) -> u32 {
     let BindTarget { stage, class } = target;
     let BindTables {
@@ -2955,7 +4833,7 @@ fn apply_binds<T: Copy, B: Clone>(
         crate::runtime::drain::note_store_route(class.reach_route(reach));
     }
     let mut cleared = 0u32;
-    for (i, entry) in entries.iter().copied().enumerate() {
+    for (i, entry) in entries.iter().enumerate() {
         let index = first.saturating_add(i as u32);
         if index >= class.table() {
             // The walk stops here, and it used to stop in silence — a `break`
@@ -3021,15 +4899,13 @@ fn apply_binds<T: Copy, B: Clone>(
             break;
         }
         let bind = make(index, entry);
+        // Two arms and no third: `ShaderStage` is the render opcode set's whole
+        // vocabulary, so "the record named no stage" — which used to reach here
+        // as `Stage::Unknown` and count the clear against a table it could not
+        // name — is not a state a lifted bind can be in.
         let list = match stage {
-            Stage::Vertex => Arc::make_mut(vertex),
-            Stage::Fragment => Arc::make_mut(fragment),
-            // No table to bind into, but a slot the guest cleared is still
-            // cleared: the count is what the record said, not what we modelled.
-            Stage::Unknown => {
-                cleared = cleared.saturating_add(bind.is_none() as u32);
-                continue;
-            }
+            ShaderStage::Vertex => Arc::make_mut(vertex),
+            ShaderStage::Fragment => Arc::make_mut(fragment),
         };
         let Some(bind) = bind else {
             list.retain(|b| slot(b) != index);
@@ -3789,17 +5665,30 @@ fn retarget_render_pass_draw(
 /// before the render stream that follows them — but it is an ordering property
 /// of the device rather than of the Metal API, and a design that stopped
 /// completing compute before render would break this silently.
+/// Record one indirect draw, whose counts live in a guest buffer.
+///
+/// **Which form this is comes from the record's own variant**, not from the
+/// opcode read a second time: an `IndexedIndirect` carries an `IndexRef` and a
+/// `PrimitivesIndirect` does not, so "the indexed form with no index buffer"
+/// and "the unindexed form" stopped being one shape with a flag beside it.
 fn execute_indirect_draw<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    cmd: &render::Command,
+    opcode: u32,
+    record: &reims_vgpu_protocol::decode::render::DrawRecord,
     acc: &mut StreamAccum,
 ) {
     use crate::protocol::draw::indirect;
+    use reims_vgpu_protocol::decode::render::DrawRecord;
 
-    let indexed_form = cmd.opcode == wire_render::OPCODE_DRAW_INDEXED_INDIRECT;
-    let block_len = if indexed_form {
+    let (primitive, arguments, index) = match record {
+        DrawRecord::PrimitivesIndirect(d) => (d.primitive, d.arguments, None),
+        DrawRecord::IndexedIndirect(d) => (d.primitive, d.arguments, Some(d.index)),
+        // Taken by the caller's direct arms.
+        _ => return,
+    };
+    let block_len = if index.is_some() {
         indirect::INDEXED_LEN
     } else {
         indirect::UNINDEXED_LEN
@@ -3808,8 +5697,8 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
         state,
         host,
         task_id,
-        cmd.indirect_buffer_ref,
-        cmd.indirect_buffer_offset,
+        arguments.buffer_ref,
+        arguments.offset,
         block_len,
     ) {
         Ok(block) => block,
@@ -3819,41 +5708,37 @@ fn execute_indirect_draw<M: HostMemory + HostOps>(
             // draw, and `read_buffer_window`'s status already names which rung
             // of the resolve refused. Latched per buffer ref because a guest
             // re-issues the same indirect draw every frame.
-            note_indirect_draw_refused(task_id, cmd, status);
+            note_indirect_draw_refused(task_id, opcode, arguments, status);
             return;
         }
     };
 
-    let (args, index_start, base_vertex) = if indexed_form {
-        match indirect::indexed(&block, cmd.primitive_type) {
+    let (args, index_start, base_vertex) = match index {
+        Some(_) => match indirect::indexed(&block, primitive) {
             Some(v) => (v.0, v.1, v.2),
             None => return,
-        }
-    } else {
-        match indirect::unindexed(&block, cmd.primitive_type) {
+        },
+        None => match indirect::unindexed(&block, primitive) {
             Some(args) => (args, 0, 0),
             None => return,
-        }
+        },
     };
 
     acc.saw_draw = true;
-    if indexed_form {
+    if let Some(index) = index {
         // `indexStart` counts indices, not bytes. The loader is given a byte
-        // offset, so it is scaled here by the width the record's own
-        // `index_type` declares — the same two widths `translate::raster::
-        // index_type` accepts, and an unknown one is left to the loader's
-        // typed refusal rather than being guessed at as 2.
-        let stride = match cmd.index_type {
-            1 => 4u64, // MTLIndexTypeUInt32
-            _ => 2,    // MTLIndexTypeUInt16, and Metal's default
-        };
+        // offset, so it is scaled here by the width the record's own index type
+        // declares — `IndexType::bytes`, which is the same table
+        // `translate::raster::index_type` reads, rather than a `1 => 4, _ => 2`
+        // restatement whose `_` arm answered for an ordinal the record can no
+        // longer carry.
         acc.indexed = Some(IndexedDrawInfo {
-            index_type: cmd.index_type,
+            index_type: index.index_type.ordinal(),
             index_count: args.vertex_count,
-            index_buffer_ref: cmd.index_buffer_ref,
-            index_buffer_offset: cmd
-                .index_buffer_offset
-                .saturating_add(u64::from(index_start).saturating_mul(stride)),
+            index_buffer_ref: index.buffer_ref,
+            index_buffer_offset: index
+                .offset
+                .saturating_add(u64::from(index_start).saturating_mul(index.index_type.bytes())),
             base_vertex: i64::from(base_vertex),
         });
     } else {
@@ -4298,9 +6183,9 @@ pub(crate) mod finish_phase;
 
 mod report;
 use report::{
-    is_indexed_draw_opcode, note_clear_dropped, note_color_subresource_unsupported,
-    note_compute_refusal, note_depth_stencil_unsupported, note_draw_encode_fail,
-    note_empty_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
+    note_clear_dropped, note_color_subresource_unsupported, note_compute_refusal,
+    note_depth_stencil_unsupported, note_draw_encode_fail, note_empty_scissor,
+    note_empty_viewport_or_scissor, note_indexed_draw_without_buffer, note_indirect_draw_refused,
     note_info_record_unanswered, note_pass_array_length_unsupported, note_pass_extent_for_slot,
     note_pass_raster_sample_count_unsupported, note_pass_target_extent, note_residency_declaration,
     note_store_action_no_attachment, note_store_action_options_unsupported, note_stream_draw_drops,

@@ -1,3 +1,48 @@
+// DISCONNECTED SOURCE — this file does not compile, is not feature-gated, and
+// is not linkable. No `mod` declaration reaches `dead/`. It is here to be read.
+//
+// What this was: this device's own blit-rail decoder, `runtime::decode::blit`.
+// One `decode` over every opcode the rail carries, returning one flat `Command`
+// with roughly fifty fields — the union of nine transfers, three
+// indirect-command records, four content directives, two fences and four
+// `BlitEncoderSPI` rows — plus a `kind` tag and a `copy_kind` tag saying which
+// of them were live.
+//
+// Why it went, three reasons:
+//
+//   * A record's *class* and its *field offsets* were one verdict. The match
+//     arm that decided "this is a texture-to-texture copy" was the same arm
+//     that read the fields, so a misclassification read a real layout at the
+//     wrong offsets and produced a plausible copy of the wrong bytes. The class
+//     now comes from the closure ledger through
+//     `reims_vgpu_core::operation::classify`, and each class is lifted by the
+//     layer that owns its layout.
+//   * The flat record made two independent reads of the same question. `kind`
+//     and `copy_kind` were set separately and read separately — once to charge
+//     the census clock and once to pick the executor — so a record could be
+//     timed as one family and executed as another with nothing comparing the
+//     two. `BlitRecord`'s variants carry named payloads and `kind()` is derived
+//     from the variant, so both reads are one.
+//   * `has_options` existed only because this decoder knew which records carry
+//     an `options:` word and the record did not. A record with no options field
+//     selects the whole texel, which is exactly what
+//     `protocol::blit::select_aspect(0)` answers, so the flag was a second
+//     spelling of a zero.
+//
+// What did NOT move for a shape reason: the four rows the closure ledger has
+// not settled — `resetCommandsInBuffer:withRange:`,
+// `copyIndirectCommandBuffer:…`, and the two `fillTexture:…` forms. An
+// unresolved row has no established contract, so no layer above the wire may
+// give it a shape; this device decodes them in order to *decline* them by name
+// and with their extents, and that decline's count is the measurement that
+// settles the row. `runtime::decode::blit_spi` is that decoder, and it is
+// deliberately narrow: it refuses every settled opcode, so no record on this
+// rail has two readings.
+//
+// Replaced by commit "cutover: the blit rail's nine transfers were a flat
+// record with a tag saying which fields were live". Do not resurrect: read it,
+// then fix the new owner.
+
 //! Blit command decoder (port of `host/utils/reims-vgpu-blit-decode`).
 //!
 //! # The three indirect-command-buffer records, which this decoder reads and no

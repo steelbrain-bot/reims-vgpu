@@ -227,6 +227,20 @@ impl SlotGeneration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChannelId(pub u32);
 
+impl ChannelId {
+    /// The domain that exists because the device does.
+    ///
+    /// Every other domain is opened by a `CmdDefineFifo` the guest sends, and
+    /// **this is the domain it sends it on**. There is no packet that could
+    /// open it: a model requiring one would refuse the command that opens
+    /// everything else, along with every task definition, object-list bind and
+    /// device query the guest puts on the root FIFO. So
+    /// [`crate::session::SessionModel::new`] opens it, and
+    /// [`crate::session::SessionModel::retire_channel`] refuses to close it —
+    /// the root FIFO's publication lifetime is the device's.
+    pub const ROOT: Self = Self(0);
+}
+
 /// A packet's position within its channel.
 ///
 /// Channel-local and monotonic. Two packets on different channels have no

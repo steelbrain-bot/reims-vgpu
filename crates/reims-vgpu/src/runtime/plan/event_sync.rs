@@ -30,7 +30,6 @@ pub enum Decision {
     SignalNoop = 2,
     WaitSatisfied = 3,
     WaitPending = 4,
-    WaitTimeoutUnsupported = 5,
 }
 
 /// Why the [`Decision`] came out the way it did.
@@ -50,7 +49,6 @@ pub enum Reason {
     WaitReached = 5,
     WaitMissingSignal = 6,
     WaitBelowTarget = 7,
-    WaitTimeoutUnsupported = 8,
     FenceUpdateFirst = 9,
     FenceUpdateAdvance = 10,
     FenceUpdateAtMax = 11,
@@ -120,10 +118,18 @@ fn is_fence_domain(domain: Domain) -> bool {
 ///
 /// Signals carry an explicit wire value and advance monotonically; a repeated or
 /// backwards value is ignored rather than rejected. A wait is satisfied once the
-/// stored value reaches the target. Wait-with-timeout is refused outright — there
-/// is no deferred host timer, so honouring the timeout is not possible and
-/// silently treating it as an untimed wait would change the guest's contract.
-pub fn plan_event(kind: EventKind, value: u64, has_timeout: bool, current: Option<u64>) -> Plan {
+/// stored value reaches the target.
+///
+/// # There is no bounded wait to plan
+///
+/// `waitForEvent:value:timeoutMS:` is refused where its contract is settled —
+/// `reims_vgpu_protocol::sync::event_kind` gives it no kind, so
+/// `decode::sync` refuses the record and it never reaches a planner. This
+/// function took a `has_timeout` flag and answered `WaitTimeoutUnsupported` for
+/// it, which put one settled row's refusal in two places: the closure ledger
+/// where it belongs, and here, where it was found first and read as a gap in
+/// the planner rather than as a decision about the wire.
+pub fn plan_event(kind: EventKind, value: u64, current: Option<u64>) -> Plan {
     match kind {
         EventKind::Signal => match current {
             None => Plan::signal(Reason::SignalFirst, value),
@@ -135,10 +141,6 @@ pub fn plan_event(kind: EventKind, value: u64, has_timeout: bool, current: Optio
             Some(cur) if cur >= value => {
                 Plan::decided(Decision::WaitSatisfied, Reason::WaitReached)
             }
-            _ if has_timeout => Plan::decided(
-                Decision::WaitTimeoutUnsupported,
-                Reason::WaitTimeoutUnsupported,
-            ),
             Some(_) => Plan::decided(Decision::WaitPending, Reason::WaitBelowTarget),
             None => Plan::decided(Decision::WaitPending, Reason::WaitMissingSignal),
         },
@@ -175,42 +177,35 @@ mod tests {
 
     #[test]
     fn signal_first_and_advance() {
-        let plan = plan_event(EventKind::Signal, 5, false, None);
+        let plan = plan_event(EventKind::Signal, 5, None);
         assert!(plan.updates_state);
         assert_eq!(plan.update_value, 5);
         assert_eq!(plan.reason, Reason::SignalFirst);
 
-        let plan2 = plan_event(EventKind::Signal, 7, false, Some(5));
+        let plan2 = plan_event(EventKind::Signal, 7, Some(5));
         assert_eq!(plan2.reason, Reason::SignalAdvance);
         assert_eq!(plan2.update_value, 7);
 
-        let plan3 = plan_event(EventKind::Signal, 5, false, Some(5));
+        let plan3 = plan_event(EventKind::Signal, 5, Some(5));
         assert!(!plan3.updates_state);
         assert_eq!(plan3.reason, Reason::SignalEqualIgnored);
 
-        let plan4 = plan_event(EventKind::Signal, 4, false, Some(5));
+        let plan4 = plan_event(EventKind::Signal, 4, Some(5));
         assert!(!plan4.updates_state);
         assert_eq!(plan4.reason, Reason::SignalStaleIgnored);
     }
 
     #[test]
     fn wait_pending_and_satisfied() {
-        let p = plan_event(EventKind::Wait, 3, false, None);
+        let p = plan_event(EventKind::Wait, 3, None);
         assert_eq!(p.decision, Decision::WaitPending);
         assert_eq!(p.reason, Reason::WaitMissingSignal);
 
-        let p2 = plan_event(EventKind::Wait, 3, false, Some(3));
+        let p2 = plan_event(EventKind::Wait, 3, Some(3));
         assert_eq!(p2.decision, Decision::WaitSatisfied);
 
-        let p3 = plan_event(EventKind::Wait, 3, false, Some(2));
+        let p3 = plan_event(EventKind::Wait, 3, Some(2));
         assert_eq!(p3.reason, Reason::WaitBelowTarget);
-
-        // A timeout is refused even when the wait would otherwise be pending,
-        // but never when it is already satisfied.
-        let p4 = plan_event(EventKind::Wait, 3, true, None);
-        assert_eq!(p4.decision, Decision::WaitTimeoutUnsupported);
-        let p5 = plan_event(EventKind::Wait, 3, true, Some(3));
-        assert_eq!(p5.decision, Decision::WaitSatisfied);
     }
 
     #[test]

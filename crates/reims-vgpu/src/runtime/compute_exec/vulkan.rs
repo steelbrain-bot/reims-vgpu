@@ -486,7 +486,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     acc: &ComputeAccum,
-    cmd: &ComputeCommand,
+    dispatch: &DispatchRecord,
 ) -> ComputeStatus {
     use crate::backend::vulkan::engine::{
         self as vk_engine, ComputeBufferResource, ComputeImageResult, ComputeRequest,
@@ -536,7 +536,7 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         grid,
         threadgroup: tg,
         dispatch_threads,
-    } = match resolve_dispatch_dims_reported(state, host, task_id, cmd, acc) {
+    } = match resolve_dispatch_dims_reported(state, host, task_id, dispatch, acc) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -589,8 +589,24 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     ) {
         Ok(b) => b,
         Err(e) => {
+            // What the ordering plane thought of this pipeline when the
+            // dispatch was refused --- the compute twin of the render arm's
+            // field in `draw::vulkan`, and it is here because that field is
+            // what made the render losses legible and this one had no
+            // equivalent. A driven macos-26 desktop leaves three compute
+            // refusals that cannot be classified without it: `ready` is the
+            // ordering plane releasing work against a shader still being
+            // translated, `retired` is a packet recorded before the guest's
+            // delete and a loss this device chose to take, and they are
+            // opposite conclusions from the same line.
+            let model_pipeline = state
+                .object_name(task_id, acc.pipeline_ref)
+                .map_or("unnamed", |id| {
+                    state.pipeline_state(id).unwrap_or("unleased")
+                });
             crate::observe::Emit::decline("compute_linux_m2v", &e)
                 .field("pipe", acc.pipeline_ref)
+                .field("model_pipeline", model_pipeline)
                 .fail_once(acc.pipeline_ref as u64);
             return ComputeStatus::MetalFailed("compute_vk_translate");
         }
@@ -1272,15 +1288,18 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         samplers,
         storage_images,
     };
+    // The engine reaches this device's own object caches through the shared
+    // borrow, so it is taken before the closure and released with it.
+    let device: &DeviceState = state;
     let run_engine = |req: &ComputeRequest| {
-        let engine_done = spawn_compute_engine_stall_watchdog(
+        // The guard, not a boolean: the slot returns to service when the call
+        // returns *or* unwinds, and there is no arming without one.
+        let _watch = super::stall_watchdog::arm_compute_engine_stall_watchdog(
             acc.pipeline_ref,
             req,
-            std::time::Duration::from_millis(COMPUTE_ENGINE_STALL_PROXY_MS),
+            std::time::Duration::from_millis(super::stall_watchdog::COMPUTE_ENGINE_STALL_PROXY_MS),
         );
-        let out = vk_engine::execute_compute_request(req);
-        engine_done.store(true, std::sync::atomic::Ordering::Release);
-        out
+        vk_engine::execute_compute_request(device, req)
     };
     let out_result = run_engine(&req);
     let out = match out_result {
@@ -1531,62 +1550,6 @@ pub(crate) fn kernel_dispatch_launch(
             })
             .collect(),
     })
-}
-
-const COMPUTE_ENGINE_STALL_PROXY_MS: u64 = 2_000;
-
-/// Measurement-only watchdog for backend calls that cannot be bounded by a
-/// Vulkan fence timeout (notably pipeline creation and some driver submits).
-/// It never changes execution. A fired proxy preserves the private request
-/// inputs under /tmp so the stall can be reproduced without another VM boot.
-pub(super) fn spawn_compute_engine_stall_watchdog(
-    pipeline_ref: u32,
-    req: &crate::backend::vulkan::engine::ComputeRequest,
-    threshold: std::time::Duration,
-) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
-    let done = Arc::new(AtomicBool::new(false));
-    let thread_done = Arc::clone(&done);
-    let spirv = req.spirv.clone();
-    let grid = req.dispatch.threadgroups_per_grid();
-    let buffers = req.storage_buffers.len();
-    let images = req.storage_images.len();
-    let image_geometry: Vec<_> = req
-        .storage_images
-        .iter()
-        .map(|img| (img.binding, img.width, img.height))
-        .collect();
-    std::thread::spawn(move || {
-        std::thread::sleep(threshold);
-        if thread_done.load(Ordering::Acquire) {
-            return;
-        }
-        let elapsed_ms = threshold.as_millis();
-        crate::observe::fail(format!(
-            "compute_engine_stall reason=backend_call_unreturned pipe={pipeline_ref} elapsed_ms={elapsed_ms} grid={grid:?} nbuf={buffers} nimg={images} image_geom={image_geometry:?}"
-        ));
-        let base = format!("/tmp/reims-vgpu-compute-stall-pipe-{pipeline_ref}");
-        let mut bytes = Vec::with_capacity(spirv.len().saturating_mul(4));
-        for word in spirv {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        if let Err(e) = std::fs::write(format!("{base}.spv"), &bytes) {
-            crate::observe::fail(format!(
-                "compute_engine_stall reason=spv_dump_failed pipe={pipeline_ref} err={e}"
-            ));
-        }
-        let meta = format!(
-            "pipe={pipeline_ref}\nelapsed_ms={elapsed_ms}\ngrid={grid:?}\nnbuf={buffers}\nnimg={images}\nimage_geom={image_geometry:?}\n"
-        );
-        if let Err(e) = std::fs::write(format!("{base}.txt"), meta) {
-            crate::observe::fail(format!(
-                "compute_engine_stall reason=metadata_dump_failed pipe={pipeline_ref} err={e}"
-            ));
-        }
-    });
-    done
 }
 
 pub(super) fn spirv_words_le(bytes: &[u8]) -> Result<Vec<u32>, ComputeSpirvDecline> {
@@ -1919,7 +1882,7 @@ fn multisample_sampled_texture<M: HostMemory + HostOps>(
         state,
         host,
         task_id,
-        crate::runtime::decode::render::ColorAttachment {
+        crate::runtime::render_pass::ColorAttachment {
             texture_ref,
             ..Default::default()
         },

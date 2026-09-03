@@ -177,6 +177,41 @@ pub struct QueryRequest {
     pub reply: ReplyShape,
 }
 
+/// Where each question's answer goes, resolved by the layer that has the
+/// address spaces.
+///
+/// # Why this is a trait and not a field of the request
+///
+/// [`ReplyDestination`] is a backing and a window, and neither is on the wire.
+/// The four questions do not even share a destination space: two carry a
+/// **task GVA**, one carries a **guest page frame** in no task's address space
+/// at all, and resolving either needs a registry this crate cannot see.
+/// [`resolve`] therefore takes a destination rather than deriving one, and this
+/// is the door the caller answers through.
+///
+/// # It takes the payload, and that is deliberate
+///
+/// [`RequestWords`] would be the tidier input and cannot serve: the
+/// heap-texture request's words bound nothing, so
+/// [`RequestWords::HeapTexture`] carries none — while its payload does carry a
+/// reply address and a reply length. A trait keyed on the words could not
+/// answer for that question at all.
+///
+/// # `None` is the packet's, not the resolver's
+///
+/// An implementor that reaches the same decoders [`request_words`] reaches
+/// answers `None` only when the payload cannot hold the reply address its own
+/// layout puts there — which is a refusal about the guest's bytes, not an
+/// input the resolver is short of. A resolver that could not resolve an
+/// address it *did* find would be a gap, and there is no such case: an address
+/// this device holds no allocation for still names storage, and storage this
+/// device can identify.
+pub trait Destinations {
+    /// Where this question's answer goes, or `None` when the payload does not
+    /// carry the address its layout puts there.
+    fn destination(&self, kind: QueryKind, payload: &[u8]) -> Option<ReplyDestination>;
+}
+
 /// A query packet's request words, as its own layout carries them.
 ///
 /// One variant per layout rather than per question, because the two device-info

@@ -269,7 +269,9 @@ fn decode_texture_view_hop_reasoned<M: HostMemory + HostOps>(
         &[OBJECT_TYPE_TEXTURE_VIEW],
     )
     .map_err(|rung| match rung {
-        objects::LadderRung::NoListEntry => TextureViewDecline::HopEntryMissing { texture_ref },
+        objects::LadderRung::NoListEntry | objects::LadderRung::NoTaskSpace => {
+            TextureViewDecline::HopEntryMissing { texture_ref }
+        }
         objects::LadderRung::WrongType { got } => TextureViewDecline::HopObjectNotView {
             texture_ref,
             object_type: got,
@@ -982,7 +984,7 @@ fn load_linear_texture_impl<M: HostMemory + HostOps>(
         &[OBJECT_TYPE_TEXTURE, OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS],
     )
     .map_err(|rung| match rung {
-        objects::LadderRung::NoListEntry => R::ObjectListMiss,
+        objects::LadderRung::NoListEntry | objects::LadderRung::NoTaskSpace => R::ObjectListMiss,
         objects::LadderRung::WrongType { got } => R::NotATexture { object_type: got },
         objects::LadderRung::DescRead { .. } => R::DescriptorUnreadable,
     })?;

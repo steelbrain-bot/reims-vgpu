@@ -37,9 +37,6 @@ use crate::observe::Decline;
 // longer downgrade at all: they carry the source format through to the bind.
 // Only the tests read it here; the rail that acts on it imports its own. The
 // Metal arm tests the band instead (`load_action_in_contract`).
-use crate::runtime::decode::render::{
-    ColorAttachment, DepthAttachment, ScissorRect, StencilAttachment,
-};
 use crate::runtime::decode::resource::{
     decode_buffer_texture_descriptor, decode_depth_stencil_descriptor,
     decode_render_pipeline_descriptor, decode_texture_descriptor, texture_view_opcode,
@@ -54,6 +51,9 @@ use crate::runtime::mapper;
 use crate::runtime::mapping_write;
 use crate::runtime::mtlb::{load_mtlb, AirLoadRail};
 use crate::runtime::objects;
+use crate::runtime::render_pass::{
+    ColorAttachment, DepthAttachment, ScissorRect, StencilAttachment,
+};
 #[cfg(test)]
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 use reims_vgpu_protocol::pass_action::{is_declared_load_action, is_declared_store_action};
@@ -227,7 +227,7 @@ impl BindTableClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PastTableBind {
     pub class: BindTableClass,
-    pub stage: crate::runtime::decode::render::Stage,
+    pub stage: reims_vgpu_protocol::render::ShaderStage,
     /// The guest's own slot index, so it reads against [`BindTableClass::table`].
     pub index: u32,
     /// The object bound there. Never zero — see [`first_bind_past_table`].
@@ -236,11 +236,10 @@ pub struct PastTableBind {
 
 impl PastTableBind {
     pub fn stage_name(&self) -> &'static str {
-        match self.stage {
-            crate::runtime::decode::render::Stage::Vertex => "vertex",
-            crate::runtime::decode::render::Stage::Fragment => "fragment",
-            crate::runtime::decode::render::Stage::Unknown => "unknown",
-        }
+        // Two arms, because `ShaderStage` is the render opcode set's whole
+        // stage vocabulary. The "unknown" this used to answer with named a
+        // variant no decoder arm ever produced.
+        self.stage.name()
     }
 }
 
@@ -271,7 +270,7 @@ impl PastTableBind {
 /// wrong is a Metal exception that takes the process down, and because the check
 /// that once stood at each consumer had already drifted three ways.
 pub fn first_bind_past_table(req: &DrawEncodeRequest) -> Option<PastTableBind> {
-    use crate::runtime::decode::render::Stage;
+    use reims_vgpu_protocol::render::ShaderStage as Stage;
 
     let buffers = [
         (Stage::Vertex, &req.vertex_buffers),
@@ -909,7 +908,183 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
         report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
         return None;
     }
+    // The guest has created this pipeline object, which is the semantic model's
+    // `Declared` and nothing more — no host work has started here, and both
+    // rails reach this same door before any of theirs does.
+    //
+    // After the two zero-stage checks rather than before them: a descriptor
+    // naming no vertex or fragment function is not a pipeline the guest can
+    // ever bind, and declaring one would put a name in the table that nothing
+    // will ever advance or retire.
+    if let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) {
+        crate::runtime::drain::note_store_route(if state.declare_pipeline(name) {
+            "pipeline_declared"
+        } else {
+            "pipeline_declared_already"
+        });
+    } else {
+        // The model cannot name the slot, so it cannot hold a pipeline for it
+        // either. Counted rather than silent: every one of these is an exec
+        // transaction the ordering plane would refuse for a lease it has no
+        // entry for.
+        crate::runtime::drain::note_store_route("pipeline_declared_unnamed");
+    }
     Some(p)
+}
+
+/// Name the depth-stencil state `ds_ref` names, from whichever rail just built
+/// it.
+///
+/// One function for two call sites because the two rails load a depth-stencil
+/// state separately — `draw::vulkan::load_depth_stencil_descriptor` and
+/// `draw::metal::load_depth_stencil_state`, which differ in what they return
+/// and in whether they retain it — and the *name* is neither rail's. A boot
+/// measured four of these destroys a boot arriving with no name for the model
+/// to hold; writing the route pair twice is how the second rail comes to spell
+/// it differently and the count stops adding up.
+pub(super) fn name_depth_stencil<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ds_ref: u32,
+) {
+    objects::note_named_at_construction(
+        state,
+        host,
+        task_id,
+        ds_ref,
+        "ds_state_model_named",
+        "ds_state_model_unnamed",
+    );
+}
+
+/// Tell the ordering plane what a rail's executor found its shaders do with
+/// each bound slot.
+///
+/// Beside [`advance_pipeline`] and for the same reason: the naming is the
+/// rail-neutral half and both rails must report through one function or the
+/// counters read differently on each. Called **before** the `Ready` step, which
+/// is the order [`DeviceState::publish_pipeline_usage`] requires — a lease
+/// taken before the reflection lands gets a footprint that is conservative for
+/// the life of that transaction.
+pub(crate) fn publish_pipeline_usage<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    usage: reims_vgpu_core::pipeline::PublishedUsage,
+) {
+    let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) else {
+        crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
+        return;
+    };
+    crate::runtime::drain::note_store_route(if state.publish_pipeline_usage(name, usage) {
+        "pipeline_usage_published"
+    } else {
+        // The same population `pipeline_advance_declined` describes: a build
+        // finishing after the guest's delete, or a rail with no retained
+        // pipeline state re-walking one the table has already retired.
+        "pipeline_usage_declined"
+    });
+}
+
+/// Step the pipeline `pipeline_ref` names along its build.
+///
+/// # Why the rails call this and not the model's door directly
+///
+/// `load_render_pipeline` tells the ordering plane *that* a pipeline exists —
+/// `PipelineState::Declared`, the guest's own fact, and rail-neutral. Building
+/// it is the running rail's, and until a rail reports the result an admitted
+/// exec that leased the pipeline is parked on a compilation nothing finishes:
+/// a hang, which is worse than the `Absent` refusal an empty table gave. So
+/// every rail reports, and reports through one function so the counters read
+/// the same on both.
+///
+/// The naming is free after the first sighting — `objects::name_resource`
+/// answers from `DeviceState::object_name` and only walks the guest's list when
+/// the ref has never been seen, which by the time a pipeline is being built it
+/// has, in `load_render_pipeline`.
+///
+/// `Ready` goes through the model's own door rather than through `advance`,
+/// because becoming ready is what releases the work parked on it.
+pub(crate) fn advance_pipeline<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    next: reims_vgpu_core::pipeline::PipelineState,
+) {
+    use reims_vgpu_core::pipeline::PipelineState;
+    let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) else {
+        crate::runtime::drain::note_store_route("pipeline_advance_unnamed");
+        return;
+    };
+    let taken = if next == PipelineState::Ready {
+        let taken = state.ready_pipeline(name);
+        // The rail's own answer, beside the drain's two. See `ready_lease`.
+        if taken && crate::observe::first_sight("pipeline_lease_ready_rail", u64::from(name.slot.0))
+        {
+            crate::observe::off(format!(
+                "pipeline_lease_ready site=pipeline_lease_ready_rail slot={} gen={} task={task_id}",
+                name.slot.0, name.generation.0
+            ));
+        }
+        taken
+    } else {
+        state.advance_pipeline(name, next)
+    };
+    crate::runtime::drain::note_store_route(if taken {
+        match next {
+            PipelineState::Translating => "pipeline_translating",
+            PipelineState::Compiling => "pipeline_compiling",
+            PipelineState::Ready => "pipeline_ready",
+            _ => "pipeline_advanced_other",
+        }
+    } else {
+        // Not a defect on its own: a rail with no retained pipeline state
+        // re-walks the same pipeline on every draw and finds it already
+        // `Ready`. It is also what a build finishing after the guest's delete
+        // answers, which is why it is counted rather than dropped.
+        "pipeline_advance_declined"
+    });
+}
+
+/// The rail cannot build this pipeline, and will not be asked to try again.
+///
+/// Terminal by contract — see `reims_vgpu_core::pipeline` — so a guest
+/// re-binding a pipeline this device cannot build produces one refusal rather
+/// than one per frame, and the reason survives to whoever reads the failure
+/// channel.
+pub(crate) fn refuse_pipeline<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    reason: reims_vgpu_core::pipeline::RefusalReason,
+) {
+    let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) else {
+        crate::runtime::drain::note_store_route("pipeline_refuse_unnamed");
+        return;
+    };
+    let ended = state.refuse_pipeline(name, reason);
+    // The two facts apart. A refusal the table did not take is one that had
+    // already ended — refused before, or retired by the guest mid-build — and
+    // it is not the same event as a refusal that took and had nobody parked on
+    // it, which is every refusal until the cutover admits anything.
+    crate::runtime::drain::note_store_route(if ended.took {
+        "pipeline_refused"
+    } else {
+        "pipeline_refuse_already_ended"
+    });
+    if !ended.stranded.is_empty() {
+        crate::runtime::drain::note_store_route_n(
+            "pipeline_refuse_stranded",
+            ended.stranded.len() as u64,
+        );
+    }
+    if ended.took {
+        crate::runtime::drain::note_store_route(reason.slug());
+    }
 }
 
 /// Resolve buffer object → guest bytes starting at `offset`.
@@ -1429,7 +1604,9 @@ fn resolve_index_window_reason<M: HostMemory>(
     }
     let (gva, size) = objects::resolve_buffer_span(state, host, task_id, info.index_buffer_ref)
         .map_err(|refusal| match refusal {
-            objects::BufferSpanRefusal::Rung(objects::LadderRung::NoListEntry) => R::EntryMissing,
+            objects::BufferSpanRefusal::Rung(
+                objects::LadderRung::NoListEntry | objects::LadderRung::NoTaskSpace,
+            ) => R::EntryMissing,
             objects::BufferSpanRefusal::Rung(objects::LadderRung::WrongType { .. }) => {
                 R::ObjectType
             }
@@ -1901,7 +2078,7 @@ pub fn writeback_chain_rgba<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     task_id: u32,
-    color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
+    color_slots: &[(u32, crate::runtime::render_pass::ColorAttachment)],
     rgba: &[u8],
     cause: ChainAbandonCause,
 ) -> bool {
@@ -2145,7 +2322,7 @@ pub fn color_target_request<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &M,
     task_id: u32,
-    color: crate::runtime::decode::render::ColorAttachment,
+    color: crate::runtime::render_pass::ColorAttachment,
     pipeline_ref: u32,
     vertex_count: u32,
     instance_count: u32,
@@ -2197,8 +2374,8 @@ pub fn mrt_draw_request<M: HostMemory + HostOps>(
     host: &mut M,
     task_id: u32,
     pipeline_ref: u32,
-    color_slots: &[(u32, crate::runtime::decode::render::ColorAttachment)],
-    clears: &[crate::runtime::decode::render::ColorAttachment],
+    color_slots: &[(u32, crate::runtime::render_pass::ColorAttachment)],
+    clears: &[crate::runtime::render_pass::ColorAttachment],
     draw: crate::protocol::draw::DrawArgs,
 ) -> Option<DrawEncodeRequest> {
     if color_slots.is_empty() {

@@ -9,15 +9,101 @@
 
 use ash::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use super::context::DeviceContext;
-use super::counters::EngineCounters;
-use super::facade_decline::EngineFacadeDecline;
 use super::pools::ResourcePools;
-use super::types::{DrawError, PresentRect, TargetIdentity, WindowPresentSource};
+use super::types::{DrawError, PresentRect, WindowPresentSource};
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::translate;
+
+/// Host-window present transactions submitted to the queue and not yet retired.
+///
+/// Read by [`super::pools::ResourcePools::open_slot_mask`], which is what
+/// decides whether `dispose` may destroy a host object on the spot or must park
+/// it in the graveyard. That mask covered the engine's own command-buffer slots
+/// and its open batch, and nothing else — so a resident retired out from under a
+/// window blit that was submitted and still executing was destroyed
+/// immediately, and the blit read freed memory. `open_slot_mask`'s own
+/// documentation names this case and its remedy: a caller whose recording
+/// outlives its bookkeeping "must either do all of its bookkeeping after the
+/// submit, or make its recording slot visible here the way `open_batch` is".
+/// This is that slot.
+///
+/// A count and not a flag: the presenter runs a ring of entries
+/// ([`WindowPresenter::present_depth`]) and several can be in flight at once, so
+/// the last one to retire is what clears the slot.
+///
+/// A `static` rather than a field on either side, because it is a fact about the
+/// process: `backend::select` latches one rail, the engine owns one
+/// `VkInstance`/`VkDevice`, and `window_presenter` hangs off that same owner as
+/// one host window. It is deliberately *not* on `ResourcePools`: the registry is
+/// guest-derived state on its way to the device the guest declared it against,
+/// and a presenter that had to reach into it to say "I am still running" would
+/// be the coupling that move exists to remove.
+static WINDOW_PRESENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// Whether any host-window present is submitted and unretired.
+pub(crate) fn window_presents_in_flight() -> bool {
+    WINDOW_PRESENTS_IN_FLIGHT.load(Ordering::Acquire) != 0
+}
+
+/// Claim the window's graveyard slot for one submitted present.
+///
+/// Called only where `PresentFrame::submitted` is set, and paired with
+/// [`WindowPresenter::end_present_in_flight`] at every place it is cleared.
+fn begin_present_in_flight() {
+    WINDOW_PRESENTS_IN_FLIGHT.fetch_add(1, Ordering::Release);
+}
+
+/// Hold the window's graveyard slot for the body of a test, and give it back on
+/// drop.
+///
+/// A guard rather than a bare pair of calls, because the counter is a `static`
+/// and the suite is serial: a test that asserted its way to a panic between a
+/// claim and its release would leave every later test believing a present is
+/// outstanding, and the failure would land on an innocent test.
+#[cfg(test)]
+pub(crate) struct PresentInFlightForTest;
+
+#[cfg(test)]
+impl PresentInFlightForTest {
+    pub(crate) fn claim() -> Self {
+        begin_present_in_flight();
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PresentInFlightForTest {
+    fn drop(&mut self) {
+        WINDOW_PRESENTS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Clear `frame`'s `submitted` latch and give back the graveyard slot it
+/// claimed.
+///
+/// The two are one action and are never written apart. The latch says this
+/// entry's blit is outstanding; the slot is what `dispose` consults before
+/// destroying anything that blit may still be reading. Clearing the latch alone
+/// would open the graveyard while the blit runs — the defect the slot exists to
+/// close — and clearing the slot alone would hold it shut forever.
+///
+/// A free function over one frame rather than a method, because two of the four
+/// sites clear latches while iterating `&mut self.frames` and could not call a
+/// `&mut self` method; splitting the rule across a method and two hand-written
+/// copies is how the pair would come apart.
+///
+/// `mem::replace` and not an unconditional decrement: `recreate_swapchain` and
+/// `destroy` both clear latches that may already be clear, so the decrement has
+/// to be per claim rather than per call or it underflows.
+fn end_present_in_flight(frame: &mut PresentFrame) {
+    if std::mem::replace(&mut frame.submitted, false) {
+        WINDOW_PRESENTS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+    }
+}
 
 /// Consecutive suboptimal-flagged presents (each of which arms a swapchain
 /// recreation) before the always-on alarm names the class. Recreation normally
@@ -72,22 +158,33 @@ impl crate::observe::Decline for WindowPresentDecline {
 /// with no log line at all: the caller only reported the FIRST direct present,
 /// so a later regression into slate was invisible except as a drop in
 /// `direct_frac`. Every slate run now names its cause.
+///
+/// # Two, where there were six
+///
+/// The other four — `no_resident`, `content_not_ready`, `not_bgra`,
+/// `geom_mismatch` — were the presenter's own judgement of a resident it had
+/// re-resolved out of the registry. It resolves nothing now: the publish decides
+/// presentability a frame earlier, under the engine lock, where the registry is,
+/// and each of those four is reported there as `winpub_no_resident`,
+/// `winpub_content_not_ready`, `winpub_scanout_order` or `winpub_geometry` on
+/// the drain's route channel. A refused publish reaches this thread as no source
+/// at all, which is what [`Self::NoSource`] means.
+///
+/// The pair that remains is the pair only this thread can answer: nothing was
+/// published, or what was published has since been withdrawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlateReason {
     /// No frame source was published for this present. Expected before the
-    /// present boundary and while the guest is idle.
+    /// present boundary and while the guest is idle — and also what a publish
+    /// that *declined* looks like from here, the reason for the decline being
+    /// named at the publish.
     NoSource,
-    /// The source named candidate identities but none is in the resident
-    /// registry — the resident was evicted, or never created.
-    NoResident,
-    /// A resident exists but its content has not landed yet.
-    ContentNotReady,
-    /// A resident exists and is ready, but is not BGRA. The present blit does
-    /// no format conversion, so it cannot be shown.
-    NotBgra,
-    /// A resident exists and is ready, but at different dimensions than the
-    /// source claims — presenting it would show a torn or scaled frame.
-    GeomMismatch,
+    /// The resident this source was resolved against has since been withdrawn.
+    /// Not a statement about any resident now under that identity: the stamp
+    /// says the device replaced, dropped, re-laid-out or re-declared the one
+    /// that was promised, so the resolution the source carries may name an
+    /// image that is already destroyed.
+    SourceStale,
 }
 
 impl crate::observe::Decline for SlateReason {
@@ -101,11 +198,8 @@ impl crate::observe::Decline for SlateReason {
     /// a bare one would mix three different subsystems.
     fn slug(&self) -> &'static str {
         match self {
+            Self::SourceStale => "slate_source_stale",
             Self::NoSource => "slate_no_source",
-            Self::NoResident => "slate_no_resident",
-            Self::ContentNotReady => "slate_content_not_ready",
-            Self::NotBgra => "slate_not_bgra",
-            Self::GeomMismatch => "slate_geom_mismatch",
         }
     }
 }
@@ -152,51 +246,6 @@ impl crate::observe::Decline for StagingError {
             }
         }
     }
-}
-
-/// What the registry knows about the identity a present named, flattened so the
-/// classification below is pure and testable without a GPU.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CandidateState {
-    /// The identity resolved to a registry slot.
-    pub resident: bool,
-    pub content_ready: bool,
-    pub bgra: bool,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// Name why the resident the present named could not carry it.
-///
-/// Each arm is a distinct blocker with a distinct remedy, checked in the order
-/// a slot progresses through them (created → content landed → correct format →
-/// correct size). Collapsing them into one "no_resident" is the exact "N
-/// distinct checks share one status" trap the failure-logging rules call out.
-pub(crate) fn classify_slate(
-    source_present: bool,
-    want: (u32, u32),
-    state: CandidateState,
-) -> SlateReason {
-    if !source_present {
-        return SlateReason::NoSource;
-    }
-    if !state.resident {
-        return SlateReason::NoResident;
-    }
-    if !state.content_ready {
-        return SlateReason::ContentNotReady;
-    }
-    if !state.bgra {
-        return SlateReason::NotBgra;
-    }
-    if (state.width, state.height) != want {
-        return SlateReason::GeomMismatch;
-    }
-    // Resident, ready, BGRA and the right size — `slot_presentable` agreed with
-    // none of the blockers above, so the caller took the resident and never got
-    // here. Reaching this arm means the two disagree; report the residual class
-    // rather than inventing a sixth.
-    SlateReason::ContentNotReady
 }
 
 /// A CPU-BGRA frame offered as the present source when no resident carries the
@@ -516,12 +565,13 @@ struct PresentFrame {
     image_available: vk::Semaphore,
     in_flight: vk::Fence,
     /// Whether this entry's blit has been submitted and not yet retired.
+    ///
+    /// The only per-entry state a present still carries about its source. It
+    /// used to carry the resident identities it had pinned as well; the pin is
+    /// gone — `ResourcePools::window_holds` keeps a displayed resident off the
+    /// reclaim paths from the publish that named it, which is both wider in time
+    /// and not a write this thread has to make.
     submitted: bool,
-    /// Resident targets pinned for this present, released when its fence
-    /// retires. Per entry because two in-flight presents may pin different
-    /// surfaces and the earlier one's pins must not be dropped by the later
-    /// one's retire.
-    pinned: Vec<TargetIdentity>,
 }
 
 /// The stage the acquire semaphore is waited at, and therefore the stage the
@@ -718,7 +768,6 @@ impl WindowPresenter {
                     image_available,
                     in_flight,
                     submitted: false,
-                    pinned: Vec::new(),
                 });
             }
             Ok(())
@@ -775,7 +824,7 @@ impl WindowPresenter {
         // failure to attach: `begin_present` retries every frame until the
         // window comes back.
         if let Err(error) = presenter.recreate_swapchain(ctx) {
-            presenter.destroy(ctx, None);
+            presenter.destroy(ctx);
             return Err(error);
         }
         Ok(presenter)
@@ -796,16 +845,12 @@ impl WindowPresenter {
     /// Release every entry whose blit has finished, and say whether the entry
     /// the next present would use is free.
     ///
-    /// Sweeping all of them rather than only the next one matters for the pins:
-    /// an entry that completed is holding resident targets off the reclaim path,
-    /// and with several in flight the round-robin might not revisit it for
+    /// Sweeping all of them rather than only the next one matters for the
+    /// graveyard: an entry that completed is still holding `WINDOW_PRESENT_SLOT`
+    /// shut, and with several in flight the round-robin might not revisit it for
     /// another two presents. The return value is still about one entry, because
     /// that is the only one the caller is about to record into.
-    unsafe fn retire(
-        &mut self,
-        ctx: &DeviceContext,
-        pools: &mut ResourcePools,
-    ) -> Result<bool, DrawError> {
+    unsafe fn retire(&mut self, ctx: &DeviceContext) -> Result<bool, DrawError> {
         for ix in 0..self.frames.len() {
             if !self.frames[ix].submitted {
                 continue;
@@ -817,11 +862,7 @@ impl WindowPresenter {
             if !signaled {
                 continue;
             }
-            let pinned = std::mem::take(&mut self.frames[ix].pinned);
-            for identity in pinned {
-                let _ = pools.pin_resident_target(&identity, false);
-            }
-            self.frames[ix].submitted = false;
+            end_present_in_flight(&mut self.frames[ix]);
         }
         Ok(!self.frames[self.frame_ix].submitted)
     }
@@ -1001,7 +1042,7 @@ impl WindowPresenter {
             frame.image_available = image_available;
             // The queue idled, so nothing is outstanding regardless of what the
             // latch said before.
-            frame.submitted = false;
+            end_present_in_flight(frame);
         }
         for semaphore in self.render_finished.drain(..) {
             ctx.device.destroy_semaphore(semaphore, None);
@@ -1031,7 +1072,6 @@ impl WindowPresenter {
         &mut self,
         ctx: &DeviceContext,
         pools: &mut ResourcePools,
-        counters: &EngineCounters,
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
     ) -> Result<WindowPresentDispatch, DrawError> {
@@ -1041,7 +1081,7 @@ impl WindowPresenter {
                 self.cadence_offered = self.cadence_offered.saturating_add(1);
             }
         }
-        if !self.retire(ctx, pools)? {
+        if !self.retire(ctx)? {
             self.cadence_busy_fence = self.cadence_busy_fence.saturating_add(1);
             self.note_cadence(false, false);
             return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
@@ -1102,74 +1142,72 @@ impl WindowPresenter {
         );
         let frame_render_finished = self.render_finished[image_index as usize];
 
-        pools.batch_flush(ctx, counters)?;
-        let selected = source.and_then(|source| {
-            let slot = pools.registry_get(&source.identity)?;
-            super::pools::slot_presentable(slot, source.width, source.height).then(|| {
-                (
-                    source.identity.clone(),
-                    slot.image,
-                    slot.access,
-                    slot.width,
-                    slot.height,
-                    slot.memory.is_guest_imported(),
-                )
-            })
-        });
+        // The whole of this present's source selection, and it reads no
+        // registry.
+        //
+        // The window thread has no device to reach one through — the lock a
+        // `&DeviceState` comes behind is the one the drain holds for a whole
+        // render tranche, measured at 935-979 ms per exec packet — so the
+        // registry, which is guest-derived state on its way to the device the
+        // guest declared it against, cannot come with it. What replaced the read
+        // is one atomic load.
+        //
+        // `source.resolved` is what the publish resolved this identity to under
+        // the engine lock, and `source.epoch` is `WINDOW_SOURCE_EPOCH` as it
+        // stood at that moment. The epoch moves at every point the resolution
+        // can stop being true: `unregister_resident` (the registry's sole
+        // `remove`), `destroy_all` (its sole `drain`), `Drop for ResourcePools`,
+        // `set_registry_access` and `set_registry_format` — the last two being
+        // the only writers of the two fields production mutates on a live slot.
+        // Every other field of a slot is written once, where the slot is built.
+        //
+        // So a stamp that still compares equal is the publish's whole decision,
+        // still standing: the image is registered, its pixels landed, its byte
+        // order is the scanout's, its extent is the one being presented, and the
+        // barrier below names the access the image is actually in.
+        let stale =
+            source.is_some_and(|source| source.epoch != super::pools::window_source_epoch());
+        let selected = source
+            .filter(|_| !stale)
+            .map(|source| (source.identity.clone(), source.resolved));
         // Only reached when no resident carries this present: upload the CPU
         // bytes instead. `None` here means the window shows slate.
         let staged = if selected.is_some() {
             self.note_slate_end();
             None
         } else {
-            // Failure path only: re-read the slot to name WHY the resident could
-            // not carry. Cheap because it never runs on a good frame.
-            let state = source
-                .and_then(|source| pools.registry_get(&source.identity))
-                .map_or(CandidateState::default(), |slot| CandidateState {
-                    resident: true,
-                    content_ready: slot.content_ready,
-                    bgra: slot.scanout_order(),
-                    width: slot.width,
-                    height: slot.height,
-                });
+            // Two reasons reach here and no more. The presenter no longer judges
+            // a resident — it cannot, having no registry — so "resident but not
+            // ready", "resident but not BGRA" and "resident at the wrong size"
+            // are decided by `resident_present_decision` a frame earlier and
+            // reported there as `winpub_content_not_ready`, `winpub_scanout_order`
+            // and `winpub_geometry`. What is left is: nothing was published, or
+            // what was published has since been withdrawn.
             let want = source.map_or((0, 0), |s| (s.width, s.height));
-            let reason = classify_slate(source.is_some(), want, state);
+            let reason = if stale {
+                SlateReason::SourceStale
+            } else {
+                SlateReason::NoSource
+            };
             let staged = cpu
                 .filter(WindowCpuFrame::complete)
                 .and_then(|frame| self.stage_cpu_frame(ctx, frame));
-            self.note_slate(reason, want, state, staged.is_some());
+            self.note_slate(reason, want, source.map(|s| s.resolved), staged.is_some());
             staged
         };
-        let mut pinned = Vec::with_capacity(1);
-        if let Some((identity, _, _, _, _, _)) = selected.as_ref() {
-            if !pools.pin_resident_target(identity, true) {
-                return Err(DrawError::Facade(
-                    EngineFacadeDecline::WindowSourceDisappearedBeforePin {
-                        identity: identity.clone(),
-                    },
-                ));
-            }
-            pinned.push(identity.clone());
-        }
-
         // One blit body for both sources: they differ only in which image is
         // read and how it is made readable. Keeping them separate is how the
         // aspect-fit and letterbox-clear rules drift apart between the two
         // rails.
         let blit = selected
             .as_ref()
-            .map(
-                |(_, image, access, base_width, base_height, host_accessible)| {
-                    BlitSource::Resident {
-                        image: *image,
-                        access: *access,
-                        next_access: super::pools::ResidentAccess::transfer_read(*host_accessible),
-                        width: *base_width,
-                        height: *base_height,
-                    }
-                },
-            )
+            .map(|(_, now)| BlitSource::Resident {
+                image: now.image,
+                access: now.access,
+                next_access: super::pools::ResidentAccess::transfer_read(now.guest_imported),
+                width: now.width,
+                height: now.height,
+            })
             .or(staged);
 
         let submit_result = (|| {
@@ -1275,10 +1313,39 @@ impl WindowPresenter {
                     (0, 0, base_width, base_height),
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
-                if let Some((identity, _, _, _, _, host_accessible)) = selected.as_ref() {
+                // The window's last contact with the resident registry, and the
+                // one that stays. Two ways out of it were looked for and both
+                // are unsound; recording that here so the third reader does not
+                // spend the afternoon finding out again.
+                //
+                // **Not the publish, recording it eagerly.** The publish would
+                // be promising a transition that a `Busy` present, a failed
+                // acquire or a detached window never makes, and the registry
+                // would then describe an image the device has not moved. The lie
+                // is not the layout — a primary target rests in
+                // `TRANSFER_SRC_OPTIMAL` and `transfer_read(false)` is the same
+                // layout — it is the *access*: the next barrier over the image
+                // would name `TRANSFER_READ` as its source scope and the colour
+                // write that really happened last would never be made available.
+                //
+                // **Not a restore, transitioning back after the blit so the
+                // registry stays true.** The layout would come back and the
+                // dependency would not. A guest colour write barriering from the
+                // restored `ColorWrite` names `COLOR_ATTACHMENT_OUTPUT` as its
+                // source stage, which does not wait for this blit's `TRANSFER`
+                // read — a write-after-read on the pixels the screen is reading.
+                // The write-back exists to make that next barrier say `TRANSFER`,
+                // which is the whole of its job.
+                //
+                // What both attempts have in common is that the barrier and the
+                // record of it have to be one action, taken by whoever holds the
+                // registry, adjacent to the blit. So this write leaves when the
+                // present becomes a transaction against the device that owns the
+                // registry — not before, and not by moving the write alone.
+                if let Some((identity, now)) = selected.as_ref() {
                     pools.registry_note_access(
                         identity,
-                        super::pools::ResidentAccess::transfer_read(*host_accessible),
+                        super::pools::ResidentAccess::transfer_read(now.guest_imported),
                     );
                 }
             } else {
@@ -1323,16 +1390,12 @@ impl WindowPresenter {
             })
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
-        let submission = match submit_result {
-            Ok(submission) => submission,
-            Err(error) => {
-                for identity in pinned.drain(..) {
-                    let _ = pools.pin_resident_target(&identity, false);
-                }
-                return Err(error);
-            }
-        };
-        self.frames[frame_ix].pinned = pinned;
+        // A plain `?` now the failure arm has nothing to undo: it used to have to
+        // drop the pins this present had taken before returning.
+        let submission = submit_result?;
+        // Claimed before the latch, so the slot is never observed clear while
+        // the latch says an entry is outstanding.
+        begin_present_in_flight();
         self.frames[frame_ix].submitted = true;
         // Only a successful submit advances the ring; a `Busy` return above
         // leaves the slot for the next attempt.
@@ -1595,11 +1658,15 @@ impl WindowPresenter {
     /// window showing the guest's frame from CPU bytes (correct, and only as
     /// expensive as the host copy this rail exists to remove — a census line),
     /// and the window showing nothing at all (a visible loss — a failure line).
+    /// `promised` is the resolution the *publish* handed this thread, not a
+    /// re-read of the registry — there is no re-read any more. On
+    /// [`SlateReason::SourceStale`] it is what was withdrawn, which is the value
+    /// a reader wants; on [`SlateReason::NoSource`] there is nothing to name.
     fn note_slate(
         &mut self,
         reason: SlateReason,
         want: (u32, u32),
-        state: CandidateState,
+        promised: Option<super::pools::ResolvedResident>,
         covered: bool,
     ) {
         if self.slate_reason == Some(reason) && self.slate_covered == covered {
@@ -1612,14 +1679,15 @@ impl WindowPresenter {
         self.slate_reason = Some(reason);
         self.slate_covered = covered;
         self.slate_run = 1;
-        let seen = if state.resident {
-            format!(
-                "{}x{}/{}{}",
-                state.width, state.height, state.content_ready as u8, state.bgra as u8
-            )
-        } else {
-            "absent".to_string()
-        };
+        let seen = promised.map_or_else(
+            || "absent".to_string(),
+            |promised| {
+                format!(
+                    "{}x{}/{:?}",
+                    promised.width, promised.height, promised.access
+                )
+            },
+        );
         let emit = crate::observe::Emit::decline(
             if covered {
                 "host_window_cpu_fallback"
@@ -1689,34 +1757,24 @@ impl WindowPresenter {
         self.cadence_busy_no_area = 0;
     }
 
-    pub(crate) fn release_pins_after_idle(&mut self, pools: &mut ResourcePools) {
+    /// Give every entry's graveyard claim back after the caller has waited the
+    /// queue idle.
+    ///
+    /// It released pins as well until the presenter stopped taking any. What is
+    /// left is the claim on `WINDOW_PRESENT_SLOT`, which is the whole reason a
+    /// guest reset must call this: the bit is a `static` the graveyard consults,
+    /// so an entry that never retires would hold it shut for the rest of the
+    /// process.
+    pub(crate) fn release_claims_after_idle(&mut self) {
         for frame in &mut self.frames {
-            for identity in frame.pinned.drain(..) {
-                let _ = pools.pin_resident_target(&identity, false);
-            }
-            frame.submitted = false;
+            end_present_in_flight(frame);
         }
     }
 
-    pub(crate) unsafe fn destroy(
-        &mut self,
-        ctx: &DeviceContext,
-        pools: Option<&mut ResourcePools>,
-    ) {
+    pub(crate) unsafe fn destroy(&mut self, ctx: &DeviceContext) {
         if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::WindowDestroyQueueWaitIdle, error);
             crate::observe::Emit::decline("host_window_destroy", &decline).fail_once(0);
-        }
-        if let Some(pools) = pools {
-            for frame in &mut self.frames {
-                for identity in frame.pinned.drain(..) {
-                    let _ = pools.pin_resident_target(&identity, false);
-                }
-            }
-        } else {
-            for frame in &mut self.frames {
-                frame.pinned.clear();
-            }
         }
         if let Some(staging) = self.staging.take() {
             staging.destroy(&ctx.device);
@@ -1724,7 +1782,13 @@ impl WindowPresenter {
         // Drained rather than iterated, so a second `destroy` — `create` calls
         // it on a failed `recreate_swapchain`, and the caller may call it again
         // — cannot double-free a handle.
-        for frame in self.frames.drain(..) {
+        for mut frame in self.frames.drain(..) {
+            // `queue_wait_idle` above is what makes this sound: every entry's
+            // blit has completed, so giving the slot back here cannot open the
+            // graveyard under live work. Per entry that actually held a claim,
+            // for the reason `end_present_in_flight` uses `mem::replace` —
+            // `destroy` may run twice and a second pass has no frames left.
+            end_present_in_flight(&mut frame);
             ctx.device.destroy_fence(frame.in_flight, None);
             ctx.device.destroy_semaphore(frame.image_available, None);
         }
@@ -1972,76 +2036,6 @@ mod tests {
         assert!(line.contains("present_hz=20.0"), "{line}");
     }
 
-    fn ready(width: u32, height: u32) -> CandidateState {
-        CandidateState {
-            resident: true,
-            content_ready: true,
-            bgra: true,
-            width,
-            height,
-        }
-    }
-
-    /// No published source is the expected pre-boundary / idle case and must be
-    /// distinguishable from a source whose residents are missing.
-    #[test]
-    fn slate_without_a_source_is_named_separately() {
-        assert_eq!(
-            classify_slate(false, (0, 0), CandidateState::default()),
-            SlateReason::NoSource
-        );
-        assert_eq!(
-            classify_slate(true, (1440, 1080), CandidateState::default()),
-            SlateReason::NoResident
-        );
-    }
-
-    /// A resident that exists but has not landed content yet is the boot-era
-    /// case; it must not be reported as a missing resident.
-    #[test]
-    fn unready_resident_reports_content_not_ready() {
-        let pending = CandidateState {
-            resident: true,
-            content_ready: false,
-            bgra: true,
-            width: 1440,
-            height: 1080,
-        };
-        assert_eq!(
-            classify_slate(true, (1440, 1080), pending),
-            SlateReason::ContentNotReady
-        );
-    }
-
-    /// A resident that is ready and BGRA but the wrong size is the geometry
-    /// class — the actionable fact is the size, and it must not be folded into
-    /// `ContentNotReady`, whose remedy (wait a frame) would never converge.
-    #[test]
-    fn a_ready_resident_at_the_wrong_size_is_the_geometry_class() {
-        assert_eq!(
-            classify_slate(true, (1440, 1080), ready(1920, 1080)),
-            SlateReason::GeomMismatch
-        );
-    }
-
-    /// A ready non-BGRA resident is its own class — the present blit does no
-    /// format conversion, so collapsing it into content_not_ready would send a
-    /// reader hunting the wrong bug.
-    #[test]
-    fn non_bgra_resident_is_its_own_reason() {
-        let state = CandidateState {
-            resident: true,
-            content_ready: true,
-            bgra: false,
-            width: 1440,
-            height: 1080,
-        };
-        assert_eq!(
-            classify_slate(true, (1440, 1080), state),
-            SlateReason::NotBgra
-        );
-    }
-
     /// Every reason has a distinct, `slate_`-prefixed slug.
     ///
     /// What the prefix buys beyond distinctness is keeping a grep for this
@@ -2050,14 +2044,7 @@ mod tests {
     #[test]
     fn slate_reason_slugs_are_distinct_and_namespaced() {
         use crate::observe::Decline;
-        let mut slugs = [
-            SlateReason::NoSource,
-            SlateReason::NoResident,
-            SlateReason::ContentNotReady,
-            SlateReason::NotBgra,
-            SlateReason::GeomMismatch,
-        ]
-        .map(|r| r.slug());
+        let mut slugs = [SlateReason::NoSource, SlateReason::SourceStale].map(|r| r.slug());
         for s in slugs {
             assert!(s.starts_with("slate_"), "{s} is not namespaced");
         }
@@ -2089,19 +2076,6 @@ mod tests {
             crate::observe::Emit::decline("host_window_present", &suboptimal).render(),
             "host_window_present reason=window_present_suboptimal_persistent \
              streak=60 width=1440 height=1080"
-        );
-    }
-
-    /// A resident that clears every blocker still has to come back with *some*
-    /// reason, because the classifier only runs after `slot_presentable` already
-    /// refused. The two disagreeing is a defect in one of them, and the residual
-    /// class is what makes it visible instead of a panic or a sixth variant that
-    /// nothing else ever reads.
-    #[test]
-    fn a_resident_that_clears_every_blocker_falls_to_the_residual_class() {
-        assert_eq!(
-            classify_slate(true, (1440, 1080), ready(1440, 1080)),
-            SlateReason::ContentNotReady
         );
     }
 

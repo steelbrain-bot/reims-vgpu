@@ -129,8 +129,6 @@ pub mod refusal;
 use crate::model::{ComputeStorageResidencyKey, DeviceInfoLimits, DeviceState};
 use crate::runtime::blit_exec::{BlitStatus, LinearTextureLevel, MapperRefTexture};
 use crate::runtime::compute_exec::{ComputeAccum, ComputeStatus, ResidentServe};
-use crate::runtime::decode::blit::Command as BlitCommand;
-use crate::runtime::decode::compute::Command as ComputeCommand;
 use crate::runtime::draw::{DrawEncodeRequest, EncodeStatus, GvaSpan};
 use crate::runtime::guest_ram::{GuestRamImport, ImportId};
 use crate::runtime::gva_store_witness::GvaTargetKey;
@@ -138,6 +136,9 @@ use crate::runtime::host::{HostMemory, HostOps};
 use crate::runtime::resident_target::ResidentTarget;
 use crate::runtime::writeback_debt::GvaWritebackDebt;
 pub(crate) use compute_session::ComputeSession;
+use reims_vgpu_protocol::compute::DispatchType;
+use reims_vgpu_protocol::decode::blit::TextureSlices as BlitSliceCopy;
+use reims_vgpu_protocol::decode::compute::DispatchRecord;
 use std::sync::Arc;
 
 /// How a rail's own completion thread announces a finished stamp back to the
@@ -296,7 +297,7 @@ pub(crate) trait Backend: Copy {
         _state: &mut DeviceState,
         _host: &mut M,
         _task_id: u32,
-        _cmd: &BlitCommand,
+        _cmd: &BlitSliceCopy,
     ) -> Option<BlitStatus> {
         None
     }
@@ -333,7 +334,7 @@ pub(crate) trait Backend: Copy {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
     ) -> ComputeStatus;
 
     /// Open a multi-record encoder for one compute segment.
@@ -350,7 +351,10 @@ pub(crate) trait Backend: Copy {
                   refusal names the check that refused; see this module's note \
                   on the same exemption for `backend::metal`"
     )]
-    fn open_compute_session(&self, dispatch_type: u32) -> Result<ComputeSession, ComputeStatus>;
+    fn open_compute_session(
+        &self,
+        dispatch_type: DispatchType,
+    ) -> Result<ComputeSession, ComputeStatus>;
 
     /// Execute a dispatch onto an already-open session's encoder.
     ///
@@ -362,7 +366,7 @@ pub(crate) trait Backend: Copy {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
         session: &mut ComputeSession,
     ) -> ComputeStatus;
 
@@ -442,7 +446,12 @@ pub(crate) trait Backend: Copy {
     ///
     /// Called at the drain tail, so a deferred batch cannot sit until the next
     /// guest packet arrives.
-    fn flush_deferred_submissions(&self) {}
+    ///
+    /// Takes the device because a rail whose caches belong to the device's own
+    /// rail slot needs them here: this is one of the places a device loss is
+    /// acted on, and acting on one drops everything derived from the `VkDevice`
+    /// that is going away.
+    fn flush_deferred_submissions(&self, _state: &DeviceState) {}
 
     /// Submit the batch a guest-awaited completion stamp is parked in, and say
     /// whether that submission was this call's doing.
@@ -792,7 +801,12 @@ pub(crate) trait Backend: Copy {
     /// A rail with nothing to say at a site says nothing. That is not the same
     /// as a zero: an absent `engine_delta` means no such engine, where
     /// `engine_delta …=0` would mean an idle one.
-    fn emit_census(&self, _site: CensusSite) {}
+    ///
+    /// Takes the device because some of what a rail counts is held per device
+    /// rather than per process — the Vulkan rail's object caches live in this
+    /// device's own rail slot — and a census that could not name the device
+    /// would be reporting somebody else's levels.
+    fn emit_census(&self, _state: &DeviceState, _site: CensusSite) {}
 
     /// What this rail remembers drawing into one plane since this witness last
     /// asked, formatted as census fields.
@@ -952,9 +966,10 @@ pub(crate) trait Backend: Copy {
         _state: &DeviceState,
         _host: &M,
         _task_id: u32,
-        _streams: &[Vec<u8>],
-    ) -> bool {
-        false
+        _render_pipelines: &[u32],
+        _compute_dispatches: &[(u32, [u32; 3])],
+    ) -> Vec<u32> {
+        Vec::new()
     }
 
     /// What this rail can already serve for one compute binding, so the guest
@@ -1285,7 +1300,7 @@ impl Backend for SelectedBackend {
         state: &mut DeviceState,
         host: &mut M,
         task_id: u32,
-        cmd: &BlitCommand,
+        cmd: &BlitSliceCopy,
     ) -> Option<BlitStatus> {
         match self {
             #[cfg(feature = "backend-metal")]
@@ -1332,18 +1347,21 @@ impl Backend for SelectedBackend {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
     ) -> ComputeStatus {
         match self {
             #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.execute_dispatch(state, host, task_id, acc, cmd),
+            Self::Metal(b) => b.execute_dispatch(state, host, task_id, acc, dispatch),
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.execute_dispatch(state, host, task_id, acc, cmd),
+            Self::Vulkan(b) => b.execute_dispatch(state, host, task_id, acc, dispatch),
         }
     }
 
     #[allow(clippy::result_large_err, reason = "see the trait declaration")]
-    fn open_compute_session(&self, dispatch_type: u32) -> Result<ComputeSession, ComputeStatus> {
+    fn open_compute_session(
+        &self,
+        dispatch_type: DispatchType,
+    ) -> Result<ComputeSession, ComputeStatus> {
         match self {
             #[cfg(feature = "backend-metal")]
             Self::Metal(b) => b.open_compute_session(dispatch_type),
@@ -1358,14 +1376,18 @@ impl Backend for SelectedBackend {
         host: &mut M,
         task_id: u32,
         acc: &ComputeAccum,
-        cmd: &ComputeCommand,
+        dispatch: &DispatchRecord,
         session: &mut ComputeSession,
     ) -> ComputeStatus {
         match self {
             #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
+            Self::Metal(b) => {
+                b.execute_dispatch_nested(state, host, task_id, acc, dispatch, session)
+            }
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.execute_dispatch_nested(state, host, task_id, acc, cmd, session),
+            Self::Vulkan(b) => {
+                b.execute_dispatch_nested(state, host, task_id, acc, dispatch, session)
+            }
         }
     }
 
@@ -1546,12 +1568,12 @@ impl Backend for SelectedBackend {
         }
     }
 
-    fn flush_deferred_submissions(&self) {
+    fn flush_deferred_submissions(&self, state: &DeviceState) {
         match self {
             #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.flush_deferred_submissions(),
+            Self::Metal(b) => b.flush_deferred_submissions(state),
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.flush_deferred_submissions(),
+            Self::Vulkan(b) => b.flush_deferred_submissions(state),
         }
     }
 
@@ -1683,12 +1705,12 @@ impl Backend for SelectedBackend {
         }
     }
 
-    fn emit_census(&self, site: CensusSite) {
+    fn emit_census(&self, state: &DeviceState, site: CensusSite) {
         match self {
             #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.emit_census(site),
+            Self::Metal(b) => b.emit_census(state, site),
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.emit_census(site),
+            Self::Vulkan(b) => b.emit_census(state, site),
         }
     }
 
@@ -1788,13 +1810,18 @@ impl Backend for SelectedBackend {
         state: &DeviceState,
         host: &M,
         task_id: u32,
-        streams: &[Vec<u8>],
-    ) -> bool {
+        render_pipelines: &[u32],
+        compute_dispatches: &[(u32, [u32; 3])],
+    ) -> Vec<u32> {
         match self {
             #[cfg(feature = "backend-metal")]
-            Self::Metal(b) => b.preflight_translations(state, host, task_id, streams),
+            Self::Metal(b) => {
+                b.preflight_translations(state, host, task_id, render_pipelines, compute_dispatches)
+            }
             #[cfg(feature = "backend-vulkan")]
-            Self::Vulkan(b) => b.preflight_translations(state, host, task_id, streams),
+            Self::Vulkan(b) => {
+                b.preflight_translations(state, host, task_id, render_pipelines, compute_dispatches)
+            }
         }
     }
 
