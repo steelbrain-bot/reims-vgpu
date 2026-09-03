@@ -932,6 +932,32 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     Some(p)
 }
 
+/// Name the depth-stencil state `ds_ref` names, from whichever rail just built
+/// it.
+///
+/// One function for two call sites because the two rails load a depth-stencil
+/// state separately — `draw::vulkan::load_depth_stencil_descriptor` and
+/// `draw::metal::load_depth_stencil_state`, which differ in what they return
+/// and in whether they retain it — and the *name* is neither rail's. A boot
+/// measured four of these destroys a boot arriving with no name for the model
+/// to hold; writing the route pair twice is how the second rail comes to spell
+/// it differently and the count stops adding up.
+pub(super) fn name_depth_stencil<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    ds_ref: u32,
+) {
+    objects::note_named_at_construction(
+        state,
+        host,
+        task_id,
+        ds_ref,
+        "ds_state_model_named",
+        "ds_state_model_unnamed",
+    );
+}
+
 /// Step the pipeline `pipeline_ref` names along its build.
 ///
 /// # Why the rails call this and not the model's door directly

@@ -3073,6 +3073,44 @@ fn declare_object_name(
 /// resolve, and they stop resolving when the guest deletes them. See
 /// `reims_vgpu_core::namespace`. Their storage is `Storage::NoBytes`, which the
 /// declaration carries as `None`.
+/// Name the slot a construction has just resolved, and say whether it took.
+///
+/// # Why construction is where naming has to happen for these kinds
+///
+/// A destroy arrives after the guest has cleared its object-list slot — 2072
+/// of ~2160 on a driven boot — so the destroy itself cannot name what it ends.
+/// [`name_resource`] answers from `DeviceState::object_name` before the guest's
+/// list, which means a slot named while it was still live is still nameable
+/// afterwards; a slot never named is a destroy `SessionModel::admit` refuses
+/// with `UnknownRef`. So each kind is named where it is *constructed*, which is
+/// a different site per kind, and the boot-measured population says which sites
+/// are worth one: `delete_unnamed_*` names the eleven kinds apart precisely so
+/// this is aimed rather than guessed.
+///
+/// The two routes are the caller's because they name the kind, and a caller
+/// that passed a `format!` would be a counter no reader greps.
+pub fn note_named_at_construction<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+    named: &'static str,
+    unnamed: &'static str,
+) {
+    crate::runtime::drain::note_store_route(
+        if name_resource(state, host, task_id, obj_ref).is_some() {
+            named
+        } else {
+            // The model cannot name the slot even now, while the construction
+            // that asked for it is succeeding. Counted rather than silent: it
+            // means the list entry the construction read is not the one
+            // `name_resource` walks, which is a namespace question and not a
+            // missing call.
+            unnamed
+        },
+    );
+}
+
 pub fn name_resource<M: HostMemory>(
     state: &DeviceState,
     host: &M,

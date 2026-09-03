@@ -355,6 +355,56 @@ fn constructing_a_sampler_names_its_slot_so_its_destroy_can_still_be_resolved() 
     );
 }
 
+/// Naming at construction is a name that outlives the guest's list entry, and
+/// it is taken for every object type rather than for resources alone.
+///
+/// The kinds this door is called for are the ones a driven boot measured
+/// arriving at `CmdDeleteObject` with no name the model could hold — depth
+/// stencil 4, function 5, compute pipeline 3, against about 2160 destroys — and
+/// each is named at its own construction site because there is no shared one.
+/// What every site depends on is this: the name is taken while the entry is
+/// live, and it answers afterwards, because the guest clears the slot before it
+/// sends the destroy.
+///
+/// The fixture uses a sampler's object-list entry because the entry is the
+/// whole input — `name_resource` names a sampler, a function and a pipeline
+/// state by their slots exactly as it names a texture, and a door that behaved
+/// differently per type would be the bug this asserts against.
+#[test]
+fn naming_at_construction_outlives_the_guests_list_entry() {
+    let mut host = FakeHost::new();
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    setup_task_with_list(&mut host, &mut state);
+    put_sampler_object(&mut host, 3, 0x100, 0.5);
+
+    assert_eq!(state.object_name(1, 3), None);
+    super::note_named_at_construction(&state, &host, 1, 3, "named", "unnamed");
+    let named = state
+        .object_name(1, 3)
+        .expect("the door names the slot it was called for");
+
+    // What the guest does before every destroy this population is about.
+    let cleared = [0u8; OBJECT_LIST_ENTRY_LEN];
+    let data_gpa = 4u64 << PAGE_SHIFT_ARM64E;
+    let _ = host.write_gpa(data_gpa + 3 * OBJECT_LIST_ENTRY_LEN as u64, &cleared);
+    assert_eq!(
+        lookup_list_entry(&state, &host, 1, 3),
+        None,
+        "the fixture must really have cleared the entry, or this proves nothing"
+    );
+    assert_eq!(
+        super::name_resource(&state, &host, 1, 3),
+        Some(named),
+        "so the destroy has a resource to name and does not have to be refused"
+    );
+
+    // A slot with no entry at all cannot be named even at construction time,
+    // and the door says so rather than inventing one — that is what the
+    // `unnamed` route counts.
+    super::note_named_at_construction(&state, &host, 1, 5, "named", "unnamed");
+    assert_eq!(state.object_name(1, 5), None);
+}
+
 #[test]
 fn failed_sampler_construction_is_not_retained_and_can_retry() {
     use crate::runtime::decode::resource::OBJECT_TYPE_SERIALIZER_OBJECT;

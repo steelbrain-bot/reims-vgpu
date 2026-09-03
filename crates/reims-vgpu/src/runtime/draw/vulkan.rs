@@ -13499,6 +13499,7 @@ pub(super) fn load_depth_stencil_descriptor<M: HostMemory + HostOps>(
     // `resolve_sampler_state`: a descriptor still being published can succeed on
     // retry, and retaining a failure would make that retry impossible.
     crate::runtime::drain::note_store_route("ds_state_constructed");
+    super::name_depth_stencil(state, host, task_id, ds_ref);
     Ok((*state
         .task_depth_stencil_states
         .register(task_id, ds_ref, std::sync::Arc::new(decoded)))

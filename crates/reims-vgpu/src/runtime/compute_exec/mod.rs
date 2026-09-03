@@ -986,6 +986,19 @@ pub(crate) fn load_compute_pipeline<M: HostMemory + HostOps>(
     };
     match decoded {
         ResourceDescriptor::ComputePipeline(cp) if cp.kernel_func_ref != 0 => {
+            // The slot holds a compute pipeline, so the model can hold its name
+            // — and its destroy arrives after the guest has cleared the slot,
+            // which makes this the only moment. Inside the arm that has decided
+            // what the descriptor *is*: a serializer object of some other
+            // subtype is not this kind and must not be named as one.
+            crate::runtime::objects::note_named_at_construction(
+                state,
+                host,
+                task_id,
+                pipeline_ref,
+                "compute_pipeline_model_named",
+                "compute_pipeline_model_unnamed",
+            );
             // A descriptor that named more entries than the decoder kept refuses
             // the whole pipeline. Dropping only the stage-input is not "failing
             // closed": `stage_input: None` is what a kernel declaring no

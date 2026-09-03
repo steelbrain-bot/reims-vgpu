@@ -1610,6 +1610,7 @@ fn load_depth_stencil_state<M: HostMemory + HostOps>(
             reason,
         }
     })?;
+    crate::runtime::draw::name_depth_stencil(state, host, task_id, ds_ref);
     Ok(ReimsVgpuDepthStencilState {
         depth_compare_function: d.depth_compare_function,
         depth_write_enabled: if d.depth_write_enabled { 1 } else { 0 },
