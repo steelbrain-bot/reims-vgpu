@@ -640,7 +640,8 @@ mod tests {
     fn a_single_resource_operation_names_that_resource() {
         let one = crate::lifecycle::LifecycleOp::DeleteResource {
             task: crate::identity::TaskId(1),
-            resource: resource(4),
+            object_ref: 4,
+            resource: Some(resource(4)),
         };
         assert_eq!(one.resources(), &[resource(4)]);
         assert_eq!(

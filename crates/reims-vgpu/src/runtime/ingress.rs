@@ -1838,6 +1838,91 @@ mod tests {
         );
     }
 
+    /// An object namespace that names nothing, for the packets whose whole
+    /// question is what an unnameable reference does.
+    struct NoObjects;
+
+    impl reims_vgpu_core::resolve::TaskNamespaces for NoObjects {
+        fn resource(
+            &self,
+            _task: reims_vgpu_core::identity::TaskId,
+            _object_ref: u32,
+        ) -> Option<reims_vgpu_core::identity::ResourceId> {
+            None
+        }
+    }
+
+    /// A delete whose ref names nothing still crosses; a re-point's does not.
+    ///
+    /// **The two commands carry the same `{task, object}` record and must not
+    /// get the same answer.** The guest clears its own object-list slot before
+    /// it sends the delete, so an unnameable ref is the *ordinary* case for a
+    /// delete — a driven macos-15 boot through this model refused 741 packets of
+    /// guest work on it, each one a `CmdDeleteResource` whose device-side
+    /// teardown is keyed by `(task, ref)` and needed no name at all. A re-point
+    /// with no resource to re-point is not a re-point, and still refuses.
+    ///
+    /// The empty access list is the other half: a delete this model cannot name
+    /// is ordered against nothing, because a resource with no name is one no
+    /// other operation in the model can name either.
+    #[test]
+    fn an_unnamed_ref_still_deletes_and_still_refuses_a_repoint() {
+        use reims_vgpu_core::lifecycle::{LifecycleKind, LifecycleOp};
+
+        let row_for = |kind| {
+            LEDGER
+                .iter()
+                .find(|row| LifecycleKind::of(row.channel, row.opcode) == Some(kind))
+                .expect("the ledger has a row for every lifetime kind")
+        };
+        let unnamed = |row: &reims_vgpu_protocol::packets::Packet| {
+            let fifo = fifo_for(row.channel);
+            packet(
+                fifo,
+                SessionGeneration::FIRST,
+                StampSlot(0),
+                &drained(row.opcode),
+                Resolvers {
+                    mappings: &EveryMapping,
+                    objects: &NoObjects,
+                    storage: &EveryStorage,
+                    replies: &EveryReply,
+                },
+                device_inputs(&mut NoAccesses),
+            )
+        };
+
+        let deleted = unnamed(row_for(LifecycleKind::DeleteResource))
+            .expect("a delete is not lost to a reference the guest already cleared");
+        let Payload::ResourceLifecycle(payload) = &deleted.payload else {
+            panic!("a lifetime command must not build another class's payload");
+        };
+        assert!(
+            matches!(
+                payload.op(),
+                LifecycleOp::DeleteResource {
+                    object_ref,
+                    resource: None,
+                    ..
+                } if *object_ref == 0
+            ),
+            "the reference travels even when the name does not: {:?}",
+            payload.op()
+        );
+        assert!(
+            payload.accesses().is_empty(),
+            "a delete this model cannot name is ordered against nothing"
+        );
+
+        assert!(
+            matches!(
+                unnamed(row_for(LifecycleKind::ReplacePhysical)),
+                Err(Blocked::Refused { .. })
+            ),
+            "a re-point with no resource to re-point is not a re-point"
+        );
+    }
+
     /// [`packet`] over the ledger sweep's namespaces, so a test naming one
     /// packet does not restate the four arguments the sweep already fixes.
     fn packet_of(fifo: Fifo, drained: &drain::Packet) -> Result<Packet, Blocked> {

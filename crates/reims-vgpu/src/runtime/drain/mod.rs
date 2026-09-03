@@ -2384,7 +2384,15 @@ fn admit_and_park<H: HostMemory + HostOps>(
     let mut built = match built {
         Ok(built) => built,
         Err(blocked) => {
-            note_unadmitted(state, host, fifo, completion_slot, &packet, blocked.slug());
+            note_unadmitted(
+                state,
+                host,
+                fifo,
+                completion_slot,
+                &packet,
+                blocked.slug(),
+                || format!("{blocked:?}"),
+            );
             return;
         }
     };
@@ -2441,7 +2449,15 @@ fn admit_and_park<H: HostMemory + HostOps>(
     let admission = match state.admit_packet(&built) {
         Ok(admission) => admission,
         Err(refusal) => {
-            note_unadmitted(state, host, fifo, completion_slot, &packet, refusal.slug());
+            note_unadmitted(
+                state,
+                host,
+                fifo,
+                completion_slot,
+                &packet,
+                refusal.slug(),
+                || format!("{refusal:?}"),
+            );
             return;
         }
     };
@@ -2612,6 +2628,21 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         let Some((submission, leases)) = state.parked.planning(ingress) else {
             continue;
         };
+        // A position whose every lease is already `Ready` has had the rail's
+        // promise made for it, and this pass cannot make it again: `ready_lease`
+        // would find every step illegal and `preflight_submission` would re-walk
+        // the same records to reach the same memo. It is still parked for
+        // something else — a stamp, or a dependency — and neither is this
+        // function's to move. Skipping it is what makes the pump proportional to
+        // the pipelines still building rather than to the parked population
+        // times the passes: a partial boot measured
+        // `parked_translations_finished = 282 172` against 137 pipelines
+        // declared and readied, which is the same handful of plans re-walked
+        // thousands of times.
+        if leases.iter().all(|&lease| state.pipeline_is_ready(lease)) {
+            note_store_route("parked_translations_already_ready");
+            continue;
+        }
         let mut measured_ns = 0u64;
         if crate::runtime::exec::preflight_submission(state, &*host, submission, &mut measured_ns) {
             continue;
@@ -2710,6 +2741,10 @@ fn note_unadmitted<H: HostMemory + HostOps>(
     completion_slot: u32,
     packet: &Packet,
     reason: &'static str,
+    // The refusal's own value, rendered only when the line is written. The two
+    // call sites hold different types and neither is worth a formatted string
+    // on a path that is silent after its first sighting.
+    detail: impl FnOnce() -> String,
 ) {
     note_store_route("packet_unadmitted");
     note_store_route(reason);
@@ -2718,12 +2753,13 @@ fn note_unadmitted<H: HostMemory + HostOps>(
         (u64::from(fifo.domain().0) << 32) | u64::from(packet.opcode),
     ) {
         crate::observe::fail(format!(
-            "packet_unadmitted ch={} opcode={:#x} reason={reason} (the ordering plane would \
-             not take this packet, so its work did not run; its completion word is written \
-             out of band because the guest polls it and no ordering position exists to \
-             publish it through)",
+            "packet_unadmitted ch={} opcode={:#x} reason={reason} refusal={} (the \
+             ordering plane would not take this packet, so its work did not run; its \
+             completion word is written out of band because the guest polls it and no \
+             ordering position exists to publish it through)",
             fifo.domain().0,
-            packet.opcode
+            packet.opcode,
+            detail()
         ));
     }
     publish_word(

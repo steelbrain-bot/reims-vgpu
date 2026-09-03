@@ -281,9 +281,31 @@ pub enum LifecycleOp {
         slot: ObjectListRef,
         storage: Storage,
     },
+    /// The guest is ending one object-list slot's resource.
+    ///
+    /// # The name is optional for the reason a destroy's is
+    ///
+    /// This carried a bare `ResourceId` and an unresolvable reference refused
+    /// the whole packet, which is the same wrong answer
+    /// [`Self::DeleteObject::resource`] records and for the same reason: the
+    /// guest clears its own object-list slot *before* it sends the delete, so a
+    /// slot this device never named answers nothing when the delete arrives.
+    /// A driven macos-15 boot refused 25 packets of guest work on it.
+    ///
+    /// A refusal there loses more than the name. Every rail's teardown for this
+    /// command — the resolution memo, the GVA resource, the bound-buffer
+    /// retirement — is keyed by `(task, ref)` and not by a name, so refusing
+    /// the packet leaves the device holding the very state the delete came to
+    /// drop. So the reference travels beside the name, exactly as a destroy's
+    /// does, and `None` orders the operation against nothing: a resource this
+    /// model cannot name is one no other operation in it can name either.
     DeleteResource {
         task: TaskId,
-        resource: ResourceId,
+        /// The guest's own number, which the rail's `(task, ref)`-keyed
+        /// teardown needs whether or not the model has a name.
+        object_ref: u32,
+        /// The name, when the object namespace has one.
+        resource: Option<ResourceId>,
     },
     /// The guest has given an interval of this task's GPU virtual address
     /// space pages, and says so after it has already applied the change to its
@@ -427,14 +449,14 @@ impl LifecycleOp {
             | Self::Synchronize { resources, .. }
             | Self::SynchronizeAndDiscard { resources, .. }
             | Self::Discard { resources, .. } => resources,
-            Self::DeleteResource { resource, .. } | Self::ReplacePhysical { resource, .. } => {
-                std::slice::from_ref(resource)
-            }
+            Self::ReplacePhysical { resource, .. } => std::slice::from_ref(resource),
             // Empty when the namespace has no name for it, which is the honest
             // answer rather than a missing one: a resource this model cannot
             // name is one nothing else in it names, so a delete of it conflicts
             // with nothing.
-            Self::DeleteObject { resource, .. } => resource.as_slice(),
+            Self::DeleteObject { resource, .. } | Self::DeleteResource { resource, .. } => {
+                resource.as_slice()
+            }
             // A task's own lifetime, an address interval, a slot declaration
             // and a backing retirement each name something that is not a
             // resource id.
@@ -1185,19 +1207,28 @@ pub fn object_reference(
     let resolver = crate::resolve::InTask::new(namespaces, task);
     // The ref is resolved before the kind is judged, so a re-point naming a
     // dead object refuses as a dead object rather than as unfinished work here.
-    let resource = crate::resolve::RefResolver::resource(&resolver, command.object_id).ok_or(
-        ResolveRefusal::UnknownRef {
-            object_ref: command.object_id,
-        },
-    )?;
+    // The two kinds differ in what an unresolvable one *means*, which is why the
+    // refusal is each arm's and not this line's: a delete whose slot the guest
+    // already cleared is ordinary, and a re-point with no resource to re-point
+    // is not a re-point.
+    let resource = crate::resolve::RefResolver::resource(&resolver, command.object_id);
     match kind {
-        LifecycleKind::DeleteResource => Ok(LifecycleOp::DeleteResource { task, resource }),
+        LifecycleKind::DeleteResource => Ok(LifecycleOp::DeleteResource {
+            task,
+            object_ref: command.object_id,
+            resource,
+        }),
         // `ReplacePhysical`, and nothing else reaches here. The two terms it
         // did resolve travel with the refusal; see `NeedsStorage`.
-        other => Err(ResolveRefusal::NeedsStorage {
-            kind: other,
-            task,
-            resource,
+        other => Err(match resource {
+            Some(resource) => ResolveRefusal::NeedsStorage {
+                kind: other,
+                task,
+                resource,
+            },
+            None => ResolveRefusal::UnknownRef {
+                object_ref: command.object_id,
+            },
         }),
     }
 }
@@ -1776,9 +1807,14 @@ impl Lifecycle {
                 slot,
                 storage,
             } => self.create_resource(*task, *slot, *storage),
-            LifecycleOp::DeleteResource { task, resource } => {
-                self.delete_resource(*task, *resource)
-            }
+            LifecycleOp::DeleteResource { task, resource, .. } => match resource {
+                Some(resource) => self.delete_resource(*task, *resource),
+                // The same `None` [`LifecycleOp::DeleteObject`]'s arm answers,
+                // for the same reason: this model never named the slot, so it
+                // holds nothing to retire, and the rail's `(task, ref)`-keyed
+                // teardown is the half with work left.
+                None => Ok(Effects::default()),
+            },
             LifecycleOp::MapMemory { task, span } => self.remap(*task, *span, true),
             LifecycleOp::UnmapMemory { task, span } => self.remap(*task, *span, false),
             LifecycleOp::ReplacePhysical {
@@ -2476,7 +2512,8 @@ mod tests {
             },
             LifecycleOp::DeleteResource {
                 task: TASK,
-                resource: name(0),
+                object_ref: 0,
+                resource: Some(name(0)),
             },
             LifecycleOp::MapMemory { task: TASK, span },
             LifecycleOp::UnmapMemory { task: TASK, span },
@@ -3662,7 +3699,8 @@ mod tests {
             object_reference(LifecycleKind::DeleteResource, &payload, &Everything),
             Ok(LifecycleOp::DeleteResource {
                 task: TASK,
-                resource,
+                object_ref: 7,
+                resource: Some(resource),
             })
         );
         assert_eq!(
@@ -3702,7 +3740,8 @@ mod tests {
             ),
             Ok(LifecycleOp::DeleteResource {
                 task: TASK,
-                resource: id,
+                object_ref: 7,
+                resource: Some(id),
             })
         );
 
@@ -3723,8 +3762,13 @@ mod tests {
                 &crate::resolve::SameForEveryTask(&names),
                 &EveryMapping
             ),
-            Err(ResolveRefusal::UnknownRef { object_ref: 7 }),
-            "a deleted slot stops resolving"
+            Ok(LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 7,
+                resource: None,
+            }),
+            "a deleted slot stops *naming* — and the delete is still the \
+             operation, because the rail's teardown is keyed by the reference"
         );
         let redeclared = names.declare(ObjectListRef(7), Some(crate::access::BackingId(11)));
         assert_eq!(
@@ -3742,7 +3786,8 @@ mod tests {
             ),
             Ok(LifecycleOp::DeleteResource {
                 task: TASK,
-                resource: again,
+                object_ref: 7,
+                resource: Some(again),
             })
         );
     }
@@ -3859,22 +3904,41 @@ mod tests {
         );
     }
 
-    /// A ref naming nothing live refuses on the ref, for both kinds — the
-    /// object is judged before the operation is.
+    /// A ref naming nothing live is a refusal for the re-point and an answer
+    /// for the delete, and the two kinds share one record.
+    ///
+    /// **The asymmetry is the point.** A re-point with no resource to re-point
+    /// is not a re-point: the operation's whole content is moving one named
+    /// resource's storage, so an unresolvable ref leaves nothing to carry. A
+    /// delete's effect is keyed by the reference — every rail's teardown for it
+    /// is `(task, ref)` and not a name — and the guest clears its own
+    /// object-list slot before sending the delete, so refusing on the name
+    /// throws away the packet for the ordinary case. See
+    /// [`LifecycleOp::DeleteResource::resource`], and
+    /// [`LifecycleOp::DeleteObject::resource`] for the destroy that established
+    /// this shape.
     #[test]
-    fn an_object_reference_naming_nothing_refuses_on_the_ref() {
+    fn an_unnamed_ref_refuses_a_repoint_and_still_deletes() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&TASK.0.to_le_bytes());
         payload.extend_from_slice(&7u32.to_le_bytes());
-        for kind in [
-            LifecycleKind::DeleteResource,
-            LifecycleKind::ReplacePhysical,
-        ] {
-            assert_eq!(
-                object_reference(kind, &payload, &Nothing),
-                Err(ResolveRefusal::UnknownRef { object_ref: 7 })
-            );
-        }
+        assert_eq!(
+            object_reference(LifecycleKind::ReplacePhysical, &payload, &Nothing),
+            Err(ResolveRefusal::UnknownRef { object_ref: 7 })
+        );
+        let deleted = object_reference(LifecycleKind::DeleteResource, &payload, &Nothing);
+        assert_eq!(
+            deleted,
+            Ok(LifecycleOp::DeleteResource {
+                task: TASK,
+                object_ref: 7,
+                resource: None,
+            })
+        );
+        // And it orders against nothing, which is what makes admitting it safe:
+        // a resource this model cannot name is one no other operation in it can
+        // name either.
+        assert!(deleted.expect("an operation").resources().is_empty());
     }
 
     /// Each join refuses every kind that is not its own, and the kinds that
@@ -4509,20 +4573,22 @@ mod tests {
             named(5),
             LifecycleOp::DeleteResource {
                 task: TaskId(5),
-                resource: ResourceId {
+                object_ref: REF,
+                resource: Some(ResourceId {
                     slot: ObjectListRef(REF),
                     generation: SlotGeneration(6),
-                },
+                }),
             }
         );
         assert_eq!(
             named(9),
             LifecycleOp::DeleteResource {
                 task: TaskId(9),
-                resource: ResourceId {
+                object_ref: REF,
+                resource: Some(ResourceId {
                     slot: ObjectListRef(REF),
                     generation: SlotGeneration(10),
-                },
+                }),
             },
             "the same ref number, a different packet task, a different resource \u{2014}              which is what makes a caller-chosen namespace a wrong answer rather              than a refusal"
         );
@@ -4973,7 +5039,8 @@ mod tests {
         let effects = l
             .apply(&LifecycleOp::DeleteResource {
                 task: TASK,
-                resource: first,
+                object_ref: first.slot.0,
+                resource: Some(first),
             })
             .expect("resolves");
         assert_eq!(
@@ -5302,7 +5369,8 @@ mod tests {
                         };
                         LifecycleOp::DeleteResource {
                             task: h.task,
-                            resource: h.id,
+                            object_ref: h.id.slot.0,
+                            resource: Some(h.id),
                         }
                     }
                     14..=16 => {
@@ -5525,9 +5593,11 @@ mod tests {
                 live.entry(*task).or_default().insert(*slot, (id, backing));
                 handed.push(Handed { task: *task, id });
             }
-            LifecycleOp::DeleteResource { task, resource } => {
+            LifecycleOp::DeleteResource { task, resource, .. } => {
                 census.deletes += 1;
-                live.entry(*task).or_default().remove(&resource.slot);
+                if let Some(resource) = resource {
+                    live.entry(*task).or_default().remove(&resource.slot);
+                }
             }
             // A destroy the namespace could not name removes nothing from this
             // history, because nothing named it was ever put in.

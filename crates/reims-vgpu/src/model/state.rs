@@ -4178,6 +4178,22 @@ impl DeviceState {
             .pipeline_ready(pipeline)
     }
 
+    /// Whether a declared pipeline has already reached `Ready`.
+    ///
+    /// The read half of [`Self::ready_pipeline`], and it exists so a caller can
+    /// decline to redo work whose answer is already in the table. A pipeline the
+    /// table does not hold answers `false`: an undeclared lease is not a
+    /// promise, and treating it as one would skip the step that makes it one.
+    #[must_use]
+    pub fn pipeline_is_ready(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .get(pipeline)
+            .is_some_and(|entry| entry.state.is_ready())
+    }
+
     /// A pipeline will never build, with the reason the rail refused it.
     ///
     /// `Ended::stranded` is the transactions that can therefore never be ready.
@@ -4561,7 +4577,8 @@ impl DeviceState {
             .unwrap_or_else(|e| e.into_inner())
             .apply(&LifecycleOp::DeleteResource {
                 task: reims_vgpu_core::identity::TaskId(task_id),
-                resource: name,
+                object_ref: name.slot.0,
+                resource: Some(name),
             })
             .ok()?;
         // Exactly one, because a delete names one resource. Taken as the
@@ -5614,10 +5631,55 @@ impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .access(self.task, self.domain, participation)
-            .map_err(|refusal| reims_vgpu_core::access::AccessRefusal {
-                resource: participation.resource,
-                reason: refusal.slug(),
+            .map_err(|refusal| {
+                note_access_refused(self.task, participation, refusal);
+                reims_vgpu_core::access::AccessRefusal {
+                    resource: participation.resource,
+                    reason: refusal.slug(),
+                }
             })
+    }
+}
+
+/// Name a refused participation on the always-on channel, with its numbers.
+///
+/// **The slug alone cannot be acted on here.**
+/// [`reims_vgpu_core::access::AccessRefusal`] carries a `&'static str` by
+/// design — every refusal in that crate is greppable by the slug of the check
+/// that produced it — and a refused access refuses the whole packet its record
+/// belongs to, so this is guest work that did not run. A driven macos-15 boot
+/// through the ordering model refused seven exec packets on
+/// `lifecycle_heap`, which is `Resident::window` saying a record's window ends
+/// past its resource's extent; the slug says that much and says nothing about
+/// *which* window and *which* extent, and those three numbers are the whole of
+/// what decides whether the record is out of range or this device's extent is
+/// short.
+///
+/// First sight per `(task, slot)`, so a record refused every frame names itself
+/// once. The owner's refusal is printed as itself rather than re-encoded: the
+/// variant carries its own numbers and a second vocabulary here would drift
+/// from it.
+fn note_access_refused(
+    task: reims_vgpu_core::identity::TaskId,
+    participation: &reims_vgpu_core::access::Participation,
+    refusal: reims_vgpu_core::lifecycle::Refusal,
+) {
+    crate::runtime::drain::note_store_route("access_refused");
+    crate::runtime::drain::note_store_route(refusal.slug());
+    if crate::observe::first_sight(
+        "access_refused",
+        (u64::from(task.0) << 32) | u64::from(participation.resource.slot.0),
+    ) {
+        crate::observe::fail(format!(
+            "access_refused task={} ref={} reason={} mode={:?} extent={:?} refusal={refusal:?} \
+             (a record's participation could not become an access, which refuses the whole \
+             packet it belongs to)",
+            task.0,
+            participation.resource.slot.0,
+            refusal.slug(),
+            participation.mode,
+            participation.extent,
+        ));
     }
 }
 

@@ -3142,6 +3142,72 @@ pub fn name_resource<M: HostMemory>(
 /// from a ref naming nothing, several rails treat it as expected control flow
 /// and stay silent, and `AGENTS.md` names it as one of the things that must not
 /// be logged. Callers that care test it before calling.
+/// Say whether a memo that refused a caller's type is the guest's own answer.
+///
+/// **It decides nothing, and what it decides against is a fix.**
+/// [`resolve_descriptor`] refuses a memo hit whose type is not wanted without
+/// re-reading the guest's list. That is right if the memo is the guest's current
+/// answer and wrong if the slot has been recycled under it — and "re-read on a
+/// type refusal" is the obvious repair, so the reading below is what says it
+/// would repair nothing. `note_stale_task_resource` asks the same question on
+/// the memo *hit* path; this asks it where a hit turns into a refusal.
+///
+/// Read, on a driven macos-15 boot through the ordering model, x86/Vulkan:
+///
+/// ```text
+/// memo_wrong_type                 10216
+/// memo_wrong_type_guest_agrees    10216
+/// memo_wrong_type_memo_stale          0
+/// memo_wrong_type_third_type          0
+/// memo_wrong_type_unlisted            0
+/// ```
+///
+/// Ten thousand refusals and not one disagreement: every time a caller was told
+/// "that slot is not the type you want", the guest's own object list said the
+/// same. The population is one shape — a caller asking for
+/// `OBJECT_TYPE_TEXTURE_VIEW` about a slot the guest filled with an
+/// `OBJECT_TYPE_REF_TEXTURE` — so it is a question being asked of the wrong
+/// slot, not a cache answering for a dead one, and no repair belongs in this
+/// resolver.
+///
+/// [`probe_list_entry`] rather than [`lookup_list_entry`], because this is a
+/// question about the slot and not a resolution: the recheck bookkeeping a named
+/// lookup does must not count an instrument's read.
+fn note_memo_wrong_type<M: HostMemory>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    obj_ref: u32,
+    cached: &TaskResource,
+    want: &[u8],
+) {
+    crate::runtime::drain::note_store_route("memo_wrong_type");
+    let live = probe_list_entry(state, host, task_id, obj_ref);
+    crate::runtime::drain::note_store_route(match live {
+        None => "memo_wrong_type_unlisted",
+        Some(ref entry) if entry.object_type == cached.entry.object_type => {
+            "memo_wrong_type_guest_agrees"
+        }
+        Some(ref entry) if want.contains(&entry.object_type) => "memo_wrong_type_memo_stale",
+        Some(_) => "memo_wrong_type_third_type",
+    });
+    if crate::observe::first_sight(
+        "memo_wrong_type",
+        (u64::from(task_id) << 32) | u64::from(obj_ref),
+    ) {
+        crate::observe::fail(format!(
+            "memo_wrong_type task={task_id} ref={obj_ref} want={want:?} memo_ot={} \
+             live_ot={:?} memo_desc_gva={:#x} live_desc_gva={:?} (a retained resolution \
+             refused a caller's type without re-reading the guest's list; live_ot is what \
+             that list says now)",
+            cached.entry.object_type,
+            live.as_ref().map(|e| e.object_type),
+            cached.entry.descriptor_gva,
+            live.as_ref().map(|e| e.descriptor_gva),
+        ));
+    }
+}
+
 pub fn resolve_descriptor<M: HostMemory>(
     state: &DeviceState,
     host: &M,
@@ -3151,6 +3217,7 @@ pub fn resolve_descriptor<M: HostMemory>(
 ) -> Result<(ListObjectEntry, Arc<[u8]>), LadderRung> {
     if let Some(resource) = state.constructed_object(task_id, obj_ref) {
         if !want.contains(&resource.entry.object_type) {
+            note_memo_wrong_type(state, host, task_id, obj_ref, &resource, want);
             return Err(LadderRung::WrongType {
                 got: resource.entry.object_type,
             });
