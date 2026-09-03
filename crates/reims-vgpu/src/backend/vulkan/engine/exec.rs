@@ -3,7 +3,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use ash::vk;
-use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use super::caches::{
@@ -1664,18 +1663,16 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
         None => req.vertex_count.saturating_sub(1),
     };
-    let mut bindings = BTreeSet::new();
-    let mut vertex_locations = BTreeSet::new();
-    let mut vertex_bindings = BTreeSet::new();
-    for attribute in &req.vertex_attributes {
-        if !vertex_locations.insert(attribute.location) {
+    for (seen, attribute) in req.vertex_attributes.iter().enumerate() {
+        let earlier = &req.vertex_attributes[..seen];
+        if earlier.iter().any(|a| a.location == attribute.location) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateVertexLocation {
                     location: attribute.location,
                 },
             ));
         }
-        if !vertex_bindings.insert(attribute.binding) {
+        if earlier.iter().any(|a| a.binding == attribute.binding) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateVertexBinding {
                     binding: attribute.binding,
@@ -1798,8 +1795,8 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
-    for buffer in &req.storage_buffers {
-        if !bindings.insert((buffer.binding, 0)) {
+    for (seen, buffer) in req.storage_buffers.iter().enumerate() {
+        if descriptor_binding_claimed(req, (buffer.binding, 0), seen, 0, 0) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateStorageDescriptorBinding {
                     binding: buffer.binding,
@@ -1812,7 +1809,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             buffer.binding,
         )?;
     }
-    for image in &req.sampled_images {
+    for (seen, image) in req.sampled_images.iter().enumerate() {
         if image.width == 0 || image.height == 0 || image.layers == 0 {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledZeroGeometry {
@@ -2032,7 +2029,13 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if !bindings.insert((image.binding, image.array_element)) {
+        if descriptor_binding_claimed(
+            req,
+            (image.binding, image.array_element),
+            req.storage_buffers.len(),
+            seen,
+            0,
+        ) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateSampledDescriptorBinding {
                     binding: image.binding,
@@ -2040,7 +2043,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
             ));
         }
     }
-    for sampler in &req.samplers {
+    for (seen, sampler) in req.samplers.iter().enumerate() {
         let lod_min = sampler.lod_min_f32();
         let lod_max = sampler.lod_max_f32();
         if !lod_min.is_finite() || !lod_max.is_finite() || lod_min > lod_max {
@@ -2052,7 +2055,13 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if !bindings.insert((sampler.binding, 0)) {
+        if descriptor_binding_claimed(
+            req,
+            (sampler.binding, 0),
+            req.storage_buffers.len(),
+            req.sampled_images.len(),
+            seen,
+        ) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::DuplicateSamplerDescriptorBinding {
                     binding: sampler.binding,
@@ -2061,6 +2070,44 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
         }
     }
     Ok(())
+}
+
+/// Whether a descriptor earlier in this draw already claimed `key`.
+///
+/// # Why the prefix is a parameter and not a set
+///
+/// `validate_v1` used one `BTreeSet<(u32, u32)>` across the three descriptor
+/// lists, and its first insert is a heap node — one allocation on every draw
+/// that binds anything, which is every real draw. "Heap allocations per
+/// steady-state draw" is one of the replacement architecture's structural
+/// zeros, and this was 104 of the bytes.
+///
+/// The scan is quadratic in the number of descriptors a draw binds, which is
+/// the number a shader declares: a handful. Below any size where that matters,
+/// walking a slice already in cache beats allocating and balancing a tree.
+///
+/// The three cursors say how far the caller has got, rather than this taking a
+/// pre-built list, because the duplicate checks are interleaved with
+/// per-descriptor validation — a sampled image with a bad `descriptor_count`
+/// and a sampler with a bad LOD each refuse *before* their duplicate check. A
+/// pre-pass would change which decline a draw that is both malformed and
+/// duplicated reports.
+fn descriptor_binding_claimed(
+    req: &DrawRequest,
+    key: (u32, u32),
+    storage: usize,
+    sampled: usize,
+    samplers: usize,
+) -> bool {
+    req.storage_buffers[..storage]
+        .iter()
+        .any(|b| (b.binding, 0) == key)
+        || req.sampled_images[..sampled]
+            .iter()
+            .any(|i| (i.binding, i.array_element) == key)
+        || req.samplers[..samplers]
+            .iter()
+            .any(|s| (s.binding, 0) == key)
 }
 
 /// Stage a host-written buffer into a freshly created sampled image and leave it

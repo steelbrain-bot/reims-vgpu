@@ -850,7 +850,6 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
     /// from the number:
     ///
     /// ```text
-    ///   104 B  validate_v1
     ///    16 B  the `Vec<BindingSig>` binding list
     ///    16 B  `LayoutKey::clone` into the pipeline key
     ///    48 B  `BufferGatherRoles::of`
@@ -859,10 +858,18 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
     ///   256 B  the `Vec<WriteDescriptorSet>` growing
     /// ```
     ///
-    /// Every one is per-draw scratch that a device-owned reusable buffer would
-    /// hold instead, except the two layout ones, which need the layout cache to
-    /// be reachable without an owned `Vec<BindingSig>` per draw.
-    const CEILING: usize = 7;
+    /// A seventh, 104 B for `validate_v1`'s duplicate-binding `BTreeSet`, is
+    /// gone: the set became a scan over the lists the draw already owns.
+    ///
+    /// The four in the middle are per-draw scratch that a device-owned reusable
+    /// buffer would hold instead — but two of them hold `ash` structures with
+    /// borrow lifetimes (`vk::WriteDescriptorSet<'a>` names the buffer infos
+    /// beside it), so a buffer outliving the draw cannot hold those two without
+    /// erasing a lifetime that is load-bearing. Those want an inline array with
+    /// a bound taken from the device's descriptor limits, not a scratch. The two
+    /// layout ones need the layout cache reachable without an owned
+    /// `Vec<BindingSig>` per draw.
+    const CEILING: usize = 6;
     assert!(
         trips <= CEILING,
         "a warm repeat draw binding one storage buffer took {trips} trips into \
