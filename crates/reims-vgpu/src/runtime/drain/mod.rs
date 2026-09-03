@@ -3071,10 +3071,10 @@ fn note_stamp_visible(state: &DeviceState, index: u32, value: u32, site: &'stati
             // the guest can read from.
             //
             // **Named, once per slot, because the count is two different
-            // facts.** A boot measures about 14 000 of these, and
-            // `dead/README.md` records the same counter at zero when the
-            // publication point was moved to this site — so either the meaning
-            // drifted or the invariant broke, and a bare count cannot say
+            // facts.** A boot measures about 14 000 of these, and the driven
+            // boot taken when the publication point was moved to this site read
+            // the same counter at zero — so either the meaning drifted or the
+            // invariant broke, and a bare count cannot say
             // which. What separates them is *which slot* and *by how much*: one
             // slot whose page rewound under a timeline that will not follow it
             // is a slot to explain, and a timeline running ahead of every word

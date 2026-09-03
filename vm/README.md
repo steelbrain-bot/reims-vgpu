@@ -36,10 +36,9 @@ vm/rail-sweep.sh macos-15 macos-26        # or just these
 ```
 
 `drive-desktop.sh` is the "three rounds of launching and quitting five
-applications over ssh" that every validation row in
-`crates/reims-vgpu/src/dead/README.md` names. It is committed rather than
-described because a rate is only comparable across boots if the workload is.
-`ROUNDS` and `APPS` override it.
+applications over ssh" that every validation reading this project quotes was
+taken behind. It is committed rather than described because a rate is only
+comparable across boots if the workload is. `ROUNDS` and `APPS` override it.
 
 `rail-sweep.sh` boots each rail with `--testing`, drives it, snapshots
 `/tmp/reims-vgpu-fail.log` to `/tmp/sweep-<rail>-fail.log`, and prints the same

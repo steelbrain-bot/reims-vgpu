@@ -128,28 +128,26 @@ disjoint class back buys no safety while costing the bisect it could have provid
 State the disjointness before moving a group and make it hold structurally — named owners, not an
 argument that the current call sites happen not to overlap. If it cannot be made to hold, the group
 is larger than it looked: enlarge it rather than move anyway. Within a group the switch is atomic
-and the legacy counterpart is disconnected in the same commit. Order the groups by how little state
+and the legacy counterpart is deleted in the same commit. Order the groups by how little state
 they move; the ordering and publication core is last, and carries the scheduler's deletion.
 
-**Disconnect, do not delete — amending "the legacy counterpart is deleted in the same commit"
-above, and the plan's Seam 6.** In the commit that wires a group, move its legacy files to
-`crates/<crate>/src/dead/` and remove every `mod` declaration that reaches them. `dead/` does not
-compile, is not feature-gated, and is not linkable; it is source to read. Unreachability by
-construction is what the prohibition on two semantic models needs, and it is what a removed `mod`
-gives — a flag or a `cfg` would give the prohibition's opposite.
+**The 2026-09-02 "disconnect, do not delete" amendment is spent, and `dead/` is gone as of
+2026-09-03.** It bought attribution while packet classes were moving under outstanding macOS cells:
+a group's legacy files went to `crates/<crate>/src/dead/`, unreachable because no `mod` declared
+them, so a live regression on a class that had just moved could be read rather than reconstructed
+from `git log`. Every packet-class group has since moved, the classes it was protecting are settled,
+and the directory was deleted wholesale in one commit along with the gate that held it unreachable.
 
-Each move appends a row to `crates/<crate>/src/dead/README.md` naming what moved, which commit
-replaced it, and which new owner-level tests replaced the legacy tests that moved with it. Those
-tests stop running the moment they move, so a group that ships without that replacement coverage
-has silently lost it and the row is where that is caught. Name each replacing test as ``fn `name` ``:
-the `fn` is what `dead_is_unreachable_by_construction` reads to tell a promise about a function from
-the prose beside it, and a name written without it is a claim nothing checks.
+So the rule above is the rule again: **the group's legacy counterpart is deleted in the commit that
+wires it.** Do not recreate `dead/`, and do not stage a deletion through it — what an old arm did is
+now read out of `git log`, and the deleted-in-the-same-commit form is what the prohibition on two
+semantic models asks for directly. The one group still to move is the process-global mutable engine
+behind `backend::vulkan::engine`; when it wires, its legacy files leave the tree with it.
 
-Nothing is resurrected from `dead/`, and no build-time or run-time switch may reach it. When a live
-boot regresses, `dead/` is read to learn what the old code did and the fix lands in the new owner.
-`dead/` is deleted wholesale, in one commit, once every group has moved and the plan's gates are
-green — never pruned incrementally, because a half-emptied `dead/` reads as "these were the ones
-worth keeping".
+A group's legacy tests die with its legacy source, so the commit that wires it must name — in the
+commit message, since there is no register any more — the owner-level tests that replace them. A
+group shipping without that replacement coverage has silently lost it, and nothing in the build
+relates the two.
 
 ## Working and verification
 

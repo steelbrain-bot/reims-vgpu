@@ -4,12 +4,13 @@
 #
 # WHY THIS EXISTS. Almost every reading this project takes is a *rate* — draws
 # a second, packets a boot, refusals per desktop — and a guest sitting at an
-# idle Finder produces none of them. The numbers in `crates/reims-vgpu/src/
-# dead/README.md` are all "host-driven workload (three rounds of launching and
-# quitting five applications over ssh)", and that sentence was a shell script
-# in `/tmp` that each session re-derived from the row it was reading. Two
-# sessions re-derived it slightly differently, which is the thing a committed
-# harness stops: a rate is only comparable across boots if the workload is.
+# idle Finder produces none of them. Every such number this project has ever
+# quoted was taken behind "host-driven workload (three rounds of launching and
+# quitting five applications over ssh)", and that sentence used to be a shell
+# script in `/tmp` that each session re-derived from the reading it was
+# chasing. Two sessions re-derived it slightly differently, which is the thing
+# a committed harness stops: a rate is only comparable across boots if the
+# workload is.
 #
 # It is host-driven on purpose. Input synthesised inside the guest would be the
 # guest exercising itself; `AGENTS.md` asks for host-driven input so that what
