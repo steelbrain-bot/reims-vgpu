@@ -2243,7 +2243,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
                 &mut measured_ns,
             )
         }
-        _ => false,
+        _ => Vec::new(),
     };
     for &lease in leases {
         note_store_route(if state.declare_pipeline(lease) {
@@ -2251,7 +2251,9 @@ fn admit_and_park<H: HostMemory + HostOps>(
         } else {
             "pipeline_declared_already"
         });
-        if !translating {
+        if translating.contains(&lease.slot.0) {
+            withdraw_lease(state, lease);
+        } else if translating.is_empty() {
             ready_lease(state, lease, "pipeline_lease_ready_admission");
         }
     }
@@ -2471,13 +2473,24 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             continue;
         }
         let mut measured_ns = 0u64;
-        if crate::runtime::exec::preflight_submission(
+        let pending = crate::runtime::exec::preflight_submission(
             state,
             &*host,
             submission,
             resolved,
             &mut measured_ns,
-        ) {
+        );
+        if !pending.is_empty() {
+            // The pump's own withdrawal arm. A position can be parked on one
+            // pipeline while another it binds is `Ready` from an earlier
+            // packet, and the guest can rewrite that other one's shader while
+            // this position waits — so the pass that finds the first still
+            // building is also where the second stops being usable.
+            for &lease in leases {
+                if pending.contains(&lease.slot.0) {
+                    withdraw_lease(state, lease);
+                }
+            }
             continue;
         }
         let leases = leases.to_vec();
@@ -2536,6 +2549,38 @@ fn run_parked<H: HostMemory + HostOps>(
         // withdrawal already released whatever was queued behind it, so there
         // is nothing to publish and the name is the whole of what is owed.
         Err(refusal) => note_store_route(refusal.slug()),
+    }
+}
+
+/// Take back the promise that a lease is usable, because this rail no longer
+/// holds a translation for it.
+///
+/// The other half of [`ready_lease`], and the half the table had no step for
+/// until `77f5bd88`. `Ready` used to mean "was translated once", which is not
+/// the question a transaction about to bind it is asking: the guest rewrites
+/// the shader behind a live pipeline ref **in place**, so no delete arrives, no
+/// generation is minted, the [`reims_vgpu_core::identity::ResourceId`] is
+/// unchanged — and the rail's translate cache, being keyed by the shader's
+/// content, stops holding one. Four refs a driven macos-15 desktop, named by
+/// `m2v_pipe_content_changed`.
+///
+/// Silent when the lease was already waiting, which is the common case by three
+/// orders of magnitude: this runs for every pending ref of every pre-scan, and
+/// almost all of those are a cold pipeline that has simply not finished. What
+/// is worth a line is the *withdrawal* — a lease that was `Ready` and is not
+/// any more — and `PipelineTable::advance` is what distinguishes them, so the
+/// counter is read off the table's own census rather than guessed here.
+fn withdraw_lease(state: &DeviceState, lease: reims_vgpu_core::identity::ResourceId) {
+    if state.withdraw_pipeline(lease) {
+        note_store_route("pipeline_lease_withdrawn");
+        if crate::observe::first_sight("pipeline_lease_withdrawn", u64::from(lease.slot.0)) {
+            crate::observe::fail(format!(
+                "pipeline_lease_withdrawn slot={} gen={} (this rail stopped holding a \
+                 translation for a pipeline the model called ready; the guest rewrote its \
+                 shader without renaming it, and work binding it waits again)",
+                lease.slot.0, lease.generation.0
+            ));
+        }
     }
 }
 

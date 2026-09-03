@@ -921,7 +921,7 @@ pub fn preflight_submission<M: HostMemory + HostOps>(
     submission: &ExecSubmission,
     resolved: &reims_vgpu_core::exec::ExecWork,
     measured_ns: &mut u64,
-) -> bool {
+) -> Vec<u32> {
     let preflight_started = std::time::Instant::now();
     // The render half of the packet's leases, and the guest's own ref, which is
     // the slot half of the name: the generation is the model's business and no

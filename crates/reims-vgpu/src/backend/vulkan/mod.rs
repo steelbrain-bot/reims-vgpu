@@ -593,7 +593,7 @@ impl Backend for VulkanBackend {
         task_id: u32,
         render_pipelines: &[u32],
         compute_dispatches: &[(u32, [u32; 3])],
-    ) -> bool {
+    ) -> Vec<u32> {
         crate::runtime::exec::vulkan::preflight_translations(
             state,
             host,

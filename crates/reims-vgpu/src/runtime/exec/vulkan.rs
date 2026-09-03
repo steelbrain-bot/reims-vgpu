@@ -29,9 +29,9 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     pipelines: &[u32],
-) -> bool {
+    pending: &mut Vec<u32>,
+) {
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
-    let mut pending = false;
     for &pipeline_ref in pipelines {
         note_preflight_pipe();
         // The draw path's own memo already knows whether these two shaders are
@@ -82,22 +82,23 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             v_air,
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
-        ) {
-            pending = true;
-        }
-        if !crate::runtime::m2v_cache::ensure_cached_async(
+        ) | !crate::runtime::m2v_cache::ensure_cached_async(
             f_air,
             metal2vulkan::passes::Stage::Fragment,
             pipeline_ref,
         ) {
-            pending = true;
+            // `|` and not `||`: both stages must be *started*, so they
+            // translate in parallel and the packet is retried once rather than
+            // once per stage.
+            if !pending.contains(&pipeline_ref) {
+                pending.push(pipeline_ref);
+            }
         }
         note_preflight_part(
             PreflightPart::Cache,
             cache_started.elapsed().as_nanos() as u64,
         );
     }
-    pending
 }
 
 /// `dispatches` is the **model's own record of what this packet dispatches**,
@@ -116,9 +117,9 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     dispatches: &[(u32, [u32; 3])],
-) -> bool {
+    pending: &mut Vec<u32>,
+) {
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
-    let mut pending = false;
     for &(pipeline_ref, local_size) in dispatches {
         note_preflight_pipe();
         let air_started = std::time::Instant::now();
@@ -146,33 +147,39 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
             PreflightPart::Cache,
             cache_started.elapsed().as_nanos() as u64,
         );
-        if !cached {
-            pending = true;
+        if !cached && !pending.contains(&pipeline_ref) {
+            pending.push(pipeline_ref);
         }
     }
-    pending
 }
 
-/// [`crate::backend::Backend::preflight_translations`] for this rail.
+/// [`crate::backend::Backend::preflight_translations`] for this rail: the
+/// pipeline refs this packet binds that the rail does not hold a translation
+/// for yet, deduplicated.
 ///
-/// Every stream is scanned, not just up to the first pending one: the point is
+/// **The refs and not a bool**, because the caller has two different things to
+/// do with the two halves of the answer. A lease this rail cannot serve must
+/// stop being ready, and a lease it can serve must become ready; a single
+/// "something is pending" cannot tell the caller which lease is which, so it
+/// had to treat the whole packet as one — and the pipelines that *were* ready
+/// stayed ready either way.
+///
+/// Every ref is examined, not just up to the first pending one: the point is
 /// to *start* every cold translation this packet needs, so they proceed in
-/// parallel and the packet is retried once rather than once per stream.
+/// parallel and the packet is retried once rather than once per shader.
 pub fn preflight_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
     render_pipelines: &[u32],
     compute_dispatches: &[(u32, [u32; 3])],
-) -> bool {
+) -> Vec<u32> {
     // Both halves are asked once for the whole packet, and both are asked
     // about what the walk resolved. Neither reads a stream: the packet's bytes
     // were read once, and a second reading is a second answer to "what does
     // this packet run".
-    let render_pending = preflight_render_translations(state, host, task_id, render_pipelines);
-    // Not `||`: every cold translation this packet needs must be *started*, so
-    // they proceed in parallel and the packet is retried once rather than once
-    // per kernel.
-    let compute_pending = preflight_compute_translations(state, host, task_id, compute_dispatches);
-    render_pending || compute_pending
+    let mut pending = Vec::new();
+    preflight_render_translations(state, host, task_id, render_pipelines, &mut pending);
+    preflight_compute_translations(state, host, task_id, compute_dispatches, &mut pending);
+    pending
 }

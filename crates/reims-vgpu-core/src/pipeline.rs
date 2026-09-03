@@ -486,22 +486,59 @@ impl PipelineTable {
         if next == PipelineState::Refused {
             return false;
         }
+        // `Ready -> Translating` is a legal step and this is not the door for
+        // it, for the same reason `Refused` is not: it is a step only one
+        // caller may take, and this door is walked by callers that must not.
+        //
+        // The Metal rail retains no pipeline state, so it walks
+        // `Translating -> Compiling -> Ready` on **every draw** that binds a
+        // pipeline. If those calls could take a ready pipeline backwards, every
+        // draw would un-ready its own pipeline and every transaction parked on
+        // it would wait again — a hot loop where the withdrawal exists for four
+        // events a desktop. [`Self::withdraw`] is the door, and only the
+        // executor discovering it no longer holds the translation may open it.
+        if next == PipelineState::Translating
+            && self.pipelines.get(&id).map(|p| p.state) == Some(PipelineState::Ready)
+        {
+            return false;
+        }
         let Some(p) = self.pipelines.get_mut(&id) else {
             return false;
         };
         if !p.state.may_become(next) {
             return false;
         }
-        let from = p.state;
         p.state = next;
         match next {
             PipelineState::Ready => self.census.ready += 1,
             PipelineState::Retired => self.census.retired += 1,
-            PipelineState::Translating if from == PipelineState::Ready => {
-                self.census.withdrawn += 1;
-            }
             _ => {}
         }
+        true
+    }
+
+    /// Take a ready pipeline back to [`PipelineState::Translating`], because
+    /// the executor no longer holds a translation for it.
+    ///
+    /// Its own door rather than an [`Self::advance`] step, and the reason is
+    /// the same one [`Self::refuse`] has: the step is legal but only one caller
+    /// may take it. `advance` is walked by a rail that retains no pipeline
+    /// state and re-walks the build on every draw, and that caller taking this
+    /// step would un-ready every pipeline it draws with.
+    ///
+    /// Returns whether anything moved. `false` for a pipeline that was already
+    /// waiting, terminal, or absent — all of which are ordinary: the caller
+    /// asks for every ref its pre-scan found pending, and almost all of those
+    /// are a cold pipeline that has simply not finished yet.
+    pub fn withdraw(&mut self, id: ResourceId) -> bool {
+        let Some(p) = self.pipelines.get_mut(&id) else {
+            return false;
+        };
+        if p.state != PipelineState::Ready {
+            return false;
+        }
+        p.state = PipelineState::Translating;
+        self.census.withdrawn += 1;
         true
     }
 
@@ -923,7 +960,11 @@ mod tests {
         );
 
         assert!(
-            t.advance(id(1), PipelineState::Translating),
+            !t.advance(id(1), PipelineState::Translating),
+            "not through the door a rail walks on every draw"
+        );
+        assert!(
+            t.withdraw(id(1)),
             "the executor withdraws what it no longer holds"
         );
         assert_eq!(t.census().withdrawn, 1);
@@ -950,6 +991,14 @@ mod tests {
             "the census counts events, so the second readying is its own"
         );
         assert_eq!(t.census().withdrawn, 1, "and one withdrawal, not two");
+
+        // Asked for a pipeline that is not ready, the door moves nothing —
+        // which is the common case, because the caller asks about every ref its
+        // pre-scan found still building.
+        t.declare(id(2), GEN);
+        assert!(!t.withdraw(id(2)), "declared is not ready");
+        assert!(!t.withdraw(id(999)), "and absent is not ready either");
+        assert_eq!(t.census().withdrawn, 1);
     }
 
     /// The rule: a refusal that carries no reason is not a refusal this table

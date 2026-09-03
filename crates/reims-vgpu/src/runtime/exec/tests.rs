@@ -7861,17 +7861,15 @@ fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
     assert_eq!(resolved.render_pipeline_leases().len(), 1);
 
     assert!(
-        !super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns),
+        super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns)
+            .is_empty(),
         "no object list, so pipeline 41 has no AIR to await"
     );
     // And it is a function of its inputs: asked again, the same answer.
-    assert!(!super::preflight_submission(
-        &state,
-        &host,
-        &submission,
-        &resolved,
-        &mut measured_ns
-    ));
+    assert!(
+        super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns)
+            .is_empty()
+    );
 }
 
 /// The two walks over one stream reach the same records in the same order.

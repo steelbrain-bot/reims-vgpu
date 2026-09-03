@@ -958,8 +958,8 @@ pub(crate) trait Backend: Copy {
         _task_id: u32,
         _render_pipelines: &[u32],
         _compute_dispatches: &[(u32, [u32; 3])],
-    ) -> bool {
-        false
+    ) -> Vec<u32> {
+        Vec::new()
     }
 
     /// What this rail can already serve for one compute binding, so the guest
@@ -1802,7 +1802,7 @@ impl Backend for SelectedBackend {
         task_id: u32,
         render_pipelines: &[u32],
         compute_dispatches: &[(u32, [u32; 3])],
-    ) -> bool {
+    ) -> Vec<u32> {
         match self {
             #[cfg(feature = "backend-metal")]
             Self::Metal(b) => {

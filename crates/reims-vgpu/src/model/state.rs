@@ -4165,6 +4165,19 @@ impl DeviceState {
             .advance(pipeline, next)
     }
 
+    /// This rail no longer holds a translation for a pipeline the model called
+    /// ready, so work binding it waits again.
+    ///
+    /// See [`reims_vgpu_core::pipeline::PipelineTable::withdraw`] for why this
+    /// is not an [`Self::advance_pipeline`] step.
+    pub fn withdraw_pipeline(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .withdraw(pipeline)
+    }
+
     /// A pipeline finished building and is usable.
     ///
     /// The door rather than `advance(.., Ready)`, because becoming ready is
