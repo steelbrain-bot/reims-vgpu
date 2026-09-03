@@ -2244,7 +2244,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
             "pipeline_declared_already"
         });
         if !arrived.translating {
-            ready_lease(state, lease);
+            ready_lease(state, lease, "pipeline_lease_ready_admission");
         }
     }
 
@@ -2468,7 +2468,7 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
         let leases = leases.to_vec();
         note_store_route("parked_translations_finished");
         for lease in leases {
-            ready_lease(state, lease);
+            ready_lease(state, lease, "pipeline_lease_ready_pump");
         }
     }
 }
@@ -2531,12 +2531,32 @@ fn run_parked<H: HostMemory + HostOps>(
 /// because this is where the answer arrives: the rail's plan step has promised
 /// the packet can be executed to completion now, and that promise is exactly
 /// what a lease wait needs to know.
-fn ready_lease(state: &DeviceState, lease: reims_vgpu_core::identity::ResourceId) {
+fn ready_lease(
+    state: &DeviceState,
+    lease: reims_vgpu_core::identity::ResourceId,
+    site: &'static str,
+) {
     use reims_vgpu_core::pipeline::PipelineState;
     state.advance_pipeline(lease, PipelineState::Translating);
     state.advance_pipeline(lease, PipelineState::Compiling);
     if state.ready_pipeline(lease) {
         note_store_route("pipeline_ready");
+        // Which of the three answers put this lease at `Ready`, once per slot
+        // per site.
+        //
+        // A draw has been measured reaching a shader that was still
+        // translating while the model called its lease ready
+        // (`m2v_translation_pending_at_sync_boundary` with
+        // `model_pipeline=ready`), and the three sites that can say ready —
+        // admission, the pump, and the rail's own resolve — are indistinguishable
+        // in the aggregate counter. The one that answered first is the one whose
+        // question was wrong.
+        if crate::observe::first_sight(site, u64::from(lease.slot.0)) {
+            crate::observe::off(format!(
+                "pipeline_lease_ready site={site} slot={} gen={}",
+                lease.slot.0, lease.generation.0
+            ));
+        }
     }
 }
 

@@ -990,7 +990,16 @@ pub(crate) fn advance_pipeline<M: HostMemory + HostOps>(
         return;
     };
     let taken = if next == PipelineState::Ready {
-        state.ready_pipeline(name)
+        let taken = state.ready_pipeline(name);
+        // The rail's own answer, beside the drain's two. See `ready_lease`.
+        if taken && crate::observe::first_sight("pipeline_lease_ready_rail", u64::from(name.slot.0))
+        {
+            crate::observe::off(format!(
+                "pipeline_lease_ready site=pipeline_lease_ready_rail slot={} gen={} task={task_id}",
+                name.slot.0, name.generation.0
+            ));
+        }
+        taken
     } else {
         state.advance_pipeline(name, next)
     };
