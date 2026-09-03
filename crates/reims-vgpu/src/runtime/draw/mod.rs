@@ -1027,19 +1027,25 @@ pub(crate) fn refuse_pipeline<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route("pipeline_refuse_unnamed");
         return;
     };
-    let stranded = state.refuse_pipeline(name, reason);
-    if stranded.is_empty() {
-        // Either the refusal was not a legal step — already refused, already
-        // retired — or nothing was parked on it. Both read the same here and
-        // the census tells them apart.
-        crate::runtime::drain::note_store_route("pipeline_refused");
+    let ended = state.refuse_pipeline(name, reason);
+    // The two facts apart. A refusal the table did not take is one that had
+    // already ended — refused before, or retired by the guest mid-build — and
+    // it is not the same event as a refusal that took and had nobody parked on
+    // it, which is every refusal until the cutover admits anything.
+    crate::runtime::drain::note_store_route(if ended.took {
+        "pipeline_refused"
     } else {
+        "pipeline_refuse_already_ended"
+    });
+    if !ended.stranded.is_empty() {
         crate::runtime::drain::note_store_route_n(
             "pipeline_refuse_stranded",
-            stranded.len() as u64,
+            ended.stranded.len() as u64,
         );
     }
-    crate::runtime::drain::note_store_route(reason.slug());
+    if ended.took {
+        crate::runtime::drain::note_store_route(reason.slug());
+    }
 }
 
 /// Resolve buffer object → guest bytes starting at `offset`.

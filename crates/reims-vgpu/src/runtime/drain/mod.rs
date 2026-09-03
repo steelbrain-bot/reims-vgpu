@@ -413,11 +413,21 @@ fn apply_delete_object<H: HostMemory + HostOps>(
             if let Some(name) =
                 crate::runtime::objects::name_resource(state, host, task_id, object_ref)
             {
-                note_store_route_n(
-                    "pipeline_retire_released",
-                    state.retire_pipeline(name).len() as u64,
-                );
-                note_store_route("pipeline_retired");
+                let ended = state.retire_pipeline(name);
+                note_store_route_n("pipeline_retire_released", ended.stranded.len() as u64);
+                // Whether the table had an entry to retire, which is not the
+                // same question as whether the guest sent a delete. A driven
+                // `macos-26` boot sent 170 and the table took 116: the other 54
+                // named render pipelines this device never drew with, so they
+                // were never declared. That is ordinary, and naming it is what
+                // makes the day it stops being ordinary visible — the two
+                // numbers were otherwise separated by a subtraction of the
+                // `pipeline_table` occupancy line from this counter.
+                note_store_route(if ended.took {
+                    "pipeline_retired"
+                } else {
+                    "pipeline_retire_absent"
+                });
             } else {
                 note_store_route("pipeline_retire_unnamed");
             }

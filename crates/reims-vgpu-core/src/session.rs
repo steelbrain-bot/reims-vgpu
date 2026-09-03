@@ -35,6 +35,29 @@ use crate::transaction::{classify, DeviceTransaction, Payload, PayloadClass};
 use reims_vgpu_protocol::packets::{find, Channel};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// What ending a pipeline's life did.
+///
+/// # Why `took` is a field and not the emptiness of the list
+///
+/// Both doors that end a pipeline used to answer `Vec::new()` for two
+/// different facts: the step was not a legal one, or it was and nothing was
+/// parked on the pipeline. A driven boot made the cost of that concrete —
+/// 170 retirements against 116 the table actually took, a difference of 54
+/// readable only by subtracting an occupancy line from a route counter and
+/// knowing to. The 54 are ordinary: a guest deleting a render pipeline this
+/// device never drew with names a slot the table has no entry for. Ordinary is
+/// exactly what has to be *nameable*, or the day it stops being ordinary looks
+/// like nothing at all.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use = "work stranded by a pipeline ending holds its channel's publication head until it is withdrawn"]
+pub struct Ended {
+    /// Whether the table took the step.
+    pub took: bool,
+    /// The transactions that can therefore never be ready. Always empty when
+    /// `took` is false: a step the table refused released nothing.
+    pub stranded: Vec<IngressOrdinal>,
+}
+
 /// Why a packet did not become a transaction.
 ///
 /// Each variant is one check, never shared, so a reader can tell which one
@@ -944,17 +967,21 @@ impl SessionModel {
     /// hold their channel's publication head forever. The caller withdraws each
     /// one — see [`Self::withdraw`] — and says why on its failure channel.
     ///
-    /// Empty when the refusal was not a legal step, for
-    /// [`Self::pipeline_ready`]'s reason.
+    /// [`Ended::took`] says whether the refusal was a legal step, for
+    /// [`Self::pipeline_ready`]'s reason — an illegal one strands nothing and
+    /// must not read as a legal one that happened to strand nothing.
     pub fn pipeline_refused(
         &mut self,
         pipeline: ResourceId,
         reason: crate::pipeline::RefusalReason,
-    ) -> Vec<IngressOrdinal> {
+    ) -> Ended {
         if !self.pipelines.refuse(pipeline, reason) {
-            return Vec::new();
+            return Ended::default();
         }
-        self.scheduler.pipeline_refused(pipeline)
+        Ended {
+            took: true,
+            stranded: self.scheduler.pipeline_refused(pipeline),
+        }
     }
 
     /// The guest deleted a pipeline: retire it, and name the transactions that
@@ -977,13 +1004,17 @@ impl SessionModel {
     ///
     /// They come back rather than being dropped, for
     /// [`Self::pipeline_refused`]'s reason, and the caller withdraws each.
-    /// Empty when the retirement was not a legal step.
-    #[must_use = "work stranded by a delete holds its channel's publication head until it is withdrawn"]
-    pub fn pipeline_retired(&mut self, pipeline: ResourceId) -> Vec<IngressOrdinal> {
+    /// [`Ended::took`] says whether the retirement was a legal step — and a
+    /// guest deleting a render pipeline this device never drew with makes that
+    /// `false` on a real boot, which is ordinary and is why it is named.
+    pub fn pipeline_retired(&mut self, pipeline: ResourceId) -> Ended {
         if !self.pipelines.retire(pipeline) {
-            return Vec::new();
+            return Ended::default();
         }
-        self.scheduler.pipeline_refused(pipeline)
+        Ended {
+            took: true,
+            stranded: self.scheduler.pipeline_refused(pipeline),
+        }
     }
 
     /// A completion word became readable: record the value the timeline now
@@ -1534,7 +1565,10 @@ mod tests {
 
         assert_eq!(
             s.pipeline_retired(pipeline),
-            vec![admitted.transaction.identity.ingress]
+            Ended {
+                took: true,
+                stranded: vec![admitted.transaction.identity.ingress]
+            }
         );
         assert!(
             !s.pipeline_ready(pipeline),
@@ -1542,8 +1576,10 @@ mod tests {
         );
         assert!(s.take_ready().is_empty(), "and releases nobody");
 
-        // A second delete is not a legal step and names nobody twice.
-        assert!(s.pipeline_retired(pipeline).is_empty());
+        // A second delete is not a legal step and names nobody twice — and
+        // says which of the two it is, rather than answering an empty list for
+        // both.
+        assert_eq!(s.pipeline_retired(pipeline), Ended::default());
     }
 
     /// A reset ends the pipeline's *name*, and a transaction waiting for one
@@ -1668,7 +1704,10 @@ mod tests {
         let reason = crate::pipeline::RefusalReason::CompilationFailed("out of registers");
         assert_eq!(
             s.pipeline_refused(pipeline, reason),
-            vec![admitted.transaction.identity.ingress]
+            Ended {
+                took: true,
+                stranded: vec![admitted.transaction.identity.ingress]
+            }
         );
         // And the next packet binding it is refused at ingress rather than
         // admitted into a wait that cannot resolve.

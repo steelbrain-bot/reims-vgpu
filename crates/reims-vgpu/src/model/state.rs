@@ -4115,14 +4115,17 @@ impl DeviceState {
     /// pipeline is over. `CmdDeleteObject` names it — measured, and the name is
     /// the model's own.
     ///
-    /// The transactions it returns are the ones parked on a compilation that
-    /// will now never finish. Empty today, because nothing is admitted into
-    /// this model yet; counted rather than dropped, so the day it stops being
-    /// empty is a number and not a hang.
+    /// `Ended::stranded` is the transactions parked on a compilation that will
+    /// now never finish — empty today, because nothing is admitted into this
+    /// model yet, and counted rather than dropped so the day it stops being
+    /// empty is a number and not a hang. `Ended::took` is the other half, and a
+    /// driven boot needs it: the guest deletes render pipelines this device
+    /// never drew with, so 170 retirements a boot were 116 the table took and
+    /// 54 that named a slot it has no entry for.
     pub fn retire_pipeline(
         &self,
         pipeline: reims_vgpu_core::identity::ResourceId,
-    ) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
+    ) -> reims_vgpu_core::session::Ended {
         self.session
             .lock()
             .expect("session")
@@ -4171,16 +4174,16 @@ impl DeviceState {
 
     /// A pipeline will never build, with the reason the rail refused it.
     ///
-    /// The returned ordinals are the transactions that can therefore never be
-    /// ready. They come back rather than being dropped for the same reason
+    /// `Ended::stranded` is the transactions that can therefore never be ready.
+    /// They come back rather than being dropped for the same reason
     /// [`Self::retire_pipeline`]'s do, and the caller withdraws each and says
     /// why. Empty today, because nothing is admitted into this model yet.
-    #[must_use = "work stranded by a refusal holds its channel's publication head until it is withdrawn"]
+    /// `Ended::took` is whether the refusal was a legal step at all.
     pub fn refuse_pipeline(
         &self,
         pipeline: reims_vgpu_core::identity::ResourceId,
         reason: reims_vgpu_core::pipeline::RefusalReason,
-    ) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
+    ) -> reims_vgpu_core::session::Ended {
         self.session
             .lock()
             .expect("session")
@@ -5853,9 +5856,14 @@ mod pipeline_door_tests {
         }));
         assert_eq!(state.pipeline_census().declared, 3);
 
-        assert!(
-            state.retire_pipeline(name(9)).is_empty(),
-            "nothing is admitted into this model yet, so nothing was parked on it"
+        assert_eq!(
+            state.retire_pipeline(name(9)),
+            reims_vgpu_core::session::Ended {
+                took: true,
+                stranded: Vec::new()
+            },
+            "the table had it, and nothing is admitted into this model yet, so \
+             nothing was parked on it"
         );
         let census = state.pipeline_census();
         assert_eq!(
@@ -5866,8 +5874,14 @@ mod pipeline_door_tests {
              the declaration it ends"
         );
 
-        // Retiring what the guest never created is not an event.
-        assert!(state.retire_pipeline(name(4000)).is_empty());
+        // Retiring what the guest never created is not an event — and says so,
+        // rather than answering the same empty list a real retirement with
+        // nothing parked on it answers. A driven boot needs the difference: the
+        // guest deletes render pipelines this device never drew with.
+        assert_eq!(
+            state.retire_pipeline(name(4000)),
+            reims_vgpu_core::session::Ended::default()
+        );
         assert_eq!(state.pipeline_census().retired, 1);
     }
 
@@ -5941,8 +5955,8 @@ mod pipeline_door_tests {
                     name(9),
                     RefusalReason::TranslationFailed("vertex_translate")
                 )
-                .is_empty(),
-            "nothing is admitted into this model yet, so nothing was parked on it"
+                .took,
+            "the table had it to refuse"
         );
         assert_eq!(state.pipeline_census().refused, 1);
 
@@ -5950,17 +5964,21 @@ mod pipeline_door_tests {
         // frame, and each of those draws re-walks the rail. One refusal is the
         // whole point of the state being terminal.
         assert!(!state.advance_pipeline(name(9), PipelineState::Compiling));
-        assert!(state
-            .refuse_pipeline(name(9), RefusalReason::CompilationFailed("again"))
-            .is_empty());
+        assert!(
+            !state
+                .refuse_pipeline(name(9), RefusalReason::CompilationFailed("again"))
+                .took
+        );
         assert_eq!(state.pipeline_census().refused, 1);
 
         // Refusing what the guest never created is not an event either — which
         // is why the rails skip the decline that *is* the pipeline being
         // absent rather than refusing a name the table has no entry for.
-        assert!(state
-            .refuse_pipeline(name(4000), RefusalReason::CompilationFailed("absent"))
-            .is_empty());
+        assert!(
+            !state
+                .refuse_pipeline(name(4000), RefusalReason::CompilationFailed("absent"))
+                .took
+        );
         assert_eq!(state.pipeline_census().refused, 1);
     }
 }
