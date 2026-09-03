@@ -25,6 +25,59 @@ fn resident_resample_band(idle_ms: u64) -> &'static str {
     }
 }
 
+/// A resident left the registry while a holder still had it pinned.
+///
+/// A pin says "somebody is still reading this image", and two of the three
+/// removal reasons honour that. The reclaim sweep never selects a pinned slot —
+/// [`ResourcePools::recoverable_residents`] filters on `pin_count == 0`, so
+/// `AllocationReclaimed` cannot reach one. `ResourceReleased` leaves the slot in
+/// the registry marked [`ResidentTargetSlot::resource_released`] and lets
+/// maintenance retire it once the last pin has left, which is the deferral
+/// written down in that field's own documentation.
+///
+/// The `registry_ensure*` recreate arms are the third, and they cannot defer the
+/// way the other two do: the guest has replaced the resource under this
+/// identity, so the key has to be free for the resident taking its place and the
+/// old slot has nowhere to wait.
+///
+/// What has nowhere to wait is really the *disposal*. `retire_resident` hands
+/// the image to [`ResourcePools::dispose`], whose deferral is keyed on
+/// `open_slot_mask` — the engine's own open command-buffer slots. The host
+/// window's present transaction is not one of them: it carries its own fence,
+/// `WindowPresenter`'s per-frame `in_flight`, submitted inside `begin_present`
+/// and not waited on until some later present's `retire`. A recreate arriving
+/// between those two points can therefore see `open_slot_mask() == 0`, destroy
+/// the image on the spot, and leave the queued blit reading freed memory.
+///
+/// This names the precondition and does not fix it. The fix changes what a pin
+/// *is* — a retention that defers disposal, which in turn needs the pin to carry
+/// the slot it was taken against, so an unpin can never be applied to a
+/// successor registered under the same identity — and that is worth sizing
+/// against evidence that this fires on a live boot rather than against the
+/// reading above. `pins` and `resource_owners` are both reported because their
+/// difference is which holder class is at risk: an excess of `pins` over
+/// `resource_owners` is a transient GPU or window holder, and the window holder
+/// is the one whose fence nothing here waits on.
+pub(super) struct ResidentRetiredWhilePinned {
+    why: ResidentReclaim,
+    pins: u32,
+    resource_owners: u32,
+}
+
+impl crate::observe::Decline for ResidentRetiredWhilePinned {
+    fn slug(&self) -> &'static str {
+        "resident_retired_while_pinned"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("why", self.why.slug().to_string()),
+            ("pins", self.pins.to_string()),
+            ("resource_owners", self.resource_owners.to_string()),
+        ]
+    }
+}
+
 /// Everything a creation site knows about a resident it has just built.
 ///
 /// The stored [`ResidentTargetSlot`] is this plus what the registry owns and a
@@ -824,6 +877,21 @@ impl ResourcePools {
         let old = old?;
         if old.pin_count == 0 {
             self.registry_non_pinned_adjust(Self::slot_attachment_bytes(&old), false);
+        }
+        if old.pin_count > 0 {
+            // Latched per removal reason: a recreate storm re-enters this with
+            // the same story every frame, and the second line would carry
+            // nothing the first did not. Magnitude belongs to a counter, and
+            // there is no counter yet because reachability is the open question.
+            crate::observe::Emit::decline(
+                "resident_retired_while_pinned",
+                &ResidentRetiredWhilePinned {
+                    why,
+                    pins: old.pin_count,
+                    resource_owners: old.resource_owner_count,
+                },
+            )
+            .fail_once(why as u64);
         }
         // A sole-copy slot never leaves here through a *reclaim* — both reclaim
         // paths skip it — but it does leave through the recreate arms, where the
@@ -2722,6 +2790,71 @@ pub(super) mod pin_count_tests {
             gpu_only_content: false,
             last_touch_ms: 0,
         }
+    }
+
+    /// `unregister_resident` is the one removal path, so it is the one place
+    /// that can see a pin outstanding at removal — and the only place the
+    /// condition is nameable before the image is already gone.
+    ///
+    /// Asserted on the always-on stream rather than on a counter because the
+    /// open question this instrument exists to answer is reachability on a live
+    /// boot, and the log is what a boot is read from. The unpinned arm is here
+    /// for the reason the readback-memory probe reports both of its outcomes: a
+    /// silence has to be readable as "no holder was outstanding", which it
+    /// cannot be if the healthy case never says anything and the emitter might
+    /// simply be unwired.
+    #[test]
+    fn removing_a_pinned_resident_names_the_holder_the_disposal_will_not_wait_for() {
+        let cap = crate::observe::FailCapture::start();
+        let mut pools = ResourcePools::new();
+        let identity = pinned_identity();
+
+        // Through the product pin path, not `slot.pin_count = 1`: the count and
+        // the non-pinned totals are maintained together, and a hand-set field
+        // would remove a slot the totals still believe is unpinned.
+        pools.registry.insert(identity.clone(), ready_slot());
+        pools.registry_order.push_back(identity.clone());
+        assert!(
+            pools.pin_resident_target(&identity, true),
+            "a ready, unreleased slot grants a pin"
+        );
+
+        assert!(pools
+            .unregister_resident(&identity, ResidentReclaim::Recreated)
+            .is_some());
+        let line = cap.one("resident_retired_while_pinned");
+        assert!(
+            line.contains("reason=resident_retired_while_pinned"),
+            "{line}"
+        );
+        assert!(line.contains("why=recreated"), "{line}");
+        assert!(line.contains("pins=1"), "{line}");
+        // No serialized resource owns this one, so the whole pin is the
+        // transient class — the one whose fence `dispose` does not consult.
+        assert!(line.contains("resource_owners=0"), "{line}");
+    }
+
+    /// The other half of the pair above: a removal with no holder outstanding is
+    /// the ordinary case and must stay silent, or the line stops meaning
+    /// anything on a boot.
+    #[test]
+    fn removing_an_unpinned_resident_says_nothing() {
+        let cap = crate::observe::FailCapture::start();
+        let mut pools = ResourcePools::new();
+        let identity = pinned_identity();
+        pools.registry.insert(identity.clone(), ready_slot());
+        pools.registry_order.push_back(identity.clone());
+
+        assert!(pools
+            .unregister_resident(&identity, ResidentReclaim::Recreated)
+            .is_some());
+        assert!(
+            !cap.lines()
+                .iter()
+                .any(|l| l.contains("resident_retired_while_pinned")),
+            "{:?}",
+            cap.lines()
+        );
     }
 
     fn pinned_identity() -> TargetIdentity {
