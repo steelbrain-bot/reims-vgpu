@@ -305,6 +305,11 @@ pub struct ExecWork {
     pub pipeline_leases: Vec<ResourceId>,
     pub prerequisites: Vec<Prerequisite>,
     pub arenas: ExecArenas,
+    /// Why this transaction's bound slots stayed `Unknown`. See
+    /// [`UsageCensus`]; carried on the work rather than reported from the walk
+    /// so that the numbers describe exactly the walk whose accesses are beside
+    /// them.
+    pub usage_census: UsageCensus,
 }
 
 impl ExecWork {
@@ -555,6 +560,8 @@ pub struct ExecBuilder<'u> {
     /// Scratch [`Self::record`] gathers each operation's participations into,
     /// so the walk costs no allocation after the first record.
     participation_scratch: Vec<Participation>,
+    /// Why this walk's slots stayed `Unknown`. See [`UsageCensus`].
+    usage_census: UsageCensus,
 }
 
 /// The binding state of whichever encoder is open.
@@ -615,6 +622,7 @@ impl EncoderBindings {
         op: &ResolvedOperation,
         usages: &dyn crate::pipeline::UsageSource,
         out: &mut Vec<Participation>,
+        census: &mut UsageCensus,
     ) {
         use reims_vgpu_protocol::render::ShaderStage;
         match (self, op) {
@@ -625,15 +633,18 @@ impl EncoderBindings {
                 // stays `Unknown`, which is what a draw the device cannot name
                 // a shader for deserves.
                 let bound = state.pipeline;
-                state.footprint_into(
-                    bound.and_then(|id| usages.binding_usage(id, Some(ShaderStage::Vertex))),
-                    bound.and_then(|id| usages.binding_usage(id, Some(ShaderStage::Fragment))),
-                    out,
-                );
+                let vertex =
+                    bound.and_then(|id| usages.binding_usage(id, Some(ShaderStage::Vertex)));
+                let fragment =
+                    bound.and_then(|id| usages.binding_usage(id, Some(ShaderStage::Fragment)));
+                census.note_draw(bound, vertex.is_some(), fragment.is_some());
+                state.footprint_into(vertex, fragment, out);
             }
             (Self::Compute(state), ResolvedOperation::Compute(ComputeOp::Dispatch(_))) => {
                 let bound = state.pipeline;
-                state.footprint_into(bound.and_then(|id| usages.binding_usage(id, None)), out);
+                let kernel = bound.and_then(|id| usages.binding_usage(id, None));
+                census.note_dispatch(bound, kernel.is_some());
+                state.footprint_into(kernel, out);
             }
             _ => {}
         }
@@ -720,6 +731,7 @@ impl<'u> ExecBuilder<'u> {
             arenas: ExecArenas::default(),
             bindings: EncoderBindings::None,
             participation_scratch: Vec::new(),
+            usage_census: UsageCensus::default(),
         }
     }
 
@@ -832,7 +844,8 @@ impl<'u> ExecBuilder<'u> {
         // Gathering only. Whether the encoder has *declared* what it just
         // answered is settled on the success path below, because everything
         // between here and there can still refuse the record.
-        self.bindings.footprint_into(&op, self.usages, &mut parts);
+        self.bindings
+            .footprint_into(&op, self.usages, &mut parts, &mut self.usage_census);
         // Pushed straight onto the transaction's list and rolled back on any
         // refusal, rather than gathered into a second vector: a record's
         // accesses are at most a handful and a `Vec` per record would be an
@@ -966,7 +979,147 @@ impl<'u> ExecBuilder<'u> {
             pipeline_leases: core::mem::take(&mut self.pipeline_leases),
             prerequisites: core::mem::take(&mut self.prerequisites),
             arenas: core::mem::take(&mut self.arenas),
+            usage_census: self.usage_census,
         })
+    }
+}
+
+/// Why a bound slot stayed [`crate::access::AccessMode::Unknown`], counted as
+/// the walk decides it.
+///
+/// # The reading this exists to make possible
+///
+/// `Unknown` conflicts with everything, so it is the number the ordering plane
+/// is judged on — and a total tells you nothing about what to fix. A draw whose
+/// pipeline the walk never saw bound and a draw whose shader the executor could
+/// not reflect both contribute every slot they bind, and they have nothing in
+/// common: the first is a hole in the walk's own encoder state, the second is a
+/// contract term the rail has not recovered. Counting them apart is what says
+/// which one the next move is about.
+///
+/// Counted at the one place the answer is decided, so it cannot describe a
+/// different walk than the one that ran.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageCensus {
+    /// Draws whose encoder had no pipeline bound at all. Every slot they bind
+    /// is `Unknown` and no executor could have helped.
+    pub draws_without_a_pipeline: u32,
+    /// Draws whose pipeline was bound and published neither stage.
+    pub draws_with_no_stage_published: u32,
+    /// Draws whose pipeline published one stage and refused the other.
+    pub draws_with_one_stage_published: u32,
+    /// Draws answered by both stages, which is the whole point.
+    pub draws_with_both_stages_published: u32,
+    /// Dispatches whose encoder had no pipeline bound.
+    pub dispatches_without_a_pipeline: u32,
+    /// Dispatches whose kernel published nothing.
+    pub dispatches_with_no_stage_published: u32,
+    /// Dispatches answered by their kernel.
+    pub dispatches_published: u32,
+    /// The first pipeline a draw or dispatch found unanswered.
+    ///
+    /// A count says how much was lost and never which pipeline lost it, and the
+    /// two candidate causes — a pipeline whose executor has not published yet,
+    /// and one whose usage a withdrawal or retirement threw away — are told
+    /// apart only by asking the table what state that pipeline is in. The name
+    /// is what lets the device ask. First rather than last, and one rather than
+    /// a list, because this is a diagnosis and not a population: the walk must
+    /// not allocate for it.
+    pub first_unanswered_pipeline: Option<ResourceId>,
+}
+
+impl UsageCensus {
+    fn note_draw(&mut self, bound: Option<ResourceId>, vertex: bool, fragment: bool) {
+        let stages = usize::from(vertex) + usize::from(fragment);
+        let counter = match (bound, stages) {
+            (None, _) => &mut self.draws_without_a_pipeline,
+            (Some(_), 0) => &mut self.draws_with_no_stage_published,
+            (Some(_), 1) => &mut self.draws_with_one_stage_published,
+            (Some(_), _) => &mut self.draws_with_both_stages_published,
+        };
+        *counter = counter.saturating_add(1);
+        self.note_unanswered(bound, stages == 0);
+    }
+
+    fn note_dispatch(&mut self, bound: Option<ResourceId>, kernel: bool) {
+        let counter = match (bound, kernel) {
+            (None, _) => &mut self.dispatches_without_a_pipeline,
+            (Some(_), false) => &mut self.dispatches_with_no_stage_published,
+            (Some(_), true) => &mut self.dispatches_published,
+        };
+        *counter = counter.saturating_add(1);
+        self.note_unanswered(bound, !kernel);
+    }
+
+    /// Keep the first pipeline that answered nothing, and only that one.
+    fn note_unanswered(&mut self, bound: Option<ResourceId>, nothing_published: bool) {
+        if let (Some(id), true, None) = (bound, nothing_published, self.first_unanswered_pipeline) {
+            self.first_unanswered_pipeline = Some(id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod usage_census_tests {
+    use super::*;
+
+    /// The four draw outcomes are counted apart, because they name four
+    /// different next moves.
+    #[test]
+    fn the_reason_a_draws_slots_stayed_unknown_is_counted_and_not_summed() {
+        let id = ResourceId {
+            slot: crate::identity::ObjectListRef(9),
+            generation: crate::identity::SlotGeneration::default(),
+        };
+        let mut c = UsageCensus::default();
+        c.note_draw(None, false, false);
+        c.note_draw(Some(id), false, false);
+        c.note_draw(Some(id), true, false);
+        c.note_draw(Some(id), false, true);
+        c.note_draw(Some(id), true, true);
+        assert_eq!(
+            c,
+            UsageCensus {
+                draws_without_a_pipeline: 1,
+                draws_with_no_stage_published: 1,
+                draws_with_one_stage_published: 2,
+                draws_with_both_stages_published: 1,
+                first_unanswered_pipeline: Some(id),
+                ..UsageCensus::default()
+            },
+            "one stage published is one row whichever stage it was: the pair \
+             says how much of the draw was answered, and which half is the \
+             rail's own refusal census"
+        );
+    }
+
+    /// A dispatch has one stage, so "published" and "no stage" are the whole
+    /// answer, and a kernel can never be half-answered.
+    #[test]
+    fn a_dispatch_is_answered_or_not_and_never_half() {
+        let id = ResourceId {
+            slot: crate::identity::ObjectListRef(4),
+            generation: crate::identity::SlotGeneration::default(),
+        };
+        let mut c = UsageCensus::default();
+        c.note_dispatch(None, false);
+        c.note_dispatch(Some(id), false);
+        c.note_dispatch(Some(id), true);
+        assert_eq!(
+            c,
+            UsageCensus {
+                dispatches_without_a_pipeline: 1,
+                dispatches_with_no_stage_published: 1,
+                dispatches_published: 1,
+                first_unanswered_pipeline: Some(id),
+                ..UsageCensus::default()
+            }
+        );
+        assert_eq!(
+            c.draws_without_a_pipeline, 0,
+            "a dispatch never lands in a draw's row; the two rails are read \
+             against different denominators"
+        );
     }
 }
 

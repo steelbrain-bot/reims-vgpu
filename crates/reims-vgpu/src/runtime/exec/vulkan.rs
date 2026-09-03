@@ -78,27 +78,108 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             continue;
         };
         let cache_started = std::time::Instant::now();
-        if !crate::runtime::m2v_cache::ensure_cached_async(
+        // `|` and not `||`: both stages must be *started*, so they translate in
+        // parallel and the packet is retried once rather than once per stage.
+        let translated = crate::runtime::m2v_cache::ensure_cached_async(
             v_air,
             metal2vulkan::passes::Stage::Vertex,
             pipeline_ref,
-        ) | !crate::runtime::m2v_cache::ensure_cached_async(
+        ) & crate::runtime::m2v_cache::ensure_cached_async(
             f_air,
             metal2vulkan::passes::Stage::Fragment,
             pipeline_ref,
-        ) {
-            // `|` and not `||`: both stages must be *started*, so they
-            // translate in parallel and the packet is retried once rather than
-            // once per stage.
-            if !pending.contains(&pipeline_ref) {
-                pending.push(pipeline_ref);
-            }
-        }
+        );
         note_preflight_part(
             PreflightPart::Cache,
             cache_started.elapsed().as_nanos() as u64,
         );
+        if !translated {
+            if !pending.contains(&pipeline_ref) {
+                pending.push(pipeline_ref);
+            }
+            continue;
+        }
+        publish_render_usage(state, host, task_id, pipeline_ref, v_air, f_air);
     }
+}
+
+/// Tell the ordering plane what this pipeline's two stages do with each bound
+/// slot, from the same pass that established they are translated.
+///
+/// # Why here, when `pipeline_resolve::ready` already publishes
+///
+/// `ready` runs at the pipeline's first *draw-time* resolve, which is after the
+/// transaction that draws it was admitted — and the walk asks for a pipeline's
+/// reflection once, at admission, and never again. So every draw of the packet
+/// that first uses a pipeline gets a footprint that is `Unknown` for every slot
+/// it binds. A driven macos-15 boot measured that at **1 244 draws** against
+/// 69 448 answered by both stages: small, and entirely avoidable, because this
+/// pass runs *before* admission readies the packet's leases.
+///
+/// The compute rail has published from its own pre-scan since it had one. This
+/// is the render half, so both rails answer at the same point in a packet's
+/// life and the two counters are read against the same denominator.
+///
+/// [`crate::model::DeviceState::pipeline_usage_published`] is what keeps the
+/// two sites from being two answers: whichever reaches the pipeline first
+/// publishes, the other finds the gate closed, and the gate is the model's own
+/// record rather than a memo either site keeps.
+fn publish_render_usage<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    v_air: &[u8],
+    f_air: &[u8],
+) {
+    use crate::backend::vulkan::pipeline_resolve::VertexBindPlan;
+
+    let Some(name) = crate::runtime::objects::name_resource(state, host, task_id, pipeline_ref)
+    else {
+        crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
+        return;
+    };
+    if state.pipeline_usage_published(name) {
+        crate::runtime::drain::note_store_route("render_usage_already_published");
+        return;
+    }
+    // The descriptor, for the vertex stage's attribute slots — the buffers the
+    // fixed-function fetch reads, which the reflection does not name. Loaded
+    // only on the pass that publishes, which is once per build.
+    let Some(desc) = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
+    else {
+        crate::runtime::drain::note_store_route("render_usage_descriptor_lost");
+        return;
+    };
+    let (Ok(vertex), Ok(fragment)) = (
+        crate::runtime::m2v_cache::translate_cached_reflected(
+            v_air,
+            metal2vulkan::passes::Stage::Vertex,
+            pipeline_ref,
+        ),
+        crate::runtime::m2v_cache::translate_cached_reflected(
+            f_air,
+            metal2vulkan::passes::Stage::Fragment,
+            pipeline_ref,
+        ),
+    ) else {
+        // Cached a moment ago and not now: the entry failed or was forgotten
+        // between the two calls. Nothing is owed — the draw path reports the
+        // translation failure precisely, and an unpublished pipeline is a
+        // conservative footprint rather than a wrong one.
+        crate::runtime::drain::note_store_route("render_usage_translation_lost");
+        return;
+    };
+    let plan = VertexBindPlan::build(&desc);
+    let (usage, refusals) = crate::backend::vulkan::binding_usage::render(
+        &vertex.reflection,
+        &plan,
+        &fragment.reflection,
+    );
+    for refusal in refusals.into_iter().flatten() {
+        crate::runtime::drain::note_store_route(refusal.slug());
+    }
+    crate::runtime::draw::publish_pipeline_usage(state, host, task_id, pipeline_ref, usage);
 }
 
 /// `dispatches` is the **model's own record of what this packet dispatches**,
