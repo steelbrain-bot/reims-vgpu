@@ -162,6 +162,14 @@ pub enum FreeRefusal {
     NotOpen(Refusal),
     /// The channel still owes publication the guest is waiting on.
     Owed(RetireRefusal),
+    /// The command named the root domain, whose lifetime is the device's.
+    ///
+    /// [`ChannelId::ROOT`] is opened by [`SessionModel::new`] because there is
+    /// no packet that could open it — it is the domain a `CmdDefineFifo`
+    /// arrives *on*. Freeing it would leave the model with no domain for the
+    /// commands that open every other one, and the guest with a device that
+    /// stops answering the FIFO it is still writing to.
+    IsRoot,
 }
 
 impl FreeRefusal {
@@ -171,6 +179,7 @@ impl FreeRefusal {
         match self {
             Self::NotOpen(refusal) => refusal.slug(),
             Self::Owed(refusal) => refusal.slug(),
+            Self::IsRoot => "session_root_channel_not_freeable",
         }
     }
 }
@@ -334,7 +343,13 @@ impl SessionModel {
             epoch: DeviceEpoch::FIRST,
             device: DeviceState::Live,
             next_ingress: IngressOrdinal::default().next(),
-            open_channels: BTreeSet::new(),
+            // The root domain, open from the start. See [`ChannelId::ROOT`]:
+            // every other domain is opened by a command the guest sends on this
+            // one, so a model that required a command for this one would refuse
+            // the command that opens the rest — along with every task
+            // definition, object-list bind and device query the root FIFO
+            // carries.
+            open_channels: BTreeSet::from([ChannelId::ROOT]),
             channel_sequence: BTreeMap::new(),
             graph: DependencyGraph::new(),
             rebuilding: Vec::new(),
@@ -820,6 +835,10 @@ impl SessionModel {
     /// them would drop the completion words the guest is waiting on, so the
     /// caller drains first.
     pub fn retire_channel(&mut self, domain: ChannelId) -> Result<(), FreeRefusal> {
+        if domain == ChannelId::ROOT {
+            self.refusals += 1;
+            return Err(FreeRefusal::IsRoot);
+        }
         if !self.open_channels.remove(&domain) {
             self.refusals += 1;
             return Err(FreeRefusal::NotOpen(Refusal::ChannelNotOpen {
@@ -2141,16 +2160,32 @@ mod tests {
     /// held the channels, and nothing joined them, so a correct guest that
     /// defined a FIFO and used it got `ChannelNotOpen` on every packet.
     ///
-    /// The bootstrap door is deliberately not used here. Only the root domain
-    /// is opened by hand, which is what a real session does — the ring exists
-    /// before the guest can name anything — and everything after that is the
-    /// guest's own bytes.
+    /// The bootstrap door is deliberately not used here. The root domain is
+    /// open because a session has one — the ring exists before the guest can
+    /// name anything, and the command that opens every other domain arrives on
+    /// it — and everything after that is the guest's own bytes.
     #[test]
     fn a_guests_channel_commands_open_and_end_the_domain_it_then_submits_on() {
         const DEFINE: u16 = 0x30;
         const FREE: u16 = 0x31;
         let mut s = SessionModel::new(SessionId(1));
-        s.open_channel(ChannelId(0)).expect("the root ring");
+        assert!(
+            s.channel_open(ChannelId::ROOT),
+            "a session with no root domain has nowhere for a channel definition to arrive"
+        );
+        assert_eq!(
+            s.open_channel(ChannelId::ROOT),
+            Err(Refusal::ChannelAlreadyOpen {
+                channel: ChannelId::ROOT
+            }),
+            "and it is open once, not opened again by a bootstrap that ran twice"
+        );
+        assert_eq!(
+            s.retire_channel(ChannelId::ROOT),
+            Err(FreeRefusal::IsRoot),
+            "the root FIFO's publication lifetime is the device's, not a \
+             guest command's"
+        );
 
         let domain = ChannelId(2).0.to_le_bytes();
         let define = crate::control::resolve(Channel::Root, DEFINE, &domain).expect("a definition");
@@ -2862,6 +2897,14 @@ mod tests {
                                 assert_eq!(refusal, Refusal::ChannelNotOpen { channel: d });
                                 assert_eq!(live, 0);
                                 channel_frees_unopened += 1;
+                            }
+                            // The sweep names only child domains, so the root
+                            // refusal is unreachable from here — spelled out
+                            // rather than defaulted so that a sweep that grew
+                            // the root domain would fail here instead of
+                            // counting a refusal as an unopened free.
+                            Err(FreeRefusal::IsRoot) => {
+                                panic!("seed {seed}: the sweep named the root domain")
                             }
                         }
                     }
