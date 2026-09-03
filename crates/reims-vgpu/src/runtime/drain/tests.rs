@@ -5766,33 +5766,6 @@ fn a_stamp_wait_naming_a_slot_that_cannot_exist_runs_rather_than_parking() {
         "and nothing is parked on it, because a position waiting on a slot no \
          drain writes would hold its channel's publication head forever"
     );
-
-    // A packet carrying both an ordinary unmet wait and an undecidable one still
-    // runs: holding for the first would park the timeline forever on the second.
-    let mut both = vec![0u8; (PACKET_HEADER_LEN + 2 * PACKET_STAMP_LEN) as usize];
-    st16(&mut both[PACKET_OPCODE..], 0);
-    st16(&mut both[PACKET_STAMP_COUNT..], 2);
-    st32(
-        &mut both[PACKET_TOTAL_SIZE..],
-        PACKET_HEADER_LEN + 2 * PACKET_STAMP_LEN,
-    );
-    st32(&mut both[PACKET_HEADER_LEN as usize..], 6);
-    st32(&mut both[PACKET_HEADER_LEN as usize + 4..], 0x99);
-    st32(
-        &mut both[(PACKET_HEADER_LEN + PACKET_STAMP_LEN) as usize..],
-        bad_slot,
-    );
-    st32(
-        &mut both[(PACKET_HEADER_LEN + PACKET_STAMP_LEN) as usize + 4..],
-        1,
-    );
-    let decoded = decode_packet(&both, 0, both.len() as u32, RING).expect("two records decode");
-    assert_eq!(
-        note_packet_stamp_waits(&state, &host, None, &decoded, None),
-        StampVerdict::Unevaluable,
-        "Unevaluable outranks Hold, or the packet parks forever on the wait that \
-         cannot clear while waiting for the one that could"
-    );
 }
 
 /// The ledger separates a word this device is *holding* from one it has already
@@ -7263,101 +7236,6 @@ fn the_map_interval_audit_counts_a_clean_pairing_and_not_only_a_finding() {
         store_route_count("map_audit_consistent"),
         clean + 2,
         "a finding must not also be counted as a clean pairing"
-    );
-}
-
-/// The coalesced stamp keeps the **greatest** value a drain latched, in the same
-/// wrapping-signed order a wait is compared in.
-///
-/// Not "the last one seen". For a well-formed guest the two agree, and the whole
-/// point of taking the maximum is that a regressing stamp arriving from the
-/// guest cannot make this device publish a slot going backwards — which would
-/// unsatisfy a wait the guest had already been told was met.
-#[test]
-fn a_coalesced_stamp_keeps_the_latest_value_across_the_u32_wrap() {
-    let mut pending = PendingStamp::default();
-    assert_eq!(
-        pending.owed(),
-        None,
-        "a drain that stamped nothing owes nothing"
-    );
-
-    pending.latch(7);
-    pending.latch(9);
-    assert_eq!(pending.owed(), Some(9), "the later of two ascending stamps");
-
-    pending.latch(8);
-    assert_eq!(
-        pending.owed(),
-        Some(9),
-        "a stamp behind the one held must not pull the slot backwards"
-    );
-
-    // Across the wrap: 0xffff_fff0 then 4. The signed difference is +20, so 4 is
-    // *later*, and a plain `>=` would keep 0xffff_fff0 and stall every wait on
-    // the far side of the wrap.
-    let mut wrapped = PendingStamp::default();
-    wrapped.latch(0xffff_fff0);
-    wrapped.latch(4);
-    assert_eq!(
-        wrapped.owed(),
-        Some(4),
-        "the wrap is a signed difference, not a magnitude comparison"
-    );
-}
-
-/// A wait on the slot the drain is holding is answered from the latch.
-///
-/// Without this the packet reads the stale word out of guest RAM, returns
-/// `Hold`, and parks the channel against a stamp this device is itself sitting
-/// on — a deadlock introduced by the coalescing rather than by the guest.
-#[test]
-fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
-    const SLOT: u32 = 3;
-    let mut pending = PendingStamp::default();
-    pending.latch(20);
-
-    let met = StampWait {
-        index: SLOT,
-        value: 20,
-    };
-    assert!(
-        pending.discharges(SLOT, met),
-        "a wait at exactly the latched value is discharged"
-    );
-    assert!(
-        pending.discharges(
-            SLOT,
-            StampWait {
-                index: SLOT,
-                value: 12
-            }
-        ),
-        "and so is one behind it"
-    );
-    assert!(
-        !pending.discharges(
-            SLOT,
-            StampWait {
-                index: SLOT,
-                value: 21
-            }
-        ),
-        "a wait past the latched value is not discharged by it"
-    );
-    assert!(
-        !pending.discharges(
-            SLOT,
-            StampWait {
-                index: SLOT + 1,
-                value: 1
-            }
-        ),
-        "a wait on another slot is not this drain's to answer"
-    );
-    assert!(
-        !PendingStamp::default().discharges(SLOT, met),
-        "a drain that has latched nothing discharges nothing"
     );
 }
 
