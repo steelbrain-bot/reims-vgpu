@@ -26,6 +26,14 @@ declaration gives that by construction rather than by a flag.
   with it. Those tests stop running the moment they move; a group that ships
   without replacement coverage has silently lost it, and the row is where that
   is checked.
+- **The four rules above are a test, not a convention.**
+  `crates/reims-vgpu/tests/dead_is_unreachable_by_construction.rs` refuses a
+  `mod dead` declaration, a `#[path]` attribute pointing into a `dead/`
+  directory, any path naming `dead` from live source, and a `dead/` with no
+  register. A convention with no gate is what the amendment was written
+  against: `mod dead;` compiles, and the second semantic model it re-links
+  shows up as a behaviour difference on a live boot weeks later, attributed to
+  whatever else changed that week.
 - **`dead/` is deleted wholesale, in one commit,** once every group has moved and
   the Seam 6 gates are green. It is not pruned incrementally — a half-emptied
   `dead/` reads as "these were the ones worth keeping", which is the opposite of
