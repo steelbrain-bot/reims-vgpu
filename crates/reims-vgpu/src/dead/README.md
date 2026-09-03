@@ -29,8 +29,11 @@ declaration gives that by construction rather than by a flag.
 - **The four rules above are a test, not a convention.**
   `crates/reims-vgpu/tests/dead_is_unreachable_by_construction.rs` refuses a
   `mod dead` declaration, a `#[path]` attribute pointing into a `dead/`
-  directory, any path naming `dead` from live source, and a `dead/` with no
-  register. A convention with no gate is what the amendment was written
+  directory, an `include!` splicing a `dead/` file, a Cargo target whose `path`
+  points into one, any path naming `dead` from live source, and a `dead/` with
+  no register. Six doors, because the module tree is not the only one: a
+  `[[test]]` with `path = "src/dead/…"` compiles and links the file as its own
+  crate root while a walk of `src/` reports the tree clean. A convention with no gate is what the amendment was written
   against: `mod dead;` compiles, and the second semantic model it re-links
   shows up as a behaviour difference on a live boot weeks later, attributed to
   whatever else changed that week.

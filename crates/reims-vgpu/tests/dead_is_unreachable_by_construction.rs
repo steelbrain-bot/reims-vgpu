@@ -26,6 +26,13 @@
 //!   `use …dead::…` cannot compile without one of the two above, so a hit here
 //!   is a leftover from a reversal in progress and is worth naming separately
 //!   from the mechanism that would carry it.
+//! * **No `include!` names a `dead/` file.** A third way to compile one: the
+//!   macro splices the file into whatever module the call sits in, with no
+//!   `mod` and no `#[path]` for either of the checks above to see.
+//! * **No `Cargo.toml` target points into `dead/`.** The module tree is not the
+//!   only door. A `[[test]]` or `[[bin]]` with `path = "src/dead/…"` compiles
+//!   and links the file as its own crate root, which is a second semantic model
+//!   that the whole `src/` walk would report as clean.
 //! * **Every `dead/` has a `README.md`.** The register is where a move records
 //!   what it replaced and which owner-level tests replaced the legacy tests
 //!   that moved with it. Those tests stop running the moment they move, so a
@@ -188,5 +195,64 @@ fn every_dead_directory_carries_its_register() {
         "no `dead/` directory found at all. If the last one has been deleted \
          wholesale — which happens once, after every group has moved and the \
          gates are green — this suite has done its job and goes with it"
+    );
+}
+
+#[test]
+fn no_include_macro_splices_a_dead_file() {
+    let mut offenders = Vec::new();
+    for path in live_rust_sources() {
+        let text = std::fs::read_to_string(&path).expect("a source file is readable");
+        for (n, line) in text.lines().enumerate() {
+            let code = code_of(line);
+            if code.contains("dead/")
+                && (code.contains("include!") || code.contains("include_str!"))
+            {
+                offenders.push(format!("{}:{}", path.display(), n + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "an `include!` splices a disconnected file into whatever module the call \
+         sits in, with no `mod` and no `#[path]` for the other checks to see. \
+         Found at: {offenders:?}"
+    );
+}
+
+#[test]
+fn no_cargo_target_points_into_dead() {
+    let crates = workspace_root().join("crates");
+    let mut offenders = Vec::new();
+    let mut seen = 0usize;
+    for entry in std::fs::read_dir(&crates)
+        .expect("crates/ is readable")
+        .flatten()
+    {
+        let manifest = entry.path().join("Cargo.toml");
+        let Ok(text) = std::fs::read_to_string(&manifest) else {
+            continue;
+        };
+        seen += 1;
+        for (n, line) in text.lines().enumerate() {
+            let code = match line.find('#') {
+                Some(i) => &line[..i],
+                None => line,
+            };
+            if code.contains("dead/") {
+                offenders.push(format!("{}:{}", manifest.display(), n + 1));
+            }
+        }
+    }
+    assert!(
+        seen > 1,
+        "only {seen} manifests were read; the walk missed the tree"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a Cargo target with `path = \"src/dead/…\"` compiles and links the file \
+         as its own crate root — a second semantic model the `src/` walk would \
+         report as clean, because the module tree is not the only door. \
+         Found at: {offenders:?}"
     );
 }
