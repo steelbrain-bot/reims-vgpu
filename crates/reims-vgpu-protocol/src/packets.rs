@@ -310,39 +310,28 @@ pub const LEDGER: &[Packet] = &[
         channel: Channel::Child,
         opcode: 0x28,
         name: "CmdDeleteObject",
-        closure: Closure::Unresolved {
-            question: "the ref is in the serializer's per-kind space, which this device tracks \
-                       for three kinds and not the other eight. The kind is counted and the \
-                       object is not retired; acting on the ref against the object-list namespace \
-                       was measured and would only ever destroy an unrelated object that shared \
-                       the integer. It is also the *only* unresolved row a driven guest sends, \
-                       and the kind census says what closing it is worth: a macos-15 boot \
-                       through three rounds of five applications classified 36 471 packets and \
-                       left 2166 unclassified, every one of them this opcode --- of which 2148 \
-                       delete a sampler state, 4 a depth-stencil state and 4 a render pipeline \
-                       state, the three kinds this device does track and does retire. The eight \
-                       untracked kinds are 10 packets: 5 functions, 3 compute pipeline states \
-                       and 2 fences. The fence half then closed: a boot's two fence deletes both \
-                       named a ref this device held a fence generation under, so that ref space \
-                       does coincide and the delete retires the generations --- which leaves 8 \
-                       packets, 5 functions and 3 compute pipeline states, both cached by \
-                       content rather than by ref. Those 8 were then measured against the \
-                       guest's own object list, in the form that can answer it: the type the \
-                       destroy opcode names against the type the list entry carries, because a \
-                       resolving integer is a collision and an agreeing type is an identity. \
-                       All 8 named **no list entry at all** --- no agreement and no collision \
-                       --- so those refs are in a space this device holds nothing keyed by and \
-                       there is nothing for a retirement to find. What is left unresolved is \
-                       therefore not any kind a driven guest sends: it is the five kinds one \
-                       never sent --- buffer, texture, heap, rasterization rate map and \
-                       indirect command buffer --- for which there is no evidence either way. \
-                       The six kinds a driven guest does send are settled on their own rows in \
-                       the serializer ledger: the depth-stencil, sampler and render-pipeline \
-                       destroys retire their task-local registries, the fence destroy retires \
-                       its generations, and the function and compute-pipeline destroys are \
-                       ProvenNoOp on the cell that this device keys those two by content rather \
-                       than by ref. The row blocks 2166 packets a boot on the five-kind residue \
-                       alone",
+        closure: Closure::Implemented {
+            evidence: "retires the object-list name the destroy record's reference holds, and the \
+                       task-local registry entry its kind keeps. The record is self-describing --- \
+                       one of eleven opcodes over an identical twelve-byte body --- so the kind is \
+                       the record's and each kind is settled on its own row on the serializer \
+                       rail; a kind whose row is not settled refuses this packet by name through \
+                       `lifecycle::ResolveRefusal::UnsettledDestroy` rather than holding the whole \
+                       class out of the model. Five kinds are in that state --- buffer, texture, \
+                       heap, rasterization rate map and indirect command buffer --- and no driven \
+                       boot has ever seen one. What settled the row was the ref space, measured \
+                       twice. First: of 2203 destroys this device retires something for, 2123 \
+                       named no live object-list entry, which reads like a second namespace and is \
+                       not --- `objects::resolve_sampler_state` constructs a sampler by looking \
+                       that same number up in the guest's object list and requiring a \
+                       serializer-object entry there, so the spaces are one and the reading is \
+                       about time: the guest clears its slot before it sends the destroy. Second, \
+                       the question that follows from that: could the semantic model *name* the \
+                       reference, which is answered from the device's own namespace before the \
+                       guest's list is consulted --- zero of 1984, because nothing on the sampler \
+                       construction path had ever declared a name. Taking the name at \
+                       construction moved it to 2006 named against 2006 retired, on a driven \
+                       macos-15 boot with no line on the failure channel",
         },
     },
     Packet {

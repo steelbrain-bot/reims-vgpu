@@ -82,6 +82,12 @@ pub enum LifecycleKind {
     SynchronizeAndDiscard,
     Discard,
     DeleteBacking,
+    /// The serializer's per-kind destroy, carried in its own packet.
+    ///
+    /// The odd one of the thirteen: its payload is a task word followed by a
+    /// self-describing record, so *which* object ends is in the record's opcode
+    /// and not in this kind. See [`object_destroy`].
+    DeleteObject,
 }
 
 impl LifecycleKind {
@@ -109,6 +115,7 @@ impl LifecycleKind {
             (Child, 0x3e) => Self::SynchronizeAndDiscard,
             (Child, 0x3f) => Self::Discard,
             (Child, 0x36) => Self::DeleteBacking,
+            (Child, 0x28) => Self::DeleteObject,
             _ => return None,
         })
     }
@@ -147,7 +154,8 @@ impl LifecycleKind {
             | Self::MapMemory
             | Self::UnmapMemory
             | Self::ReplacePhysical
-            | Self::DeleteBacking => None,
+            | Self::DeleteBacking
+            | Self::DeleteObject => None,
         }
     }
 
@@ -166,6 +174,7 @@ impl LifecycleKind {
             Self::SynchronizeAndDiscard => "synchronize_and_discard",
             Self::Discard => "discard",
             Self::DeleteBacking => "delete_backing",
+            Self::DeleteObject => "delete_object",
         }
     }
 }
@@ -325,6 +334,28 @@ pub enum LifecycleOp {
         task: TaskId,
         backing: BackingId,
     },
+    /// End one serializer object: the name stops resolving, and the rail drops
+    /// whatever it holds for that kind.
+    ///
+    /// # Why the kind travels and `DeleteResource` was not reused
+    ///
+    /// The name half is identical — a slot stops resolving, and
+    /// [`crate::namespace`] owns that either way. What is not identical is what
+    /// the executor owes: a sampler destroy drops a task-local sampler
+    /// registry entry, a fence destroy drops the generations a wait is decided
+    /// against, and a function destroy drops nothing at all because that kind
+    /// is held by content. An operation that lost the kind would leave the
+    /// executor to re-derive it from bytes the model no longer carries.
+    ///
+    /// They are also two different commands on the wire — `0x25` names
+    /// `{task, object}` in the packet and this one carries a record — so
+    /// folding them would be one kind with two payload layouts, which
+    /// [`LifecycleKind::of`] could not tell apart.
+    DeleteObject {
+        task: TaskId,
+        resource: ResourceId,
+        kind: reims_vgpu_protocol::destroy::DestroyKind,
+    },
 }
 
 impl LifecycleOp {
@@ -345,6 +376,7 @@ impl LifecycleOp {
             Self::SynchronizeAndDiscard { .. } => LifecycleKind::SynchronizeAndDiscard,
             Self::Discard { .. } => LifecycleKind::Discard,
             Self::DeleteBacking { .. } => LifecycleKind::DeleteBacking,
+            Self::DeleteObject { .. } => LifecycleKind::DeleteObject,
         }
     }
 
@@ -368,9 +400,9 @@ impl LifecycleOp {
             | Self::Synchronize { resources, .. }
             | Self::SynchronizeAndDiscard { resources, .. }
             | Self::Discard { resources, .. } => resources,
-            Self::DeleteResource { resource, .. } | Self::ReplacePhysical { resource, .. } => {
-                std::slice::from_ref(resource)
-            }
+            Self::DeleteResource { resource, .. }
+            | Self::ReplacePhysical { resource, .. }
+            | Self::DeleteObject { resource, .. } => std::slice::from_ref(resource),
             // A task's own lifetime, an address interval, a slot declaration
             // and a backing retirement each name something that is not a
             // resource id.
@@ -440,9 +472,10 @@ impl LifecycleOp {
             Self::Invalidate { .. }
             | Self::Synchronize { .. }
             | Self::SynchronizeAndDiscard { .. } => Some(AccessMode::Write),
-            Self::Discard { .. } | Self::DeleteResource { .. } | Self::ReplacePhysical { .. } => {
-                Some(AccessMode::Unknown)
-            }
+            Self::Discard { .. }
+            | Self::DeleteResource { .. }
+            | Self::ReplacePhysical { .. }
+            | Self::DeleteObject { .. } => Some(AccessMode::Unknown),
             // Each names something that is not a resource, so there is no
             // per-resource claim for a mode to be about.
             Self::DefineTask { .. }
@@ -470,7 +503,8 @@ impl LifecycleOp {
             | Self::Synchronize { task, .. }
             | Self::SynchronizeAndDiscard { task, .. }
             | Self::Discard { task, .. }
-            | Self::DeleteBacking { task, .. } => *task,
+            | Self::DeleteBacking { task, .. }
+            | Self::DeleteObject { task, .. } => *task,
         }
     }
 }
@@ -653,6 +687,25 @@ pub enum ResolveRefusal {
     /// The command is not a backing retirement, so there is nothing for
     /// [`backing_retirement`] to read.
     NotABackingRetirement { kind: LifecycleKind },
+    /// The command is not a serializer destroy, so there is nothing for
+    /// [`object_destroy`] to read.
+    NotAnObjectDestroy { kind: LifecycleKind },
+    /// The bytes inside a destroy command are not a destroy record.
+    ///
+    /// Carried whole from the layer that judged them, which already tells a
+    /// number in the destroy span that nothing has measured from a record of
+    /// some other family entirely.
+    Destroy(reims_vgpu_protocol::destroy::DestroyRefusal),
+    /// The record is a destroy of a kind whose ledger row is not settled.
+    ///
+    /// Five of the eleven kinds have never been observed on a driven boot, and
+    /// acting on one would be acting on no evidence. The refusal is per
+    /// *packet* rather than per class, which is the difference between holding
+    /// five unobserved kinds out of the model and holding 5.5% of a real
+    /// guest's stream out of it.
+    UnsettledDestroy {
+        kind: reims_vgpu_protocol::destroy::DestroyKind,
+    },
     /// The retirement names a mapping the mapper holds no surface for.
     ///
     /// Carries the guest's number for [`Self::UnknownRef`]'s reason, and is a
@@ -708,6 +761,9 @@ impl ResolveRefusal {
             Self::NotATaskLifetime { .. } => "lifecycle_not_a_task_lifetime",
             Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
             Self::UnestablishedValidityOps { .. } => "lifecycle_unestablished_validity_ops",
+            Self::NotAnObjectDestroy { .. } => "lifecycle_not_an_object_destroy",
+            Self::Destroy(inner) => inner.reason(),
+            Self::UnsettledDestroy { .. } => "lifecycle_unsettled_destroy",
         }
     }
 }
@@ -904,6 +960,7 @@ pub fn operation(
         | LifecycleKind::SynchronizeAndDiscard
         | LifecycleKind::Discard => resource_list(kind, payload, objects),
         LifecycleKind::SetObjectList => object_list_bind(kind, payload),
+        LifecycleKind::DeleteObject => object_destroy(kind, payload, objects),
     }
 }
 
@@ -959,6 +1016,14 @@ pub fn task_named(kind: LifecycleKind, payload: &[u8]) -> Result<TaskId, Resolve
         LifecycleKind::SetObjectList => {
             fifo::decode_set_object_list(payload)
                 .map_err(ResolveRefusal::ShortNotice)?
+                .task_id
+        }
+        // The task word is the command's, ahead of a record whose framing this
+        // question does not need: a destroy that is too short to hold a record
+        // still names the task it would have acted in.
+        LifecycleKind::DeleteObject => {
+            fifo::decode_delete_object(payload)
+                .map_err(|error| ResolveRefusal::ShortNotice(error.short()))?
                 .task_id
         }
         // The two record lengths, told apart by the same question
@@ -1103,6 +1168,71 @@ pub fn object_reference(
             resource,
         }),
     }
+}
+
+/// Turn a serializer destroy packet's payload into the operation it names.
+///
+/// # The kind is in the record and the task is in the command
+///
+/// `CmdDeleteObject`'s payload is a task word followed by one self-describing
+/// destroy record, so this is the one lifetime join that reads two layers:
+/// [`reims_vgpu_protocol::fifo::decode_delete_object`] frames the record inside
+/// the payload, and [`reims_vgpu_protocol::destroy::decode`] says which of the
+/// eleven kinds it is and which reference it names.
+///
+/// # An unsettled kind refuses, and that is what makes the row affordable
+///
+/// The eleven kinds do not share a closure. Six are settled on their own
+/// serializer ledger rows; five — buffer, texture, heap, rasterization rate map
+/// and indirect command buffer — have never been observed on any driven boot
+/// and are unresolved. Refusing the whole *packet class* on their account was
+/// what held 5.5% of a real guest's stream out of the model; refusing the
+/// individual packet is the same honesty at 1/2000 the cost, and it costs the
+/// channel nothing because a refused packet's completion word is
+/// [`crate::session::SessionModel::admit`]'s caller's to stamp.
+///
+/// # The reference is an object-list name
+///
+/// Measured, not assumed. A sampler is constructed by looking this same number
+/// up in the guest's object list and requiring a serializer-object entry there.
+/// A driven boot finding that most destroys resolve to no *live* entry is a
+/// fact about time, not about namespaces — the guest clears its slot before it
+/// sends the destroy, and the name the device took at construction outlives the
+/// slot. That is why this resolves through [`crate::resolve::TaskNamespaces`]
+/// like every other object reference, and why it can.
+///
+/// # Errors
+///
+/// [`ResolveRefusal`]: a kind that is not a destroy command, a payload too
+/// short for the record, a record that is not a destroy, a kind the ledger has
+/// not settled, or a reference naming nothing live.
+pub fn object_destroy(
+    kind: LifecycleKind,
+    payload: &[u8],
+    namespaces: &(impl crate::resolve::TaskNamespaces + ?Sized),
+) -> Result<LifecycleOp, ResolveRefusal> {
+    if kind != LifecycleKind::DeleteObject {
+        return Err(ResolveRefusal::NotAnObjectDestroy { kind });
+    }
+    let command = fifo::decode_delete_object(payload)
+        .map_err(|error| ResolveRefusal::ShortNotice(error.short()))?;
+    let record =
+        reims_vgpu_protocol::destroy::decode(command.record).map_err(ResolveRefusal::Destroy)?;
+    if !record.kind.settled() {
+        return Err(ResolveRefusal::UnsettledDestroy { kind: record.kind });
+    }
+    let task = TaskId(command.task_id);
+    let resolver = crate::resolve::InTask::new(namespaces, task);
+    let resource = crate::resolve::RefResolver::resource(&resolver, record.object_ref).ok_or(
+        ResolveRefusal::UnknownRef {
+            object_ref: record.object_ref,
+        },
+    )?;
+    Ok(LifecycleOp::DeleteObject {
+        task,
+        resource,
+        kind: record.kind,
+    })
 }
 
 /// Turn a backing-retirement packet's payload into the operation it names.
@@ -1622,6 +1752,13 @@ impl Lifecycle {
             }
             LifecycleOp::Discard { task, resources } => self.discard(*task, resources),
             LifecycleOp::DeleteBacking { task, backing } => self.delete_backing(*task, *backing),
+            // The name half, which is the only half this model owns. Which
+            // per-kind registry the rail drops is the executor's, and it is
+            // carried on the operation so the executor does not have to
+            // re-derive it from bytes the model no longer holds.
+            LifecycleOp::DeleteObject { task, resource, .. } => {
+                self.delete_resource(*task, *resource)
+            }
         }
     }
 
@@ -2320,6 +2457,11 @@ mod tests {
                 task: TASK,
                 backing: BackingId(10),
             },
+            LifecycleOp::DeleteObject {
+                task: TASK,
+                resource: name(0),
+                kind: reims_vgpu_protocol::destroy::DestroyKind::SamplerState,
+            },
         ]
     }
 
@@ -2561,7 +2703,7 @@ mod tests {
         seen.dedup();
         assert_eq!(
             seen.len(),
-            12,
+            13,
             "every kind is a packet the ledger judged, and every judged \
              lifecycle packet is a kind"
         );
@@ -3555,6 +3697,84 @@ mod tests {
         );
     }
 
+    /// A destroy names the kind that ends, and an unsettled kind refuses the
+    /// packet rather than the class.
+    ///
+    /// The whole reason this join reads two layers. Six of the eleven kinds are
+    /// settled on their own serializer rows and five have never been observed;
+    /// holding the *class* out of the model on their account kept 5.5% of a
+    /// real guest's stream from ever reaching it, which is what
+    /// `CmdDeleteObject`'s packet row said and what it stopped saying.
+    #[test]
+    fn a_destroy_carries_its_kind_and_an_unsettled_kind_refuses_this_packet_alone() {
+        use crate::resolve::TaskNamespaces as _;
+        use reims_vgpu_protocol::destroy::DestroyKind;
+
+        let payload = |kind_opcode: u32, object_ref: u32| {
+            let rec = fifo::DELETE_OBJECT_RECORD;
+            let mut out = vec![0u8; rec + 12];
+            out[fifo::DELETE_OBJECT_TASK_ID..fifo::DELETE_OBJECT_TASK_ID + 4]
+                .copy_from_slice(&TASK.0.to_le_bytes());
+            out[rec..rec + 4].copy_from_slice(&kind_opcode.to_le_bytes());
+            out[rec + 4..rec + 8].copy_from_slice(&12u32.to_le_bytes());
+            out[rec + 8..rec + 12].copy_from_slice(&object_ref.to_le_bytes());
+            out
+        };
+
+        // A settled kind. The operation carries it, because which per-kind
+        // registry the rail drops is not re-derivable from a model that kept
+        // only the name.
+        assert_eq!(
+            object_destroy(
+                LifecycleKind::DeleteObject,
+                &payload(DestroyKind::SamplerState.opcode(), 9),
+                &Everything
+            ),
+            Ok(LifecycleOp::DeleteObject {
+                task: TASK,
+                resource: Everything.resource(TASK, 9).expect("everything resolves"),
+                kind: DestroyKind::SamplerState,
+            })
+        );
+
+        // An unsettled one. Refused by name, and by *its* name rather than the
+        // packet's — a reader has to be able to tell which of the eleven is
+        // holding the row open.
+        assert_eq!(
+            object_destroy(
+                LifecycleKind::DeleteObject,
+                &payload(DestroyKind::Heap.opcode(), 9),
+                &Everything
+            ),
+            Err(ResolveRefusal::UnsettledDestroy {
+                kind: DestroyKind::Heap
+            }),
+            "a kind no driven boot has ever sent must not be acted on"
+        );
+
+        // Bytes that are not a destroy at all keep the decoder's own reason,
+        // which already separates a number inside the destroy span that nothing
+        // has measured from a record of another family.
+        assert_eq!(
+            object_destroy(LifecycleKind::DeleteObject, &payload(1, 9), &Everything),
+            Err(ResolveRefusal::Destroy(
+                reims_vgpu_protocol::destroy::DestroyRefusal::NotADestroy { opcode: 1 }
+            ))
+        );
+
+        // And the join refuses a kind that is not its own, like every other.
+        assert_eq!(
+            object_destroy(
+                LifecycleKind::DeleteResource,
+                &payload(DestroyKind::SamplerState.opcode(), 9),
+                &Everything
+            ),
+            Err(ResolveRefusal::NotAnObjectDestroy {
+                kind: LifecycleKind::DeleteResource
+            })
+        );
+    }
+
     /// A ref naming nothing live refuses on the ref, for both kinds — the
     /// object is judged before the operation is.
     #[test]
@@ -3595,18 +3815,25 @@ mod tests {
         named.sort_unstable();
         assert_eq!(classified, named);
 
-        // Long enough for any of the records, so a refusal is about the kind
-        // and never about the length.
+        // Each kind's own well-formed payload, so a join that refuses refuses
+        // on the *kind* and not on bytes that happen not to be its record. A
+        // single all-zero buffer used to serve here, and it stopped serving
+        // when a command arrived whose payload contains a second framed record:
+        // zeros are a valid `{task, object}` and are not a valid destroy, so
+        // the sweep would have read "no join" where the join exists and the
+        // fixture was wrong.
         let payload = vec![0u8; 64];
         let mut unjoined = Vec::new();
         for kind in ALL_KINDS {
+            let own = one_payload_per_kind(kind);
             let joins = [
-                task_lifetime(kind, &payload).is_ok(),
-                object_reference(kind, &payload, &Everything).is_ok(),
-                map_notice(kind, &payload).is_ok(),
-                backing_retirement(kind, &payload, &EveryMapping).is_ok(),
-                resource_list(kind, &payload, &Everything).is_ok(),
-                object_list_bind(kind, &payload).is_ok(),
+                task_lifetime(kind, &own).is_ok(),
+                object_reference(kind, &own, &Everything).is_ok(),
+                map_notice(kind, &own).is_ok(),
+                backing_retirement(kind, &own, &EveryMapping).is_ok(),
+                resource_list(kind, &own, &Everything).is_ok(),
+                object_list_bind(kind, &own).is_ok(),
+                object_destroy(kind, &own, &Everything).is_ok(),
             ];
             let reached = joins.iter().filter(|ok| **ok).count();
             assert!(
@@ -3662,17 +3889,19 @@ mod tests {
         // above says no kind is read by two joins; this says which one each is
         // read by, which is the half no caller could answer for itself.
         for kind in ALL_KINDS {
+            let own = one_payload_per_kind(kind);
             let direct = [
-                task_lifetime(kind, &payload),
-                object_reference(kind, &payload, &Everything),
-                map_notice(kind, &payload),
-                backing_retirement(kind, &payload, &EveryMapping),
-                resource_list(kind, &payload, &Everything),
-                object_list_bind(kind, &payload),
+                task_lifetime(kind, &own),
+                object_reference(kind, &own, &Everything),
+                map_notice(kind, &own),
+                backing_retirement(kind, &own, &EveryMapping),
+                resource_list(kind, &own, &Everything),
+                object_list_bind(kind, &own),
+                object_destroy(kind, &own, &Everything),
             ]
             .into_iter()
             .find(Result::is_ok);
-            let through = operation(kind, &payload, &Everything, &EveryMapping);
+            let through = operation(kind, &own, &Everything, &EveryMapping);
             match direct {
                 Some(op) => assert_eq!(through, op, "{}", kind.name()),
                 // The one with no join names what is missing rather than
@@ -3948,7 +4177,7 @@ mod tests {
     /// `every_lifecycle_kind_reaches_at_most_one_join`, which requires every
     /// kind the packet ledger classifies to appear here — so a thirteenth kind
     /// cannot quietly skip a join test.
-    const ALL_KINDS: [LifecycleKind; 12] = [
+    const ALL_KINDS: [LifecycleKind; 13] = [
         LifecycleKind::DefineTask,
         LifecycleKind::DeleteTask,
         LifecycleKind::SetObjectList,
@@ -3961,6 +4190,7 @@ mod tests {
         LifecycleKind::SynchronizeAndDiscard,
         LifecycleKind::Discard,
         LifecycleKind::DeleteBacking,
+        LifecycleKind::DeleteObject,
     ];
 
     /// One well-formed payload per kind, each naming task [`TASK_UNDER_TEST`].
@@ -3986,6 +4216,22 @@ mod tests {
                 out
             }
             LifecycleKind::DeleteTask => task.to_le_bytes().to_vec(),
+            // A task word, then a whole destroy record — the one payload here
+            // with a second layer inside it. The kind is the record's opcode, so
+            // the fixture picks a settled one; an unsettled kind is a refusal
+            // this payload deliberately does not exercise.
+            LifecycleKind::DeleteObject => {
+                use reims_vgpu_protocol::destroy::DestroyKind;
+                let mut out = vec![0u8; fifo::DELETE_OBJECT_RECORD + 12];
+                out[fifo::DELETE_OBJECT_TASK_ID..fifo::DELETE_OBJECT_TASK_ID + 4]
+                    .copy_from_slice(&task.to_le_bytes());
+                let record = fifo::DELETE_OBJECT_RECORD;
+                out[record..record + 4]
+                    .copy_from_slice(&DestroyKind::SamplerState.opcode().to_le_bytes());
+                out[record + 4..record + 8].copy_from_slice(&12u32.to_le_bytes());
+                out[record + 8..record + 12].copy_from_slice(&7u32.to_le_bytes());
+                out
+            }
             LifecycleKind::SetObjectList => {
                 let mut out = vec![0u8; fifo::SET_OBJECT_LIST_LEN];
                 out[fifo::SET_OBJECT_LIST_TASK_ID..fifo::SET_OBJECT_LIST_TASK_ID + 4]
@@ -5195,7 +5441,8 @@ mod tests {
                 live.entry(*task).or_default().insert(*slot, (id, backing));
                 handed.push(Handed { task: *task, id });
             }
-            LifecycleOp::DeleteResource { task, resource } => {
+            LifecycleOp::DeleteResource { task, resource }
+            | LifecycleOp::DeleteObject { task, resource, .. } => {
                 census.deletes += 1;
                 live.entry(*task).or_default().remove(&resource.slot);
             }

@@ -1050,6 +1050,21 @@ mod tests {
             fill_query_request(&mut packet, kind);
             return packet;
         }
+        // The destroy command is the one whose payload contains a second framed
+        // record, so zeros are not a well-formed one of it. Filled with a kind
+        // the ledger has settled: an unsettled kind is a refusal this fixture
+        // deliberately does not exercise, because it is about the *kind* and
+        // this sweep is about the class.
+        if LifecycleKind::of(channel, opcode) == Some(LifecycleKind::DeleteObject) {
+            use reims_vgpu_protocol::destroy::DestroyKind;
+            use reims_vgpu_protocol::fifo::DELETE_OBJECT_RECORD as REC;
+            packet.payload[REC..REC + 4]
+                .copy_from_slice(&DestroyKind::SamplerState.opcode().to_le_bytes());
+            packet.payload[REC + 4..REC + 8].copy_from_slice(&12u32.to_le_bytes());
+            packet.payload[REC + 8..REC + 12].copy_from_slice(&9u32.to_le_bytes());
+            packet.payload.truncate(REC + 12);
+            return packet;
+        }
         let Some(record_len) =
             LifecycleKind::of(channel, opcode).and_then(LifecycleKind::resource_list_record_len)
         else {
@@ -1323,7 +1338,7 @@ mod tests {
             .count();
         assert_eq!(
             (control, present, crossing.len()),
-            (23, 3, 46),
+            (23, 3, 47),
             "the ledger's crossing rows changed; what reaches the model is not what the \
              module documentation says it is"
         );
