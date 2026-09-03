@@ -4214,6 +4214,16 @@ impl DeviceState {
         }
     }
 
+    /// What point the ordering plane has the timeline for `slot` standing at,
+    /// or `None` if nothing ever published to it.
+    #[must_use]
+    pub fn published_completion_stamp(
+        &self,
+        slot: reims_vgpu_core::identity::StampSlot,
+    ) -> Option<reims_vgpu_core::identity::StampValue> {
+        self.session.lock().expect("session").published_stamp(slot)
+    }
+
     /// What the ordering plane holds about the pipelines this session declared.
     #[must_use]
     pub fn pipeline_census(&self) -> reims_vgpu_core::pipeline::Census {

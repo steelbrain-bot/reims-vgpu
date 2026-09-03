@@ -7397,3 +7397,51 @@ fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
         "a drain that has latched nothing discharges nothing"
     );
 }
+
+/// The two records a completion word leaves behind are written together, and
+/// the root FIFO's slot 0 is one of them.
+///
+/// The regression this pins: `write_stamp` is the *child* FIFOs' door, and the
+/// root publishes slot 0 inline a few lines below its own dispatch. Recording
+/// the ordering plane's half at `write_stamp` alone left the model blind to the
+/// root timeline — 158 words a driven boot, on the timeline the measured root
+/// stamp waits are actually on — while every counter read healthy, because the
+/// child timelines it *did* see were complete. So the pair goes through one
+/// function and this asserts the pair, not either half.
+#[test]
+fn a_completion_word_leaves_the_owed_state_in_both_records_at_once() {
+    use reims_vgpu_core::identity::StampSlot;
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+    assert_eq!(
+        state.published_completion_stamp(StampSlot(0)),
+        None,
+        "nothing has published to the root timeline yet"
+    );
+
+    super::note_stamp_no_longer_owed(&mut state, 0, 7);
+    assert_eq!(
+        state.published_completion_stamp(StampSlot(0)).map(|v| v.0),
+        Some(7),
+        "the root slot is the one `write_stamp` never sees"
+    );
+    assert_eq!(
+        state
+            .stamp_ledger
+            .classify(super::StampWait { index: 0, value: 7 }),
+        super::UnmetSource::Queued,
+        "and the device's own ledger records the same word in the same call — \
+         `Queued` is its name for a value that has been through the write door"
+    );
+
+    super::note_stamp_no_longer_owed(&mut state, 3, 4);
+    assert_eq!(
+        state.published_completion_stamp(StampSlot(3)).map(|v| v.0),
+        Some(4)
+    );
+    assert_eq!(
+        state.published_completion_stamp(StampSlot(0)).map(|v| v.0),
+        Some(7),
+        "slots are independent timelines"
+    );
+}

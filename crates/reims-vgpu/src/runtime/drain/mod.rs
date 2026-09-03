@@ -2070,6 +2070,44 @@ pub(super) fn note_stamp_direction<H: HostMemory + HostOps>(
     }
 }
 
+/// Record, in both places that hold it, that a completion word is no longer
+/// owed.
+///
+/// **One function because there are two writers of slot 0's history and they
+/// have already drifted once.** `write_stamp` is the child FIFOs' door; the
+/// root FIFO publishes slot 0 inline a few lines below its dispatch, and the
+/// comment there already says the ledger has to record it separately "or the
+/// ledger would never see slot 0 leave the owed state". The ordering plane
+/// needs exactly the same record for exactly the same reason, and adding it to
+/// one site and not the other left the model blind to the root timeline —
+/// which is the timeline the measured root stamp waits are *on*.
+///
+/// The two records are not one record. [`StampLedger`] answers "does a rail
+/// still owe this word", a question about this device's rails;
+/// [`DeviceState::publish_completion_stamp`] answers "what point has this
+/// timeline reached", which is what discharges a `SessionModel` stamp wait.
+/// Keeping both is what lets the counters cross-check instead of one being
+/// assumed to stand for the other.
+fn note_stamp_no_longer_owed(state: &mut DeviceState, index: u32, value: u32) {
+    let page_bytes = state.page_size();
+    state.stamp_ledger.wrote(index, value, page_bytes);
+    note_store_route(
+        match state.publish_completion_stamp(
+            reims_vgpu_core::identity::StampSlot(index),
+            reims_vgpu_core::identity::StampValue(value),
+        ) {
+            crate::model::StampPublication::First => "stamp_publish_first",
+            crate::model::StampPublication::Advanced => "stamp_publish_advanced",
+            crate::model::StampPublication::Repeat => "stamp_publish_repeat",
+            // The model's timeline refused to move and this device's write will
+            // move the guest's. `note_stamp_direction` sees the same event on
+            // the arms that write the word; this sees it on every arm, and on
+            // the root timeline that has no `note_stamp_direction` at all.
+            crate::model::StampPublication::Behind => "stamp_publish_behind",
+        },
+    );
+}
+
 /// Write stamp value to FIFO base page slot and set status bit.
 pub fn write_stamp<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -2084,36 +2122,7 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // Census: from here the value is no longer owed by the coalescing rail, it
     // is with the publication rail below. Recorded before that rail runs so the
     // ledger never reports as still-owed a word already being settled.
-    let page_bytes = state.page_size();
-    state.stamp_ledger.wrote(index, stamp_value, page_bytes);
-    // The ordering plane's half of the same event, at the same line and for the
-    // same reason: from here the value is no longer owed. `SessionModel::admit`
-    // parks a packet whose header names a point another packet must publish,
-    // and this is the only thing that discharges that wait — so a cutover
-    // without it parks every packet the guest orders behind a fence, the way an
-    // unadvanced pipeline would park every exec.
-    //
-    // Beside the device's own ledger rather than replacing it: the ledger
-    // answers "is this word still owed by the coalescing rail", which is a
-    // question about this device's rails and not about ordering, and the two
-    // records are cross-checked by the counters below rather than by one being
-    // assumed to stand for the other.
-    note_store_route(
-        match state.publish_completion_stamp(
-            reims_vgpu_core::identity::StampSlot(index),
-            reims_vgpu_core::identity::StampValue(stamp_value),
-        ) {
-            crate::model::StampPublication::First => "stamp_publish_first",
-            crate::model::StampPublication::Advanced => "stamp_publish_advanced",
-            crate::model::StampPublication::Repeat => "stamp_publish_repeat",
-            // The model's timeline refused to move and this device's write will
-            // move the guest's. `note_stamp_direction` sees the same event, but
-            // only on the rail arm that writes the word inline — this sees it on
-            // both, which is the hole that made `stamp_write_backward = 0`
-            // weaker evidence than it read as.
-            crate::model::StampPublication::Behind => "stamp_publish_behind",
-        },
-    );
+    note_stamp_no_longer_owed(state, index, stamp_value);
     // Before the guest is told anything finished, everything this device still
     // owes guest RAM has to be in guest RAM. After this write the guest may free
     // the render targets and its allocator may hand those pages to anything, and
@@ -3129,13 +3138,13 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // Root stamp = slot 0.
                 if state.gfx.fifo_base_page != 0 {
                     if let Some(off) = stamp_slot_offset(0, state.page_size()) {
-                        // Census: the root FIFO publishes slot 0 inline rather
-                        // than through `write_stamp`, so it records here or the
-                        // ledger would never see slot 0 leave the owed state.
-                        let page_bytes = state.page_size();
-                        state
-                            .stamp_ledger
-                            .wrote(0, packet.completion_stamp, page_bytes);
+                        // The root FIFO publishes slot 0 inline rather than
+                        // through `write_stamp`, so it records here or neither
+                        // the ledger nor the ordering plane would ever see slot
+                        // 0 leave the owed state. Both records at once, because
+                        // adding the second to `write_stamp` alone is exactly
+                        // the drift `note_stamp_no_longer_owed` exists to stop.
+                        note_stamp_no_longer_owed(state, 0, packet.completion_stamp);
                         // Root and child FIFOs own the same bounded pending-stamp
                         // queue contract. Slot 0 therefore takes the same
                         // submission-attached completion rail: the completion
