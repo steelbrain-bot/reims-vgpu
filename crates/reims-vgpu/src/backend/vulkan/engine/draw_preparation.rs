@@ -232,9 +232,24 @@ impl Decline for DrawPreparationDecline {
             Self::VertexAirExtract { reason, .. } | Self::FragmentAirExtract { reason, .. } => {
                 reason.slug()
             }
-            Self::VertexTranslate { reason, .. } | Self::FragmentTranslate { reason, .. } => {
-                reason.slug()
-            }
+            // **Not `reason.slug()`, and a driven macos-15 boot is why.** These
+            // two carry `M2vCacheDecline`, which `runtime::m2v_cache` also
+            // emits under its own name — so delegating made this refusal share
+            // `fail_once`'s latch with that emitter, and the log said so:
+            // `observe_slug reason=observe_slug_collision
+            // slug=m2v_translation_pending_at_sync_boundary
+            // holder=…m2v_cache::M2vCacheDecline
+            // claimant=…draw_preparation::DrawPreparationDecline`. Whichever
+            // side fires first for a discriminant silences the other for the
+            // rest of the boot, which is the shape `SecondaryTargetUnbuildable`
+            // below already declines to take, and it silenced exactly the
+            // draw-side occurrences a lost-draw investigation was counting.
+            //
+            // The reason is not lost: `fields` carries it as `m2v_reason`, so
+            // one grep still finds the refusal and the cache line that reports
+            // the same translation.
+            Self::VertexTranslate { .. } => "draw_prepare_vertex_translate",
+            Self::FragmentTranslate { .. } => "draw_prepare_fragment_translate",
             Self::GeometryUnsupported { .. } => "draw_prepare_geometry_unsupported",
             Self::BindSlotPastTable { .. } => "draw_prepare_bind_slot_past_table",
             // One slug for all five `MrtDrop` reasons, with the reason carried
@@ -401,7 +416,14 @@ impl Decline for DrawPreparationDecline {
                 pipeline_ref,
                 reason,
             } => {
-                let mut fields = vec![("pipeline_ref", pipeline_ref.to_string())];
+                let mut fields = vec![
+                    ("pipeline_ref", pipeline_ref.to_string()),
+                    // The cache's own slug, so one grep finds both this refusal
+                    // and the `m2v_cache` line reporting the same translation —
+                    // which is what the slug used to do, before sharing it
+                    // silenced one of the two.
+                    ("m2v_reason", reason.slug().to_string()),
+                ];
                 fields.extend(reason.fields());
                 fields
             }
@@ -888,6 +910,52 @@ mod tests {
         };
         assert_eq!(decline.slug(), "draw_index_out_of_bounds");
         assert!(decline.fields().is_empty());
+    }
+
+    /// The draw-preparation refusal and the cache line reporting the same
+    /// translation are two types, and two types may not spell one slug.
+    ///
+    /// [`crate::observe::Emit::decline`] claims a slug on behalf of its
+    /// concrete type, and a second type claiming a held slug panics in a test
+    /// build. Both sides are emitted here **in one test**, so the property does
+    /// not depend on which other test in the suite happened to render an
+    /// `M2vCacheDecline` first.
+    ///
+    /// It is a regression test for a defect a driven macos-15 boot found and no
+    /// unit test could: `{Vertex,Fragment}Translate` delegated to
+    /// `reason.slug()`, so a draw refused against a still-translating shader
+    /// shared `fail_once`'s latch with `runtime::m2v_cache`'s own line. The
+    /// first side to fire for a discriminant silenced the other for the rest of
+    /// the boot, and the silenced side was the one a lost-draw investigation was
+    /// counting.
+    #[test]
+    fn the_draw_refusal_and_the_cache_line_do_not_share_a_slug() {
+        use crate::runtime::m2v_cache::M2vCacheDecline;
+
+        let reason = M2vCacheDecline::TranslationPending { stage: "fragment" };
+        let cache = crate::observe::Emit::decline("linux_m2v", &reason).render();
+        let draw = crate::observe::Emit::decline(
+            "linux_m2v_draw",
+            &DrawPreparationDecline::FragmentTranslate {
+                pipeline_ref: 5,
+                reason: M2vCacheDecline::TranslationPending { stage: "fragment" },
+            },
+        )
+        .render();
+
+        assert!(
+            cache.contains("reason=m2v_translation_pending_at_sync_boundary"),
+            "{cache}"
+        );
+        assert!(
+            draw.contains("reason=draw_prepare_fragment_translate"),
+            "{draw}"
+        );
+        // Nothing is lost by not sharing the name: one grep still finds both.
+        assert!(
+            draw.contains("m2v_reason=m2v_translation_pending_at_sync_boundary"),
+            "{draw}"
+        );
     }
 
     #[test]

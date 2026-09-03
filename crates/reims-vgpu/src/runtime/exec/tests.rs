@@ -1,7 +1,6 @@
 // Only the compute-preflight test names these opcodes, and that test is
 // Vulkan-only — this device compiles no compute preflight without it.
 #[cfg(feature = "backend-vulkan")]
-
 use reims_vgpu_wire::OP_HEADER_LEN;
 
 use super::*;
