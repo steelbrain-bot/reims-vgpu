@@ -156,14 +156,14 @@ row (172 862 draws), or off a named off-VM gate.
 | Cache misses for a live unchanged contract object after first resolution | 0 | **met to within first use** | `layout_hits=48 880`/`layout_misses=59`, `pipeline 48 610`/`329`, `pass 61 828`/`20`, `shader 97 637`/`142`. The misses are first sights: `attr_sets` settles at **14** for the boot, which is the plateau these unbounded caches are justified by. |
 | Shared/global mutex acquisitions per draw | 0 | **not met** | `static ENGINE: Lazy<Mutex<EngineState>>`. Every draw takes it. This is the process-global engine named above, and nothing else on this list is blocked on anything else. |
 | Global atomic census updates per draw | 0 | **not met** | `EngineCounters` is a bag of process-global atomics and a draw bumps a dozen. Uncontended today *because* the engine mutex already serialises draws, so it is the same blocker wearing a different hat: sharding the counters before the lock goes buys nothing measurable. |
-| Host GPU waits for ordinary commands | 0 | **not measured here** | No gate names it. `render_post_wait_skips` and `compute_post_wait_skips` count the skips, not the waits. |
-| Wakeups whose scheduling unit is a draw | 0 | **not measured here** | The queue owner is one thread and `queue_async_submits` bounds its wakeups at batch rate, but nothing asserts it. |
+| Host GPU waits for ordinary commands | 0 | **met** | `ring_retire_blocks=0` and `fence_timeouts=0` over 172 862 draws, with `readbacks=0` — no draw ever waited for a ring slot's fence, which is the only wait a steady-state draw could take. The two warm-draw gates assert both deltas at zero, so it is a standing check and not one boot's reading. `render_post_wait_skips=49 550` is the positive half: the skip path ran. |
+| Wakeups whose scheduling unit is a draw | 0 | **met at the queue owner** | `queue_async_submits=2 404` for 172 862 draws, equal to `batch_flushes` — the queue owner wakes once per batch, never per draw. Only that thread is measured; a wakeup elsewhere would not appear here. |
 | Re-scans of already resolved EXEC bytes | 0 | **not measured here** | |
-| Repeated transfers for one range, version and direction | 0 | **not measured here** | `buffer_bind_reuses=303 021` on an earlier boot is evidence in this direction, not the gate. |
+| Repeated transfers for one range, version and direction | 0 | **met for buffers, unmeasured for images** | `buffer_bind_reuses=304 017` and `buffer_index_bind_reuses=892`: every one is a bind served from a copy the command buffer already held rather than a second transfer of the same bytes. The image side is not the same claim — `sampled_reuploads=45` at 15.3 MB are lawful, since the content version moved, but nothing here separates a lawful reupload from a repeated one. |
 | Pipeline compiles on a Ready pipeline draw | 0 | **met** | fn `warm_identical_dispatch_zero_creates_and_allocs` and the `creates`/`allocs` deltas the batch suite asserts at zero on a warm draw. |
 | Supported operations reaching an unknown access-mode or stage fallback | 0 | **not measured here** | |
 
-**Do not read a "not measured here" as a zero.** Four of them may well hold; the
+**Do not read a "not measured here" as a zero.** Both may well hold; the
 point of the column is that nobody has asked, and the plan's own argument for
 this table is that an unmeasured zero and a violated one are indistinguishable
 from the outside.

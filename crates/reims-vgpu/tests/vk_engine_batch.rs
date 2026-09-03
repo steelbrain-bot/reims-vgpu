@@ -768,6 +768,16 @@ fn a_warm_repeat_draw_does_not_enter_the_allocator() {
         during.batch_flushes, 0,
         "and did not flush, which is not a steady-state draw: {during:?}"
     );
+    // "No host GPU wait for an ordinary command" is a structural zero of its
+    // own, and the ring is the only place a steady-state draw could take one:
+    // a wrapped ring waits the slot's fence before reusing it. Asserted here
+    // rather than in a test of its own because the measured region is already
+    // exactly one steady-state draw.
+    assert_eq!(
+        (during.ring_retire_blocks, during.fence_timeouts),
+        (0, 0),
+        "the measured draw waited on the GPU: {during:?}"
+    );
 
     assert_eq!(
         trips, 0,
@@ -892,6 +902,16 @@ fn a_warm_repeat_draw_that_binds_descriptors_and_vertex_buffers_does_not_allocat
     assert_eq!(
         during.batch_flushes, 0,
         "and did not flush, which is not a steady-state draw: {during:?}"
+    );
+    // "No host GPU wait for an ordinary command" is a structural zero of its
+    // own, and the ring is the only place a steady-state draw could take one:
+    // a wrapped ring waits the slot's fence before reusing it. Asserted here
+    // rather than in a test of its own because the measured region is already
+    // exactly one steady-state draw.
+    assert_eq!(
+        (during.ring_retire_blocks, during.fence_timeouts),
+        (0, 0),
+        "the measured draw waited on the GPU: {during:?}"
     );
     // A zero is only about the paths the draw took, so the draw has to be shown
     // to have taken them. Without this, a fixture that stopped binding vertex
