@@ -98,6 +98,27 @@ impl PipelineState {
                     Self::Declared | Self::Translating | Self::Compiling | Self::Ready,
                     Self::Retired
                 )
+                // **`Ready` is not terminal, and a driven macos-15 desktop is
+                // why.** These states say whether *the device* can execute the
+                // pipeline now, not what the guest's object list says it is.
+                // The guest rewrites the shader behind a live pipeline ref in
+                // place — no delete, no new generation, so no new
+                // [`ResourceId`] — and the executor's translation is keyed by
+                // the shader's content, so it stops holding one. Four refs a
+                // desktop, measured.
+                //
+                // With no step back, `Ready` meant "was translated once" and a
+                // transaction binding that ref was released against a shader
+                // the executor was still translating. The alternative — leaving
+                // it `Ready` and letting the record refuse — is a lost draw
+                // with the model still claiming the pipeline was usable, which
+                // is a model that disagrees with the device.
+                //
+                // Only the executor may take this step, and only because it is
+                // the layer that discovers it: this crate cannot read a shader.
+                // It is not a reset — `Declared` is unreachable from here,
+                // because the pipeline is still declared and always was.
+                | (Self::Ready, Self::Translating)
         )
     }
 }
@@ -305,6 +326,15 @@ pub struct Census {
     pub leases_pending: usize,
     /// Leases taken on a pipeline that was already ready. The steady state.
     pub leases_ready: usize,
+    /// Pipelines that left [`PipelineState::Ready`] because the executor
+    /// stopped holding their translation.
+    ///
+    /// Counted rather than merely allowed: the step exists for a guest that
+    /// rewrites a shader in place, and a count that climbs with the frame rate
+    /// would mean something else is provoking it — a cycle between the
+    /// withdrawal and whatever re-readies, which is a hang rather than four
+    /// events a desktop.
+    pub withdrawn: usize,
 }
 
 /// What the table is holding, by state, at one moment.
@@ -462,10 +492,14 @@ impl PipelineTable {
         if !p.state.may_become(next) {
             return false;
         }
+        let from = p.state;
         p.state = next;
         match next {
             PipelineState::Ready => self.census.ready += 1,
             PipelineState::Retired => self.census.retired += 1,
+            PipelineState::Translating if from == PipelineState::Ready => {
+                self.census.withdrawn += 1;
+            }
             _ => {}
         }
         true
@@ -857,6 +891,65 @@ mod tests {
         assert_eq!(t.lease(id(1), GEN), Lease::Ready);
         assert_eq!(t.census().leases_pending, 1);
         assert_eq!(t.census().leases_ready, 1);
+    }
+
+    /// A pipeline the executor stopped holding a translation for goes back to
+    /// waiting, and a transaction binding it waits again.
+    ///
+    /// This is the step a driven macos-15 desktop needs and the table did not
+    /// have. The guest rewrites the shader behind a live pipeline ref in place,
+    /// so no delete and no new generation arrives and the [`ResourceId`] is
+    /// unchanged; the executor's translation is keyed by the shader's content
+    /// and it stops holding one. `Ready` was terminal, so the ordering plane
+    /// went on releasing transactions against a shader that was mid-translation.
+    ///
+    /// `Declared` stays unreachable from here: the pipeline is still declared,
+    /// and a step back to it would say the guest had not created it.
+    #[test]
+    fn a_pipeline_whose_translation_the_executor_no_longer_holds_waits_again() {
+        let mut t = PipelineTable::new();
+        t.declare(id(1), GEN);
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(t.advance(id(1), step));
+        }
+        assert_eq!(
+            t.waits_for(&[id(1)], GEN),
+            Ok(vec![]),
+            "nothing to wait for"
+        );
+
+        assert!(
+            t.advance(id(1), PipelineState::Translating),
+            "the executor withdraws what it no longer holds"
+        );
+        assert_eq!(t.census().withdrawn, 1);
+        assert_eq!(
+            t.waits_for(&[id(1)], GEN),
+            Ok(vec![id(1)]),
+            "and the next transaction binding it waits"
+        );
+        assert_eq!(t.resting().translating, 1);
+        assert_eq!(t.resting().ready, 0);
+
+        assert!(
+            !t.advance(id(1), PipelineState::Declared),
+            "it is still declared; there is no step back to saying it is not"
+        );
+
+        // And it comes back the same way it came the first time.
+        assert!(t.advance(id(1), PipelineState::Compiling));
+        assert!(t.advance(id(1), PipelineState::Ready));
+        assert_eq!(t.waits_for(&[id(1)], GEN), Ok(vec![]));
+        assert_eq!(
+            t.census().ready,
+            2,
+            "the census counts events, so the second readying is its own"
+        );
+        assert_eq!(t.census().withdrawn, 1, "and one withdrawal, not two");
     }
 
     /// The rule: a refusal that carries no reason is not a refusal this table
