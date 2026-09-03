@@ -100,55 +100,6 @@ classes, or guest rails. Vulkan 1.2 is the baseline; newer functionality require
 capability-gated fallback. Host-pointer import is optional, and guest-visible semantics must be the
 same on imported and copying paths.
 
-## Wire a finished subsystem immediately
-
-The replacement architecture is landing subsystem by subsystem, and each one **joins production in
-the commit that finishes it**. A subsystem that exists but is reachable only from its own tests has
-not been verified against a guest; a release that switches thirty of them at once has no bisect
-that can attribute a regression to one. So a subsystem is done when its legacy counterpart is gone
-or delegates to it — not when it compiles.
-
-What this does *not* license is two semantic models running at once. No per-packet feature switch
-choosing between executors, no shadow execution that mutates state twice, no adapter translating
-between an old model and a new one. A call site that *replaces* its own logic with a call into the
-owning crate creates no second model, and is the shape to reach for.
-
-Wire in order of how little state moves. A pure translation or plan module — a function of its
-inputs returning a value — wires first: the caller keeps its ownership and loses only its duplicate
-arithmetic, so a regression points at one table. Modules owning handles, caches, or submission
-lifetimes wire once the model that owns those lifetimes is in place, because they cannot be split.
-
-The same rule decides how the final ingress switch is cut. **A packet class moves to the new model
-alone exactly when nothing it owns is ordered against, or shares mutable state with, anything still
-on the legacy path. Classes that do share such state move together, and that group — not
-"everything" — is the atomic unit.** Two models are dangerous because they can disagree about one
-piece of state; where there is no shared state there is nothing to disagree about, and holding a
-disjoint class back buys no safety while costing the bisect it could have provided.
-
-State the disjointness before moving a group and make it hold structurally — named owners, not an
-argument that the current call sites happen not to overlap. If it cannot be made to hold, the group
-is larger than it looked: enlarge it rather than move anyway. Within a group the switch is atomic
-and the legacy counterpart is deleted in the same commit. Order the groups by how little state
-they move; the ordering and publication core is last, and carries the scheduler's deletion.
-
-**The 2026-09-02 "disconnect, do not delete" amendment is spent, and `dead/` is gone as of
-2026-09-03.** It bought attribution while packet classes were moving under outstanding macOS cells:
-a group's legacy files went to `crates/<crate>/src/dead/`, unreachable because no `mod` declared
-them, so a live regression on a class that had just moved could be read rather than reconstructed
-from `git log`. Every packet-class group has since moved, the classes it was protecting are settled,
-and the directory was deleted wholesale in one commit along with the gate that held it unreachable.
-
-So the rule above is the rule again: **the group's legacy counterpart is deleted in the commit that
-wires it.** Do not recreate `dead/`, and do not stage a deletion through it — what an old arm did is
-now read out of `git log`, and the deleted-in-the-same-commit form is what the prohibition on two
-semantic models asks for directly. The one group still to move is the process-global mutable engine
-behind `backend::vulkan::engine`; when it wires, its legacy files leave the tree with it.
-
-A group's legacy tests die with its legacy source, so the commit that wires it must name — in the
-commit message, since there is no register any more — the owner-level tests that replace them. A
-group shipping without that replacement coverage has silently lost it, and nothing in the build
-relates the two.
-
 ## Working and verification
 
 Use a workflow proportionate to the change:
