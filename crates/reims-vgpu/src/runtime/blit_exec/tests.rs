@@ -20,33 +20,37 @@ use reims_vgpu_protocol::decode::blit::{
     TextureEndpoint, TextureRegion, TextureSlices, TextureToBuffer,
 };
 
-/// The channel is the whole diagnostic for this rail: 177 checks collapse
-/// into eight statuses, so a refusal that reaches the dispatch line without a
-/// reason says almost nothing. An uninstrumented site used to render a bare
-/// `reason=` with nothing after it — not greppable, and indistinguishable from
-/// a missing field rather than from a missing *reason*.
+/// The reason is the whole diagnostic for this rail: 177 checks collapse into
+/// six classes, so a refusal that reaches the dispatch line carrying only its
+/// class says almost nothing.
+///
+/// This once had a gap to guard. The reason travelled in a thread-local the
+/// failing site was *asked* to set, a site that forgot returned a coarse status
+/// with the channel empty, and the line rendered a bare `reason=` — not
+/// greppable and indistinguishable from a missing field. It was given the name
+/// `blit_unattributed` so the gap at least announced itself.
+///
+/// There is no gap to name now, and this asserts why rather than asserting the
+/// name: [`BlitStatus::Failed`] has a `reason` field, `br` is its only
+/// constructor, and neither can be spelled without one. A site that forgets
+/// does not compile.
 #[test]
-fn an_unattributed_refusal_names_the_gap_rather_than_rendering_an_empty_reason() {
+fn a_refusal_cannot_be_spelled_without_the_check_that_fired() {
     use crate::observe::{Emit, Refusal};
 
-    clear_blit_fail_reason();
-    assert_eq!(
-        BlitStatus::Bounds.refusal(),
-        Some("blit_unattributed"),
-        "a refusal with an empty channel must still name something"
-    );
-    let line = Emit::refusal("blit", &BlitStatus::Bounds)
+    let st = br(BlitFailure::Bounds, "fill_out_of_range");
+    assert_eq!(st.refusal(), Some("fill_out_of_range"));
+    assert_eq!(st.failure(), Some(BlitFailure::Bounds));
+    let line = Emit::refusal("blit", &st)
         .expect("a refusal produces a line")
         .render();
-    assert_eq!(line, "blit reason=blit_unattributed");
-    assert!(
-        !line.contains("reason= "),
-        "the line rendered an empty reason: {line}"
-    );
+    assert_eq!(line, "blit reason=fill_out_of_range");
 
-    // An instrumented site names its own check instead.
-    let st = br(BlitStatus::Bounds, "fill_out_of_range");
-    assert_eq!(st.refusal(), Some("fill_out_of_range"));
+    // Two refusals of the same class are two different lines, which is the
+    // property the class alone cannot give.
+    let other = br(BlitFailure::Bounds, "fill_range_oob");
+    assert_eq!(other.failure(), st.failure());
+    assert_ne!(other.refusal(), st.refusal());
 }
 
 /// `Ok`, a zero-extent no-op and a soft fence wait are control flow. The
@@ -58,7 +62,7 @@ fn zero_extent_and_pending_fences_are_control_flow_not_refusals() {
     use crate::observe::{Emit, Refusal};
 
     // A stale channel value must not resurrect a success as a refusal.
-    let _ = br(BlitStatus::Bounds, "fill_out_of_range");
+    let _ = br(BlitFailure::Bounds, "fill_out_of_range");
     for ok in [
         BlitStatus::Ok,
         BlitStatus::ZeroExtent,
@@ -291,7 +295,7 @@ fn a_blit_destination_is_bounded_against_a_guest_that_repoints_it_mid_copy() {
     );
     assert_eq!(
         st,
-        BlitStatus::GuestIo,
+        BlitFailure::GuestIo,
         "a destination page the command never named must be refused"
     );
     assert_eq!(
@@ -413,11 +417,10 @@ fn an_unaligned_pattern_fill_is_refused_rather_than_guessed() {
     cmd.pattern = FillPattern::Pattern4(0x89ab_cdef);
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
-        BlitStatus::Unsupported
-    );
-    assert_eq!(
-        blit_fail_reason(),
-        "fill_pattern4_unaligned_range",
+        BlitStatus::Failed {
+            failure: BlitFailure::Unsupported,
+            reason: "fill_pattern4_unaligned_range",
+        },
         "the refusal must name the phase question rather than reporting a \
          generic unsupported"
     );
@@ -463,11 +466,15 @@ fn a_byte_fill_and_a_four_equal_byte_pattern_fill_write_the_same_bytes() {
     );
 }
 
-/// The reason channel names *which* collapsed check fired for a coarse
-/// `BlitStatus`, distinguishes distinct causes, is reset per command so a stale
-/// slug never leaks across blits, and stays empty after a successful blit.
+/// A refusal names *which* collapsed check fired, and two refusals of one class
+/// coming out of one executor are distinguishable.
+///
+/// It used to also assert that the channel was reset per command and left empty
+/// by a success. Both were properties of the thread-local and neither is
+/// expressible now: there is nothing to reset, and `BlitStatus::Ok` has no
+/// reason field to be stale.
 #[test]
-fn blit_fail_reason_names_distinct_causes_and_resets_per_command() {
+fn a_refusal_names_which_of_the_collapsed_checks_fired() {
     let (mut host, mut state) = blit_device();
     install_buffer(&mut host, &mut state, 7, 1, 256);
 
@@ -476,17 +483,21 @@ fn blit_fail_reason_names_distinct_causes_and_resets_per_command() {
     cmd.length = 8;
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
-        BlitStatus::MissingResource
+        BlitStatus::Failed {
+            failure: BlitFailure::MissingResource,
+            reason: "buf_ref_zero",
+        }
     );
-    assert_eq!(blit_fail_reason(), "buf_ref_zero");
 
     // Unbound ref → same coarse status, DIFFERENT reason "buf_no_list_entry".
     cmd.buffer_ref = 42; // never installed
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
-        BlitStatus::MissingResource
+        BlitStatus::Failed {
+            failure: BlitFailure::MissingResource,
+            reason: "buf_no_list_entry",
+        }
     );
-    assert_eq!(blit_fail_reason(), "buf_no_list_entry");
 
     // In-bounds range on a valid buffer → the channel is reset at entry and the
     // successful blit leaves it empty (no stale "buf_no_list_entry").
@@ -497,16 +508,17 @@ fn blit_fail_reason_names_distinct_causes_and_resets_per_command() {
         execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
         BlitStatus::Ok
     );
-    assert_eq!(blit_fail_reason(), "");
 
     // Out-of-range fill on a valid buffer → Bounds, reason "fill_range_oob".
     cmd.location = 250;
     cmd.length = 64; // 250+64 > 256
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::FillBuffer(cmd)),
-        BlitStatus::Bounds
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "fill_range_oob",
+        }
     );
-    assert_eq!(blit_fail_reason(), "fill_range_oob");
 }
 
 #[test]
@@ -544,7 +556,7 @@ fn copy_b2b_overlap_rejected() {
     cmd.size = 16;
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToBuffer(cmd)),
-        BlitStatus::Overlap
+        BlitFailure::Overlap
     );
 }
 
@@ -678,25 +690,31 @@ fn an_extent_past_the_edge_is_refused_like_an_origin_past_the_edge() {
     cmd.size = over;
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
-        BlitStatus::Bounds
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "t2t_extent_oob",
+        }
     );
-    assert_eq!(blit_fail_reason(), "t2t_extent_oob");
 
     let mut cmd = t2b(3, 5);
     cmd.size = over;
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureToBuffer(cmd)),
-        BlitStatus::Bounds
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "t2b_extent_oob",
+        }
     );
-    assert_eq!(blit_fail_reason(), "t2b_extent_oob");
 
     let mut cmd = b2t(5, 3);
     cmd.size = over;
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
-        BlitStatus::Bounds
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "b2t_extent_oob",
+        }
     );
-    assert_eq!(blit_fail_reason(), "b2t_extent_oob");
 
     // An extent that exactly fills the target is not past the edge. The bound
     // is inclusive, and a refusal here would decline every full-surface copy —
@@ -735,9 +753,11 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     };
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
-        BlitStatus::Bounds
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "t2t_origin_oob",
+        }
     );
-    assert_eq!(blit_fail_reason(), "t2t_origin_oob");
 
     // texture→texture: a mapper-ref-texture endpoint with a non-zero z origin (mapper-ref-texture
     // is 2D) → Unsupported, a DIFFERENT reason under the same executor.
@@ -750,9 +770,11 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     };
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
-        BlitStatus::Unsupported
+        BlitStatus::Failed {
+            failure: BlitFailure::Unsupported,
+            reason: "t2t_t11_z",
+        }
     );
-    assert_eq!(blit_fail_reason(), "t2t_t11_z");
 
     // texture→buffer: source origin past bounds → Bounds "t2b_origin_oob".
     let mut cmd = t2b(3, 5);
@@ -764,9 +786,11 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     };
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureToBuffer(cmd)),
-        BlitStatus::Bounds
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "t2b_origin_oob",
+        }
     );
-    assert_eq!(blit_fail_reason(), "t2b_origin_oob");
 
     // buffer→texture: destination origin past bounds → Bounds "b2t_origin_oob".
     let mut cmd = b2t(5, 3);
@@ -778,12 +802,15 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
     };
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
-        BlitStatus::Bounds
+        BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "b2t_origin_oob",
+        }
     );
-    assert_eq!(blit_fail_reason(), "b2t_origin_oob");
 
-    // A full-target valid mapper-ref-texture→mapper-ref-texture copy succeeds and resets the
-    // channel, so no stale slug leaks into the next command's dispatch line.
+    // A full-target valid mapper-ref-texture→mapper-ref-texture copy succeeds,
+    // and carries no reason to leak into the next command's dispatch line
+    // because `Ok` has no field one could sit in.
     let mut cmd = t2t(3, 4);
     cmd.size = Size {
         width: 2,
@@ -794,7 +821,6 @@ fn copy_executor_reason_slugs_name_distinct_sites() {
         execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureRegion(cmd)),
         BlitStatus::Ok
     );
-    assert_eq!(blit_fail_reason(), "");
 }
 
 /// Install mapper-ref-texture object-list entry + mapping pages (2×2 BGRA).
@@ -1104,7 +1130,7 @@ fn ref_texture_unknown_record_tag_fails_closed() {
         &bad,
     );
     match resolve_texture_backing(&mut state, &mut host, 1, obj_ref, 0, 0) {
-        Err(st) => assert_eq!(st, BlitStatus::Unsupported),
+        Err(st) => assert_eq!(st, BlitFailure::Unsupported),
         Ok(_) => panic!("unknown ref-texture record tag must fail closed"),
     }
 }
@@ -1391,7 +1417,7 @@ fn texture_view_swizzled_view_rejected_for_blit() {
     cmd.bytes_per_row = 4;
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
-        BlitStatus::Unsupported
+        BlitFailure::Unsupported
     );
 }
 
@@ -1419,7 +1445,7 @@ fn texture_view_level_base_on_mapper_ref_texture_rejected() {
     cmd.bytes_per_row = 4;
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
-        BlitStatus::Unsupported
+        BlitFailure::Unsupported
     );
 }
 
@@ -1710,7 +1736,6 @@ fn an_unmeasurable_copy_region_refuses_rather_than_writing_unbounded() {
     // case that matters: the loop would have written its way up to the bad
     // row before anything noticed.
     let tex = TextureBacking::Linear(level(1 << 62));
-    clear_blit_fail_reason();
     assert_eq!(
         texture_region_window(
             &state,
@@ -1723,13 +1748,11 @@ fn an_unmeasurable_copy_region_refuses_rather_than_writing_unbounded() {
             1,
             4
         ),
-        Err(BlitStatus::Bounds),
-        "an overflowing region must refuse the copy"
-    );
-    assert_eq!(
-        blit_fail_reason(),
-        "tex_window_last_texel_oob",
-        "the refusal must name itself on the always-on failure channel"
+        Err(BlitStatus::Failed {
+            failure: BlitFailure::Bounds,
+            reason: "tex_window_last_texel_oob",
+        }),
+        "an overflowing region must refuse the copy, and name itself while it does"
     );
 
     // A zero extent is not a failure: the row loops are `0..copy_d` /
@@ -1893,7 +1916,7 @@ fn multilevel_view_relative_level_oob() {
     cmd.bytes_per_row = 4;
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
-        BlitStatus::Bounds
+        BlitFailure::Bounds
     );
 }
 
@@ -2096,7 +2119,7 @@ fn a_last_array_slice_is_not_charged_for_its_trailing_row_padding() {
     );
     set_installed_allocation_size(&mut host, &state, 2, EXACT - 1);
     match resolve_texture_backing(&mut state, &mut host, 1, 2, 0, 1) {
-        Err(st) => assert_eq!(st, BlitStatus::Bounds),
+        Err(st) => assert_eq!(st, BlitFailure::Bounds),
         Ok(_) => panic!("one byte short of the read extent must still be refused"),
     }
 }
@@ -2541,7 +2564,7 @@ fn whole_surface_0x13e_volume_rejects_multi_slice() {
     cmd.level_count = 1;
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd)),
-        BlitStatus::Unsupported
+        BlitFailure::Unsupported
     );
 }
 
@@ -2559,7 +2582,10 @@ fn whole_surface_0x13e_volume_rejects_nonzero_slice() {
     cmd.level_count = 1;
     let st = execute_blit(&mut state, &mut host, 1, &BlitRecord::TextureSlices(cmd));
     assert!(
-        matches!(st, BlitStatus::Bounds | BlitStatus::Unsupported),
+        matches!(
+            st.failure(),
+            Some(BlitFailure::Bounds | BlitFailure::Unsupported)
+        ),
         "expected Bounds or Unsupported, got {st:?}"
     );
 }
@@ -2616,7 +2642,7 @@ fn blit_fence_zero_ref_fails() {
     let upd = fence_record(FenceKind::Update, 0);
     assert_eq!(
         execute_blit_fence(&mut state, 1, &upd),
-        BlitStatus::MissingResource
+        BlitFailure::MissingResource
     );
 }
 
@@ -2639,7 +2665,7 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
 
     // copy_extent: zero stays a no-op extent; in-range and exactly-max pass
     // through unchanged; over-max is `None`, which every caller turns into
-    // `BlitStatus::Bounds` rather than into a smaller copy.
+    // `BlitFailure::Bounds` rather than into a smaller copy.
     assert_eq!(
         copy_extent("t", "w", 0, 100),
         Some(0),
@@ -2672,7 +2698,10 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
     assert_eq!(texture_storage_bpp(MTL_FORMAT_RGBA16_FLOAT), Ok(8));
     assert_eq!(
         texture_storage_bpp(0xFFFF),
-        Err(BlitStatus::Unsupported),
+        Err(BlitStatus::Failed {
+            failure: BlitFailure::Unsupported,
+            reason: "storage_bpp_unknown",
+        }),
         "unknown format must fail visibly, not invent a stride",
     );
 
@@ -2701,7 +2730,10 @@ fn blit_geometry_helpers_clamp_bpp_and_aspect() {
     // Unknown option bit -> visible failure (no invented aspect).
     assert_eq!(
         copy_aspect_for_options(MTL_FORMAT_DEPTH32_FLOAT_STENCIL8, 1 << 8),
-        Err(BlitStatus::Unsupported),
+        Err(BlitStatus::Failed {
+            failure: BlitFailure::Unsupported,
+            reason: "blit_options_unknown_bits",
+        }),
     );
 }
 
@@ -2958,7 +2990,7 @@ fn a_copy_refuses_a_view_chain_the_sample_arm_also_refuses() {
     };
     assert_eq!(
         execute_blit(&mut state, &mut host, 1, &BlitRecord::BufferToTexture(cmd)),
-        BlitStatus::Unsupported,
+        BlitFailure::Unsupported,
         "the copy arm followed a chain the sample arm refused"
     );
 }

@@ -141,7 +141,7 @@ macro_rules! ladder_slug {
 ///
 /// ```ignore
 /// objects::resolve_descriptor(state, host, task_id, buffer_ref, &[OBJECT_TYPE_BUFFER])
-///     .map_err(|rung| br(BlitStatus::MissingResource, ladder_slugs!("buf")(rung)))?
+///     .map_err(|rung| br(BlitFailure::MissingResource, ladder_slugs!("buf")(rung)))?
 /// ```
 ///
 /// The match is exhaustive over the rungs, so adding one to the enum breaks

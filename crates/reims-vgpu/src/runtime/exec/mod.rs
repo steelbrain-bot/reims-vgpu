@@ -2654,10 +2654,11 @@ fn handle_blit_transfer_record<M: HostMemory + HostOps>(
             st => {
                 // Icon/upload path often uses blit copies; fail-visible for RE.
                 // The reason names the specific failing site inside blit_exec
-                // that produced the coarse `st` — 177 checks collapse into
-                // eight statuses, so the status alone says almost nothing.
-                // `Refusal` supplies it, and an uninstrumented site now reads
-                // `blit_unattributed` rather than rendering a bare `reason=`.
+                // that produced the coarse `st` — 177 checks collapse into six
+                // classes, so the class alone says almost nothing. It rides in
+                // the value: `BlitStatus::Failed` has nowhere to put a refusal
+                // that did not name its check, so there is no site here that
+                // can render a bare `reason=`.
                 //
                 // The endpoints and extents are the record's own Debug rather
                 // than a hand-picked list of fields: the fields a record has

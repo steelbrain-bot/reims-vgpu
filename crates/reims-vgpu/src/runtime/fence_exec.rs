@@ -38,10 +38,10 @@ impl crate::observe::Refusal for FenceStatus {
     /// it, so logging it would flood.
     ///
     /// One caveat a reader needs: `exec`'s blit-fence arm remaps
-    /// `BlitStatus::MissingResource` into `Missing`, which is a real failure
-    /// rather than an unbound ref. That site logs it through the blit rail's own
-    /// reason channel, so it is not silent — but the two meanings do share this
-    /// variant, and separating them belongs with `BlitStatus`'s own migration.
+    /// `BlitFailure::MissingResource` into `Missing`, which is a real failure
+    /// rather than an unbound ref. It is not silent — the blit status it came
+    /// from carries `fence_missing` in its own `reason` — but the two meanings
+    /// do share this variant.
     fn refusal(&self) -> Option<&'static str> {
         match self {
             Self::Ok | Self::Pending | Self::Missing => None,
@@ -387,8 +387,8 @@ mod tests {
 
         let remapped = crate::runtime::blit_exec::blit_status_from_fence(st);
         assert_eq!(
-            crate::runtime::blit_exec::blit_fail_reason(),
-            "fence_domain_unknown",
+            remapped.reason(),
+            Some("fence_domain_unknown"),
             "the remap flattened the fence reason; got {remapped:?}"
         );
     }
