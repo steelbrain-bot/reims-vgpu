@@ -741,15 +741,43 @@ fn load_command_streams<M: HostMemory + HostOps>(
     streams
 }
 
-pub fn process_exec_indirect2<M: HostMemory + HostOps>(
-    state: &mut DeviceState,
-    host: &mut M,
+/// One `CmdExecIndirect2` packet, read.
+///
+/// **The seam between deciding and doing.** Everything above it is a function
+/// of the packet's bytes and guest memory: which task, what the resource table
+/// declares, and the command buffers themselves. Everything below it is host
+/// work. The replacement architecture puts an admission decision between the
+/// two — a packet may be judged and then *parked*, and executed later — so the
+/// two halves cannot be one straight line through a single function, and the
+/// buffers have to be a value that outlives the reading.
+///
+/// That is also why there is no separate double-load to remove: the streams are
+/// loaded once, here, and whoever executes them is handed the same `Vec`.
+struct ExecSubmission {
+    task_id: u32,
+    /// Per resource this submission touches, who owns the authoritative bytes
+    /// afterwards. Applied by [`consume_resource_table`] *before* any of the
+    /// submission's work runs.
+    resource_descs: Vec<ExecResourceDesc>,
+    /// The command buffers the header declares, in the order it declares them.
+    streams: Vec<Vec<u8>>,
+}
+
+/// Read one `CmdExecIndirect2` packet into the submission it describes.
+///
+/// `None` for every reason the packet does not describe one, each of which is
+/// already on the always-on channel where it is refused. `measured_ns`
+/// accumulates this call's own spans so [`note_exec_header`] can derive the
+/// leftover; see that function for why the header phase is a subtraction.
+fn read_submission<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
     payload: &[u8],
-) -> ExecResult {
-    let exec_started = std::time::Instant::now();
-    let mut out = ExecResult::default();
+    out: &mut ExecResult,
+    measured_ns: &mut u64,
+) -> Option<ExecSubmission> {
     if payload.len() < CHILD_EXEC_INDIRECT_HEADER_LEN as usize {
-        return out;
+        return None;
     }
     let raw_task = ld32(&payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..]);
     // The resolver guarantees a live slot or nothing, so there is no second
@@ -764,7 +792,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             state.tasks.live_count(),
             payload.len()
         ));
-        return out;
+        return None;
     };
     out.task_id = task_id;
 
@@ -778,14 +806,14 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
             "exec_indirect2 short_payload task={task_id} res={resource_count} cbufs={cmdbuf_count} need={need} plen={}",
             payload.len()
         ));
-        return out;
+        return None;
     }
     if cmdbuf_count == 0 {
         crate::observe::fail(format!(
             "exec_indirect2 zero_cbufs task={task_id} res={resource_count} plen={}",
             payload.len()
         ));
-        return out;
+        return None;
     }
 
     // The guest declares, per resource this submission touches, who owns the
@@ -801,27 +829,41 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
         Vec::new()
     });
 
-    // Every command buffer the header declares, because `need` above already
-    // bounded how many there can be: the guest cannot claim a table longer than
-    // the descriptors it actually supplied, so `cmdbuf_count` is capped by
-    // `payload.len() / CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN` and `with_capacity`
-    // below cannot be talked into an allocation the payload does not back.
-    //
-    // A fixed ceiling used to sit here and truncate with `.min()`, above the
-    // check that already bounded the same number. Nothing derived it — a
-    // submission of 17 lost its last command buffer entirely, before the loop,
-    // with no fail line, which is a whole packet of guest draws vanishing into a
-    // silently shorter table.
     // This call's measured spans, summed, so `Header` can be the leftover. The
     // census's own totals cover the whole window and cannot answer for one call.
-    let mut measured_ns = 0u64;
     let load_started = std::time::Instant::now();
     let streams = load_command_streams(state, host, task_id, payload, cbufs_off, cmdbuf_count);
     out.streams_loaded += u32::try_from(streams.len()).unwrap_or(u32::MAX);
     note_command_stream_count(streams.len());
     let load_ns = load_started.elapsed().as_nanos() as u64;
-    measured_ns += load_ns;
+    *measured_ns += load_ns;
     crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Load, load_ns);
+
+    Some(ExecSubmission {
+        task_id,
+        resource_descs,
+        streams,
+    })
+}
+
+/// Run one read submission's host work.
+///
+/// Sets `out.deferred` and does nothing else when a referenced render stage is
+/// still translating: the packet stays unconsumed so the guest replays it, and
+/// replay must not duplicate clears, fences, dispatches or writeback.
+fn execute_submission<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    submission: &ExecSubmission,
+    out: &mut ExecResult,
+    measured_ns: &mut u64,
+) {
+    let ExecSubmission {
+        task_id,
+        resource_descs,
+        streams,
+    } = submission;
+    let task_id = *task_id;
 
     // Plan before execute: cold AIR translation is immutable CPU work and can
     // run without protocol ownership. Keep the packet unconsumed until every
@@ -830,13 +872,13 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     let translation_pending = {
         let preflight_started = std::time::Instant::now();
         let pending =
-            crate::backend::selected().preflight_translations(state, host, task_id, &streams);
+            crate::backend::selected().preflight_translations(state, host, task_id, streams);
         // Timed on this side of the seam, and unconditionally: the phase is the
         // drain's own accounting of where an exec call's time went, and a rail
         // that preflights nothing has to show as the zero it costs rather than
         // as an absent column the leftover `Header` silently absorbs.
         let preflight_ns = preflight_started.elapsed().as_nanos() as u64;
-        measured_ns += preflight_ns;
+        *measured_ns += preflight_ns;
         crate::runtime::drain::note_exec_phase(
             crate::runtime::drain::ExecPhase::Preflight,
             preflight_ns,
@@ -845,8 +887,7 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     };
     if translation_pending {
         out.deferred = true;
-        note_exec_header(exec_started, measured_ns);
-        return out;
+        return;
     }
 
     // Before any of this submission's work runs. Each record states what was
@@ -854,23 +895,42 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // pixels the guest has since overwritten has to go now — landing it later
     // would replace the guest's own bytes with a frame the guest has declared
     // stale.
-    consume_resource_table(state, task_id, &resource_descs);
+    consume_resource_table(state, task_id, resource_descs);
 
     for stream in streams {
         let mut acc = StreamAccum::default();
         let walk_started = std::time::Instant::now();
-        walk_stream(state, host, task_id, &stream, &mut out, &mut acc);
+        walk_stream(state, host, task_id, stream, out, &mut acc);
         let walk_ns = walk_started.elapsed().as_nanos() as u64;
-        measured_ns += walk_ns;
+        *measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
         let finish_started = std::time::Instant::now();
-        finish_stream(state, host, task_id, &mut out, &acc);
+        finish_stream(state, host, task_id, out, &acc);
         let finish_ns = finish_started.elapsed().as_nanos() as u64;
-        measured_ns += finish_ns;
+        *measured_ns += finish_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Finish, finish_ns);
     }
+}
+
+pub fn process_exec_indirect2<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    payload: &[u8],
+) -> ExecResult {
+    let exec_started = std::time::Instant::now();
+    let mut out = ExecResult::default();
+    let mut measured_ns = 0u64;
+    // A packet that does not describe a submission has already said so where it
+    // refused, and closes no phase tiling: there is nothing between the header
+    // and the refusal for the leftover to account for.
+    let Some(submission) = read_submission(state, host, payload, &mut out, &mut measured_ns) else {
+        return out;
+    };
+    execute_submission(state, host, &submission, &mut out, &mut measured_ns);
     note_exec_header(exec_started, measured_ns);
-    out.total_us = elapsed_us(exec_started);
+    if !out.deferred {
+        out.total_us = elapsed_us(exec_started);
+    }
     out
 }
 

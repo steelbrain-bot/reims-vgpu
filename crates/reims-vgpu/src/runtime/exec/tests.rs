@@ -7721,3 +7721,120 @@ fn a_segment_opened_over_an_open_compute_segment_commits_it_and_says_so() {
         "opening a segment over an open compute segment must be named: {added}"
     );
 }
+
+/// A submission is executed from the buffers it was read with.
+///
+/// **The property the replacement architecture's parking rests on.** An
+/// admitted packet may be held — behind a pipeline still compiling, or behind a
+/// completion word another packet owes — and run later. If execution re-read
+/// the command buffers out of guest memory at that point, it would run whatever
+/// the guest had written there in the meantime, which is neither the stream the
+/// device judged nor a stream the guest asked to run twice.
+///
+/// The test states it the only way that distinguishes the two: the guest's page
+/// is overwritten with zeroes between the read and the execution. A device that
+/// re-read would signal nothing.
+#[test]
+fn a_submission_executes_the_streams_it_was_read_with_and_not_guest_memory_again() {
+    use crate::model::FENCE_DOMAIN_EVENT;
+    use crate::protocol::fifo::{
+        CHILD_EXEC_INDIRECT_CMDBUF_GVA, CHILD_EXEC_INDIRECT_CMDBUF_LENGTH,
+    };
+    use crate::runtime::gva_mem::{define_task_pages_arm64e, write_task_gva_arm64e};
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    define_task_pages_arm64e(&mut host, &mut state, 4, 16);
+
+    // One event segment carrying one signal: the smallest record whose effect
+    // is a value this test can read back out of the model.
+    let (event_ref, value) = (21u32, 4u64);
+    let mut record = vec![0u8; 0x14];
+    st32(&mut record[0..4], 0x191);
+    st32(&mut record[4..8], 0x14);
+    st32(&mut record[8..12], event_ref);
+    st64(&mut record[12..20], value);
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+    st32(
+        &mut stream[0..4],
+        (SEGMENT_HEADER_LEN + record.len()) as u32,
+    );
+    stream[4] = SegmentKind::Event.wire_type();
+    stream.extend_from_slice(&record);
+
+    let stream_gva = 8u64 << PAGE_SHIFT_ARM64E;
+    write_task_gva_arm64e(&mut host, &state.tasks[1], stream_gva, &stream);
+
+    let mut payload = vec![
+        0u8;
+        CHILD_EXEC_INDIRECT_HEADER_LEN as usize
+            + CHILD_EXEC_INDIRECT_CMDBUF_DESC_LEN as usize
+    ];
+    st32(&mut payload[CHILD_EXEC_INDIRECT_TASK_ID as usize..], 1);
+    st32(&mut payload[CHILD_EXEC_INDIRECT_CMDBUF_COUNT as usize..], 1);
+    let cb = CHILD_EXEC_INDIRECT_HEADER_LEN as usize;
+    st64(
+        &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_GVA as usize..],
+        stream_gva,
+    );
+    st64(
+        &mut payload[cb + CHILD_EXEC_INDIRECT_CMDBUF_LENGTH as usize..],
+        stream.len() as u64,
+    );
+
+    let mut out = ExecResult::default();
+    let mut measured_ns = 0u64;
+    let submission = read_submission(&state, &host, &payload, &mut out, &mut measured_ns)
+        .expect("the packet names a live task and one command buffer");
+    assert_eq!(
+        submission.streams.len(),
+        1,
+        "the header declares one command buffer and it is read here, once"
+    );
+    assert_eq!(out.streams_loaded, 1);
+    assert_eq!(
+        state.fence_generation(1, FENCE_DOMAIN_EVENT, event_ref),
+        None,
+        "reading a submission runs none of it"
+    );
+
+    // The guest reuses the page under a packet this device is still holding,
+    // and the read-back is what keeps this test from passing vacuously: a
+    // silently ineffective overwrite would leave the original stream in guest
+    // memory and both readings would signal.
+    write_task_gva_arm64e(
+        &mut host,
+        &state.tasks[1],
+        stream_gva,
+        &vec![0u8; stream.len()],
+    );
+    let mut readback = vec![0xffu8; stream.len()];
+    crate::runtime::gva_mem::read_task_gva_by_id(
+        &host,
+        &state.tasks,
+        1,
+        stream_gva,
+        &mut readback,
+        PAGE_SHIFT_ARM64E,
+    )
+    .expect("the page is mapped");
+    assert!(
+        readback.iter().all(|b| *b == 0),
+        "the overwrite must have landed, or this test proves nothing"
+    );
+
+    execute_submission(
+        &mut state,
+        &mut host,
+        &submission,
+        &mut out,
+        &mut measured_ns,
+    );
+    assert_eq!(
+        state.fence_generation(1, FENCE_DOMAIN_EVENT, event_ref),
+        Some(value),
+        "the signal the read submission carries is the one that runs, whatever \
+         the guest has since written where it came from"
+    );
+}
