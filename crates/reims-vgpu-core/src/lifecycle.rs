@@ -1765,17 +1765,47 @@ impl Lifecycle {
                 Resident::Dedicated { .. } => None,
             },
         };
+        // The whole of this resource, in whichever vocabulary its storage shape
+        // uses. Named once because two arms below need it: a participation that
+        // says "the whole thing" and one whose window this resource cannot hold.
+        let whole = match resident {
+            Resident::Dedicated { .. } => ParticipationExtent::Whole,
+            Resident::Placed(p) => ParticipationExtent::Range(p.region),
+        };
         let extent = match participation.extent {
-            ParticipationExtent::Range(range) => ParticipationExtent::Range(
-                resident
-                    .window(range.offset, range.length)
-                    .map_err(|refusal| Refusal::Heap { task, refusal })?,
-            ),
+            // **A window that does not fit widens; it does not refuse.**
+            //
+            // A record's `Range` is an *upper bound on what the record touches*
+            // and not an assertion that those bytes exist.
+            // `ImagePitch::span_bytes` says so in its own doc — it multiplies a
+            // pitch by a height or a depth and its caller widens to the whole
+            // buffer rather than guess a packed layout, "because a packed guess
+            // is a shorter span than the copy really touches and a short span is
+            // a missed hazard edge". A bound built to err long, checked as if it
+            // were exact, refuses the copies it was made safe for.
+            //
+            // It was measured. A driven macos-15 boot refused seven exec packets
+            // a boot here, every one of them a `0x12c`
+            // `copyFromBuffer:…toTexture:…` reading its source buffer:
+            // `offset=65536 length=196608` of a resource whose whole extent is
+            // 196 608 bytes, the span being `bytes_per_row × height` over a
+            // sub-rect that starts partway in. Each refusal threw away a whole
+            // packet of guest work.
+            //
+            // So the answer is the one three lines up, for the same reason:
+            // widening over-orders and never under-orders, exactly as
+            // `resolve_no_bytes`' `AccessKey::DomainOnly` does. Narrowing —
+            // clamping the window to the extent — is the one answer that is
+            // wrong, because it claims fewer bytes than the record may touch and
+            // a short claim is an edge that does not get built.
+            //
+            // The caller can see it happened: it asked with a `Range` and got a
+            // key that is not one.
+            ParticipationExtent::Range(range) => resident
+                .window(range.offset, range.length)
+                .map_or(whole, ParticipationExtent::Range),
             ParticipationExtent::Subresource(range) => ParticipationExtent::Subresource(range),
-            ParticipationExtent::Whole => match resident {
-                Resident::Dedicated { .. } => ParticipationExtent::Whole,
-                Resident::Placed(p) => ParticipationExtent::Range(p.region),
-            },
+            ParticipationExtent::Whole => whole,
         };
         let bytes = match extent {
             ParticipationExtent::Range(range) => Some(range),
@@ -5845,6 +5875,62 @@ mod tests {
         assert!(none.key.may_alias(bytes.key));
         assert!(bytes.key.may_alias(none.key));
         assert_eq!(none.key.rung(), 3, "and the imprecision is priced");
+    }
+
+    /// A window past the resource's end widens to the whole of it and still
+    /// meets every access over it.
+    ///
+    /// **The claim is a bound, not an assertion.** A record's `Range` is the
+    /// most bytes it could touch — `ImagePitch::span_bytes` builds one by
+    /// multiplying a pitch by a height, deliberately long — so checking it as if
+    /// it were exact refuses the copies the long side was for. A driven macos-15
+    /// boot threw away seven whole exec packets a boot on it, every one a
+    /// `0x12c` `copyFromBuffer:…toTexture:…` reading `offset=65536
+    /// length=196608` of a 196 608-byte source buffer.
+    ///
+    /// The widened access is compared against an exact one over the same
+    /// resource, because the property that makes widening safe is not that it is
+    /// coarse — it is that it still *meets*. A clamped window would be finer and
+    /// wrong: it would claim fewer bytes than the record may touch, and the edge
+    /// that does not get built is a race.
+    #[test]
+    fn a_window_past_the_extent_widens_to_the_whole_resource() {
+        let (mut l, name) = with_one_resource(0x1000);
+        let over = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name,
+                    // One byte longer than the resource, from its own start.
+                    extent: ParticipationExtent::Range(range(0, 0x1001)),
+                    mode: AccessMode::Read,
+                    api_stages: 0,
+                },
+            )
+            .expect("a bound past the end is not a refusal");
+        assert!(
+            !matches!(over.key, crate::access::AccessKey::Range(..)),
+            "the window this model could not hold is not reported as one: {:?}",
+            over.key
+        );
+
+        let inside = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name,
+                    extent: ParticipationExtent::Range(range(0x40, 0x40)),
+                    mode: AccessMode::Write,
+                    api_stages: 0,
+                },
+            )
+            .expect("a window inside the extent");
+        assert!(
+            over.key.may_alias(inside.key) && inside.key.may_alias(over.key),
+            "widening must not lose the edge the record's own bytes would have drawn"
+        );
     }
 
     /// A slot nothing declared still refuses, which is what the absent

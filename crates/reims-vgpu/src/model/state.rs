@@ -5648,13 +5648,71 @@ impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
                 .unwrap_or_else(|e| e.into_inner())
                 .access(self.task, self.domain, participation)
         };
-        answer.map_err(|refusal| {
-            note_access_refused(self.state, self.task, participation, refusal);
-            reims_vgpu_core::access::AccessRefusal {
-                resource: participation.resource,
-                reason: refusal.slug(),
+        match answer {
+            Ok(intent) => {
+                note_access_widened(self.state, self.task, participation, &intent);
+                Ok(intent)
             }
-        })
+            Err(refusal) => {
+                note_access_refused(self.state, self.task, participation, refusal);
+                Err(reims_vgpu_core::access::AccessRefusal {
+                    resource: participation.resource,
+                    reason: refusal.slug(),
+                })
+            }
+        }
+    }
+}
+
+/// Name a record whose window the owner could not hold, and widened.
+///
+/// **The event is derived and not reported, because the owner has nowhere to
+/// report it from.** `Lifecycle::access` widens a `Range` participation that
+/// does not fit its resource's extent to the whole of that resource — a bound
+/// built to err long must not be checked as if it were exact, see the arm's own
+/// doc — and `reims_vgpu_core` has no failure channel to say so on. It does not
+/// need one: a caller that asked with a `Range` and was answered with a key that
+/// is not a range has been told, and this is the caller.
+///
+/// It was a refused packet until the owner widened. Seven a boot on a driven
+/// macos-15 run, every one a `0x12c` `copyFromBuffer:…toTexture:…` reading
+/// `offset=65536 length=196608` of a 196 608-byte source buffer, and each one
+/// cost a whole packet of guest work. Counted now rather than counted then,
+/// because the number that matters has changed from "packets dropped" to "edges
+/// drawn coarser than the record asked for".
+fn note_access_widened(
+    state: &DeviceState,
+    task: reims_vgpu_core::identity::TaskId,
+    participation: &reims_vgpu_core::access::Participation,
+    intent: &reims_vgpu_core::access::AccessIntent,
+) {
+    use reims_vgpu_core::access::{AccessKey, ParticipationExtent};
+    let ParticipationExtent::Range(asked) = participation.extent else {
+        return;
+    };
+    if matches!(intent.key, AccessKey::Range(..)) {
+        return;
+    }
+    crate::runtime::drain::note_store_route("access_window_widened");
+    if crate::observe::first_sight(
+        "access_window_widened",
+        (u64::from(task.0) << 32) | u64::from(participation.resource.slot.0),
+    ) {
+        let resident = state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve(task, participation.resource);
+        crate::observe::fail(format!(
+            "access_window_widened task={} ref={} mode={:?} asked={asked:?} \
+             resident={resident:?} rung={} (the record's window is a bound on what it \
+             touches and this resource cannot hold it, so the access orders against the \
+             whole resource rather than against nothing)",
+            task.0,
+            participation.resource.slot.0,
+            participation.mode,
+            intent.key.rung(),
+        ));
     }
 }
 
@@ -5768,23 +5826,26 @@ mod device_access_tests {
         }
     }
 
-    /// A refused access returns, and describing it does not re-enter the lock.
+    /// A widened window returns, and saying so does not re-enter the lock.
     ///
-    /// **A hang here is this test failing.** `note_access_refused` reads the
-    /// object the slot holds, which takes `DeviceState::lifecycle` — the same
-    /// lock the answer was produced under. Written as one `map_err` chain the
-    /// guard is still alive when it runs, and the device deadlocks on its first
-    /// refused record: a driven boot froze that way with
-    /// `walk_records_render = 42`. There is no assertion that can catch a
-    /// deadlock from inside the thread it deadlocks, so the assertion is that
-    /// this returns at all, and the refusal it returns is the owner's.
+    /// **A hang here is this test failing.** Both of this door's observers —
+    /// `note_access_widened` and `note_access_refused` — read state that takes
+    /// `DeviceState::lifecycle`, the same lock the answer was produced under.
+    /// Written as one chain on the locked call the guard is still alive when
+    /// they run, and the device deadlocks on the first record that trips one: a
+    /// driven boot froze exactly that way, `walk_records_render = 42` for seven
+    /// minutes. There is no assertion that catches a deadlock from inside the
+    /// thread it deadlocks, so the assertion is that this returns at all — and
+    /// that what comes back is the widened access rather than a refusal.
     #[test]
-    fn a_refused_access_returns_and_its_description_does_not_re_enter_the_lock() {
+    fn a_widened_access_returns_and_saying_so_does_not_re_enter_the_lock() {
+        use reims_vgpu_core::access::AccessKey;
+
         let (state, name) = state_with_one_resource();
         let mut access = state.task_access(TaskId(TASK), DOMAIN);
-        // A window one byte past the resource's own 4096, which is the shape
-        // `Resident::window` refuses and the shape a driven boot met.
-        let refusal = access
+        // A window one byte past the resource's own 4096: a bound the record
+        // built long, which this resource cannot hold.
+        let intent = access
             .access(&Participation {
                 resource: name,
                 extent: ParticipationExtent::Range(ByteRange {
@@ -5794,9 +5855,13 @@ mod device_access_tests {
                 mode: AccessMode::Read,
                 api_stages: 0,
             })
-            .expect_err("a window past the extent is not an access");
-        assert_eq!(refusal.resource, name);
-        assert_eq!(refusal.reason, "lifecycle_heap");
+            .expect("a bound past the end is not a refusal");
+        assert!(
+            !matches!(intent.key, AccessKey::Range(..)),
+            "the window that did not fit is not reported as one: {:?}",
+            intent.key
+        );
+        assert_eq!(intent.domain, DOMAIN);
     }
 
     /// The interleaving a command-stream walk performs, which the owner's own

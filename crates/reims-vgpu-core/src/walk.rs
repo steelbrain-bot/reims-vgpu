@@ -102,8 +102,20 @@ pub enum WalkRefusal {
         refusal: ResolveRefusal,
     },
     /// The builder refused the operation's placement, ordering or access.
+    ///
+    /// `record` is the refused record's own opcode when a record is what was
+    /// being placed, and `None` for the three placements that are a *segment*'s
+    /// — a protection envelope, an encoder beginning, a segment ending — which
+    /// have a site and no record. **It is the field a window refusal cannot be
+    /// diagnosed without**: `StreamRefusal::Access`'s reason says a
+    /// participation did not fit its resource's extent, and whether that is a
+    /// record naming bytes past the end or two coordinate spaces meeting turns
+    /// on which record it was. A driven macos-15 boot refuses seven exec
+    /// packets a boot this way, all at one site, and the site alone names no
+    /// record.
     Place {
         at: StreamSite,
+        record: Option<u32>,
         refusal: StreamRefusal,
     },
     /// The stream ended with an encoder or a protection envelope unfinished.
@@ -222,13 +234,21 @@ fn segment(
             // rule and not restated here.
             return builder
                 .protection_envelope(ProtectionOptions(options))
-                .map_err(|refusal| WalkRefusal::Place { at, refusal });
+                .map_err(|refusal| WalkRefusal::Place {
+                    at,
+                    record: None,
+                    refusal,
+                });
         }
         SegmentBody::Encoder { kind, commands } => (kind, commands),
     };
     builder
         .begin_encoder(kind, framed.lifetime)
-        .map_err(|refusal| WalkRefusal::Place { at, refusal })?;
+        .map_err(|refusal| WalkRefusal::Place {
+            at,
+            record: None,
+            refusal,
+        })?;
     let mut records = OpStream::new(commands);
     loop {
         // Taken before the step, so it is the offset the record starts at
@@ -246,16 +266,26 @@ fn segment(
         let Ok(view) = record else {
             return Err(WalkRefusal::RecordFraming { at });
         };
+        // Taken before the view is consumed, and only so a refusal can name it.
+        let record = view.opcode();
         let resolved = resolve::operation(kind.rail(), &view, resolver, builder.arenas_mut())
             .map_err(|refusal| WalkRefusal::Resolve { at, refusal })?;
         builder
             .record(resolved, source)
-            .map_err(|refusal| WalkRefusal::Place { at, refusal })?;
+            .map_err(|refusal| WalkRefusal::Place {
+                at,
+                record: Some(record),
+                refusal,
+            })?;
     }
     builder
         .end_segment()
         .map(|_| ())
-        .map_err(|refusal| WalkRefusal::Place { at, refusal })
+        .map_err(|refusal| WalkRefusal::Place {
+            at,
+            record: None,
+            refusal,
+        })
 }
 
 #[cfg(test)]
