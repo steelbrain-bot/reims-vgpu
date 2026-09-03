@@ -34,7 +34,7 @@
 //! here — but it is a reason to make the retention *countable*, which
 //! [`ParkedWork::retained_bytes`] and [`ParkedStore::retained_bytes`] are.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use reims_vgpu_core::identity::IngressOrdinal;
 
@@ -148,6 +148,16 @@ impl Release {
 #[derive(Default)]
 pub struct ParkedStore {
     work: BTreeMap<IngressOrdinal, ParkedWork>,
+    /// Positions the model has released to run and this device has not run
+    /// yet.
+    ///
+    /// Separate from `work` because "may run" and "has bytes" are two facts
+    /// with two owners: the model decides the first through `take_ready`, and
+    /// this store holds the second. A position can be parked and not runnable
+    /// (waiting on a hazard, a stamp or a pipeline) and it can be runnable and
+    /// not yet run, which is the state this set exists to make expressible —
+    /// see [`Self::ready_in_order`].
+    ready: BTreeSet<IngressOrdinal>,
     retained_bytes: usize,
     /// The most bytes ever parked at once, so a boot can report the retention
     /// the switch introduced instead of only its instantaneous value.
@@ -194,6 +204,7 @@ impl ParkedStore {
     #[must_use = "a parked position taken out and not run is a packet that never runs"]
     pub fn release(&mut self, ingress: IngressOrdinal, why: Release) -> Option<ParkedWork> {
         let work = self.work.remove(&ingress)?;
+        self.ready.remove(&ingress);
         self.retained_bytes = self.retained_bytes.saturating_sub(work.retained_bytes());
         crate::runtime::drain::note_store_route(why.slug());
         match why {
@@ -205,6 +216,47 @@ impl ParkedStore {
                 None
             }
         }
+    }
+
+    /// Record that the model has released this position to run.
+    ///
+    /// `false` when this store is not holding the ordinal, which the caller
+    /// counts rather than trusting: the two are kept in step by the drain
+    /// parking every packet it admits, and a `take_ready` naming something
+    /// unparked means that has stopped being true. It is not an assertion,
+    /// because this is reached from the QEMU shim and no panic may cross that
+    /// boundary.
+    #[must_use = "a ready position this store does not hold is a packet nothing will run"]
+    pub fn mark_ready(&mut self, ingress: IngressOrdinal) -> bool {
+        if !self.work.contains_key(&ingress) {
+            crate::runtime::drain::note_store_route("parked_ready_unheld");
+            return false;
+        }
+        self.ready.insert(ingress);
+        true
+    }
+
+    /// The positions that may run, in ingress order.
+    ///
+    /// A list rather than a `next()`, because **the caller may decline any one
+    /// of them and must still reach the rest.** This device has two execution
+    /// gates the model does not model — host paint two presents behind, and a
+    /// translation whose AIR is not built — and both are properties of the
+    /// device's own readiness rather than of the packet's ordering. A door that
+    /// handed out one position at a time would make declining it block every
+    /// later one, which is the head-of-line stall the switch exists to remove.
+    ///
+    /// A declined position stays here and is offered again on the next drain;
+    /// nothing has to put it back, because only running it takes it out.
+    #[must_use]
+    pub fn ready_in_order(&self) -> Vec<IngressOrdinal> {
+        self.ready.iter().copied().collect()
+    }
+
+    /// How many positions may run but have not.
+    #[must_use]
+    pub fn ready_len(&self) -> usize {
+        self.ready.len()
     }
 
     /// Whether this ordinal is holding bytes. For a caller deciding whether a
@@ -245,6 +297,7 @@ impl ParkedStore {
     #[must_use = "the guest is owed a typed reason for every position this dropped"]
     pub fn drain_all(&mut self) -> Vec<IngressOrdinal> {
         self.retained_bytes = 0;
+        self.ready.clear();
         std::mem::take(&mut self.work).into_keys().collect()
     }
 }
@@ -344,5 +397,69 @@ mod tests {
         let mut store = ParkedStore::new();
         store.park(ordinal(4), ParkedWork::new(1, packet(4)));
         store.park(ordinal(4), ParkedWork::new(1, packet(4)));
+    }
+    /// A position the device declines to run stays runnable, and the ones
+    /// behind it still run.
+    ///
+    /// **The head-of-line stall the switch exists to remove.** This device has
+    /// two execution gates the model does not model — host paint two presents
+    /// behind, and an exec packet whose AIR translation is not built — and
+    /// today each of them stops the whole channel by leaving the ring head
+    /// where it is. Declining one ready position must not do that.
+    #[test]
+    fn a_declined_position_does_not_stop_the_ones_behind_it() {
+        let mut store = ParkedStore::new();
+        for n in [1, 2, 3] {
+            store.park(ordinal(n), ParkedWork::new(1, packet(8)));
+            assert!(store.mark_ready(ordinal(n)));
+        }
+
+        // The device runs 2 and 3 and declines 1 — a present held behind paint.
+        assert_eq!(
+            store.ready_in_order(),
+            vec![ordinal(1), ordinal(2), ordinal(3)]
+        );
+        for n in [2, 3] {
+            assert!(store.release(ordinal(n), Release::Ready).is_some());
+        }
+
+        // Nothing put it back, because nothing took it out.
+        assert_eq!(store.ready_in_order(), vec![ordinal(1)]);
+        assert!(store.release(ordinal(1), Release::Ready).is_some());
+        assert!(store.is_empty());
+        assert_eq!(store.ready_len(), 0);
+    }
+
+    /// Running a position takes it out of both facts at once, so a second
+    /// drain cannot offer bytes that have already executed.
+    #[test]
+    fn running_a_position_takes_it_off_the_ready_list_too() {
+        let mut store = ParkedStore::new();
+        store.park(ordinal(5), ParkedWork::new(1, packet(8)));
+        assert!(store.mark_ready(ordinal(5)));
+
+        assert!(store.release(ordinal(5), Release::Ready).is_some());
+        assert!(store.ready_in_order().is_empty());
+    }
+
+    /// A withdrawal takes it off too: work the model took away must not be
+    /// offered as runnable.
+    #[test]
+    fn a_withdrawal_takes_a_ready_position_off_the_list() {
+        let mut store = ParkedStore::new();
+        store.park(ordinal(6), ParkedWork::new(1, packet(8)));
+        assert!(store.mark_ready(ordinal(6)));
+
+        assert!(store.release(ordinal(6), Release::Withdrawn).is_none());
+        assert!(store.ready_in_order().is_empty());
+    }
+
+    /// A ready position this store never held is answered and not asserted,
+    /// because this is reached from the QEMU shim.
+    #[test]
+    fn a_ready_position_with_no_bytes_is_answered_not_asserted() {
+        let mut store = ParkedStore::new();
+        assert!(!store.mark_ready(ordinal(8)));
+        assert!(store.ready_in_order().is_empty());
     }
 }
