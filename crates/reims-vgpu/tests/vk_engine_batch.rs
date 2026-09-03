@@ -776,6 +776,102 @@ fn a_warm_repeat_draw_does_not_enter_the_allocator() {
     );
 }
 
+/// The same measurement for a draw that binds a descriptor, which is the shape
+/// a real guest sends and the one the zero above does not reach.
+///
+/// A descriptor-free draw builds its binding list with `Vec::with_capacity(0)`
+/// and clones an empty `Vec` into the pipeline key, and neither allocates — so
+/// the zero above is a true statement about a narrow shape. One storage buffer
+/// is enough to leave it: the binding list becomes a real `Vec`, and
+/// `PipelineKey` carries a `LayoutKey` by value, so building the pipeline
+/// lookup key clones it again.
+///
+/// Recorded as a ceiling rather than asserted at zero, because closing this one
+/// is a change to how layouts are keyed — the cache would have to be reachable
+/// without an owned `Vec<BindingSig>` per draw — and a gate that fails on
+/// arrival gets weakened or ignored. Lowering the constant is the work; raising
+/// it needs a reason in the commit.
+#[test]
+fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffic() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_701,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let mut opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    opener.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 64])),
+    });
+    match engine::execute_draw_request(engine_device(), &opener) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("opener draw: {msg}");
+        }
+    }
+
+    let mut joiner = batch_req(&vert, &frag, &identity, true, half_scissor(true));
+    joiner.storage_buffers.push(StorageBufferResource {
+        binding: 0,
+        content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 64])),
+    });
+    for n in 1..=8 {
+        engine::execute_draw_request(engine_device(), &joiner)
+            .unwrap_or_else(|e| panic!("warm-up draw #{n}: {e}"));
+    }
+
+    let before = engine::counter_snapshot();
+    let (result, trips) = reims_vgpu_testkit::allocations::measure(|| {
+        engine::execute_draw_request(engine_device(), &joiner)
+    });
+    result.expect("the measured draw is the ninth repeat of one that succeeded");
+    let during = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        during.batch_joins, 1,
+        "the measured region recorded exactly one joining draw: {during:?}"
+    );
+    assert_eq!(
+        during.batch_flushes, 0,
+        "and did not flush, which is not a steady-state draw: {during:?}"
+    );
+
+    /// What this rail reads today, and where each trip comes from — traced
+    /// once, so the next person to lower this starts from the list rather than
+    /// from the number:
+    ///
+    /// ```text
+    ///   104 B  validate_v1
+    ///    16 B  the `Vec<BindingSig>` binding list
+    ///    16 B  `LayoutKey::clone` into the pipeline key
+    ///    48 B  `BufferGatherRoles::of`
+    ///   128 B  the bound-buffer list growing
+    ///    24 B  the `Vec<DescriptorBufferInfo>` collect
+    ///   256 B  the `Vec<WriteDescriptorSet>` growing
+    /// ```
+    ///
+    /// Every one is per-draw scratch that a device-owned reusable buffer would
+    /// hold instead, except the two layout ones, which need the layout cache to
+    /// be reachable without an owned `Vec<BindingSig>` per draw.
+    const CEILING: usize = 7;
+    assert!(
+        trips <= CEILING,
+        "a warm repeat draw binding one storage buffer took {trips} trips into \
+         the allocator, above the recorded ceiling of {CEILING}. The plan's \
+         value for this is 0"
+    );
+    eprintln!("warm repeat draw, one storage buffer: {trips} allocator trips");
+}
+
 /// A batch refuses joiners at `BATCH_MAX_DRAWS`: the draw after a full batch
 /// flushes and reopens, and the one after that joins the second batch. Keeps
 /// the GPU fed and the staging pool recycling instead of hoarding a whole run
