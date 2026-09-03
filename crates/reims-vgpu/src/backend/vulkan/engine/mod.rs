@@ -403,7 +403,7 @@ impl EngineState {
             unsafe {
                 #[cfg(feature = "host-window")]
                 if let Some(mut presenter) = presenter {
-                    presenter.destroy(ctx, Some(&mut self.pools));
+                    presenter.destroy(ctx);
                 }
                 caches.destroy_all(&ctx.device);
                 self.pools.destroy_all(&ctx.device);
@@ -1112,7 +1112,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         unsafe {
             #[cfg(feature = "host-window")]
             if let Some(presenter) = window_presenter.as_mut() {
-                presenter.release_pins_after_idle(pools);
+                presenter.release_claims_after_idle();
             }
             pools.destroy_all(&ctx.device);
         }
@@ -1265,13 +1265,8 @@ pub fn window_present_detach() {
         return;
     };
     note_window_present_attached(false);
-    let EngineState {
-        ref owner,
-        ref mut pools,
-        ..
-    } = &mut *guard;
-    if let Some(ctx) = owner.ctx.as_ref() {
-        unsafe { presenter.destroy(ctx, Some(pools)) };
+    if let Some(ctx) = guard.owner.ctx.as_ref() {
+        unsafe { presenter.destroy(ctx) };
     }
 }
 

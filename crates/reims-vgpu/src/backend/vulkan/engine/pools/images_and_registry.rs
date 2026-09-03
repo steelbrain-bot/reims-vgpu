@@ -2211,13 +2211,50 @@ impl ResourcePools {
         )
     }
 
+    /// Whether the host window is presenting from this resident, and so no
+    /// reclaim path may take it.
+    ///
+    /// This replaced a pin the presenter took around its blit. The pin was a
+    /// worse fit in both directions. It was too *narrow* in time — it existed
+    /// only while a blit was in flight, so a resident the window was displaying
+    /// but not currently blitting was an ordinary reclaim victim — and it was
+    /// the presenter's `&mut ResourcePools` write, on a thread that must stop
+    /// touching this registry at all: it holds no device, and the registry is on
+    /// its way to the device the guest declared it against.
+    ///
+    /// `window_published` is the set the publish maintains and every removal
+    /// path already consults to move [`super::WINDOW_SOURCE_EPOCH`]. Asking it
+    /// here makes one set answer both questions — which residents a reclaim must
+    /// not take, and which residents' removal invalidates the window's source —
+    /// instead of a pin and a set that could disagree.
+    ///
+    /// The set is the publish's, so this holds a resident the window has been
+    /// published against *at any point* since the last epoch bump, not only the
+    /// one on screen now. That is deliberate and it is bounded: at most
+    /// [`super::WINDOW_PUBLISHED_MAX`] identities, and the publish that would
+    /// exceed it bumps the epoch and clears the set, which returns every stale
+    /// one to the reclaim paths in the same call. A narrower set would have to
+    /// know when a present *stopped* reading a source, which is the window
+    /// thread's knowledge and the thing this boundary exists to stop asking for.
+    ///
+    /// It is not a safety mechanism and does not have to be one. A reclaim that
+    /// *did* take a published resident would move the epoch, so the window's next
+    /// present falls to host memory rather than to a destroyed handle, and a blit
+    /// already in flight is held by `WINDOW_PRESENT_SLOT`'s graveyard bit. This
+    /// is the policy half: do not reclaim the surface the user is looking at.
+    fn window_holds(&self, identity: &TargetIdentity) -> bool {
+        self.window_published.contains(identity)
+    }
+
     fn released_resident_keys(&self, max: usize) -> Vec<TargetIdentity> {
         self.registry_order
             .iter()
             .filter(|identity| {
-                self.registry
-                    .get(*identity)
-                    .is_some_and(ResidentTargetSlot::released_and_collectable)
+                !self.window_holds(identity)
+                    && self
+                        .registry
+                        .get(*identity)
+                        .is_some_and(ResidentTargetSlot::released_and_collectable)
             })
             .take(max)
             .cloned()
@@ -2616,9 +2653,11 @@ impl ResourcePools {
         self.registry_order
             .iter()
             .filter(|k| {
-                self.registry
-                    .get(*k)
-                    .is_some_and(|slot| slot.pin_count == 0 && !slot.gpu_only_content)
+                !self.window_holds(k)
+                    && self
+                        .registry
+                        .get(*k)
+                        .is_some_and(|slot| slot.pin_count == 0 && !slot.gpu_only_content)
             })
             .cloned()
             .collect()
@@ -3887,6 +3926,79 @@ pub(super) mod pin_count_tests {
 
         assert!(pools.pin_resident_target(&id, false));
         assert_eq!(pools.released_resident_keys(1), vec![id]);
+    }
+
+    /// The resident the host window has been published against is not a reclaim
+    /// victim on either path, and stops being held the moment the publish set is
+    /// answered for.
+    ///
+    /// Asserted on both `released_resident_keys` (the drain's collection of what
+    /// the guest has released) and `recoverable_residents` (the allocation
+    /// retry's wider sweep), because they are separate predicates and a hold
+    /// that only one of them honoured would let the other destroy the image the
+    /// window is blitting from.
+    #[test]
+    fn a_window_published_resident_is_taken_by_neither_reclaim_path() {
+        let mut pools = ResourcePools::new();
+        let id = pinned_identity();
+        pools.registry.insert(id.clone(), dummy_slot(true));
+        pools.registry_order.push_back(id.clone());
+        assert_eq!(pools.retain_resident_target(&id), Some(false));
+        assert_eq!(pools.release_resident_ownership(&id), Some(true));
+        assert_eq!(
+            pools.released_resident_keys(1),
+            vec![id.clone()],
+            "released and unheld is the baseline this test moves away from"
+        );
+
+        pools.note_window_published(Some(&id));
+        assert!(
+            pools.released_resident_keys(1).is_empty(),
+            "the surface the user is looking at is not collectable because the guest let go of it"
+        );
+        assert!(
+            pools.recoverable_residents().is_empty(),
+            "nor is it recoverable memory for a retried allocation"
+        );
+
+        // The hold is the publish set and nothing else, so answering for the set
+        // gives the resident back to both paths in one action.
+        pools.invalidate_window_sources();
+        assert_eq!(pools.released_resident_keys(1), vec![id.clone()]);
+        assert_eq!(pools.recoverable_residents(), vec![id]);
+    }
+
+    /// Overflowing the publish set returns everything it was holding, so the
+    /// hold cannot accumulate residents a long-running guest never gets back.
+    ///
+    /// This is the bound the hold rests on: it is not that a stale entry leaves
+    /// when the window stops reading it — nothing on this side of the boundary
+    /// knows that — but that the (`WINDOW_PUBLISHED_MAX` + 1)th publish clears
+    /// every one of them.
+    #[test]
+    fn overflowing_the_publish_set_returns_the_residents_it_was_holding() {
+        let mut pools = ResourcePools::new();
+        let now = 10_000;
+        pools.idle_clock_ms = now;
+        for id in 1..=super::WINDOW_PUBLISHED_MAX as u32 {
+            admit(&mut pools, surf(id), now, 0);
+            pools.note_window_published(Some(&surf(id)));
+        }
+        assert!(
+            pools.recoverable_residents().is_empty(),
+            "every admitted resident is held by the publish set"
+        );
+
+        let overflow = surf(super::WINDOW_PUBLISHED_MAX as u32 + 1);
+        admit(&mut pools, overflow.clone(), now, 0);
+        pools.note_window_published(Some(&overflow));
+        assert_eq!(
+            pools.recoverable_residents(),
+            (1..=super::WINDOW_PUBLISHED_MAX as u32)
+                .map(surf)
+                .collect::<Vec<_>>(),
+            "the bump cleared the set, and only the identity that caused it is held"
+        );
     }
 
     /// A released resource whose resident still holds the only copy of a frame

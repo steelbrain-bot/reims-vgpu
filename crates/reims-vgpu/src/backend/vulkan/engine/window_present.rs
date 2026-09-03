@@ -14,9 +14,8 @@ use std::time::Instant;
 
 use super::context::DeviceContext;
 use super::counters::EngineCounters;
-use super::facade_decline::EngineFacadeDecline;
 use super::pools::ResourcePools;
-use super::types::{DrawError, PresentRect, TargetIdentity, WindowPresentSource};
+use super::types::{DrawError, PresentRect, WindowPresentSource};
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::translate;
 
@@ -567,12 +566,13 @@ struct PresentFrame {
     image_available: vk::Semaphore,
     in_flight: vk::Fence,
     /// Whether this entry's blit has been submitted and not yet retired.
+    ///
+    /// The only per-entry state a present still carries about its source. It
+    /// used to carry the resident identities it had pinned as well; the pin is
+    /// gone — `ResourcePools::window_holds` keeps a displayed resident off the
+    /// reclaim paths from the publish that named it, which is both wider in time
+    /// and not a write this thread has to make.
     submitted: bool,
-    /// Resident targets pinned for this present, released when its fence
-    /// retires. Per entry because two in-flight presents may pin different
-    /// surfaces and the earlier one's pins must not be dropped by the later
-    /// one's retire.
-    pinned: Vec<TargetIdentity>,
 }
 
 /// The stage the acquire semaphore is waited at, and therefore the stage the
@@ -769,7 +769,6 @@ impl WindowPresenter {
                     image_available,
                     in_flight,
                     submitted: false,
-                    pinned: Vec::new(),
                 });
             }
             Ok(())
@@ -826,7 +825,7 @@ impl WindowPresenter {
         // failure to attach: `begin_present` retries every frame until the
         // window comes back.
         if let Err(error) = presenter.recreate_swapchain(ctx) {
-            presenter.destroy(ctx, None);
+            presenter.destroy(ctx);
             return Err(error);
         }
         Ok(presenter)
@@ -847,16 +846,12 @@ impl WindowPresenter {
     /// Release every entry whose blit has finished, and say whether the entry
     /// the next present would use is free.
     ///
-    /// Sweeping all of them rather than only the next one matters for the pins:
-    /// an entry that completed is holding resident targets off the reclaim path,
-    /// and with several in flight the round-robin might not revisit it for
+    /// Sweeping all of them rather than only the next one matters for the
+    /// graveyard: an entry that completed is still holding `WINDOW_PRESENT_SLOT`
+    /// shut, and with several in flight the round-robin might not revisit it for
     /// another two presents. The return value is still about one entry, because
     /// that is the only one the caller is about to record into.
-    unsafe fn retire(
-        &mut self,
-        ctx: &DeviceContext,
-        pools: &mut ResourcePools,
-    ) -> Result<bool, DrawError> {
+    unsafe fn retire(&mut self, ctx: &DeviceContext) -> Result<bool, DrawError> {
         for ix in 0..self.frames.len() {
             if !self.frames[ix].submitted {
                 continue;
@@ -867,10 +862,6 @@ impl WindowPresenter {
                 .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowFenceStatus, error)))?;
             if !signaled {
                 continue;
-            }
-            let pinned = std::mem::take(&mut self.frames[ix].pinned);
-            for identity in pinned {
-                let _ = pools.pin_resident_target(&identity, false);
             }
             end_present_in_flight(&mut self.frames[ix]);
         }
@@ -1092,7 +1083,7 @@ impl WindowPresenter {
                 self.cadence_offered = self.cadence_offered.saturating_add(1);
             }
         }
-        if !self.retire(ctx, pools)? {
+        if !self.retire(ctx)? {
             self.cadence_busy_fence = self.cadence_busy_fence.saturating_add(1);
             self.note_cadence(false, false);
             return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
@@ -1207,18 +1198,6 @@ impl WindowPresenter {
             self.note_slate(reason, want, source.map(|s| s.resolved), staged.is_some());
             staged
         };
-        let mut pinned = Vec::with_capacity(1);
-        if let Some((identity, _)) = selected.as_ref() {
-            if !pools.pin_resident_target(identity, true) {
-                return Err(DrawError::Facade(
-                    EngineFacadeDecline::WindowSourceDisappearedBeforePin {
-                        identity: identity.clone(),
-                    },
-                ));
-            }
-            pinned.push(identity.clone());
-        }
-
         // One blit body for both sources: they differ only in which image is
         // read and how it is made readable. Keeping them separate is how the
         // aspect-fit and letterbox-clear rules drift apart between the two
@@ -1385,16 +1364,9 @@ impl WindowPresenter {
             })
             .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
-        let submission = match submit_result {
-            Ok(submission) => submission,
-            Err(error) => {
-                for identity in pinned.drain(..) {
-                    let _ = pools.pin_resident_target(&identity, false);
-                }
-                return Err(error);
-            }
-        };
-        self.frames[frame_ix].pinned = pinned;
+        // A plain `?` now the failure arm has nothing to undo: it used to have to
+        // drop the pins this present had taken before returning.
+        let submission = submit_result?;
         // Claimed before the latch, so the slot is never observed clear while
         // the latch says an entry is outstanding.
         begin_present_in_flight();
@@ -1759,34 +1731,24 @@ impl WindowPresenter {
         self.cadence_busy_no_area = 0;
     }
 
-    pub(crate) fn release_pins_after_idle(&mut self, pools: &mut ResourcePools) {
+    /// Give every entry's graveyard claim back after the caller has waited the
+    /// queue idle.
+    ///
+    /// It released pins as well until the presenter stopped taking any. What is
+    /// left is the claim on `WINDOW_PRESENT_SLOT`, which is the whole reason a
+    /// guest reset must call this: the bit is a `static` the graveyard consults,
+    /// so an entry that never retires would hold it shut for the rest of the
+    /// process.
+    pub(crate) fn release_claims_after_idle(&mut self) {
         for frame in &mut self.frames {
-            for identity in frame.pinned.drain(..) {
-                let _ = pools.pin_resident_target(&identity, false);
-            }
             end_present_in_flight(frame);
         }
     }
 
-    pub(crate) unsafe fn destroy(
-        &mut self,
-        ctx: &DeviceContext,
-        pools: Option<&mut ResourcePools>,
-    ) {
+    pub(crate) unsafe fn destroy(&mut self, ctx: &DeviceContext) {
         if let Err(error) = ctx.queue_wait_idle() {
             let decline = VkCall::new(VkOp::WindowDestroyQueueWaitIdle, error);
             crate::observe::Emit::decline("host_window_destroy", &decline).fail_once(0);
-        }
-        if let Some(pools) = pools {
-            for frame in &mut self.frames {
-                for identity in frame.pinned.drain(..) {
-                    let _ = pools.pin_resident_target(&identity, false);
-                }
-            }
-        } else {
-            for frame in &mut self.frames {
-                frame.pinned.clear();
-            }
         }
         if let Some(staging) = self.staging.take() {
             staging.destroy(&ctx.device);
