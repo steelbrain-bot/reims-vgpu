@@ -892,6 +892,32 @@ impl ResourcePools {
     /// either do all of its bookkeeping after the submit, or make its recording
     /// slot visible here the way `open_batch` is. Do not assume the graveyard
     /// covers it: it covers the two states above, and this is a third.
+    ///
+    /// # Every submission, and what makes it visible here
+    ///
+    /// The warning above was abstract and one caller had already walked into it,
+    /// so the inventory is written down. Six sites reach the queue, and each is
+    /// covered by exactly one of three mechanisms:
+    ///
+    /// | submission | covered by |
+    /// |---|---|
+    /// | `exec::execute_draw` | `seal_entry` + `finish_entry_async` mark the slot pending |
+    /// | `exec_compute` transient storage | the same, and the ring entry *is* the slot's lifetime |
+    /// | `exec_compute` registered resident | the pin, plus `compute_rekey_refusal` and `recoverable_compute_storage_residents`' `!pinned` filter |
+    /// | guest-write copy (`mod.rs`) | `seal_entry` + `finish_entry_async` |
+    /// | readback copy (`mod.rs`) | `seal_entry` + `finish_entry_async` |
+    /// | host-window present | [`super::WINDOW_PRESENT_SLOT`] |
+    ///
+    /// The last row was the gap, and it was the one submission whose fence
+    /// belonged to something other than this ring: the presenter's, retired by a
+    /// *later* present rather than by anything here. The compute row is the
+    /// interesting one to keep in mind when adding a submission — it is covered
+    /// twice, and the second mechanism is a pin only because the resident was
+    /// deliberately popped out of the ring's live set at acquire.
+    ///
+    /// This is a reading of six call sites, not a gate. Nothing in the build
+    /// relates a new submission to this table, so a seventh arrives uncovered
+    /// and silent — which is what the paragraph above is for.
     fn open_slot_mask(&self) -> SlotMask {
         let mut mask: SlotMask = 0;
         for (index, slot) in self.slots.iter().enumerate() {
