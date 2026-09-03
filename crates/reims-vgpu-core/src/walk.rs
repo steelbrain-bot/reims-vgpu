@@ -324,7 +324,7 @@ mod tests {
         continues_into_next: true,
     };
 
-    fn builder() -> ExecBuilder {
+    fn builder() -> ExecBuilder<'static> {
         ExecBuilder::new()
     }
 

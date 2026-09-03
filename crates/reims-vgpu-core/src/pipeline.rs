@@ -29,6 +29,7 @@
 
 use crate::access::AccessMode;
 use crate::identity::{ResourceId, SessionGeneration};
+use reims_vgpu_protocol::render::ShaderStage;
 use std::collections::HashMap;
 
 /// Where a pipeline is in its life.
@@ -307,11 +308,126 @@ impl LeaseRefusal {
     }
 }
 
+/// One pipeline's published usage, per shader stage.
+///
+/// A stage is [`Option`] and not a defaulted [`BindingUsage`], and the
+/// difference is the whole safety argument. An empty `BindingUsage` says every
+/// slot is past the end of the pipeline's binding set — that is, *unreferenced*,
+/// contributing nothing to the footprint. "Nothing has been published for this
+/// stage" says the opposite: nothing is known, so every bound slot participates
+/// as [`AccessMode::Unknown`]. Collapsing the two would turn a pipeline nobody
+/// has reflected into a draw with no memory footprint at all, which is every
+/// hazard edge missed rather than a coarser answer.
+///
+/// A render pipeline publishes the two render stages and leaves compute unset;
+/// a compute pipeline does the reverse. Asking a render pipeline for its
+/// compute stage therefore answers "not published", which is the true answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublishedUsage {
+    vertex: Option<BindingUsage>,
+    fragment: Option<BindingUsage>,
+    compute: Option<BindingUsage>,
+}
+
+impl PublishedUsage {
+    /// What a render executor knows about the two render stages.
+    ///
+    /// Each stage is an [`Option`] the caller states, because knowing one and
+    /// not the other is a real position for an executor to be in — a vertex
+    /// module that reflected and a fragment module that did not — and the
+    /// difference between "published, references nothing" and "not published"
+    /// is exactly the difference between no participation and an `Unknown` one.
+    #[must_use]
+    pub fn render(vertex: Option<BindingUsage>, fragment: Option<BindingUsage>) -> Self {
+        Self {
+            vertex,
+            fragment,
+            compute: None,
+        }
+    }
+
+    /// What a compute executor knows, once it has compiled the kernel.
+    #[must_use]
+    pub fn compute(kernel: BindingUsage) -> Self {
+        Self {
+            vertex: None,
+            fragment: None,
+            compute: Some(kernel),
+        }
+    }
+
+    /// The stage's usage, or `None` where nothing was published for it.
+    ///
+    /// `None` for the stage argument is the compute stage: a dispatch reads one
+    /// set of tables and there is no [`ShaderStage`] value that names it.
+    #[must_use]
+    pub fn stage(&self, stage: Option<ShaderStage>) -> Option<&BindingUsage> {
+        match stage {
+            Some(ShaderStage::Vertex) => self.vertex.as_ref(),
+            Some(ShaderStage::Fragment) => self.fragment.as_ref(),
+            None => self.compute.as_ref(),
+        }
+    }
+}
+
+/// What an executor has published about the shaders behind a pipeline.
+///
+/// The read side of [`PipelineTable::publish_usage`], as a trait because the
+/// walk that needs it must not depend on where the table lives — see
+/// [`crate::walk::exec`]. Every implementation answers `None` for a pipeline it
+/// knows nothing about, and `None` is the conservative answer: the encoder then
+/// gives every bound slot [`AccessMode::Unknown`].
+pub trait UsageSource: core::fmt::Debug {
+    /// One stage of one pipeline, or `None` if nothing is published for it.
+    fn binding_usage(
+        &self,
+        pipeline: ResourceId,
+        stage: Option<ShaderStage>,
+    ) -> Option<&BindingUsage>;
+}
+
+/// Nothing is published, for a caller with no executor answer to give.
+///
+/// A statement and not an opt-out: it produces exactly the conservative
+/// footprint the model took before anything published, so a caller using it
+/// pays for every edge and misses none.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoUsage;
+
+impl UsageSource for NoUsage {
+    fn binding_usage(
+        &self,
+        _pipeline: ResourceId,
+        _stage: Option<ShaderStage>,
+    ) -> Option<&BindingUsage> {
+        None
+    }
+}
+
 /// The pipeline objects of one session.
 #[derive(Debug, Default)]
 pub struct PipelineTable {
     pipelines: HashMap<ResourceId, Pipeline>,
+    /// What an executor has published about each pipeline's shaders.
+    ///
+    /// Beside [`Self::pipelines`] rather than a field of [`Pipeline`], which is
+    /// `Copy` and is passed around by value everywhere a lease is answered.
+    /// Its lifetime is the pipeline entry's: every door that removes an entry
+    /// or un-builds it removes this too, because a reflection is a fact about a
+    /// build and a pipeline that has to be built again has not published
+    /// anything about the build that will replace it.
+    usage: HashMap<ResourceId, PublishedUsage>,
     census: Census,
+}
+
+impl UsageSource for PipelineTable {
+    fn binding_usage(
+        &self,
+        pipeline: ResourceId,
+        stage: Option<ShaderStage>,
+    ) -> Option<&BindingUsage> {
+        self.usage.get(&pipeline)?.stage(stage)
+    }
 }
 
 /// What the table has seen.
@@ -511,7 +627,14 @@ impl PipelineTable {
         p.state = next;
         match next {
             PipelineState::Ready => self.census.ready += 1,
-            PipelineState::Retired => self.census.retired += 1,
+            PipelineState::Retired => {
+                self.census.retired += 1;
+                // The name is gone, so the reflection under it is too. Left
+                // behind it would be answered for a later pipeline that
+                // reused the id, which is a narrower footprint derived from
+                // another object's shader.
+                self.usage.remove(&id);
+            }
             _ => {}
         }
         true
@@ -538,6 +661,9 @@ impl PipelineTable {
             return false;
         }
         p.state = PipelineState::Translating;
+        // The build this described is the one the executor just said it no
+        // longer holds. What the rebuild publishes is the rebuild's.
+        self.usage.remove(&id);
         self.census.withdrawn += 1;
         true
     }
@@ -553,6 +679,9 @@ impl PipelineTable {
         p.state = PipelineState::Refused;
         p.refusal = Some(reason);
         self.census.refused += 1;
+        // A build that will not happen publishes nothing, and anything already
+        // published described a build this refusal supersedes.
+        self.usage.remove(&id);
         true
     }
 
@@ -693,6 +822,39 @@ impl PipelineTable {
         Ok(waits)
     }
 
+    /// An executor finished compiling and says what its shaders do with each
+    /// bound slot.
+    ///
+    /// **The one door the model's own conservatism is bought back through.**
+    /// Without a publication [`crate::encoder`] gives every bound slot
+    /// [`AccessMode::Unknown`], which conflicts with everything; the first boot
+    /// that counted found 81 % of its accesses in that column. This is the fact
+    /// that narrows them, and only the layer holding the shader can state it —
+    /// which is why it arrives as an immutable value an executor pushes rather
+    /// than as a question the model asks.
+    ///
+    /// Refused for a pipeline this table does not hold, and for one that has
+    /// reached a terminal state: a reflection landing after the guest deleted
+    /// the pipeline describes a build nothing may bind, and keeping it would
+    /// leave an entry alive under a name that is gone. Returns whether it
+    /// landed.
+    ///
+    /// Republication is allowed and replaces. A pipeline taken back to
+    /// [`PipelineState::Translating`] by [`Self::withdraw`] or
+    /// [`Self::device_lost`] has already had its usage dropped, so what lands
+    /// after a rebuild is the rebuild's own answer and never the previous
+    /// build's.
+    pub fn publish_usage(&mut self, id: ResourceId, usage: PublishedUsage) -> bool {
+        let Some(p) = self.pipelines.get(&id) else {
+            return false;
+        };
+        if p.state.is_terminal() {
+            return false;
+        }
+        self.usage.insert(id, usage);
+        true
+    }
+
     /// Retire a pipeline the guest deleted.
     pub fn retire(&mut self, id: ResourceId) -> bool {
         self.advance(id, PipelineState::Retired)
@@ -749,6 +911,9 @@ impl PipelineTable {
             out.removed.push(*id);
             false
         });
+        for id in &out.removed {
+            self.usage.remove(id);
+        }
         out.destroy.sort_unstable();
         out.removed.sort_unstable();
         out
@@ -798,6 +963,11 @@ impl PipelineTable {
             // to — a `Ready -> Declared` step admitted there would let an
             // ordinary caller un-build a live pipeline.
             p.state = PipelineState::Declared;
+            // Every reflection here described a build performed by the device
+            // incarnation that just ended. The shader is the guest's and does
+            // not change, but the pipeline these were published against is
+            // gone, and a rebuild republishes.
+            self.usage.remove(id);
             rebuilding.push(*id);
         }
         rebuilding.sort_unstable();
@@ -813,6 +983,10 @@ impl PipelineTable {
     pub fn compact(&mut self) {
         self.pipelines
             .retain(|_, p| p.state != PipelineState::Retired);
+        // Belt and braces against a retired entry that reached this table by
+        // some door other than `advance`: an entry here with no pipeline beside
+        // it would be answered for whatever next takes the id.
+        self.usage.retain(|id, _| self.pipelines.contains_key(id));
     }
 
     #[must_use]

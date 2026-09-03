@@ -530,8 +530,20 @@ impl ExecTransaction<'_> {
 /// with its segment, an encoder that never ended — each is the cursor's refusal
 /// and reaches the caller unchanged.
 #[derive(Debug)]
-pub struct ExecBuilder {
+pub struct ExecBuilder<'u> {
     cursor: StreamCursor,
+    /// What an executor has published about the pipelines this packet binds.
+    ///
+    /// A field of the builder rather than an argument to [`Self::record`],
+    /// because it is used for exactly one thing — narrowing the footprint the
+    /// builder's own encoder tables answer — and a per-record argument would
+    /// let two records of one packet be resolved against two different answers.
+    /// It is the same shape as the tables themselves: state of the walk, not of
+    /// the record.
+    ///
+    /// [`Self::new`] supplies [`crate::pipeline::NoUsage`], which is the
+    /// conservative answer and not an absent one; see that type.
+    usages: &'u dyn crate::pipeline::UsageSource,
     streams: Vec<ResolvedStream>,
     open: Option<ResolvedStream>,
     accesses: Vec<AccessIntent>,
@@ -598,13 +610,30 @@ impl EncoderBindings {
     ///
     /// **Changes nothing.** Taking a footprint is not keeping it — see
     /// [`Self::keep`].
-    fn footprint_into(&self, op: &ResolvedOperation, out: &mut Vec<Participation>) {
+    fn footprint_into(
+        &self,
+        op: &ResolvedOperation,
+        usages: &dyn crate::pipeline::UsageSource,
+        out: &mut Vec<Participation>,
+    ) {
+        use reims_vgpu_protocol::render::ShaderStage;
         match (self, op) {
             (Self::Render(state), ResolvedOperation::Render(RenderOp::Draw(_))) => {
-                state.footprint_into(None, None, out);
+                // The bound pipeline is the encoder's own state, so the
+                // question asked is about the pipeline this draw will actually
+                // use. A draw with nothing bound asks nothing and every slot
+                // stays `Unknown`, which is what a draw the device cannot name
+                // a shader for deserves.
+                let bound = state.pipeline;
+                state.footprint_into(
+                    bound.and_then(|id| usages.binding_usage(id, Some(ShaderStage::Vertex))),
+                    bound.and_then(|id| usages.binding_usage(id, Some(ShaderStage::Fragment))),
+                    out,
+                );
             }
             (Self::Compute(state), ResolvedOperation::Compute(ComputeOp::Dispatch(_))) => {
-                state.footprint_into(None, out);
+                let bound = state.pipeline;
+                state.footprint_into(bound.and_then(|id| usages.binding_usage(id, None)), out);
             }
             _ => {}
         }
@@ -659,20 +688,30 @@ impl EncoderBindings {
     }
 }
 
-impl Default for ExecBuilder {
+impl<'u> Default for ExecBuilder<'u> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ExecBuilder {
+/// The answer [`ExecBuilder::new`] uses: nothing published, every bound slot
+/// `Unknown`. A `static` because the builder holds a reference and this one has
+/// no state to be per-builder.
+static NO_USAGE: crate::pipeline::NoUsage = crate::pipeline::NoUsage;
+
+impl<'u> ExecBuilder<'u> {
     /// A builder for a packet whose contents are not yet known and whose
     /// position in the arrival order is not this layer's to know. See
     /// [`ExecWork`].
+    ///
+    /// Nothing is published to it, so every bound slot of every draw and
+    /// dispatch participates as [`crate::access::AccessMode::Unknown`]. A
+    /// caller that can do better uses [`ExecBuilder::with_usage`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             cursor: StreamCursor::new(),
+            usages: &NO_USAGE,
             streams: Vec::new(),
             open: None,
             accesses: Vec::new(),
@@ -681,6 +720,21 @@ impl ExecBuilder {
             arenas: ExecArenas::default(),
             bindings: EncoderBindings::None,
             participation_scratch: Vec::new(),
+        }
+    }
+
+    /// The same builder, resolving its footprints against what an executor has
+    /// published.
+    ///
+    /// **The narrowing arrives here and nowhere else.** Set once for the whole
+    /// packet: a packet's records are one transaction and one access list, so
+    /// two records resolved against two different answers would be one
+    /// transaction describing two different pipelines' shaders.
+    #[must_use]
+    pub fn with_usage(usages: &'u dyn crate::pipeline::UsageSource) -> Self {
+        Self {
+            usages,
+            ..Self::new()
         }
     }
 
@@ -778,7 +832,7 @@ impl ExecBuilder {
         // Gathering only. Whether the encoder has *declared* what it just
         // answered is settled on the success path below, because everything
         // between here and there can still refuse the record.
-        self.bindings.footprint_into(&op, &mut parts);
+        self.bindings.footprint_into(&op, self.usages, &mut parts);
         // Pushed straight onto the transaction's list and rolled back on any
         // refusal, rather than gathered into a second vector: a record's
         // accesses are at most a handful and a `Vec` per record would be an
@@ -1020,7 +1074,7 @@ mod tests {
         }
     }
 
-    fn builder() -> ExecBuilder {
+    fn builder() -> ExecBuilder<'static> {
         ExecBuilder::new()
     }
 
@@ -1115,6 +1169,174 @@ mod tests {
             .iter()
             .filter(|a| backing(a.key) != Some(BackingId(5)))
             .all(|a| a.mode == AccessMode::Unknown));
+    }
+
+    /// A published reflection narrows the draw's footprint, and an unpublished
+    /// stage stays `Unknown`.
+    ///
+    /// **The gate on the one door the model's conservatism is bought back
+    /// through.** Before anything published, the first driven boot that counted
+    /// found `access_mode_unknown` at 81 % of every access the dependency graph
+    /// ordered against — every bound slot of every draw, because
+    /// [`crate::encoder::slot_mode`] has no other answer without a
+    /// [`crate::pipeline::BindingUsage`].
+    ///
+    /// Three slots and three answers, because the three are the three things a
+    /// reflection can say and each is wrong in a different way if collapsed:
+    /// slot 0 is read (narrowed, and no longer conflicts with another reader),
+    /// slot 1 is written (narrowed, and still does), slot 2 is *not referenced*
+    /// and contributes no participation at all. The fragment stage publishes
+    /// nothing, so its own bound slot keeps the conservative answer — which is
+    /// what says an unpublished stage is not silently read as "references
+    /// nothing".
+    #[test]
+    fn a_published_reflection_narrows_the_slots_it_names_and_no_others() {
+        use crate::pipeline::{BindingUsage, PipelineState, PipelineTable, PublishedUsage};
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let pipeline = res(9);
+        let mut table = PipelineTable::new();
+        assert!(table.declare(pipeline, crate::identity::SessionGeneration::FIRST));
+        assert!(table.advance(pipeline, PipelineState::Translating));
+        assert!(table.advance(pipeline, PipelineState::Compiling));
+        assert!(table.advance(pipeline, PipelineState::Ready));
+        // Vertex reflected, fragment not. Both are real positions for an
+        // executor and the two answers differ.
+        assert!(table.publish_usage(
+            pipeline,
+            PublishedUsage::render(
+                Some(BindingUsage::new(
+                    vec![Some(AccessMode::Read), Some(AccessMode::Write), None],
+                    Vec::new(),
+                )),
+                None,
+            )
+        ));
+
+        let mut b = ExecBuilder::with_usage(&table);
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        let entries = bind_arena(&mut b, &[res(7), res(8), res(6)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: ShaderStage::Vertex,
+                first: 0,
+                entries,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        let fragment = bind_arena(&mut b, &[res(4)]);
+        b.record(
+            ResolvedOperation::Render(RenderOp::BindBuffers {
+                stage: ShaderStage::Fragment,
+                first: 0,
+                entries: fragment,
+            }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("bind");
+        b.record(
+            ResolvedOperation::Render(RenderOp::SetPipeline { pipeline }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("set pipeline");
+        b.record(a_draw(), &mut StubRegistry(ChannelId(1)))
+            .expect("draw");
+
+        let mode_of = |id: u64| {
+            b.accesses
+                .iter()
+                .find(|a| backing(a.key) == Some(BackingId(id)))
+                .map(|a| a.mode)
+        };
+        assert_eq!(
+            mode_of(7),
+            Some(AccessMode::Read),
+            "the reflection said read"
+        );
+        assert_eq!(
+            mode_of(8),
+            Some(AccessMode::Write),
+            "and said write for the next slot"
+        );
+        assert_eq!(
+            mode_of(6),
+            None,
+            "a slot the shader does not reference contributes nothing at all"
+        );
+        assert_eq!(
+            mode_of(4),
+            Some(AccessMode::Unknown),
+            "the fragment stage published nothing, and nothing published is not \
+             'references nothing'"
+        );
+    }
+
+    /// A pipeline's reflection does not outlive the build it described.
+    ///
+    /// Every door that un-builds or unnames a pipeline drops it, and the reason
+    /// is the same at each: an id the guest can reuse would otherwise answer
+    /// with another object's shader, and a narrower footprint derived from the
+    /// wrong shader is a missing hazard edge rather than a wrong log line.
+    #[test]
+    fn a_reflection_dies_with_the_build_it_described() {
+        use crate::pipeline::{BindingUsage, PipelineState, PipelineTable, PublishedUsage};
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let id = res(9);
+        let usage = || {
+            PublishedUsage::render(
+                Some(BindingUsage::new(vec![Some(AccessMode::Read)], Vec::new())),
+                None,
+            )
+        };
+        let ready = || {
+            let mut t = PipelineTable::new();
+            assert!(t.declare(id, crate::identity::SessionGeneration::FIRST));
+            assert!(t.advance(id, PipelineState::Translating));
+            assert!(t.advance(id, PipelineState::Compiling));
+            assert!(t.advance(id, PipelineState::Ready));
+            assert!(t.publish_usage(id, usage()));
+            t
+        };
+        let published = |t: &PipelineTable| {
+            crate::pipeline::UsageSource::binding_usage(t, id, Some(ShaderStage::Vertex)).is_some()
+        };
+
+        let mut t = ready();
+        assert!(published(&t), "the fixture publishes");
+        assert!(t.withdraw(id));
+        assert!(
+            !published(&t),
+            "the executor said it no longer holds the translation this described"
+        );
+
+        let mut t = ready();
+        assert!(t.retire(id));
+        assert!(!published(&t), "the guest deleted the name");
+
+        let mut t = ready();
+        assert!(!t.device_lost().is_empty());
+        assert!(!published(&t), "the incarnation that built it is gone");
+
+        let mut t = ready();
+        let closed = t.generation_closed(crate::identity::SessionGeneration::FIRST);
+        assert!(closed.removed.contains(&id));
+        assert!(!published(&t), "the generation that named it closed");
+
+        // And a reflection landing after the name is gone does not resurrect
+        // it.
+        let mut t = ready();
+        assert!(t.retire(id));
+        assert!(
+            !t.publish_usage(id, usage()),
+            "a compile finishing after the delete describes a build nothing may bind"
+        );
+        assert!(!published(&t));
     }
 
     /// Three draws over one binding table declare its slots once.

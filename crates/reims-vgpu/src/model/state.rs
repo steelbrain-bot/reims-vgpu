@@ -4378,6 +4378,44 @@ impl DeviceState {
             .withdraw(pipeline)
     }
 
+    /// What an executor found its shaders do with each bound slot.
+    ///
+    /// **Published before [`Self::ready_pipeline`], never after.** Ready is the
+    /// event that lets a transaction lease the pipeline, and a lease taken
+    /// before the reflection landed produces a footprint that is conservative
+    /// forever — the walk asks once, at admission, and never asks again. So the
+    /// order is publish, then ready; the reverse is not a defect the model can
+    /// see, which is exactly why it is written down here.
+    ///
+    /// Returns whether it landed. `false` for a pipeline this model does not
+    /// hold or has already retired or refused; see
+    /// [`reims_vgpu_core::pipeline::PipelineTable::publish_usage`].
+    pub fn publish_pipeline_usage(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        usage: reims_vgpu_core::pipeline::PublishedUsage,
+    ) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .publish_usage(pipeline, usage)
+    }
+
+    /// The published reflections, for the length of one packet's walk.
+    ///
+    /// A guard rather than a per-lookup call, because the walk asks once per
+    /// bound slot per draw and a lock per slot would put the ordering plane's
+    /// mutex on the hottest path this device has. Held across the walk, taken
+    /// and dropped by [`crate::runtime::ingress::device_packet`], and safe to
+    /// hold there because nothing the walk touches reaches this mutex —
+    /// [`Self::task_access`] and the name resolvers are the `lifecycle` owner's,
+    /// which is a different lock.
+    #[must_use]
+    pub fn pipeline_usage(&self) -> PipelineUsage<'_> {
+        PipelineUsage(self.session.lock().expect("session"))
+    }
+
     /// A pipeline finished building and is usable.
     ///
     /// The door rather than `advance(.., Ready)`, because becoming ready is
@@ -7013,5 +7051,27 @@ mod slot_table_reach_tests {
                 "{name} must not have defined the task it refused"
             );
         }
+    }
+}
+
+/// The ordering plane's published reflections, borrowed for one packet's walk.
+///
+/// See [`DeviceState::pipeline_usage`] for why this is a guard and not a
+/// lookup.
+pub struct PipelineUsage<'a>(std::sync::MutexGuard<'a, reims_vgpu_core::session::SessionModel>);
+
+impl std::fmt::Debug for PipelineUsage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PipelineUsage")
+    }
+}
+
+impl reims_vgpu_core::pipeline::UsageSource for PipelineUsage<'_> {
+    fn binding_usage(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        stage: Option<reims_vgpu_protocol::render::ShaderStage>,
+    ) -> Option<&reims_vgpu_core::pipeline::BindingUsage> {
+        self.0.pipelines_ref().binding_usage(pipeline, stage)
     }
 }

@@ -352,6 +352,14 @@ pub struct ExecStreams<'a> {
     /// whichever task submitted them, and resolving a ref in the wrong task
     /// finds whatever shared the integer.
     pub task: reims_vgpu_core::identity::TaskId,
+    /// What executors have published about the pipelines these streams bind.
+    ///
+    /// Supplied by the caller rather than read here, for the reason `accesses`
+    /// is: this bridge is a pure function of the packet and the things the
+    /// device hands it, and reaching into the ordering plane from inside the
+    /// walk would be a second owner of the answer. See
+    /// [`crate::model::DeviceState::pipeline_usage`].
+    pub usages: &'a dyn reims_vgpu_core::pipeline::UsageSource,
     /// One entry per command buffer the packet's table names, in table order,
     /// already read out of the task's address space.
     ///
@@ -469,11 +477,16 @@ fn exec_payload(
 ) -> Result<reims_vgpu_core::exec::ExecWork, Blocked> {
     let ExecStreams {
         task,
+        usages,
         streams,
         accesses,
     } = exec;
     let resolver = reims_vgpu_core::resolve::InTask::new(objects, task);
-    let mut builder = reims_vgpu_core::exec::ExecBuilder::new();
+    // One usage answer for the whole packet, which is what `with_usage`'s own
+    // doc requires: a packet is one transaction and one access list, so two of
+    // its records resolved against two answers would describe two pipelines'
+    // shaders in one footprint.
+    let mut builder = reims_vgpu_core::exec::ExecBuilder::with_usage(usages);
     for stream in streams {
         reims_vgpu_core::walk::command_buffer(stream, &resolver, accesses, &mut builder)
             .map_err(|refusal| Blocked::Refused(Refused::Exec(refusal)))?;
@@ -665,6 +678,11 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
         reims_vgpu_core::identity::TaskId(s.task_id())
     });
     let mut accesses = state.task_access(task, fifo.domain());
+    // Taken here and dropped when this returns, so the ordering plane's lock is
+    // held for exactly one packet's walk. Safe to hold across it because every
+    // other owner the walk reaches — the namespaces and the access source — is
+    // the `lifecycle` owner's and not this one's.
+    let usages = state.pipeline_usage();
     let no_streams: [Vec<u8>; 0] = [];
     packet(
         fifo,
@@ -675,6 +693,7 @@ pub fn device_packet<M: crate::runtime::host::HostMemory>(
         DeviceInputs {
             exec: ExecStreams {
                 task,
+                usages: &usages,
                 streams: submission.map_or(&no_streams, |s| s.streams()),
                 accesses: &mut accesses,
             },
@@ -1292,6 +1311,7 @@ mod tests {
         DeviceInputs {
             exec: ExecStreams {
                 task: reims_vgpu_core::identity::TaskId(0),
+                usages: &reims_vgpu_core::pipeline::NoUsage,
                 streams: &[],
                 accesses,
             },
@@ -1553,6 +1573,7 @@ mod tests {
             DeviceInputs {
                 exec: ExecStreams {
                     task: reims_vgpu_core::identity::TaskId(0),
+                    usages: &reims_vgpu_core::pipeline::NoUsage,
                     streams: &[],
                     accesses: &mut accesses,
                 },
@@ -1596,6 +1617,7 @@ mod tests {
             DeviceInputs {
                 exec: ExecStreams {
                     task: reims_vgpu_core::identity::TaskId(1),
+                    usages: &reims_vgpu_core::pipeline::NoUsage,
                     streams: &streams,
                     accesses: &mut accesses,
                 },
