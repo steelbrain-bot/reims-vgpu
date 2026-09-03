@@ -3339,6 +3339,8 @@ use reims_vgpu_protocol::extent::Extent3;
 #[cfg(all(feature = "backend-metal", target_os = "macos"))]
 pub mod metal;
 #[cfg(feature = "backend-vulkan")]
+pub mod stall_watchdog;
+#[cfg(feature = "backend-vulkan")]
 pub mod vulkan;
 
 // The two constructors are free functions here rather than an inherent `impl`

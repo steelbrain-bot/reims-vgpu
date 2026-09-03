@@ -1809,26 +1809,32 @@ fn stage_texture_ref_texture_without_surface_is_missing() {
 }
 
 #[cfg(feature = "backend-vulkan")]
-#[test]
-fn incomplete_compute_engine_call_fires_stall_proxy() {
-    use crate::backend::vulkan::engine::ComputeRequest;
-    use std::time::Duration;
-
-    let pipe = 0xf000_0000 | (std::process::id() & 0x0fff_ffff);
-    let req = ComputeRequest {
-        spirv: vec![0x0723_0203],
+fn stall_request(word: u32) -> crate::backend::vulkan::engine::ComputeRequest {
+    crate::backend::vulkan::engine::ComputeRequest {
+        spirv: vec![word],
         entry: "main".into(),
         dispatch: crate::backend::vulkan::engine::ComputeDispatch::Workgroups([1, 1, 1]),
         ..Default::default()
-    };
-    let done = spawn_compute_engine_stall_watchdog(pipe, &req, Duration::from_millis(10));
-    std::thread::sleep(Duration::from_millis(40));
-    done.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn incomplete_compute_engine_call_fires_stall_proxy() {
+    use crate::runtime::compute_exec::stall_watchdog::arm_compute_engine_stall_watchdog;
+    use std::time::Duration;
+
+    let pipe = 0xf000_0000 | (std::process::id() & 0x0fff_ffff);
+    let req = stall_request(0x0723_0203);
+    let watch = arm_compute_engine_stall_watchdog(pipe, &req, Duration::from_millis(10));
+    std::thread::sleep(Duration::from_millis(200));
+    drop(watch);
 
     let log = std::fs::read_to_string(crate::observe::fail_log_path()).expect("fail log");
     assert!(log.lines().any(|line| {
         line.contains("compute_engine_stall reason=backend_call_unreturned")
             && line.contains(&format!("pipe={pipe}"))
+            && line.contains("elapsed_ms=10")
     }));
     let base = format!("/tmp/reims-vgpu-compute-stall-pipe-{pipe}");
     let _ = std::fs::remove_file(format!("{base}.spv"));

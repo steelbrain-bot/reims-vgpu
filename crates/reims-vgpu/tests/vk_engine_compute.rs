@@ -15,6 +15,13 @@ use reims_vgpu::backend::vulkan::engine::{
     ComputeStorageResidency, StorageImageFormat,
 };
 use reims_vgpu::model::ComputeStorageResidencyKey;
+
+/// The allocation counter the two structural-zero gates at the foot of this
+/// file measure with. Every other test here pays one relaxed thread-local read
+/// per allocation and nothing else.
+#[global_allocator]
+static ALLOCATOR: reims_vgpu_testkit::allocations::Counting =
+    reims_vgpu_testkit::allocations::Counting::new();
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -1628,4 +1635,75 @@ fn compute_sampled_a8unorm_arrives_in_alpha() {
         "alpha: got {}, want {want_alpha}",
         got[3]
     );
+}
+
+// ---------------------------------------------------------------------------
+// The compute stall watchdog's two structural zeros.
+//
+// These live here rather than beside the watchdog's own unit tests for one
+// reason: the allocation counter is a `#[global_allocator]`, and the library's
+// unit-test binary does not install one. A `measure` there would report zero
+// trips for every path, including a path that allocates — a gate that cannot
+// fail. This binary installs the counter above, so the zero it reports is the
+// path's, not the harness's.
+// ---------------------------------------------------------------------------
+
+use reims_vgpu::runtime::compute_exec::stall_watchdog::arm_compute_engine_stall_watchdog;
+
+fn stall_request() -> ComputeRequest {
+    ComputeRequest {
+        spirv: vec![0x0723_0203],
+        entry: "main".into(),
+        dispatch: engine::ComputeDispatch::Workgroups([1, 1, 1]),
+        ..Default::default()
+    }
+}
+
+/// A call that returns inside its threshold must leave nothing behind — no
+/// report, and no thread. The report half is what the watchdog always promised;
+/// the thread half is the structural zero it used to violate, one thread per
+/// dispatch, each sleeping the whole threshold whether or not anything stalled.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_watched_dispatch_that_returns_creates_no_thread_of_its_own() {
+    fn live_threads() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("/proc/self/task")
+            .count()
+    }
+
+    let pipe = 0xf100_0000 | (std::process::id() & 0x0fff_ffff);
+    let req = stall_request();
+    let far = std::time::Duration::from_secs(600);
+    // The first arm starts the one thread this subsystem owns, so the baseline
+    // is taken after it, not before: the claim under test is per dispatch.
+    drop(arm_compute_engine_stall_watchdog(pipe, &req, far));
+    let before = live_threads();
+    for _ in 0..64 {
+        drop(arm_compute_engine_stall_watchdog(pipe, &req, far));
+    }
+    assert_eq!(
+        live_threads(),
+        before,
+        "64 watched dispatches created threads; the watchdog is per-dispatch again"
+    );
+}
+
+/// The other structural zero the per-dispatch thread violated: it cloned the
+/// kernel's whole SPIR-V module on every arm, and held the copy alive for the
+/// threshold. A slot refills its buffers in place, so a repeat dispatch through
+/// a warm slot reaches the allocator zero times.
+#[test]
+fn a_repeat_arm_through_a_warm_slot_does_not_enter_the_allocator() {
+    let pipe = 0xf200_0000 | (std::process::id() & 0x0fff_ffff);
+    let req = stall_request();
+    let far = std::time::Duration::from_secs(600);
+    // Warm: the thread, the table, and the first slot's two buffers.
+    for _ in 0..4 {
+        drop(arm_compute_engine_stall_watchdog(pipe, &req, far));
+    }
+    let (_, trips) = reims_vgpu_testkit::allocations::measure(|| {
+        drop(arm_compute_engine_stall_watchdog(pipe, &req, far));
+    });
+    assert_eq!(trips, 0, "arming a warm slot allocated {trips} time(s)");
 }
