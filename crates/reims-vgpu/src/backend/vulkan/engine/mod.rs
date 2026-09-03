@@ -217,9 +217,99 @@ pub(crate) fn color_subresource_layers() -> ash::vk::ImageSubresourceLayers {
     }
 }
 
+/// This device's immutable-object caches, held in the device's own rail slot.
+///
+/// # Why the caches are the device's and the context is not
+///
+/// A `VkInstance` and a `VkDevice` are facts about the host: one physical GPU
+/// per process, chosen once. What is cached against them is not. Every entry
+/// here is keyed by something the *guest* declared — a shader's content digest,
+/// a pipeline's descriptor, a render pass's attachment set, a sampler's state —
+/// so the population is a function of the guest's own object set and ends when
+/// that guest's device does. Keeping it beside the context made it outlive
+/// every device on the process, which is the thing the replacement
+/// architecture's device epochs exist to stop.
+///
+/// # The lock, and the order it is taken in
+///
+/// Its own [`Mutex`] rather than a field under the engine's, because the slot
+/// it lives in belongs to [`crate::model::DeviceState`] and the engine may not
+/// be the thing that owns a device's lifetime. Every entry point that reaches
+/// it holds the engine guard first and this one second, which is the only order
+/// this crate ever takes them in. [`Self::take`] is the exception and is
+/// written to be one: it empties the caches under this lock, releases it, and
+/// only then asks the engine for a context to destroy them through — so the one
+/// path that runs at device teardown cannot invert the order.
+pub(crate) struct DeviceObjectCaches(Mutex<ObjectCaches>);
+
+impl Default for DeviceObjectCaches {
+    fn default() -> Self {
+        Self(Mutex::new(ObjectCaches::new()))
+    }
+}
+
+impl std::fmt::Debug for DeviceObjectCaches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceObjectCaches")
+            .field("levels", &self.levels())
+            .finish()
+    }
+}
+
+impl DeviceObjectCaches {
+    /// Borrow the caches for the length of one engine operation.
+    ///
+    /// The same `Mutex` the engine's own state uses, which is `parking_lot`'s
+    /// and therefore does not poison. That is the behaviour this wants: a panic
+    /// under this lock leaves the caches consistent — every entry is an owned
+    /// handle in a map — and a device that refused every later draw because one
+    /// earlier draw panicked would turn a recoverable refusal into a dead boot.
+    fn with<R>(&self, f: impl FnOnce(&mut ObjectCaches) -> R) -> R {
+        let mut caches = self.0.lock();
+        f(&mut caches)
+    }
+
+    /// Live entries per cache, for the census. See [`ObjectCaches::levels`].
+    pub(crate) fn levels(&self) -> [usize; 6] {
+        self.with(|caches| caches.levels())
+    }
+
+    /// Empty the caches and destroy what came out, through whatever context the
+    /// engine still has.
+    ///
+    /// Called at the end of the device lifetime this slot belongs to. Without a
+    /// context there is nothing to destroy *through* — the `VkDevice` that owned
+    /// these handles is already gone — so the entries are dropped logically,
+    /// which is exactly what `flush_device_derived` does in the same situation.
+    pub(crate) fn end_device(&self) {
+        let mut taken = {
+            let mut caches = self.0.lock();
+            std::mem::replace(&mut *caches, ObjectCaches::new())
+        };
+        // `Device`, which is what its own doc calls teardown.
+        let guard = lock_engine_at(EngineLockSite::Device);
+        if let Some(ctx) = guard.owner.ctx.as_ref() {
+            unsafe { taken.destroy_all(&ctx.device) };
+        } else {
+            taken.clear_logical();
+        }
+    }
+}
+
+/// This rail's caches for `state`'s device.
+///
+/// `None` is another rail holding the slot, which `backend::select`'s
+/// one-rail-per-process latch makes unreachable in any live build. Callers
+/// refuse by name rather than falling back to a second cache, because a second
+/// cache is a second owner of the same handles.
+fn device_caches(state: &crate::model::DeviceState) -> Option<&DeviceObjectCaches> {
+    state
+        .rail_state::<crate::backend::vulkan::pipeline_resolve::VulkanDeviceState>()
+        .map(|rail| &rail.caches)
+}
+
 struct EngineState {
     owner: ContextOwner,
-    caches: ObjectCaches,
     pools: ResourcePools,
     counters: EngineCounters,
     #[cfg(feature = "host-window")]
@@ -230,7 +320,6 @@ impl EngineState {
     fn new() -> Self {
         Self {
             owner: ContextOwner::new(),
-            caches: ObjectCaches::new(),
             pools: ResourcePools::new(),
             counters: EngineCounters::default(),
             #[cfg(feature = "host-window")]
@@ -261,10 +350,10 @@ impl EngineState {
     ///
     /// Returns whether a fresh context came up, so a caller that can retry knows
     /// whether retrying is worth anything.
-    fn on_device_lost(&mut self) -> bool {
+    fn on_device_lost(&mut self, caches: &mut ObjectCaches) -> bool {
         self.counters.device_lost.fetch_add(1, Ordering::Relaxed);
         self.owner.mark_device_lost();
-        self.flush_device_derived();
+        self.flush_device_derived(caches);
         let EngineState {
             ref mut owner,
             ref counters,
@@ -289,7 +378,7 @@ impl EngineState {
     /// the exception — its only constructor is on the window thread — so this
     /// takes it and publishes that it is gone, and
     /// `host_window::present::App::reattach_engine` is what builds it again.
-    fn flush_device_derived(&mut self) {
+    fn flush_device_derived(&mut self, caches: &mut ObjectCaches) {
         clear_device_capabilities();
         RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
         // Taken and published unconditionally, before anything fallible. The
@@ -316,14 +405,14 @@ impl EngineState {
                 if let Some(mut presenter) = presenter {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
-                self.caches.destroy_all(&ctx.device);
+                caches.destroy_all(&ctx.device);
                 self.pools.destroy_all(&ctx.device);
             }
         } else {
-            self.caches.clear_logical();
+            caches.clear_logical();
         }
         self.pools = ResourcePools::new();
-        self.caches = ObjectCaches::new();
+        *caches = ObjectCaches::new();
     }
 }
 
@@ -1186,12 +1275,26 @@ pub fn window_present_detach() {
     }
 }
 
-/// Execute one draw against the persistent engine.
-pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> {
+/// Execute one draw against the persistent engine, with `state`'s own caches.
+pub fn execute_draw_request(
+    state: &crate::model::DeviceState,
+    req: &DrawRequest,
+) -> Result<DrawOutput, DrawError> {
+    let Some(device_caches) = device_caches(state) else {
+        return Err(DrawError::Facade(
+            facade_decline::EngineFacadeDecline::DeviceCachesUnreachable,
+        ));
+    };
+    device_caches.with(|caches| execute_draw_request_with(caches, req))
+}
+
+fn execute_draw_request_with(
+    caches: &mut ObjectCaches,
+    req: &DrawRequest,
+) -> Result<DrawOutput, DrawError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
-        ref mut caches,
         ref mut pools,
         ref counters,
         ..
@@ -1223,7 +1326,7 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
             Ok(out)
         }
         Err(DrawError::DeviceLost(decline)) => {
-            guard.on_device_lost();
+            guard.on_device_lost(caches);
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
@@ -1235,13 +1338,31 @@ pub fn execute_draw_request(req: &DrawRequest) -> Result<DrawOutput, DrawError> 
 /// while the worker sleeps; every in-engine consumer path (reads, compute,
 /// prefetch, next non-joinable draw) already flushes via begin_entry, so this
 /// only bounds the idle-tail latency. No-op without a context or open batch.
-pub fn flush_batched_draws() {
+pub fn flush_batched_draws(state: &crate::model::DeviceState) {
     if !end_of_tranche_requires_engine(
         BATCH_OPEN.load(std::sync::atomic::Ordering::Acquire),
         device_lost::device_lost_seen(),
     ) {
         return;
     }
+    // The tail flush itself touches no cache. It takes the device's caches
+    // because it is one of the three places a device loss is *acted on*, and
+    // acting on one drops everything derived from the `VkDevice` that is going
+    // away — which is where the caches are. An arm here that could not reach
+    // them would leave a boot's worth of handles from a dead device in the
+    // slot, and the next draw would bind one.
+    let Some(device_caches) = device_caches(state) else {
+        crate::observe::Emit::decline(
+            "vk_batch_flush",
+            &facade_decline::EngineFacadeDecline::DeviceCachesUnreachable,
+        )
+        .fail_once(0);
+        return;
+    };
+    device_caches.with(flush_batched_draws_with);
+}
+
+fn flush_batched_draws_with(caches: &mut ObjectCaches) {
     let lock_started = std::time::Instant::now();
     let mut guard = lock_engine();
     guard.counters.batch_tail_lock_us.fetch_add(
@@ -1253,7 +1374,7 @@ pub fn flush_batched_draws() {
     // observed by a thread that cannot take the engine lock gets acted on. See
     // `device_lost::note_device_lost_seen` for the boot that needed it.
     if device_lost::take_device_lost_seen() {
-        guard.on_device_lost();
+        guard.on_device_lost(caches);
         return;
     }
     let lost = {
@@ -1298,7 +1419,7 @@ pub fn flush_batched_draws() {
     // "A lost device surfaces again on the next draw" is only true while draws
     // keep coming, and a device loss is one of the things that stops them.
     if lost {
-        guard.on_device_lost();
+        guard.on_device_lost(caches);
     }
 }
 
@@ -1855,12 +1976,26 @@ pub fn quiesce_guest_reads() {
     }
 }
 
-/// Execute one compute dispatch against the persistent engine.
-pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, ComputeError> {
+/// Execute one compute dispatch against the engine, with `state`'s own caches.
+pub fn execute_compute_request(
+    state: &crate::model::DeviceState,
+    req: &ComputeRequest,
+) -> Result<ComputeOutput, ComputeError> {
+    let Some(device_caches) = device_caches(state) else {
+        return Err(DrawError::Facade(
+            facade_decline::EngineFacadeDecline::DeviceCachesUnreachable,
+        ));
+    };
+    device_caches.with(|caches| execute_compute_request_with(caches, req))
+}
+
+fn execute_compute_request_with(
+    caches: &mut ObjectCaches,
+    req: &ComputeRequest,
+) -> Result<ComputeOutput, ComputeError> {
     let mut guard = lock_engine();
     let EngineState {
         ref mut owner,
-        ref mut caches,
         ref mut pools,
         ref counters,
         ..
@@ -1874,7 +2009,7 @@ pub fn execute_compute_request(req: &ComputeRequest) -> Result<ComputeOutput, Co
             Ok(out)
         }
         Err(DrawError::DeviceLost(decline)) => {
-            guard.on_device_lost();
+            guard.on_device_lost(caches);
             Err(DrawError::DeviceLost(decline))
         }
         Err(e) => Err(e),
@@ -5310,8 +5445,12 @@ pub fn maintain_resources(now_ms: u64) {
 /// `(shaders, layouts, passes, pipelines, samplers, compute_pipelines)`.
 ///
 /// See [`caches::ObjectCaches::levels`] for what reading it answers.
-pub fn object_cache_levels() -> [usize; 6] {
-    lock_engine().caches.levels()
+///
+/// Zeros when the device's rail slot is another rail's — the same answer a
+/// census gets for a cache that holds nothing, which is what an unreachable
+/// one holds for this rail.
+pub fn object_cache_levels(state: &crate::model::DeviceState) -> [usize; 6] {
+    device_caches(state).map_or([0; 6], DeviceObjectCaches::levels)
 }
 
 /// Active topology policy for one deferred-submit command buffer, for the
@@ -5400,7 +5539,13 @@ pub fn reset_draw_counters() {
 }
 
 /// Test-only: destroy device, clear recreate budget, rebuild on next draw.
-pub fn test_reset_engine() {
+pub fn test_reset_engine(state: &crate::model::DeviceState) {
+    device_caches(state)
+        .expect("this rail holds the slot")
+        .with(|caches| test_reset_engine_with(caches));
+}
+
+fn test_reset_engine_with(caches: &mut ObjectCaches) {
     let mut g = lock_engine();
     RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
     // A healthy `DeviceContext` is kept across the reset; only the pools, the
@@ -5431,7 +5576,7 @@ pub fn test_reset_engine() {
             ctx.queue_barrier();
         }
         unsafe {
-            g.caches.destroy_all(&ctx.device);
+            caches.destroy_all(&ctx.device);
             g.pools.destroy_all(&ctx.device);
         }
         if poisoned {
@@ -5444,7 +5589,7 @@ pub fn test_reset_engine() {
     } else {
         g.owner = ContextOwner::new();
     }
-    g.caches = ObjectCaches::new();
+    *caches = ObjectCaches::new();
     g.pools = ResourcePools::new();
     g.counters.reset_all();
 }
@@ -5477,16 +5622,32 @@ pub fn device_recreate_count() -> u32 {
 }
 
 /// Mark context poisoned and flush as if device lost (tests that assert recreate cap).
-pub fn test_poison_and_flush() {
-    let mut g = lock_engine();
-    g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
-    g.owner.mark_device_lost();
-    g.flush_device_derived();
+pub fn test_poison_and_flush(state: &crate::model::DeviceState) {
+    device_caches(state)
+        .expect("this rail holds the slot")
+        .with(|caches| {
+            let mut g = lock_engine();
+            g.counters.device_lost.fetch_add(1, Ordering::Relaxed);
+            g.owner.mark_device_lost();
+            g.flush_device_derived(caches);
+        });
 }
 
 #[cfg(all(test, feature = "host-window"))]
 mod device_loss_window_rail_tests {
     use super::*;
+
+    /// A device whose rail slot this rail holds, which is what every entry
+    /// point below reaches its caches through.
+    fn device() -> crate::model::DeviceState {
+        let state =
+            crate::model::DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        assert!(
+            device_caches(&state).is_some(),
+            "precondition: this rail holds the slot"
+        );
+        state
+    }
 
     /// A device-loss flush must leave the window rail claiming nothing.
     ///
@@ -5522,7 +5683,7 @@ mod device_loss_window_rail_tests {
         let _ = device_lost::take_device_lost_seen();
         note_window_present_attached(true);
         device_lost::note_device_lost_seen();
-        flush_batched_draws();
+        flush_batched_draws(&device());
         assert!(
             !window_present_attached(),
             "the end-of-tranche flush must run the recovery for a latched loss"
@@ -5540,7 +5701,7 @@ mod device_loss_window_rail_tests {
             window_present_attached(),
             "precondition: the flag is what a successful attach publishes"
         );
-        test_poison_and_flush();
+        test_poison_and_flush(&device());
         assert!(
             !window_present_attached(),
             "the presenter died with the device, so nothing may still claim it"

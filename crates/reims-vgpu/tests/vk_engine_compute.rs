@@ -19,6 +19,24 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+/// The device every engine call in this file is made against.
+///
+/// One per process, like the engine it drives. The object caches this suite
+/// measures — `create_*`/`alloc_*` at zero on a warm draw — live in a device's
+/// own rail slot now, so a fresh device per call would present a cold cache to
+/// every draw and no warm assertion in this file could hold. Each test's cold
+/// start comes from `engine_test_session`'s reset, exactly as it did when the
+/// caches were the engine's.
+fn engine_device() -> &'static reims_vgpu::model::DeviceState {
+    static DEVICE: OnceLock<reims_vgpu::model::DeviceState> = OnceLock::new();
+    DEVICE.get_or_init(|| {
+        reims_vgpu::model::DeviceState::new(
+            reims_vgpu::model::DeviceId(1),
+            reims_vgpu_protocol::gva::PAGE_SHIFT_X86,
+        )
+    })
+}
+
 /// Acquire the process-global engine lock **and** reset the engine, in that
 /// order. Every engine-touching test must start from a fresh context:
 /// `device_loss_named_and_recreate_bounded` deliberately drives the
@@ -38,7 +56,7 @@ fn engine_test_session() -> std::sync::MutexGuard<'static, ()> {
         })
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    engine::test_reset_engine();
+    engine::test_reset_engine(engine_device());
     guard
 }
 
@@ -268,7 +286,7 @@ fn translate_kernel(name: &str) -> Option<Vec<u32>> {
 }
 
 fn engine_or_skip(label: &str, req: &ComputeRequest) -> Option<engine::ComputeOutput> {
-    match engine::execute_compute_request(req) {
+    match engine::execute_compute_request(engine_device(), req) {
         Ok(o) => Some(o),
         Err(e) => {
             let s = e.to_string();
@@ -557,7 +575,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
             seed_skipped: false,
         }],
     };
-    let hit = engine::execute_compute_request(&hit_req).expect("resident compute hit");
+    let hit =
+        engine::execute_compute_request(engine_device(), &hit_req).expect("resident compute hit");
     assert_eq!(
         hit.images[0]
             .bytes()
@@ -596,7 +615,8 @@ fn compute_storage_image_rgba8unorm_known_result() {
             seed_skipped: false,
         }],
     };
-    let mismatch = engine::execute_compute_request(&mismatch_req).expect("generation mismatch");
+    let mismatch = engine::execute_compute_request(engine_device(), &mismatch_req)
+        .expect("generation mismatch");
     assert!(
         mismatch.images[0]
             .bytes()
@@ -701,7 +721,7 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     // vacuous pass this call removes.
     engine::note_resident_storage_copied_out(&identity(0));
     for i in 1..ADMITS {
-        engine::execute_compute_request(&request(i, 1)).expect("filler dispatch");
+        engine::execute_compute_request(engine_device(), &request(i, 1)).expect("filler dispatch");
         engine::note_resident_storage_copied_out(&identity(i));
     }
 
@@ -709,7 +729,8 @@ fn every_admitted_compute_storage_resident_survives_past_the_retired_slot_cap() 
     // sweep that happened to spare the identity it was asked about.
     for i in 0..ADMITS {
         engine::reset_draw_counters();
-        engine::execute_compute_request(&request(i, 2)).expect("resident re-dispatch");
+        engine::execute_compute_request(engine_device(), &request(i, 2))
+            .expect("resident re-dispatch");
         assert_eq!(
             engine::counter_snapshot().compute_storage_seed_uploads,
             0,
@@ -863,7 +884,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     // Skip dispatch: one texel, zero-placeholder bytes, matching generation.
     // Untouched texels staying red prove the placeholder was never seeded.
     engine::reset_draw_counters();
-    let skip = engine::execute_compute_request(&make([1, 1, 1], 2, 3, true))
+    let skip = engine::execute_compute_request(engine_device(), &make([1, 1, 1], 2, 3, true))
         .expect("seed-skip resident hit");
     for p in skip.images[0]
         .bytes()
@@ -882,7 +903,7 @@ fn compute_storage_image_seed_skip_and_lost_resident() {
     // Lost resident: evicting guest state must turn the same skip request
     // into the named failure, never a silent zero seed.
     engine::reset_guest_state();
-    let err = engine::execute_compute_request(&make([1, 1, 1], 3, 4, true))
+    let err = engine::execute_compute_request(engine_device(), &make([1, 1, 1], 3, 4, true))
         .expect_err("lost resident must fail");
     assert!(
         err.to_string()
@@ -987,7 +1008,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     // Resident hit: the sampled image is seeded device-locally from the red
     // resident; the zero placeholder never uploads.
     engine::reset_draw_counters();
-    let hit = engine::execute_compute_request(&make_fetch(2)).expect("resident sample hit");
+    let hit = engine::execute_compute_request(engine_device(), &make_fetch(2))
+        .expect("resident sample hit");
     let got: Vec<u32> = hit.buffers[0]
         .bytes
         .chunks_exact(4)
@@ -1010,8 +1032,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
     assert_eq!(snap.compute_sampled_resident_copy_bytes, (w * h * 4) as u64);
 
     // Stale generation must fail visibly, never seed the placeholder.
-    let err =
-        engine::execute_compute_request(&make_fetch(9)).expect_err("stale generation must fail");
+    let err = engine::execute_compute_request(engine_device(), &make_fetch(9))
+        .expect_err("stale generation must fail");
     assert!(
         err.to_string()
             .contains("vk_compute_exec_resident_sample_generation_mismatch"),
@@ -1020,7 +1042,8 @@ fn compute_sampled_resident_copy_and_lost_resident() {
 
     // Evicted resident must fail visibly too.
     engine::reset_guest_state();
-    let err = engine::execute_compute_request(&make_fetch(2)).expect_err("lost resident must fail");
+    let err = engine::execute_compute_request(engine_device(), &make_fetch(2))
+        .expect_err("lost resident must fail");
     assert!(
         err.to_string()
             .contains("vk_compute_exec_resident_sample_absent"),
@@ -1284,7 +1307,7 @@ fn compute_storage_image_r16float_if_supported() {
             seed_skipped: false,
         }],
     };
-    match engine::execute_compute_request(&req) {
+    match engine::execute_compute_request(engine_device(), &req) {
         Ok(out) => {
             assert_eq!(out.images.len(), 1);
             assert_eq!(
@@ -1532,7 +1555,7 @@ fn compute_sampled_resident_bind_refuses_a_pyramid() {
         samplers: vec![],
         storage_images: vec![],
     };
-    let err = engine::execute_compute_request(&req)
+    let err = engine::execute_compute_request(engine_device(), &req)
         .expect_err("a resident source cannot answer for a pyramid");
     let text = err.to_string();
     if skip_if_no_gpu(&text) {

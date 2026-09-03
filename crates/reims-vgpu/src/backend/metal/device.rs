@@ -201,7 +201,11 @@ impl Backend for MetalBackend {
         (1024, 32)
     }
 
-    fn emit_census(&self, site: CensusSite) {
+    /// This rail's caches are its own and are not held in the device's rail
+    /// slot, so the device is not read here. It is in the signature because the
+    /// Vulkan rail's caches *are*, and the trait carries the more demanding of
+    /// the two.
+    fn emit_census(&self, _state: &crate::model::DeviceState, site: CensusSite) {
         // One line, at one site. The other three are engine counters, phase
         // windows and a mutex census that this rail has no counterpart for —
         // absent rather than zeroed, so a reader cannot mistake "no such engine"

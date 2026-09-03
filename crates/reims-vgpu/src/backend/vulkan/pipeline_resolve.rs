@@ -165,6 +165,14 @@ pub type TaskRenderPipelineStates = TaskReferenceStates<ResolvedRenderPipeline>;
 #[derive(Debug, Default)]
 pub struct VulkanDeviceState {
     pub render_pipelines: TaskRenderPipelineStates,
+    /// The immutable-object caches — shader modules, layouts, render passes,
+    /// pipelines, samplers — this rail builds for one device's lifetime.
+    ///
+    /// They were the process-global engine's until they moved here. Every entry
+    /// is keyed by something the *guest* declared, so the population ends when
+    /// the guest's device does, and the engine that kept them beside its
+    /// `VkInstance` made them outlive every device on the process.
+    pub(crate) caches: crate::backend::vulkan::engine::DeviceObjectCaches,
 }
 
 impl RailDeviceState for VulkanDeviceState {
@@ -196,6 +204,11 @@ impl RailDeviceState for VulkanDeviceState {
             "pipeline_state_device_ended",
             self.render_pipelines.clear() as u64,
         );
+        // The caches hold native objects, so their ending is a destruction and
+        // not a drop. It goes through whatever context the engine still has,
+        // which is the engine's half of this division: the device owns *when*,
+        // the rail owns *what it costs*.
+        self.caches.end_device();
     }
 }
 

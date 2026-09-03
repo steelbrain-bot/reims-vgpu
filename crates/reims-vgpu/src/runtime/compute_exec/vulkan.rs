@@ -1288,13 +1288,16 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
         samplers,
         storage_images,
     };
+    // The engine reaches this device's own object caches through the shared
+    // borrow, so it is taken before the closure and released with it.
+    let device: &DeviceState = state;
     let run_engine = |req: &ComputeRequest| {
         let engine_done = spawn_compute_engine_stall_watchdog(
             acc.pipeline_ref,
             req,
             std::time::Duration::from_millis(COMPUTE_ENGINE_STALL_PROXY_MS),
         );
-        let out = vk_engine::execute_compute_request(req);
+        let out = vk_engine::execute_compute_request(device, req);
         engine_done.store(true, std::sync::atomic::Ordering::Release);
         out
     };

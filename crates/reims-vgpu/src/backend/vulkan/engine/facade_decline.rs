@@ -26,6 +26,14 @@ pub enum EngineFacadeDecline {
     WindowSourceDisappearedBeforePin {
         identity: TargetIdentity,
     },
+    /// The device's rail slot is held by a different rail, so this rail's
+    /// object caches for it cannot be reached.
+    ///
+    /// Unreachable in any live build — `backend::select` latches one rail per
+    /// process — and refused by name anyway, because the alternative is a
+    /// second cache owning handles the first one also owns. A caller that fell
+    /// back to one would be running two owners of the same `VkPipeline`.
+    DeviceCachesUnreachable,
 }
 
 impl Decline for EngineFacadeDecline {
@@ -39,6 +47,7 @@ impl Decline for EngineFacadeDecline {
             Self::WindowSourceDisappearedBeforePin { .. } => {
                 "vk_engine_window_source_disappeared_before_pin"
             }
+            Self::DeviceCachesUnreachable => "vk_engine_device_caches_unreachable",
         }
     }
 
@@ -59,6 +68,7 @@ impl Decline for EngineFacadeDecline {
                 fields
             }
             Self::WindowSourceDisappearedBeforePin { identity } => identity_fields(identity),
+            Self::DeviceCachesUnreachable => Vec::new(),
         }
     }
 }

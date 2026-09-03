@@ -2799,6 +2799,7 @@ pub fn note_drain_setup(ns: u64) {
 
 /// Accumulate one completed drain tranche; emits at most once per second.
 pub fn note_drain_tranche(
+    state: &crate::model::DeviceState,
     host: &dyn crate::runtime::host::HostOps,
     drain_us: u64,
     publish_us: u64,
@@ -2855,9 +2856,12 @@ pub fn note_drain_tranche(
         }
         // Under `window_publish`, which says how many frames were offered but
         // not why fewer reached the screen.
-        rail.emit_census(CensusSite::Serialization {
-            win_ms: DRAIN_DUTY.last_window_ms(),
-        });
+        rail.emit_census(
+            state,
+            CensusSite::Serialization {
+                win_ms: DRAIN_DUTY.last_window_ms(),
+            },
+        );
         if let Some(routes) = take_store_routes() {
             crate::observe::off(routes);
         }
@@ -2881,8 +2885,8 @@ pub fn note_drain_tranche(
         for line in crate::observe::footprint::census_lines(crate::observe::elapsed_ms() as u64) {
             crate::observe::off(line);
         }
-        rail.emit_census(CensusSite::WorkingSet);
-        rail.emit_census(CensusSite::Throughput);
+        rail.emit_census(state, CensusSite::WorkingSet);
+        rail.emit_census(state, CensusSite::Throughput);
         emit_alias_pressure(host);
         // After `CensusSite::Throughput`, which is where a rail emits its own
         // phase split: the two divide against each other and reading them in the
@@ -2890,7 +2894,7 @@ pub fn note_drain_tranche(
         // which is the misreading this line exists to correct. Not asked of the
         // rail — the timer is runtime-side and either rail is measured by it.
         emit_chain_phase();
-        rail.emit_census(CensusSite::Levels);
+        rail.emit_census(state, CensusSite::Levels);
     }
 }
 

@@ -393,8 +393,8 @@ impl Backend for VulkanBackend {
         engine::maintain_resources(now_ms);
     }
 
-    fn flush_deferred_submissions(&self) {
-        engine::flush_batched_draws();
+    fn flush_deferred_submissions(&self, state: &DeviceState) {
+        engine::flush_batched_draws(state);
     }
 
     fn flush_batch_for_waiting_stamp(&self, stamp_index: u32) -> bool {
@@ -645,13 +645,13 @@ impl Backend for VulkanBackend {
         draw::vulkan::forget_plane_draw_ring(mapping_id);
     }
 
-    fn emit_census(&self, site: CensusSite) {
+    fn emit_census(&self, state: &DeviceState, site: CensusSite) {
         match site {
             CensusSite::Serialization { win_ms } => census::emit_engine_lock(win_ms),
             CensusSite::WorkingSet => census::emit_working_set(),
             CensusSite::Throughput => census::emit_engine_delta(),
             CensusSite::Levels => {
-                census::emit_object_cache_levels();
+                census::emit_object_cache_levels(state);
                 census::emit_guest_import_levels();
             }
         }

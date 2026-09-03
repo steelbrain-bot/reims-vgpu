@@ -565,7 +565,7 @@ pub fn device_drain(id: u64) -> bool {
     // Submit any deferred draw batch before the worker sleeps: consumers
     // inside the tranche flush on their own (engine begin_entry), this bounds
     // only the idle-tail latency of the last same-target run.
-    crate::backend::selected().flush_deferred_submissions();
+    crate::backend::selected().flush_deferred_submissions(&device.state);
     let tail_us = tail_started.elapsed().as_micros() as u64;
     let boundary_started = std::time::Instant::now();
     publish_present_boundary(&slot, device.state.present.frame_flush_seen);
@@ -577,6 +577,7 @@ pub fn device_drain(id: u64) -> bool {
     #[cfg(feature = "host-window")]
     window_publish::publish_window_frame(&slot, &mut device.state);
     crate::runtime::drain::note_drain_tranche(
+        &device.state,
         &host,
         drain_us,
         publish_started.elapsed().as_micros() as u64,
