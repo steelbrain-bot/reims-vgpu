@@ -5632,7 +5632,7 @@ impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
             .unwrap_or_else(|e| e.into_inner())
             .access(self.task, self.domain, participation)
             .map_err(|refusal| {
-                note_access_refused(self.task, participation, refusal);
+                note_access_refused(self.state, self.task, participation, refusal);
                 reims_vgpu_core::access::AccessRefusal {
                     resource: participation.resource,
                     reason: refusal.slug(),
@@ -5660,6 +5660,7 @@ impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
 /// variant carries its own numbers and a second vocabulary here would drift
 /// from it.
 fn note_access_refused(
+    state: &DeviceState,
     task: reims_vgpu_core::identity::TaskId,
     participation: &reims_vgpu_core::access::Participation,
     refusal: reims_vgpu_core::lifecycle::Refusal,
@@ -5670,15 +5671,24 @@ fn note_access_refused(
         "access_refused",
         (u64::from(task.0) << 32) | u64::from(participation.resource.slot.0),
     ) {
+        // The object's own type and descriptor length, because the two things a
+        // window refusal can be are a record naming bytes past the end and this
+        // device having recovered too short an extent — and which one it is
+        // turns on what kind of object the slot holds. `None` when nothing was
+        // ever constructed for the slot, which is itself the answer for a
+        // participation over a name with no memo behind it.
+        let constructed = state.constructed_object(task.0, participation.resource.slot.0);
         crate::observe::fail(format!(
             "access_refused task={} ref={} reason={} mode={:?} extent={:?} refusal={refusal:?} \
-             (a record's participation could not become an access, which refuses the whole \
-             packet it belongs to)",
+             object_type={:?} desc_len={:?} (a record's participation could not become an \
+             access, which refuses the whole packet it belongs to)",
             task.0,
             participation.resource.slot.0,
             refusal.slug(),
             participation.mode,
             participation.extent,
+            constructed.as_ref().map(|r| r.entry.object_type),
+            constructed.as_ref().map(|r| r.descriptor.len()),
         ));
     }
 }

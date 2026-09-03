@@ -352,9 +352,27 @@ pub enum LifecycleOp {
         resources: Vec<ResourceId>,
     },
     /// Retire a backing and the resources that named it.
+    /// The guest is retiring one surface's host backing, and with it every
+    /// resource that named those bytes.
+    ///
+    /// # The backing is optional for the reason a delete's name is
+    ///
+    /// The record's first word is a **mapping** id, and a mapping that no
+    /// longer resolves is one this model never had a backing for — so there is
+    /// nothing here to retire, and there never was. Refusing on it threw away
+    /// the packet, which is the same wrong answer
+    /// [`Self::DeleteResource::resource`] records: a driven macos-15 boot
+    /// refused one a boot that way, and the rail's own mapping-keyed teardown
+    /// was the half with work left.
+    ///
+    /// The mapping travels beside the backing so that half has what it needs
+    /// whether or not this model can name anything.
     DeleteBacking {
         task: TaskId,
-        backing: BackingId,
+        /// The guest's own mapping id, which the rail's teardown is keyed by.
+        mapping: crate::identity::MappingId,
+        /// The bytes, when the mapping still resolves to some.
+        backing: Option<BackingId>,
     },
     /// End one serializer object: the name stops resolving, and the rail drops
     /// whatever it holds for that kind.
@@ -760,13 +778,6 @@ pub enum ResolveRefusal {
     UnsettledDestroy {
         kind: reims_vgpu_protocol::destroy::DestroyKind,
     },
-    /// The retirement names a mapping the mapper holds no surface for.
-    ///
-    /// Carries the guest's number for [`Self::UnknownRef`]'s reason, and is a
-    /// *different* refusal from it: the two numbers come from namespaces that
-    /// overlap, so a log that spelled them the same way would send a reader to
-    /// the object list to look for a mapping.
-    UnknownMapping { mapping: u32 },
     /// The command is not a map-or-unmap notice, so there is no interval for
     /// [`map_notice`] to read. [`NotAResourceList`](Self::NotAResourceList)'s
     /// sibling, and a caller asking the wrong question rather than a malformed
@@ -810,7 +821,6 @@ impl ResolveRefusal {
             Self::NotAnObjectReference { .. } => "lifecycle_not_an_object_reference",
             Self::NeedsStorage { .. } => "lifecycle_needs_storage",
             Self::NotABackingRetirement { .. } => "lifecycle_not_a_backing_retirement",
-            Self::UnknownMapping { .. } => "lifecycle_unknown_mapping",
             Self::NotAMapNotice { .. } => "lifecycle_not_a_map_notice",
             Self::NotATaskLifetime { .. } => "lifecycle_not_a_task_lifetime",
             Self::ShortNotice(_) => fifo::ShortPayload::SLUG,
@@ -1332,13 +1342,14 @@ pub fn backing_retirement(
     }
     let command = fifo::decode_delete_backing(payload).map_err(ResolveRefusal::ShortNotice)?;
     let mapping = crate::identity::MappingId(command.object_id);
-    let backing = resolver
-        .backing(mapping)
-        .ok_or(ResolveRefusal::UnknownMapping {
-            mapping: command.object_id,
-        })?;
+    // Not `ok_or(UnknownMapping)`. A retirement's effect must not be lost to a
+    // mapping this model never held — see [`LifecycleOp::DeleteBacking`] — and
+    // the mapping itself is carried so the executor's own teardown runs either
+    // way.
+    let backing = resolver.backing(mapping);
     Ok(LifecycleOp::DeleteBacking {
         task: TaskId(command.task_id),
+        mapping,
         backing,
     })
 }
@@ -1831,7 +1842,13 @@ impl Lifecycle {
                 self.synchronize(*task, resources, true)
             }
             LifecycleOp::Discard { task, resources } => self.discard(*task, resources),
-            LifecycleOp::DeleteBacking { task, backing } => self.delete_backing(*task, *backing),
+            LifecycleOp::DeleteBacking { task, backing, .. } => match backing {
+                Some(backing) => self.delete_backing(*task, *backing),
+                // No bytes were ever named for this mapping, so no resource in
+                // this model can be resident on them. The rail's mapping-keyed
+                // teardown is the half with work left.
+                None => Ok(Effects::default()),
+            },
             // The name half, which is the only half this model owns. Which
             // per-kind registry the rail drops is the executor's, and it is
             // carried on the operation so the executor does not have to
@@ -2541,7 +2558,8 @@ mod tests {
             },
             LifecycleOp::DeleteBacking {
                 task: TASK,
-                backing: BackingId(10),
+                mapping: crate::identity::MappingId(10),
+                backing: Some(BackingId(10)),
             },
             LifecycleOp::DeleteObject {
                 task: TASK,
@@ -3550,7 +3568,8 @@ mod tests {
         let effects = l
             .apply(&LifecycleOp::DeleteBacking {
                 task: TASK,
-                backing: BackingId(10),
+                mapping: crate::identity::MappingId(10),
+                backing: Some(BackingId(10)),
             })
             .expect("live task");
         assert_eq!(effects.teardowns.len(), 2, "and only those two");
@@ -3580,27 +3599,40 @@ mod tests {
             backing_retirement(LifecycleKind::DeleteBacking, &payload, &EveryMapping),
             Ok(LifecycleOp::DeleteBacking {
                 task: TaskId(4),
-                backing: BackingId(1_009),
+                mapping: crate::identity::MappingId(9),
+                backing: Some(BackingId(1_009)),
             })
         );
     }
 
-    /// A mapping the mapper holds no surface for refuses under its own name.
+    /// A mapping the mapper holds no surface for still retires.
     ///
-    /// Not `UnknownRef`: that one names an object-list ref, and the two number
-    /// spaces overlap, so one slug for both would send a reader to the object
-    /// list to look for a mapping.
+    /// **A retirement is never refused for a name nothing resolves**, which is
+    /// the rule [`LifecycleOp::DeleteObject`] established and
+    /// [`LifecycleOp::DeleteResource`] joined. This is the third command under
+    /// it, and the one whose id is a *mapping*: a mapping this model holds no
+    /// surface for is one no resource in it can be resident on, so there is
+    /// nothing to retire here and never was — while the rail's own
+    /// mapping-keyed teardown still has work, and only the mapping id can
+    /// reach it.
     #[test]
-    fn a_retirement_naming_no_live_surface_refuses_as_a_mapping() {
+    fn a_retirement_naming_no_live_surface_still_retires() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&9u32.to_le_bytes());
         payload.extend_from_slice(&4u32.to_le_bytes());
-        let refusal = backing_retirement(LifecycleKind::DeleteBacking, &payload, &NoMapping)
-            .expect_err("no live surface");
-        assert_eq!(refusal, ResolveRefusal::UnknownMapping { mapping: 9 });
-        assert_ne!(
-            refusal.slug(),
-            ResolveRefusal::UnknownRef { object_ref: 9 }.slug()
+        let op = backing_retirement(LifecycleKind::DeleteBacking, &payload, &NoMapping)
+            .expect("a retirement is not lost to an unheld mapping");
+        assert_eq!(
+            op,
+            LifecycleOp::DeleteBacking {
+                task: TaskId(4),
+                mapping: crate::identity::MappingId(9),
+                backing: None,
+            }
+        );
+        assert!(
+            op.resources().is_empty(),
+            "no backing, so no resource of this model's is named"
         );
     }
 
@@ -5098,7 +5130,8 @@ mod tests {
         let effects = l
             .apply(&LifecycleOp::DeleteBacking {
                 task: TASK,
-                backing: BackingId(10),
+                mapping: crate::identity::MappingId(10),
+                backing: Some(BackingId(10)),
             })
             .expect("resolves");
         assert_eq!(effects.teardowns.len(), 1);
@@ -5384,7 +5417,11 @@ mod tests {
                             extent: range(0, RESOURCE_LENGTH),
                         }
                     }
-                    17 => LifecycleOp::DeleteBacking { task, backing },
+                    17 => LifecycleOp::DeleteBacking {
+                        task,
+                        mapping: crate::identity::MappingId(backing.0 as u32),
+                        backing: Some(backing),
+                    },
                     18 => LifecycleOp::MapMemory {
                         task,
                         span: GuestSpan {
@@ -5618,11 +5655,13 @@ mod tests {
                     entry.1 = *backing;
                 }
             }
-            LifecycleOp::DeleteBacking { task, backing } => {
+            LifecycleOp::DeleteBacking { task, backing, .. } => {
                 census.retired_backings += 1;
-                live.entry(*task)
-                    .or_default()
-                    .retain(|_, (_, b)| b != backing);
+                if let Some(backing) = backing {
+                    live.entry(*task)
+                        .or_default()
+                        .retain(|_, (_, b)| b != backing);
+                }
             }
             // A bind changes what an unresolved reference will construct and
             // ends nothing already declared, so the shadow of live names does

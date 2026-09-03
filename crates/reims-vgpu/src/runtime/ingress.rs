@@ -1923,6 +1923,51 @@ mod tests {
         );
     }
 
+    /// A backing retirement whose mapping resolves to nothing still retires.
+    ///
+    /// The third command under the same rule as the two above, and the one
+    /// whose id is a **mapping** rather than an object-list ref. A driven
+    /// macos-15 boot refused one packet a boot on it. The operation carries the
+    /// guest's mapping id either way, because that is the only thing the rail's
+    /// own teardown can be keyed by.
+    #[test]
+    fn a_retirement_whose_mapping_resolves_to_nothing_still_retires() {
+        use reims_vgpu_core::lifecycle::{LifecycleKind, LifecycleOp};
+
+        let row = LEDGER
+            .iter()
+            .find(|row| {
+                LifecycleKind::of(row.channel, row.opcode) == Some(LifecycleKind::DeleteBacking)
+            })
+            .expect("the ledger has a backing-retirement row");
+        let built = packet(
+            fifo_for(row.channel),
+            SessionGeneration::FIRST,
+            StampSlot(0),
+            &drained(row.opcode),
+            Resolvers {
+                mappings: &NOTHING_MAPPED,
+                objects: &EveryObject,
+                storage: &EveryStorage,
+                replies: &EveryReply,
+            },
+            device_inputs(&mut NoAccesses),
+        )
+        .expect("a retirement is not lost to an unheld mapping");
+        let Payload::ResourceLifecycle(payload) = &built.payload else {
+            panic!("a lifetime command must not build another class's payload");
+        };
+        assert!(
+            matches!(
+                payload.op(),
+                LifecycleOp::DeleteBacking { backing: None, .. }
+            ),
+            "the mapping named no bytes this model holds: {:?}",
+            payload.op()
+        );
+        assert!(payload.accesses().is_empty());
+    }
+
     /// [`packet`] over the ledger sweep's namespaces, so a test naming one
     /// packet does not restate the four arguments the sweep already fixes.
     fn packet_of(fifo: Fifo, drained: &drain::Packet) -> Result<Packet, Blocked> {
