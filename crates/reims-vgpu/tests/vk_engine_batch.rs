@@ -781,17 +781,45 @@ fn a_warm_repeat_draw_does_not_enter_the_allocator() {
 /// a real guest sends and the one the zero above does not reach.
 ///
 /// A descriptor-free draw builds its binding list with `Vec::with_capacity(0)`
-/// and clones an empty `Vec` into the pipeline key, and neither allocates — so
-/// the zero above is a true statement about a narrow shape. One storage buffer
-/// is enough to leave it: the binding list becomes a real `Vec`, and
-/// `PipelineKey` carries a `LayoutKey` by value, so building the pipeline
-/// lookup key clones it again.
+/// and its pipeline key holds two empty vectors, and none of that allocates —
+/// so the zero above was a true statement about a narrow shape. One storage
+/// buffer was enough to leave it, and this test was recorded as a **ceiling of
+/// six** rather than a zero, on the argument that a gate which fails on arrival
+/// gets weakened or ignored.
 ///
-/// Recorded as a ceiling rather than asserted at zero, because closing this one
-/// is a change to how layouts are keyed — the cache would have to be reachable
-/// without an owned `Vec<BindingSig>` per draw — and a gate that fails on
-/// arrival gets weakened or ignored. Lowering the constant is the work; raising
-/// it needs a reason in the commit.
+/// It is a zero now. Six went to zero in four steps, and the trace list is kept
+/// because the shape they shared is the point: every one was a list built fresh
+/// per draw, for the length of one draw, out of data the draw already had.
+///
+/// * 104 B, `validate_v1`'s duplicate-binding `BTreeSet` — became a scan over
+///   the lists the draw already owns.
+/// * 24 B and 256 B, a `Vec<vk::DescriptorBufferInfo>` and a
+///   `Vec<vk::WriteDescriptorSet>`. This test is what caught them: it prints
+///   `descriptor_pushes`, `descriptor_set_binds` and `descriptor_set_updates`
+///   beside the count, all three were **zero**, and the draw was building
+///   Vulkan's write structures every time on the way to sending none of them.
+/// * 48 B, `BufferGatherRoles::of` — the table is gone; the three call sites
+///   scan the request it was built from.
+/// * 128 B, the storage-bind list, and the vertex-bind list beside it — both
+///   live in the command buffer's graphics scratch now.
+/// * 16 B and 16 B, the `Vec<BindingSig>` and its clone into the pipeline key.
+///   These were the two the ceiling existed for, and closing them was the
+///   change the ceiling predicted: the layout cache is looked up by a *slice*
+///   and `PipelineKey` carries a `Copy` `LayoutId`.
+///
+/// # What a zero here still does not cover
+///
+/// `PipelineKey::attrs` is a `Vec<AttrKey>` built per draw, and this fixture
+/// draws without vertex attributes, so it is empty and does not allocate. A
+/// guest draw has attributes — the boot behind `f819d513` bound 162 246 vertex
+/// slots — so a real steady-state draw still pays one trip that this
+/// measurement cannot see. Interning attribute sets the way layouts are now
+/// interned is what closes it; until then this zero is a statement about
+/// descriptors and not about the whole draw.
+///
+/// The bytes are asserted with the trips for that reason: a trip count alone
+/// cannot say whether a zero is the path's or the fixture's, and 0 B is at
+/// least a claim that nothing at all was asked for.
 #[test]
 fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffic() {
     let _guard = engine_test_lock().lock().unwrap();
@@ -847,48 +875,11 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
         "and did not flush, which is not a steady-state draw: {during:?}"
     );
 
-    /// What this rail reads today, and where each trip comes from — traced
-    /// once, so the next person to lower this starts from the list rather than
-    /// from the number:
-    ///
-    /// ```text
-    ///    16 B  the `Vec<BindingSig>` binding list
-    ///    16 B  `LayoutKey::clone` into the pipeline key
-    /// ```
-    ///
-    /// Four are gone since, and the byte total is the check on that list: 32 B
-    /// over two trips is exactly the two above, so nothing unlisted is hiding
-    /// behind a number that only counts calls.
-    ///
-    /// * 104 B, `validate_v1`'s duplicate-binding `BTreeSet` — became a scan
-    ///   over the lists the draw already owns.
-    /// * 24 B and 256 B, a `Vec<vk::DescriptorBufferInfo>` and a
-    ///   `Vec<vk::WriteDescriptorSet>`. This test is what caught them: it prints
-    ///   `descriptor_pushes`, `descriptor_set_binds` and
-    ///   `descriptor_set_updates` beside the count, all three were **zero**, and
-    ///   the draw was building Vulkan's write structures every time on the way
-    ///   to sending none of them.
-    /// * 48 B, `BufferGatherRoles::of` — the table is gone; the three call sites
-    ///   scan the request it was built from.
-    /// * 128 B, the storage-bind list, which is the "bound-buffer list growing"
-    ///   the earlier trace named. It lives in the command buffer's scratch
-    ///   beside the descriptor list now, because the one is derived from the
-    ///   other.
-    ///
-    /// Both survivors are the same fact: `PipelineKey` carries `LayoutKey` by
-    /// value and `LayoutKey` owns a `Vec<BindingSig>`, so a draw builds that
-    /// vector and then clones it to look the pipeline up. Closing them is a
-    /// change to how layouts are keyed — the cache reachable without an owned
-    /// vector per draw, a `Digest128` over the canonical bindings being the
-    /// idiom this crate already uses for SPIR-V — and that is why this is still
-    /// a ceiling. Lowering the constant is the work; raising it needs a reason
-    /// in the commit.
-    const CEILING: usize = 2;
-    assert!(
-        trips <= CEILING,
-        "a warm repeat draw binding one storage buffer took {trips} trips into \
-         the allocator, above the recorded ceiling of {CEILING}. The plan's \
-         value for this is 0"
+    assert_eq!(
+        (trips, cost.bytes),
+        (0, 0),
+        "a warm repeat draw binding one storage buffer entered the allocator; \
+         the plan's value for this is 0 and it has been 0 since `LayoutId`"
     );
     eprintln!(
         "warm repeat draw, one storage buffer: {trips} allocator trips, {} bytes, \

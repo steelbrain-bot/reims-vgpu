@@ -6,8 +6,8 @@ use ash::vk;
 use std::sync::atomic::Ordering;
 
 use super::caches::{
-    canonicalize_layout_bindings, AttrKey, BindingSig, Color0Load, LayoutKey, ObjectCaches,
-    PassKey, PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
+    canonicalize_layout_bindings, AttrKey, BindingSig, Color0Load, ObjectCaches, PassKey,
+    PipelineKey, SecondaryAttachKey, MAX_SECONDARY_ATTACH,
 };
 use super::context::ContextOwner;
 use super::counters::{CreateSite, EngineCounters};
@@ -2940,16 +2940,13 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     phase.enter(super::draw_phase::Phase::Pipeline);
 
-    // Build layout key from storage / sampled / sampler bindings. Sized up
-    // front: this grew from empty on every draw, so a draw with the eight or so
-    // descriptors a Maps chain binds paid three reallocations to reach a width
-    // its inputs already state.
-    let mut layout_bindings = Vec::with_capacity(
-        req.storage_buffers.len()
-            + req.sampled_images.len()
-            + req.samplers.len()
-            + req.color_input as usize,
-    );
+    // Build the layout's bindings from storage / sampled / sampler descriptors,
+    // into the command buffer's own scratch. It was a draw-local `Vec`, sized up
+    // front because growing from empty cost a Maps-sized descriptor set three
+    // reallocations — but a right-sized allocation is still an allocation a
+    // draw, and the layout cache is looked up by a slice of these, so the buffer
+    // that survives between draws is the one the lookup can borrow from.
+    let layout_bindings = pools.layout_bindings_scratch();
     for b in &req.storage_buffers {
         layout_bindings.push(BindingSig {
             binding: b.binding,
@@ -2982,10 +2979,15 @@ pub(crate) unsafe fn execute_draw_inner(
             count: 1,
         });
     }
-    let layout_bindings = canonicalize_layout_bindings(layout_bindings)?;
-    if let Some(binding) = layout_bindings.iter().find(|binding| binding.count > 1) {
+    canonicalize_layout_bindings(layout_bindings)?;
+    if let Some(binding) = pools
+        .layout_bindings()
+        .iter()
+        .find(|binding| binding.count > 1)
+    {
         let dynamic_indexing = ctx.features.sampled_image_array_dynamic_indexing;
-        let required_descriptors = layout_bindings
+        let required_descriptors = pools
+            .layout_bindings()
             .iter()
             .filter(|candidate| {
                 vk::DescriptorType::from_raw(candidate.ty as i32)
@@ -3015,16 +3017,12 @@ pub(crate) unsafe fn execute_draw_inner(
     if let Some((binding, fragment)) = used_binding_absent_from_layout(
         &req.vert_used_descriptor_bindings,
         &req.frag_used_descriptor_bindings,
-        &layout_bindings,
+        pools.layout_bindings(),
     ) {
         return Err(DrawError::Unsupported(
             super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
         ));
     }
-    let layout_key = LayoutKey {
-        bindings: layout_bindings,
-        push_constant: None,
-    };
     // Resolve load action: resident > guest/host seed > Clear black.
     let mut load_uses_gpu_content = req.load_from_target;
     // output_bgra (computed with the batch decision above): BGRA output only
@@ -3204,7 +3202,8 @@ pub(crate) unsafe fn execute_draw_inner(
     let (frag_digest, frag_module) =
         caches.get_or_create_shader_memoized(ctx, &req.frag_spirv, counters, pools)?;
     phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
-    let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
+    let layout = caches.get_or_create_layout(ctx, pools.layout_bindings(), None, counters)?;
+    let (dsl, pipeline_layout) = (layout.dsl, layout.pipeline_layout);
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
     phase.enter(super::draw_phase::Phase::Pipeline);
     // How many viewport slots this draw rasterizes into, checked against the
@@ -3378,7 +3377,7 @@ pub(crate) unsafe fn execute_draw_inner(
         raster: raster_plan.state,
         depth_stencil: depth_stencil_plan.state,
         viewport_slots: slot_count_u32,
-        layout: layout_key.clone(),
+        layout: layout.id,
     };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
@@ -4269,7 +4268,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // Push descriptors are the Vulkan spelling closest to Metal encoder
     // binding state: the writes become commands in this command buffer, with no
     // separately allocated object. The layout cache made the same decision.
-    let push_descriptors = layout_key.uses_push_descriptors(ctx.caps.push_descriptor);
+    let push_descriptors = layout.push_descriptors;
     // Owning pool block travels alongside an allocated set so the flush-time
     // free routes back to the block it came from. A push layout owns neither.
     let mut dset_pool: Option<vk::DescriptorPool> = None;

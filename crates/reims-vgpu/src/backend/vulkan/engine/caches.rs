@@ -81,28 +81,223 @@ pub(crate) struct BindingSig {
     pub count: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct LayoutKey {
-    pub bindings: Vec<BindingSig>,
-    /// Reflected compute push-constant byte range. Graphics layouts carry none.
-    pub push_constant: Option<(u32, u32)>,
+/// Identity of one descriptor-set + pipeline layout, for the life of this
+/// device's caches.
+///
+/// A `Copy` handle and not the layout's bindings, because [`PipelineKey`] and
+/// [`ComputePipelineKey`] carry the layout: a key holding an owned
+/// `Vec<BindingSig>` is a heap allocation and a clone on **every draw**, on a
+/// path whose whole purpose is a lookup that usually hits.
+///
+/// Deliberately not a digest. [`super::digest`]'s own header argues against a
+/// digest standing alone as an identity, and nothing here needs one to:
+/// [`LayoutTable`] issues these in order, retains each layout's bindings, and
+/// compares them on every hit. The digest is the bucket; the bindings decide.
+/// An id can therefore only name a layout that exists, and two distinct
+/// binding sets can never share one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct LayoutId(u32);
+
+/// What a resolved layout gives its caller.
+///
+/// `push_descriptors` travels with the handles rather than being asked again
+/// from the bindings, because it is the flag the `VkDescriptorSetLayout` was
+/// *created* with. Asking twice — once at create, once at bind — is two answers
+/// to one question, and a host whose capability report moved between them would
+/// write an allocated set into a push layout.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolvedLayout {
+    pub id: LayoutId,
+    pub dsl: vk::DescriptorSetLayout,
+    pub pipeline_layout: vk::PipelineLayout,
+    pub push_descriptors: bool,
 }
 
-impl LayoutKey {
-    /// Whether this layout is represented by command-buffer-local push
-    /// descriptors on this device. This same answer creates the layout and
-    /// chooses how every consumer writes it.
-    pub(crate) fn uses_push_descriptors(
-        &self,
-        caps: crate::backend::vulkan::caps::PushDescriptorCaps,
-    ) -> bool {
-        !self.bindings.is_empty() && caps.supports_counts(self.bindings.iter().map(|b| b.count))
+/// A layout create this device refused, kept so the next identical ask replays
+/// the reason rather than paying the driver call again.
+struct LayoutRefusal {
+    bindings: Vec<BindingSig>,
+    push_constant: Option<(u32, u32)>,
+    error: DrawError,
+}
+
+struct LayoutEntry {
+    /// Retained, and compared on every hit. This is what makes [`LayoutId`] an
+    /// identity rather than a fingerprint.
+    bindings: Vec<BindingSig>,
+    /// Reflected compute push-constant byte range. Graphics layouts carry none.
+    push_constant: Option<(u32, u32)>,
+    dsl: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    push_descriptors: bool,
+}
+
+/// Whether a layout with these bindings is represented by command-buffer-local
+/// push descriptors on this device.
+///
+/// Called once, when the layout is created; every later consumer reads
+/// [`ResolvedLayout::push_descriptors`] instead.
+fn layout_uses_push_descriptors(
+    bindings: &[BindingSig],
+    caps: crate::backend::vulkan::caps::PushDescriptorCaps,
+) -> bool {
+    !bindings.is_empty() && caps.supports_counts(bindings.iter().map(|b| b.count))
+}
+
+/// The device's descriptor/pipeline layouts, looked up by a *slice* of binding
+/// signatures rather than by an owned key.
+///
+/// That is the whole reason it is not an [`ObjectCache`]. A `HashMap<LayoutKey,
+/// _>` can only be probed with a `LayoutKey`, so every draw built one — a
+/// `Vec<BindingSig>` — and then cloned it into its pipeline key, which was two
+/// of the last four heap allocations on the steady-state draw path. Bucketing
+/// by a digest of the slice and confirming against retained bindings answers
+/// the same question from a borrowed slice.
+struct LayoutTable {
+    /// Indexed by [`LayoutId`]. Entries are never removed except by
+    /// [`Self::clear`] and [`Self::take_all`], which empty the whole table, so
+    /// an id outstanding in a `PipelineKey` cannot name a hole.
+    entries: Vec<LayoutEntry>,
+    /// Digest of `(push_constant, bindings)` to the ids that digest could name.
+    /// A bucket with more than one entry is a digest collision between
+    /// different layouts, which the comparison below resolves.
+    buckets: HashMap<Digest128, Vec<u32>>,
+    /// Last positive resolve, for the same reason [`ObjectCache::front`] exists:
+    /// a render encoder repeats one layout for long runs, and the front hit
+    /// costs one slice comparison instead of a hash.
+    front: Option<u32>,
+    /// Create failures worth replaying, as `(bindings, push range, error)`.
+    /// A `Vec` and not a map because it is empty on a healthy boot and bounded
+    /// by [`NEGATIVE_CAP`]; scanning it is cheaper than hashing to ask.
+    negative: VecDeque<LayoutRefusal>,
+}
+
+impl LayoutTable {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            buckets: HashMap::new(),
+            front: None,
+            negative: VecDeque::new(),
+        }
+    }
+
+    fn digest(bindings: &[BindingSig], push_constant: Option<(u32, u32)>) -> Digest128 {
+        Digest128::of_items(&push_constant, bindings)
+    }
+
+    fn matches(entry: &LayoutEntry, bindings: &[BindingSig], pc: Option<(u32, u32)>) -> bool {
+        entry.push_constant == pc && entry.bindings == bindings
+    }
+
+    fn resolved(&self, index: u32) -> ResolvedLayout {
+        let entry = &self.entries[index as usize];
+        ResolvedLayout {
+            id: LayoutId(index),
+            dsl: entry.dsl,
+            pipeline_layout: entry.pipeline_layout,
+            push_descriptors: entry.push_descriptors,
+        }
+    }
+
+    fn get(&mut self, bindings: &[BindingSig], pc: Option<(u32, u32)>) -> Option<ResolvedLayout> {
+        if let Some(index) = self.front {
+            if Self::matches(&self.entries[index as usize], bindings, pc) {
+                return Some(self.resolved(index));
+            }
+        }
+        let candidates = self.buckets.get(&Self::digest(bindings, pc))?;
+        let index = *candidates
+            .iter()
+            .find(|index| Self::matches(&self.entries[**index as usize], bindings, pc))?;
+        self.front = Some(index);
+        Some(self.resolved(index))
+    }
+
+    fn insert(
+        &mut self,
+        bindings: &[BindingSig],
+        pc: Option<(u32, u32)>,
+        dsl: vk::DescriptorSetLayout,
+        pipeline_layout: vk::PipelineLayout,
+        push_descriptors: bool,
+    ) -> ResolvedLayout {
+        self.negative
+            .retain(|refusal| !(refusal.push_constant == pc && refusal.bindings == bindings));
+        let index = self.entries.len() as u32;
+        self.entries.push(LayoutEntry {
+            bindings: bindings.to_vec(),
+            push_constant: pc,
+            dsl,
+            pipeline_layout,
+            push_descriptors,
+        });
+        self.buckets
+            .entry(Self::digest(bindings, pc))
+            .or_default()
+            .push(index);
+        self.front = Some(index);
+        self.resolved(index)
+    }
+
+    fn get_negative(&self, bindings: &[BindingSig], pc: Option<(u32, u32)>) -> Option<DrawError> {
+        self.negative
+            .iter()
+            .find(|refusal| refusal.push_constant == pc && refusal.bindings == bindings)
+            .map(|refusal| refusal.error.clone())
+    }
+
+    /// Remember a create failure, under the rule [`ObjectCache::insert_negative`]
+    /// states: a refusal about how full the device is right now is not a fact
+    /// about the request and is not remembered.
+    fn insert_negative(&mut self, bindings: &[BindingSig], pc: Option<(u32, u32)>, err: DrawError) {
+        if err.out_of_memory() {
+            return;
+        }
+        if self.get_negative(bindings, pc).is_some() {
+            return;
+        }
+        if self.negative.len() >= NEGATIVE_CAP {
+            self.negative.pop_front();
+        }
+        self.negative.push_back(LayoutRefusal {
+            bindings: bindings.to_vec(),
+            push_constant: pc,
+            error: err,
+        });
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.buckets.clear();
+        self.front = None;
+        self.negative.clear();
+    }
+
+    fn take_all(&mut self) -> Vec<(vk::DescriptorSetLayout, vk::PipelineLayout)> {
+        self.buckets.clear();
+        self.front = None;
+        self.negative.clear();
+        self.entries
+            .drain(..)
+            .map(|entry| (entry.dsl, entry.pipeline_layout))
+            .collect()
     }
 }
 
+/// Sort by binding number, refuse two different signatures on one binding, and
+/// drop exact duplicates — in place, on the caller's buffer.
+///
+/// In place because both callers hold reusable scratch: a draw's bindings live
+/// in the command buffer's graphics scratch, and returning a fresh `Vec` would
+/// put the allocation back that moving them there removed.
 pub(crate) fn canonicalize_layout_bindings(
-    mut bindings: Vec<BindingSig>,
-) -> Result<Vec<BindingSig>, super::DrawError> {
+    bindings: &mut Vec<BindingSig>,
+) -> Result<(), super::DrawError> {
     bindings.sort_by_key(|binding| binding.binding);
     for pair in bindings.windows(2) {
         if pair[0].binding == pair[1].binding && pair[0] != pair[1] {
@@ -118,7 +313,7 @@ pub(crate) fn canonicalize_layout_bindings(
         }
     }
     bindings.dedup();
-    Ok(bindings)
+    Ok(())
 }
 
 /// Max secondary color attachments (MRT slot 1..): every colour slot Apple's
@@ -670,7 +865,7 @@ pub(crate) struct PipelineKey {
     /// `viewportCount`; [`super::viewport_slot_count`] is the only place that
     /// decides it.
     pub viewport_slots: u32,
-    pub layout: LayoutKey,
+    pub layout: LayoutId,
 }
 
 /// Lc: compute pipeline cache key — SPIR-V content digest + entry name + layout
@@ -684,7 +879,7 @@ pub(crate) struct PipelineKey {
 pub(crate) struct ComputePipelineKey {
     pub spirv: Digest128,
     pub entry: String,
-    pub layout: LayoutKey,
+    pub layout: LayoutId,
     pub local_size: Option<[u32; 3]>,
 }
 
@@ -980,7 +1175,7 @@ impl ShaderDigestIndex {
 
 pub(crate) struct ObjectCaches {
     shaders: ObjectCache<Digest128, vk::ShaderModule>,
-    layouts: ObjectCache<LayoutKey, (vk::DescriptorSetLayout, vk::PipelineLayout)>,
+    layouts: LayoutTable,
     passes: ObjectCache<PassKey, vk::RenderPass>,
     pipelines: ObjectCache<PipelineKey, vk::Pipeline>,
     /// Exact last Vulkan variant for each retained guest pipeline object.
@@ -1437,7 +1632,7 @@ impl ObjectCaches {
     pub(crate) fn new() -> Self {
         Self {
             shaders: ObjectCache::new(),
-            layouts: ObjectCache::new(),
+            layouts: LayoutTable::new(),
             passes: ObjectCache::new(),
             pipelines: ObjectCache::new(),
             pipeline_objects: ObjectVariantIndex::default(),
@@ -1711,24 +1906,32 @@ impl ObjectCaches {
         Ok((key, module))
     }
 
+    /// Resolve the layout these canonical bindings name, creating it once.
+    ///
+    /// Takes a **slice**, not a key: the caller's bindings live in reusable
+    /// scratch, and the returned [`ResolvedLayout::id`] is what its pipeline key
+    /// carries. Takes no `&mut ResourcePools` either, because the only thing the
+    /// old signature used it for was disposing a layout an insert displaced, and
+    /// [`LayoutTable`] appends — a content lookup that missed cannot displace
+    /// the entry it just failed to find.
     pub(crate) unsafe fn get_or_create_layout(
         &mut self,
         ctx: &DeviceContext,
-        key: &LayoutKey,
+        bindings: &[BindingSig],
+        push_constant: Option<(u32, u32)>,
         counters: &EngineCounters,
-        pools: &mut ResourcePools,
-    ) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout), DrawError> {
-        if let Some(err) = self.layouts.get_negative(key) {
+    ) -> Result<ResolvedLayout, DrawError> {
+        if let Some(err) = self.layouts.get_negative(bindings, push_constant) {
             counters.layout_misses.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
-        if let Some((dsl, pl)) = self.layouts.get(key) {
+        if let Some(resolved) = self.layouts.get(bindings, push_constant) {
             counters.layout_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok((dsl, pl));
+            return Ok(resolved);
         }
         counters.layout_misses.fetch_add(1, Ordering::Relaxed);
-        let bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = key
-            .bindings
+        let push_descriptors = layout_uses_push_descriptors(bindings, ctx.caps.push_descriptor);
+        let layout_bindings: Vec<vk::DescriptorSetLayoutBinding<'_>> = bindings
             .iter()
             .map(|b| {
                 vk::DescriptorSetLayoutBinding::default()
@@ -1738,11 +1941,10 @@ impl ObjectCaches {
                     .stage_flags(vk::ShaderStageFlags::from_raw(b.stages))
             })
             .collect();
-        let dsl = if bindings.is_empty() {
+        let dsl = if layout_bindings.is_empty() {
             vk::DescriptorSetLayout::null()
         } else {
-            let binding_flags: Vec<_> = key
-                .bindings
+            let binding_flags: Vec<_> = bindings
                 .iter()
                 .map(|binding| {
                     if binding.count > 1 {
@@ -1755,9 +1957,9 @@ impl ObjectCaches {
             let mut flags = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
                 .binding_flags(&binding_flags);
             let mut create_info = vk::DescriptorSetLayoutCreateInfo::default()
-                .bindings(&bindings)
+                .bindings(&layout_bindings)
                 .push_next(&mut flags);
-            if key.uses_push_descriptors(ctx.caps.push_descriptor) {
+            if push_descriptors {
                 create_info =
                     create_info.flags(vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR);
             }
@@ -1767,19 +1969,19 @@ impl ObjectCaches {
                 .map_err(|e| {
                     let err =
                         DrawError::VkCall(VkCall::new(VkOp::CachesCreateDescriptorSetLayout, e));
-                    self.layouts.insert_negative(key.clone(), err.clone());
+                    self.layouts
+                        .insert_negative(bindings, push_constant, err.clone());
                     err
                 })?;
             counters.note_create(CreateSite::DescriptorSetLayout);
             d
         };
-        let layouts: Vec<vk::DescriptorSetLayout> = if dsl == vk::DescriptorSetLayout::null() {
+        let set_layouts: Vec<vk::DescriptorSetLayout> = if dsl == vk::DescriptorSetLayout::null() {
             Vec::new()
         } else {
             vec![dsl]
         };
-        let push_ranges: Vec<_> = key
-            .push_constant
+        let push_ranges: Vec<_> = push_constant
             .map(|(offset, size)| {
                 vk::PushConstantRange::default()
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -1792,7 +1994,7 @@ impl ObjectCaches {
             .device
             .create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
-                    .set_layouts(&layouts)
+                    .set_layouts(&set_layouts)
                     .push_constant_ranges(&push_ranges),
                 None,
             )
@@ -1801,17 +2003,14 @@ impl ObjectCaches {
                     ctx.device.destroy_descriptor_set_layout(dsl, None);
                 }
                 let err = DrawError::VkCall(VkCall::new(VkOp::CachesCreatePipelineLayout, e));
-                self.layouts.insert_negative(key.clone(), err.clone());
+                self.layouts
+                    .insert_negative(bindings, push_constant, err.clone());
                 err
             })?;
         counters.note_create(CreateSite::PipelineLayout);
-        if let Some((old_dsl, old_pl)) = self.layouts.insert(key.clone(), (dsl, pl)) {
-            pools.dispose(&ctx.device, DeferredHandle::PipelineLayout(old_pl));
-            if old_dsl != vk::DescriptorSetLayout::null() {
-                pools.dispose(&ctx.device, DeferredHandle::DescriptorSetLayout(old_dsl));
-            }
-        }
-        Ok((dsl, pl))
+        Ok(self
+            .layouts
+            .insert(bindings, push_constant, dsl, pl, push_descriptors))
     }
 
     pub(crate) unsafe fn get_or_create_pass(
@@ -2857,8 +3056,8 @@ mod object_cache_tests {
         let caps = crate::backend::vulkan::caps::PushDescriptorCaps {
             max_descriptors: 32,
         };
-        let layout = |counts: &[u32]| LayoutKey {
-            bindings: counts
+        let bindings = |counts: &[u32]| -> Vec<BindingSig> {
+            counts
                 .iter()
                 .enumerate()
                 .map(|(binding, &count)| BindingSig {
@@ -2867,12 +3066,11 @@ mod object_cache_tests {
                     stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
                     count,
                 })
-                .collect(),
-            push_constant: None,
+                .collect()
         };
-        assert!(layout(&[16, 16]).uses_push_descriptors(caps));
-        assert!(!layout(&[16, 17]).uses_push_descriptors(caps));
-        assert!(!layout(&[]).uses_push_descriptors(caps));
+        assert!(layout_uses_push_descriptors(&bindings(&[16, 16]), caps));
+        assert!(!layout_uses_push_descriptors(&bindings(&[16, 17]), caps));
+        assert!(!layout_uses_push_descriptors(&bindings(&[]), caps));
     }
 
     /// Pipeline and live-pass compatibility exclude load actions but retain
@@ -3045,6 +3243,161 @@ mod object_cache_tests {
         );
     }
 
+    /// A `LayoutId` is an identity and not a fingerprint, and this is the claim
+    /// that says so: the table is forced to bucket two *different* layouts
+    /// together, and it still tells them apart.
+    ///
+    /// Buckets are keyed by a digest of the bindings, which is why the question
+    /// exists at all. A cache that stopped at the digest would return the first
+    /// entry in the bucket — a `VkPipelineLayout` built for someone else's
+    /// descriptors — and the draw would bind against a layout it does not match.
+    /// Nothing downstream could notice: the handles are opaque and the draw
+    /// records normally. Retaining the bindings and comparing them is what makes
+    /// that unreachable, and this test reaches into `buckets` to prove the
+    /// comparison is load-bearing rather than waiting for a natural collision.
+    #[test]
+    fn two_layouts_sharing_a_digest_bucket_keep_separate_identities() {
+        use ash::vk::Handle as _;
+        let sig = |binding, count| BindingSig {
+            binding,
+            ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
+            stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count,
+        };
+        let first = vec![sig(0, 1)];
+        let second = vec![sig(1, 2), sig(2, 3)];
+
+        let mut table = LayoutTable::new();
+        let a = table.insert(
+            &first,
+            None,
+            vk::DescriptorSetLayout::from_raw(0x11),
+            vk::PipelineLayout::from_raw(0xaa),
+            true,
+        );
+        let b = table.insert(
+            &second,
+            Some((0, 16)),
+            vk::DescriptorSetLayout::from_raw(0x22),
+            vk::PipelineLayout::from_raw(0xbb),
+            false,
+        );
+        assert_ne!(a.id, b.id);
+
+        // Force the collision the digest is allowed to have and the table is
+        // not: both ids in one bucket, under both digests.
+        let keys: Vec<Digest128> = table.buckets.keys().copied().collect();
+        assert_eq!(keys.len(), 2, "the two layouts digested apart on their own");
+        for key in keys {
+            table.buckets.insert(key, vec![a.id.0, b.id.0]);
+        }
+
+        table.front = None;
+        let found_first = table.get(&first, None).expect("first layout still found");
+        assert_eq!(found_first.id, a.id);
+        assert_eq!(
+            found_first.pipeline_layout,
+            vk::PipelineLayout::from_raw(0xaa)
+        );
+        assert!(found_first.push_descriptors);
+
+        table.front = None;
+        let found_second = table
+            .get(&second, Some((0, 16)))
+            .expect("second layout still found");
+        assert_eq!(found_second.id, b.id);
+        assert_eq!(
+            found_second.pipeline_layout,
+            vk::PipelineLayout::from_raw(0xbb)
+        );
+        assert!(!found_second.push_descriptors);
+
+        // The push range is part of the identity, not decoration: the same
+        // bindings under a different range are a different pipeline layout.
+        table.front = None;
+        assert!(table.get(&second, None).is_none());
+    }
+
+    /// The front index answers without touching a bucket, and it must answer
+    /// about the layout that was actually asked for. A front that matched on
+    /// anything less than the full bindings would hand every draw in a run the
+    /// first layout of that run.
+    #[test]
+    fn the_layout_front_does_not_answer_for_a_different_binding_set() {
+        use ash::vk::Handle as _;
+        let sig = |binding| BindingSig {
+            binding,
+            ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
+            stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count: 1,
+        };
+        let mut table = LayoutTable::new();
+        let a = table.insert(
+            &[sig(0)],
+            None,
+            vk::DescriptorSetLayout::null(),
+            vk::PipelineLayout::from_raw(0xaa),
+            false,
+        );
+        assert_eq!(table.front, Some(a.id.0), "insert primes the front");
+        assert!(
+            table.get(&[sig(1)], None).is_none(),
+            "the front answered for a binding set it does not hold"
+        );
+        assert_eq!(table.get(&[sig(0)], None).map(|found| found.id), Some(a.id));
+    }
+
+    /// A create failure is replayed for the bindings that produced it and for no
+    /// others, and a refusal about how full the device is right now is not
+    /// remembered at all — the rule `ObjectCache::insert_negative` states, which
+    /// the layout table had to restate because it is not an `ObjectCache`.
+    #[test]
+    fn a_layout_refusal_is_replayed_only_for_its_own_bindings() {
+        use ash::vk::Handle as _;
+        let sig = |binding| BindingSig {
+            binding,
+            ty: vk::DescriptorType::STORAGE_BUFFER.as_raw() as u32,
+            stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
+            count: 1,
+        };
+        let mut table = LayoutTable::new();
+        table.insert_negative(
+            &[sig(0)],
+            None,
+            DrawError::VkCall(VkCall::new(
+                VkOp::CachesCreatePipelineLayout,
+                vk::Result::ERROR_UNKNOWN,
+            )),
+        );
+        assert!(table.get_negative(&[sig(0)], None).is_some());
+        assert!(table.get_negative(&[sig(1)], None).is_none());
+        assert!(table.get_negative(&[sig(0)], Some((0, 4))).is_none());
+
+        table.insert_negative(
+            &[sig(2)],
+            None,
+            DrawError::VkCall(VkCall::new(
+                VkOp::CachesCreatePipelineLayout,
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            )),
+        );
+        assert!(
+            table.get_negative(&[sig(2)], None).is_none(),
+            "out of memory describes this instant, not the request"
+        );
+
+        // A later success clears the refusal, so a device that recovers is not
+        // answered from a memory of when it had not.
+        table.insert(
+            &[sig(0)],
+            None,
+            vk::DescriptorSetLayout::null(),
+            vk::PipelineLayout::from_raw(0xaa),
+            false,
+        );
+        assert!(table.get_negative(&[sig(0)], None).is_none());
+    }
+
     #[test]
     fn layout_bindings_coalesce_array_elements_and_refuse_conflicting_shapes() {
         let sig = |count| BindingSig {
@@ -3053,12 +3406,12 @@ mod object_cache_tests {
             stages: vk::ShaderStageFlags::COMPUTE.as_raw(),
             count,
         };
-        assert_eq!(
-            canonicalize_layout_bindings(vec![sig(8), sig(8)]),
-            Ok(vec![sig(8)])
-        );
+        let mut duplicated = vec![sig(8), sig(8)];
+        assert_eq!(canonicalize_layout_bindings(&mut duplicated), Ok(()));
+        assert_eq!(duplicated, vec![sig(8)]);
+        let mut conflicting = vec![sig(8), sig(4)];
         assert!(matches!(
-            canonicalize_layout_bindings(vec![sig(8), sig(4)]),
+            canonicalize_layout_bindings(&mut conflicting),
             Err(super::super::DrawError::Unsupported(
                 super::super::reason::DrawReason::DescriptorBindingConflict {
                     binding: 32,

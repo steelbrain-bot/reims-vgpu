@@ -2506,6 +2506,27 @@ impl ResourcePools {
         self.cb_graphics.vertex_binds.push((binding, bound));
     }
 
+    /// Begin a draw's layout-binding list, discarding the previous draw's, and
+    /// hand it over to be filled.
+    ///
+    /// `&mut` rather than a `stage_*` call per binding, because unlike the bind
+    /// lists the caller must also *canonicalize* this one — sort, refuse a
+    /// conflict, dedup — and a per-item setter cannot express that.
+    pub(in crate::backend::vulkan::engine) fn layout_bindings_scratch(
+        &mut self,
+    ) -> &mut Vec<super::super::caches::BindingSig> {
+        self.cb_graphics.layout_bindings.clear();
+        &mut self.cb_graphics.layout_bindings
+    }
+
+    /// The canonical bindings the recording draw declared, for the layout
+    /// lookup and the checks around it.
+    pub(in crate::backend::vulkan::engine) fn layout_bindings(
+        &self,
+    ) -> &[super::super::caches::BindingSig] {
+        &self.cb_graphics.layout_bindings
+    }
+
     /// Begin a draw's storage-bind list, discarding the previous draw's.
     pub(crate) fn begin_storage_binds(&mut self) {
         self.cb_graphics.storage_binds.clear();

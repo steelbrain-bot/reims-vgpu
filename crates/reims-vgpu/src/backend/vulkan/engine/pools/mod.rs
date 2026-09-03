@@ -950,6 +950,13 @@ pub(crate) struct CbGraphicsState {
     /// holding one from here and the other as a local could not hand both to one
     /// function without borrowing this struct twice.
     storage_binds: Vec<(u32, super::exec::BoundBuffer, u64)>,
+    /// The descriptor-layout binding signatures the recording draw declares,
+    /// canonicalized in place. Scratch, like the two above it.
+    ///
+    /// The layout cache is looked up by a *slice* of these, so this is the
+    /// buffer that lookup borrows from — and it is why the cache had to stop
+    /// being keyed by an owned `LayoutKey`.
+    layout_bindings: Vec<super::caches::BindingSig>,
 }
 
 impl CbGraphicsState {
@@ -992,6 +999,7 @@ impl CbGraphicsState {
             vertex_offsets: _,
             vertex_binds: _,
             storage_binds: _,
+            layout_bindings: _,
         } = self;
         *pipeline = None;
         *pipeline_layout = None;
@@ -1288,8 +1296,6 @@ pub(crate) enum DeferredHandle {
     ImageView(vk::ImageView),
     Framebuffer(vk::Framebuffer),
     Pipeline(vk::Pipeline),
-    PipelineLayout(vk::PipelineLayout),
-    DescriptorSetLayout(vk::DescriptorSetLayout),
     RenderPass(vk::RenderPass),
     ShaderModule(vk::ShaderModule),
     Sampler(vk::Sampler),
@@ -1313,8 +1319,6 @@ impl DeferredHandle {
             | Self::GuestAllocationBarrier(_)
             | Self::Framebuffer(_)
             | Self::Pipeline(_)
-            | Self::PipelineLayout(_)
-            | Self::DescriptorSetLayout(_)
             | Self::RenderPass(_)
             | Self::ShaderModule(_)
             | Self::Sampler(_) => None,
@@ -1387,10 +1391,6 @@ impl ResourcePools {
             DeferredHandle::ImageView(view) => device.destroy_image_view(view, None),
             DeferredHandle::Framebuffer(fb) => device.destroy_framebuffer(fb, None),
             DeferredHandle::Pipeline(p) => device.destroy_pipeline(p, None),
-            DeferredHandle::PipelineLayout(pl) => device.destroy_pipeline_layout(pl, None),
-            DeferredHandle::DescriptorSetLayout(dsl) => {
-                device.destroy_descriptor_set_layout(dsl, None)
-            }
             DeferredHandle::RenderPass(rp) => device.destroy_render_pass(rp, None),
             DeferredHandle::ShaderModule(s) => device.destroy_shader_module(s, None),
             DeferredHandle::Sampler(s) => device.destroy_sampler(s, None),

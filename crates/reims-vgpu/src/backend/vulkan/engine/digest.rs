@@ -74,6 +74,44 @@ impl Digest128 {
             Self::of_bytes(&bytes)
         }
     }
+
+    /// Digest of a slice of hashable items and the context they belong to,
+    /// without materializing their bytes.
+    ///
+    /// For a caller whose content is already typed — a descriptor layout's
+    /// binding signatures, say — rather than a byte or word buffer. Building
+    /// that buffer to reach [`Self::of_bytes`] would be a heap allocation on a
+    /// path whose whole reason for wanting a digest is that it runs per draw.
+    ///
+    /// **A bucket, not an identity**, and here that is not a caveat: the caller
+    /// this exists for retains its items and compares them on a hit, exactly as
+    /// this module's header argues a digest user should. `len` is the item
+    /// count, not a byte count, so two digests are comparable only within one
+    /// item type.
+    pub fn of_items<C: Hash, T: Hash>(context: &C, items: &[T]) -> Self {
+        let mut ha = DefaultHasher::new();
+        0x9e37_79b9_7f4a_7c15u64.hash(&mut ha);
+        context.hash(&mut ha);
+        items.hash(&mut ha);
+        let a = ha.finish();
+
+        let mut hb = DefaultHasher::new();
+        0xc2b2_ae3d_27d4_eb4fu64.hash(&mut hb);
+        // Reverse order, as `of_bytes` does, so a collision in `a` alone does
+        // not imply one in `b`.
+        for item in items.iter().rev() {
+            item.hash(&mut hb);
+        }
+        context.hash(&mut hb);
+        items.len().hash(&mut hb);
+        let b = hb.finish();
+
+        Self {
+            a,
+            b,
+            len: items.len() as u64,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +124,21 @@ mod tests {
         let b = Digest128::of_bytes(b"world");
         assert_ne!(a, b);
         assert_eq!(a, Digest128::of_bytes(b"hello"));
+    }
+
+    #[test]
+    fn item_digest_separates_order_content_and_length() {
+        let base = [1u32, 2, 3];
+        let d = |items: &[u32]| Digest128::of_items(&0u8, items);
+        assert_eq!(d(&base), d(&[1, 2, 3]));
+        assert_ne!(d(&base), d(&[3, 2, 1]), "order");
+        assert_ne!(d(&base), d(&[1, 2, 4]), "content");
+        assert_ne!(d(&base), d(&[1, 2, 3, 3]), "length");
+        assert_ne!(
+            Digest128::of_items(&0u8, &base),
+            Digest128::of_items(&1u8, &base),
+            "context"
+        );
     }
 
     #[test]

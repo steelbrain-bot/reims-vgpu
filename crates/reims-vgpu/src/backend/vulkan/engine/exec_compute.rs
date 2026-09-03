@@ -6,9 +6,7 @@ use ash::vk;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
-use super::caches::{
-    canonicalize_layout_bindings, BindingSig, ComputePipelineKey, LayoutKey, ObjectCaches,
-};
+use super::caches::{canonicalize_layout_bindings, BindingSig, ComputePipelineKey, ObjectCaches};
 use super::compute_execution::ComputeExecutionDecline;
 use super::compute_validation::ComputeValidationDecline;
 use super::context::ContextOwner;
@@ -419,7 +417,7 @@ pub(crate) unsafe fn execute_compute_inner(
             count: img.descriptor_count,
         });
     }
-    let layout_bindings = canonicalize_layout_bindings(layout_bindings)?;
+    canonicalize_layout_bindings(&mut layout_bindings)?;
     for binding in layout_bindings.iter().filter(|binding| binding.count > 1) {
         let descriptor_type = vk::DescriptorType::from_raw(binding.ty as i32);
         let dynamic_indexing = match descriptor_type {
@@ -469,13 +467,11 @@ pub(crate) unsafe fn execute_compute_inner(
         ));
     }
 
-    let layout_key = LayoutKey {
-        bindings: layout_bindings,
-        push_constant: req.dispatch.push_constant_range(),
-    };
+    let push_constant = req.dispatch.push_constant_range();
 
     let (spirv_digest, module) = caches.get_or_create_shader(ctx, &req.spirv, counters, pools)?;
-    let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
+    let layout = caches.get_or_create_layout(ctx, &layout_bindings, push_constant, counters)?;
+    let (dsl, pipeline_layout) = (layout.dsl, layout.pipeline_layout);
     let shader_source = super::caches::ShaderModuleSource {
         module,
         spirv: &req.spirv,
@@ -491,7 +487,7 @@ pub(crate) unsafe fn execute_compute_inner(
             let cpipe_key = ComputePipelineKey {
                 spirv: spirv_digest,
                 entry: req.entry.clone(),
-                layout: layout_key.clone(),
+                layout: layout.id,
                 local_size: None,
             };
             dispatch_steps.push(DispatchStep {
@@ -517,7 +513,7 @@ pub(crate) unsafe fn execute_compute_inner(
                 let cpipe_key = ComputePipelineKey {
                     spirv: spirv_digest,
                     entry: req.entry.clone(),
-                    layout: layout_key.clone(),
+                    layout: layout.id,
                     local_size: Some(region.local_size),
                 };
                 dispatch_steps.push(DispatchStep {
@@ -815,7 +811,7 @@ pub(crate) unsafe fn execute_compute_inner(
         });
     }
 
-    let push_descriptors = layout_key.uses_push_descriptors(ctx.caps.push_descriptor);
+    let push_descriptors = layout.push_descriptors;
     // Owning pool block travels with an allocated set for a correctly-routed
     // free. A push layout records its writes into the command buffer instead.
     let mut dset_pool: Option<vk::DescriptorPool> = None;
