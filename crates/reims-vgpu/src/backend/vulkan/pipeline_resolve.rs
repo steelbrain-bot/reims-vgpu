@@ -98,7 +98,7 @@ pub struct VertexBindPlan {
 }
 
 impl VertexBindPlan {
-    fn build(desc: &RenderPipelineDescriptor) -> Self {
+    pub(crate) fn build(desc: &RenderPipelineDescriptor) -> Self {
         let mut constant_step: Vec<u32> = desc
             .vertex_attributes
             .iter()
@@ -498,6 +498,42 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     })
 }
 
+/// The publish half of [`ready`], skipped when the pre-scan already answered.
+///
+/// Split out so the gate and the work are one statement: a caller that checked
+/// the gate and then built the tables anyway would pay for them twice, and a
+/// caller that built them and let the model refuse the write would pay for them
+/// on every resolve.
+fn publish_usage_if_unpublished<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    resolved: &ResolvedRenderPipeline,
+) {
+    let Some(name) = crate::runtime::objects::name_resource(state, host, task_id, pipeline_ref)
+    else {
+        note_store_route("pipeline_usage_unnamed");
+        return;
+    };
+    if state.pipeline_usage_published(name) {
+        note_store_route("render_usage_already_published");
+        return;
+    }
+    let (usage, refusals) = crate::backend::vulkan::binding_usage::render(
+        &resolved.vertex.reflection,
+        &resolved.bind_plan,
+        &resolved.fragment.reflection,
+    );
+    for refusal in refusals.into_iter().flatten() {
+        // A stage that cannot be published is a stage left at `Unknown`, which
+        // costs ordering and never correctness — so it is counted rather than
+        // failed, and the count is what says which reason is worth closing.
+        note_store_route(refusal.slug());
+    }
+    crate::runtime::draw::publish_pipeline_usage(state, host, task_id, pipeline_ref, usage);
+}
+
 /// Tell the ordering plane this pipeline is usable, which releases the exec
 /// transactions parked on its lease.
 ///
@@ -508,6 +544,14 @@ fn resolve_uncached<M: HostMemory + HostOps>(
 /// transaction lease this pipeline, and the walk asks for the reflection once
 /// at admission and never again. So a lease taken between the two would carry
 /// a footprint that stays `Unknown` for the life of that transaction.
+///
+/// **This is the later of the two publish sites, and the fallback.**
+/// `runtime::exec::vulkan::publish_render_usage` publishes from the pre-scan,
+/// which runs before admission readies the lease and is therefore in front of
+/// the draw that would otherwise miss it. This site is what answers on a path
+/// with no pre-scan — the memo-off ablation, and a direct resolve. The model's
+/// `pipeline_usage_published` is the single arbiter, so the pipeline's binding
+/// set is enumerated once whichever site reaches it first.
 fn ready<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -515,19 +559,7 @@ fn ready<M: HostMemory + HostOps>(
     pipeline_ref: u32,
     resolved: &ResolvedRenderPipeline,
 ) {
-    let (usage, refusals) = crate::backend::vulkan::binding_usage::render(
-        &resolved.vertex.reflection,
-        &resolved.bind_plan,
-        &resolved.fragment.reflection,
-    );
-    for refusal in refusals.into_iter().flatten() {
-        // A stage that cannot be published is a stage left at `Unknown`, which
-        // costs ordering and never correctness — so it is counted rather than
-        // failed, and the count is what says which of the three reasons is
-        // worth closing.
-        note_store_route(refusal.slug());
-    }
-    crate::runtime::draw::publish_pipeline_usage(state, host, task_id, pipeline_ref, usage);
+    publish_usage_if_unpublished(state, host, task_id, pipeline_ref, resolved);
     crate::runtime::draw::advance_pipeline(
         state,
         host,

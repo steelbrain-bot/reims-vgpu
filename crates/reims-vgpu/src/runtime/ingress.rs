@@ -2031,6 +2031,11 @@ mod tests {
                 .find(|row| LifecycleKind::of(row.channel, row.opcode) == Some(want))
                 .expect("the ledger has a row for every settled lifetime kind")
         };
+        // A device only so the census can ask what the model thinks of a
+        // pipeline a draw left unanswered. This fixture's packets are lifetime
+        // packets and bind none, so the answer is never reached — the argument
+        // is what the counting door takes, not what this test is about.
+        let device = crate::model::DeviceState::new(crate::model::DeviceId(1), 12);
         let counted = |want: LifecycleKind| {
             let row = row_of(want);
             let fifo = fifo_for(row.channel);
@@ -2047,7 +2052,7 @@ mod tests {
                 store_route_count("access_mode_read_write"),
                 store_route_count("access_mode_unknown"),
             ];
-            note_access_modes(&built);
+            note_access_modes(&device, &built);
             [
                 store_route_count("access_mode_read") - before[0],
                 store_route_count("access_mode_write") - before[1],

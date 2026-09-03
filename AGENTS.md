@@ -100,57 +100,6 @@ classes, or guest rails. Vulkan 1.2 is the baseline; newer functionality require
 capability-gated fallback. Host-pointer import is optional, and guest-visible semantics must be the
 same on imported and copying paths.
 
-## Wire a finished subsystem immediately
-
-The replacement architecture is landing subsystem by subsystem, and each one **joins production in
-the commit that finishes it**. A subsystem that exists but is reachable only from its own tests has
-not been verified against a guest; a release that switches thirty of them at once has no bisect
-that can attribute a regression to one. So a subsystem is done when its legacy counterpart is gone
-or delegates to it — not when it compiles.
-
-What this does *not* license is two semantic models running at once. No per-packet feature switch
-choosing between executors, no shadow execution that mutates state twice, no adapter translating
-between an old model and a new one. A call site that *replaces* its own logic with a call into the
-owning crate creates no second model, and is the shape to reach for.
-
-Wire in order of how little state moves. A pure translation or plan module — a function of its
-inputs returning a value — wires first: the caller keeps its ownership and loses only its duplicate
-arithmetic, so a regression points at one table. Modules owning handles, caches, or submission
-lifetimes wire once the model that owns those lifetimes is in place, because they cannot be split.
-
-The same rule decides how the final ingress switch is cut. **A packet class moves to the new model
-alone exactly when nothing it owns is ordered against, or shares mutable state with, anything still
-on the legacy path. Classes that do share such state move together, and that group — not
-"everything" — is the atomic unit.** Two models are dangerous because they can disagree about one
-piece of state; where there is no shared state there is nothing to disagree about, and holding a
-disjoint class back buys no safety while costing the bisect it could have provided.
-
-State the disjointness before moving a group and make it hold structurally — named owners, not an
-argument that the current call sites happen not to overlap. If it cannot be made to hold, the group
-is larger than it looked: enlarge it rather than move anyway. Within a group the switch is atomic
-and the legacy counterpart is disconnected in the same commit. Order the groups by how little state
-they move; the ordering and publication core is last, and carries the scheduler's deletion.
-
-**Disconnect, do not delete — amending "the legacy counterpart is deleted in the same commit"
-above, and the plan's Seam 6.** In the commit that wires a group, move its legacy files to
-`crates/<crate>/src/dead/` and remove every `mod` declaration that reaches them. `dead/` does not
-compile, is not feature-gated, and is not linkable; it is source to read. Unreachability by
-construction is what the prohibition on two semantic models needs, and it is what a removed `mod`
-gives — a flag or a `cfg` would give the prohibition's opposite.
-
-Each move appends a row to `crates/<crate>/src/dead/README.md` naming what moved, which commit
-replaced it, and which new owner-level tests replaced the legacy tests that moved with it. Those
-tests stop running the moment they move, so a group that ships without that replacement coverage
-has silently lost it and the row is where that is caught. Name each replacing test as ``fn `name` ``:
-the `fn` is what `dead_is_unreachable_by_construction` reads to tell a promise about a function from
-the prose beside it, and a name written without it is a claim nothing checks.
-
-Nothing is resurrected from `dead/`, and no build-time or run-time switch may reach it. When a live
-boot regresses, `dead/` is read to learn what the old code did and the fix lands in the new owner.
-`dead/` is deleted wholesale, in one commit, once every group has moved and the plan's gates are
-green — never pruned incrementally, because a half-emptied `dead/` reads as "these were the ones
-worth keeping".
-
 ## Working and verification
 
 Use a workflow proportionate to the change:

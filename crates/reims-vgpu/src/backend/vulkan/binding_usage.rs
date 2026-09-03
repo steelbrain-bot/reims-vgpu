@@ -19,8 +19,11 @@
 //! silently delete the participations it left out, and a deleted participation
 //! is a missing hazard edge rather than a coarser one.
 //!
-//! That is why every unhandled case here refuses the stage rather than skipping
-//! the binding.
+//! That is why a binding this mapping cannot place refuses the stage rather
+//! than being skipped. The only bindings left out are the ones whose index
+//! cannot be a guest slot at all — sampler state, a framebuffer fetch, and the
+//! translator's two band placeholders — where leaving them out says nothing
+//! about a slot the guest can spell.
 //!
 //! # The vertex fetch is not in the reflection, and it still reads
 //!
@@ -36,6 +39,15 @@
 //! union. A slot in it that the reflection did not describe is a read, because
 //! the fetch reads it; a slot both describe keeps the shader's answer, which is
 //! never weaker.
+//!
+//! # The compute fetch has the same hole and no descriptor to fill it
+//!
+//! A kernel `[[stage_in]]` is the same fixed-function read, and the compute
+//! pipeline's stage-input descriptor is the vertex descriptor's twin — but it
+//! does not reach here, and the reflection's index for the kind is one the
+//! translator invented rather than one the guest spelled. So a kernel that
+//! declares one refuses instead of publishing a table missing the slot the
+//! guest actually bound. See [`UnpublishableStage::KernelStageInput`].
 
 use reims_vgpu_core::access::AccessMode;
 use reims_vgpu_core::pipeline::{BindingUsage, PublishedUsage};
@@ -54,9 +66,31 @@ pub(crate) enum UnpublishableStage {
     /// A binding whose Metal index is synthesized rather than the guest's, so
     /// it cannot be placed in a table the guest's slot numbers index.
     SyntheticIndex,
-    /// A binding kind this mapping has no row for. New kinds arrive with the
-    /// translator; the stage stays conservative until one is written.
-    UnknownKind,
+    /// A kernel `[[stage_in]]` attribute array: the fixed-function compute
+    /// fetch, and the compute form of the problem the vertex stage solves with
+    /// [`VertexBindPlan::attribute_slots`].
+    ///
+    /// **The contract term this is missing.** Metal supplies stage-input data
+    /// through ordinary buffer-table slots the *pipeline descriptor* selects,
+    /// and the reflection cannot name those: its `metal_index` for this kind is
+    /// a slot allocated as the lowest index the kernel's own declared buffers
+    /// do not occupy, which is a translator ABI decision and not a number the
+    /// guest ever spelled. So the guest binds a buffer the dispatch reads and
+    /// the table has no row that names it.
+    ///
+    /// Publishing anyway would call that slot unreferenced and delete a read
+    /// edge, so the stage is refused whole. What closes it is the compute
+    /// pipeline's stage-input descriptor — the compute twin of the vertex
+    /// descriptor — which this device decodes for the dispatch and does not
+    /// hand to this mapping.
+    KernelStageInput,
+    /// An authored acceleration structure or function table bound as an object
+    /// rather than as bytes this device placed.
+    ///
+    /// It occupies a buffer index, so leaving it out of the table would read as
+    /// unreferenced — and this mapping has no basis for saying that about a
+    /// binding whose guest-side resource class it does not model.
+    AuthoredObject,
     /// A slot number that does not fit the table this builds. The guest may
     /// bind any slot — nothing refuses a high one — so this is a real answer
     /// and not an impossibility.
@@ -67,7 +101,8 @@ impl UnpublishableStage {
     pub(crate) const fn slug(self) -> &'static str {
         match self {
             Self::SyntheticIndex => "binding_usage_synthetic_index",
-            Self::UnknownKind => "binding_usage_unknown_kind",
+            Self::KernelStageInput => "binding_usage_kernel_stage_in",
+            Self::AuthoredObject => "binding_usage_authored_object",
             Self::SlotTooHigh => "binding_usage_slot_too_high",
         }
     }
@@ -182,16 +217,37 @@ fn stage_tables(reflection: &ShaderReflection) -> Result<Tables, UnpublishableSt
                     },
                 )?;
             }
-            // Bind no memory the footprint is about. `Sampler` and
-            // `StaticSampler` are sampler state; `ColorInput` is a framebuffer
-            // fetch the pass already orders. None of the three is in the
-            // encoder's buffer or texture table, so leaving them out of both
-            // says nothing about a slot.
-            ResourceKind::Sampler | ResourceKind::StaticSampler | ResourceKind::ColorInput => {}
-            ResourceKind::EmbeddedArgBufferTexture => {
-                return Err(UnpublishableStage::SyntheticIndex)
-            }
-            _ => return Err(UnpublishableStage::UnknownKind),
+            // Bind no memory the footprint is about, and none of them can
+            // shadow a guest slot. `Sampler` and `StaticSampler` are sampler
+            // state; `ColorInput` is a framebuffer fetch the pass already
+            // orders. The two synthesized placeholders sit at the first binding
+            // in their band that no Metal resource claims, which is by
+            // construction an index the guest did not bind — so leaving all
+            // five out of both tables says nothing about a slot the guest can
+            // spell.
+            ResourceKind::Sampler
+            | ResourceKind::StaticSampler
+            | ResourceKind::ColorInput
+            | ResourceKind::SynthesizedNullTexture
+            | ResourceKind::SynthesizedReadSampler => {}
+            // Indices the translator invented. Placing one would answer for
+            // whatever the guest bound at the same number, and the answer would
+            // be *narrower* than `Unknown`, which is the direction that loses
+            // edges.
+            ResourceKind::EmbeddedArgBufferTexture
+            | ResourceKind::EmbeddedArgBufferBuffer
+            | ResourceKind::BufferAddressTable => return Err(UnpublishableStage::SyntheticIndex),
+            ResourceKind::KernelStageInput => return Err(UnpublishableStage::KernelStageInput),
+            ResourceKind::PrimitiveAccelerationStructure
+            | ResourceKind::VisibleFunctionTable
+            | ResourceKind::IntersectionFunctionTable => {
+                return Err(UnpublishableStage::AuthoredObject)
+            } // No wildcard, on purpose. `ResourceKind` is exhaustively named
+              // above, so a translator that grows a kind fails to *compile* here
+              // rather than quietly answering `Unknown` for it — which is the
+              // difference between a decision this mapping made and one it never
+              // noticed it was making. The compiler is the only reader that can
+              // catch that at the moment the kind arrives.
         }
     }
     Ok((buffers, textures))
@@ -242,6 +298,18 @@ pub(crate) fn render(
     let f = stage_usage(fragment);
     let refusals = [v.as_ref().err().copied(), f.as_ref().err().copied()];
     (PublishedUsage::render(v.ok(), f.ok()), refusals)
+}
+
+/// What this rail can say about one compute pipeline, or why it cannot.
+///
+/// One stage and no widening: a dispatch has no fixed-function fetch, so the
+/// kernel's reflection is the whole of what it reads and writes and there is no
+/// second table to union in. Whole or nothing for the reason the module doc
+/// gives, which is why this is a `Result` rather than the render arm's pair —
+/// a compute pipeline with a refused stage publishes nothing at all, and
+/// nothing is what leaves the dispatch's slots `Unknown`.
+pub(crate) fn compute(kernel: &ShaderReflection) -> Result<PublishedUsage, UnpublishableStage> {
+    stage_usage(kernel).map(PublishedUsage::compute)
 }
 
 #[cfg(test)]
@@ -375,5 +443,110 @@ mod tests {
             "named only by the attribute list, and the fetch reads it"
         );
         assert_eq!(usage.buffer(1), None, "named by neither");
+    }
+
+    /// A kernel publishes its own stage and neither render one.
+    ///
+    /// The distinction the `PublishedUsage` shape exists for: asking a compute
+    /// pipeline for its vertex stage must answer "not published" rather than
+    /// "published, references nothing", because the second would delete every
+    /// participation a mis-staged reader asked about.
+    #[test]
+    fn a_kernel_publishes_the_compute_stage_and_leaves_the_render_stages_unpublished() {
+        use reims_vgpu_protocol::render::ShaderStage;
+
+        let r = reflection(vec![
+            binding(ResourceKind::Buffer, 0, Some(ResourceAccess::ReadOnly)),
+            binding(
+                ResourceKind::StorageImage,
+                2,
+                Some(ResourceAccess::WriteOnly),
+            ),
+            binding(ResourceKind::ThreadgroupBuffer, 4, None),
+        ]);
+        let published = compute(&r).expect("every kind here has a row");
+        let kernel = published
+            .stage(None)
+            .expect("the compute stage is the one this publishes");
+        assert_eq!(kernel.buffer(0), Some(AccessMode::Read));
+        assert_eq!(
+            kernel.buffer(4),
+            Some(AccessMode::Unknown),
+            "threadgroup memory occupies a buffer index and binds no guest              resource, so it is declared rather than left to read as unreferenced"
+        );
+        assert_eq!(kernel.texture(2), Some(AccessMode::Write));
+        assert_eq!(kernel.texture(0), None, "no binding names it");
+        assert!(
+            published.stage(Some(ShaderStage::Vertex)).is_none()
+                && published.stage(Some(ShaderStage::Fragment)).is_none(),
+            "a dispatch has no render stages, and 'unpublished' is the true              answer rather than an empty table"
+        );
+    }
+
+    /// A kernel this mapping cannot enumerate whole publishes nothing.
+    ///
+    /// One stage means there is no partial answer to keep: the render arm can
+    /// publish a vertex table while the fragment one refuses, because each is
+    /// exactly true on its own. A refused kernel leaves the dispatch's slots
+    /// `Unknown`, which is what a table stopping short would silently not do.
+    #[test]
+    fn a_kernel_with_an_unenumerable_binding_publishes_nothing_at_all() {
+        let r = reflection(vec![
+            binding(ResourceKind::Buffer, 0, Some(ResourceAccess::ReadOnly)),
+            binding(
+                ResourceKind::EmbeddedArgBufferTexture,
+                1,
+                Some(ResourceAccess::Sampled),
+            ),
+        ]);
+        assert_eq!(compute(&r), Err(UnpublishableStage::SyntheticIndex));
+    }
+
+    /// The compute fixed-function fetch refuses the stage, and is told apart
+    /// from every other synthetic index.
+    ///
+    /// It is the vertex fetch's problem with no vertex descriptor to solve it:
+    /// the guest binds the stage-input buffer at a slot its *pipeline*
+    /// descriptor names, while the reflection's index for the kind is the
+    /// lowest one the kernel's own buffers leave free. Publishing would call
+    /// the guest's slot unreferenced and delete a read edge, so this refuses —
+    /// and it carries its own reason because it is the one of these with a
+    /// known way to close it.
+    #[test]
+    fn a_kernel_stage_in_refuses_the_stage_under_its_own_reason() {
+        let r = reflection(vec![
+            binding(ResourceKind::Buffer, 1, Some(ResourceAccess::ReadOnly)),
+            binding(ResourceKind::KernelStageInput, 0, None),
+        ]);
+        assert_eq!(compute(&r), Err(UnpublishableStage::KernelStageInput));
+        assert_eq!(
+            UnpublishableStage::KernelStageInput.slug(),
+            "binding_usage_kernel_stage_in"
+        );
+    }
+
+    /// The translator's two placeholders are skipped, not refused.
+    ///
+    /// Each sits at the first binding in its band that no Metal resource
+    /// claims, so its index is by construction one the guest did not bind.
+    /// Leaving them out of both tables says nothing about a slot the guest can
+    /// spell, and refusing for them would cost every other slot of the stage
+    /// its answer for nothing.
+    #[test]
+    fn the_translators_placeholders_cost_the_stage_nothing() {
+        let r = reflection(vec![
+            binding(ResourceKind::Buffer, 0, Some(ResourceAccess::ReadOnly)),
+            binding(ResourceKind::SynthesizedNullTexture, 7, None),
+            binding(ResourceKind::SynthesizedReadSampler, 7, None),
+        ]);
+        let published = compute(&r).expect("a placeholder is not a refusal");
+        let kernel = published.stage(None).expect("the compute stage");
+        assert_eq!(kernel.buffer(0), Some(AccessMode::Read));
+        assert_eq!(
+            kernel.texture(7),
+            None,
+            "the placeholder binds no guest texture, and its band index is one \
+             no Metal texture claims"
+        );
     }
 }

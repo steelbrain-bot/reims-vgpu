@@ -2214,7 +2214,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
         false
     });
-    note_access_modes(&built);
+    note_access_modes(state, &built);
     // The pipelines the records bind, told to the model before it is asked
     // whether the packet may run: `PipelineTable::waits_for` refuses a lease it
     // has no entry for, and the entry is this device's to make. The list is the
@@ -2233,6 +2233,21 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // against a shader that is still translating, which is the
     // `m2v_translation_pending_at_sync_boundary` loss measured on a driven
     // macos-15 desktop.
+    //
+    // **Declared before the rail pre-scans, not after.** The pre-scan is where
+    // a rail first holds a translated shader, and publishing what that shader
+    // reads is refused for a pipeline the table does not yet hold — so
+    // declaring afterwards would make the model's own stated order (publish,
+    // then ready) unreachable on the packet that first builds the kernel. The
+    // step is the guest's fact and the walk's own list; taking it earlier
+    // states the same thing at the first moment it is known.
+    for &lease in leases {
+        note_store_route(if state.declare_pipeline(lease) {
+            "pipeline_declared"
+        } else {
+            "pipeline_declared_already"
+        });
+    }
     let translating = match (arrived.submission.as_ref(), built.payload.exec()) {
         (Some(submission), Some(resolved)) => {
             let mut measured_ns = 0u64;
@@ -2247,11 +2262,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
         _ => Vec::new(),
     };
     for &lease in leases {
-        note_store_route(if state.declare_pipeline(lease) {
-            "pipeline_declared"
-        } else {
-            "pipeline_declared_already"
-        });
         if translating.contains(&lease.slot.0) {
             withdraw_lease(state, lease);
         } else if translating.is_empty() {
@@ -2321,7 +2331,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
 /// a count taken at the encoder would include intents a payload never carried.
 ///
 /// See fn `an_unknown_mode_access_is_counted_apart_from_a_known_one`.
-pub(crate) fn note_access_modes(built: &reims_vgpu_core::session::Packet) {
+pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::session::Packet) {
     use reims_vgpu_core::access::AccessMode;
     for access in built.payload.accesses() {
         note_store_route(match access.mode {
@@ -2330,6 +2340,65 @@ pub(crate) fn note_access_modes(built: &reims_vgpu_core::session::Packet) {
             AccessMode::ReadWrite => "access_mode_read_write",
             AccessMode::Unknown => "access_mode_unknown",
         });
+    }
+    // Why the `Unknown`s above are `Unknown`, from the walk that decided it.
+    //
+    // The total is what the ordering plane is judged on and it says nothing
+    // about what to fix. A draw the walk never saw bind a pipeline and a draw
+    // whose shader the rail could not reflect both contribute every slot they
+    // bind, and the two have nothing in common: the first is a hole in the
+    // walk's own encoder state, the second is a contract term the rail has not
+    // recovered. Reported apart so the next move is aimed rather than guessed.
+    let Some(work) = built.payload.exec() else {
+        return;
+    };
+    let census = &work.usage_census;
+    for (route, n) in [
+        ("draw_usage_no_pipeline", census.draws_without_a_pipeline),
+        ("draw_usage_no_stage", census.draws_with_no_stage_published),
+        (
+            "draw_usage_one_stage",
+            census.draws_with_one_stage_published,
+        ),
+        (
+            "draw_usage_both_stages",
+            census.draws_with_both_stages_published,
+        ),
+        (
+            "dispatch_usage_no_pipeline",
+            census.dispatches_without_a_pipeline,
+        ),
+        (
+            "dispatch_usage_no_stage",
+            census.dispatches_with_no_stage_published,
+        ),
+        ("dispatch_usage_published", census.dispatches_published),
+        (
+            "unknown_from_a_table",
+            census.unknown_participations_from_a_table,
+        ),
+        (
+            "unknown_with_no_table",
+            census.unknown_participations_with_no_table,
+        ),
+    ] {
+        note_store_route_n(route, u64::from(n));
+    }
+    // Which pipeline, and what the table thinks of it. The counts above say a
+    // draw found nothing published; only the pipeline's *state* tells the two
+    // causes apart — an executor that has not answered yet, and one whose
+    // answer a withdrawal or a retirement threw away. Once per slot.
+    if let Some(id) = census.first_unanswered_pipeline {
+        if crate::observe::first_sight("draw_usage_no_stage", u64::from(id.slot.0)) {
+            crate::observe::fail(format!(
+                "draw_usage_no_stage slot={} gen={} model_pipeline={} (a draw bound this \
+                 pipeline and the ordering plane had no reflection for it, so every slot \
+                 the draw binds ordered against every other access to the same resource)",
+                id.slot.0,
+                id.generation.0,
+                state.pipeline_state(id).unwrap_or("unleased"),
+            ));
+        }
     }
 }
 
@@ -3002,10 +3071,10 @@ fn note_stamp_visible(state: &DeviceState, index: u32, value: u32, site: &'stati
             // the guest can read from.
             //
             // **Named, once per slot, because the count is two different
-            // facts.** A boot measures about 14 000 of these, and
-            // `dead/README.md` records the same counter at zero when the
-            // publication point was moved to this site — so either the meaning
-            // drifted or the invariant broke, and a bare count cannot say
+            // facts.** A boot measures about 14 000 of these, and the driven
+            // boot taken when the publication point was moved to this site read
+            // the same counter at zero — so either the meaning drifted or the
+            // invariant broke, and a bare count cannot say
             // which. What separates them is *which slot* and *by how much*: one
             // slot whose page rewound under a timeline that will not follow it
             // is a slot to explain, and a timeline running ahead of every word

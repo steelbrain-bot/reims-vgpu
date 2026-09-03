@@ -580,6 +580,25 @@ impl PipelineTable {
         self.pipelines.get(&id)
     }
 
+    /// Whether an executor has already said what this pipeline's shaders do
+    /// with each bound slot.
+    ///
+    /// The read side of [`Self::publish_usage`] as a *question*, for a rail
+    /// whose pre-scan reaches the same pipeline once per packet and must build
+    /// its tables once per build. Enumerating a shader's binding set allocates,
+    /// and a rail-side "already done" set would be a second record of a fact
+    /// this table already holds — one that a withdrawal or a retirement could
+    /// leave disagreeing with it. Asking here cannot disagree.
+    ///
+    /// `false` for a pipeline this table does not hold, which is the answer
+    /// that makes the caller try: an executor that publishes before the
+    /// pipeline is declared is refused by [`Self::publish_usage`], and the next
+    /// pass is what lands it.
+    #[must_use]
+    pub fn usage_published(&self, id: ResourceId) -> bool {
+        self.usage.contains_key(&id)
+    }
+
     /// Advance a pipeline. Returns whether the step was legal and taken.
     ///
     /// An illegal step is refused rather than applied, and a caller that has to
@@ -1102,6 +1121,57 @@ mod tests {
         assert_eq!(t.lease(id(1), GEN), Lease::Ready);
         assert_eq!(t.census().leases_pending, 1);
         assert_eq!(t.census().leases_ready, 1);
+    }
+
+    /// The memo a rail's pre-scan skips on is the same record the answer lands
+    /// in, so it cannot outlive the answer.
+    ///
+    /// This is why the question is the table's and not the rail's. A pre-scan
+    /// reaches the same pipeline once per packet and must enumerate its binding
+    /// set once per *build*; a set kept beside the rail would go on saying
+    /// "covered" after a withdrawal threw the published usage away, and the
+    /// rebuilt shader's usage would never be published at all.
+    ///
+    /// Also the undeclared case, which is what makes the gate safe to try
+    /// early: an executor holding a translation before the table holds the
+    /// pipeline gets `false` from both doors, so nothing is recorded and the
+    /// next pass publishes.
+    #[test]
+    fn the_published_usage_memo_is_dropped_by_everything_that_drops_the_usage() {
+        let mut t = PipelineTable::new();
+        let usage = || PublishedUsage::compute(BindingUsage::new(vec![], vec![]));
+
+        assert!(
+            !t.usage_published(id(1)),
+            "nothing is published for a pipeline this table does not hold"
+        );
+        assert!(
+            !t.publish_usage(id(1), usage()),
+            "and publishing into one is refused rather than recorded"
+        );
+        assert!(!t.usage_published(id(1)));
+
+        assert!(t.declare(id(1), GEN));
+        assert!(t.advance(id(1), PipelineState::Translating));
+        assert!(t.advance(id(1), PipelineState::Compiling));
+        assert!(t.advance(id(1), PipelineState::Ready));
+        assert!(t.publish_usage(id(1), usage()));
+        assert!(t.usage_published(id(1)), "the pass that lands it");
+
+        assert!(t.withdraw(id(1)));
+        assert!(
+            !t.usage_published(id(1)),
+            "the rebuild's usage is not the previous build's, so the memo must              let the rail publish again"
+        );
+
+        assert!(t.advance(id(1), PipelineState::Compiling));
+        assert!(t.advance(id(1), PipelineState::Ready));
+        assert!(t.publish_usage(id(1), usage()));
+        assert!(t.retire(id(1)));
+        assert!(
+            !t.usage_published(id(1)),
+            "a retired pipeline holds no answer, and a rail that thought it did              would never publish for the name that replaces it"
+        );
     }
 
     /// A pipeline the executor stopped holding a translation for goes back to
