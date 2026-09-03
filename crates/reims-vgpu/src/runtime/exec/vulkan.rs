@@ -51,6 +51,15 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
         let Ok((v_mtlb, f_mtlb)) = pair else {
             // Normal execution emits the precise pipeline/MTLB failure. A
             // missing plan input is deterministic, not asynchronous work.
+            //
+            // Counted, because "not pending" is what this arm says and it is
+            // the answer that readies the packet's pipeline leases at
+            // admission. A draw has been measured reaching a shader that was
+            // still translating while its lease read `ready`, and a pipeline
+            // this pre-scan silently stopped examining is one of the two ways
+            // that can happen — the other being a pipeline the scan never
+            // reached at all. They were one silence.
+            crate::runtime::drain::note_store_route("preflight_mtlb_unloadable");
             continue;
         };
         // A container whose AIR will not extract is the same "deterministic
@@ -60,6 +69,7 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
             crate::runtime::mtlb::extract_air(&v_mtlb),
             crate::runtime::mtlb::extract_air(&f_mtlb),
         ) else {
+            crate::runtime::drain::note_store_route("preflight_air_unextractable");
             continue;
         };
         let cache_started = std::time::Instant::now();
