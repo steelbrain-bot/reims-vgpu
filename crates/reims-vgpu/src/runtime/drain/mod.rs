@@ -2233,12 +2233,11 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // has no entry for, and the entry is this device's to make. The list is the
     // walk's own answer and not a second scan, so what is declared cannot
     // disagree with what the transaction is then admitted waiting on.
-    let leases = built
+    let leases: &[reims_vgpu_core::identity::ResourceId] = built
         .payload
         .exec()
-        .map(|work| work.pipeline_leases.clone())
-        .unwrap_or_default();
-    for &lease in &leases {
+        .map_or(&[], |work| &work.pipeline_leases);
+    for &lease in leases {
         note_store_route(if state.declare_pipeline(lease) {
             "pipeline_declared"
         } else {
@@ -2264,16 +2263,32 @@ fn admit_and_park<H: HostMemory + HostOps>(
             return;
         }
     };
-    let ingress = admission.admitted.transaction.identity.ingress;
-    let work = match arrived.submission {
-        Some(submission) => crate::runtime::parked::ParkedWork::with_submission(
+    let mut transaction = admission.admitted.transaction;
+    let ingress = transaction.identity.ingress;
+    // The resolved records move out of the transaction the model just handed
+    // back. `admit` keeps a transaction's accesses in its dependency graph and
+    // returns everything else, and nothing downstream of this line reads the
+    // transaction again — so taking the work here is taking the only copy there
+    // is, and the position's pipeline leases become a field of it rather than a
+    // second list that could disagree with it.
+    let resolved = match &mut transaction.payload {
+        reims_vgpu_core::transaction::Payload::Exec(work) => Some(std::mem::take(work)),
+        _ => None,
+    };
+    // Both halves or neither: the command buffers are what the packet was
+    // admitted *against* and the resolved records are what it was admitted
+    // *as*, and a position holding one without the other could plan from bytes
+    // its records never named. An exec packet has both; every other class has
+    // neither.
+    let work = match (arrived.submission, resolved) {
+        (Some(submission), Some(resolved)) => crate::runtime::parked::ParkedWork::with_submission(
             fifo.domain().0,
             admission.epoch,
             packet,
             submission,
-            leases,
+            resolved,
         ),
-        None => crate::runtime::parked::ParkedWork::new(fifo.domain().0, admission.epoch, packet),
+        _ => crate::runtime::parked::ParkedWork::new(fifo.domain().0, admission.epoch, packet),
     };
     state.parked.park(ingress, work);
 }

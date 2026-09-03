@@ -40,6 +40,7 @@ use reims_vgpu_core::identity::{DeviceEpoch, IngressOrdinal, ResourceId};
 
 use crate::runtime::drain::Packet;
 use crate::runtime::exec::ExecSubmission;
+use reims_vgpu_core::exec::ExecWork;
 
 /// One admitted packet's retained inputs.
 ///
@@ -65,17 +66,23 @@ pub struct ParkedWork {
     epoch: DeviceEpoch,
     packet: Packet,
     submission: Option<ExecSubmission>,
-    /// The pipelines this packet's records bind, as the model's own walk
-    /// answered.
+    /// What the model's ingress walk resolved this packet's records into.
     ///
-    /// Retained because they are what the *pump* advances: a submission whose
-    /// translations were still running when it arrived is parked on these, and
-    /// the only thing that can release it is a later pass finding the
-    /// translations done and readying them. Taken from
-    /// `reims_vgpu_core::exec::ExecWork::pipeline_leases` rather than rescanned,
-    /// so what is advanced cannot disagree with what the transaction was
-    /// admitted waiting on.
-    leases: Vec<ResourceId>,
+    /// **Moved out of the transaction `SessionModel::admit` handed back, not
+    /// copied beside it.** The model keeps a transaction's accesses in its
+    /// dependency graph and returns everything else to this device, so before
+    /// this field the resolved records were built, read for their pipeline
+    /// leases, and dropped at the admission site — the walk ran in production
+    /// and its answer was thrown away, leaving the executor to decode the same
+    /// bytes a second time.
+    ///
+    /// Holding it here is what makes the pipeline leases a *derivation* rather
+    /// than a second list: [`Self::leases`] reads `pipeline_leases` out of this
+    /// work, so what the pump advances cannot disagree with what the
+    /// transaction was admitted waiting on. It is `None` for every class that
+    /// resolves to something other than exec work, which is every class that
+    /// leases no pipeline.
+    resolved: Option<ExecWork>,
 }
 
 impl ParkedWork {
@@ -87,7 +94,7 @@ impl ParkedWork {
             epoch,
             packet,
             submission: None,
-            leases: Vec::new(),
+            resolved: None,
         }
     }
 
@@ -99,14 +106,14 @@ impl ParkedWork {
         epoch: DeviceEpoch,
         packet: Packet,
         submission: ExecSubmission,
-        leases: Vec<ResourceId>,
+        resolved: ExecWork,
     ) -> Self {
         Self {
             domain,
             epoch,
             packet,
             submission: Some(submission),
-            leases,
+            resolved: Some(resolved),
         }
     }
 
@@ -134,17 +141,29 @@ impl ParkedWork {
     }
 
     /// The pipelines this packet's records bind.
+    ///
+    /// Read off the resolved work rather than stored beside it; see
+    /// [`Self::resolved`].
     #[must_use]
     pub fn leases(&self) -> &[ResourceId] {
-        &self.leases
+        self.resolved
+            .as_ref()
+            .map_or(&[][..], |work| &work.pipeline_leases)
+    }
+
+    /// The records this packet resolved to, for an executor that would
+    /// otherwise decode its bytes again.
+    #[must_use]
+    pub const fn resolved(&self) -> Option<&ExecWork> {
+        self.resolved.as_ref()
     }
 
     /// Host bytes this position is holding.
     ///
-    /// The payload and the command buffers, which are the two allocations
-    /// parking keeps alive; the stamp-wait records are bounded by the header's
-    /// `u16` count and are counted with them rather than being a third term
-    /// nobody could act on separately.
+    /// The payload, the command buffers and the resolved records, which are the
+    /// three allocations parking keeps alive; the stamp-wait records are
+    /// bounded by the header's `u16` count and are counted with the payload
+    /// rather than being a fourth term nobody could act on separately.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         self.packet.payload.len()
@@ -154,7 +173,35 @@ impl ParkedWork {
                 .submission
                 .as_ref()
                 .map_or(0, ExecSubmission::retained_bytes)
+            + self.resolved.as_ref().map_or(0, resolved_bytes)
     }
+}
+
+/// The heap a resolved packet's records occupy.
+///
+/// Counted term by term rather than as one `size_of` of the struct, because
+/// every one of them is a separate `Vec` whose length is the guest's: a packet
+/// with ten thousand records retains ten thousand records' worth of host
+/// memory, and a measure that reported the struct's inline size would report
+/// the same number for a packet with one.
+fn resolved_bytes(work: &ExecWork) -> usize {
+    use reims_vgpu_core::exec::StreamRecord;
+    use std::mem::size_of;
+
+    let arenas = &work.arenas;
+    work.streams
+        .iter()
+        .map(|stream| stream.records.len() * size_of::<StreamRecord>())
+        .sum::<usize>()
+        + work.accesses.len() * size_of::<reims_vgpu_core::access::AccessIntent>()
+        + work.pipeline_leases.len() * size_of::<ResourceId>()
+        + work.prerequisites.len() * size_of::<reims_vgpu_core::exec::Prerequisite>()
+        + arenas.buffer_bindings.len() * size_of::<reims_vgpu_core::bind::BufferBinding>()
+        + arenas.object_bindings.len() * size_of::<reims_vgpu_core::bind::ObjectBinding>()
+        + arenas.resources.len() * size_of::<ResourceId>()
+        + arenas.pass_descriptors.len() * size_of::<reims_vgpu_core::pass::PassDescriptor>()
+        + arenas.viewports.len() * size_of::<reims_vgpu_core::render::Viewport>()
+        + arenas.scissors.len() * size_of::<reims_vgpu_core::render::ScissorRect>()
 }
 
 /// Why a parked position was let go without running.
@@ -313,7 +360,7 @@ impl ParkedStore {
     #[must_use]
     pub fn planning(&self, ingress: IngressOrdinal) -> Option<(&ExecSubmission, &[ResourceId])> {
         let work = self.work.get(&ingress)?;
-        Some((work.submission.as_ref()?, &work.leases))
+        Some((work.submission.as_ref()?, work.leases()))
     }
 
     /// The completion slots a parked position is waiting on.
@@ -562,5 +609,71 @@ mod tests {
         let mut store = ParkedStore::new();
         assert!(!store.mark_ready(ordinal(8)));
         assert!(store.ready_in_order().is_empty());
+    }
+
+    fn leased(refs: &[u32]) -> ExecWork {
+        ExecWork {
+            pipeline_leases: refs
+                .iter()
+                .map(|&r| ResourceId {
+                    slot: reims_vgpu_core::identity::ObjectListRef(r),
+                    generation: reims_vgpu_core::identity::SlotGeneration(1),
+                })
+                .collect(),
+            ..ExecWork::default()
+        }
+    }
+
+    /// The leases the pump advances are the resolved work's own field, so
+    /// there is no second list to keep in step with it.
+    #[test]
+    fn the_leases_a_position_advances_are_the_resolved_works() {
+        let work = ParkedWork::with_submission(
+            2,
+            EPOCH,
+            packet(4),
+            ExecSubmission::stated(7, Vec::new()),
+            leased(&[11, 12]),
+        );
+
+        let resolved = work.resolved().expect("an exec position resolved");
+        assert_eq!(work.leases(), resolved.pipeline_leases.as_slice());
+        assert_eq!(work.leases().len(), 2);
+    }
+
+    /// A class that resolves to no exec work leases nothing, rather than
+    /// leaving a caller to distinguish "no leases" from "not exec".
+    #[test]
+    fn a_position_with_no_resolved_work_leases_nothing() {
+        let work = ParkedWork::new(1, EPOCH, packet(4));
+        assert!(work.resolved().is_none());
+        assert!(work.leases().is_empty());
+    }
+
+    /// Retention counts the records a position holds, so a packet that
+    /// resolved to more of them is measured as holding more.
+    #[test]
+    fn retention_counts_the_resolved_records() {
+        let bare = ParkedWork::with_submission(
+            2,
+            EPOCH,
+            packet(4),
+            ExecSubmission::stated(7, Vec::new()),
+            ExecWork::default(),
+        );
+        let leases = ParkedWork::with_submission(
+            2,
+            EPOCH,
+            packet(4),
+            ExecSubmission::stated(7, Vec::new()),
+            leased(&[11, 12, 13]),
+        );
+
+        assert!(
+            leases.retained_bytes() > bare.retained_bytes(),
+            "three leases are three leases' worth of host memory: {} vs {}",
+            leases.retained_bytes(),
+            bare.retained_bytes()
+        );
     }
 }
