@@ -2021,9 +2021,14 @@ fn execute_compute_request_with(
 /// Used by mapper-ref-texture sample dig (`sample_src=… resident_ready=`) to detect the
 /// resident-vs-guest split without a full readback. Does not create devices or
 /// allocate; returns false if the engine is uninit or the key is absent.
-/// Whether the window presenter would take this resident for a present at
-/// `width`x`height`. Shares [`pools::slot_presentable`] with the presenter's own
-/// selection so the two cannot answer differently.
+/// Whether a resident can carry a present at `width`x`height`. Shares
+/// [`pools::slot_presentable`] with `resident_present_decision` — the window
+/// *publish*, which is where this question is now decided — so the two cannot
+/// answer differently.
+///
+/// The presenter used to be the sharer, re-resolving the identity out of the
+/// registry on its own thread. It no longer reads a registry at all: it takes
+/// the publish's `WindowPresentResolution` and checks one atomic stamp.
 ///
 /// Not gated on `host-window`, because the question is about the target registry
 /// rather than about a window: `runtime::drain`'s `present_unbacked` gate asks it

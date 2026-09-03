@@ -17,11 +17,11 @@ use crate::model::DeviceState;
 /// Would a resident carry the present this mapping names, at this geometry?
 ///
 /// Asks [`engine::resident_presentable`], which shares `pools::slot_presentable`
-/// with the window presenter's own selection. Sharing the rule is the point
-/// rather than tidiness: a looser predicate here would report a frame as carried
-/// that the presenter then refuses, which is a disagreement neither call site
-/// can see on its own — the same shape as the publish/present split that once
-/// blanked the window.
+/// with the window *publish* — the transaction that decides whether a resident
+/// carries a present. Sharing the rule is the point rather than tidiness: a
+/// looser predicate here would report a frame as carried that the publish then
+/// refuses, which is a disagreement neither call site can see on its own — the
+/// same shape as the publish/present split that once blanked the window.
 pub fn present_resident_carries(
     state: &DeviceState,
     mapping: u32,

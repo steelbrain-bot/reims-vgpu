@@ -1927,10 +1927,10 @@ pub struct WindowPresentSource {
     /// measured at 935-979 ms per exec packet, and a present waiting on that is
     /// not a present.
     ///
-    /// Today the window *also* re-resolves the identity under the engine lock,
-    /// so this is checked beside an authority rather than as one. That is
-    /// deliberate and temporary: it is how a disagreement between the two gets
-    /// found on a live boot before the re-resolve is the thing being removed.
+    /// It is the authority, not a check beside one. The window re-resolved the
+    /// identity under the engine lock for three commits while a divergence
+    /// census compared the two on every present and reported no disagreement
+    /// across three driven boots; the re-resolve is gone.
     pub epoch: u64,
     /// What the publish resolved this identity to — the image, its layout, its
     /// extent and its storage class.
@@ -1942,9 +1942,8 @@ pub struct WindowPresentSource {
     /// invalid — not merely stale — if the image has since moved. See
     /// [`super::pools::ResolvedResident`].
     ///
-    /// Compared against the re-resolve rather than used in its place, for the
-    /// same reason the stamp was: a disagreement is a thing to find while there
-    /// is still an authority to disagree with.
+    /// This is what the blit reads. The window resolves nothing: `epoch` above
+    /// says the publish's decision still stands, and this is that decision.
     // Only the host-window arm reads this: it is the window presenter's
     // comparison against its own re-resolve, and a build with no window has no
     // presenter. A `cfg` here answers "what did this build compile", which is

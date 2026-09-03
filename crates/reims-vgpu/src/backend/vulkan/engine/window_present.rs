@@ -153,141 +153,6 @@ impl crate::observe::Decline for WindowPresentDecline {
     }
 }
 
-/// How a publish-time resolution and the window's own re-resolve of the same
-/// identity disagreed.
-///
-/// The window thread reads the resident registry twice per present — once to
-/// resolve the identity it was published against, once more on the failure path
-/// to name why — and that read is what holds the registry in the process-global
-/// engine. `WindowPresentSource::epoch` was added so the *first* question could
-/// be answered without a registry. This enum is how the answer is checked
-/// against the authority before that authority is removed.
-///
-/// Ordered coarsest to finest and reported as the **first** difference rather
-/// than the only one, the same ladder rule [`super::types::TargetKeyDivergence`]
-/// states: a different image is not one object with a moved layout, so nothing
-/// finer about the pair is worth reporting.
-///
-/// A boot on which none of these appears says the publish-time resolution and
-/// the re-resolve agreed on every frame, which is what removing the re-resolve
-/// needs. A boot on which [`Self::Access`] appears says something else, and it is
-/// the finding this census exists for: the blit names `access` as its barrier's
-/// `oldLayout`, so a layout that moved between publish and present is not a
-/// stale picture but an invalid transition, and the removal would have to move
-/// layout ownership rather than merely carry a value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WindowSourceDivergence {
-    /// The stamp says the promise stands and the registry offers no presentable
-    /// slot under that identity. The stamp is not a complete cover of the ways a
-    /// published resident can leave, and this is the reading that says so.
-    Vanished,
-    /// A different `VkImage` is registered under this identity. The stamp missed
-    /// a replacement, which is the use-after-free case.
-    Image,
-    /// Same image, and its layout moved since publish.
-    Access,
-    /// Same image, different extent.
-    Geometry,
-    /// Same image and extent, and its storage class moved — which decides the
-    /// layout the blit leaves it in.
-    GuestImported,
-}
-
-/// One divergence, with the pair of resolutions that named it.
-///
-/// The values are the reading and not decoration: for
-/// [`WindowSourceDivergence::Access`] specifically, this window's own blit
-/// leaves a resident in `TransferRead`, so a `ColorWrite` -> `TransferRead`
-/// move is this thread re-presenting a source it already blitted — a redraw
-/// with no new frame — while any other pair is the drain having touched the
-/// image between publish and present. Those two have different fixes and the
-/// class alone cannot tell them apart.
-struct WindowSourceDiverged {
-    class: WindowSourceDivergence,
-    published: super::pools::ResolvedResident,
-    now: Option<super::pools::ResolvedResident>,
-}
-
-impl crate::observe::Decline for WindowSourceDiverged {
-    fn slug(&self) -> &'static str {
-        match self.class {
-            WindowSourceDivergence::Vanished => "window_source_vanished",
-            WindowSourceDivergence::Image => "window_source_image_moved",
-            WindowSourceDivergence::Access => "window_source_access_moved",
-            WindowSourceDivergence::Geometry => "window_source_geometry_moved",
-            WindowSourceDivergence::GuestImported => "window_source_storage_moved",
-        }
-    }
-
-    fn fields(&self) -> Vec<(&'static str, String)> {
-        let mut fields = vec![
-            ("was_image", format!("{:?}", self.published.image)),
-            ("was_access", format!("{:?}", self.published.access)),
-            (
-                "was_geom",
-                format!("{}x{}", self.published.width, self.published.height),
-            ),
-            ("was_guest", self.published.guest_imported.to_string()),
-        ];
-        if let Some(now) = self.now.as_ref() {
-            fields.extend([
-                ("now_image", format!("{:?}", now.image)),
-                ("now_access", format!("{:?}", now.access)),
-                ("now_geom", format!("{}x{}", now.width, now.height)),
-                ("now_guest", now.guest_imported.to_string()),
-            ]);
-        }
-        fields
-    }
-}
-
-/// The ladder itself, with no logging in it, so it can be tested as the total
-/// function it is rather than through a log line.
-fn divergence_class(
-    published: &super::pools::ResolvedResident,
-    now: Option<&super::pools::ResolvedResident>,
-) -> Option<WindowSourceDivergence> {
-    let Some(now) = now else {
-        return Some(WindowSourceDivergence::Vanished);
-    };
-    if published.image != now.image {
-        Some(WindowSourceDivergence::Image)
-    } else if published.access != now.access {
-        Some(WindowSourceDivergence::Access)
-    } else if published.width != now.width || published.height != now.height {
-        Some(WindowSourceDivergence::Geometry)
-    } else if published.guest_imported != now.guest_imported {
-        Some(WindowSourceDivergence::GuestImported)
-    } else {
-        None
-    }
-}
-
-/// Compare what the publish resolved against what the window's re-resolve found,
-/// and name the first difference on the always-on channel.
-///
-/// Latched per class rather than counted: reachability is the open question, and
-/// a class that recurs every frame would say nothing after its first line.
-/// Magnitude belongs to a counter, and there is no counter yet for the same
-/// reason `resident_retired_while_pinned` has none.
-fn note_source_divergence(
-    published: &super::pools::ResolvedResident,
-    now: Option<&super::pools::ResolvedResident>,
-) {
-    let Some(class) = divergence_class(published, now) else {
-        return;
-    };
-    crate::observe::Emit::decline(
-        "window_source_divergence",
-        &WindowSourceDiverged {
-            class,
-            published: *published,
-            now: now.copied(),
-        },
-    )
-    .fail_once(class as u64);
-}
-
 /// Why a present cleared to slate instead of blitting a guest resident.
 ///
 /// A slate present is the window showing *nothing* — on the arm64 MoltenVK
@@ -295,26 +160,32 @@ fn note_source_divergence(
 /// with no log line at all: the caller only reported the FIRST direct present,
 /// so a later regression into slate was invisible except as a drop in
 /// `direct_frac`. Every slate run now names its cause.
+///
+/// # Two, where there were six
+///
+/// The other four — `no_resident`, `content_not_ready`, `not_bgra`,
+/// `geom_mismatch` — were the presenter's own judgement of a resident it had
+/// re-resolved out of the registry. It resolves nothing now: the publish decides
+/// presentability a frame earlier, under the engine lock, where the registry is,
+/// and each of those four is reported there as `winpub_no_resident`,
+/// `winpub_content_not_ready`, `winpub_scanout_order` or `winpub_geometry` on
+/// the drain's route channel. A refused publish reaches this thread as no source
+/// at all, which is what [`Self::NoSource`] means.
+///
+/// The pair that remains is the pair only this thread can answer: nothing was
+/// published, or what was published has since been withdrawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SlateReason {
     /// No frame source was published for this present. Expected before the
-    /// present boundary and while the guest is idle.
+    /// present boundary and while the guest is idle — and also what a publish
+    /// that *declined* looks like from here, the reason for the decline being
+    /// named at the publish.
     NoSource,
-    /// The source named candidate identities but none is in the resident
-    /// registry — the resident was evicted, or never created.
-    NoResident,
-    /// A resident exists but its content has not landed yet.
-    ContentNotReady,
-    /// A resident exists and is ready, but is not BGRA. The present blit does
-    /// no format conversion, so it cannot be shown.
-    NotBgra,
-    /// A resident exists and is ready, but at different dimensions than the
-    /// source claims — presenting it would show a torn or scaled frame.
-    GeomMismatch,
-    /// The resident this source was resolved against has since left the
-    /// registry. Not a statement about any resident now under that identity:
-    /// the stamp says the device replaced or dropped the one that was promised,
-    /// so the image handle the source carries may already be destroyed.
+    /// The resident this source was resolved against has since been withdrawn.
+    /// Not a statement about any resident now under that identity: the stamp
+    /// says the device replaced, dropped, re-laid-out or re-declared the one
+    /// that was promised, so the resolution the source carries may name an
+    /// image that is already destroyed.
     SourceStale,
 }
 
@@ -331,10 +202,6 @@ impl crate::observe::Decline for SlateReason {
         match self {
             Self::SourceStale => "slate_source_stale",
             Self::NoSource => "slate_no_source",
-            Self::NoResident => "slate_no_resident",
-            Self::ContentNotReady => "slate_content_not_ready",
-            Self::NotBgra => "slate_not_bgra",
-            Self::GeomMismatch => "slate_geom_mismatch",
         }
     }
 }
@@ -381,51 +248,6 @@ impl crate::observe::Decline for StagingError {
             }
         }
     }
-}
-
-/// What the registry knows about the identity a present named, flattened so the
-/// classification below is pure and testable without a GPU.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CandidateState {
-    /// The identity resolved to a registry slot.
-    pub resident: bool,
-    pub content_ready: bool,
-    pub bgra: bool,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// Name why the resident the present named could not carry it.
-///
-/// Each arm is a distinct blocker with a distinct remedy, checked in the order
-/// a slot progresses through them (created → content landed → correct format →
-/// correct size). Collapsing them into one "no_resident" is the exact "N
-/// distinct checks share one status" trap the failure-logging rules call out.
-pub(crate) fn classify_slate(
-    source_present: bool,
-    want: (u32, u32),
-    state: CandidateState,
-) -> SlateReason {
-    if !source_present {
-        return SlateReason::NoSource;
-    }
-    if !state.resident {
-        return SlateReason::NoResident;
-    }
-    if !state.content_ready {
-        return SlateReason::ContentNotReady;
-    }
-    if !state.bgra {
-        return SlateReason::NotBgra;
-    }
-    if (state.width, state.height) != want {
-        return SlateReason::GeomMismatch;
-    }
-    // Resident, ready, BGRA and the right size — `slot_presentable` agreed with
-    // none of the blockers above, so the caller took the resident and never got
-    // here. Reaching this arm means the two disagree; report the residual class
-    // rather than inventing a sixth.
-    SlateReason::ContentNotReady
 }
 
 /// A CPU-BGRA frame offered as the present source when no resident carries the
@@ -1332,66 +1154,57 @@ impl WindowPresenter {
         let frame_render_finished = self.render_finished[image_index as usize];
 
         pools.batch_flush(ctx, counters)?;
-        // Fail closed on a stale stamp, and do it *before* the registry read
-        // below rather than as one more condition inside it.
+        // The whole of this present's source selection, and it reads no
+        // registry.
         //
-        // The stamp exists to be answerable without the registry — that is the
-        // whole reason it exists, the window thread having no device to reach one
-        // through. Checking it here means it runs in the shape it will run in
-        // once the re-resolve below is gone, instead of being exercised only as
-        // a redundant agreement with an authority that is on its way out.
+        // The window thread has no device to reach one through — the lock a
+        // `&DeviceState` comes behind is the one the drain holds for a whole
+        // render tranche, measured at 935-979 ms per exec packet — so the
+        // registry, which is guest-derived state on its way to the device the
+        // guest declared it against, cannot come with it. What replaced the read
+        // is one atomic load.
         //
-        // `note_slate` already reports this: a stale stamp reaches it as
-        // `SlateReason::SourceStale`, run-deduped with a frame count, and the
-        // present falls back to host memory — so the reading is both a named
-        // decline and a dent in `direct_frac`. On a boot where it stays absent,
-        // the stamp never overrode the re-resolve and removing the re-resolve
-        // changes no frame.
+        // `source.resolved` is what the publish resolved this identity to under
+        // the engine lock, and `source.epoch` is `WINDOW_SOURCE_EPOCH` as it
+        // stood at that moment. The epoch moves at every point the resolution
+        // can stop being true: `unregister_resident` (the registry's sole
+        // `remove`), `destroy_all` (its sole `drain`), `Drop for ResourcePools`,
+        // `set_registry_access` and `set_registry_format` — the last two being
+        // the only writers of the two fields production mutates on a live slot.
+        // Every other field of a slot is written once, where the slot is built.
+        //
+        // So a stamp that still compares equal is the publish's whole decision,
+        // still standing: the image is registered, its pixels landed, its byte
+        // order is the scanout's, its extent is the one being presented, and the
+        // barrier below names the access the image is actually in.
         let stale =
             source.is_some_and(|source| source.epoch != super::pools::window_source_epoch());
-        let selected = source.filter(|_| !stale).and_then(|source| {
-            let slot = pools.registry_get(&source.identity)?;
-            super::pools::slot_presentable(slot, source.width, source.height).then(|| {
-                (
-                    source.identity.clone(),
-                    super::pools::slot_window_resolution(slot),
-                )
-            })
-        });
-        // The census that says whether this re-resolve can be removed. It is the
-        // only thing in this function that reads the publish-time resolution, and
-        // it changes no frame: the blit below still uses the re-resolve.
-        if let Some(source) = source.filter(|_| !stale) {
-            note_source_divergence(&source.resolved, selected.as_ref().map(|(_, now)| now));
-        }
+        let selected = source
+            .filter(|_| !stale)
+            .map(|source| (source.identity.clone(), source.resolved));
         // Only reached when no resident carries this present: upload the CPU
         // bytes instead. `None` here means the window shows slate.
         let staged = if selected.is_some() {
             self.note_slate_end();
             None
         } else {
-            // Failure path only: re-read the slot to name WHY the resident could
-            // not carry. Cheap because it never runs on a good frame.
-            let state = source
-                .filter(|_| !stale)
-                .and_then(|source| pools.registry_get(&source.identity))
-                .map_or(CandidateState::default(), |slot| CandidateState {
-                    resident: true,
-                    content_ready: slot.content_ready,
-                    bgra: slot.scanout_order(),
-                    width: slot.width,
-                    height: slot.height,
-                });
+            // Two reasons reach here and no more. The presenter no longer judges
+            // a resident — it cannot, having no registry — so "resident but not
+            // ready", "resident but not BGRA" and "resident at the wrong size"
+            // are decided by `resident_present_decision` a frame earlier and
+            // reported there as `winpub_content_not_ready`, `winpub_scanout_order`
+            // and `winpub_geometry`. What is left is: nothing was published, or
+            // what was published has since been withdrawn.
             let want = source.map_or((0, 0), |s| (s.width, s.height));
             let reason = if stale {
                 SlateReason::SourceStale
             } else {
-                classify_slate(source.is_some(), want, state)
+                SlateReason::NoSource
             };
             let staged = cpu
                 .filter(WindowCpuFrame::complete)
                 .and_then(|frame| self.stage_cpu_frame(ctx, frame));
-            self.note_slate(reason, want, state, staged.is_some());
+            self.note_slate(reason, want, source.map(|s| s.resolved), staged.is_some());
             staged
         };
         let mut pinned = Vec::with_capacity(1);
@@ -1847,11 +1660,15 @@ impl WindowPresenter {
     /// window showing the guest's frame from CPU bytes (correct, and only as
     /// expensive as the host copy this rail exists to remove — a census line),
     /// and the window showing nothing at all (a visible loss — a failure line).
+    /// `promised` is the resolution the *publish* handed this thread, not a
+    /// re-read of the registry — there is no re-read any more. On
+    /// [`SlateReason::SourceStale`] it is what was withdrawn, which is the value
+    /// a reader wants; on [`SlateReason::NoSource`] there is nothing to name.
     fn note_slate(
         &mut self,
         reason: SlateReason,
         want: (u32, u32),
-        state: CandidateState,
+        promised: Option<super::pools::ResolvedResident>,
         covered: bool,
     ) {
         if self.slate_reason == Some(reason) && self.slate_covered == covered {
@@ -1864,14 +1681,15 @@ impl WindowPresenter {
         self.slate_reason = Some(reason);
         self.slate_covered = covered;
         self.slate_run = 1;
-        let seen = if state.resident {
-            format!(
-                "{}x{}/{}{}",
-                state.width, state.height, state.content_ready as u8, state.bgra as u8
-            )
-        } else {
-            "absent".to_string()
-        };
+        let seen = promised.map_or_else(
+            || "absent".to_string(),
+            |promised| {
+                format!(
+                    "{}x{}/{:?}",
+                    promised.width, promised.height, promised.access
+                )
+            },
+        );
         let emit = crate::observe::Emit::decline(
             if covered {
                 "host_window_cpu_fallback"
@@ -2155,178 +1973,6 @@ unsafe fn blit_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ash::vk::Handle as _;
-
-    /// A resolution that agrees with itself, so each test below moves exactly
-    /// one field and the ladder's answer is attributable to that field.
-    fn resolution() -> super::super::pools::ResolvedResident {
-        super::super::pools::ResolvedResident {
-            image: vk::Image::null(),
-            access: super::super::pools::ResidentAccess::ColorWrite(
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            ),
-            width: 1920,
-            height: 1080,
-            guest_imported: false,
-        }
-    }
-
-    #[test]
-    fn a_resolution_that_did_not_move_is_no_divergence() {
-        assert_eq!(divergence_class(&resolution(), Some(&resolution())), None);
-    }
-
-    #[test]
-    fn a_fresh_stamp_over_an_absent_slot_is_the_stamps_own_hole() {
-        // The reading that says the epoch is not a complete cover of the ways a
-        // published resident can leave — which is the whole claim the window's
-        // registry-free check rests on.
-        assert_eq!(
-            divergence_class(&resolution(), None),
-            Some(WindowSourceDivergence::Vanished)
-        );
-    }
-
-    #[test]
-    fn each_field_of_the_resolution_names_its_own_class() {
-        let published = resolution();
-        for (moved, expect) in [
-            (
-                super::super::pools::ResolvedResident {
-                    // A handle value that is merely *different*: the class is
-                    // about inequality, and a valid handle is not needed to
-                    // state it.
-                    image: vk::Image::from_raw(7),
-                    ..published
-                },
-                WindowSourceDivergence::Image,
-            ),
-            (
-                super::super::pools::ResolvedResident {
-                    access: super::super::pools::ResidentAccess::TransferRead(
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    ),
-                    ..published
-                },
-                WindowSourceDivergence::Access,
-            ),
-            (
-                super::super::pools::ResolvedResident {
-                    height: 1200,
-                    ..published
-                },
-                WindowSourceDivergence::Geometry,
-            ),
-            (
-                super::super::pools::ResolvedResident {
-                    guest_imported: true,
-                    ..published
-                },
-                WindowSourceDivergence::GuestImported,
-            ),
-        ] {
-            assert_eq!(divergence_class(&published, Some(&moved)), Some(expect));
-        }
-    }
-
-    #[test]
-    fn the_ladder_answers_the_coarsest_difference_and_not_the_finest() {
-        // Every field moved at once. A different image is not one object whose
-        // layout moved, so nothing finer than `Image` is worth reporting — the
-        // same rule `TargetKeyDivergence` states for the registry's own ladder,
-        // and the reason this is a ladder rather than a set of flags.
-        let published = resolution();
-        let moved = super::super::pools::ResolvedResident {
-            image: vk::Image::from_raw(7),
-            access: super::super::pools::ResidentAccess::Untouched,
-            width: 640,
-            height: 480,
-            guest_imported: true,
-        };
-        assert_eq!(
-            divergence_class(&published, Some(&moved)),
-            Some(WindowSourceDivergence::Image)
-        );
-    }
-
-    #[test]
-    fn every_divergence_class_has_its_own_slug() {
-        use crate::observe::Decline as _;
-        let classes = [
-            WindowSourceDivergence::Vanished,
-            WindowSourceDivergence::Image,
-            WindowSourceDivergence::Access,
-            WindowSourceDivergence::Geometry,
-            WindowSourceDivergence::GuestImported,
-        ];
-        let mut slugs: Vec<&str> = classes
-            .iter()
-            .map(|class| {
-                WindowSourceDiverged {
-                    class: *class,
-                    published: resolution(),
-                    now: None,
-                }
-                .slug()
-            })
-            .collect();
-        slugs.sort_unstable();
-        let count = slugs.len();
-        slugs.dedup();
-        assert_eq!(
-            slugs.len(),
-            count,
-            "two classes sharing a slug is the defect the decline vocabulary \
-             exists to prevent: the log fires and the reader still cannot say \
-             which check refused"
-        );
-    }
-
-    #[test]
-    fn a_divergence_line_carries_both_resolutions_and_no_whitespace_in_a_value() {
-        // The sink is parsed by splitting on spaces, so a value with a space in
-        // it silently becomes two fields.
-        let line = crate::observe::Emit::decline(
-            "window_source_divergence",
-            &WindowSourceDiverged {
-                class: WindowSourceDivergence::Access,
-                published: resolution(),
-                now: Some(super::super::pools::ResolvedResident {
-                    access: super::super::pools::ResidentAccess::TransferRead(
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    ),
-                    ..resolution()
-                }),
-            },
-        )
-        .render();
-        assert!(line.contains("reason=window_source_access_moved"), "{line}");
-        assert!(line.contains("was_access=ColorWrite("), "{line}");
-        assert!(line.contains("now_access=TransferRead("), "{line}");
-        for field in line.split(' ').skip(1) {
-            assert!(
-                field.contains('=') && !field.ends_with('='),
-                "every field is one whitespace-free k=v pair: {line}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_vanished_source_names_only_what_was_promised() {
-        // There is no "now" to report, and inventing one — zeros, or the
-        // published values echoed back — would read as a slot that is there.
-        let line = crate::observe::Emit::decline(
-            "window_source_divergence",
-            &WindowSourceDiverged {
-                class: WindowSourceDivergence::Vanished,
-                published: resolution(),
-                now: None,
-            },
-        )
-        .render();
-        assert!(line.contains("was_image="), "{line}");
-        assert!(!line.contains("now_"), "{line}");
-    }
 
     #[test]
     fn swapchain_recreation_line_names_geometry_and_reason() {
@@ -2402,76 +2048,6 @@ mod tests {
         assert!(line.contains("present_hz=20.0"), "{line}");
     }
 
-    fn ready(width: u32, height: u32) -> CandidateState {
-        CandidateState {
-            resident: true,
-            content_ready: true,
-            bgra: true,
-            width,
-            height,
-        }
-    }
-
-    /// No published source is the expected pre-boundary / idle case and must be
-    /// distinguishable from a source whose residents are missing.
-    #[test]
-    fn slate_without_a_source_is_named_separately() {
-        assert_eq!(
-            classify_slate(false, (0, 0), CandidateState::default()),
-            SlateReason::NoSource
-        );
-        assert_eq!(
-            classify_slate(true, (1440, 1080), CandidateState::default()),
-            SlateReason::NoResident
-        );
-    }
-
-    /// A resident that exists but has not landed content yet is the boot-era
-    /// case; it must not be reported as a missing resident.
-    #[test]
-    fn unready_resident_reports_content_not_ready() {
-        let pending = CandidateState {
-            resident: true,
-            content_ready: false,
-            bgra: true,
-            width: 1440,
-            height: 1080,
-        };
-        assert_eq!(
-            classify_slate(true, (1440, 1080), pending),
-            SlateReason::ContentNotReady
-        );
-    }
-
-    /// A resident that is ready and BGRA but the wrong size is the geometry
-    /// class — the actionable fact is the size, and it must not be folded into
-    /// `ContentNotReady`, whose remedy (wait a frame) would never converge.
-    #[test]
-    fn a_ready_resident_at_the_wrong_size_is_the_geometry_class() {
-        assert_eq!(
-            classify_slate(true, (1440, 1080), ready(1920, 1080)),
-            SlateReason::GeomMismatch
-        );
-    }
-
-    /// A ready non-BGRA resident is its own class — the present blit does no
-    /// format conversion, so collapsing it into content_not_ready would send a
-    /// reader hunting the wrong bug.
-    #[test]
-    fn non_bgra_resident_is_its_own_reason() {
-        let state = CandidateState {
-            resident: true,
-            content_ready: true,
-            bgra: false,
-            width: 1440,
-            height: 1080,
-        };
-        assert_eq!(
-            classify_slate(true, (1440, 1080), state),
-            SlateReason::NotBgra
-        );
-    }
-
     /// Every reason has a distinct, `slate_`-prefixed slug.
     ///
     /// What the prefix buys beyond distinctness is keeping a grep for this
@@ -2480,14 +2056,7 @@ mod tests {
     #[test]
     fn slate_reason_slugs_are_distinct_and_namespaced() {
         use crate::observe::Decline;
-        let mut slugs = [
-            SlateReason::NoSource,
-            SlateReason::NoResident,
-            SlateReason::ContentNotReady,
-            SlateReason::NotBgra,
-            SlateReason::GeomMismatch,
-        ]
-        .map(|r| r.slug());
+        let mut slugs = [SlateReason::NoSource, SlateReason::SourceStale].map(|r| r.slug());
         for s in slugs {
             assert!(s.starts_with("slate_"), "{s} is not namespaced");
         }
@@ -2519,19 +2088,6 @@ mod tests {
             crate::observe::Emit::decline("host_window_present", &suboptimal).render(),
             "host_window_present reason=window_present_suboptimal_persistent \
              streak=60 width=1440 height=1080"
-        );
-    }
-
-    /// A resident that clears every blocker still has to come back with *some*
-    /// reason, because the classifier only runs after `slot_presentable` already
-    /// refused. The two disagreeing is a defect in one of them, and the residual
-    /// class is what makes it visible instead of a panic or a sixth variant that
-    /// nothing else ever reads.
-    #[test]
-    fn a_resident_that_clears_every_blocker_falls_to_the_residual_class() {
-        assert_eq!(
-            classify_slate(true, (1440, 1080), ready(1440, 1080)),
-            SlateReason::ContentNotReady
         );
     }
 

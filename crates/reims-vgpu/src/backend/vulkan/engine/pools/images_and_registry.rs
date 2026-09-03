@@ -2918,6 +2918,13 @@ pub(super) mod pin_count_tests {
         dummy_slot(true)
     }
 
+    /// The one interpretation this rail builds that is *not* the scanout's byte
+    /// order, so a test can name "not presentable for format reasons" without
+    /// transcribing a Vulkan enum.
+    fn rgba_format() -> translate::pixel::ResidentFormat {
+        translate::pixel::ResidentFormat::of(translate::pixel::RESIDENT_RGBA_FORMAT)
+    }
+
     fn dummy_slot(content_ready: bool) -> ResidentTargetSlot {
         ResidentTargetSlot {
             image: vk::Image::null(),
@@ -3028,6 +3035,140 @@ pub(super) mod pin_count_tests {
         pools.registry_order.push_back(identity.clone());
     }
 
+    /// The publish's own ladder, in the order a slot progresses through it, and
+    /// the route name each rung answers with.
+    ///
+    /// This is where a resident is judged unable to carry a present. It used to
+    /// be judged twice — once here and once again by the presenter, which
+    /// re-read the slot on its failure path to name a `SlateReason` — and the
+    /// presenter's copy was the tested one. It is not any more: the presenter
+    /// takes the publish's decision and reads no registry, so this ladder is the
+    /// only one, and these are the tests the presenter's four classification
+    /// tests became.
+    ///
+    /// Ordered, and reported as the *first* blocker: a resident with no content
+    /// yet is not a resident of the wrong size, and remedying the size would not
+    /// make it presentable.
+    #[test]
+    fn the_publish_names_the_first_blocker_a_resident_carries() {
+        let ready = ready_slot();
+        assert!(super::slot_present_decline(&ready, 16, 16).is_none());
+
+        let mut unready = ready_slot();
+        unready.content_ready = false;
+        assert!(matches!(
+            super::slot_present_decline(&unready, 16, 16),
+            Some(super::ResidentPresentDecline::ContentNotReady)
+        ));
+
+        // Struct-update rather than an assignment, so the source-level count in
+        // `the_registry_writes_a_residents_access_in_exactly_one_place` keeps
+        // meaning "this many writers of a live slot's field".
+        let rgba = ResidentTargetSlot {
+            format: rgba_format(),
+            ..ready_slot()
+        };
+        assert!(
+            !rgba.scanout_order(),
+            "the present blit does no channel-order conversion"
+        );
+        assert!(matches!(
+            super::slot_present_decline(&rgba, 16, 16),
+            Some(super::ResidentPresentDecline::ScanoutOrder)
+        ));
+
+        assert!(matches!(
+            super::slot_present_decline(&ready, 32, 16),
+            Some(super::ResidentPresentDecline::Geometry)
+        ));
+
+        // Every rung failing at once answers the coarsest, not the finest.
+        let mut all = rgba;
+        all.content_ready = false;
+        assert!(matches!(
+            super::slot_present_decline(&all, 32, 16),
+            Some(super::ResidentPresentDecline::ContentNotReady)
+        ));
+    }
+
+    /// And each blocker reaches the drain as its own route name, because the
+    /// fallback it selects copies the whole framebuffer through host memory on
+    /// every frame and "no direct present" without a cause is what let
+    /// `direct_frac` sit at 0.00 for a whole boot.
+    #[test]
+    fn each_publish_blocker_has_its_own_route_name() {
+        let mut pools = ResourcePools::new();
+        let absent = surface(61);
+        assert_eq!(
+            super::super::super::resident_present_decision(&mut pools, &absent, 16, 16).err(),
+            Some("winpub_no_resident")
+        );
+
+        let unready = surface(62);
+        let mut slot = ready_slot();
+        slot.content_ready = false;
+        pools.registry.insert(unready.clone(), slot);
+        assert_eq!(
+            super::super::super::resident_present_decision(&mut pools, &unready, 16, 16).err(),
+            Some("winpub_content_not_ready")
+        );
+
+        let rgba = surface(63);
+        pools.registry.insert(
+            rgba.clone(),
+            ResidentTargetSlot {
+                format: rgba_format(),
+                ..ready_slot()
+            },
+        );
+        assert_eq!(
+            super::super::super::resident_present_decision(&mut pools, &rgba, 16, 16).err(),
+            Some("winpub_scanout_order")
+        );
+
+        let sized = surface(64);
+        pools.registry.insert(sized.clone(), ready_slot());
+        assert_eq!(
+            super::super::super::resident_present_decision(&mut pools, &sized, 32, 16).err(),
+            Some("winpub_geometry")
+        );
+
+        // And the accepting arm hands back the resolution the presenter blits
+        // from, resolved off the slot this transaction just accepted.
+        let good = surface(65);
+        pools.registry.insert(good.clone(), ready_slot());
+        let publication = super::super::super::resident_present_decision(&mut pools, &good, 16, 16)
+            .expect("a ready, BGRA, correctly sized resident carries the present");
+        assert_eq!(
+            publication.resolved,
+            super::slot_window_resolution(pools.registry_get(&good).expect("registered"))
+        );
+        assert_eq!(publication.epoch, super::window_source_epoch());
+    }
+
+    /// A declined publish records nothing, so a resident the window cannot take
+    /// does not join the set whose removal moves the epoch.
+    #[test]
+    fn a_declined_publish_vouches_for_nothing() {
+        let mut pools = ResourcePools::new();
+        let unready = surface(66);
+        let mut slot = ready_slot();
+        slot.content_ready = false;
+        pools.registry.insert(unready.clone(), slot);
+        assert!(
+            super::super::super::resident_present_decision(&mut pools, &unready, 16, 16).is_err()
+        );
+        let stamped = super::window_source_epoch();
+        assert!(pools
+            .unregister_resident(&unready, ResidentReclaim::ResourceReleased)
+            .is_some());
+        assert_eq!(
+            super::window_source_epoch(),
+            stamped,
+            "nothing was published against it"
+        );
+    }
+
     /// The access half of the window's licence: the promised layout and source
     /// masks, not only the promised image.
     ///
@@ -3115,7 +3256,7 @@ pub(super) mod pin_count_tests {
         pools.set_registry_format(&published, held);
         assert_eq!(super::window_source_epoch(), stamped);
 
-        let other = translate::pixel::ResidentFormat::of(translate::pixel::RESIDENT_RGBA_FORMAT);
+        let other = rgba_format();
         assert_ne!(other, held, "the two interpretations must actually differ");
         pools.set_registry_format(&published, other);
         assert_ne!(

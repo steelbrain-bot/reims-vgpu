@@ -1819,12 +1819,16 @@ impl Drop for ResourcePools {
 /// under an identity the window is published against. A fresh stamp therefore
 /// vouches for this whole value and not only for the image in it.
 ///
-/// This is still carried beside the re-resolve rather than in place of it, and
-/// [`super::window_present::WindowSourceDivergence`] compares the two on every
-/// present. A boot where no class appears is the evidence that removing the
-/// re-resolve changes no frame; the two boots that have run report exactly that,
-/// and `Access` reporting zero across them is also what says the rule above
-/// costs no frames.
+/// Every field here is either written once, where the slot is built — `image`,
+/// `width`, `height`, `memory` — or has a sole writer that moves the epoch on a
+/// change: `set_registry_access` and `set_registry_format`. Together with the
+/// registry's sole `remove`, its sole `drain` and `Drop for ResourcePools`, that
+/// is why a fresh stamp vouches for this whole value and the window reads no
+/// registry at all.
+///
+/// It was carried beside the re-resolve for three commits while
+/// `window_source_divergence` compared the two on every present. Three driven
+/// boots reported no class of disagreement, and the re-resolve is gone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedResident {
     pub image: vk::Image,
