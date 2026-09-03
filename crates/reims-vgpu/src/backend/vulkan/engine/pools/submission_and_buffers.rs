@@ -3967,10 +3967,7 @@ impl ResourcePools {
         // A component mapping is legal on the view; only the image
         // dimensionality must be the ordinary single-plane 2D form.
         if key.image.layers != 1
-            || key.image.volume
-            || key.image.cube
-            || key.image.arrayed
-            || key.image.one_dim
+            || key.image.kind != reims_vgpu_core::texture_shape::TextureKind::D2
         {
             return Ok(None);
         }
@@ -4074,10 +4071,7 @@ impl ResourcePools {
             width,
             height,
             layers,
-            volume,
-            cube,
-            arrayed,
-            one_dim,
+            kind,
             format,
             swizzle,
         } = sk;
@@ -4097,29 +4091,21 @@ impl ResourcePools {
             }
             return Ok(handles);
         }
-        let image_type = if one_dim {
-            vk::ImageType::TYPE_1D
-        } else if volume {
-            vk::ImageType::TYPE_3D
-        } else {
-            vk::ImageType::TYPE_2D
+        // The view type is `reims_vgpu_vulkan::view`'s answer and not a cascade
+        // here. It used to be six ordered `if`s over four booleans, where the
+        // order was the only thing keeping `one_dim && cube` from producing a
+        // cube view of a 1D image; the shape is a total type now and the
+        // translation is an exhaustive match in the crate that owns it.
+        let view_type = reims_vgpu_vulkan::view::view_type(kind);
+        let image_type = match kind.dimensions() {
+            reims_vgpu_core::texture_shape::Dimensions::One => vk::ImageType::TYPE_1D,
+            reims_vgpu_core::texture_shape::Dimensions::Two => vk::ImageType::TYPE_2D,
+            reims_vgpu_core::texture_shape::Dimensions::Three => vk::ImageType::TYPE_3D,
         };
-        let view_type = if one_dim && arrayed {
-            vk::ImageViewType::TYPE_1D_ARRAY
-        } else if one_dim {
-            vk::ImageViewType::TYPE_1D
-        } else if volume {
-            vk::ImageViewType::TYPE_3D
-        } else if cube {
-            vk::ImageViewType::CUBE
-        } else if arrayed {
-            vk::ImageViewType::TYPE_2D_ARRAY
-        } else {
-            vk::ImageViewType::TYPE_2D
-        };
+        let volume = kind.is_volume();
         let extent_depth = if volume { layers } else { 1 };
         let array_layers = if volume { 1 } else { layers };
-        let flags = if cube {
+        let flags = if kind.is_cube() {
             vk::ImageCreateFlags::CUBE_COMPATIBLE
         } else {
             vk::ImageCreateFlags::empty()
@@ -4195,10 +4181,7 @@ impl ResourcePools {
             width,
             height,
             layers,
-            volume,
-            cube,
-            arrayed,
-            one_dim,
+            kind,
             format,
             swizzle,
         };
@@ -4970,10 +4953,7 @@ mod recycle_tests {
             width: w,
             height: h,
             layers: 1,
-            volume: false,
-            cube: false,
-            arrayed: false,
-            one_dim: false,
+            kind: reims_vgpu_core::texture_shape::TextureKind::D2,
             format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
                 crate::protocol::pixel_format::TexelLayout::Bgra8,
             ),

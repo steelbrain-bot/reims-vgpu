@@ -822,10 +822,7 @@ fn sampled_guest_runs_land_the_guest_bytes_the_shader_samples() {
         width: 2,
         height: 2,
         layers: 1,
-        arrayed: false,
-        volume: false,
-        cube: false,
-        one_dim: false,
+        kind: reims_vgpu_core::texture_shape::TextureKind::D2,
         multisampled: false,
         source: SampledSource::GuestRuns(
             GuestRunSource {

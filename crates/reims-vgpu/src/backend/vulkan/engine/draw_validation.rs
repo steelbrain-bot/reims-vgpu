@@ -137,11 +137,17 @@ pub enum DrawValidationDecline {
         height: u32,
         layers: u32,
     },
+    /// A one-dimensional image whose height is not one.
+    ///
+    /// The two shape conflicts this used to carry as well — two of
+    /// `arrayed`/`volume`/`cube` set at once, and a 1D image that was also a
+    /// volume or a cube — are unrepresentable now that the shape is a
+    /// `TextureKind` rather than four booleans, so the only conflict left is
+    /// between the shape and an extent stated beside it.
     SampledShapeConflict {
         binding: u32,
-        arrayed: bool,
-        volume: bool,
-        cube: bool,
+        kind: &'static str,
+        height: u32,
     },
     SampledCubeGeometry {
         binding: u32,
@@ -419,14 +425,12 @@ impl Decline for DrawValidationDecline {
             ],
             Self::SampledShapeConflict {
                 binding,
-                arrayed,
-                volume,
-                cube,
+                kind,
+                height,
             } => vec![
                 ("binding", binding.to_string()),
-                ("arrayed", arrayed.to_string()),
-                ("volume", volume.to_string()),
-                ("cube", cube.to_string()),
+                ("kind", (*kind).to_string()),
+                ("height", height.to_string()),
             ],
             Self::SampledNonArrayLayers { binding, layers } => vec![
                 ("binding", binding.to_string()),
@@ -631,9 +635,8 @@ mod tests {
             },
             DrawValidationDecline::SampledShapeConflict {
                 binding: 32,
-                arrayed: true,
-                volume: true,
-                cube: false,
+                kind: "1d",
+                height: 4,
             },
             DrawValidationDecline::SampledCubeGeometry {
                 binding: 32,

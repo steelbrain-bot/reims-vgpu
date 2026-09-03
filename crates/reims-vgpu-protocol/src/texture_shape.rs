@@ -171,6 +171,22 @@ impl TextureKind {
         )
     }
 
+    /// Whether the extent's third axis is a depth rather than a layer count.
+    ///
+    /// Spelled here rather than as `dimensions() == Three` at each reader,
+    /// because it is the same question `is_arrayed` and `is_cube` answer and a
+    /// reader asking all three should ask them the same way.
+    #[must_use]
+    pub const fn is_volume(self) -> bool {
+        matches!(self.dimensions(), Dimensions::Three)
+    }
+
+    /// Whether the type has one spatial axis.
+    #[must_use]
+    pub const fn is_one_dim(self) -> bool {
+        matches!(self.dimensions(), Dimensions::One)
+    }
+
     /// Whether each array element is six faces rather than one slice.
     #[must_use]
     pub const fn is_cube(self) -> bool {

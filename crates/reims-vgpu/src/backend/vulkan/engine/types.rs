@@ -1091,14 +1091,26 @@ pub struct SampledImageResource {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
-    pub arrayed: bool,
-    pub volume: bool,
-    pub cube: bool,
-    /// Metal `texture1d` / `texture1d_array` (color-transfer LUTs): the image is
-    /// created as a Vulkan 1D image so the sampled descriptor type matches the
-    /// shader's declared 1D image. `height` is 1; `arrayed` selects
-    /// `TYPE_1D_ARRAY`. Mutually exclusive with `volume` and `cube`.
-    pub one_dim: bool,
+    /// The image and view shape, as **one** total answer.
+    ///
+    /// This was four independent booleans — `arrayed`, `volume`, `cube`,
+    /// `one_dim` — with the exclusions between them stated in a doc comment
+    /// ("mutually exclusive with `volume` and `cube`") rather than in the type.
+    /// Twelve of their sixteen combinations name no Vulkan image, the three
+    /// structs that carried them set them in two different field orders, and
+    /// the only thing standing between a permuted assignment and the wrong view
+    /// type was an ordered `if` cascade at the creation site and a test that
+    /// existed to catch the permutation. A kind cannot be permuted.
+    ///
+    /// Multisampling is deliberately **not** folded in here even though
+    /// [`reims_vgpu_core::texture_shape::TextureKind`] can spell it: the
+    /// neutral 1×1 substitute below binds a shape without being multisampled,
+    /// so the two are independent facts and [`Self::multisampled`] stays its
+    /// own field. Metal `texture1d` / `texture1d_array` (colour-transfer LUTs)
+    /// arrive as `D1` / `D1Array`, which is what makes the image a Vulkan 1D
+    /// image so the sampled descriptor type matches the shader's declared 1D
+    /// image; `height` is 1 for those.
+    pub kind: reims_vgpu_core::texture_shape::TextureKind,
     /// The shader declares a multisampled 2D image at this binding. Such an
     /// image can only come from a retained multisample target; linear bytes
     /// cannot be uploaded into one with a buffer-to-image copy.

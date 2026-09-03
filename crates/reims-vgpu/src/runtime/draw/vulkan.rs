@@ -29,10 +29,13 @@ use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 /// binding a truncated array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SampledImageShape {
-    arrayed: bool,
-    volume: bool,
-    cube: bool,
-    one_dim: bool,
+    /// The image and view shape, as one total answer rather than four
+    /// booleans whose exclusions could only be stated in prose. See
+    /// [`crate::backend::vulkan::engine::types::SampledImageResource::kind`].
+    kind: reims_vgpu_core::texture_shape::TextureKind,
+    /// Independent of [`Self::kind`] on purpose: the neutral 1x1 substitute
+    /// binds a shape without being multisampled, so a `D2Multisample` kind
+    /// would over-state what that path asks for.
     multisampled: bool,
     layers: u32,
 }
@@ -53,37 +56,39 @@ fn sampled_image_shape(
     kind: crate::runtime::spirv_bind::SampledImageKind,
 ) -> Option<SampledImageShape> {
     use crate::runtime::spirv_bind::SampledImageKind;
-    // Plain 2D, which every other shape is a single flag away from.
+    use reims_vgpu_core::texture_shape::TextureKind;
+    // Plain 2D, which every other shape names by its own kind.
     let d2 = SampledImageShape {
-        arrayed: false,
-        volume: false,
-        cube: false,
-        one_dim: false,
+        kind: TextureKind::D2,
         multisampled: false,
         layers: 1,
     };
     Some(match kind {
         SampledImageKind::D1 => SampledImageShape {
-            one_dim: true,
+            kind: TextureKind::D1,
             ..d2
         },
         SampledImageKind::D1Array => SampledImageShape {
-            one_dim: true,
-            arrayed: true,
+            kind: TextureKind::D1Array,
             ..d2
         },
         SampledImageKind::D2 => d2,
+        // The kind stays `D2`: a multisampled bind is a 2D image whose sample
+        // count is stated beside it, and the engine reads the two separately.
         SampledImageKind::D2Multisample => SampledImageShape {
             multisampled: true,
             ..d2
         },
         SampledImageKind::D2Array => SampledImageShape {
-            arrayed: true,
+            kind: TextureKind::D2Array,
             ..d2
         },
-        SampledImageKind::D3 => SampledImageShape { volume: true, ..d2 },
+        SampledImageKind::D3 => SampledImageShape {
+            kind: TextureKind::D3,
+            ..d2
+        },
         SampledImageKind::Cube => SampledImageShape {
-            cube: true,
+            kind: TextureKind::Cube,
             layers: 6,
             ..d2
         },
@@ -7873,13 +7878,13 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     ));
                 };
                 let SampledImageShape {
-                    arrayed,
-                    volume,
-                    cube,
-                    one_dim,
+                    kind: image_shape,
                     multisampled,
                     mut layers,
                 } = shape;
+                let volume = image_shape.is_volume();
+                let one_dim = image_shape.is_one_dim();
+                let cube = image_shape.is_cube();
                 if multisampled && !source_is_target {
                     return Err(DrawError::DrawPreparation(
                         DrawPreparationDecline::TextureDimensionUnsupported {
@@ -7988,10 +7993,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     width: tw,
                     height: th,
                     layers,
-                    arrayed,
-                    volume,
-                    cube,
-                    one_dim,
+                    kind: image_shape,
                     multisampled,
                     source,
                     byte_origin,
@@ -8097,10 +8099,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 width: 1,
                 height: 1,
                 layers: shape.layers,
-                arrayed: shape.arrayed,
-                volume: shape.volume,
-                cube: shape.cube,
-                one_dim: shape.one_dim,
+                kind: shape.kind,
                 multisampled: false,
                 // One texel per layer, because the byte-length validation
                 // charges every layer: a cube's neutral substitute is six
@@ -12749,43 +12748,51 @@ mod vulkan_split_tests {
         // Before this mapping the sampled path declined the whole draw with
         // `draw_prepare_texture_dimension_unsupported`, so the color-managed
         // desktop composite stored nothing and presented unbacked.
+        use reims_vgpu_core::texture_shape::TextureKind;
+
         let d1 = sampled_image_shape(SampledImageKind::D1).expect("D1 is expressible");
-        assert!(d1.one_dim && !d1.arrayed && !d1.volume && !d1.cube);
+        assert_eq!(d1.kind, TextureKind::D1);
         assert_eq!(d1.layers, 1);
 
         let d1_array =
             sampled_image_shape(SampledImageKind::D1Array).expect("D1Array is expressible");
-        assert!(d1_array.one_dim && d1_array.arrayed && !d1_array.volume && !d1_array.cube);
+        assert_eq!(d1_array.kind, TextureKind::D1Array);
         assert_eq!(d1_array.layers, 1);
     }
 
-    /// Every kind reaches its whole flag set, not just its 1D-ness.
+    /// Every reflected dimensionality reaches the shape kind that names it.
     ///
-    /// This asserted `!one_dim` and nothing else, which left `D2Array`'s
-    /// `arrayed` and `D3`'s `volume` unpinned — and those two are adjacent
-    /// `bool`s of a five-field shape, so swapping them compiles and would have
-    /// bound a 3D image for an array and vice versa with the test still green.
+    /// This used to compare a four-boolean tuple, and had to, because the shape
+    /// carried four adjacent `bool`s and swapping two of them compiled: a test
+    /// that asserted only `!one_dim` left `D2Array`'s `arrayed` and `D3`'s
+    /// `volume` unpinned and would have bound a 3D image for an array with the
+    /// test still green. One kind per row is now the whole of the answer.
+    ///
+    /// `D2Multisample` maps to `D2` deliberately: the sample count is a
+    /// separate field, so the shape it asks for is the plain 2D one.
     #[test]
-    fn sampled_image_shape_gives_each_kind_its_whole_flag_set() {
+    fn sampled_image_shape_gives_each_kind_its_own_shape() {
         use crate::runtime::spirv_bind::SampledImageKind;
+        use reims_vgpu_core::texture_shape::TextureKind;
 
-        // (kind, arrayed, volume, one_dim). `cube` is false throughout — the
-        // cube kinds decline instead of producing a shape.
-        for (kind, arrayed, volume, one_dim) in [
-            (SampledImageKind::D2, false, false, false),
-            (SampledImageKind::D2Array, true, false, false),
-            (SampledImageKind::D3, false, true, false),
-            (SampledImageKind::D1, false, false, true),
-            (SampledImageKind::D1Array, true, false, true),
+        for (kind, want) in [
+            (SampledImageKind::D2, TextureKind::D2),
+            (SampledImageKind::D2Multisample, TextureKind::D2),
+            (SampledImageKind::D2Array, TextureKind::D2Array),
+            (SampledImageKind::D3, TextureKind::D3),
+            (SampledImageKind::D1, TextureKind::D1),
+            (SampledImageKind::D1Array, TextureKind::D1Array),
         ] {
             let shape = sampled_image_shape(kind).expect("expressible shape");
-            assert_eq!(
-                (shape.arrayed, shape.volume, shape.cube, shape.one_dim),
-                (arrayed, volume, false, one_dim),
-                "{kind:?} did not map to its own flags"
-            );
+            assert_eq!(shape.kind, want, "{kind:?} did not map to its own shape");
             assert_eq!(shape.layers, 1, "{kind:?} layers");
         }
+        assert!(
+            sampled_image_shape(SampledImageKind::D2Multisample)
+                .expect("expressible")
+                .multisampled,
+            "the sample count is the field the multisample kind does set"
+        );
     }
 
     /// A pass's records share one depth attachment, named or not.
@@ -13079,14 +13086,13 @@ mod vulkan_split_tests {
         // drive that choice one-to-one.
         let cube = sampled_image_shape(SampledImageKind::Cube).expect("cube is expressible");
         assert_eq!(
-            (
-                cube.cube,
-                cube.arrayed,
-                cube.volume,
-                cube.one_dim,
-                cube.layers
-            ),
-            (true, false, false, false, 6)
+            (cube.kind, cube.layers),
+            (reims_vgpu_core::texture_shape::TextureKind::Cube, 6)
+        );
+        assert_eq!(
+            reims_vgpu_vulkan::view::view_type(cube.kind),
+            ash::vk::ImageViewType::CUBE,
+            "a cube binds a CUBE view and not a 2D array"
         );
         // A cube array needs 6*n layers and n is a descriptor field this
         // decoder does not read; the refusal keeps that gap named.

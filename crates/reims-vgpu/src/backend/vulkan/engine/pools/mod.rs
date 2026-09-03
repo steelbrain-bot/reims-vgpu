@@ -1333,15 +1333,14 @@ pub(crate) struct SampledSlot {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
-    pub volume: bool,
-    pub cube: bool,
-    pub arrayed: bool,
-    /// The image was created as a Vulkan 1D (`TYPE_1D` / `TYPE_1D_ARRAY`) image
-    /// because the shader's sampled binding reflects a Metal `texture1d` /
-    /// `texture1d_array` (color-transfer LUTs). Part of the pool key: a 1D view
-    /// and a `height==1` 2D view are byte-identical images but incompatible
-    /// descriptor types, so a recycled slot must never cross that boundary.
-    pub one_dim: bool,
+    /// The image and view shape this slot was created with.
+    ///
+    /// Part of the pool key: a 1D view and a `height == 1` 2D view are
+    /// byte-identical images but incompatible descriptor types, so a recycled
+    /// slot must never cross that boundary. One field rather than the four
+    /// booleans it replaces — see
+    /// [`crate::backend::vulkan::engine::types::SampledImageResource::kind`].
+    pub kind: reims_vgpu_core::texture_shape::TextureKind,
     pub format: ash::vk::Format,
     /// The view's component mapping, from the decoded texture-view swizzle. Part of
     /// the pool key because it is baked into the `VkImageView`: a recycled slot
@@ -1399,10 +1398,7 @@ pub(crate) struct SampledKey {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) layers: u32,
-    pub(crate) volume: bool,
-    pub(crate) cube: bool,
-    pub(crate) arrayed: bool,
-    pub(crate) one_dim: bool,
+    pub(crate) kind: reims_vgpu_core::texture_shape::TextureKind,
     pub(crate) format: ash::vk::Format,
     pub(crate) swizzle: crate::protocol::pixel_format::SwizzlePlan,
 }
@@ -1420,10 +1416,7 @@ impl SampledKey {
             width: r.width,
             height: r.height,
             layers: r.layers,
-            volume: r.volume,
-            cube: r.cube,
-            arrayed: r.arrayed,
-            one_dim: r.one_dim,
+            kind: r.kind,
             format: r.format,
             swizzle: r.swizzle,
         }
@@ -1436,10 +1429,7 @@ impl SampledKey {
     /// sampled pool rather than entering the attachment-count-sized pool.
     pub(crate) fn is_plain_2d_identity_view(self) -> bool {
         self.layers == 1
-            && !self.volume
-            && !self.cube
-            && !self.arrayed
-            && !self.one_dim
+            && self.kind == reims_vgpu_core::texture_shape::TextureKind::D2
             && self.swizzle.is_identity()
     }
 }
@@ -1450,10 +1440,7 @@ impl SampledSlot {
             width: self.width,
             height: self.height,
             layers: self.layers,
-            volume: self.volume,
-            cube: self.cube,
-            arrayed: self.arrayed,
-            one_dim: self.one_dim,
+            kind: self.kind,
             format: self.format,
             swizzle: self.swizzle,
         }
@@ -1472,10 +1459,7 @@ impl SampledSlot {
             width: self.width,
             height: self.height,
             layers: self.layers,
-            volume: self.volume,
-            cube: self.cube,
-            arrayed: self.arrayed,
-            one_dim: self.one_dim,
+            kind: self.kind,
             format: self.format,
             swizzle: self.swizzle,
         }
@@ -3409,7 +3393,9 @@ mod sampled_key_tests {
     use crate::backend::vulkan::engine::types::{SampledImageResource, SampledSource};
     use crate::protocol::pixel_format::SwizzlePlan;
 
-    fn resource(arrayed: bool, volume: bool, cube: bool, one_dim: bool) -> SampledImageResource {
+    use reims_vgpu_core::texture_shape::TextureKind;
+
+    fn resource(kind: TextureKind) -> SampledImageResource {
         SampledImageResource {
             binding: 0,
             array_element: 0,
@@ -3417,10 +3403,7 @@ mod sampled_key_tests {
             width: 7,
             height: 5,
             layers: 3,
-            arrayed,
-            volume,
-            cube,
-            one_dim,
+            kind,
             multisampled: false,
             source: SampledSource::Bytes(std::sync::Arc::new(Vec::new())),
             byte_origin: Default::default(),
@@ -3430,92 +3413,63 @@ mod sampled_key_tests {
         }
     }
 
-    /// Each shape flag reaches the key field of its own name.
+    /// Every shape a resource can carry reaches the key unchanged.
     ///
-    /// The four are adjacent, all `bool`, and declared in a different order on
-    /// the resource (`arrayed, volume, cube, one_dim`) than on the key
-    /// (`volume, cube, arrayed, one_dim`), so any permutation of them compiles
-    /// and none of the callers could have noticed. One flag set at a time is
-    /// the only pattern that pins all four: with two set, a swap between them
-    /// is invisible.
+    /// This replaces a one-hot sweep over four adjacent `bool` fields that were
+    /// declared in one order on the resource and another on the key, so any
+    /// permutation of them compiled and no caller could have noticed. A single
+    /// `TextureKind` cannot be permuted, and the sweep is now over the whole
+    /// declared set rather than over four flags one at a time — which is
+    /// strictly more than the old test could reach, because with two flags set
+    /// a swap between them was invisible to it.
     #[test]
-    fn every_shape_flag_reaches_the_key_field_of_its_own_name() {
-        // Set on the resource as (arrayed, volume, cube, one_dim); read back
-        // off the key as (volume, cube, arrayed, one_dim).
-        let one_hot = [
-            (
-                "arrayed",
-                (true, false, false, false),
-                (false, false, true, false),
-            ),
-            (
-                "volume",
-                (false, true, false, false),
-                (true, false, false, false),
-            ),
-            (
-                "cube",
-                (false, false, true, false),
-                (false, true, false, false),
-            ),
-            (
-                "one_dim",
-                (false, false, false, true),
-                (false, false, false, true),
-            ),
-        ];
-        for (name, (arrayed, volume, cube, one_dim), want) in one_hot {
-            let k = SampledKey::of(&resource(arrayed, volume, cube, one_dim));
+    fn every_shape_reaches_the_key_unchanged() {
+        for kind in TextureKind::ALL {
             assert_eq!(
-                (k.volume, k.cube, k.arrayed, k.one_dim),
-                want,
-                "{name} did not reach the key field of its own name"
+                SampledKey::of(&resource(kind)).kind,
+                kind,
+                "{} did not reach the key",
+                kind.name()
             );
         }
     }
 
-    /// The extent and view fields carry across too, so a flag test passing
+    /// The extent and view fields carry across too, so a shape test passing
     /// cannot hide a crossed `width`/`height` beside it.
     #[test]
     fn the_extent_and_view_fields_carry_across() {
-        let k = SampledKey::of(&resource(false, false, false, false));
+        let k = SampledKey::of(&resource(TextureKind::D2));
         assert_eq!((k.width, k.height, k.layers), (7, 5, 3));
         assert_eq!(k.format, ash::vk::Format::R8G8B8A8_UNORM);
         assert_eq!(k.swizzle, SwizzlePlan::default());
     }
 
-    /// Only one key can describe the plain view of one attachment. Every shape
-    /// dimension that could make a second incompatible view keeps that bind out
-    /// of the attachment-count-sized scratch pool.
+    /// Only one key can describe the plain view of one attachment. Every other
+    /// shape, and every non-identity swizzle, keeps that bind out of the
+    /// attachment-count-sized scratch pool.
+    ///
+    /// The shape half is now exhaustive: `TextureKind::ALL` minus `D2` is every
+    /// shape that must be excluded, where the old test listed four flags and so
+    /// could not have said anything about a fifth.
     #[test]
     fn attachment_snapshot_pool_accepts_only_plain_2d_identity_views() {
-        let mut plain = SampledKey::of(&resource(false, false, false, false));
+        let mut plain = SampledKey::of(&resource(TextureKind::D2));
         plain.layers = 1;
         assert!(plain.is_plain_2d_identity_view());
 
-        let variants = vec![
+        let mut variants = vec![
             SampledKey { layers: 2, ..plain },
-            SampledKey {
-                volume: true,
-                ..plain
-            },
-            SampledKey {
-                cube: true,
-                ..plain
-            },
-            SampledKey {
-                arrayed: true,
-                ..plain
-            },
-            SampledKey {
-                one_dim: true,
-                ..plain
-            },
             SampledKey {
                 swizzle: crate::protocol::pixel_format::swizzle_plan(&[4, 3, 2, 1]).unwrap(),
                 ..plain
             },
         ];
+        variants.extend(
+            TextureKind::ALL
+                .into_iter()
+                .filter(|&kind| kind != TextureKind::D2)
+                .map(|kind| SampledKey { kind, ..plain }),
+        );
         assert!(variants
             .into_iter()
             .all(|key| !key.is_plain_2d_identity_view()));

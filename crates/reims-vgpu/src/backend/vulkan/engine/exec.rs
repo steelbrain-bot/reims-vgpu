@@ -1823,30 +1823,24 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if (image.arrayed as u8 + image.volume as u8 + image.cube as u8) > 1 {
+        // The two shape conflicts that used to be checked here — two of
+        // `arrayed`/`volume`/`cube` set at once, and a 1D image that was also a
+        // volume or a cube — are gone because they cannot be spelled: the shape
+        // is one `TextureKind` and not four booleans. What is left is the
+        // conflict between the shape and an extent stated beside it, which no
+        // type can rule out.
+        //
+        // A 1D image (`texture1d` / `texture1d_array`) is a single row.
+        if image.kind.is_one_dim() && image.height != 1 {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledShapeConflict {
                     binding: image.binding,
-                    arrayed: image.arrayed,
-                    volume: image.volume,
-                    cube: image.cube,
+                    kind: image.kind.name(),
+                    height: image.height,
                 },
             ));
         }
-        // A 1D image (`texture1d` / `texture1d_array`) is a single row: it may
-        // combine only with `arrayed` (the 1D-array case) and always has
-        // height 1. `volume`/`cube` are 2D/3D shapes and cannot co-occur.
-        if image.one_dim && (image.volume || image.cube || image.height != 1) {
-            return Err(DrawError::DrawValidation(
-                DrawValidationDecline::SampledShapeConflict {
-                    binding: image.binding,
-                    arrayed: image.arrayed,
-                    volume: image.volume,
-                    cube: image.cube,
-                },
-            ));
-        }
-        if image.cube && (image.layers != 6 || image.width != image.height) {
+        if image.kind.is_cube() && (image.layers != 6 || image.width != image.height) {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledCubeGeometry {
                     binding: image.binding,
@@ -1856,7 +1850,11 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 },
             ));
         }
-        if !image.arrayed && !image.volume && !image.cube && image.layers != 1 {
+        if !image.kind.is_arrayed()
+            && !image.kind.is_volume()
+            && !image.kind.is_cube()
+            && image.layers != 1
+        {
             return Err(DrawError::DrawValidation(
                 DrawValidationDecline::SampledNonArrayLayers {
                     binding: image.binding,
@@ -1912,7 +1910,18 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 ));
             }
             SampledSource::Target(identity) => {
-                if image.arrayed || image.volume || image.cube || image.layers != 1 {
+                // Spelled as the three shape questions the four booleans used
+                // to ask, and not as `kind != D2`: this check has never
+                // included the 1D case, so a `texture1d` bind of a resident
+                // reaches the geometry comparison below. Whether it should is a
+                // separate question from how the shape is carried, and
+                // answering it here would be a behaviour change riding on a
+                // representation change.
+                if image.kind.is_arrayed()
+                    || image.kind.is_volume()
+                    || image.kind.is_cube()
+                    || image.layers != 1
+                {
                     return Err(DrawError::Unsupported(
                         super::reason::DrawReason::ResidentSampledNot2d {
                             binding: image.binding,
@@ -1936,7 +1945,7 @@ pub(crate) fn validate_v1(req: &DrawRequest) -> Result<(), DrawError> {
                 // A cube's face ordering is not carried by this source. Arrays
                 // and volumes are ordinary consecutive image planes and the
                 // copy below consumes all of them.
-                if image.cube {
+                if image.kind.is_cube() {
                     return Err(DrawError::Unsupported(
                         super::reason::DrawReason::GuestRunSampledNot2d {
                             binding: image.binding,
@@ -3916,7 +3925,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     array_element: resource.array_element,
                     image: img,
                     staging: st,
-                    volume: resource.volume,
+                    volume: resource.kind.is_volume(),
                     layers: resource.layers,
                 });
             }
@@ -4197,7 +4206,7 @@ pub(crate) unsafe fn execute_draw_inner(
                     image: img,
                     source,
                     row_length_texels: src.row_length_texels,
-                    volume: resource.volume,
+                    volume: resource.kind.is_volume(),
                     layers: resource.layers,
                     gathered_len: src.total_len as usize,
                 });
@@ -7109,10 +7118,7 @@ mod tests {
                 width: w,
                 height: h,
                 layers: 1,
-                arrayed: false,
-                volume: false,
-                cube: false,
-                one_dim: false,
+                kind: reims_vgpu_core::texture_shape::TextureKind::D2,
                 multisampled: false,
                 source: SampledSource::GuestRuns(
                     GuestRunSource {
@@ -7210,10 +7216,7 @@ mod tests {
             width: 16,
             height: 16,
             layers: 1,
-            arrayed: false,
-            volume: false,
-            cube: false,
-            one_dim: false,
+            kind: reims_vgpu_core::texture_shape::TextureKind::D2,
             multisampled: false,
             source: SampledSource::Target(identity),
             byte_origin: Default::default(),
@@ -7245,7 +7248,7 @@ mod tests {
         assert_eq!(feedback_color_index(&req, &plain, false), None);
 
         let mut non_plain = target_sample(primary);
-        non_plain.arrayed = true;
+        non_plain.kind = reims_vgpu_core::texture_shape::TextureKind::D2Array;
         assert_eq!(feedback_color_index(&req, &non_plain, true), None);
 
         let secondary = secondary_with_clear(super::super::types::ColorClearValue::default());
@@ -7640,7 +7643,7 @@ mod tests {
     #[test]
     fn guest_runs_volume_validates_every_depth_plane() {
         let mut req = guest_run_req(16, 8, 16 * 8 * 4 * 3, 0);
-        req.sampled_images[0].volume = true;
+        req.sampled_images[0].kind = reims_vgpu_core::texture_shape::TextureKind::D3;
         req.sampled_images[0].layers = 3;
         assert!(validate_v1(&req).is_ok());
 
@@ -7659,7 +7662,7 @@ mod tests {
         // Three 4-texel-by-2-row planes at a six-texel row pitch: five full
         // padded rows followed by the final tight row.
         let mut req = guest_run_req(4, 2, 5 * 24 + 16, 6);
-        req.sampled_images[0].volume = true;
+        req.sampled_images[0].kind = reims_vgpu_core::texture_shape::TextureKind::D3;
         req.sampled_images[0].layers = 3;
         assert!(validate_v1(&req).is_ok());
     }
@@ -7753,7 +7756,7 @@ mod tests {
         // The sampled arm: four factors, and `layers` is the one that tips it.
         // `arrayed`, because a non-array image with layers != 1 is refused
         // earlier and would never reach the multiplication.
-        req.sampled_images[0].arrayed = true;
+        req.sampled_images[0].kind = reims_vgpu_core::texture_shape::TextureKind::D2Array;
         req.sampled_images[0].width = u32::MAX;
         req.sampled_images[0].height = u32::MAX;
         req.sampled_images[0].layers = u32::MAX;
