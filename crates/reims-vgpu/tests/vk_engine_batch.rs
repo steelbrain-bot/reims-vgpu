@@ -750,10 +750,23 @@ fn a_warm_repeat_draw_does_not_enter_the_allocator() {
             .unwrap_or_else(|e| panic!("warm-up draw #{n}: {e}"));
     }
 
+    let before = engine::counter_snapshot();
     let (result, trips) = reims_vgpu_testkit::allocations::measure(|| {
         engine::execute_draw_request(engine_device(), &joiner)
     });
     result.expect("the measured draw is the ninth repeat of one that succeeded");
+    // A zero is only a reading if a draw happened inside the region. An early
+    // return — a request rejected at validation, a batch already closed — would
+    // also allocate nothing, and would pass this for the wrong reason.
+    let during = engine::counter_snapshot().delta_since(&before);
+    assert_eq!(
+        during.batch_joins, 1,
+        "the measured region recorded exactly one joining draw: {during:?}"
+    );
+    assert_eq!(
+        during.batch_flushes, 0,
+        "and did not flush, which is not a steady-state draw: {during:?}"
+    );
 
     assert_eq!(
         trips, 0,
