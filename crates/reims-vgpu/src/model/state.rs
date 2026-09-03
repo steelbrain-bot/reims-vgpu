@@ -2802,7 +2802,15 @@ pub struct DeviceState {
     /// next packet names. The packet *envelope* — stamps, ordering position,
     /// completion — stays with the drain for every class and moves when the
     /// ordering core does. What has moved is one lifetime, to its one owner.
-    pub session: reims_vgpu_core::session::SessionModel,
+    ///
+    /// **Private, and reached through the doors below.** The same shape the
+    /// resource-lifetime group left `lifecycle` in, for the same reason: the
+    /// paths that will feed this model next — a pipeline being declared,
+    /// translated, built or refused — run on the draw rails, which hold
+    /// `&DeviceState` and cannot take a `&mut` field. A `Mutex` and named doors
+    /// keep "which state changes, from where" a list a reader can enumerate,
+    /// instead of a public field any call site can reach into.
+    session: Mutex<reims_vgpu_core::session::SessionModel>,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
     /// immutable AIR translation is still loading. The packet head and stamp
     /// remain untouched until retry, so this is scheduler state rather than a
@@ -3299,9 +3307,9 @@ impl DeviceState {
             gfx: GfxRegs::default(),
             iosfc: IosfcRegs::default(),
             gva_store_witness: Default::default(),
-            session: reims_vgpu_core::session::SessionModel::new(
+            session: Mutex::new(reims_vgpu_core::session::SessionModel::new(
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
-            ),
+            )),
             translation_deferred_mask: 0,
             stamp_deferred_mask: 0,
             translation_order_hold_mask: 0,
@@ -4016,6 +4024,8 @@ impl DeviceState {
             if mask & (1u32 << channel) != 0 {
                 let _ = self
                     .session
+                    .lock()
+                    .expect("session")
                     .open_channel(reims_vgpu_core::identity::ChannelId(channel));
             }
         }
@@ -4028,7 +4038,22 @@ impl DeviceState {
     /// [`Self::session`] for why the other two answer a different question.
     pub fn child_domain_open(&self, channel: u32) -> bool {
         self.session
+            .lock()
+            .expect("session")
             .channel_open(reims_vgpu_core::identity::ChannelId(channel))
+    }
+
+    /// Perform a resolved control operation's effect on the ordering plane.
+    ///
+    /// The one door a channel definition or free reaches the model through, and
+    /// the reason the field below it is private: the drain used to hold a `&mut`
+    /// and call the model directly, which is a shape no `&DeviceState` caller
+    /// could copy.
+    pub fn apply_channel_control(
+        &self,
+        op: reims_vgpu_core::control::ControlOp,
+    ) -> Result<(), reims_vgpu_core::session::ControlRefusal> {
+        self.session.lock().expect("session").apply_control(op)
     }
 
     /// The open child domains as the bit mask this device's registers speak in.

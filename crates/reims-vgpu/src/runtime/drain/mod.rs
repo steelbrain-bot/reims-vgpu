@@ -2935,7 +2935,7 @@ fn process_root_packet<H: HostMemory + HostOps>(
             // writer of it. What stays here is everything that is *not* the
             // domain's publication lifetime: the pending-work bit, and the
             // per-channel drain state `forget_child_channel` resets.
-            let verdict = state.session.apply_control(op);
+            let verdict = state.apply_channel_control(op);
             note_channel_transition_verdict(verdict, transition, ch);
             if transition == control::ChannelTransition::Free {
                 // Only a free clears it: an open is not a claim that nothing is
