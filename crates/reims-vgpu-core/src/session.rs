@@ -986,6 +986,40 @@ impl SessionModel {
         self.scheduler.pipeline_refused(pipeline)
     }
 
+    /// A completion word became readable: record the value the timeline now
+    /// stands at, and release whatever was waiting for it.
+    ///
+    /// **The guest advances timelines this model does not own.** A device that
+    /// published only from its own completions would hold packets against a
+    /// value already written — see [`crate::ready::Scheduler::publish`] — so
+    /// the publication has to arrive from whoever writes the word, which is
+    /// the drain and not this plane.
+    ///
+    /// Nothing comes back. The released transactions join the ready list and
+    /// leave it through [`Self::take_ready`], which is the one place work is
+    /// taken; a door that returned them here would be a second one, and a
+    /// caller using both would run the same transaction twice.
+    ///
+    /// The value is not necessarily the one that lands: a slot only ever moves
+    /// *later* on its wrapping timeline, so a word written behind the slot is
+    /// recorded as no movement at all. Ask [`Self::published_stamp`] for what
+    /// the slot actually holds — the two disagreeing is a fence going
+    /// backwards, which unsatisfies waits the guest has already been told are
+    /// met.
+    pub fn stamp_published(&mut self, stamp: CompletionStamp) {
+        self.scheduler.publish(stamp);
+    }
+
+    /// What a slot's timeline stands at, or `None` if nothing ever published
+    /// to it.
+    #[must_use]
+    pub fn published_stamp(
+        &self,
+        slot: crate::identity::StampSlot,
+    ) -> Option<crate::identity::StampValue> {
+        self.scheduler.published_value(slot)
+    }
+
     /// Transactions that have become ready since the last call.
     #[must_use = "a transaction taken off the ready list and not run is one that never runs"]
     pub fn take_ready(&mut self) -> Vec<IngressOrdinal> {

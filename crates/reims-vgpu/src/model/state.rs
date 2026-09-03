@@ -3284,6 +3284,29 @@ pub const FENCE_DOMAIN_COMPUTE: u8 = 3;
 /// Domain tag for render fences.
 pub const FENCE_DOMAIN_RENDER: u8 = 4;
 
+/// What writing a completion word did to the ordering plane's record of that
+/// slot's timeline.
+///
+/// Four facts and not one, because they mean four different things and only
+/// one of them is a defect. [`Self::Repeat`] is how a packet that signals
+/// nothing is spelled on this wire — the header repeats the slot's current
+/// value rather than clearing it — and [`Self::Behind`] is a fence going
+/// backwards, which unsatisfies every wait between the two values and is the
+/// first thing to rule out before reading an unmet-wait count as an ordering
+/// problem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StampPublication {
+    /// Nothing had ever published to this slot.
+    First,
+    /// The timeline moved forward.
+    Advanced,
+    /// The same value again.
+    Repeat,
+    /// The word is behind what the slot already holds, so the model's timeline
+    /// did not move and this device's guest-visible write disagrees with it.
+    Behind,
+}
+
 impl DeviceState {
     /// GPA for a guest PFN under this device's page size.
     #[inline]
@@ -4162,6 +4185,33 @@ impl DeviceState {
             .lock()
             .expect("session")
             .pipeline_refused(pipeline, reason)
+    }
+
+    /// The guest's completion word for `slot` has moved to `value`.
+    ///
+    /// The other end of a stamp wait. `SessionModel::admit` parks a packet
+    /// whose header names a point another packet must have published, and the
+    /// only thing that discharges that wait is this — so a cutover without it
+    /// would park every packet the guest orders behind a fence, forever, the
+    /// same way an unadvanced pipeline would park every exec.
+    ///
+    /// Answers with what the write did to the slot's timeline, which is four
+    /// different facts and not one. See [`StampPublication`].
+    pub fn publish_completion_stamp(
+        &self,
+        slot: reims_vgpu_core::identity::StampSlot,
+        value: reims_vgpu_core::identity::StampValue,
+    ) -> StampPublication {
+        let mut session = self.session.lock().expect("session");
+        let before = session.published_stamp(slot);
+        session.stamp_published(reims_vgpu_core::identity::CompletionStamp { slot, value });
+        let after = session.published_stamp(slot);
+        match before {
+            None => StampPublication::First,
+            Some(before) if after == Some(value) && before != value => StampPublication::Advanced,
+            Some(before) if before == value => StampPublication::Repeat,
+            Some(_) => StampPublication::Behind,
+        }
     }
 
     /// What the ordering plane holds about the pipelines this session declared.
@@ -5854,6 +5904,78 @@ mod pipeline_door_tests {
             .refuse_pipeline(name(4000), RefusalReason::CompilationFailed("absent"))
             .is_empty());
         assert_eq!(state.pipeline_census().refused, 1);
+    }
+}
+
+#[cfg(test)]
+mod stamp_publication_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use reims_vgpu_core::identity::{StampSlot, StampValue};
+
+    fn publish(state: &DeviceState, slot: u32, value: u32) -> StampPublication {
+        state.publish_completion_stamp(StampSlot(slot), StampValue(value))
+    }
+
+    /// A slot's timeline is first written, then advanced, and a word repeating
+    /// the value it already holds is not movement.
+    ///
+    /// The repeat is not a corner case on this wire: a packet that does not
+    /// signal repeats its channel's current completion word rather than
+    /// leaving the slot alone, so it is the ordinary shape of most of the
+    /// stream and would otherwise read as a fence advancing thousands of times
+    /// a second.
+    #[test]
+    fn a_slot_is_first_written_then_advanced_and_a_repeat_is_neither() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(publish(&state, 3, 10), StampPublication::First);
+        assert_eq!(publish(&state, 3, 10), StampPublication::Repeat);
+        assert_eq!(publish(&state, 3, 11), StampPublication::Advanced);
+
+        // Slots are independent timelines. A device with one counter across
+        // them would report every second channel's first word as behind.
+        assert_eq!(publish(&state, 4, 1), StampPublication::First);
+        assert_eq!(publish(&state, 3, 12), StampPublication::Advanced);
+    }
+
+    /// A word behind the slot leaves the model's timeline where it was, and
+    /// says so.
+    ///
+    /// This device writes the packet header's word into the guest's slot
+    /// without comparing, so the two records *can* disagree — and the
+    /// disagreement is the interesting half: a fence going backwards
+    /// unsatisfies every wait between the two values, and a model that
+    /// silently followed it would take back readiness the guest has already
+    /// been told about.
+    #[test]
+    fn a_word_behind_the_slot_does_not_move_the_model_and_is_named() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(publish(&state, 0, 100), StampPublication::First);
+        assert_eq!(publish(&state, 0, 99), StampPublication::Behind);
+        assert_eq!(
+            publish(&state, 0, 100),
+            StampPublication::Repeat,
+            "the slot still holds 100, so the model did not follow the rewind"
+        );
+    }
+
+    /// Later is decided on the wrapping timeline and not numerically.
+    ///
+    /// A guest whose completion counter wraps past `u32::MAX` writes a smaller
+    /// number that is nonetheless the later point. A model comparing with `>`
+    /// would call it a rewind and refuse to advance for the rest of the boot,
+    /// which is a hang that starts four billion packets in and cannot be
+    /// reproduced by driving apps.
+    #[test]
+    fn a_wrapped_timeline_advances_to_the_smaller_number() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(publish(&state, 1, u32::MAX - 1), StampPublication::First);
+        assert_eq!(publish(&state, 1, 3), StampPublication::Advanced);
+        assert_eq!(
+            publish(&state, 1, u32::MAX - 1),
+            StampPublication::Behind,
+            "and the point before the wrap is behind the one after it"
+        );
     }
 }
 

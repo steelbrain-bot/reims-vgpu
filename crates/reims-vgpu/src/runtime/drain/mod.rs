@@ -2086,6 +2086,34 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     // ledger never reports as still-owed a word already being settled.
     let page_bytes = state.page_size();
     state.stamp_ledger.wrote(index, stamp_value, page_bytes);
+    // The ordering plane's half of the same event, at the same line and for the
+    // same reason: from here the value is no longer owed. `SessionModel::admit`
+    // parks a packet whose header names a point another packet must publish,
+    // and this is the only thing that discharges that wait — so a cutover
+    // without it parks every packet the guest orders behind a fence, the way an
+    // unadvanced pipeline would park every exec.
+    //
+    // Beside the device's own ledger rather than replacing it: the ledger
+    // answers "is this word still owed by the coalescing rail", which is a
+    // question about this device's rails and not about ordering, and the two
+    // records are cross-checked by the counters below rather than by one being
+    // assumed to stand for the other.
+    note_store_route(
+        match state.publish_completion_stamp(
+            reims_vgpu_core::identity::StampSlot(index),
+            reims_vgpu_core::identity::StampValue(stamp_value),
+        ) {
+            crate::model::StampPublication::First => "stamp_publish_first",
+            crate::model::StampPublication::Advanced => "stamp_publish_advanced",
+            crate::model::StampPublication::Repeat => "stamp_publish_repeat",
+            // The model's timeline refused to move and this device's write will
+            // move the guest's. `note_stamp_direction` sees the same event, but
+            // only on the rail arm that writes the word inline — this sees it on
+            // both, which is the hole that made `stamp_write_backward = 0`
+            // weaker evidence than it read as.
+            crate::model::StampPublication::Behind => "stamp_publish_behind",
+        },
+    );
     // Before the guest is told anything finished, everything this device still
     // owes guest RAM has to be in guest RAM. After this write the guest may free
     // the render targets and its allocator may hand those pages to anything, and
