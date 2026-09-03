@@ -703,8 +703,17 @@ mod tests {
         assert!(d.state.cursor.show);
     }
 
+    /// An opcode no ledger row names does not run, and the ring does not stop
+    /// on it.
+    ///
+    /// It used to reach the root dispatch's `_` arm and be reported there. It
+    /// now never reaches an arm at all: the ordering plane refuses it as
+    /// `UnknownCommand`, which is the same statement made by the layer that
+    /// owns the question, and the packet's ring position is released either
+    /// way. The head moving is the assertion that matters — a guest sending one
+    /// unknown opcode must not stall its FIFO forever.
     #[test]
-    fn fail_visible_unknown_root() {
+    fn an_unknown_root_opcode_is_refused_and_the_ring_moves_on() {
         let mut d = dev();
         let mut h = FakeHost::new();
         setup_boot_regs(&mut d, &mut h);
@@ -716,7 +725,18 @@ mod tests {
         d.state.gfx.fifo_written = PACKET_HEADER_LEN;
         d.state.pending.main_drain = true;
         d.drain(&mut h);
-        assert!(!d.fails().is_empty());
+        assert_eq!(
+            d.state
+                .gfx
+                .fifo_read
+                .load(std::sync::atomic::Ordering::Acquire),
+            PACKET_HEADER_LEN,
+            "a packet the model will not take still frees the ring position it held"
+        );
+        assert!(
+            d.state.parked.is_empty(),
+            "and nothing is holding bytes for work that was never admitted"
+        );
     }
 
     #[test]

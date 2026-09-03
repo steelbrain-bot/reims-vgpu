@@ -36,7 +36,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use reims_vgpu_core::identity::{DeviceEpoch, IngressOrdinal};
+use reims_vgpu_core::identity::{DeviceEpoch, IngressOrdinal, ResourceId};
 
 use crate::runtime::drain::Packet;
 use crate::runtime::exec::ExecSubmission;
@@ -65,6 +65,17 @@ pub struct ParkedWork {
     epoch: DeviceEpoch,
     packet: Packet,
     submission: Option<ExecSubmission>,
+    /// The pipelines this packet's records bind, as the model's own walk
+    /// answered.
+    ///
+    /// Retained because they are what the *pump* advances: a submission whose
+    /// translations were still running when it arrived is parked on these, and
+    /// the only thing that can release it is a later pass finding the
+    /// translations done and readying them. Taken from
+    /// `reims_vgpu_core::exec::ExecWork::pipeline_leases` rather than rescanned,
+    /// so what is advanced cannot disagree with what the transaction was
+    /// admitted waiting on.
+    leases: Vec<ResourceId>,
 }
 
 impl ParkedWork {
@@ -76,6 +87,7 @@ impl ParkedWork {
             epoch,
             packet,
             submission: None,
+            leases: Vec::new(),
         }
     }
 
@@ -87,12 +99,14 @@ impl ParkedWork {
         epoch: DeviceEpoch,
         packet: Packet,
         submission: ExecSubmission,
+        leases: Vec<ResourceId>,
     ) -> Self {
         Self {
             domain,
             epoch,
             packet,
             submission: Some(submission),
+            leases,
         }
     }
 
@@ -117,6 +131,12 @@ impl ParkedWork {
     #[must_use]
     pub const fn submission(&self) -> Option<&ExecSubmission> {
         self.submission.as_ref()
+    }
+
+    /// The pipelines this packet's records bind.
+    #[must_use]
+    pub fn leases(&self) -> &[ResourceId] {
+        &self.leases
     }
 
     /// Host bytes this position is holding.
@@ -280,6 +300,62 @@ impl ParkedStore {
     #[must_use]
     pub fn ready_len(&self) -> usize {
         self.ready.len()
+    }
+
+    /// One parked position's planning inputs, without taking them out.
+    ///
+    /// **Not a second way out.** The bytes leave by `release` and only by
+    /// `release`; this is a shared borrow, so nothing reached through it can
+    /// run the packet. It exists because the plan step — `preflight` — takes a
+    /// shared `&DeviceState` and answers whether a position's translations are
+    /// done, which is a question that has to be asked *before* deciding to take
+    /// the bytes out.
+    #[must_use]
+    pub fn planning(&self, ingress: IngressOrdinal) -> Option<(&ExecSubmission, &[ResourceId])> {
+        let work = self.work.get(&ingress)?;
+        Some((work.submission.as_ref()?, &work.leases))
+    }
+
+    /// The completion slots a parked position is waiting on.
+    ///
+    /// The model holds the waits and does not hold the guest's page; this
+    /// device holds the page and does not decide the waits. So the slots come
+    /// from the packet the position retained, which is where the guest wrote
+    /// them, and what is done with them — reading the page and telling the
+    /// plane what it holds — stays the caller's.
+    #[must_use]
+    pub fn awaited_slots(&self, ingress: IngressOrdinal) -> Vec<u32> {
+        self.work
+            .get(&ingress)
+            .map(|w| w.packet.stamp_waits.iter().map(|wait| wait.index).collect())
+            .unwrap_or_default()
+    }
+
+    /// The ordering domain of a parked position, for a caller that has the
+    /// ordinal and needs the channel.
+    #[must_use]
+    pub fn domain_of(&self, ingress: IngressOrdinal) -> Option<u32> {
+        self.work.get(&ingress).map(ParkedWork::domain)
+    }
+
+    /// The opcode of a parked position, for the gates that route on it.
+    #[must_use]
+    pub fn opcode(&self, ingress: IngressOrdinal) -> Option<u16> {
+        self.work.get(&ingress).map(|w| w.packet.opcode)
+    }
+
+    /// Every parked position the model has not released, in ingress order.
+    ///
+    /// What the pump walks. A position is here because something it waits on
+    /// has not happened; for an exec packet that something can be a translation
+    /// this device itself has to finish, and nothing but a later pass will.
+    #[must_use]
+    pub fn waiting_in_order(&self) -> Vec<IngressOrdinal> {
+        self.work
+            .keys()
+            .filter(|o| !self.ready.contains(o))
+            .copied()
+            .collect()
     }
 
     /// Whether this ordinal is holding bytes. For a caller deciding whether a

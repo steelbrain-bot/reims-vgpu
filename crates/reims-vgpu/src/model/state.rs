@@ -2348,14 +2348,20 @@ pub struct PresentState {
     ///
     /// apple-gfx `pending_frames` / PGDisplay `waitForPendingFrames` entry gate:
     /// when this is ≥ [`crate::runtime::drain::MAX_UNPAINTED_PRESENTS`], the
-    /// child drain **holds** the next CmdDisplaySwap at channel head (no stamp)
-    /// until paint clears the count. Accepted presents still stamp at retain.
+    /// drain **declines to run** the released CmdDisplaySwap until paint clears
+    /// the count. Accepted presents still stamp at retain.
     pub unpainted_presents: u32,
     /// Suppress repeated fail-log lines while the same present packet remains
-    /// held at the pending-frames entry gate.
+    /// held at the pending-frames gate.
     pub backpressure_hold_active: bool,
     pub backpressure_hold_channel: u32,
-    pub backpressure_hold_head: u32,
+    /// Which present is being held, as its ordering position.
+    ///
+    /// A position and not a ring head: a held present no longer sits at a
+    /// consumer pointer — the head moved past it at arrival — so the thing that
+    /// distinguishes one hold episode from the next is the transaction, which is
+    /// what the guest is actually waiting on.
+    pub backpressure_hold_position: u64,
     /// Always-on diagnostic counter for distinct pending-frames hold episodes.
     pub backpressure_hold_count: u64,
     /// Recycled scratch for the present-capture frame buffer.
@@ -2826,16 +2832,6 @@ pub struct DeviceState {
     /// remain untouched until retry, so this is scheduler state rather than a
     /// submitted async GPU job.
     pub translation_deferred_mask: u32,
-    /// FIFO timelines whose head packet is held on an unmet stamp wait. Bit 0
-    /// is the root FIFO and child channel N uses bit N, the same convention as
-    /// [`Self::translation_order_hold_mask`].
-    ///
-    /// Held rather than skipped: the head and the completion stamp stay
-    /// untouched, so a retry re-decodes the same packet and no side effect can
-    /// happen twice. The mask is what tells `drain_pending` which timelines to
-    /// re-offer while the pass is still publishing stamps, since another
-    /// timeline's stamp is the only thing that can satisfy one.
-    pub stamp_deferred_mask: u32,
     /// Root/child FIFO timelines held behind a cold-translation EXEC. Bit 0 is
     /// the root FIFO; child channel N uses bit N. This is diagnostic scheduler
     /// ownership, not a guest-visible protocol mask.
@@ -3345,7 +3341,6 @@ impl DeviceState {
             )),
             parked: crate::runtime::parked::ParkedStore::new(),
             translation_deferred_mask: 0,
-            stamp_deferred_mask: 0,
             translation_order_hold_mask: 0,
             translation_order_holds: 0,
             present_translation_holds: 0,
@@ -4229,6 +4224,20 @@ impl DeviceState {
             epoch: session.epoch(),
             admitted,
         })
+    }
+
+    /// The semantic lifetime the model is in right now.
+    ///
+    /// **A reader's fact, and that is why it is asked here rather than inside
+    /// `admit`.** A guest reset races the drain: a packet that left the ring
+    /// before the reset and reaches ingress after it names a lifetime that has
+    /// closed, and nothing else can tell — the guest's packet carries no
+    /// generation. So the reader states the one it was holding when it took the
+    /// bytes, and the model compares. See
+    /// [`reims_vgpu_core::session::Packet::session`].
+    #[must_use]
+    pub fn session_generation(&self) -> reims_vgpu_core::identity::SessionGeneration {
+        self.session.lock().expect("session").generation()
     }
 
     /// The positions the model has released to run since the last ask.

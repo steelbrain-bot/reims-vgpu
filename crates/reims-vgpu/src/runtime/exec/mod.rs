@@ -910,7 +910,7 @@ fn read_submission<M: HostMemory + HostOps>(
 /// than once per stream. That is the rail's own contract — see
 /// `crate::backend::Backend::preflight_translations` — and it is the property
 /// that makes calling this early worth anything.
-fn preflight_submission<M: HostMemory + HostOps>(
+pub fn preflight_submission<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     submission: &ExecSubmission,
@@ -1019,6 +1019,30 @@ pub fn plan_and_execute<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     submission: &ExecSubmission,
+    out: ExecResult,
+) -> ExecResult {
+    let mut measured_ns = 0u64;
+    if preflight_submission(state, host, submission, &mut measured_ns) {
+        let mut out = out;
+        out.deferred = true;
+        return out;
+    }
+    execute_planned(state, host, submission, out)
+}
+
+/// Run a submission whose plan step has already answered.
+///
+/// The door for a caller that planned earlier — which is every admitted
+/// packet, because whether its translations are done is what decided it could
+/// run at all. Planning again here would be asking a question already answered
+/// and paying for it once per pipeline on the hottest path this device has.
+///
+/// The caller owes the answer: a submission run without its plan step having
+/// said `false` may encode against a shader that is still being translated.
+pub fn execute_planned<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    submission: &ExecSubmission,
     mut out: ExecResult,
 ) -> ExecResult {
     let started = std::time::Instant::now();
@@ -1028,11 +1052,7 @@ pub fn plan_and_execute<M: HostMemory + HostOps>(
     // pure CPU work over bytes the submission already holds, where the read
     // walks the guest's page tables and the execution consumes the resource
     // table.
-    if preflight_submission(state, host, submission, &mut measured_ns) {
-        out.deferred = true;
-    } else {
-        execute_submission(state, host, submission, &mut out, &mut measured_ns);
-    }
+    execute_submission(state, host, submission, &mut out, &mut measured_ns);
     note_exec_header(started, measured_ns);
     if !out.deferred {
         out.total_us = elapsed_us(started);
