@@ -1039,6 +1039,27 @@ pub(crate) enum PushDescriptorBinding {
     },
 }
 
+impl PushDescriptorBinding {
+    /// The three fields both arms carry, so a consumer that only needs the
+    /// descriptor's identity does not have to match on its payload.
+    pub(crate) fn slot(&self) -> (u32, u32, vk::DescriptorType) {
+        match self {
+            Self::Buffer {
+                binding,
+                array_element,
+                ty,
+                ..
+            }
+            | Self::Image {
+                binding,
+                array_element,
+                ty,
+                ..
+            } => (*binding, *array_element, *ty),
+        }
+    }
+}
+
 fn push_descriptors_match(
     bound_layout: Option<vk::PipelineLayout>,
     bound: &[PushDescriptorBinding],

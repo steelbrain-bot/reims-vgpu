@@ -854,29 +854,34 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
     ///    16 B  `LayoutKey::clone` into the pipeline key
     ///    48 B  `BufferGatherRoles::of`
     ///   128 B  the bound-buffer list growing
-    ///    24 B  the `Vec<DescriptorBufferInfo>` collect
-    ///   256 B  the `Vec<WriteDescriptorSet>` growing
     /// ```
     ///
-    /// A seventh, 104 B for `validate_v1`'s duplicate-binding `BTreeSet`, is
-    /// gone: the set became a scan over the lists the draw already owns.
+    /// Three are gone since. 104 B for `validate_v1`'s duplicate-binding
+    /// `BTreeSet` — the set became a scan over the lists the draw already owns.
+    /// Then 24 B for a `Vec<vk::DescriptorBufferInfo>` and 256 B for a
+    /// `Vec<vk::WriteDescriptorSet>`, which this test is what caught: it prints
+    /// `descriptor_pushes`, `descriptor_set_binds` and `descriptor_set_updates`
+    /// beside the trip count, all three were **zero**, and the draw was building
+    /// Vulkan's write structures every time on the way to sending none of them.
+    /// The binding list is built into the command buffer's scratch and Vulkan's
+    /// structures are derived only by the consumer that sends them.
     ///
-    /// The four in the middle are per-draw scratch that a device-owned reusable
-    /// buffer would hold instead — but two of them hold `ash` structures with
-    /// borrow lifetimes (`vk::WriteDescriptorSet<'a>` names the buffer infos
-    /// beside it), so a buffer outliving the draw cannot hold those two without
-    /// erasing a lifetime that is load-bearing. Those want an inline array with
-    /// a bound taken from the device's descriptor limits, not a scratch. The two
-    /// layout ones need the layout cache reachable without an owned
-    /// `Vec<BindingSig>` per draw.
-    const CEILING: usize = 6;
+    /// Of the four left, two are per-draw scratch a device-owned reusable buffer
+    /// would hold instead, and the two layout ones need the layout cache
+    /// reachable without an owned `Vec<BindingSig>` per draw — `PipelineKey`
+    /// carries `LayoutKey` by value, so building the lookup key clones it.
+    const CEILING: usize = 4;
     assert!(
         trips <= CEILING,
         "a warm repeat draw binding one storage buffer took {trips} trips into \
          the allocator, above the recorded ceiling of {CEILING}. The plan's \
          value for this is 0"
     );
-    eprintln!("warm repeat draw, one storage buffer: {trips} allocator trips");
+    eprintln!(
+        "warm repeat draw, one storage buffer: {trips} allocator trips, \
+         descriptor_pushes={} descriptor_set_binds={} descriptor_set_updates={}",
+        during.descriptor_pushes, during.descriptor_set_binds, during.descriptor_set_updates
+    );
 }
 
 /// A batch refuses joiners at `BATCH_MAX_DRAWS`: the draw after a full batch

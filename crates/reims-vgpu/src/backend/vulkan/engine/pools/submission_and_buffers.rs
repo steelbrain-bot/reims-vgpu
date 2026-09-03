@@ -2492,6 +2492,22 @@ impl ResourcePools {
         &mut self.cb_graphics.push_scratch
     }
 
+    /// The list [`Self::push_descriptor_scratch`] was last filled with, read
+    /// back for a consumer that has to translate it. Shared, so the caller
+    /// cannot change what the comparison below will read.
+    pub(crate) fn push_descriptor_scratch_ref(&self) -> &[super::PushDescriptorBinding] {
+        &self.cb_graphics.push_scratch
+    }
+
+    /// The list this command buffer is *known to carry*, which after
+    /// [`Self::push_descriptors_changed`] returns `true` is the one that has to
+    /// be recorded. It is the scratch the caller filled — the two are swapped,
+    /// not copied — and reading it here rather than the scratch is what keeps
+    /// "what was recorded" and "what was asked for" one value.
+    pub(crate) fn push_descriptor_echo(&self) -> &[super::PushDescriptorBinding] {
+        &self.cb_graphics.push_bindings
+    }
+
     /// Return whether this draw must record its push descriptors, retaining a
     /// byte-exact echo when it does.
     pub(crate) fn push_descriptors_changed(

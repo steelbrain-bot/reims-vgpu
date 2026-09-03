@@ -4311,74 +4311,39 @@ pub(crate) unsafe fn execute_draw_inner(
     } else {
         None
     };
-    let buffer_infos: Vec<_> = storage_slots
-        .iter()
-        .map(|(_, bound, len)| {
-            vk::DescriptorBufferInfo::default()
-                .buffer(bound.buffer)
-                .offset(bound.offset)
-                .range(descriptor_range(*len))
-        })
-        .collect();
-    let sampled_infos: Vec<_> = sampled
-        .iter()
-        .map(|image| {
-            vk::DescriptorImageInfo::default()
-                .image_view(image.view())
-                .image_layout(image.descriptor_layout())
-        })
-        .collect();
-    let sampler_infos: Vec<_> = sampler_handles
-        .iter()
-        .map(|(_, s)| vk::DescriptorImageInfo::default().sampler(*s))
-        .collect();
     // Framebuffer fetch: the input attachment IS the color target's view;
     // derive the same layout as the subpass reference. A draw that also
     // samples the target upgrades both from GENERAL to the feedback layout.
-    let color_input_info = vk::DescriptorImageInfo::default()
-        .image_view(target_view)
-        .image_layout(pass_key.color_layout(0));
-    let dst_set = dset.unwrap_or_default();
-    let mut descriptor_writes = Vec::new();
-    for (i, (binding, _, _)) in storage_slots.iter().enumerate() {
-        descriptor_writes.push(
-            vk::WriteDescriptorSet::default()
-                .dst_set(dst_set)
-                .dst_binding(*binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(&buffer_infos[i])),
-        );
-    }
-    for (i, image) in sampled.iter().enumerate() {
-        descriptor_writes.push(
-            vk::WriteDescriptorSet::default()
-                .dst_set(dst_set)
-                .dst_binding(image.binding())
-                .dst_array_element(image.array_element())
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .image_info(std::slice::from_ref(&sampled_infos[i])),
-        );
-    }
-    for (i, (binding, _)) in sampler_handles.iter().enumerate() {
-        descriptor_writes.push(
-            vk::WriteDescriptorSet::default()
-                .dst_set(dst_set)
-                .dst_binding(*binding)
-                .descriptor_type(vk::DescriptorType::SAMPLER)
-                .image_info(std::slice::from_ref(&sampler_infos[i])),
-        );
-    }
-    if req.color_input {
-        descriptor_writes.push(
-            vk::WriteDescriptorSet::default()
-                .dst_set(dst_set)
-                .dst_binding(super::types::COLOR_INPUT_BINDING)
-                .descriptor_type(vk::DescriptorType::INPUT_ATTACHMENT)
-                .image_info(std::slice::from_ref(&color_input_info)),
-        );
-    }
-    if dset.is_some() {
-        ctx.device.update_descriptor_sets(&descriptor_writes, &[]);
+    let color_input_layout = pass_key.color_layout(0);
+    // This draw's bindings, as this device's own list rather than as Vulkan's
+    // write structures.
+    //
+    // The write structures used to be built here, unconditionally, for both
+    // consumers at once — and on the push rail the consumer below sends them
+    // only when they *differ* from what the command buffer already carries. A
+    // warm repeat draw therefore built a `Vec<vk::DescriptorBufferInfo>` and a
+    // `Vec<vk::WriteDescriptorSet>` per draw, on the way to sending neither:
+    // measured on the ninth repeat of one `DrawRequest`, `descriptor_pushes`,
+    // `descriptor_set_binds` and `descriptor_set_updates` were all zero while
+    // those two allocations happened every time. Deferring the translation to
+    // each consumer is what makes "no full binding-table rebuild on an unchanged
+    // draw" true of the host side and not only of the recording.
+    //
+    // Built into the command buffer's own scratch, which keeps its capacity
+    // across draws, so this list itself costs no allocation.
+    fill_descriptor_bindings(
+        pools.push_descriptor_scratch(),
+        &storage_slots,
+        &sampled,
+        &sampler_handles,
+        req.color_input.then_some((target_view, color_input_layout)),
+    );
+    if let Some(dset) = dset {
+        // An allocated set is fresh out of the pool and carries nothing, so
+        // there is no unchanged case to elide: it is written every draw.
+        with_descriptor_writes(pools.push_descriptor_scratch_ref(), dset, |writes| {
+            ctx.device.update_descriptor_sets(writes, &[]);
+        });
         counters
             .descriptor_set_updates
             .fetch_add(1, Ordering::Relaxed);
@@ -5395,58 +5360,27 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     if push_descriptors {
-        let push_state = pools.push_descriptor_scratch();
-        push_state.extend(storage_slots.iter().zip(&buffer_infos).map(
-            |((binding, _, _), info)| super::pools::PushDescriptorBinding::Buffer {
-                binding: *binding,
-                array_element: 0,
-                ty: vk::DescriptorType::STORAGE_BUFFER,
-                buffer: info.buffer,
-                offset: info.offset,
-                range: info.range,
-            },
-        ));
-        push_state.extend(sampled.iter().zip(&sampled_infos).map(|(image, info)| {
-            super::pools::PushDescriptorBinding::Image {
-                binding: image.binding(),
-                array_element: image.array_element(),
-                ty: vk::DescriptorType::SAMPLED_IMAGE,
-                sampler: info.sampler,
-                view: info.image_view,
-                layout: info.image_layout,
-            }
-        }));
-        push_state.extend(sampler_handles.iter().zip(&sampler_infos).map(
-            |((binding, _), info)| super::pools::PushDescriptorBinding::Image {
-                binding: *binding,
-                array_element: 0,
-                ty: vk::DescriptorType::SAMPLER,
-                sampler: info.sampler,
-                view: info.image_view,
-                layout: info.image_layout,
-            },
-        ));
-        if req.color_input {
-            push_state.push(super::pools::PushDescriptorBinding::Image {
-                binding: super::types::COLOR_INPUT_BINDING,
-                array_element: 0,
-                ty: vk::DescriptorType::INPUT_ATTACHMENT,
-                sampler: color_input_info.sampler,
-                view: color_input_info.image_view,
-                layout: color_input_info.image_layout,
-            });
-        }
         if pools.push_descriptors_changed(pipeline_layout, counters) {
-            ctx.push_descriptor
+            // Only here, and this is the point of the split: the list was built
+            // once above, the comparison read it, and Vulkan's write structures
+            // are derived from it only on the draw that actually sends them.
+            let push_entry = ctx
+                .push_descriptor
                 .as_ref()
-                .expect("push layout requires enabled entry points")
-                .cmd_push_descriptor_set(
-                    cb,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline_layout,
-                    0,
-                    &descriptor_writes,
-                );
+                .expect("push layout requires enabled entry points");
+            with_descriptor_writes(
+                pools.push_descriptor_echo(),
+                vk::DescriptorSet::null(),
+                |writes| {
+                    push_entry.cmd_push_descriptor_set(
+                        cb,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        pipeline_layout,
+                        0,
+                        writes,
+                    );
+                },
+            );
             counters.descriptor_pushes.fetch_add(1, Ordering::Relaxed);
         }
     } else if let Some(dset) = dset {
@@ -6249,6 +6183,136 @@ fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
 /// is built, but relying on that is relying on a call order this type cannot
 /// see; refusing here makes the bound the array's own, under the same
 /// `SecondaryAttachmentCap` reason, so the two cannot disagree.
+/// Fill `out` with this draw's descriptor bindings, in the order Vulkan's write
+/// structures will be derived in.
+///
+/// The list is this device's own vocabulary, not Vulkan's. That is what lets the
+/// two consumers below take it at different times: the push rail compares it
+/// against what the command buffer already carries and usually sends nothing,
+/// while a freshly allocated descriptor set is always written. Building Vulkan's
+/// structures here would charge every draw for the rarer of the two.
+fn fill_descriptor_bindings(
+    out: &mut Vec<super::pools::PushDescriptorBinding>,
+    storage_slots: &[(u32, BoundBuffer, u64)],
+    sampled: &[PreparedSampled],
+    sampler_handles: &[(u32, vk::Sampler)],
+    color_input: Option<(vk::ImageView, vk::ImageLayout)>,
+) {
+    out.extend(storage_slots.iter().map(|(binding, bound, len)| {
+        super::pools::PushDescriptorBinding::Buffer {
+            binding: *binding,
+            array_element: 0,
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            buffer: bound.buffer,
+            offset: bound.offset,
+            range: descriptor_range(*len),
+        }
+    }));
+    out.extend(
+        sampled
+            .iter()
+            .map(|image| super::pools::PushDescriptorBinding::Image {
+                binding: image.binding(),
+                array_element: image.array_element(),
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                sampler: vk::Sampler::null(),
+                view: image.view(),
+                layout: image.descriptor_layout(),
+            }),
+    );
+    out.extend(sampler_handles.iter().map(|(binding, sampler)| {
+        super::pools::PushDescriptorBinding::Image {
+            binding: *binding,
+            array_element: 0,
+            ty: vk::DescriptorType::SAMPLER,
+            sampler: *sampler,
+            view: vk::ImageView::null(),
+            layout: vk::ImageLayout::UNDEFINED,
+        }
+    }));
+    if let Some((view, layout)) = color_input {
+        out.push(super::pools::PushDescriptorBinding::Image {
+            binding: super::types::COLOR_INPUT_BINDING,
+            array_element: 0,
+            ty: vk::DescriptorType::INPUT_ATTACHMENT,
+            sampler: vk::Sampler::null(),
+            view,
+            layout,
+        });
+    }
+}
+
+/// Derive Vulkan's write structures from `bindings` and hand them to `f`.
+///
+/// A closure and not a return value: `vk::WriteDescriptorSet<'a>` borrows the
+/// `vk::Descriptor*Info` beside it, so the two cannot be returned together
+/// without a self-referential struct. The borrow is load-bearing — it is what
+/// stops a write outliving the info it points at — so the shape that keeps it is
+/// the right one and the callback is the price.
+///
+/// `dst_set` is ignored by `vkCmdPushDescriptorSetKHR`, which is why the push
+/// rail passes a null handle rather than inventing one.
+fn with_descriptor_writes<R>(
+    bindings: &[super::pools::PushDescriptorBinding],
+    dst_set: vk::DescriptorSet,
+    f: impl FnOnce(&[vk::WriteDescriptorSet<'_>]) -> R,
+) -> R {
+    let mut buffer_infos: Vec<vk::DescriptorBufferInfo> = Vec::new();
+    let mut image_infos: Vec<vk::DescriptorImageInfo> = Vec::new();
+    // Filled first and in full, so neither vector reallocates while the writes
+    // below hold references into it.
+    for binding in bindings {
+        match binding {
+            super::pools::PushDescriptorBinding::Buffer {
+                buffer,
+                offset,
+                range,
+                ..
+            } => buffer_infos.push(
+                vk::DescriptorBufferInfo::default()
+                    .buffer(*buffer)
+                    .offset(*offset)
+                    .range(*range),
+            ),
+            super::pools::PushDescriptorBinding::Image {
+                sampler,
+                view,
+                layout,
+                ..
+            } => image_infos.push(
+                vk::DescriptorImageInfo::default()
+                    .sampler(*sampler)
+                    .image_view(*view)
+                    .image_layout(*layout),
+            ),
+        }
+    }
+    let mut buffers = 0usize;
+    let mut images = 0usize;
+    let mut writes: Vec<vk::WriteDescriptorSet<'_>> = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let (dst_binding, array_element, ty) = binding.slot();
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(dst_set)
+            .dst_binding(dst_binding)
+            .dst_array_element(array_element)
+            .descriptor_type(ty);
+        writes.push(match binding {
+            super::pools::PushDescriptorBinding::Buffer { .. } => {
+                let write = write.buffer_info(std::slice::from_ref(&buffer_infos[buffers]));
+                buffers += 1;
+                write
+            }
+            super::pools::PushDescriptorBinding::Image { .. } => {
+                let write = write.image_info(std::slice::from_ref(&image_infos[images]));
+                images += 1;
+                write
+            }
+        });
+    }
+    f(&writes)
+}
+
 struct ClearValues {
     values: [vk::ClearValue; 1 + MAX_SECONDARY_ATTACH + 1],
     len: usize,
