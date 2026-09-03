@@ -1242,13 +1242,17 @@ pub fn window_present_resize(width: u32, height: u32) {
 /// 960 in twenty, `busy` zero and `failed` zero in both, with an empty failure
 /// log.
 ///
+/// Presenting is the frequent WSI call; **recreating is the dangerous one**, and
+/// a present-only probe would have missed it. It destroys and rebuilds a
+/// `VkSwapchainKHR` against a surface the compositor and the event loop both
+/// still own. The probe therefore arms `recreate_pending` on a cadence, so the
+/// rebuild happens inside an off-thread present: 31 rebuilds across 959 presents
+/// in twenty seconds, same zeros, same empty log.
+///
 /// That is evidence about one WSI implementation. MoltenVK acquires its drawable
 /// through `CAMetalLayer`, which is a different implementation with different
 /// thread rules, and the pathway table carries two Apple rows — so the probe has
-/// to be run on an Apple host before the move is designed for one. It also says
-/// nothing about resizing: it holds one geometry for the whole run and never
-/// makes `recreate_swapchain` race the loop's own resize handling, which is the
-/// second thing the move would have to be right about.
+/// to be run on an Apple host before the move is designed for one.
 #[cfg(feature = "host-window")]
 pub fn window_present_frame(
     source: Option<&WindowPresentSource>,

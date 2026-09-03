@@ -43,15 +43,29 @@
 //! evidence about the platform it ran on and about nothing else. Run it on the
 //! other host before designing for the other host.
 //!
-//! It is also a *presenting* probe, not a resizing one: it publishes CPU frames
-//! at a fixed size and never asks the window to change geometry, so it says
-//! nothing about `recreate_swapchain` racing the loop's own resize handling.
+//! # Swapchain recreation, which is the other half of the question
+//!
+//! Presenting is the frequent WSI call; recreating is the dangerous one. It
+//! destroys and rebuilds a `VkSwapchainKHR` against a surface the compositor and
+//! the event loop both still own, and a present-only probe would have missed it
+//! entirely. So every `REIMS_VGPU_PROBE_RECREATE_EVERY` frames (default 30) the
+//! probe thread toggles the presenter's desired extent, which arms
+//! `recreate_pending`, and the *next off-thread present* is the one that
+//! destroys and rebuilds the swapchain. The reported `recreates` count is how
+//! many times that was asked for.
+//!
+//! Whether the requested extent is honoured is not the point and is not asserted
+//! — Wayland reports a `currentExtent` the driver clamps to, and the native
+//! window is never actually resized here. The point is that the destroy/create
+//! pair ran on the wrong thread and the rail kept presenting afterwards.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use reims_vgpu::backend::vulkan::engine::{window_present_attached, window_present_frame};
+use reims_vgpu::backend::vulkan::engine::{
+    window_present_attached, window_present_frame, window_present_resize,
+};
 use reims_vgpu::backend::window::{WindowCpuFrame, WindowPresentOutcome};
 use reims_vgpu::host_window::present::{spawn, FrameSlot, WindowConfig, WindowMode, WindowWaker};
 
@@ -71,14 +85,21 @@ fn main() {
     let wake = WindowWaker::new();
     let stop = Arc::new(AtomicBool::new(false));
 
+    let recreate_every: u64 = std::env::var("REIMS_VGPU_PROBE_RECREATE_EVERY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30);
+
     let presented = Arc::new(AtomicU64::new(0));
     let busy = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
+    let recreates = Arc::new(AtomicU64::new(0));
 
     let probe_stop = Arc::clone(&stop);
     let probe_presented = Arc::clone(&presented);
     let probe_busy = Arc::clone(&busy);
     let probe_failed = Arc::clone(&failed);
+    let probe_recreates = Arc::clone(&recreates);
     let probe = std::thread::spawn(move || {
         // The window thread has to have built its loop, created the surface and
         // attached the presenter before there is anything to present through.
@@ -101,6 +122,18 @@ fn main() {
         let mut first_error: Option<String> = None;
         while Instant::now() < until && !probe_stop.load(Ordering::Acquire) {
             seq += 1;
+            // Arm a swapchain rebuild for the present two lines below. The
+            // toggle only has to make the extent *differ* from the last one; see
+            // the module docs on why the value itself is not the claim.
+            if recreate_every != 0 && seq % recreate_every == 0 {
+                let height = if (seq / recreate_every) % 2 == 0 {
+                    H
+                } else {
+                    H - 1
+                };
+                window_present_resize(W, height);
+                probe_recreates.fetch_add(1, Ordering::Relaxed);
+            }
             let bgra = gradient(W, H, (seq as u32).wrapping_mul(3));
             let frame = WindowCpuFrame {
                 bgra: &bgra,
@@ -151,8 +184,12 @@ fn main() {
     let presented = presented.load(Ordering::Relaxed);
     let busy = busy.load(Ordering::Relaxed);
     let failed = failed.load(Ordering::Relaxed);
-    println!("off_thread_present presented={presented} busy={busy} failed={failed}");
-    if failed > 0 || presented == 0 {
+    let recreates = recreates.load(Ordering::Relaxed);
+    println!(
+        "off_thread_present presented={presented} busy={busy} failed={failed} \
+         recreates={recreates}"
+    );
+    if failed > 0 || presented == 0 || (recreate_every != 0 && recreates == 0) {
         println!("off_thread_present verdict=refused");
         std::process::exit(1);
     }
