@@ -638,13 +638,19 @@ impl EncoderBindings {
                 let fragment =
                     bound.and_then(|id| usages.binding_usage(id, Some(ShaderStage::Fragment)));
                 census.note_draw(bound, vertex.is_some(), fragment.is_some());
+                let before = out.len();
+                let had_a_table = vertex.is_some() || fragment.is_some();
                 state.footprint_into(vertex, fragment, out);
+                census.note_unknowns(&out[before..], had_a_table);
             }
             (Self::Compute(state), ResolvedOperation::Compute(ComputeOp::Dispatch(_))) => {
                 let bound = state.pipeline;
                 let kernel = bound.and_then(|id| usages.binding_usage(id, None));
                 census.note_dispatch(bound, kernel.is_some());
+                let before = out.len();
+                let had_a_table = kernel.is_some();
                 state.footprint_into(kernel, out);
+                census.note_unknowns(&out[before..], had_a_table);
             }
             _ => {}
         }
@@ -1016,6 +1022,17 @@ pub struct UsageCensus {
     pub dispatches_with_no_stage_published: u32,
     /// Dispatches answered by their kernel.
     pub dispatches_published: u32,
+    /// `Unknown` participations a *published* table produced.
+    ///
+    /// The other half of the row, and the one a count of draws cannot give:
+    /// one conceded slot in a pipeline that draws ten thousand times is ten
+    /// thousand conflicting participations, and one wholly unpublished pipeline
+    /// that draws twice is four. Which of those the residue is decides whether
+    /// the next move is about the publisher or about the reflection it
+    /// publishes, so they are weighted the way the ordering plane weighs them.
+    pub unknown_participations_from_a_table: u32,
+    /// `Unknown` participations emitted because there was no table to ask.
+    pub unknown_participations_with_no_table: u32,
     /// The first pipeline a draw or dispatch found unanswered.
     ///
     /// A count says how much was lost and never which pipeline lost it, and the
@@ -1049,6 +1066,24 @@ impl UsageCensus {
         };
         *counter = counter.saturating_add(1);
         self.note_unanswered(bound, !kernel);
+    }
+
+    /// Split the `Unknown`s a footprint just produced by whether a table
+    /// answered them.
+    fn note_unknowns(&mut self, produced: &[Participation], had_a_table: bool) {
+        let unknown = produced
+            .iter()
+            .filter(|p| p.mode == crate::access::AccessMode::Unknown)
+            .count();
+        let Ok(unknown) = u32::try_from(unknown) else {
+            return;
+        };
+        let counter = if had_a_table {
+            &mut self.unknown_participations_from_a_table
+        } else {
+            &mut self.unknown_participations_with_no_table
+        };
+        *counter = counter.saturating_add(unknown);
     }
 
     /// Keep the first pipeline that answered nothing, and only that one.
@@ -1090,6 +1125,47 @@ mod usage_census_tests {
             "one stage published is one row whichever stage it was: the pair \
              says how much of the draw was answered, and which half is the \
              rail's own refusal census"
+        );
+    }
+
+    /// The `Unknown`s are split by whether a table produced them, and they are
+    /// weighted the way the ordering plane weighs them.
+    ///
+    /// A count of *draws* cannot answer this row. One conceded slot in a
+    /// pipeline that draws ten thousand times is ten thousand conflicting
+    /// participations; one wholly unpublished pipeline that draws twice is
+    /// four. Which of those the residue is decides whether the next move is
+    /// about the publisher or about the reflection it publishes.
+    #[test]
+    fn an_unknown_is_charged_to_the_table_that_conceded_it_or_to_the_absence_of_one() {
+        use crate::access::AccessMode;
+        use crate::identity::{ObjectListRef, SlotGeneration};
+
+        let part = |mode| Participation {
+            resource: ResourceId {
+                slot: ObjectListRef(1),
+                generation: SlotGeneration::default(),
+            },
+            extent: crate::access::ParticipationExtent::Whole,
+            mode,
+            api_stages: 0,
+        };
+        let mut c = UsageCensus::default();
+        c.note_unknowns(
+            &[
+                part(AccessMode::Unknown),
+                part(AccessMode::Read),
+                part(AccessMode::Unknown),
+            ],
+            true,
+        );
+        c.note_unknowns(&[part(AccessMode::Unknown)], false);
+        assert_eq!(c.unknown_participations_from_a_table, 2);
+        assert_eq!(c.unknown_participations_with_no_table, 1);
+        assert_eq!(
+            c.draws_without_a_pipeline, 0,
+            "counting the participations is not counting the draws, which is \
+             the whole reason both rows exist"
         );
     }
 

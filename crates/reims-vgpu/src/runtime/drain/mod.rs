@@ -2373,6 +2373,14 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
             census.dispatches_with_no_stage_published,
         ),
         ("dispatch_usage_published", census.dispatches_published),
+        (
+            "unknown_from_a_table",
+            census.unknown_participations_from_a_table,
+        ),
+        (
+            "unknown_with_no_table",
+            census.unknown_participations_with_no_table,
+        ),
     ] {
         note_store_route_n(route, u64::from(n));
     }
