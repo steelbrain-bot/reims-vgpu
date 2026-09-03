@@ -932,6 +932,24 @@ pub(crate) struct CbGraphicsState {
     vertex_scratch: Vec<VertexBufferBinding>,
     vertex_buffers: Vec<vk::Buffer>,
     vertex_offsets: Vec<vk::DeviceSize>,
+    /// The vertex binds the recording draw has staged so far, in request order.
+    ///
+    /// Scratch and not state, like the three above it: it says what the draw
+    /// currently being assembled asked for, never what the command buffer
+    /// carries. It lives here rather than as a local in the draw because a local
+    /// is a heap allocation per draw, and `bind_vertex_buffers` already claims
+    /// in its own doc that every array it touches is reusable — the caller's was
+    /// the one that was not.
+    vertex_binds: Vec<(u32, super::exec::BoundBuffer)>,
+    /// The storage-buffer binds the recording draw has staged, as
+    /// `(binding, bound, content length)`. Scratch, for the reason
+    /// [`Self::vertex_binds`] is.
+    ///
+    /// It lives beside [`Self::push_scratch`] rather than in the draw because
+    /// the descriptor list is derived from the two together, and a caller
+    /// holding one from here and the other as a local could not hand both to one
+    /// function without borrowing this struct twice.
+    storage_binds: Vec<(u32, super::exec::BoundBuffer, u64)>,
 }
 
 impl CbGraphicsState {
@@ -972,6 +990,8 @@ impl CbGraphicsState {
             vertex_scratch: _,
             vertex_buffers: _,
             vertex_offsets: _,
+            vertex_binds: _,
+            storage_binds: _,
         } = self;
         *pipeline = None;
         *pipeline_layout = None;

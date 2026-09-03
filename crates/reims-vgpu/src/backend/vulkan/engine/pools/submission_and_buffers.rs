@@ -2438,45 +2438,47 @@ impl ResourcePools {
         device: &ash::Device,
         cb: vk::CommandBuffer,
         counters: &EngineCounters,
-        requested: &[(u32, super::super::exec::BoundBuffer)],
     ) {
-        let g = &mut self.cb_graphics;
+        // Disjoint field borrows: the request list and the normalization scratch
+        // are two fields of one struct and this is the only place both are live.
+        let super::CbGraphicsState {
+            vertex_binds,
+            vertex_scratch,
+            vertex_buffers,
+            vertex_offsets,
+            ..
+        } = &mut self.cb_graphics;
         counters
             .vertex_buffer_bind_slots
-            .fetch_add(requested.len() as u64, Ordering::Relaxed);
+            .fetch_add(vertex_binds.len() as u64, Ordering::Relaxed);
 
-        g.vertex_scratch.clear();
-        g.vertex_scratch
-            .extend(
-                requested
-                    .iter()
-                    .map(|(binding, bound)| super::VertexBufferBinding {
-                        binding: *binding,
-                        buffer: bound.buffer,
-                        offset: bound.offset,
-                    }),
-            );
-        super::normalize_vertex_bindings(&mut g.vertex_scratch);
+        vertex_scratch.clear();
+        vertex_scratch.extend(vertex_binds.iter().map(|(binding, bound)| {
+            super::VertexBufferBinding {
+                binding: *binding,
+                buffer: bound.buffer,
+                offset: bound.offset,
+            }
+        }));
+        super::normalize_vertex_bindings(vertex_scratch);
         counters
             .vertex_buffer_bind_emitted
-            .fetch_add(g.vertex_scratch.len() as u64, Ordering::Relaxed);
+            .fetch_add(vertex_scratch.len() as u64, Ordering::Relaxed);
 
-        g.vertex_buffers.clear();
-        g.vertex_offsets.clear();
-        g.vertex_buffers
-            .extend(g.vertex_scratch.iter().map(|entry| entry.buffer));
-        g.vertex_offsets
-            .extend(g.vertex_scratch.iter().map(|entry| entry.offset));
+        vertex_buffers.clear();
+        vertex_offsets.clear();
+        vertex_buffers.extend(vertex_scratch.iter().map(|entry| entry.buffer));
+        vertex_offsets.extend(vertex_scratch.iter().map(|entry| entry.offset));
 
         let mut start = 0;
-        while start < g.vertex_scratch.len() {
-            let end = super::vertex_binding_run_end(&g.vertex_scratch, start);
+        while start < vertex_scratch.len() {
+            let end = super::vertex_binding_run_end(vertex_scratch, start);
             unsafe {
                 device.cmd_bind_vertex_buffers(
                     cb,
-                    g.vertex_scratch[start].binding,
-                    &g.vertex_buffers[start..end],
-                    &g.vertex_offsets[start..end],
+                    vertex_scratch[start].binding,
+                    &vertex_buffers[start..end],
+                    &vertex_offsets[start..end],
                 )
             };
             counters
@@ -2486,15 +2488,65 @@ impl ResourcePools {
         }
     }
 
-    /// Scratch in which the next draw normalizes its push-descriptor state.
-    pub(crate) fn push_descriptor_scratch(&mut self) -> &mut Vec<super::PushDescriptorBinding> {
-        self.cb_graphics.push_scratch.clear();
-        &mut self.cb_graphics.push_scratch
+    /// Begin a draw's vertex-bind list, discarding the previous draw's.
+    ///
+    /// Paired with [`Self::stage_vertex_bind`] and consumed by
+    /// [`Self::bind_vertex_buffers`]. The list stays here between draws so its
+    /// capacity survives; only its contents are per draw.
+    pub(crate) fn begin_vertex_binds(&mut self) {
+        self.cb_graphics.vertex_binds.clear();
     }
 
-    /// The list [`Self::push_descriptor_scratch`] was last filled with, read
-    /// back for a consumer that has to translate it. Shared, so the caller
-    /// cannot change what the comparison below will read.
+    /// Record that the recording draw binds `bound` at `binding`.
+    pub(in crate::backend::vulkan::engine) fn stage_vertex_bind(
+        &mut self,
+        binding: u32,
+        bound: super::super::exec::BoundBuffer,
+    ) {
+        self.cb_graphics.vertex_binds.push((binding, bound));
+    }
+
+    /// Begin a draw's storage-bind list, discarding the previous draw's.
+    pub(crate) fn begin_storage_binds(&mut self) {
+        self.cb_graphics.storage_binds.clear();
+    }
+
+    /// Record that the recording draw binds `bound` at `binding`, with `len`
+    /// bytes of content behind it.
+    pub(in crate::backend::vulkan::engine) fn stage_storage_bind(
+        &mut self,
+        binding: u32,
+        bound: super::super::exec::BoundBuffer,
+        len: u64,
+    ) {
+        self.cb_graphics.storage_binds.push((binding, bound, len));
+    }
+
+    /// The cleared descriptor scratch and this draw's storage binds, together.
+    ///
+    /// Together because the caller derives one from the other and both live in
+    /// this struct: asking for them one at a time would be two borrows of
+    /// `self`, and keeping either as a draw-local would be the heap allocation
+    /// per draw that putting them here removed.
+    pub(in crate::backend::vulkan::engine) fn descriptor_scratch_and_storage_binds(
+        &mut self,
+    ) -> (
+        &mut Vec<super::PushDescriptorBinding>,
+        &[(u32, super::super::exec::BoundBuffer, u64)],
+    ) {
+        let super::CbGraphicsState {
+            push_scratch,
+            storage_binds,
+            ..
+        } = &mut self.cb_graphics;
+        push_scratch.clear();
+        (push_scratch, storage_binds)
+    }
+
+    /// The list [`Self::descriptor_scratch_and_storage_binds`] handed out and
+    /// the caller filled, read back for a consumer that has to translate it.
+    /// Shared, so the caller cannot change what the comparison below will
+    /// read.
     pub(crate) fn push_descriptor_scratch_ref(&self) -> &[super::PushDescriptorBinding] {
         &self.cb_graphics.push_scratch
     }

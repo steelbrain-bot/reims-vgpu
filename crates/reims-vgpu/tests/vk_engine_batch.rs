@@ -751,9 +751,10 @@ fn a_warm_repeat_draw_does_not_enter_the_allocator() {
     }
 
     let before = engine::counter_snapshot();
-    let (result, trips) = reims_vgpu_testkit::allocations::measure(|| {
+    let (result, cost) = reims_vgpu_testkit::allocations::measure_cost(|| {
         engine::execute_draw_request(engine_device(), &joiner)
     });
+    let trips = cost.trips;
     result.expect("the measured draw is the ninth repeat of one that succeeded");
     // A zero is only a reading if a draw happened inside the region. An early
     // return — a request rejected at validation, a batch already closed — would
@@ -831,9 +832,10 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
     }
 
     let before = engine::counter_snapshot();
-    let (result, trips) = reims_vgpu_testkit::allocations::measure(|| {
+    let (result, cost) = reims_vgpu_testkit::allocations::measure_cost(|| {
         engine::execute_draw_request(engine_device(), &joiner)
     });
+    let trips = cost.trips;
     result.expect("the measured draw is the ninth repeat of one that succeeded");
     let during = engine::counter_snapshot().delta_since(&before);
     assert_eq!(
@@ -852,25 +854,36 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
     /// ```text
     ///    16 B  the `Vec<BindingSig>` binding list
     ///    16 B  `LayoutKey::clone` into the pipeline key
-    ///    48 B  `BufferGatherRoles::of`
-    ///   128 B  the bound-buffer list growing
     /// ```
     ///
-    /// Three are gone since. 104 B for `validate_v1`'s duplicate-binding
-    /// `BTreeSet` — the set became a scan over the lists the draw already owns.
-    /// Then 24 B for a `Vec<vk::DescriptorBufferInfo>` and 256 B for a
-    /// `Vec<vk::WriteDescriptorSet>`, which this test is what caught: it prints
-    /// `descriptor_pushes`, `descriptor_set_binds` and `descriptor_set_updates`
-    /// beside the trip count, all three were **zero**, and the draw was building
-    /// Vulkan's write structures every time on the way to sending none of them.
-    /// The binding list is built into the command buffer's scratch and Vulkan's
-    /// structures are derived only by the consumer that sends them.
+    /// Four are gone since, and the byte total is the check on that list: 32 B
+    /// over two trips is exactly the two above, so nothing unlisted is hiding
+    /// behind a number that only counts calls.
     ///
-    /// Of the four left, two are per-draw scratch a device-owned reusable buffer
-    /// would hold instead, and the two layout ones need the layout cache
-    /// reachable without an owned `Vec<BindingSig>` per draw — `PipelineKey`
-    /// carries `LayoutKey` by value, so building the lookup key clones it.
-    const CEILING: usize = 4;
+    /// * 104 B, `validate_v1`'s duplicate-binding `BTreeSet` — became a scan
+    ///   over the lists the draw already owns.
+    /// * 24 B and 256 B, a `Vec<vk::DescriptorBufferInfo>` and a
+    ///   `Vec<vk::WriteDescriptorSet>`. This test is what caught them: it prints
+    ///   `descriptor_pushes`, `descriptor_set_binds` and
+    ///   `descriptor_set_updates` beside the count, all three were **zero**, and
+    ///   the draw was building Vulkan's write structures every time on the way
+    ///   to sending none of them.
+    /// * 48 B, `BufferGatherRoles::of` — the table is gone; the three call sites
+    ///   scan the request it was built from.
+    /// * 128 B, the storage-bind list, which is the "bound-buffer list growing"
+    ///   the earlier trace named. It lives in the command buffer's scratch
+    ///   beside the descriptor list now, because the one is derived from the
+    ///   other.
+    ///
+    /// Both survivors are the same fact: `PipelineKey` carries `LayoutKey` by
+    /// value and `LayoutKey` owns a `Vec<BindingSig>`, so a draw builds that
+    /// vector and then clones it to look the pipeline up. Closing them is a
+    /// change to how layouts are keyed — the cache reachable without an owned
+    /// vector per draw, a `Digest128` over the canonical bindings being the
+    /// idiom this crate already uses for SPIR-V — and that is why this is still
+    /// a ceiling. Lowering the constant is the work; raising it needs a reason
+    /// in the commit.
+    const CEILING: usize = 2;
     assert!(
         trips <= CEILING,
         "a warm repeat draw binding one storage buffer took {trips} trips into \
@@ -878,9 +891,12 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
          value for this is 0"
     );
     eprintln!(
-        "warm repeat draw, one storage buffer: {trips} allocator trips, \
+        "warm repeat draw, one storage buffer: {trips} allocator trips, {} bytes, \
          descriptor_pushes={} descriptor_set_binds={} descriptor_set_updates={}",
-        during.descriptor_pushes, during.descriptor_set_binds, during.descriptor_set_updates
+        cost.bytes,
+        during.descriptor_pushes,
+        during.descriptor_set_binds,
+        during.descriptor_set_updates
     );
 }
 

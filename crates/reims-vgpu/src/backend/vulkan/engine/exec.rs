@@ -92,11 +92,17 @@ pub(super) struct BufferGatherRole {
 }
 
 impl BufferGatherRole {
+    /// The two single-consumer answers, as names. Only the test asserts against
+    /// them: [`buffer_gather_role`] accumulates its fields as it scans, because
+    /// an allocation bound as both is one answer carrying both and a seed-then-
+    /// merge shape would have to say so twice.
+    #[cfg(test)]
     const VERTEX: Self = Self {
         vertex: true,
         storage: false,
         index_alignment: None,
     };
+    #[cfg(test)]
     const STORAGE: Self = Self {
         vertex: false,
         storage: true,
@@ -164,84 +170,51 @@ fn buffer_bind_offset_alignment(role: BufferGatherRole, storage_align: u64) -> u
     storage.max(role.index_alignment.unwrap_or(1))
 }
 
-/// One draw's buffer binds partitioned by the consumer(s) each physical content
-/// allocation serves.
+/// The consumer(s) this draw binds one physical content allocation for, or
+/// `None` if this draw does not bind it at all.
 ///
-/// A flat table and not a map. The population is a handful — a driven Maps boot
-/// reads 2.9 vertex attributes and about six buffer binds a draw — and the
-/// question asked of it is three bits wide, so an ordered map cost a node
-/// allocation per *distinct* allocation on every draw plus a pointer-chasing
-/// probe per bind, to answer something a linear scan over one contiguous
-/// allocation answers in a few compares. `sg_roles_us` was 0.15 µs of a 9.3 µs
-/// chain before this and the probes were charged to `sg_vertex`/`sg_index`/
-/// `sg_storage` beside it.
+/// A scan and not a table, and it has been each of the three shapes in turn. It
+/// began as an ordered map, which cost a node allocation per *distinct*
+/// allocation on every draw plus a pointer-chasing probe per bind, to answer
+/// something three bits wide — `sg_roles_us` was 0.15 µs of a 9.3 µs chain and
+/// the probes were charged to `sg_vertex`/`sg_index`/`sg_storage` beside it.
+/// Then it became a flat `Vec` built once per draw and scanned linearly, which
+/// removed the probes and left one heap allocation a draw.
 ///
-/// Built from key derivations that take no reference to what they name — see
-/// [`CbBind::key_of`] — because the `DrawRequest` this borrows outlives the
-/// table, so the allocations cannot go anywhere while it is being read.
-struct BufferGatherRoles {
-    entries: Vec<((usize, u64, u64), BufferGatherRole)>,
-}
-
-impl BufferGatherRoles {
-    fn of(req: &DrawRequest) -> Self {
-        let mut entries: Vec<((usize, u64, u64), BufferGatherRole)> = Vec::with_capacity(
-            req.vertex_attributes.len()
-                + req.storage_buffers.len()
-                + req.indexed.is_some() as usize,
-        );
-        // `entry`-shaped, so a content allocation named twice in one draw stays
-        // one physical operation carrying both roles.
-        let mut merge = |key, seed: BufferGatherRole, add: fn(&mut BufferGatherRole)| match entries
-            .iter_mut()
-            .find(|(held, _)| *held == key)
-        {
-            Some((_, role)) => add(role),
-            None => entries.push((key, seed)),
-        };
-        for content in req.vertex_attributes.iter().map(|r| &r.content) {
-            merge(CbBind::key_of(content), BufferGatherRole::VERTEX, |role| {
-                role.vertex = true
-            });
+/// The table itself is what is gone now. The population is a handful — a driven
+/// Maps boot reads 2.9 vertex attributes and about six buffer binds a draw — and
+/// the three call sites ask about a key they already hold, so scanning the
+/// request the table was *built from* is the same order of work as scanning the
+/// table, minus the allocation and minus a second structure that could disagree
+/// with the first. "Shared content is one operation" stops being an invariant a
+/// merge has to maintain and becomes a property of the answer: both flags come
+/// back from one call because both loops below can set them.
+///
+/// Keys are derived by [`CbBind::key_of`], which takes no reference to what it
+/// names, and the `DrawRequest` outlives every call — so no allocation named
+/// here can move while it is being compared.
+fn buffer_gather_role(req: &DrawRequest, key: (usize, u64, u64)) -> Option<BufferGatherRole> {
+    let mut role = BufferGatherRole::default();
+    let mut bound = false;
+    for content in req.vertex_attributes.iter().map(|r| &r.content) {
+        if CbBind::key_of(content) == key {
+            role.vertex = true;
+            bound = true;
         }
-        for content in req.storage_buffers.iter().map(|r| &r.content) {
-            merge(CbBind::key_of(content), BufferGatherRole::STORAGE, |role| {
-                role.storage = true
-            });
+    }
+    for content in req.storage_buffers.iter().map(|r| &r.content) {
+        if CbBind::key_of(content) == key {
+            role.storage = true;
+            bound = true;
         }
-        if let Some(indexed) = &req.indexed {
-            let alignment = indexed.index_type.byte_size() as u64;
-            let key = CbBind::key_of(&indexed.content);
-            let seed = BufferGatherRole {
-                vertex: false,
-                storage: false,
-                index_alignment: Some(alignment),
-            };
-            match entries.iter_mut().find(|(held, _)| *held == key) {
-                Some((_, role)) => role.index_alignment = Some(alignment),
-                None => entries.push((key, seed)),
-            }
+    }
+    if let Some(indexed) = &req.indexed {
+        if CbBind::key_of(&indexed.content) == key {
+            role.index_alignment = Some(indexed.index_type.byte_size() as u64);
+            bound = true;
         }
-        Self { entries }
     }
-
-    /// The role of the bind this key names. Every bind was classified by
-    /// [`Self::of`] from the same `DrawRequest`, so an absent key is a caller
-    /// asking about a bind that is not in this draw.
-    fn role(&self, key: (usize, u64, u64)) -> Option<BufferGatherRole> {
-        self.entries
-            .iter()
-            .find(|(held, _)| *held == key)
-            .map(|(_, role)| *role)
-    }
-
-    /// How many *physical* operations the draw's binds partition into, which is
-    /// the property the role split exists to preserve. Nothing on the draw path
-    /// asks; the partition test does.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.len()
-    }
+    bound.then_some(role)
 }
 
 impl PendingGuestGather {
@@ -3443,9 +3416,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // this command buffer is copied once.
     let mut guest_gathers: Vec<PendingGuestGather> = Vec::new();
     phase.enter(super::draw_phase::Phase::StageRoles);
-    let gather_roles = BufferGatherRoles::of(req);
     phase.enter(super::draw_phase::Phase::StageVertex);
-    let mut vertex_bufs = Vec::new();
+    pools.begin_vertex_binds();
     for resource in &req.vertex_attributes {
         let needs_shift = !no_vertex_fetch
             && resource.step_function == VertexStepFunction::Constant
@@ -3498,14 +3470,13 @@ pub(crate) unsafe fn execute_draw_inner(
                 &resource.content,
                 StageBufferUse {
                     snapshot_volatile: batch_eligible,
-                    gather_role: gather_roles
-                        .role(CbBind::key_of(&resource.content))
+                    gather_role: buffer_gather_role(req, CbBind::key_of(&resource.content))
                         .expect("every vertex buffer was classified"),
                 },
                 &mut guest_gathers,
             )?
         };
-        vertex_bufs.push((resource.binding, slot));
+        pools.stage_vertex_bind(resource.binding, slot);
     }
 
     // Index data follows the same retained resource path as vertex/storage
@@ -3520,8 +3491,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &indexed.content,
             StageBufferUse {
                 snapshot_volatile: batch_eligible,
-                gather_role: gather_roles
-                    .role(CbBind::key_of(&indexed.content))
+                gather_role: buffer_gather_role(req, CbBind::key_of(&indexed.content))
                     .expect("the index buffer was classified"),
             },
             &mut guest_gathers,
@@ -3534,7 +3504,7 @@ pub(crate) unsafe fn execute_draw_inner(
     // pooled slot carries `POOL_SLOT_USAGE`, so there is no usage for that
     // reuse to be wrong about).
     phase.enter(super::draw_phase::Phase::StageStorage);
-    let mut storage_slots = Vec::new();
+    pools.begin_storage_binds();
     for resource in &req.storage_buffers {
         let slot = stage_buffer_content(
             ctx,
@@ -3543,13 +3513,12 @@ pub(crate) unsafe fn execute_draw_inner(
             &resource.content,
             StageBufferUse {
                 snapshot_volatile: batch_eligible,
-                gather_role: gather_roles
-                    .role(CbBind::key_of(&resource.content))
+                gather_role: buffer_gather_role(req, CbBind::key_of(&resource.content))
                     .expect("every storage buffer was classified"),
             },
             &mut guest_gathers,
         )?;
-        storage_slots.push((resource.binding, slot, resource.content.len() as u64));
+        pools.stage_storage_bind(resource.binding, slot, resource.content.len() as u64);
     }
 
     // Target seed staging (CPU import only — not LoadFromTarget).
@@ -4331,9 +4300,10 @@ pub(crate) unsafe fn execute_draw_inner(
     //
     // Built into the command buffer's own scratch, which keeps its capacity
     // across draws, so this list itself costs no allocation.
+    let (descriptor_scratch, storage_binds) = pools.descriptor_scratch_and_storage_binds();
     fill_descriptor_bindings(
-        pools.push_descriptor_scratch(),
-        &storage_slots,
+        descriptor_scratch,
+        storage_binds,
         &sampled,
         &sampler_handles,
         req.color_input.then_some((target_view, color_input_layout)),
@@ -5397,7 +5367,7 @@ pub(crate) unsafe fn execute_draw_inner(
             .fetch_add(1, Ordering::Relaxed);
     }
     phase.enter(super::draw_phase::Phase::RecordDraw);
-    unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters, &vertex_bufs) };
+    unsafe { pools.bind_vertex_buffers(&ctx.device, cb, counters) };
     match (&req.indexed, &index_slot) {
         (Some(indexed), Some(ibuf)) => {
             ctx.device
@@ -7043,23 +7013,29 @@ mod tests {
             ..DrawRequest::default()
         };
 
-        let roles = BufferGatherRoles::of(&req);
-        assert_eq!(roles.len(), 4, "shared content must stay one operation");
-        assert_eq!(roles.role(keys[0]), Some(BufferGatherRole::VERTEX));
-        assert_eq!(roles.role(keys[1]), Some(BufferGatherRole::STORAGE));
-        assert!(roles
-            .role(keys[2])
+        assert_eq!(
+            buffer_gather_role(&req, keys[0]),
+            Some(BufferGatherRole::VERTEX)
+        );
+        assert_eq!(
+            buffer_gather_role(&req, keys[1]),
+            Some(BufferGatherRole::STORAGE)
+        );
+        // "Shared content stays one operation" used to be asserted as a table
+        // length, and a length can only say the merge did not add an entry. It
+        // is one *answer* now: the allocation bound twice comes back carrying
+        // both roles, which is the claim the byte columns actually rest on, and
+        // there is no second structure that could hold it as two.
+        assert!(buffer_gather_role(&req, keys[2])
             .expect("shared was classified")
             .is_shared());
-        let index = roles
-            .role(keys[3])
-            .expect("the index buffer was classified");
+        let index = buffer_gather_role(&req, keys[3]).expect("the index buffer was classified");
         assert!(index.includes_index());
         assert_eq!(index.index_alignment, Some(2));
-        // The table answers only about this draw's binds. An unclassified key
-        // must be `None` and not the role of whichever entry a scan happened to
-        // stop on — the three call sites `expect()` on exactly this.
-        assert_eq!(roles.role((0xdead_beef, 0, 16)), None);
+        // Only about this draw's binds. An unclassified key must be `None` and
+        // not the role of whichever bind a scan happened to stop on — the three
+        // call sites `expect()` on exactly this.
+        assert_eq!(buffer_gather_role(&req, (0xdead_beef, 0, 16)), None);
     }
 
     /// The bands tile every attachment size with no gap and no overlap, and a
