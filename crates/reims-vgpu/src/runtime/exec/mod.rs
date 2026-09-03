@@ -764,6 +764,37 @@ pub struct ExecSubmission {
 }
 
 impl ExecSubmission {
+    /// The task whose object list the refs inside these streams index.
+    ///
+    /// From the exec header and not from the FIFO — see
+    /// `crate::runtime::ingress::ExecStreams::task`.
+    #[must_use]
+    pub const fn task_id(&self) -> u32 {
+        self.task_id
+    }
+
+    /// The command buffers, in the order the header declares them.
+    #[must_use]
+    pub fn streams(&self) -> &[Vec<u8>] {
+        &self.streams
+    }
+
+    /// A submission stated outright rather than read out of a packet.
+    ///
+    /// For the suites that are about what a *read* submission does downstream
+    /// — parking, admission, execution — where reaching them through
+    /// [`read_submission`] would mean building a guest page table and an exec
+    /// header to state two command buffers. The reading has its own tests;
+    /// this is for everything the reading feeds.
+    #[cfg(test)]
+    pub(crate) fn stated(task_id: u32, streams: Vec<Vec<u8>>) -> Self {
+        Self {
+            task_id,
+            resource_descs: Vec::new(),
+            streams,
+        }
+    }
+
     /// Host bytes this submission is holding, for a caller accounting for what
     /// a parked position retains.
     ///

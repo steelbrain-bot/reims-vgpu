@@ -158,6 +158,19 @@ pub enum Gap {
     /// The ledger has not closed this row, so [`classify`] gives it no class
     /// and the model may not claim it. Production answers it alone.
     Unresolved,
+    /// An exec packet reached [`device_packet`] without the command buffers it
+    /// names.
+    ///
+    /// The streams live in the task's address space, so reading them is a
+    /// page-table walk the caller performs before admission — see
+    /// [`ExecStreams`]. Every reason that walk produces nothing is already
+    /// named on the always-on channel by `crate::runtime::exec::read_submission`
+    /// where it was refused, so this says only that they did not arrive, which
+    /// is the one thing this bridge can state about them.
+    ///
+    /// A gap and not a refusal: the packet's own bytes are well formed, and
+    /// what is missing is memory the model was not given.
+    ExecStreamsUnread,
 }
 
 impl Gap {
@@ -166,6 +179,7 @@ impl Gap {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Unresolved => "ingress_row_unresolved",
+            Self::ExecStreamsUnread => "ingress_exec_streams_unread",
         }
     }
 }
@@ -554,6 +568,121 @@ pub fn packet(
     })
 }
 
+/// What the caller read out of guest memory for one packet, which
+/// [`device_packet`] will not read for it.
+///
+/// Both members are guest-memory work performed at a moment this bridge cannot
+/// choose. The command buffers are read *before* admission, out of the task's
+/// address space; the replacement storage is read *after* this device has moved
+/// a re-pointed resource's incarnation, because an earlier answer is the old
+/// one. A door that performed either would be a bridge that mutates guest
+/// state, and one that performed them at its own convenience would answer with
+/// the wrong bytes.
+///
+/// One value rather than two arguments for [`Resolvers`]'s reason: a third such
+/// input should become a field rather than a signature change through every
+/// caller.
+pub struct PacketReads<'a> {
+    /// The exec class's command buffers, already read. `None` for every other
+    /// class, and for an exec packet whose streams this device could not read —
+    /// see [`Gap::ExecStreamsUnread`].
+    pub submission: Option<&'a crate::runtime::exec::ExecSubmission>,
+    /// What a re-pointed reference names now, or why the device cannot say.
+    pub repointed: Result<ReplacementStorage, crate::runtime::objects::RepointStorageRefusal>,
+}
+
+/// [`packet`] with this device supplying every namespace it asks for.
+///
+/// # Why the assembly is a function and not a call site
+///
+/// [`packet`]'s inputs are five borrows of four different device tables, and
+/// three of them have to be constructed rather than looked up:
+/// `crate::runtime::objects::TaskNames` is `(state, host)`, the access source is
+/// `crate::model::DeviceState::task_access` bound to *this packet's* task and
+/// domain, and the mapping resolver is the device itself. Spelled at a call
+/// site, the pairing is the caller's to get right — and the pairing that can go
+/// wrong silently is the access source's, which takes a task and a domain that
+/// are properties of the packet and would resolve someone else's participations
+/// against this packet's ordering if they were taken from anywhere else.
+///
+/// Here the task comes from the submission's own header and the domain from the
+/// `Fifo` the packet was drained out of, which are the two facts the packet
+/// itself carries.
+///
+/// # The two inputs the caller still supplies, and why they are not read here
+///
+/// [`ExecStreams::streams`] is a page-table walk per command buffer and
+/// [`ReplacementStorage`] is read *after* this device has moved a re-pointed
+/// resource's storage incarnation. Both are the caller's work by contract —
+/// see `crate::runtime::exec::ExecSubmission` for the first and
+/// [`ReplacementStorage`] for the second — and a door that performed them
+/// would be a bridge that mutates guest state.
+///
+/// # Errors
+///
+/// Whatever [`packet`] refuses, plus [`Gap::ExecStreamsUnread`] for an exec
+/// packet whose command buffers this device did not read.
+pub fn device_packet<M: crate::runtime::host::HostMemory>(
+    state: &crate::model::DeviceState,
+    host: &M,
+    fifo: Fifo,
+    session: SessionGeneration,
+    completion_slot: StampSlot,
+    drained: &drain::Packet,
+    reads: PacketReads<'_>,
+) -> Result<Packet, Blocked> {
+    let PacketReads {
+        submission,
+        repointed,
+    } = reads;
+    let channel = fifo.channel();
+    let class = classify(channel, drained.opcode);
+    // Asked before anything is built, because the answer decides whether the
+    // exec inputs below are the packet's or a stand-in: an exec packet with no
+    // streams would otherwise walk an empty table into an empty transaction,
+    // which admits and executes nothing while reporting success.
+    if class == Some(PayloadClass::Exec) && submission.is_none() {
+        return Err(Blocked::Gap {
+            channel,
+            opcode: drained.opcode,
+            gap: Gap::ExecStreamsUnread,
+        });
+    }
+
+    let names = crate::runtime::objects::TaskNames::new(state, host);
+    let resolvers = Resolvers {
+        mappings: state,
+        objects: &names,
+        storage: &names,
+        replies: &names,
+    };
+    // `TaskId(0)` for every class that is not exec: the field is the task an
+    // exec packet's *records* index, which only an exec header states, and the
+    // access source is untouched by the other four classes. It is not a
+    // default that could be wrong — a class that never asks cannot be answered
+    // for the wrong task.
+    let task = submission.map_or(reims_vgpu_core::identity::TaskId(0), |s| {
+        reims_vgpu_core::identity::TaskId(s.task_id())
+    });
+    let mut accesses = state.task_access(task, fifo.domain());
+    let no_streams: [Vec<u8>; 0] = [];
+    packet(
+        fifo,
+        session,
+        completion_slot,
+        drained,
+        resolvers,
+        DeviceInputs {
+            exec: ExecStreams {
+                task,
+                streams: submission.map_or(&no_streams, |s| s.streams()),
+                accesses: &mut accesses,
+            },
+            repointed,
+        },
+    )
+}
+
 /// What a present asks to show, and the one access that orders it.
 ///
 /// # A present reads the whole of one surface
@@ -886,6 +1015,7 @@ mod tests {
     // The channel bound, read only by the test that sweeps it: `Fifo::child`
     // asks `is_child_channel` and never the constant behind it.
     use crate::model::MAX_CHANNELS;
+    use reims_vgpu_core::identity::TaskId;
     use reims_vgpu_protocol::packets::LEDGER;
 
     /// A payload long enough for every control command's own layout and every
@@ -1358,7 +1488,6 @@ mod tests {
     /// caller's.
     #[test]
     fn a_repoint_crosses_with_the_models_identity_and_the_devices_storage() {
-        use reims_vgpu_core::identity::TaskId;
         use reims_vgpu_core::lifecycle::LifecycleOp;
         use reims_vgpu_core::resolve::TaskNamespaces as _;
 
@@ -1872,5 +2001,198 @@ mod tests {
             assert_eq!(fifo.domain(), ChannelId(id));
             assert_eq!(fifo.channel(), Channel::Child);
         }
+    }
+}
+
+/// [`device_packet`] against a real [`crate::model::DeviceState`].
+///
+/// Separate from the module's own suite because the questions are different:
+/// that one asks what [`packet`] builds from stated namespaces, and this asks
+/// whether the device's namespaces can be *assembled* into the ones it asks
+/// for. Those fail in different places — a wrong payload against a wrong door —
+/// and a fixture holding both would answer neither cleanly.
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+    use crate::model::{DeviceId, DeviceState, CHILD_OP_EXEC_INDIRECT2};
+    use crate::runtime::exec::ExecSubmission;
+    use crate::runtime::host::FakeHost;
+    use reims_vgpu_core::access::{BackingId, ByteRange};
+    use reims_vgpu_core::lifecycle::Storage;
+
+    const TASK: u32 = 2;
+    const TEXTURE: u32 = 11;
+    const BACKING: BackingId = BackingId(0x9000);
+    const SESSION: SessionGeneration = SessionGeneration::FIRST;
+    const SLOT: StampSlot = StampSlot(1);
+
+    /// One `generateMipmapsForTexture:` record, framed the way the guest's
+    /// serializer frames one.
+    ///
+    /// Written here rather than reached for, because the writing side of the
+    /// record and segment layouts lives in `reims_vgpu_core`'s own test module
+    /// and no production path needs it. What is duplicated is an opcode, a
+    /// length and a header — all three read from the wire crate's constants, so
+    /// a layout change breaks this the same way it breaks the reader.
+    fn one_blit_stream(texture: u32) -> Vec<u8> {
+        use reims_vgpu_protocol::segment::SegmentKind;
+        use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
+
+        let payload = texture.to_le_bytes();
+        let mut record = Vec::new();
+        record
+            .extend_from_slice(&reims_vgpu_wire::ops::blit::OPCODE_GENERATE_MIPMAPS.to_le_bytes());
+        record.extend_from_slice(
+            &((reims_vgpu_protocol::decode::OP_HEADER_LEN + payload.len()) as u32).to_le_bytes(),
+        );
+        record.extend_from_slice(&payload);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&((SEGMENT_HEADER_LEN + record.len()) as u32).to_le_bytes());
+        out.push(SegmentKind::Blit.wire_type());
+        // Self-contained: the segment opens its encoder and ends it.
+        out.push(0);
+        out.push(0);
+        // The byte the serializer never writes.
+        out.push(0xaa);
+        out.extend_from_slice(&record);
+        out
+    }
+
+    fn exec_packet(payload: Vec<u8>) -> drain::Packet {
+        drain::Packet {
+            opcode: CHILD_OP_EXEC_INDIRECT2,
+            stamp_waits: Vec::new(),
+            total_size: 0,
+            completion_stamp: 9,
+            payload,
+            next_head: 0,
+        }
+    }
+
+    fn device_with_texture() -> DeviceState {
+        let mut state = DeviceState::new(DeviceId(1), 12);
+        state.define_task(TASK, 1 << 20, 0x200);
+        let _declared = state
+            .declare_object(
+                TASK,
+                TEXTURE,
+                Storage::Dedicated {
+                    backing: BACKING,
+                    extent: ByteRange {
+                        offset: 0,
+                        length: 0x4000,
+                    },
+                },
+            )
+            .expect("the task is open");
+        state
+    }
+
+    /// The reads for a packet that is not a re-point, with `submission`
+    /// stated by each test.
+    fn reads(submission: Option<&ExecSubmission>) -> PacketReads<'_> {
+        PacketReads {
+            submission,
+            repointed: Err(crate::runtime::objects::RepointStorageRefusal::Unnamed),
+        }
+    }
+
+    /// The assembly the switch is: a real device's namespaces answer a real
+    /// command stream, and the access the record claims comes out keyed on the
+    /// storage the device declared.
+    ///
+    /// This is the shape that could not be written before the access door
+    /// existed: the resolver and the access source both borrow the device, and
+    /// the walk alternates between them once per record.
+    #[test]
+    fn a_command_stream_resolves_and_records_through_the_devices_own_doors() {
+        let state = device_with_texture();
+        let host = FakeHost::new();
+        let submission = ExecSubmission::stated(TASK, vec![one_blit_stream(TEXTURE)]);
+        let drained = exec_packet(Vec::new());
+
+        let built = device_packet(
+            &state,
+            &host,
+            Fifo::child(1).expect("a child channel"),
+            SESSION,
+            SLOT,
+            &drained,
+            reads(Some(&submission)),
+        )
+        .expect("a well-framed blit over a declared texture");
+
+        let Payload::Exec(work) = built.payload else {
+            panic!("an exec opcode is the exec class");
+        };
+        let named: Vec<u64> = work
+            .accesses
+            .iter()
+            .filter_map(|a| match a.key {
+                reims_vgpu_core::access::AccessKey::Range(r, _)
+                | reims_vgpu_core::access::AccessKey::Subresource(r, _)
+                | reims_vgpu_core::access::AccessKey::Whole(r) => Some(r.backing.0),
+                reims_vgpu_core::access::AccessKey::DomainOnly
+                | reims_vgpu_core::access::AccessKey::Heap(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            named,
+            vec![BACKING.0],
+            "the access is keyed on the storage the device declared for the ref"
+        );
+        assert_eq!(built.domain, ChannelId(1));
+    }
+
+    /// A ref the task never declared refuses the whole packet, rather than
+    /// yielding a transaction that is missing the edge the record asked for.
+    #[test]
+    fn an_undeclared_ref_refuses_the_whole_exec_packet() {
+        let state = device_with_texture();
+        let host = FakeHost::new();
+        let submission = ExecSubmission::stated(TASK, vec![one_blit_stream(TEXTURE + 1)]);
+        let drained = exec_packet(Vec::new());
+
+        let blocked = device_packet(
+            &state,
+            &host,
+            Fifo::child(1).expect("a child channel"),
+            SESSION,
+            SLOT,
+            &drained,
+            reads(Some(&submission)),
+        )
+        .expect_err("nothing names that ref and no guest list answers for it");
+        assert!(
+            matches!(blocked, Blocked::Refused(Refused::Exec(_))),
+            "the walk's own refusal, not a gap: {blocked:?}"
+        );
+    }
+
+    /// An exec packet whose command buffers this device did not read is a gap
+    /// and not an empty transaction.
+    ///
+    /// The failure this rules out is silent: with no streams the walk has
+    /// nothing to refuse, so the builder finishes an access list of length zero
+    /// and the packet admits, orders against nothing, and executes nothing —
+    /// a whole submission of guest draws reported as done.
+    #[test]
+    fn an_exec_packet_without_its_streams_is_a_gap() {
+        let state = device_with_texture();
+        let host = FakeHost::new();
+        let drained = exec_packet(Vec::new());
+
+        let blocked = device_packet(
+            &state,
+            &host,
+            Fifo::child(1).expect("a child channel"),
+            SESSION,
+            SLOT,
+            &drained,
+            reads(None),
+        )
+        .expect_err("the caller read no command buffers for it");
+        assert_eq!(blocked.gap(), Some(Gap::ExecStreamsUnread));
     }
 }
