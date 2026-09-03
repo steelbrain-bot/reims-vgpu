@@ -1900,7 +1900,14 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
             verdict = verdict.and(StampVerdict::Unevaluable);
             continue;
         };
-        if wait.satisfied_by(current) {
+        let device_satisfies = wait.satisfied_by(current);
+        // After the comparison and never before it: publishing first would
+        // teach the plane the answer and then congratulate it for knowing.
+        // This is the arm that covers the GPU-ordered rail — a word queued
+        // there lands without this device writing it, and the drain's own read
+        // of the slot is the first place this device *observes* that it has.
+        note_stamp_visible(state, index, current, "stamp_visible_observed");
+        if device_satisfies {
             note_store_route("packet_stamp_wait_met");
             against_model(true, "stamp_wait_model_agrees_met");
             continue;
@@ -2126,27 +2133,45 @@ pub(super) fn note_stamp_direction<H: HostMemory + HostOps>(
     }
 }
 
-/// Record, in both places that hold it, that a completion word is no longer
-/// owed.
+/// Record that a completion word is no longer owed by the coalescing rail.
 ///
 /// **One function because there are two writers of slot 0's history and they
 /// have already drifted once.** `write_stamp` is the child FIFOs' door; the
-/// root FIFO publishes slot 0 inline a few lines below its dispatch, and the
-/// comment there already says the ledger has to record it separately "or the
-/// ledger would never see slot 0 leave the owed state". The ordering plane
-/// needs exactly the same record for exactly the same reason, and adding it to
-/// one site and not the other left the model blind to the root timeline —
-/// which is the timeline the measured root stamp waits are *on*.
+/// root FIFO reaches its own slot inline a few lines below its dispatch, and
+/// the comment there records why it has to say so separately.
 ///
-/// The two records are not one record. [`StampLedger`] answers "does a rail
-/// still owe this word", a question about this device's rails;
-/// [`DeviceState::publish_completion_stamp`] answers "what point has this
-/// timeline reached", which is what discharges a `SessionModel` stamp wait.
-/// Keeping both is what lets the counters cross-check instead of one being
-/// assumed to stand for the other.
+/// This is *not* the ordering plane's event. Handing a word to a rail is
+/// submission, and submission is not completion — see [`note_stamp_visible`],
+/// which is where the plane is told.
 fn note_stamp_no_longer_owed(state: &mut DeviceState, index: u32, value: u32) {
     let page_bytes = state.page_size();
     state.stamp_ledger.wrote(index, value, page_bytes);
+}
+
+/// Tell the ordering plane a completion word is **readable by the guest**.
+///
+/// # Why this is not where the word is handed to a rail
+///
+/// It was, for one commit, and a driven boot measured the cost exactly:
+/// `stamp_wait_model_ahead = 12 824` against `stamp_unmet_queued = 12 824`,
+/// the same number twice. `write_stamp` hands the word to the GPU-ordered
+/// rail and returns; the word lands when that rail's submission retires,
+/// which is later, and every wait in between is one the model called
+/// satisfied while the guest could still read the old value. A cutover
+/// publishing there would release, twelve thousand times a boot, work ordered
+/// behind GPU work that had not finished. Submission is not completion.
+///
+/// So the plane is told at the three places a word is *observed to have
+/// landed*: the two arms that write it into the page inline, and the drain's
+/// own read of the slot when it evaluates a wait — which is what covers the
+/// queued arm, because a queued word nobody waits on is one no admitted
+/// transaction is ordered behind.
+///
+/// `site` names which of the three, so the split stays readable: a boot where
+/// the observed arm carries everything is a boot where the inline arms have
+/// stopped running.
+fn note_stamp_visible(state: &DeviceState, index: u32, value: u32, site: &'static str) {
+    note_store_route(site);
     note_store_route(
         match state.publish_completion_stamp(
             reims_vgpu_core::identity::StampSlot(index),
@@ -2155,10 +2180,10 @@ fn note_stamp_no_longer_owed(state: &mut DeviceState, index: u32, value: u32) {
             crate::model::StampPublication::First => "stamp_publish_first",
             crate::model::StampPublication::Advanced => "stamp_publish_advanced",
             crate::model::StampPublication::Repeat => "stamp_publish_repeat",
-            // The model's timeline refused to move and this device's write will
-            // move the guest's. `note_stamp_direction` sees the same event on
-            // the arms that write the word; this sees it on every arm, and on
-            // the root timeline that has no `note_stamp_direction` at all.
+            // The plane's timeline refused to move and something has put a
+            // smaller value in the page. `note_stamp_direction` sees the same
+            // event on the arms that write the word; this sees it on every arm
+            // the guest can read from.
             crate::model::StampPublication::Behind => "stamp_publish_behind",
         },
     );
@@ -2218,6 +2243,9 @@ pub fn write_stamp<H: HostMemory + HostOps>(
     let page_size = state.page_size() as usize;
     note_stamp_direction(host, gpa, index, stamp_value);
     if gpa_map::write_u32(host, gpa, stamp_value, page_size).is_ok() {
+        // The word is in the page: from here the guest can read it, which is
+        // the event the ordering plane's stamp waits are about.
+        note_stamp_visible(state, index, stamp_value, "stamp_visible_inline");
         // The guest's fence has moved. Everything it allocated for the work this
         // stamp completes may be freed from here on, which is why a Store's
         // guest-page write has to have landed before the stamp rather than
@@ -3194,12 +3222,13 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                 // Root stamp = slot 0.
                 if state.gfx.fifo_base_page != 0 {
                     if let Some(off) = stamp_slot_offset(0, state.page_size()) {
-                        // The root FIFO publishes slot 0 inline rather than
-                        // through `write_stamp`, so it records here or neither
-                        // the ledger nor the ordering plane would ever see slot
-                        // 0 leave the owed state. Both records at once, because
-                        // adding the second to `write_stamp` alone is exactly
-                        // the drift `note_stamp_no_longer_owed` exists to stop.
+                        // The root FIFO reaches slot 0 inline rather than
+                        // through `write_stamp`, so it records here or the
+                        // ledger would never see slot 0 leave the owed state.
+                        // The ordering plane's half is further down, at the
+                        // arm that puts the word in the page — this one is
+                        // reached by the queued arm too, and a queued word has
+                        // not landed.
                         note_stamp_no_longer_owed(state, 0, packet.completion_stamp);
                         // Root and child FIFOs own the same bounded pending-stamp
                         // queue contract. Slot 0 therefore takes the same
@@ -3228,6 +3257,12 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         )
                         .is_ok()
                         {
+                            note_stamp_visible(
+                                state,
+                                0,
+                                packet.completion_stamp,
+                                "stamp_visible_root",
+                            );
                             // A window armed after this point has outlived a fence
                             // the moment it is still armed at the next one. The
                             // counter is what `armed_stamp_seq` is compared

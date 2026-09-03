@@ -7398,43 +7398,50 @@ fn a_pending_stamp_discharges_a_wait_on_its_own_slot_and_no_other() {
     );
 }
 
-/// The two records a completion word leaves behind are written together, and
-/// the root FIFO's slot 0 is one of them.
+/// Handing a completion word to a rail leaves the device's ledger, and does
+/// **not** move the ordering plane's timeline; putting it where the guest can
+/// read it does.
 ///
-/// The regression this pins: `write_stamp` is the *child* FIFOs' door, and the
-/// root publishes slot 0 inline a few lines below its own dispatch. Recording
-/// the ordering plane's half at `write_stamp` alone left the model blind to the
-/// root timeline — 158 words a driven boot, on the timeline the measured root
-/// stamp waits are actually on — while every counter read healthy, because the
-/// child timelines it *did* see were complete. So the pair goes through one
-/// function and this asserts the pair, not either half.
+/// The regression this pins is one that shipped. Publishing at `write_stamp`
+/// looked right on every counter it emitted, and a driven boot priced it
+/// exactly: `stamp_wait_model_ahead = 12 824` against `stamp_unmet_queued =
+/// 12 824`, the same number twice. `write_stamp` hands the word to the
+/// GPU-ordered rail; the word lands when that rail's submission retires. Every
+/// wait in between is one the plane called satisfied while the guest could
+/// still read the old value — so a cutover publishing there would release,
+/// twelve thousand times a boot, work ordered behind GPU work that had not
+/// finished. Submission is not completion, and this is the assertion that says
+/// so in the two directions that matter.
 #[test]
-fn a_completion_word_leaves_the_owed_state_in_both_records_at_once() {
+fn owing_a_word_is_not_publishing_it_and_only_the_landing_moves_the_plane() {
     use reims_vgpu_core::identity::StampSlot;
 
     let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
-    assert_eq!(
-        state.published_completion_stamp(StampSlot(0)),
-        None,
-        "nothing has published to the root timeline yet"
-    );
 
     super::note_stamp_no_longer_owed(&mut state, 0, 7);
-    assert_eq!(
-        state.published_completion_stamp(StampSlot(0)).map(|v| v.0),
-        Some(7),
-        "the root slot is the one `write_stamp` never sees"
-    );
     assert_eq!(
         state
             .stamp_ledger
             .classify(super::StampWait { index: 0, value: 7 }),
         super::UnmetSource::Queued,
-        "and the device's own ledger records the same word in the same call — \
-         `Queued` is its name for a value that has been through the write door"
+        "the device's ledger has it: `Queued` is its name for a word that has \
+         been through the write door and is with a rail"
+    );
+    assert_eq!(
+        state.published_completion_stamp(StampSlot(0)),
+        None,
+        "and the ordering plane must not: the guest cannot read it yet"
     );
 
-    super::note_stamp_no_longer_owed(&mut state, 3, 4);
+    super::note_stamp_visible(&state, 0, 7, "stamp_visible_inline");
+    assert_eq!(
+        state.published_completion_stamp(StampSlot(0)).map(|v| v.0),
+        Some(7),
+        "the landing is the plane's event, and the root slot is the one \
+         `write_stamp` never reaches"
+    );
+
+    super::note_stamp_visible(&state, 3, 4, "stamp_visible_observed");
     assert_eq!(
         state.published_completion_stamp(StampSlot(3)).map(|v| v.0),
         Some(4)
