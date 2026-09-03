@@ -270,7 +270,7 @@ impl DeviceObjectCaches {
     }
 
     /// Live entries per cache, for the census. See [`ObjectCaches::levels`].
-    pub(crate) fn levels(&self) -> [usize; 6] {
+    pub(crate) fn levels(&self) -> [usize; 7] {
         self.with(|caches| caches.levels())
     }
 
@@ -5595,15 +5595,16 @@ pub fn maintain_resources(now_ms: u64) {
 
 /// Snapshot of create/alloc/hit-miss counters (for tests and thrash proxies).
 /// Live entries in each immutable-object cache:
-/// `(shaders, layouts, passes, pipelines, samplers, compute_pipelines)`.
+/// `(shaders, layouts, attribute sets, passes, pipelines, samplers,
+/// compute_pipelines)`.
 ///
 /// See [`caches::ObjectCaches::levels`] for what reading it answers.
 ///
 /// Zeros when the device's rail slot is another rail's — the same answer a
 /// census gets for a cache that holds nothing, which is what an unreachable
 /// one holds for this rail.
-pub fn object_cache_levels(state: &crate::model::DeviceState) -> [usize; 6] {
-    device_caches(state).map_or([0; 6], DeviceObjectCaches::levels)
+pub fn object_cache_levels(state: &crate::model::DeviceState) -> [usize; 7] {
+    device_caches(state).map_or([0; 7], DeviceObjectCaches::levels)
 }
 
 /// Active topology policy for one deferred-submit command buffer, for the

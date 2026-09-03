@@ -3182,19 +3182,21 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     pass_key.sample_count = raster_sample_count;
     pass_key.multisample_resolve = req.multisample_resolve;
-    let attr_keys: Vec<AttrKey> = req
-        .vertex_attributes
-        .iter()
-        .map(|a| AttrKey {
-            location: a.location,
-            binding: a.binding,
-            format: a.format,
-            offset: a.offset,
-            stride: a.stride,
-            step_function: a.step_function,
-            step_rate: a.step_rate,
-        })
-        .collect();
+    // Into the command buffer's scratch and then interned, for the reason the
+    // layout bindings below are: `PipelineKey` carries the attribute set, and a
+    // key owning a `Vec<AttrKey>` is a heap allocation on every draw that has
+    // attributes — which is every draw a guest actually sends.
+    let attr_scratch = pools.attr_keys_scratch();
+    attr_scratch.extend(req.vertex_attributes.iter().map(|a| AttrKey {
+        location: a.location,
+        binding: a.binding,
+        format: a.format,
+        offset: a.offset,
+        stride: a.stride,
+        step_function: a.step_function,
+        step_rate: a.step_rate,
+    }));
+    let attr_keys = caches.intern_attrs(pools.attr_keys());
 
     phase.enter(super::draw_phase::Phase::PipelineShader);
     let (vert_digest, vert_module) =

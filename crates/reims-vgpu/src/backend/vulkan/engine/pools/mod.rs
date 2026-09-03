@@ -957,6 +957,9 @@ pub(crate) struct CbGraphicsState {
     /// buffer that lookup borrows from — and it is why the cache had to stop
     /// being keyed by an owned `LayoutKey`.
     layout_bindings: Vec<super::caches::BindingSig>,
+    /// The vertex-attribute keys the recording draw declares. Scratch, and
+    /// interned by the caller into an `AttrsId` its pipeline key carries.
+    attr_keys: Vec<super::caches::AttrKey>,
 }
 
 impl CbGraphicsState {
@@ -1000,6 +1003,7 @@ impl CbGraphicsState {
             vertex_binds: _,
             storage_binds: _,
             layout_bindings: _,
+            attr_keys: _,
         } = self;
         *pipeline = None;
         *pipeline_layout = None;

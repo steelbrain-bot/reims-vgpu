@@ -81,6 +81,84 @@ pub(crate) struct BindingSig {
     pub count: u32,
 }
 
+/// Content identity for a slice, issued in order and confirmed by comparison.
+///
+/// A digest picks the bucket and the *retained* slice decides the hit, so an id
+/// is an identity and not a fingerprint — the shape [`LayoutTable`] uses for
+/// binding signatures, without the Vulkan handles that make that one its own
+/// type. [`super::digest`]'s header argues a digest should be read this way, and
+/// both users here are the argument's own case: a cache key that owns a `Vec`
+/// can only be probed with a `Vec`, which is a heap allocation on a path whose
+/// whole job is a lookup that usually hits.
+///
+/// Unbounded, on the same argument [`ObjectCache`] is: the population is the
+/// guest's distinct object set and plateaus. [`ObjectCaches::levels`] publishes
+/// the count so that argument can be falsified.
+struct SliceIntern<T> {
+    /// Indexed by id. Never removed except by [`Self::clear`], so an id held in
+    /// a cache key cannot name a hole.
+    entries: Vec<Vec<T>>,
+    buckets: HashMap<Digest128, Vec<u32>>,
+    /// Last hit. Consecutive draws overwhelmingly repeat one set.
+    front: Option<u32>,
+}
+
+impl<T: Clone + Eq + std::hash::Hash> SliceIntern<T> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            buckets: HashMap::new(),
+            front: None,
+        }
+    }
+
+    /// The id for `items`, issuing one if this is the first time it is seen.
+    fn intern(&mut self, items: &[T]) -> u32 {
+        if let Some(index) = self.front {
+            if self.entries[index as usize] == items {
+                return index;
+            }
+        }
+        let digest = Digest128::of_items(&(), items);
+        let bucket = self.buckets.entry(digest).or_default();
+        if let Some(index) = bucket
+            .iter()
+            .copied()
+            .find(|index| self.entries[*index as usize] == items)
+        {
+            self.front = Some(index);
+            return index;
+        }
+        let index = self.entries.len() as u32;
+        bucket.push(index);
+        self.entries.push(items.to_vec());
+        self.front = Some(index);
+        index
+    }
+
+    fn get(&self, index: u32) -> &[T] {
+        &self.entries[index as usize]
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.buckets.clear();
+        self.front = None;
+    }
+}
+
+/// Identity of one draw's vertex-attribute set.
+///
+/// Same reason as [`LayoutId`]: `PipelineKey` carries it, and a key owning a
+/// `Vec<AttrKey>` is a heap allocation on every draw that has attributes —
+/// which is every draw a guest actually sends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct AttrsId(u32);
+
 /// Identity of one descriptor-set + pipeline layout, for the life of this
 /// device's caches.
 ///
@@ -768,7 +846,7 @@ impl PassCompatField {
 pub(crate) struct PipelineKey {
     pub vert: Digest128,
     pub frag: Digest128,
-    pub attrs: Vec<AttrKey>,
+    pub attrs: AttrsId,
     /// What this pipeline is identified by as far as the primitive type is
     /// concerned — the guest's exact type on a host that bakes it, its
     /// topology class where `vkCmdSetPrimitiveTopology` may move within a
@@ -1176,6 +1254,7 @@ impl ShaderDigestIndex {
 pub(crate) struct ObjectCaches {
     shaders: ObjectCache<Digest128, vk::ShaderModule>,
     layouts: LayoutTable,
+    attr_sets: SliceIntern<AttrKey>,
     passes: ObjectCache<PassKey, vk::RenderPass>,
     pipelines: ObjectCache<PipelineKey, vk::Pipeline>,
     /// Exact last Vulkan variant for each retained guest pipeline object.
@@ -1633,6 +1712,7 @@ impl ObjectCaches {
         Self {
             shaders: ObjectCache::new(),
             layouts: LayoutTable::new(),
+            attr_sets: SliceIntern::new(),
             passes: ObjectCache::new(),
             pipelines: ObjectCache::new(),
             pipeline_objects: ObjectVariantIndex::default(),
@@ -1658,6 +1738,9 @@ impl ObjectCaches {
                 device.destroy_descriptor_set_layout(dsl, None);
             }
         }
+        // No handles of its own; it is emptied here so a fresh device does not
+        // inherit ids issued against the one that just went away.
+        self.attr_sets.clear();
         for rp in self.passes.take_all() {
             device.destroy_render_pass(rp, None);
         }
@@ -1670,7 +1753,8 @@ impl ObjectCaches {
     }
 
     /// Live entries in each cache, in the order
-    /// `(shaders, layouts, passes, pipelines, samplers, compute_pipelines)`.
+    /// `(shaders, layouts, attribute sets, passes, pipelines, samplers,
+    /// compute_pipelines)`.
     ///
     /// Published because [`ObjectCache`] is unbounded on the argument that its
     /// entry count is the guest's distinct object set and therefore plateaus.
@@ -1678,10 +1762,11 @@ impl ObjectCaches {
     /// falsify it: a level that climbs for the life of a boot instead of
     /// settling means some key is carrying per-frame state and the argument is
     /// wrong for that cache. Levels, not deltas — the census line says so.
-    pub(crate) fn levels(&self) -> [usize; 6] {
+    pub(crate) fn levels(&self) -> [usize; 7] {
         [
             self.shaders.len(),
             self.layouts.len(),
+            self.attr_sets.len(),
             self.passes.len(),
             self.pipelines.len(),
             self.samplers.len(),
@@ -1695,6 +1780,7 @@ impl ObjectCaches {
         self.shader_digests.clear();
         self.shaders.clear();
         self.layouts.clear();
+        self.attr_sets.clear();
         self.passes.clear();
         self.pipeline_objects.clear();
         self.pipelines.clear();
@@ -1904,6 +1990,15 @@ impl ObjectCaches {
             pools.dispose(&ctx.device, DeferredHandle::ShaderModule(old));
         }
         Ok((key, module))
+    }
+
+    /// The id for this draw's vertex-attribute set, issuing one on first sight.
+    ///
+    /// Takes a slice for the reason [`Self::get_or_create_layout`] does: the
+    /// caller's attributes live in reusable scratch, and the id is what its
+    /// pipeline key carries.
+    pub(crate) fn intern_attrs(&mut self, attrs: &[AttrKey]) -> AttrsId {
+        AttrsId(self.attr_sets.intern(attrs))
     }
 
     /// Resolve the layout these canonical bindings name, creating it once.
@@ -2469,12 +2564,18 @@ impl ObjectCaches {
         // pipeline miss and only when some attribute really needs substituting:
         // on a host that accepts every format — every host this project has run
         // on — `vert_spirv` is never read at all.
+        //
+        // Copied out of the intern table rather than borrowed from it, because
+        // every refusal below takes `&mut self` to record a negative entry. One
+        // allocation on the *miss* path, which is the path that is about to
+        // compile a pipeline.
+        let attrs: Vec<AttrKey> = self.attr_sets.get(key.attrs.0).to_vec();
         let mut shader_inputs: Option<VertexInputWidths> = None;
-        let mut attribute_formats = Vec::with_capacity(key.attrs.len());
-        let mut binding_rates = Vec::with_capacity(key.attrs.len());
+        let mut attribute_formats = Vec::with_capacity(attrs.len());
+        let mut binding_rates = Vec::with_capacity(attrs.len());
         let mut binding_divisors: Vec<Option<vk::VertexInputBindingDivisorDescriptionKHR>> =
-            Vec::with_capacity(key.attrs.len());
-        for attr in &key.attrs {
+            Vec::with_capacity(attrs.len());
+        for attr in &attrs {
             let binding = match translate::support::resolve(
                 ctx.vertex_formats,
                 attr.format,
@@ -2590,12 +2691,11 @@ impl ObjectCaches {
                 .module(frag_module)
                 .name(&main_c),
         ];
-        // Both lists were rebuilt here from `key.attrs` with the step function
+        // Both lists were rebuilt here from the attributes with the step function
         // matched a second and a third time. They are built once, in the loop
         // that already refused every step function without a rate, so the two
         // spellings cannot answer differently for one attribute.
-        let vertex_binding_descs: Vec<_> = key
-            .attrs
+        let vertex_binding_descs: Vec<_> = attrs
             .iter()
             .zip(&binding_rates)
             .map(|(attribute, rate)| {
@@ -2608,8 +2708,7 @@ impl ObjectCaches {
         // A divisor of one is what Vulkan already does, so declaring it would
         // pull in the extension structure for nothing.
         let vertex_binding_divisors: Vec<_> = binding_divisors.iter().flatten().copied().collect();
-        let vertex_attribute_descs: Vec<_> = key
-            .attrs
+        let vertex_attribute_descs: Vec<_> = attrs
             .iter()
             .zip(&attribute_formats)
             .map(|(attribute, format)| {

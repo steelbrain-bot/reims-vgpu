@@ -24,7 +24,7 @@ use reims_vgpu::backend::vulkan::engine::{
     self, BufferContent, DepthState, DrawRequest, GuestRun, GuestRunSource, IndexType,
     IndexedDrawResource, PrimitiveTopology, SampledImageResource, SampledSource,
     SamplerCompareFunction, SamplerResource, ScissorResource, StorageBufferResource,
-    TargetIdentity,
+    TargetIdentity, VertexAttributeFormat, VertexAttributeResource, VertexStepFunction,
 };
 /// The resident format every `TargetIdentity::Surface` in this file is built at.
 ///
@@ -807,21 +807,23 @@ fn a_warm_repeat_draw_does_not_enter_the_allocator() {
 ///   change the ceiling predicted: the layout cache is looked up by a *slice*
 ///   and `PipelineKey` carries a `Copy` `LayoutId`.
 ///
-/// # What a zero here still does not cover
+/// * one more `Vec<AttrKey>`, `PipelineKey::attrs`. This one the fixture could
+///   not see at all until it grew vertex attributes: it draws three now, with
+///   their locations deliberately out of binding order, because a draw without
+///   attributes leaves that vector empty and an empty vector does not allocate.
+///   A guest draw has attributes — the boot behind `f819d513` bound 162 246
+///   vertex slots — so a zero measured without them was a zero about a shape no
+///   guest sends. Attribute sets are interned the way layouts are.
 ///
-/// `PipelineKey::attrs` is a `Vec<AttrKey>` built per draw, and this fixture
-/// draws without vertex attributes, so it is empty and does not allocate. A
-/// guest draw has attributes — the boot behind `f819d513` bound 162 246 vertex
-/// slots — so a real steady-state draw still pays one trip that this
-/// measurement cannot see. Interning attribute sets the way layouts are now
-/// interned is what closes it; until then this zero is a statement about
-/// descriptors and not about the whole draw.
+/// # What the zero rests on
 ///
-/// The bytes are asserted with the trips for that reason: a trip count alone
-/// cannot say whether a zero is the path's or the fixture's, and 0 B is at
-/// least a claim that nothing at all was asked for.
+/// Bytes are asserted with trips, and the counters with both. A trip count
+/// alone cannot say whether a zero is the path's or the fixture's, so the test
+/// also asserts that the measured draw joined a batch, did not flush, and bound
+/// its three vertex slots — a fixture that quietly stopped doing any of those
+/// would report the same zero for the wrong reason.
 #[test]
-fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffic() {
+fn a_warm_repeat_draw_that_binds_descriptors_and_vertex_buffers_does_not_allocate() {
     let _guard = engine_test_lock().lock().unwrap();
     let (vert, frag) = triangle_spirv();
     let identity = TargetIdentity::Surface {
@@ -832,11 +834,27 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
         format: SURFACE_TEST_FORMAT,
     };
 
+    // Three attributes, whose location order deliberately disagrees with their
+    // binding order, so the draw pays the normalization a guest draw pays.
+    let attributes = || {
+        [(0u32, 2u32), (1, 0), (2, 1)].map(|(location, binding)| VertexAttributeResource {
+            location,
+            binding,
+            format: VertexAttributeFormat::Float2,
+            offset: 0,
+            stride: 8,
+            step_function: VertexStepFunction::PerVertex,
+            step_rate: 1,
+            content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 24])),
+        })
+    };
+
     let mut opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
     opener.storage_buffers.push(StorageBufferResource {
         binding: 0,
         content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 64])),
     });
+    opener.vertex_attributes.extend(attributes());
     match engine::execute_draw_request(engine_device(), &opener) {
         Ok(_) => {}
         Err(e) => {
@@ -854,6 +872,7 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
         binding: 0,
         content: BufferContent::Bytes(std::sync::Arc::new(vec![0u8; 64])),
     });
+    joiner.vertex_attributes.extend(attributes());
     for n in 1..=8 {
         engine::execute_draw_request(engine_device(), &joiner)
             .unwrap_or_else(|e| panic!("warm-up draw #{n}: {e}"));
@@ -874,6 +893,13 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
         during.batch_flushes, 0,
         "and did not flush, which is not a steady-state draw: {during:?}"
     );
+    // A zero is only about the paths the draw took, so the draw has to be shown
+    // to have taken them. Without this, a fixture that stopped binding vertex
+    // buffers would report the same zero for a different reason.
+    assert_eq!(
+        during.vertex_buffer_bind_slots, 3,
+        "the measured draw bound its three vertex attributes: {during:?}"
+    );
 
     assert_eq!(
         (trips, cost.bytes),
@@ -882,7 +908,8 @@ fn a_warm_repeat_draw_that_binds_a_descriptor_does_not_grow_its_allocator_traffi
          the plan's value for this is 0 and it has been 0 since `LayoutId`"
     );
     eprintln!(
-        "warm repeat draw, one storage buffer: {trips} allocator trips, {} bytes, \
+        "warm repeat draw, one storage buffer + three vertex attributes: \
+         {trips} allocator trips, {} bytes, \
          descriptor_pushes={} descriptor_set_binds={} descriptor_set_updates={}",
         cost.bytes,
         during.descriptor_pushes,

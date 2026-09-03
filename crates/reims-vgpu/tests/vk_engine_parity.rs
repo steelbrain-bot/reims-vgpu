@@ -1972,7 +1972,7 @@ fn a_second_devices_caches_are_its_own_and_ending_one_spares_the_other() {
     );
     assert_eq!(
         engine::object_cache_levels(&second),
-        [0; 6],
+        [0; 7],
         "a device that has drawn nothing has cached nothing, whatever another \
          device on the same GPU has cached"
     );

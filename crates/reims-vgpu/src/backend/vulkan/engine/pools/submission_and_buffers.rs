@@ -2506,6 +2506,20 @@ impl ResourcePools {
         self.cb_graphics.vertex_binds.push((binding, bound));
     }
 
+    /// Begin a draw's vertex-attribute list, discarding the previous draw's,
+    /// and hand it over to be filled.
+    pub(in crate::backend::vulkan::engine) fn attr_keys_scratch(
+        &mut self,
+    ) -> &mut Vec<super::super::caches::AttrKey> {
+        self.cb_graphics.attr_keys.clear();
+        &mut self.cb_graphics.attr_keys
+    }
+
+    /// The vertex-attribute keys the recording draw declared, for interning.
+    pub(in crate::backend::vulkan::engine) fn attr_keys(&self) -> &[super::super::caches::AttrKey] {
+        &self.cb_graphics.attr_keys
+    }
+
     /// Begin a draw's layout-binding list, discarding the previous draw's, and
     /// hand it over to be filled.
     ///
