@@ -2065,10 +2065,79 @@ pub fn declared_storage(
     let (offset, length) = extent.ok_or(StorageRefusal::ExtentUnrecovered {
         object_type: entry.object_type,
     })?;
+    note_extent_against_allocation(state, task_id, obj_ref, entry, descriptor, offset, length);
     Ok(Storage::Dedicated {
         backing,
         extent: ByteRange { offset, length },
     })
+}
+
+/// Say when a declared extent is a strict sub-window of the allocation it sits
+/// in, and how short.
+///
+/// **The census the exec window refusals need.** `Lifecycle::access` checks a
+/// record's `Range` participation against the resource's *extent* — the union of
+/// its level records for a texture, the whole allocation for a buffer — and a
+/// driven macos-15 boot refuses seven exec packets a boot on
+/// `OutOfPlacement`, one of them `ref=28` asking `offset=65536 length=196608`
+/// of a resource whose resident range is `{offset: 0, length: 196608}`. The
+/// window's end is 262 144, which is exactly 256 KiB, and the extent is exactly
+/// 192 KiB: a record naming the allocation where the model holds a sub-window
+/// of it would look precisely like that.
+///
+/// So this measures the gap directly, and the gap is not rare. A driven
+/// macos-15 boot:
+///
+/// ```text
+/// declared_extent_is_the_allocation   6348
+/// declared_extent_is_a_sub_window     4117
+/// declared_extent_over_no_window       204
+/// ```
+///
+/// **Two declarations in five put an extent strictly inside its allocation**,
+/// and every one of the 492 distinct `(task, ref)` pairs named is a texture —
+/// 175 `OBJECT_TYPE_TEXTURE` and 317 `OBJECT_TYPE_TEXTURE_GENERATE_MIPMAPS`,
+/// none of any other type. That is `Descriptor::allocation_extent`'s union of
+/// level records doing exactly what its doc says, and it is what makes the
+/// window check a live surface rather than a corner: the refusals are seven a
+/// boot today against four thousand declarations that could produce one.
+///
+/// It also shows the neighbours. `ref=27` holds `{0, 65536}` of a 196 608-byte
+/// allocation and `ref=28` holds the whole 196 608 of one — and it is `ref=28`
+/// that a record asks for `offset=65536 length=196608` of, overrunning by
+/// exactly `ref=27`'s length. What is still unrecovered is which record that
+/// is: the refusal names its `StreamSite` and not its kind, and the kind is
+/// what says whether the offset belongs to the object or to the allocation.
+fn note_extent_against_allocation(
+    state: &DeviceState,
+    task_id: u32,
+    obj_ref: u32,
+    entry: &ListObjectEntry,
+    descriptor: &[u8],
+    offset: u64,
+    length: u64,
+) {
+    let Some((_, allocation)) = backing_window(state.page_shift, entry, descriptor) else {
+        crate::runtime::drain::note_store_route("declared_extent_over_no_window");
+        return;
+    };
+    if offset.saturating_add(length) >= allocation {
+        crate::runtime::drain::note_store_route("declared_extent_is_the_allocation");
+        return;
+    }
+    crate::runtime::drain::note_store_route("declared_extent_is_a_sub_window");
+    if crate::observe::first_sight(
+        "declared_extent_is_a_sub_window",
+        (u64::from(task_id) << 32) | u64::from(obj_ref),
+    ) {
+        crate::observe::fail(format!(
+            "declared_extent_is_a_sub_window task={task_id} ref={obj_ref} \
+             object_type={} extent_offset={offset} extent_length={length} \
+             allocation={allocation} (the model will check every record's window against \
+             the extent, so a record naming the allocation refuses here)",
+            entry.object_type,
+        ));
+    }
 }
 
 /// The device answering the semantic model's mapping-namespace resolver.
