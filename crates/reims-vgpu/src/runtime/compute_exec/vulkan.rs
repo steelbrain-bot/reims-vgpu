@@ -589,8 +589,24 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     ) {
         Ok(b) => b,
         Err(e) => {
+            // What the ordering plane thought of this pipeline when the
+            // dispatch was refused --- the compute twin of the render arm's
+            // field in `draw::vulkan`, and it is here because that field is
+            // what made the render losses legible and this one had no
+            // equivalent. A driven macos-26 desktop leaves three compute
+            // refusals that cannot be classified without it: `ready` is the
+            // ordering plane releasing work against a shader still being
+            // translated, `retired` is a packet recorded before the guest's
+            // delete and a loss this device chose to take, and they are
+            // opposite conclusions from the same line.
+            let model_pipeline = state
+                .object_name(task_id, acc.pipeline_ref)
+                .map_or("unnamed", |id| {
+                    state.pipeline_state(id).unwrap_or("unleased")
+                });
             crate::observe::Emit::decline("compute_linux_m2v", &e)
                 .field("pipe", acc.pipeline_ref)
+                .field("model_pipeline", model_pipeline)
                 .fail_once(acc.pipeline_ref as u64);
             return ComputeStatus::MetalFailed("compute_vk_translate");
         }
