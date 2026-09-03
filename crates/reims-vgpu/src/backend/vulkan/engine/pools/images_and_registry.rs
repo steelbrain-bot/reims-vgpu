@@ -657,6 +657,46 @@ impl ResourcePools {
         self.set_compute_sole_copy(identity, false)
     }
 
+    /// Record which resident the host window has just been published against,
+    /// or clear it when the publish declined.
+    ///
+    /// Called from the drain, which is the only place that knows: the publish
+    /// path holds a `&DeviceState` and resolves the display transaction to one
+    /// identity. The window thread never calls this and must not — it is the
+    /// side of the boundary that is losing its registry access, not gaining
+    /// more.
+    pub(crate) fn note_window_published(&mut self, identity: Option<&TargetIdentity>) {
+        // A decline is deliberately a no-op rather than a clear. The window keeps
+        // presenting the last source it was given, which nothing has removed, so
+        // that identity must stay vouched for — clearing here would drop it from
+        // the set and its later removal would then move no epoch.
+        let Some(identity) = identity else {
+            return;
+        };
+        if self.window_published.contains(identity) {
+            return;
+        }
+        if self.window_published.len() >= super::WINDOW_PUBLISHED_MAX {
+            // Bump rather than evict: evicting the oldest would leave a live
+            // source whose removal moves nothing, which is the exact hole the
+            // set exists to close. Bumping costs one present from host memory.
+            self.invalidate_window_sources();
+        }
+        self.window_published.push(identity.clone());
+    }
+
+    /// Move [`super::WINDOW_SOURCE_EPOCH`] and drop the identities it was
+    /// vouching for.
+    ///
+    /// The two are one action: the epoch moving is what makes every stamp taken
+    /// before it stale, so every identity in the set has been answered for and
+    /// keeping them would make a later removal move the epoch again for sources
+    /// that are already invalid.
+    fn invalidate_window_sources(&mut self) {
+        self.window_published.clear();
+        super::WINDOW_SOURCE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
     /// Pin/unpin a resident against removal while its content exists nowhere but
     /// the GPU image. Answers whether a slot was there to pin.
     ///
@@ -894,6 +934,20 @@ impl ResourcePools {
         let old = old?;
         if old.pin_count == 0 {
             self.registry_non_pinned_adjust(Self::slot_attachment_bytes(&old), false);
+        }
+        // The window's licence to stop re-reading the registry. Bumped here and
+        // nowhere else, because this is the one removal path — so a stamp taken
+        // at publish is invalidated by every way a resident can leave, without
+        // each of those ways having to know a window exists.
+        //
+        // The identity is cleared as well as stamped: the next publish sets it
+        // again, and leaving a stale one here would let a *later* removal of a
+        // re-registered resident bump the epoch for a window that had already
+        // moved on. Costless if it does — the cost of a spurious bump is one
+        // frame from host memory — but it would make the counter mean less than
+        // it says.
+        if self.window_published.contains(identity) {
+            self.invalidate_window_sources();
         }
         if old.pin_count > 0 {
             // Latched per removal reason: a recreate storm re-enters this with
@@ -2872,6 +2926,177 @@ pub(super) mod pin_count_tests {
             "{:?}",
             cap.lines()
         );
+    }
+
+    fn surface(id: u32) -> TargetIdentity {
+        TargetIdentity::Surface {
+            id,
+            width: 16,
+            height: 16,
+            generation: 0,
+            format: translate::pixel::SCANOUT_FORMAT,
+        }
+    }
+
+    fn admit_ready(pools: &mut ResourcePools, identity: &TargetIdentity) {
+        pools.registry.insert(identity.clone(), ready_slot());
+        pools.registry_order.push_back(identity.clone());
+    }
+
+    /// The stamp the window checks instead of the registry, at the one removal
+    /// path that can invalidate it.
+    ///
+    /// Driven through `note_window_published` + `unregister_resident` rather than
+    /// by writing the epoch, because the claim is that *removal* is what
+    /// invalidates a published source — a test that moved the counter itself
+    /// would pass with the bump wired to nothing.
+    #[test]
+    fn removing_a_published_resident_moves_the_window_stamp() {
+        let mut pools = ResourcePools::new();
+        let published = surface(1);
+        let other = surface(2);
+        admit_ready(&mut pools, &published);
+        admit_ready(&mut pools, &other);
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        // A resident the window was never published against moves nothing.
+        // Every `ResourceReleased` retire in a boot comes through here, and a
+        // stamp that moved on each would send the window to host memory
+        // constantly — `direct_frac` is what that costs.
+        assert!(pools
+            .unregister_resident(&other, ResidentReclaim::ResourceReleased)
+            .is_some());
+        assert_eq!(
+            super::window_source_epoch(),
+            stamped,
+            "an unrelated resident leaving is not the window's business"
+        );
+
+        assert!(pools
+            .unregister_resident(&published, ResidentReclaim::Recreated)
+            .is_some());
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "a published resident leaving is exactly what the stamp is for"
+        );
+    }
+
+    /// The defect that made this a set rather than "the latest published
+    /// identity".
+    ///
+    /// The window's frame slot holds the newest source, but the window thread
+    /// may be holding an older one it has already read out — so a switch of
+    /// displayed surface must not stop vouching for the previous one. Recording
+    /// only the latest, publishing B and then retiring A left A's stamp
+    /// comparing equal, and A's image handle is what a source the window still
+    /// held would have blitted from.
+    #[test]
+    fn publishing_a_second_surface_does_not_stop_vouching_for_the_first() {
+        let mut pools = ResourcePools::new();
+        let first = surface(1);
+        let second = surface(2);
+        admit_ready(&mut pools, &first);
+        admit_ready(&mut pools, &second);
+
+        pools.note_window_published(Some(&first));
+        let stamped_for_first = super::window_source_epoch();
+        pools.note_window_published(Some(&second));
+        assert_eq!(
+            super::window_source_epoch(),
+            stamped_for_first,
+            "publishing another surface invalidates nothing by itself"
+        );
+
+        assert!(pools
+            .unregister_resident(&first, ResidentReclaim::Recreated)
+            .is_some());
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped_for_first,
+            "the first surface is still one a live source can name"
+        );
+    }
+
+    /// A decline is a no-op, not a clear.
+    ///
+    /// The window goes on presenting the source it was last given, which nothing
+    /// has removed — so that identity has to stay vouched for. Clearing on
+    /// decline would drop it and its later removal would move no epoch.
+    #[test]
+    fn a_declined_publish_keeps_vouching_for_what_was_already_handed_out() {
+        let mut pools = ResourcePools::new();
+        let published = surface(1);
+        admit_ready(&mut pools, &published);
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+        pools.note_window_published(None);
+
+        assert!(pools
+            .unregister_resident(&published, ResidentReclaim::Recreated)
+            .is_some());
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the decline did not take back the source already in the window's slot"
+        );
+    }
+
+    /// The set is answered for when the epoch moves, so a re-registered
+    /// identity nobody has published again moves nothing.
+    ///
+    /// A spurious bump would still be *safe* — it costs one present from host
+    /// memory — but the counter would stop meaning "a resident some live source
+    /// names has gone", which is the only claim the window reads it for.
+    #[test]
+    fn the_stamp_moves_once_per_publish_not_once_per_key() {
+        let mut pools = ResourcePools::new();
+        let published = surface(1);
+        admit_ready(&mut pools, &published);
+        pools.note_window_published(Some(&published));
+
+        assert!(pools
+            .unregister_resident(&published, ResidentReclaim::Recreated)
+            .is_some());
+        let after_first = super::window_source_epoch();
+
+        admit_ready(&mut pools, &published);
+        assert!(pools
+            .unregister_resident(&published, ResidentReclaim::Recreated)
+            .is_some());
+        assert_eq!(
+            super::window_source_epoch(),
+            after_first,
+            "no publish named this resident, so no live source can be holding it"
+        );
+    }
+
+    /// Overflow bumps rather than evicting, because evicting the oldest would
+    /// leave a live source whose removal moves nothing — the hole the set
+    /// exists to close, reintroduced by its own bound.
+    #[test]
+    fn overflowing_the_published_set_invalidates_instead_of_forgetting() {
+        let mut pools = ResourcePools::new();
+        let first = surface(0);
+        admit_ready(&mut pools, &first);
+        pools.note_window_published(Some(&first));
+        let stamped = super::window_source_epoch();
+
+        for id in 1..=super::WINDOW_PUBLISHED_MAX as u32 {
+            let identity = surface(id);
+            admit_ready(&mut pools, &identity);
+            pools.note_window_published(Some(&identity));
+        }
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the set could not go on vouching for every one of them, so it \
+             vouched for none"
+        );
+        assert!(pools
+            .unregister_resident(&first, ResidentReclaim::Recreated)
+            .is_some());
     }
 
     fn pinned_identity() -> TargetIdentity {

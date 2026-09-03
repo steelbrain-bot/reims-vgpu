@@ -1915,6 +1915,23 @@ pub struct WindowPresentSource {
     pub width: u32,
     pub height: u32,
     pub identity: TargetIdentity,
+    /// [`super::pools::window_source_epoch`] as it stood when the drain resolved
+    /// this identity and recorded it as the window's published resident.
+    ///
+    /// The window thread's check that the resident it was promised is still the
+    /// one the registry holds — answerable with a single atomic load and no
+    /// registry access, which is the whole point. The registry is guest-derived
+    /// state on its way to the device the guest declared it against, and the
+    /// window thread holds no device and cannot be given one: the lock a device
+    /// would come behind is the one the drain holds for a whole render tranche,
+    /// measured at 935-979 ms per exec packet, and a present waiting on that is
+    /// not a present.
+    ///
+    /// Today the window *also* re-resolves the identity under the engine lock,
+    /// so this is checked beside an authority rather than as one. That is
+    /// deliberate and temporary: it is how a disagreement between the two gets
+    /// found on a live boot before the re-resolve is the thing being removed.
+    pub epoch: u64,
 }
 
 impl Default for TargetIdentity {

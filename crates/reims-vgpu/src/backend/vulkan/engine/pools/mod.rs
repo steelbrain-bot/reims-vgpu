@@ -404,6 +404,27 @@ pub(crate) struct ResourcePools {
     /// rather than guessed at. Diagnostic only — nothing reads it to decide
     /// anything.
     reclaimed_recent: VecDeque<(TargetIdentity, ResidentReclaim, u64)>,
+    /// Every resident the host window has been published against since
+    /// [`WINDOW_SOURCE_EPOCH`] last moved.
+    ///
+    /// A *set* and not the latest one, and that distinction is the whole
+    /// correctness of the stamp. The window's frame slot holds the newest
+    /// published source, but the window thread may be holding an older one it
+    /// read out of that slot, or blitting from one — so "the resident currently
+    /// published" is not the set of residents a live source can name. Recording
+    /// only the latest let a switch of displayed surface hide the previous one's
+    /// removal: publish B, retire A, and A's stamp still compared equal because
+    /// A was no longer the one being watched.
+    ///
+    /// Cleared whenever the epoch moves, so it holds only what is still
+    /// vouched for. Bounded by [`WINDOW_PUBLISHED_MAX`]; overflowing bumps the
+    /// epoch rather than dropping an entry, because dropping the oldest is
+    /// exactly the hole above.
+    ///
+    /// The window thread never reads or writes this. It is the drain's record of
+    /// what it has handed out, kept on the side of the boundary that has the
+    /// device.
+    window_published: Vec<TargetIdentity>,
     /// Highest non-pinned resident population this device has held, in slots.
     /// Reported as `registry_pressure`'s `peak`, beside the bytes the same
     /// sample occupied — the pair is what says a slot count was never a proxy
@@ -1117,6 +1138,38 @@ pub(crate) const RING_DEPTH: usize = 8;
 /// on. Sized so the whole ring fits, which is what bounds the graveyard — a
 /// handle's mask can only name slots that existed when it was disposed, and
 /// every one of those retires within a ring wrap.
+/// How many distinct residents the window may be published against between two
+/// movements of [`WINDOW_SOURCE_EPOCH`] before the epoch is moved to make room.
+///
+/// One display transaction resolves to one identity, and a settled desktop
+/// republishes the same one, so the live population is 1 and this is headroom
+/// for a surface switch or two rather than a working size. Overflowing costs one
+/// present from host memory, which is why the bound may be this small and why
+/// overflowing bumps rather than evicting.
+const WINDOW_PUBLISHED_MAX: usize = 8;
+
+/// Bumped whenever a resident the host window has been published against leaves
+/// the registry.
+///
+/// The window thread's licence to trust a resolved present source without
+/// re-reading the registry. It is a plain counter rather than a flag so a source
+/// stamped before a retire *and a re-registration* still fails closed: a flag
+/// cleared by the re-registration would read as "still valid" for a source
+/// naming the image that was destroyed in between.
+///
+/// Global rather than per-identity because there is one host window and one
+/// published identity at a time, and a false invalidation costs one frame from
+/// host memory — the conservative direction, and the reason
+/// [`ResourcePools::unregister_resident`] may bump it without proving the window
+/// still cares.
+pub(crate) static WINDOW_SOURCE_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// The stamp a present source resolved right now should carry.
+pub(crate) fn window_source_epoch() -> u64 {
+    WINDOW_SOURCE_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) type SlotMask = u32;
 
 /// The [`SlotMask`] bit standing for "a host-window present is submitted and not

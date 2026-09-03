@@ -380,7 +380,7 @@ impl EngineState {
     /// `host_window::present::App::reattach_engine` is what builds it again.
     fn flush_device_derived(&mut self, caches: &mut ObjectCaches) {
         clear_device_capabilities();
-        RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+        invalidate_all_resident_holders();
         // Taken and published unconditionally, before anything fallible. The
         // presenter's swapchain, surface and semaphores were made against the
         // device that is going away; whether or not there is still a `ctx` to
@@ -1087,7 +1087,7 @@ pub struct GuestResetStats {
 pub fn reset_guest_state() -> GuestResetStats {
     let mut guard = lock_engine();
     LAST_TAIL_BATCH_FLUSH_US.store(0, std::sync::atomic::Ordering::Release);
-    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+    invalidate_all_resident_holders();
     let (resident_targets, pooled_targets, sampled_images, storage_images) =
         guard.pools.guest_reset_counts();
     let stats = GuestResetStats {
@@ -2039,21 +2039,41 @@ pub fn resident_presentable(identity: &TargetIdentity, width: u32, height: u32) 
         .is_some_and(|slot| pools::slot_presentable(slot, width, height))
 }
 
+/// Decide whether `identity` can carry a direct present, and on `Ok` record it
+/// as the resident the window is published against and return the stamp that
+/// records *when*.
+///
+/// The recording and the decision are one transaction for the reason the pin and
+/// the allocation-kind read in `retain_resident_target` are: a caller that did
+/// them separately could publish one identity and record another, and the
+/// recording is what the one removal path recognises in order to invalidate the
+/// window's source.
 fn resident_present_decision(
-    pools: &ResourcePools,
+    pools: &mut ResourcePools,
     identity: &TargetIdentity,
     width: u32,
     height: u32,
-) -> Result<(), &'static str> {
+) -> Result<u64, &'static str> {
     let Some(slot) = pools.registry_get(identity) else {
+        pools.note_window_published(None);
         return Err("winpub_no_resident");
     };
-    match pools::slot_present_decline(slot, width, height) {
-        None => Ok(()),
-        Some(pools::ResidentPresentDecline::ContentNotReady) => Err("winpub_content_not_ready"),
-        Some(pools::ResidentPresentDecline::ScanoutOrder) => Err("winpub_scanout_order"),
-        Some(pools::ResidentPresentDecline::Geometry) => Err("winpub_geometry"),
+    if let Some(decline) = pools::slot_present_decline(slot, width, height) {
+        pools.note_window_published(None);
+        return Err(match decline {
+            pools::ResidentPresentDecline::ContentNotReady => "winpub_content_not_ready",
+            pools::ResidentPresentDecline::ScanoutOrder => "winpub_scanout_order",
+            pools::ResidentPresentDecline::Geometry => "winpub_geometry",
+        });
     }
+    pools.note_window_published(Some(identity));
+    // Read *after* the recording, so a removal racing this transaction is either
+    // ordered before it — and then this stamp is already the post-bump value and
+    // the source is honestly valid — or ordered after, and bumps past this
+    // stamp. Both hold because every removal path and this function are under
+    // the same engine lock; the load is an `Acquire` so the window thread, which
+    // is not, still sees the bump.
+    Ok(pools::window_source_epoch())
 }
 
 /// Maintain the resident working set for one published frame and decide
@@ -2075,7 +2095,7 @@ pub fn prepare_window_resident_present(
     identity: &TargetIdentity,
     width: u32,
     height: u32,
-) -> Result<(), &'static str> {
+) -> Result<u64, &'static str> {
     let now_ms = crate::observe::elapsed_ms() as u64;
     let mut guard = lock_engine();
     let EngineState {
@@ -2151,6 +2171,31 @@ impl ResidentResourceLease {
             epoch: RESIDENT_RESOURCE_EPOCH.load(Ordering::Acquire),
         }
     }
+}
+
+/// End every resident holder's licence at once, in both counters that issue one.
+///
+/// Two counters answer for a resident being gone, and they answer for different
+/// holders. `RESIDENT_RESOURCE_EPOCH` invalidates the leases a serialized
+/// resource holds — `ResidentResourceLease::matches` and its `Drop` both read
+/// it. [`pools::WINDOW_SOURCE_EPOCH`] invalidates the present source the host
+/// window was published against, which is the licence the window has to trust a
+/// resolved image without re-reading the registry.
+///
+/// Every wholesale invalidation is one event for both — the registry those names
+/// referred to is being replaced or destroyed — so they are bumped through one
+/// function. Written apart, the window would keep a stamp that still compares
+/// equal across a `ResourcePools::new()`, and present from an image
+/// `destroy_all` had already freed: the identity is gone from the *new*
+/// registry, but the stamp is the window's only test and nothing had moved it.
+///
+/// This cannot be tested into place — a *new* wholesale-invalidation site that
+/// bumps only one counter is exactly the defect, and no test relates a future
+/// site to this function. The three that exist call it; that is the whole
+/// guarantee, and it is why they call a function rather than repeat two lines.
+fn invalidate_all_resident_holders() {
+    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+    pools::WINDOW_SOURCE_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -5547,7 +5592,7 @@ pub fn test_reset_engine(state: &crate::model::DeviceState) {
 
 fn test_reset_engine_with(caches: &mut ObjectCaches) {
     let mut g = lock_engine();
-    RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
+    invalidate_all_resident_holders();
     // A healthy `DeviceContext` is kept across the reset; only the pools, the
     // caches and the owner's flags are rebuilt.
     //

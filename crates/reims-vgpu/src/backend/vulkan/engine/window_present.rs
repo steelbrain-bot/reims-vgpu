@@ -176,6 +176,11 @@ pub(crate) enum SlateReason {
     /// A resident exists and is ready, but at different dimensions than the
     /// source claims — presenting it would show a torn or scaled frame.
     GeomMismatch,
+    /// The resident this source was resolved against has since left the
+    /// registry. Not a statement about any resident now under that identity:
+    /// the stamp says the device replaced or dropped the one that was promised,
+    /// so the image handle the source carries may already be destroyed.
+    SourceStale,
 }
 
 impl crate::observe::Decline for SlateReason {
@@ -189,6 +194,7 @@ impl crate::observe::Decline for SlateReason {
     /// a bare one would mix three different subsystems.
     fn slug(&self) -> &'static str {
         match self {
+            Self::SourceStale => "slate_source_stale",
             Self::NoSource => "slate_no_source",
             Self::NoResident => "slate_no_resident",
             Self::ContentNotReady => "slate_content_not_ready",
@@ -1191,7 +1197,24 @@ impl WindowPresenter {
         let frame_render_finished = self.render_finished[image_index as usize];
 
         pools.batch_flush(ctx, counters)?;
-        let selected = source.and_then(|source| {
+        // Fail closed on a stale stamp, and do it *before* the registry read
+        // below rather than as one more condition inside it.
+        //
+        // The stamp exists to be answerable without the registry — that is the
+        // whole reason it exists, the window thread having no device to reach one
+        // through. Checking it here means it runs in the shape it will run in
+        // once the re-resolve below is gone, instead of being exercised only as
+        // a redundant agreement with an authority that is on its way out.
+        //
+        // `note_slate` already reports this: a stale stamp reaches it as
+        // `SlateReason::SourceStale`, run-deduped with a frame count, and the
+        // present falls back to host memory — so the reading is both a named
+        // decline and a dent in `direct_frac`. On a boot where it stays absent,
+        // the stamp never overrode the re-resolve and removing the re-resolve
+        // changes no frame.
+        let stale =
+            source.is_some_and(|source| source.epoch != super::pools::window_source_epoch());
+        let selected = source.filter(|_| !stale).and_then(|source| {
             let slot = pools.registry_get(&source.identity)?;
             super::pools::slot_presentable(slot, source.width, source.height).then(|| {
                 (
@@ -1213,6 +1236,7 @@ impl WindowPresenter {
             // Failure path only: re-read the slot to name WHY the resident could
             // not carry. Cheap because it never runs on a good frame.
             let state = source
+                .filter(|_| !stale)
                 .and_then(|source| pools.registry_get(&source.identity))
                 .map_or(CandidateState::default(), |slot| CandidateState {
                     resident: true,
@@ -1222,7 +1246,11 @@ impl WindowPresenter {
                     height: slot.height,
                 });
             let want = source.map_or((0, 0), |s| (s.width, s.height));
-            let reason = classify_slate(source.is_some(), want, state);
+            let reason = if stale {
+                SlateReason::SourceStale
+            } else {
+                classify_slate(source.is_some(), want, state)
+            };
             let staged = cpu
                 .filter(WindowCpuFrame::complete)
                 .and_then(|frame| self.stage_cpu_frame(ctx, frame));
