@@ -353,7 +353,34 @@ pub enum LifecycleOp {
     /// [`LifecycleKind::of`] could not tell apart.
     DeleteObject {
         task: TaskId,
-        resource: ResourceId,
+        /// The guest's own number, which is what every rail's retirement is
+        /// keyed by — `(task, ref)`, not a name.
+        ///
+        /// Carried beside the name rather than derived from it because for one
+        /// measured kind there *is* no name: a fence comes into being when an
+        /// exec stream first signals it, so no path reads a fence out of the
+        /// guest's object list and the namespace has nothing to give.
+        object_ref: u32,
+        /// The name, when the object namespace has one.
+        ///
+        /// # `None` is an answer, not a failure
+        ///
+        /// This used to be a `ResourceId` and an unresolvable reference
+        /// refused the whole packet. That is wrong for a *destroy*, and a
+        /// driven boot priced it: seven a boot arrive with neither a name in
+        /// the model nor a live entry in the guest's list —
+        /// `delete_unnamed_and_unresolvable`, of which two are fences. Refusing
+        /// those loses the retirement, and for a fence that is a wrong answer
+        /// rather than a dropped one: `retire_fence` clears the stored
+        /// generation, and a generation outliving its fence makes the next
+        /// fence to reuse that reference start life already signalled.
+        ///
+        /// Nothing is lost by ordering it against nothing. A resource the
+        /// namespace cannot name is one no other operation in this model can
+        /// name either, so there is no access for this delete to conflict with
+        /// — see [`Self::resources`], which returns an empty slice for exactly
+        /// this case.
+        resource: Option<ResourceId>,
         kind: reims_vgpu_protocol::destroy::DestroyKind,
     },
 }
@@ -400,9 +427,14 @@ impl LifecycleOp {
             | Self::Synchronize { resources, .. }
             | Self::SynchronizeAndDiscard { resources, .. }
             | Self::Discard { resources, .. } => resources,
-            Self::DeleteResource { resource, .. }
-            | Self::ReplacePhysical { resource, .. }
-            | Self::DeleteObject { resource, .. } => std::slice::from_ref(resource),
+            Self::DeleteResource { resource, .. } | Self::ReplacePhysical { resource, .. } => {
+                std::slice::from_ref(resource)
+            }
+            // Empty when the namespace has no name for it, which is the honest
+            // answer rather than a missing one: a resource this model cannot
+            // name is one nothing else in it names, so a delete of it conflicts
+            // with nothing.
+            Self::DeleteObject { resource, .. } => resource.as_slice(),
             // A task's own lifetime, an address interval, a slot declaration
             // and a backing retirement each name something that is not a
             // resource id.
@@ -1204,8 +1236,13 @@ pub fn object_reference(
 /// # Errors
 ///
 /// [`ResolveRefusal`]: a kind that is not a destroy command, a payload too
-/// short for the record, a record that is not a destroy, a kind the ledger has
-/// not settled, or a reference naming nothing live.
+/// short for the record, a record that is not a destroy, or a kind the ledger
+/// has not settled.
+///
+/// **Not** a reference naming nothing live. That used to refuse here and it
+/// was wrong for a destroy: the effect is keyed by `(task, ref)` and the
+/// reference is right there, so refusing loses a retirement this device can
+/// still perform. See [`LifecycleOp::DeleteObject::resource`].
 pub fn object_destroy(
     kind: LifecycleKind,
     payload: &[u8],
@@ -1223,13 +1260,14 @@ pub fn object_destroy(
     }
     let task = TaskId(command.task_id);
     let resolver = crate::resolve::InTask::new(namespaces, task);
-    let resource = crate::resolve::RefResolver::resource(&resolver, record.object_ref).ok_or(
-        ResolveRefusal::UnknownRef {
-            object_ref: record.object_ref,
-        },
-    )?;
+    // Not `ok_or(UnknownRef)`. A destroy is the one lifecycle command whose
+    // effect must not be lost to an unresolvable reference — see
+    // [`LifecycleOp::DeleteObject::resource`] — and the reference itself is
+    // carried so the executor's `(task, ref)`-keyed retirement runs either way.
+    let resource = crate::resolve::RefResolver::resource(&resolver, record.object_ref);
     Ok(LifecycleOp::DeleteObject {
         task,
+        object_ref: record.object_ref,
         resource,
         kind: record.kind,
     })
@@ -1756,9 +1794,14 @@ impl Lifecycle {
             // per-kind registry the rail drops is the executor's, and it is
             // carried on the operation so the executor does not have to
             // re-derive it from bytes the model no longer holds.
-            LifecycleOp::DeleteObject { task, resource, .. } => {
-                self.delete_resource(*task, *resource)
-            }
+            LifecycleOp::DeleteObject { task, resource, .. } => match resource {
+                Some(resource) => self.delete_resource(*task, *resource),
+                // Nothing in this model was ever named for it, so there is
+                // nothing here to drop. The rail's own `(task, ref)`-keyed
+                // retirement is the half that still has work to do, and it has
+                // the reference.
+                None => Ok(Effects::default()),
+            },
         }
     }
 
@@ -2459,7 +2502,8 @@ mod tests {
             },
             LifecycleOp::DeleteObject {
                 task: TASK,
-                resource: name(0),
+                object_ref: 0,
+                resource: Some(name(0)),
                 kind: reims_vgpu_protocol::destroy::DestroyKind::SamplerState,
             },
         ]
@@ -3732,10 +3776,44 @@ mod tests {
             ),
             Ok(LifecycleOp::DeleteObject {
                 task: TASK,
-                resource: Everything.resource(TASK, 9).expect("everything resolves"),
+                object_ref: 9,
+                resource: Some(Everything.resource(TASK, 9).expect("everything resolves")),
                 kind: DestroyKind::SamplerState,
             })
         );
+
+        // A reference nothing names. **Not refused**: a destroy is the one
+        // lifecycle command whose effect must not be lost to an unresolvable
+        // reference, because every rail's retirement is keyed by `(task, ref)`
+        // and the reference is right there. A driven macos-15 boot sends seven
+        // of these — `delete_unnamed_and_unresolvable`, of which two are fences
+        // — and losing a fence's retirement is a *wrong answer* rather than a
+        // dropped one: the stored generation outlives the fence and the next
+        // fence to reuse that reference starts life already signalled.
+        assert_eq!(
+            object_destroy(
+                LifecycleKind::DeleteObject,
+                &payload(DestroyKind::Fence.opcode(), 9),
+                &Nothing
+            ),
+            Ok(LifecycleOp::DeleteObject {
+                task: TASK,
+                object_ref: 9,
+                resource: None,
+                kind: DestroyKind::Fence,
+            })
+        );
+        // And it is ordered against nothing, which is the honest answer: a
+        // resource this model cannot name is one no other operation in it names
+        // either, so there is no access for the delete to conflict with.
+        let unnamed = LifecycleOp::DeleteObject {
+            task: TASK,
+            object_ref: 9,
+            resource: None,
+            kind: DestroyKind::Fence,
+        };
+        assert!(unnamed.resources().is_empty());
+        assert_eq!(unnamed.task(), TASK);
 
         // An unsettled one. Refused by name, and by *its* name rather than the
         // packet's — a reader has to be able to tell which of the eleven is
@@ -5441,10 +5519,17 @@ mod tests {
                 live.entry(*task).or_default().insert(*slot, (id, backing));
                 handed.push(Handed { task: *task, id });
             }
-            LifecycleOp::DeleteResource { task, resource }
-            | LifecycleOp::DeleteObject { task, resource, .. } => {
+            LifecycleOp::DeleteResource { task, resource } => {
                 census.deletes += 1;
                 live.entry(*task).or_default().remove(&resource.slot);
+            }
+            // A destroy the namespace could not name removes nothing from this
+            // history, because nothing named it was ever put in.
+            LifecycleOp::DeleteObject { task, resource, .. } => {
+                census.deletes += 1;
+                if let Some(resource) = resource {
+                    live.entry(*task).or_default().remove(&resource.slot);
+                }
             }
             LifecycleOp::ReplacePhysical {
                 task,
