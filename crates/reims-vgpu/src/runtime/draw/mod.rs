@@ -958,6 +958,36 @@ pub(super) fn name_depth_stencil<M: HostMemory + HostOps>(
     );
 }
 
+/// Tell the ordering plane what a rail's executor found its shaders do with
+/// each bound slot.
+///
+/// Beside [`advance_pipeline`] and for the same reason: the naming is the
+/// rail-neutral half and both rails must report through one function or the
+/// counters read differently on each. Called **before** the `Ready` step, which
+/// is the order [`DeviceState::publish_pipeline_usage`] requires — a lease
+/// taken before the reflection lands gets a footprint that is conservative for
+/// the life of that transaction.
+pub(crate) fn publish_pipeline_usage<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    usage: reims_vgpu_core::pipeline::PublishedUsage,
+) {
+    let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) else {
+        crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
+        return;
+    };
+    crate::runtime::drain::note_store_route(if state.publish_pipeline_usage(name, usage) {
+        "pipeline_usage_published"
+    } else {
+        // The same population `pipeline_advance_declined` describes: a build
+        // finishing after the guest's delete, or a rail with no retained
+        // pipeline state re-walking one the table has already retired.
+        "pipeline_usage_declined"
+    });
+}
+
 /// Step the pipeline `pipeline_ref` names along its build.
 ///
 /// # Why the rails call this and not the model's door directly

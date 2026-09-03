@@ -17,6 +17,9 @@
 //! pipeline enums become Vulkan ones there and nowhere else, so the same
 //! decision cannot be made twice with two different answers.
 
+/// What this rail's translated shaders do with each bound slot, so the model
+/// stops ordering every one of them as `Unknown`.
+pub(crate) mod binding_usage;
 pub mod caps;
 /// The census lines only this rail can answer. Reached through
 /// [`Backend::emit_census`], never through a `cfg`.

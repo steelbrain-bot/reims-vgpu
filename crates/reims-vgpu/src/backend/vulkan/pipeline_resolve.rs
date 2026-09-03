@@ -150,6 +150,32 @@ impl VertexBindPlan {
     pub fn feeds_stage_in(&self, buffer_index: u32) -> bool {
         self.attribute.binary_search(&buffer_index).is_ok()
     }
+
+    /// Every buffer index the attribute list names, sorted.
+    ///
+    /// The set half of [`Self::feeds_stage_in`], for a caller that has to walk
+    /// it rather than ask about one index — see
+    /// [`crate::backend::vulkan::binding_usage`], which needs the whole set
+    /// because the vertex fetch's reads are exactly the ones the reflection
+    /// does not carry.
+    pub(crate) fn attribute_slots(&self) -> &[u32] {
+        &self.attribute
+    }
+
+    /// A plan stating only its attribute slots, for tests about what those
+    /// mean. Not a door into the real construction: [`Self::build`] derives
+    /// both sets from one descriptor and remains the only way a live plan is
+    /// made.
+    #[cfg(test)]
+    pub(crate) fn for_test(attribute: &[u32]) -> Self {
+        let mut attribute = attribute.to_vec();
+        attribute.sort_unstable();
+        attribute.dedup();
+        Self {
+            constant_step: Box::new([]),
+            attribute: attribute.into_boxed_slice(),
+        }
+    }
 }
 
 /// Per-task render pipeline states, keyed by the pipeline API's reference
@@ -369,14 +395,14 @@ pub fn resolve<M: HostMemory + HostOps>(
     if !memo_enabled() {
         note_store_route("pipe_memo_off");
         return resolve_uncached(state, host, task_id, pipeline_ref)
-            .inspect(|_| ready(state, host, task_id, pipeline_ref))
+            .inspect(|resolved| ready(state, host, task_id, pipeline_ref, resolved))
             .map(Arc::new);
     }
 
     let Some(states) = retained(state) else {
         note_store_route("pipe_memo_off");
         return resolve_uncached(state, host, task_id, pipeline_ref)
-            .inspect(|_| ready(state, host, task_id, pipeline_ref))
+            .inspect(|resolved| ready(state, host, task_id, pipeline_ref, resolved))
             .map(Arc::new);
     };
     if let Some(resolved) = states.get(task_id, pipeline_ref) {
@@ -388,7 +414,7 @@ pub fn resolve<M: HostMemory + HostOps>(
     let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
     resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
     let registered = states.register(task_id, pipeline_ref, Arc::new(resolved));
-    ready(state, host, task_id, pipeline_ref);
+    ready(state, host, task_id, pipeline_ref, &registered);
     Ok(registered)
 }
 
@@ -478,7 +504,30 @@ fn resolve_uncached<M: HostMemory + HostOps>(
 /// Called after the retained state is filed rather than before, so that the
 /// first work released cannot arrive at a registry that does not yet hold what
 /// it will ask for.
-fn ready<M: HostMemory + HostOps>(state: &DeviceState, host: &M, task_id: u32, pipeline_ref: u32) {
+/// Published before the `Ready` step, never after: `Ready` is what lets a
+/// transaction lease this pipeline, and the walk asks for the reflection once
+/// at admission and never again. So a lease taken between the two would carry
+/// a footprint that stays `Unknown` for the life of that transaction.
+fn ready<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    resolved: &ResolvedRenderPipeline,
+) {
+    let (usage, refusals) = crate::backend::vulkan::binding_usage::render(
+        &resolved.vertex.reflection,
+        &resolved.bind_plan,
+        &resolved.fragment.reflection,
+    );
+    for refusal in refusals.into_iter().flatten() {
+        // A stage that cannot be published is a stage left at `Unknown`, which
+        // costs ordering and never correctness — so it is counted rather than
+        // failed, and the count is what says which of the three reasons is
+        // worth closing.
+        note_store_route(refusal.slug());
+    }
+    crate::runtime::draw::publish_pipeline_usage(state, host, task_id, pipeline_ref, usage);
     crate::runtime::draw::advance_pipeline(
         state,
         host,
