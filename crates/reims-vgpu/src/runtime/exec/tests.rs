@@ -7656,3 +7656,68 @@ fn a_compact_draw_and_its_wide_encoding_record_the_same_draw() {
         "neither encoding carries an instance count, so both draw one"
     );
 }
+
+/// A sink whose segment pairing is broken names the loss instead of absorbing
+/// it.
+///
+/// The two cases here are unreachable from `walk_stream`, which pairs its own
+/// calls — and that is exactly why they are worth a test. The sink exists so
+/// that a *different* walker can drive it, and the first thing a different
+/// walker can get wrong is the pairing. Both losses are whole compute
+/// dispatches, so neither may be silent.
+#[test]
+fn a_compute_record_with_no_segment_open_is_a_named_loss() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let task_id = 0x5731_0101;
+    let before = sink_body().len();
+    let mut sink = StreamSink {
+        state: &mut state,
+        host: &mut host,
+        task_id,
+        out: &mut out,
+        acc: &mut acc,
+        compute: None,
+    };
+    // No `begin_segment`. The record's bytes are never read, because the sink
+    // refuses before reaching the handler.
+    sink.record(SegmentKind::Compute, 0x1234, &[0u8; OP_HEADER_LEN]);
+    let added = sink_body().split_off(before);
+    assert!(
+        added.contains("exec_compute_record_unopened")
+            && added.contains(&format!("task={task_id}")),
+        "a compute record with no open segment must name the lost dispatch: {added}"
+    );
+}
+
+#[test]
+fn a_segment_opened_over_an_open_compute_segment_commits_it_and_says_so() {
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let mut out = ExecResult::default();
+    let mut acc = StreamAccum::default();
+    let task_id = 0x5731_0102;
+    let before = sink_body().len();
+    let mut sink = StreamSink {
+        state: &mut state,
+        host: &mut host,
+        task_id,
+        out: &mut out,
+        acc: &mut acc,
+        compute: None,
+    };
+    sink.begin_segment(SegmentKind::Compute);
+    assert!(sink.compute.is_some(), "a compute segment opens an encoder");
+    sink.begin_segment(SegmentKind::Render);
+    assert!(
+        sink.compute.is_none(),
+        "the unended compute segment is committed rather than carried into the render one"
+    );
+    let added = sink_body().split_off(before);
+    assert!(
+        added.contains("exec_segment_unended") && added.contains(&format!("task={task_id}")),
+        "opening a segment over an open compute segment must be named: {added}"
+    );
+}

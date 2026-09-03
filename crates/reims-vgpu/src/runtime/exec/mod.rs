@@ -1178,6 +1178,135 @@ impl crate::observe::Refusal for RecordFraming {
     }
 }
 
+/// The per-record work an exec stream's segments cause, separated from whoever
+/// walks the stream.
+///
+/// `walk_stream` used to hold both halves: the framing loop, and inside each of
+/// its five arms the handler call plus — for compute — the segment-spanning
+/// encoder that one record opens and the segment's end commits. They are two
+/// different things. `reims_vgpu_core::walk` frames and records the same
+/// segments from the same `reims_vgpu_protocol::segment::SegmentStream`, and a
+/// device driven from that walk needs this half without this loop.
+///
+/// Splitting them here is what makes the walker substitutable rather than
+/// duplicated. `walk.rs`'s own module documentation names the class of defect
+/// that matters: two walks over one stream are two chances to disagree about
+/// where a record was, and the dispatch is the part that would have had to be
+/// written twice for them to disagree at all.
+///
+/// The sink owns exactly the state that spans records — the open compute
+/// segment — and nothing that spans streams.
+struct StreamSink<'a, M: HostMemory + HostOps> {
+    state: &'a mut DeviceState,
+    host: &'a mut M,
+    task_id: u32,
+    out: &'a mut ExecResult,
+    acc: &'a mut StreamAccum,
+    /// `Some` between the [`Self::begin_segment`] and [`Self::end_segment`] of a
+    /// compute segment, and `None` everywhere else. A compute record arriving
+    /// while this is `None` is a walker that skipped the opening, which is a
+    /// loss and is named rather than absorbed.
+    compute: Option<crate::runtime::compute_session::ComputeSegment>,
+}
+
+impl<'a, M: HostMemory + HostOps> StreamSink<'a, M> {
+    /// A segment of `kind` is about to deliver its records.
+    fn begin_segment(&mut self, kind: SegmentKind) {
+        if self.compute.is_some() {
+            // The previous segment's encoder was never committed. Committing it
+            // here is the only reading that does not drop the work the guest
+            // already recorded into it, and the line says the walker paired its
+            // calls wrongly rather than leaving that silent.
+            crate::observe::fail(format!(
+                "exec_segment_unended task={} opening={} (a segment opened while a compute \
+                 segment was still open, so its encoder had not been committed)",
+                self.task_id,
+                kind.name()
+            ));
+            self.end_segment();
+        }
+        if matches!(kind, SegmentKind::Compute) {
+            self.compute = Some(crate::runtime::compute_session::ComputeSegment::default());
+        }
+    }
+
+    /// One record of the open segment.
+    ///
+    /// `kind` is the segment's, which is the only defensible source for the
+    /// rail a record is read on — the same rule `reims_vgpu_core::walk` states
+    /// for `resolve::operation`, and the reason it is a parameter here rather
+    /// than something this method could derive from the opcode.
+    fn record(&mut self, kind: SegmentKind, opcode: u32, cmd: &[u8]) {
+        match kind {
+            SegmentKind::Render => handle_render_record(
+                self.state,
+                self.host,
+                self.task_id,
+                opcode,
+                cmd,
+                self.out,
+                self.acc,
+            ),
+            SegmentKind::Blit => {
+                handle_blit_record(self.state, self.host, self.task_id, opcode, cmd)
+            }
+            SegmentKind::Compute => {
+                let Some(compute) = self.compute.as_mut() else {
+                    crate::observe::fail(format!(
+                        "exec_compute_record_unopened task={} op={opcode:#x} len={} (a compute \
+                         record arrived with no compute segment open, so its dispatch is lost)",
+                        self.task_id,
+                        cmd.len()
+                    ));
+                    return;
+                };
+                handle_compute_record(
+                    self.state,
+                    self.host,
+                    self.task_id,
+                    opcode,
+                    cmd,
+                    self.out,
+                    compute,
+                );
+            }
+            SegmentKind::Event => handle_event_record(self.state, self.task_id, cmd),
+            SegmentKind::Info => {
+                handle_info_record(self.state, self.host, self.task_id, opcode, cmd);
+            }
+        }
+    }
+
+    /// The open segment has delivered its last record.
+    ///
+    /// Only compute has anything to do here, and it is a commit rather than a
+    /// teardown: the session's whole multi-record encoder is the work, so a
+    /// failure at this point loses all of it and is the one thing this method
+    /// reports.
+    fn end_segment(&mut self) {
+        let Some(mut segment) = self.compute.take() else {
+            return;
+        };
+        let Some(status) = crate::runtime::compute_session::finish_session(
+            &mut segment.session,
+            self.state,
+            self.host,
+            self.task_id,
+        ) else {
+            return;
+        };
+        if !matches!(status, ComputeStatus::Ok) {
+            self.out.compute_control_fail += 1;
+            // Segment-end commit: the whole multi-record session's work is
+            // gone, and this counter was its only trace.
+            if let Some(e) = crate::observe::Emit::refusal("compute_session_finish", &status) {
+                e.field("task", self.task_id)
+                    .fail_once(u64::from(self.task_id));
+            }
+        }
+    }
+}
+
 fn walk_stream<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -1203,6 +1332,14 @@ fn walk_stream<M: HostMemory + HostOps>(
                 .fail_once(u64::from(task_id));
             return;
         }
+    };
+    let mut sink = StreamSink {
+        state,
+        host,
+        task_id,
+        out,
+        acc,
+        compute: None,
     };
     for framed in segments.by_ref() {
         let framed = match framed {
@@ -1243,51 +1380,11 @@ fn walk_stream<M: HostMemory + HostOps>(
         // on that rail and the reading was a rail-dependent multiple of the
         // truth.
         crate::runtime::drain::note_store_route(segment_chain_route(framed.lifetime));
-        match kind {
-            SegmentKind::Render => {
-                walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
-                    handle_render_record(state, host, task_id, op, cmd, out, acc)
-                });
-            }
-            SegmentKind::Blit => {
-                walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
-                    handle_blit_record(state, host, task_id, op, cmd)
-                });
-            }
-            SegmentKind::Compute => {
-                let mut compute = crate::runtime::compute_session::ComputeSegment::default();
-                walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
-                    handle_compute_record(state, host, task_id, op, cmd, out, &mut compute)
-                });
-                if let Some(st) = crate::runtime::compute_session::finish_session(
-                    &mut compute.session,
-                    state,
-                    host,
-                    task_id,
-                ) {
-                    if !matches!(st, ComputeStatus::Ok) {
-                        out.compute_control_fail += 1;
-                        // Segment-end commit: the whole multi-record session's
-                        // work is gone, and this counter was its only trace.
-                        if let Some(e) =
-                            crate::observe::Emit::refusal("compute_session_finish", &st)
-                        {
-                            e.field("task", task_id).fail_once(u64::from(task_id));
-                        }
-                    }
-                }
-            }
-            SegmentKind::Event => {
-                walk_segment_records(kind, framed.commands_offset, commands, |_op, cmd| {
-                    handle_event_record(state, task_id, cmd)
-                });
-            }
-            SegmentKind::Info => {
-                walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
-                    handle_info_record(state, host, task_id, op, cmd)
-                });
-            }
-        }
+        sink.begin_segment(kind);
+        walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
+            sink.record(kind, op, cmd);
+        });
+        sink.end_segment();
     }
 }
 
