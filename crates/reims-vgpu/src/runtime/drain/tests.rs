@@ -6170,6 +6170,106 @@ fn a_delete_object_record_must_fit_the_payload_that_carries_it() {
     }
 }
 
+/// A destroy whose ref names an object of another kind retires no pipeline.
+///
+/// **A pipeline table entry is a tombstone, so one wrong retirement is
+/// permanent.** `PipelineTable::declare` refuses an id it already holds and
+/// `peek` answers `AbsentBecause::Retired` for ever after, so a transaction that
+/// binds the real pipeline is refused at admission from then on — the whole
+/// packet, not the draw.
+///
+/// It was measured on a guest. A driven macos-26 boot answered `TypeDiffers` for
+/// **34 of the 36** destroys that reached this arm, and refused **914 exec
+/// packets** with `pipeline_absent_retired`; the macos-15 boot beside it deletes
+/// four pipelines and refuses none. The census that says which ref space the
+/// destroy's number belongs to already ran two blocks earlier; this is that
+/// answer being acted on instead of only counted.
+#[test]
+fn a_pipeline_destroy_whose_ref_names_another_kind_retires_no_pipeline() {
+    use crate::protocol::gva::{DIRECTORY_DEPTH, DIRECTORY_ROOT_PFN};
+    use crate::runtime::decode::resource::{OBJECT_LIST_ENTRY_LEN, OBJECT_TYPE_TEXTURE};
+    use reims_vgpu_core::pipeline::PipelineState;
+    use reims_vgpu_wire::ops::destroy::{DELETE_TOTAL_LEN, OPCODE_DELETE_RENDER_PIPELINE_STATE};
+
+    const TASK: u32 = 2;
+    const REF: u32 = 3;
+
+    // One flat page table, GVA page 0 → data pfn 4, exactly as the object-list
+    // fixtures build it: the list entry is read *through the task's own page
+    // table*, so a raw GPA write would leave the census reading nothing and the
+    // gate untested.
+    let mut host = FakeHost::new();
+    let dir_gpa = 2u64 << PAGE_SHIFT_X86;
+    let root_gpa = 3u64 << PAGE_SHIFT_X86;
+    let data_gpa = 4u64 << PAGE_SHIFT_X86;
+    host.map_range(dir_gpa, 0x20, 0);
+    host.map_range(root_gpa, 0x4000, 0);
+    host.map_range(data_gpa, 0x200, 0);
+    let mut d = [0u8; 8];
+    st32(&mut d[DIRECTORY_ROOT_PFN as usize..], 3);
+    st32(&mut d[DIRECTORY_DEPTH as usize..], 1);
+    let _ = host.write_gpa(dir_gpa, &d);
+    st32(&mut d[..4], 4);
+    let _ = host.write_gpa(root_gpa, &d[..4]);
+
+    let mut state = DeviceState::new(crate::model::DeviceId(1), PAGE_SHIFT_X86);
+    state.define_task(TASK, 0x1000, 2);
+    assert!(state.set_object_list(TASK, 0, 8));
+
+    // The slot holds a **texture**, which is not what a render-pipeline destroy
+    // names. Its descriptor is never read: the gate is the entry's type.
+    let mut entry = [0u8; OBJECT_LIST_ENTRY_LEN];
+    st32(&mut entry, u32::from(OBJECT_TYPE_TEXTURE) | (4u32 << 8));
+    entry[4..].copy_from_slice(&0x40u64.to_le_bytes());
+    let _ = host.write_gpa(
+        data_gpa + u64::from(REF) * OBJECT_LIST_ENTRY_LEN as u64,
+        &entry,
+    );
+
+    // The name the ref already has, declared directly so the test's subject is
+    // the destroy and not the descriptor read. `name_resource` answers from
+    // `DeviceState::object_name` before the guest's list, so this is exactly the
+    // name the destroy would resolve to and retire.
+    assert_eq!(
+        crate::runtime::objects::probe_list_entry(&state, &host, TASK, REF).map(|e| e.object_type),
+        Some(OBJECT_TYPE_TEXTURE),
+        "the fixture's list entry is what the census reads"
+    );
+    let name = state
+        .declare_object(TASK, REF, reims_vgpu_core::lifecycle::Storage::NoBytes)
+        .expect("the task is open")
+        .id;
+    assert!(state.declare_pipeline(name), "declared for the first time");
+    state.advance_pipeline(name, PipelineState::Translating);
+    state.advance_pipeline(name, PipelineState::Compiling);
+    assert!(state.ready_pipeline(name));
+
+    let mut payload = vec![0u8; 4 + DELETE_TOTAL_LEN as usize];
+    st32(&mut payload[0..], TASK);
+    st32(&mut payload[4..], OPCODE_DELETE_RENDER_PIPELINE_STATE);
+    st32(&mut payload[8..], DELETE_TOTAL_LEN);
+    st32(&mut payload[12..], REF);
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &Packet {
+            opcode: CHILD_OP_DELETE_OBJECT,
+            stamp_waits: Vec::new(),
+            total_size: PACKET_HEADER_LEN + payload.len() as u32,
+            completion_stamp: 0,
+            payload,
+            next_head: 0,
+        },
+    );
+
+    assert!(
+        state.pipeline_is_ready(name),
+        "the destroy's ref is a number in another space; retiring the object \
+         that merely shares it tombstones a pipeline the guest still binds"
+    );
+}
+
 /// `CmdDeleteObject` must not retire an object-table entry, however exactly its
 /// record's ref matches one.
 ///

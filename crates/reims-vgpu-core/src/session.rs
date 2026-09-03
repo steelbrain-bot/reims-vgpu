@@ -1736,9 +1736,12 @@ mod tests {
         let err = s.admit(&leased).expect_err("nothing declared it");
         assert_eq!(
             err,
-            Refusal::PipelineUnusable(crate::pipeline::LeaseRefusal::Absent { pipeline })
+            Refusal::PipelineUnusable(crate::pipeline::LeaseRefusal::Absent {
+                pipeline,
+                because: crate::pipeline::AbsentBecause::Undeclared,
+            })
         );
-        assert_eq!(err.slug(), "pipeline_absent");
+        assert_eq!(err.slug(), "pipeline_absent_undeclared");
         // The refusal consumed no ordinal, like every other one here.
         let gen = s.generation();
         s.pipelines().declare(pipeline, gen);
@@ -1821,7 +1824,7 @@ mod tests {
         );
         assert_eq!(
             s.pipelines().lease(deleted, gen),
-            Lease::Absent,
+            Lease::Absent(crate::pipeline::AbsentBecause::Retired),
             "and a deleted object is not resurrected by a new device"
         );
 
@@ -2726,8 +2729,14 @@ mod tests {
             "and none of the four can ever be named again, so none of them stays"
         );
         for p in [declared, translating, ready, refused] {
-            assert_eq!(s.pipelines().lease(p, gen), Lease::Absent);
-            assert_eq!(s.pipelines().lease(p, reset.generation), Lease::Absent);
+            assert_eq!(
+                s.pipelines().lease(p, gen),
+                Lease::Absent(crate::pipeline::AbsentBecause::Undeclared)
+            );
+            assert_eq!(
+                s.pipelines().lease(p, reset.generation),
+                Lease::Absent(crate::pipeline::AbsentBecause::Undeclared)
+            );
         }
 
         // The next generation declares its own, and a second reset takes only

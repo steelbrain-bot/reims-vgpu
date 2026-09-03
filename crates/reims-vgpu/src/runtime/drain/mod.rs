@@ -352,7 +352,7 @@ fn apply_delete_object<H: HostMemory + HostOps>(
     //
     // Asked before the retirement acts, so the reading is about the ref the
     // guest sent and not about what dropping it did.
-    if is_retained_kind(op.opcode()) {
+    let ref_space = is_retained_kind(op.opcode()).then(|| {
         note_delete_object_ref_space(
             state,
             host,
@@ -360,8 +360,8 @@ fn apply_delete_object<H: HostMemory + HostOps>(
             object_ref,
             op.opcode(),
             RefSpacePopulation::Retained,
-        );
-    }
+        )
+    });
     if op.opcode() == reims_vgpu_wire::ops::destroy::OPCODE_DELETE_SAMPLER_STATE {
         let retired = state.task_sampler_states.delete(task_id, object_ref);
         note_store_route(if retired {
@@ -416,7 +416,31 @@ fn apply_delete_object<H: HostMemory + HostOps>(
         // it the table only grows, and a transaction parked on a compilation
         // the guest has just cancelled would wait for a step that never comes.
         if object == RetainedObject::RenderPipelineState {
-            if let Some(name) =
+            // **Only when the slot the ref names still holds a render pipeline.**
+            // The census two blocks up asks exactly this and it is not
+            // rhetorical: a driven macos-26 boot answered `TypeDiffers` for 34
+            // of the 36 destroys that reached this line. A destroy whose ref
+            // resolves to an object of another kind is a ref in the
+            // serializer's own per-kind space — the census's own conclusion —
+            // and `name_resource` then hands back the name of whatever
+            // *shares the integer*, which this retires.
+            //
+            // A pipeline table entry is a tombstone once retired: `declare`
+            // refuses an id it already holds and `peek` answers
+            // `AbsentBecause::Retired` forever, so one wrong retirement refuses
+            // every later packet that binds the real pipeline. That is what it
+            // cost — **914 exec packets refused `pipeline_absent_retired` on
+            // macos-26 against zero on macos-15**, which is the boot where the
+            // guest deletes four.
+            //
+            // `NoListEntry` retires too, and deliberately: the guest clears its
+            // own object-list slot before sending the destroy, so an absent
+            // entry is the ordinary case and `name_resource` answers it from
+            // the name the slot already had. It is only a *disagreeing* entry
+            // that says the integer belongs to something else.
+            if ref_space == Some(RefSpaceAnswer::TypeDiffers) {
+                note_store_route("pipeline_retire_declined_other_ref_space");
+            } else if let Some(name) =
                 crate::runtime::objects::name_resource(state, host, task_id, object_ref)
             {
                 let ended = state.retire_pipeline(name);
@@ -603,7 +627,7 @@ fn note_delete_object_ref_space<M: HostMemory>(
     object_ref: u32,
     opcode: u32,
     retained: RefSpacePopulation,
-) {
+) -> RefSpaceAnswer {
     use crate::runtime::decode::resource::{
         OBJECT_TYPE_BUFFER, OBJECT_TYPE_FUNCTION, OBJECT_TYPE_SERIALIZER_OBJECT,
         OBJECT_TYPE_TEXTURE,
@@ -656,13 +680,14 @@ fn note_delete_object_ref_space<M: HostMemory>(
     }
     let Some(entry) = entry else {
         note_store_route(retained.route(RefSpaceAnswer::NoListEntry));
-        return;
+        return RefSpaceAnswer::NoListEntry;
     };
-    let route = retained.route(if entry.object_type == expected {
+    let answer = if entry.object_type == expected {
         RefSpaceAnswer::TypeAgrees
     } else {
         RefSpaceAnswer::TypeDiffers
-    });
+    };
+    let route = retained.route(answer);
     note_store_route(route);
     if crate::observe::first_sight(route, (u64::from(opcode) << 32) | u64::from(object_ref)) {
         crate::observe::fail(format!(
@@ -674,6 +699,7 @@ fn note_delete_object_ref_space<M: HostMemory>(
             expected
         ));
     }
+    answer
 }
 
 /// Which FIFO a packet arrived on, for a log line.
@@ -2525,8 +2551,14 @@ fn note_unadmitted<H: HostMemory + HostOps>(
 ) {
     note_store_route("packet_unadmitted");
     note_store_route(reason);
+    // Latched under the *refusal's* own slug rather than under
+    // `packet_unadmitted`, because `first_sight` keys on the reason it is given
+    // and one opcode refuses for several. A driven macos-26 boot's 918
+    // unadmitted packets were 914 `pipeline_absent` and 4
+    // `resolve_ref_names_no_object`, every one of them child `0x37` — and under
+    // one slug the log printed whichever arrived first and hid the rest.
     if crate::observe::first_sight(
-        "packet_unadmitted",
+        reason,
         (u64::from(fifo.domain().0) << 32) | u64::from(packet.opcode),
     ) {
         crate::observe::fail(format!(

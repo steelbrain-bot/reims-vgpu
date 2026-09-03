@@ -218,8 +218,40 @@ pub enum Lease {
     Pending,
     /// It will never be usable, with the reason.
     Refused(RefusalReason),
-    /// There is no such pipeline in this generation.
-    Absent,
+    /// There is no such pipeline in this generation, and which of the three
+    /// ways that happened.
+    Absent(AbsentBecause),
+}
+
+/// The three ways a pipeline this session holds no lease for got that way.
+///
+/// **They are different defects and the slug alone cannot tell them apart.**
+/// A driven macos-26 boot refused 914 exec packets on `pipeline_absent` where a
+/// macos-15 boot refused none, and the three candidates predict different fixes:
+/// a name nothing declared is a lease list built from something other than the
+/// walk, a stale generation is a reset that did not close its table, and a
+/// retired one is the guest's own delete arriving before work that still binds
+/// it — which under a model that parks packets is a delete resolved at the
+/// wrong moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbsentBecause {
+    /// No entry at all: nothing ever declared this id.
+    Undeclared,
+    /// An entry from a generation this session has left behind.
+    OtherGeneration,
+    /// The guest deleted it, or its generation closed.
+    Retired,
+}
+
+impl AbsentBecause {
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Undeclared => "pipeline_absent_undeclared",
+            Self::OtherGeneration => "pipeline_absent_other_generation",
+            Self::Retired => "pipeline_absent_retired",
+        }
+    }
 }
 
 /// Why a transaction can never use a pipeline it binds.
@@ -237,6 +269,7 @@ pub enum LeaseRefusal {
     },
     Absent {
         pipeline: ResourceId,
+        because: AbsentBecause,
     },
 }
 
@@ -248,7 +281,7 @@ impl LeaseRefusal {
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Refused { reason, .. } => reason.slug(),
-            Self::Absent { .. } => "pipeline_absent",
+            Self::Absent { because, .. } => because.slug(),
         }
     }
 }
@@ -474,10 +507,13 @@ impl PipelineTable {
     /// says whether compilation starts early enough grows with refusals.
     fn peek(&self, id: ResourceId, generation: SessionGeneration) -> Lease {
         let Some(p) = self.pipelines.get(&id) else {
-            return Lease::Absent;
+            return Lease::Absent(AbsentBecause::Undeclared);
         };
-        if p.generation != generation || p.state == PipelineState::Retired {
-            return Lease::Absent;
+        if p.generation != generation {
+            return Lease::Absent(AbsentBecause::OtherGeneration);
+        }
+        if p.state == PipelineState::Retired {
+            return Lease::Absent(AbsentBecause::Retired);
         }
         match p.state {
             PipelineState::Ready => Lease::Ready,
@@ -487,7 +523,7 @@ impl PipelineTable {
             PipelineState::Declared | PipelineState::Translating | PipelineState::Compiling => {
                 Lease::Pending
             }
-            PipelineState::Retired => Lease::Absent,
+            PipelineState::Retired => Lease::Absent(AbsentBecause::Retired),
         }
     }
 
@@ -496,7 +532,7 @@ impl PipelineTable {
         match lease {
             Lease::Ready => self.census.leases_ready += 1,
             Lease::Pending => self.census.leases_pending += 1,
-            Lease::Refused(_) | Lease::Absent => {}
+            Lease::Refused(_) | Lease::Absent(_) => {}
         }
     }
 
@@ -538,12 +574,45 @@ impl PipelineTable {
         for &pipeline in leases {
             match self.peek(pipeline, generation) {
                 Lease::Ready => taken.push(Lease::Ready),
+                // **A pipeline the guest deleted is not a reason to refuse the
+                // packet.** It is neither a wait — nothing will build it — nor a
+                // failure of this device, and the transaction's other records
+                // have nothing to do with it. On this interface a command buffer
+                // recorded before the delete still binds the object, and the
+                // guest is entitled to submit it: the host encoder retained the
+                // pipeline when the record was written, and the guest's delete
+                // ends the *name*.
+                //
+                // Refusing cost whole packets. A driven macos-26 boot refused
+                // **9374 exec packets** with `pipeline_absent_retired` — the
+                // guest deletes 145 pipelines a boot and keeps binding them —
+                // while the macos-15 boot beside it deletes four and refuses
+                // none. Every one of those packets carried records that had
+                // nothing to do with the deleted pipeline.
+                //
+                // What the executor does with a bind it cannot satisfy is the
+                // executor's, and it already answers: the rail drops its own
+                // retained object on the same delete and reports the missing
+                // bind per *draw*. One draw is what the guest loses, which is
+                // what it lost before this table existed.
+                //
+                // The other two ways to be absent stay refusals, because
+                // neither is the guest's doing. `Undeclared` means the lease
+                // list and the declarations disagree — the caller declares every
+                // lease before admitting — and `OtherGeneration` is work that
+                // outlived a reset, whose host objects a destroyer has already
+                // been handed.
+                Lease::Absent(AbsentBecause::Retired) => {
+                    taken.push(Lease::Absent(AbsentBecause::Retired))
+                }
                 Lease::Pending => {
                     taken.push(Lease::Pending);
                     waits.push(pipeline);
                 }
                 Lease::Refused(reason) => return Err(LeaseRefusal::Refused { pipeline, reason }),
-                Lease::Absent => return Err(LeaseRefusal::Absent { pipeline }),
+                Lease::Absent(because) => {
+                    return Err(LeaseRefusal::Absent { pipeline, because });
+                }
             }
         }
         // Decided in full first: nothing is charged for a list that refuses.
@@ -886,11 +955,17 @@ mod tests {
         assert_eq!(t.waits_for(&[id(1)], GEN), Ok(Vec::new()));
         assert_eq!(
             t.waits_for(&[id(1)], GEN.next()),
-            Err(LeaseRefusal::Absent { pipeline: id(1) })
+            Err(LeaseRefusal::Absent {
+                pipeline: id(1),
+                because: AbsentBecause::OtherGeneration,
+            })
         );
         assert_eq!(
             t.waits_for(&[id(9)], GEN),
-            Err(LeaseRefusal::Absent { pipeline: id(9) }),
+            Err(LeaseRefusal::Absent {
+                pipeline: id(9),
+                because: AbsentBecause::Undeclared,
+            }),
             "and one that was never declared at all"
         );
     }
@@ -949,7 +1024,7 @@ mod tests {
             !t.advance(id(1), PipelineState::Ready),
             "the host finished building an object the guest no longer has"
         );
-        assert_eq!(t.lease(id(1), GEN), Lease::Absent);
+        assert_eq!(t.lease(id(1), GEN), Lease::Absent(AbsentBecause::Retired));
     }
 
     /// A refusal is terminal and carries its reason to whoever reads it, so a
@@ -1003,7 +1078,56 @@ mod tests {
         t.advance(id(1), PipelineState::Compiling);
         t.advance(id(1), PipelineState::Ready);
         assert_eq!(t.lease(id(1), GEN), Lease::Ready);
-        assert_eq!(t.lease(id(1), GEN.next()), Lease::Absent);
+        assert_eq!(
+            t.lease(id(1), GEN.next()),
+            Lease::Absent(AbsentBecause::OtherGeneration)
+        );
+    }
+
+    /// A pipeline the guest deleted is not a wait and not a refusal.
+    ///
+    /// **The three ways to be absent are not one answer.** A guest delete ends
+    /// the *name*, and a command buffer recorded before it still binds the
+    /// object — the host encoder retained it when the record was written — so a
+    /// transaction carrying that record is entitled to run, and the records
+    /// beside it have nothing to do with the deleted pipeline. A driven macos-26
+    /// boot refused 9374 exec packets on this before the distinction existed.
+    ///
+    /// The other two stay refusals and this asserts that too: `Undeclared` means
+    /// the lease list disagrees with what was declared, and `OtherGeneration` is
+    /// work that outlived a reset whose host objects are already gone.
+    #[test]
+    fn a_retired_pipeline_is_neither_a_wait_nor_a_refusal() {
+        let mut t = PipelineTable::new();
+        assert!(t.declare(id(1), GEN));
+        t.advance(id(1), PipelineState::Translating);
+        t.advance(id(1), PipelineState::Compiling);
+        t.advance(id(1), PipelineState::Ready);
+        assert!(t.retire(id(1)));
+
+        assert_eq!(
+            t.waits_for(&[id(1)], GEN),
+            Ok(Vec::new()),
+            "the guest ended the name; there is nothing left to wait for and \
+             nothing here that makes the packet unrunnable"
+        );
+
+        assert_eq!(
+            t.waits_for(&[id(9)], GEN),
+            Err(LeaseRefusal::Absent {
+                pipeline: id(9),
+                because: AbsentBecause::Undeclared,
+            }),
+            "a lease nothing declared is the caller's two lists disagreeing"
+        );
+        assert_eq!(
+            t.waits_for(&[id(1)], GEN.next()),
+            Err(LeaseRefusal::Absent {
+                pipeline: id(1),
+                because: AbsentBecause::OtherGeneration,
+            }),
+            "and work that outlived a reset names host objects already handed away"
+        );
     }
 
     /// Two live declarations of one id would mean the object namespace failed
@@ -1072,7 +1196,7 @@ mod tests {
             t.lease(refused, gen),
             Lease::Refused(RefusalReason::CompilationFailed("no"))
         );
-        assert_eq!(t.lease(retired, gen), Lease::Absent);
+        assert_eq!(t.lease(retired, gen), Lease::Absent(AbsentBecause::Retired));
         assert_eq!(
             t.census().declared,
             before.declared + 4,
@@ -1133,7 +1257,10 @@ mod tests {
     #[test]
     fn an_absent_pipeline_answers_absent_rather_than_pending() {
         let mut t = PipelineTable::new();
-        assert_eq!(t.lease(id(9), GEN), Lease::Absent);
+        assert_eq!(
+            t.lease(id(9), GEN),
+            Lease::Absent(AbsentBecause::Undeclared)
+        );
         assert!(!t.advance(id(9), PipelineState::Translating));
         assert!(!t.refuse(id(9), RefusalReason::CompilationFailed("x")));
     }
