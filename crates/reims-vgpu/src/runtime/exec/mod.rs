@@ -945,6 +945,7 @@ fn execute_submission<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
     submission: &ExecSubmission,
+    resolved: Option<&reims_vgpu_core::exec::ExecWork>,
     out: &mut ExecResult,
     measured_ns: &mut u64,
 ) {
@@ -962,10 +963,24 @@ fn execute_submission<M: HostMemory + HostOps>(
     // stale.
     consume_resource_table(state, task_id, resource_descs);
 
+    // One cursor for the whole packet, not one per buffer: a packet's
+    // command-buffer table is one submission and the model resolved all of it
+    // into one flat record order, so a cursor that restarted per buffer would
+    // compare the second buffer's records against the first buffer's answers.
+    let mut resolved = resolved.map(ResolvedCursor::new);
+
     for stream in streams {
         let mut acc = StreamAccum::default();
         let walk_started = std::time::Instant::now();
-        walk_stream(state, host, task_id, stream, out, &mut acc);
+        walk_stream(
+            state,
+            host,
+            task_id,
+            stream,
+            out,
+            &mut acc,
+            resolved.as_mut(),
+        );
         let walk_ns = walk_started.elapsed().as_nanos() as u64;
         *measured_ns += walk_ns;
         crate::runtime::drain::note_exec_phase(crate::runtime::drain::ExecPhase::Walk, walk_ns);
@@ -1027,7 +1042,7 @@ pub fn plan_and_execute<M: HostMemory + HostOps>(
         out.deferred = true;
         return out;
     }
-    execute_planned(state, host, submission, out)
+    run_submission(state, host, submission, None, out)
 }
 
 /// Run a submission whose plan step has already answered.
@@ -1042,7 +1057,25 @@ pub fn plan_and_execute<M: HostMemory + HostOps>(
 pub fn execute_planned<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
+    inputs: RetainedInputs<'_>,
+    out: ExecResult,
+) -> ExecResult {
+    run_submission(state, host, inputs.submission, Some(inputs.resolved), out)
+}
+
+/// The execution half, with or without the model's answer about what the
+/// records are.
+///
+/// `resolved` is `Some` for a packet the model admitted and parked, which is
+/// every packet on the driven path, and `None` for the one caller that reads a
+/// submission and runs it in the same breath. That caller has no transaction,
+/// so there is nothing for a cursor to stand in — not a weaker mode of the same
+/// walk, but the absence of the second walk this exists to retire.
+fn run_submission<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
     submission: &ExecSubmission,
+    resolved: Option<&reims_vgpu_core::exec::ExecWork>,
     mut out: ExecResult,
 ) -> ExecResult {
     let started = std::time::Instant::now();
@@ -1052,7 +1085,14 @@ pub fn execute_planned<M: HostMemory + HostOps>(
     // pure CPU work over bytes the submission already holds, where the read
     // walks the guest's page tables and the execution consumes the resource
     // table.
-    execute_submission(state, host, submission, &mut out, &mut measured_ns);
+    execute_submission(
+        state,
+        host,
+        submission,
+        resolved,
+        &mut out,
+        &mut measured_ns,
+    );
     note_exec_header(started, measured_ns);
     if !out.deferred {
         out.total_us = elapsed_us(started);
@@ -1216,6 +1256,95 @@ impl crate::observe::Decline for ResourceTableDecline {
 
 fn elapsed_us(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// The two inputs an admitted packet was retained with.
+///
+/// One type rather than two arguments, because they are one fact: the command
+/// buffers are what the packet was admitted *against* and the resolved records
+/// are what it was admitted *as*, both taken at arrival before the guest could
+/// rewrite either. A caller holding one without the other would be running
+/// bytes its records never named.
+#[derive(Clone, Copy)]
+pub struct RetainedInputs<'a> {
+    pub submission: &'a ExecSubmission,
+    pub resolved: &'a reims_vgpu_core::exec::ExecWork,
+}
+
+/// Where an executing walk stands in the records the model already resolved
+/// this packet into.
+///
+/// **The walks are the same walk.** Both this device's executor and
+/// `reims_vgpu_core::walk` frame a command buffer with
+/// `reims_vgpu_protocol::segment::SegmentStream` and its records with
+/// `reims_vgpu_wire::op::OpStream`, step a protection envelope over without
+/// recording it, and visit every framed record of every buffer in table order.
+/// So the *n*th record this executor reaches is the *n*th record the model
+/// resolved, and a flat cursor is the whole of the correspondence — no second
+/// framing pass, and nothing positional to keep in step.
+///
+/// It is a cursor and not an index because the claim is worth checking rather
+/// than assuming: the class the model resolved and the class this opcode
+/// belongs to are compared at every step, and a disagreement is counted by name
+/// instead of being acted on. Until that count is a measured zero on a driven
+/// boot, nothing here decides anything.
+struct ResolvedCursor<'a> {
+    records: Vec<&'a reims_vgpu_core::exec::StreamRecord>,
+    next: usize,
+}
+
+impl<'a> ResolvedCursor<'a> {
+    fn new(work: &'a reims_vgpu_core::exec::ExecWork) -> Self {
+        Self {
+            records: work.records().collect(),
+            next: 0,
+        }
+    }
+
+    /// The resolved operation standing where this walk is, if the two agree
+    /// about what it is.
+    ///
+    /// Advances whatever the answer, because the walks advance together: a step
+    /// that held its place on a disagreement would put every later record off
+    /// by one and turn one bad reading into a whole packet of them.
+    fn step(
+        &mut self,
+        kind: SegmentKind,
+        opcode: u32,
+    ) -> Option<&'a reims_vgpu_core::exec::ResolvedOperation> {
+        let record = self.records.get(self.next);
+        self.next += 1;
+        let Some(record) = record else {
+            crate::runtime::drain::note_store_route("resolved_walk_past_end");
+            return None;
+        };
+        let Some(expected) = stream_class(kind, opcode) else {
+            // The ledger has not settled this opcode as a stream record, so
+            // this walk has no class to compare against and says so rather than
+            // reporting the model's answer as wrong.
+            crate::runtime::drain::note_store_route("resolved_walk_unjudged");
+            return None;
+        };
+        if record.op.class() != expected {
+            crate::runtime::drain::note_store_route("resolved_walk_class_differs");
+            return None;
+        }
+        crate::runtime::drain::note_store_route("resolved_walk_aligned");
+        Some(&record.op)
+    }
+}
+
+/// The stream class an opcode belongs to on the rail its segment names.
+///
+/// The ledger's own answer, through the same two steps
+/// `reims_vgpu_core::resolve::operation` takes, so "which class is this record"
+/// has one owner and this is a reader of it rather than a second table.
+fn stream_class(kind: SegmentKind, opcode: u32) -> Option<OperationClass> {
+    let row = reims_vgpu_protocol::closure::find(kind.rail(), opcode)?;
+    match reims_vgpu_core::operation::classify(row) {
+        Some(reims_vgpu_core::operation::OperationHome::Stream(class)) => Some(class),
+        Some(reims_vgpu_core::operation::OperationHome::ObjectLifecycle) | None => None,
+    }
 }
 
 /// Walk every record in one segment, handing each handler its opcode and its
@@ -1524,6 +1653,7 @@ fn walk_stream<M: HostMemory + HostOps>(
     stream: &[u8],
     out: &mut ExecResult,
     acc: &mut StreamAccum,
+    mut resolved: Option<&mut ResolvedCursor<'_>>,
 ) {
     // The outermost frame in the crate, and it is
     // `reims_vgpu_protocol::segment`'s. This device had its own segment framer
@@ -1592,6 +1722,14 @@ fn walk_stream<M: HostMemory + HostOps>(
         crate::runtime::drain::note_store_route(segment_chain_route(framed.lifetime));
         sink.begin_segment(kind);
         walk_segment_records(kind, framed.commands_offset, commands, |op, cmd| {
+            // Stepped for every record this walk reaches, whether or not the
+            // arm below has anything to do with the answer: the two walks stay
+            // in correspondence by advancing together, and a step taken only
+            // for the classes that consume it would be a cursor that means
+            // something different in every segment.
+            if let Some(cursor) = resolved.as_deref_mut() {
+                let _ = cursor.step(kind, op);
+            }
             sink.record(kind, op, cmd);
         });
         sink.end_segment();

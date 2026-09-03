@@ -215,6 +215,7 @@ fn a_stream_that_will_not_frame_says_so_instead_of_executing_nothing() {
         &truncated_segment(SegmentKind::Render.wire_type(), 64, 0),
         &mut out,
         &mut acc,
+        None,
     );
     let added = sink_body()[before..].to_string();
     assert!(
@@ -370,7 +371,9 @@ fn an_unknown_segment_family_ends_the_walk_and_the_envelope_does_not() {
     let mut acc = StreamAccum::default();
     let task_id = 0x5731_0002;
     let cap = crate::observe::FailCapture::start();
-    walk_stream(&mut state, &mut host, task_id, &stream, &mut out, &mut acc);
+    walk_stream(
+        &mut state, &mut host, task_id, &stream, &mut out, &mut acc, None,
+    );
     let lines = cap.lines();
 
     assert_eq!(
@@ -500,7 +503,7 @@ fn event_segment_signal_wait_in_stream() {
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None);
 
     // The signal landed, and the pending wait for 8 left it alone. The
     // three per-op counters this used to assert had no product reader; the
@@ -552,7 +555,7 @@ fn a_bounded_event_wait_is_refused_by_contract_and_leaves_the_generation_alone()
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
     let cap = crate::observe::FailCapture::start();
-    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None);
     let lines = cap.lines();
 
     assert!(
@@ -5520,7 +5523,7 @@ fn a_render_encoder_fence_reaches_the_render_fence_domain() {
     let mut host = FakeHost::new();
     let mut out = ExecResult::default();
     let mut acc = StreamAccum::default();
-    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc);
+    walk_stream(&mut state, &mut host, 1, &stream, &mut out, &mut acc, None);
 
     // Two updates: the first seeds the generation, the second advances it. A
     // dropped fence leaves `None` here, which is what this used to read.
@@ -7828,6 +7831,7 @@ fn a_submission_executes_the_streams_it_was_read_with_and_not_guest_memory_again
         &mut state,
         &mut host,
         &submission,
+        None,
         &mut out,
         &mut measured_ns,
     );
@@ -7883,4 +7887,169 @@ fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
         &submission,
         &mut measured_ns
     ));
+}
+
+/// The two walks over one stream reach the same records in the same order.
+///
+/// This is the whole of [`ResolvedCursor`]'s claim, and it is worth a test
+/// rather than a comment: the model resolves a packet's records at ingress and
+/// this executor walks the same bytes again when the model releases it, so
+/// "the *n*th record here is the *n*th record there" is the only thing that
+/// lets the second walk stop decoding. A framer that counted a protection
+/// envelope, a segment continuation or a refused record differently on one side
+/// than the other would put the cursor off by one, and every later record would
+/// be read as the wrong operation rather than as a refusal.
+///
+/// A mixed stream on purpose — three encoder families, a continuation and an
+/// envelope — because a stream of one family could not see a divergence that
+/// only a boundary produces.
+#[test]
+fn the_executing_walk_and_the_resolving_walk_reach_the_same_records() {
+    use reims_vgpu_core::access::{AccessRefusal, BackingId, Participation, ResourceKey};
+    use reims_vgpu_core::identity::{ChannelId, ObjectListRef, ResourceId, SlotGeneration};
+    use reims_vgpu_core::resolve::RefResolver;
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    use reims_vgpu_protocol::sync::{OPCODE_SIGNAL_EVENT, OPCODE_WAIT_EVENT};
+
+    struct Everything;
+    impl RefResolver for Everything {
+        fn resource(&self, object_ref: u32) -> Option<ResourceId> {
+            Some(ResourceId {
+                slot: ObjectListRef(object_ref),
+                generation: SlotGeneration(1),
+            })
+        }
+    }
+
+    fn record(buf: &mut Vec<u8>, opcode: u32, payload: &[u8]) {
+        let len = (OP_HEADER_LEN + payload.len()) as u32;
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], opcode);
+        st32(&mut hdr[4..8], len);
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(payload);
+    }
+
+    /// The two encoder-lifetime bytes are written from both ends of the edge,
+    /// exactly as the serializer writes them: the segment that continues sets
+    /// `continues_previous`, and the one it continues sets `continues_into_next`
+    /// — a continuation whose predecessor did not say so is refused, which is
+    /// how this fixture first found out it was writing only one of the two.
+    fn segment(buf: &mut Vec<u8>, type_: u8, lifetime: (bool, bool), payload: &[u8]) {
+        let len = (SEGMENT_HEADER_LEN + payload.len()) as u32;
+        let mut hdr = [0u8; 8];
+        st32(&mut hdr[0..4], len);
+        hdr[4] = type_;
+        hdr[5] = u8::from(lifetime.0);
+        hdr[6] = u8::from(lifetime.1);
+        buf.extend_from_slice(&hdr);
+        buf.extend_from_slice(payload);
+    }
+
+    let mut blit = Vec::new();
+    record(
+        &mut blit,
+        reims_vgpu_wire::ops::blit::OPCODE_GENERATE_MIPMAPS,
+        &7u32.to_le_bytes(),
+    );
+    record(
+        &mut blit,
+        reims_vgpu_wire::ops::blit::OPCODE_GENERATE_MIPMAPS,
+        &9u32.to_le_bytes(),
+    );
+
+    let event_body = core::mem::size_of::<reims_vgpu_wire::ops::event::SignalWait>();
+    let mut events = Vec::new();
+    for (opcode, value) in [(OPCODE_SIGNAL_EVENT, 7u64), (OPCODE_WAIT_EVENT, 7)] {
+        let mut payload = vec![0u8; event_body];
+        st32(&mut payload[0..4], 11);
+        st64(&mut payload[4..12], value);
+        record(&mut events, opcode, &payload);
+    }
+
+    let mut stream = Vec::new();
+    segment(
+        &mut stream,
+        SegmentKind::Blit.wire_type(),
+        (false, true),
+        &blit,
+    );
+    // A continuation: one encoder across two segments, which the model records
+    // into a single `ResolvedStream` and this executor visits as two segments.
+    // The flat order is what has to agree, and this is the case that proves it
+    // is the flat order and not a per-segment index.
+    segment(
+        &mut stream,
+        SegmentKind::Blit.wire_type(),
+        (true, false),
+        &blit,
+    );
+    segment(
+        &mut stream,
+        SegmentKind::Event.wire_type(),
+        (false, false),
+        &events,
+    );
+
+    let mut source = |part: &Participation| -> Result<_, AccessRefusal> {
+        Ok(part.resolve(
+            ChannelId(2),
+            ResourceKey {
+                backing: BackingId(u64::from(part.resource.slot.0)),
+                heap: None,
+            },
+            None,
+            None,
+        ))
+    };
+    let work = reims_vgpu_core::walk::exec(
+        &stream,
+        &Everything,
+        &mut source,
+        reims_vgpu_core::exec::ExecBuilder::new(),
+    )
+    .expect("every record in the fixture resolves");
+    assert_eq!(work.record_count(), 6, "the fixture's own record count");
+
+    // The executor's walk, driven for its opcodes only: what is under test is
+    // the correspondence, and running the handlers would need a whole host.
+    let mut cursor = ResolvedCursor::new(&work);
+    let mut seen = Vec::new();
+    for framed in
+        reims_vgpu_protocol::segment::SegmentStream::new(&stream).expect("the fixture frames")
+    {
+        let framed = framed.expect("the fixture frames");
+        let reims_vgpu_protocol::segment::SegmentBody::Encoder { kind, commands } = framed.body
+        else {
+            continue;
+        };
+        for op in reims_vgpu_wire::op::OpStream::new(commands) {
+            let op = op.expect("the fixture frames");
+            seen.push(
+                cursor
+                    .step(kind, op.opcode())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "record {} of the executing walk found no resolved twin",
+                            seen.len()
+                        )
+                    })
+                    .class(),
+            );
+        }
+    }
+
+    use reims_vgpu_core::operation::OperationClass;
+    assert_eq!(
+        seen,
+        vec![
+            OperationClass::Blit,
+            OperationClass::Blit,
+            OperationClass::Blit,
+            OperationClass::Blit,
+            OperationClass::Event,
+            OperationClass::Event,
+        ],
+        "the flat order agrees across the continuation and the family boundary"
+    );
 }

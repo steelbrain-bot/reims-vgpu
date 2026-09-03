@@ -2502,7 +2502,7 @@ fn run_parked<H: HostMemory + HostOps>(
         state.draining_channel = domain;
         state.draining_mask |= bit;
         let started = std::time::Instant::now();
-        let _ = process_child_packet(state, host, domain, work.packet(), work.submission());
+        let _ = process_child_packet(state, host, domain, work.packet(), work.retained());
         census::note_drain_proc(work.packet().opcode, started.elapsed().as_nanos() as u64);
         if was_draining == 0 {
             state.draining_mask &= !bit;
@@ -5659,19 +5659,20 @@ fn note_packet_domain_definition(state: &DeviceState, channel_id: u32, opcode: u
 
 /// Do one child packet's host work.
 ///
-/// `submission` is the command buffers a caller read out of the task's address
-/// space **before** the ring head moved past this packet — the exec class's
-/// only input that is not in the packet. `None` means "read it now", which is
-/// what a caller holding the packet at its ring position does; `Some` is what a
-/// caller running a retained packet at an ordering position has, and it is the
-/// same bytes the transaction was admitted against rather than whatever the
-/// guest has since put at those addresses.
+/// `retained` is what a caller running a packet at an ordering position holds:
+/// the command buffers read out of the task's address space **before** the ring
+/// head moved past this packet — the exec class's only input that is not in the
+/// packet — together with the records the model resolved those buffers into.
+/// `None` means "read it now", which is what a caller holding the packet at its
+/// ring position does. The retained form is the same bytes the transaction was
+/// admitted against rather than whatever the guest has since put at those
+/// addresses, and the same records it was admitted as.
 fn process_child_packet<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     channel_id: u32,
     packet: &Packet,
-    submission: Option<&crate::runtime::exec::ExecSubmission>,
+    retained: Option<crate::runtime::exec::RetainedInputs<'_>>,
 ) -> ChildPacketDisposition {
     note_packet_domain_definition(state, channel_id, packet.opcode);
     note_packet_class(reims_vgpu_protocol::packets::Channel::Child, packet.opcode);
@@ -5921,11 +5922,11 @@ fn process_child_packet<H: HostMemory + HostOps>(
                 // were done is what decided the packet could run at all, so
                 // asking again would be paying per pipeline for an answer the
                 // model already acted on.
-                let result = match submission {
-                    Some(submission) => crate::runtime::exec::execute_planned(
+                let result = match retained {
+                    Some(inputs) => crate::runtime::exec::execute_planned(
                         state,
                         host,
-                        submission,
+                        inputs,
                         crate::runtime::exec::ExecResult::default(),
                     ),
                     None => {

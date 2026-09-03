@@ -158,6 +158,21 @@ impl ParkedWork {
         self.resolved.as_ref()
     }
 
+    /// Everything this position retained beyond its own packet, for the
+    /// executor.
+    ///
+    /// One answer rather than two accessors a caller could take separately:
+    /// the two halves were parked together or not at all, and a caller that
+    /// could ask for one alone could run bytes against records that are not
+    /// theirs.
+    #[must_use]
+    pub fn retained(&self) -> Option<crate::runtime::exec::RetainedInputs<'_>> {
+        Some(crate::runtime::exec::RetainedInputs {
+            submission: self.submission.as_ref()?,
+            resolved: self.resolved.as_ref()?,
+        })
+    }
+
     /// Host bytes this position is holding.
     ///
     /// The payload, the command buffers and the resolved records, which are the
