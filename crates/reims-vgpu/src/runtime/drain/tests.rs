@@ -7452,3 +7452,153 @@ fn owing_a_word_is_not_publishing_it_and_only_the_landing_moves_the_plane() {
         "slots are independent timelines"
     );
 }
+
+/// [`arrival`] — the step both drain loops used to spell for themselves.
+mod arrivals {
+    use super::*;
+    use crate::runtime::host::FakeHost;
+
+    /// Two guest pages: enough for a child ring's page list to be a list.
+    const PAGE: u64 = 4096;
+    const ROOT_BASE: u64 = 0x10_0000;
+    const CHILD_PAGE_0: u64 = 0x20_0000;
+    const CHILD_PAGE_1: u64 = 0x21_0000;
+    const CAPACITY: u32 = 2 * PAGE as u32;
+
+    /// A host with a root ring and a child ring, both holding `bytes` at
+    /// offset zero.
+    fn host_with(bytes: &[u8]) -> FakeHost {
+        let mut host = FakeHost::new();
+        for base in [ROOT_BASE, CHILD_PAGE_0, CHILD_PAGE_1] {
+            host.map_range(base, PAGE as usize, 0);
+        }
+        host.map_range(ROOT_BASE + PAGE, PAGE as usize, 0);
+        host.write_gpa(ROOT_BASE, bytes).expect("mapped");
+        host.write_gpa(CHILD_PAGE_0, bytes).expect("mapped");
+        host
+    }
+
+    fn root() -> Ring<'static> {
+        Ring::Root {
+            base_gpa: ROOT_BASE,
+            capacity: CAPACITY,
+        }
+    }
+
+    const CHILD_PAGES: [u64; 2] = [CHILD_PAGE_0, CHILD_PAGE_1];
+
+    fn child() -> Ring<'static> {
+        Ring::Child {
+            page_gpas: &CHILD_PAGES,
+            capacity: CAPACITY,
+            page_shift: PAGE_SHIFT_X86,
+        }
+    }
+
+    /// The two rings take the same bytes to the same packet.
+    ///
+    /// **This is what the extraction is for.** One span and one page list are
+    /// two ways of reaching bytes, not two definitions of what a packet is —
+    /// and the two copies of header-snapshot-decode had already drifted once,
+    /// which `packet_snapshot_len`'s own doc records.
+    #[test]
+    fn both_rings_take_the_same_bytes_to_the_same_packet() {
+        let bytes = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
+        let host = host_with(&bytes);
+        let tail = bytes.len() as u32;
+
+        let (Arrival::Packet(from_root), Arrival::Packet(from_child)) = (
+            arrival(&root(), &host, 0, tail),
+            arrival(&child(), &host, 0, tail),
+        ) else {
+            panic!("a whole published packet arrives from either ring");
+        };
+        assert_eq!(from_root, from_child);
+        assert_eq!(from_root.opcode, ROOT_OP_DEFINE_FIFO);
+        assert_eq!(from_root.completion_stamp, 7);
+        assert_eq!(from_root.next_head, tail);
+    }
+
+    /// A head that has caught its tail is nothing, and is not a read.
+    #[test]
+    fn a_head_that_has_caught_the_tail_is_nothing() {
+        let host = FakeHost::new();
+        assert!(matches!(arrival(&root(), &host, 12, 12), Arrival::Nothing));
+    }
+
+    /// A producer mid-write is nothing, on both rings and at both stages: too
+    /// few bytes for a header, and a header whose packet is not all there.
+    ///
+    /// Neither reaches the always-on channel, which is the carve-out
+    /// [`PacketError::fault`] makes mechanical and the reason `Nothing` is one
+    /// answer rather than three.
+    #[test]
+    fn a_producer_mid_write_is_nothing_on_either_ring() {
+        let bytes = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
+        let host = host_with(&bytes);
+
+        for ring in [root(), child()] {
+            assert!(
+                matches!(
+                    arrival(&ring, &host, 0, PACKET_HEADER_LEN - 1),
+                    Arrival::Nothing
+                ),
+                "fewer bytes published than a header"
+            );
+            assert!(
+                matches!(
+                    arrival(&ring, &host, 0, PACKET_HEADER_LEN),
+                    Arrival::Nothing
+                ),
+                "a header published and its payload not yet"
+            );
+        }
+    }
+
+    /// A tail behind its head is a fault, on either ring.
+    #[test]
+    fn a_desynced_head_and_tail_is_a_fault() {
+        let host = FakeHost::new();
+        for ring in [root(), child()] {
+            assert!(matches!(
+                arrival(&ring, &host, 8, CAPACITY + 64),
+                Arrival::Fault(PacketFault::DesyncedHeadTail)
+            ));
+        }
+    }
+
+    /// A declared size the ring itself could never hold is the guest's error,
+    /// and comes back as the fault its own ring reports.
+    #[test]
+    fn a_size_past_the_ring_is_a_fault_from_either_ring() {
+        let mut bytes = packet_bytes(ROOT_OP_DEFINE_FIFO, 7, &1u32.to_le_bytes());
+        bytes[PACKET_TOTAL_SIZE..PACKET_TOTAL_SIZE + 4]
+            .copy_from_slice(&(CAPACITY + 1).to_le_bytes());
+        let host = host_with(&bytes);
+
+        for ring in [root(), child()] {
+            assert!(matches!(
+                arrival(&ring, &host, 0, CAPACITY),
+                Arrival::Fault(PacketFault::BadSize)
+            ));
+        }
+    }
+
+    /// Each ring reports a failed read under its own name, which is what the
+    /// two drains' `FailEvent` variants are keyed on.
+    #[test]
+    fn a_read_that_fails_is_named_by_the_ring_it_failed_on() {
+        // No RAM at all, so the header read cannot land.
+        let mut host = FakeHost::new();
+        host.mark_non_ram(0, u64::MAX);
+
+        assert!(matches!(
+            arrival(&root(), &host, 0, CAPACITY),
+            Arrival::Fault(PacketFault::RootHeaderRead)
+        ));
+        assert!(matches!(
+            arrival(&child(), &host, 0, CAPACITY),
+            Arrival::Fault(PacketFault::ChildHeaderRead)
+        ));
+    }
+}

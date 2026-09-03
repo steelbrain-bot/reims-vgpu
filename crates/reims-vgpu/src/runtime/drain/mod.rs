@@ -2143,6 +2143,120 @@ fn decode_packet_inner(
 /// Timed at the function rather than at its four call sites, so both FIFOs and
 /// both reads per packet are counted and a fifth call site cannot be added
 /// without being measured.
+/// A FIFO's bytes, and how this device reaches them.
+///
+/// The root ring is one contiguous guest-physical span; a child ring is a page
+/// list walked at the device's page shift. **That is the whole of the
+/// difference between the two drains' reads**, and naming it is what lets one
+/// arrival step serve both rings instead of each keeping its own copy of
+/// header-snapshot-decode.
+///
+/// The copies had already drifted once — see [`packet_snapshot_len`], whose own
+/// doc records the arm one ring grew and the other did not — which is the
+/// reading this type exists to stop repeating.
+pub enum Ring<'a> {
+    /// The device's own FIFO: one span, from a base GPA.
+    Root { base_gpa: u64, capacity: u32 },
+    /// A guest-defined channel's FIFO: a page list, walked at `page_shift`.
+    Child {
+        page_gpas: &'a [u64],
+        capacity: u32,
+        page_shift: u32,
+    },
+}
+
+impl Ring<'_> {
+    /// The ring's data length, which is the modulus every head is taken under.
+    #[must_use]
+    pub const fn capacity(&self) -> u32 {
+        match *self {
+            Self::Root { capacity, .. } | Self::Child { capacity, .. } => capacity,
+        }
+    }
+
+    fn read<M: HostMemory>(&self, mem: &M, absolute: u32, len: u32) -> Result<Vec<u8>, MemError> {
+        match *self {
+            Self::Root { base_gpa, capacity } => {
+                read_ring_bytes(mem, base_gpa, capacity, absolute, len)
+            }
+            Self::Child {
+                page_gpas,
+                capacity,
+                page_shift,
+            } => read_child_ring_bytes(mem, page_gpas, capacity, absolute, len, page_shift),
+        }
+    }
+
+    /// The faults a failed header read and a failed snapshot read are reported
+    /// as, which are the two names each ring already had for them.
+    const fn read_faults(&self) -> (PacketFault, PacketFault) {
+        match *self {
+            Self::Root { .. } => (PacketFault::RootHeaderRead, PacketFault::RootSnapRead),
+            Self::Child { .. } => (PacketFault::ChildHeaderRead, PacketFault::ChildSnapRead),
+        }
+    }
+}
+
+/// What one look at a ring's consumer pointer found.
+///
+/// Three answers and not more, because a drain does three things with them: run
+/// the packet, stop quietly, or stop and say why.
+pub enum Arrival {
+    /// A whole packet, decoded out of a snapshot of the ring.
+    Packet(Packet),
+    /// Nothing to run, and nothing to report.
+    ///
+    /// The head has caught the tail, or the producer is mid-write: fewer bytes
+    /// published than a header, or a header whose `total_size` names bytes that
+    /// are not there yet. **A partial packet is the normal state of a producer**
+    /// — see [`PacketError::fault`], which is where that carve-out is made
+    /// mechanical — so all three are one answer and none of them is a line in
+    /// the log.
+    Nothing,
+    /// A registered fault. The drain stops and names it on its own ring's
+    /// event; which event that is stays the caller's, because the two rings
+    /// report through different `FailEvent` variants.
+    Fault(PacketFault),
+}
+
+/// Take the next packet at `head`, out of whichever ring this is.
+///
+/// The step both drain loops used to spell for themselves: bound the published
+/// bytes, read the header, work out how much of the packet is safe to snapshot,
+/// read that, and decode it. Every one of those five is shared, and the two
+/// copies differed only in which reader they called and which `FailEvent` they
+/// reported through — the first of which is [`Ring`]'s and the second of which
+/// stays the caller's.
+///
+/// The head is passed rather than read here on purpose: the root ring keeps its
+/// consumer pointer in an atomic this device also publishes to, and a step that
+/// loaded it itself would be a second reader of a value the caller is in the
+/// middle of advancing.
+pub fn arrival<M: HostMemory>(ring: &Ring<'_>, mem: &M, head: u32, tail: u32) -> Arrival {
+    if head == tail {
+        return Arrival::Nothing;
+    }
+    let capacity = ring.capacity();
+    let Some(available) = published_byte_count(head, tail, capacity) else {
+        return Arrival::Fault(PacketFault::DesyncedHeadTail);
+    };
+    if available < PACKET_HEADER_LEN {
+        return Arrival::Nothing;
+    }
+    let (header_fault, snap_fault) = ring.read_faults();
+    let Ok(header) = ring.read(mem, head, PACKET_HEADER_LEN) else {
+        return Arrival::Fault(header_fault);
+    };
+    let snap_len = packet_snapshot_len(&header, available, capacity);
+    let Ok(snap) = ring.read(mem, head, snap_len) else {
+        return Arrival::Fault(snap_fault);
+    };
+    match decode_packet(&snap, head, available, capacity) {
+        Ok(packet) => Arrival::Packet(packet),
+        Err(err) => err.fault().map_or(Arrival::Nothing, Arrival::Fault),
+    }
+}
+
 fn read_ring_bytes<M: HostMemory>(
     mem: &M,
     base_gpa: u64,
@@ -3209,88 +3323,26 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
     let base = state.pfn_gpa(state.gfx.fifo_base_page) + state.gfx.fifo_start as u64;
     let mut completed = false;
 
-    while state
-        .gfx
-        .fifo_read
-        .load(std::sync::atomic::Ordering::Acquire)
-        != state.gfx.fifo_written
-    {
-        let Some(available) = published_byte_count(
-            state
-                .gfx
-                .fifo_read
-                .load(std::sync::atomic::Ordering::Acquire),
-            state.gfx.fifo_written,
-            ring_size,
-        ) else {
-            state.record_fail(FailEvent::MalformedRootPacket {
-                fault: PacketFault::DesyncedHeadTail,
-                head: state
-                    .gfx
-                    .fifo_read
-                    .load(std::sync::atomic::Ordering::Acquire),
-            });
-            break;
-        };
-        if available < PACKET_HEADER_LEN {
-            break;
-        }
-        // Snapshot up to min(available, ring_size) — header first then full packet.
-        let header = match read_ring_bytes(
-            host,
-            base,
-            ring_size,
-            state
-                .gfx
-                .fifo_read
-                .load(std::sync::atomic::Ordering::Acquire),
-            PACKET_HEADER_LEN,
-        ) {
-            Ok(h) => h,
-            Err(_) => {
-                state.record_fail(FailEvent::MalformedRootPacket {
-                    fault: PacketFault::RootHeaderRead,
-                    head: state
-                        .gfx
-                        .fifo_read
-                        .load(std::sync::atomic::Ordering::Acquire),
-                });
+    let ring = Ring::Root {
+        base_gpa: base,
+        capacity: ring_size,
+    };
+    loop {
+        // Loaded once per turn and used for the whole of it. Every read below
+        // used to load it again, which was the same value each time — nothing
+        // advances the consumer pointer until this loop stores to it — read
+        // seven ways.
+        let head = state
+            .gfx
+            .fifo_read
+            .load(std::sync::atomic::Ordering::Acquire);
+        match arrival(&ring, host, head, state.gfx.fifo_written) {
+            Arrival::Nothing => break,
+            Arrival::Fault(fault) => {
+                state.record_fail(FailEvent::MalformedRootPacket { fault, head });
                 break;
             }
-        };
-        let snap_len = packet_snapshot_len(&header, available, ring_size);
-        let snap = match read_ring_bytes(
-            host,
-            base,
-            ring_size,
-            state
-                .gfx
-                .fifo_read
-                .load(std::sync::atomic::Ordering::Acquire),
-            snap_len,
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                state.record_fail(FailEvent::MalformedRootPacket {
-                    fault: PacketFault::RootSnapRead,
-                    head: state
-                        .gfx
-                        .fifo_read
-                        .load(std::sync::atomic::Ordering::Acquire),
-                });
-                break;
-            }
-        };
-        match decode_packet(
-            &snap,
-            state
-                .gfx
-                .fifo_read
-                .load(std::sync::atomic::Ordering::Acquire),
-            available,
-            ring_size,
-        ) {
-            Ok(packet) => {
+            Arrival::Packet(packet) => {
                 // The main FIFO stamps per packet and latches nothing, so there is
                 // no pending value here for a wait to be answered from.
                 if note_packet_stamp_waits(state, host, None, &packet, None) == StampVerdict::Hold {
@@ -3376,21 +3428,6 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
                         }
                     }
                 }
-            }
-            Err(err) => {
-                // `fault()` decides which errors reach the log: a packet the
-                // producer is still writing is ring control flow and answers
-                // `None`. Either way the drain stops here and comes back.
-                if let Some(fault) = err.fault() {
-                    state.record_fail(FailEvent::MalformedRootPacket {
-                        fault,
-                        head: state
-                            .gfx
-                            .fifo_read
-                            .load(std::sync::atomic::Ordering::Acquire),
-                    });
-                }
-                break;
             }
         }
     }
@@ -6025,75 +6062,47 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
         };
-        if head == tail {
-            break;
-        }
-        let Some(available) = published_byte_count(head, tail, ring_length) else {
-            state.record_fail(FailEvent::MalformedChildPacket {
-                channel: channel_id,
-                fault: PacketFault::DesyncedHeadTail,
-                head,
-            });
-            break;
+        let ring = Ring::Child {
+            page_gpas: &page_gpas,
+            capacity: ring_length,
+            page_shift: state.page_shift,
         };
-        if available < PACKET_HEADER_LEN {
-            break;
-        }
-        let header = match read_child_ring_bytes(
-            host,
-            &page_gpas,
-            ring_length,
-            head,
-            PACKET_HEADER_LEN,
-            state.page_shift,
-        ) {
-            Ok(h) => h,
-            Err(_) => {
+        match arrival(&ring, host, head, tail) {
+            Arrival::Nothing => break,
+            Arrival::Fault(fault) => {
                 state.record_fail(FailEvent::MalformedChildPacket {
                     channel: channel_id,
-                    fault: PacketFault::ChildHeaderRead,
+                    fault,
                     head,
                 });
                 break;
             }
-        };
-        let snap_len = packet_snapshot_len(&header, available, ring_length);
-        let snap = match read_child_ring_bytes(
-            host,
-            &page_gpas,
-            ring_length,
-            head,
-            snap_len,
-            state.page_shift,
-        ) {
-            Ok(s) => s,
-            Err(_) => {
-                state.record_fail(FailEvent::MalformedChildPacket {
-                    channel: channel_id,
-                    fault: PacketFault::ChildSnapRead,
-                    head,
-                });
-                break;
-            }
-        };
-        // Entry gate before decode of full payload: hold CmdDisplaySwap when
-        // host paint is already two presents behind (apple-gfx pending_frames
-        // >= 2). Leave head unmoved so body draws on other channels can still
-        // land via drain_other; re-enter after note_present_paint_consumed.
-        let peek_opcode = ld16(&header[PACKET_OPCODE..]);
-        if matches!(
-            peek_opcode,
-            CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3
-        ) && state.present.unpainted_presents >= MAX_UNPAINTED_PRESENTS
-        {
-            note_present_backpressure_hold(state, channel_id, head, tail);
-            // Paint will schedule the next worker slice. Preserve this channel
-            // without self-waking the worker ahead of QEMU's action BH.
-            state.pending.child_mask |= bit;
-            break;
-        }
-        match decode_packet(&snap, head, available, ring_length) {
-            Ok(packet) => {
+            Arrival::Packet(packet) => {
+                // Entry gate: hold CmdDisplaySwap when host paint is already two
+                // presents behind (apple-gfx pending_frames >= 2). Leave head
+                // unmoved so body draws on other channels can still land via
+                // drain_other; re-enter after note_present_paint_consumed.
+                //
+                // It used to peek the opcode out of the header before the
+                // payload was decoded. Decoding is a parse of a snapshot this
+                // device has already read and no side effect of the packet has
+                // run, so the gate holds the same packets from the same place;
+                // what it costs is a parse on the rare hold, and what it buys is
+                // that the ring read is one named step.
+                if matches!(
+                    packet.opcode,
+                    CHILD_OP_DISPLAY_SWAP
+                        | CHILD_OP_DISPLAY_TRANSACTION2
+                        | CHILD_OP_DISPLAY_TRANSACTION3
+                ) && state.present.unpainted_presents >= MAX_UNPAINTED_PRESENTS
+                {
+                    note_present_backpressure_hold(state, channel_id, head, tail);
+                    // Paint will schedule the next worker slice. Preserve this
+                    // channel without self-waking the worker ahead of QEMU's
+                    // action BH.
+                    state.pending.child_mask |= bit;
+                    break;
+                }
                 if note_packet_stamp_waits(
                     state,
                     host,
@@ -6185,16 +6194,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     }
                     break;
                 }
-            }
-            Err(err) => {
-                if let Some(fault) = err.fault() {
-                    state.record_fail(FailEvent::MalformedChildPacket {
-                        channel: channel_id,
-                        fault,
-                        head,
-                    });
-                }
-                break;
             }
         }
     }
