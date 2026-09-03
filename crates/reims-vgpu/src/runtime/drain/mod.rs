@@ -3671,11 +3671,16 @@ fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
 /// `packet_class_query=3`, `packet_class_control=10` — 2227 classified — and
 /// `packet_class_unclassified=0`**, with no line on the failure channel.
 ///
-/// So on this rail the ordering group refuses nothing for want of a class, and
+/// **macos-15 retaken, same workload, same day**: `packet_class_exec=9571`,
+/// `packet_class_lifecycle=15033`, `packet_class_present=1066`,
+/// `packet_class_query=13`, `packet_class_control=11` — 25 694 classified —
+/// and `packet_class_unclassified=0` against the 2166 above, with
+/// `packet_unadmitted=0`.
+///
+/// So on both rails the ordering group refuses nothing for want of a class, and
 /// the four remaining rows are a contract question rather than a cutover
-/// blocker. The macos-15 denominator above has not been retaken since the row
-/// settled; the numbers are kept as the measurement that found the blocker,
-/// not as this rail's current reading.
+/// blocker. The 2166 is kept as the measurement that found the blocker, not as
+/// a current reading.
 ///
 /// **And the kind census says the open question is 10 packets wide.** Of the
 /// 2166, `child_delete_object_sampler_state=2148`,

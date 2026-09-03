@@ -3689,6 +3689,86 @@ fn the_stale_resolution_witness_counts_what_it_compared() {
     );
 }
 
+/// The other half of the reply-destination question, asked of a page frame.
+///
+/// `CmdGetDeviceInfo` replies into a bare guest page frame, which lies in no
+/// task's address space, so the allocation scan above cannot be pointed at it.
+/// The frame can still be part of a **mapping's** surface, and that is the
+/// collision that matters: the reply write and every access to that surface
+/// would come out over two backings and never be ordered against each other.
+///
+/// Both driven rails read `device_info_reply_after_an_identity = 1`, so the
+/// mint-count arm never closes on a real guest and this is the arm that has to.
+#[test]
+fn a_device_info_reply_frame_is_measured_against_the_mappings_this_device_holds() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::iosurface_pages::{PAGE_ENTRY_PFN_SHIFT, PAGE_ENTRY_VALID};
+
+    fn pte(pfn: u32) -> u32 {
+        (pfn << PAGE_ENTRY_PFN_SHIFT) | PAGE_ENTRY_VALID
+    }
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    const HELD: u32 = 0x40;
+    const FREE: u32 = 0x41;
+
+    // Before anything is minted the closing arm answers, and it answers without
+    // looking at a mapping at all — which is why it cannot be the only arm.
+    let before = store_route_count("device_info_reply_before_any_identity");
+    super::note_device_info_reply_destination(&state, HELD);
+    assert_eq!(
+        store_route_count("device_info_reply_before_any_identity"),
+        before + 1
+    );
+
+    // One identity handed out, so the mint count can no longer close anything.
+    let _ = state.frame_backing_identity(0xdead);
+    assert!(state.backing_identities_minted() > 0);
+
+    state.mappings.insert(
+        7,
+        crate::model::MappingEntry {
+            mapped: true,
+            page_entries: vec![pte(0x10), pte(HELD), pte(0x11)],
+            ..Default::default()
+        },
+    );
+    // An unmapped entry's page list names pages it no longer holds, so it is
+    // not live storage and must not produce a finding.
+    state.mappings.insert(
+        8,
+        crate::model::MappingEntry {
+            mapped: false,
+            page_entries: vec![pte(FREE)],
+            ..Default::default()
+        },
+    );
+
+    let inside = store_route_count("device_info_reply_frame_in_a_mapping");
+    let outside = store_route_count("device_info_reply_frame_in_no_mapping");
+
+    super::note_device_info_reply_destination(&state, HELD);
+    assert_eq!(
+        store_route_count("device_info_reply_frame_in_a_mapping"),
+        inside + 1,
+        "the reply page is one of a live mapping's surface pages"
+    );
+
+    super::note_device_info_reply_destination(&state, FREE);
+    assert_eq!(
+        store_route_count("device_info_reply_frame_in_no_mapping"),
+        outside + 1,
+        "an unmapped mapping's stale page list is not storage anything holds"
+    );
+
+    super::note_device_info_reply_destination(&state, 0x99);
+    assert_eq!(
+        store_route_count("device_info_reply_frame_in_no_mapping"),
+        outside + 2,
+        "and a page no mapping ever named is the closing answer"
+    );
+}
+
 /// A query's reply buffer is either part of an allocation this device
 /// identifies or it is not, and the instrument says which — with the number it
 /// examined.

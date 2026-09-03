@@ -2498,6 +2498,20 @@ impl<M: HostMemory> reims_vgpu_core::resolve::ResourceStorage for TaskNames<'_, 
 ///
 /// `query_reply_scanned` is the denominator. Without it a boot where no reply
 /// overlapped anything and a boot where no query resolved a task read the same.
+///
+/// # What two driven boots answered
+///
+/// **Twenty-eight replies scanned, twenty-eight outside every allocation, none
+/// inside.** macos-15 reads `query_reply_scanned = 24` and
+/// `query_reply_outside_every_allocation = 24`; macos-26 reads 4 and 4. Neither
+/// rail produced a `query_reply_inside_an_allocation` line.
+///
+/// So of the two errors the cutover has to choose between, only one has a
+/// population here: giving a task-GVA reply destination a backing of its own is
+/// the construction these guests support, and resolving it into an allocation
+/// would be ordering the write against memory it does not touch. Twenty-eight
+/// is a small denominator and this is a rail-and-workload reading, not a
+/// theorem — the route stays so a boot that finds the other case says so.
 pub fn note_query_reply_destination(
     state: &DeviceState,
     task_id: u32,
@@ -2699,6 +2713,34 @@ impl<M: HostMemory> reims_vgpu_core::query::Destinations for TaskNames<'_, M> {
 /// `device_info_reply_after_an_identity` is the one that keeps the term open,
 /// and it carries the counts on the failure channel because a bare route would
 /// not say how much storage the mint would have to be compared against.
+///
+/// # The mint count alone cannot close it, and two driven boots are why
+///
+/// macos-15 and macos-26 both read `device_info_reply_scanned = 1` and
+/// `device_info_reply_after_an_identity = 1`: the guest asks after this device
+/// has minted, every time, so the closing arm above never runs on a real rail
+/// and the term would stay open forever on the counter alone.
+///
+/// The counter was also answering the wrong question. A monotone never-reused
+/// [`crate::model::BackingWindowRefs`] counter feeds all three key spaces, so a
+/// fresh number *cannot* equal one already handed out — that part is closed by
+/// construction and needs no boot. The danger the plan names is the opposite
+/// one and is about **storage, not numbers**: if the reply page is also part of
+/// storage some other identity already names, then the reply write and every
+/// access to that storage come out over two backings and the hazard edge
+/// between them is never drawn.
+///
+/// So the question is asked of geometry, in the one key space a page frame can
+/// collide with. A task-GVA window is reached through a task's page table and
+/// is [`note_query_reply_destination`]'s half; what is left is a mapping's
+/// surface, whose storage *is* a list of guest page frames
+/// ([`crate::model::MappingEntry::page_entries`]). Scanning them is affordable
+/// here for the same reason the other half's scan is: the guest asks once a
+/// boot.
+///
+/// `device_info_reply_frame_in_no_mapping` is the closing answer and
+/// `device_info_reply_frame_in_a_mapping` is the open one — and unlike the
+/// mint count, both are reachable on a rail that has already minted.
 pub fn note_device_info_reply_destination(state: &DeviceState, reply_pfn: u32) {
     crate::runtime::drain::note_store_route("device_info_reply_scanned");
     let minted = state.backing_identities_minted();
@@ -2707,15 +2749,38 @@ pub fn note_device_info_reply_destination(state: &DeviceState, reply_pfn: u32) {
         return;
     }
     crate::runtime::drain::note_store_route("device_info_reply_after_an_identity");
-    if crate::observe::first_sight("device_info_reply_after_an_identity", u64::from(reply_pfn)) {
+    // Which mapping, if any, already holds this page as part of its surface.
+    // `mapped` and a non-empty page list together are what make an entry live
+    // storage: an unmapped mapping's stale list names pages it no longer holds,
+    // and reporting one would be a finding about nothing.
+    let reply_gpa = state.pfn_gpa(reply_pfn);
+    let page_shift = state.page_shift;
+    let holder = state.mappings.iter().find_map(|(&id, mapping)| {
+        if !mapping.mapped || mapping.page_entries.is_empty() {
+            return None;
+        }
+        mapping
+            .page_entries
+            .iter()
+            .any(|&entry| {
+                crate::protocol::iosurface_pages::entry_gpa_shift(entry, page_shift)
+                    == Some(reply_gpa)
+            })
+            .then_some(id)
+    });
+    let Some(holder) = holder else {
+        crate::runtime::drain::note_store_route("device_info_reply_frame_in_no_mapping");
+        return;
+    };
+    crate::runtime::drain::note_store_route("device_info_reply_frame_in_a_mapping");
+    if crate::observe::first_sight("device_info_reply_frame_in_a_mapping", u64::from(reply_pfn)) {
         let resources = state.task_resources.len();
         let tasks = state.tasks.live_count();
         crate::observe::fail(format!(
-            "device_info_reply_after_an_identity pfn={reply_pfn:#x} minted={minted} \
-             tasks={tasks} resources={resources} (the reply page can only be given a \
-             minted identity, and this device has already handed identities out — so \
-             whether the reply write is ordered against the storage holding them is \
-             unestablished)"
+            "device_info_reply_frame_in_a_mapping pfn={reply_pfn:#x} mapping={holder} \
+             minted={minted} tasks={tasks} resources={resources} (the reply page is part \
+             of a mapping's surface, so an identity of its own would leave the reply write \
+             unordered against every access to that surface)"
         ));
     }
 }
