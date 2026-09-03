@@ -622,18 +622,33 @@ fn note_delete_object_ref_space<M: HostMemory>(
     let named = state.object_name(task_id, object_ref).is_some();
     note_store_route(retained.named_route(named));
     if !named {
-        // *Which* kinds the model cannot name, which the two counters above do
-        // not say. They are the packets `SessionModel::admit` would refuse with
-        // `UnknownRef`, and closing that population means naming each kind
-        // where it is *constructed* — a different site per kind, and a fix
-        // aimed at the wrong one buys nothing. A driven boot puts the whole
-        // population under twenty against ~2160 destroys, so it is small
-        // enough that guessing its composition from an older reading is how a
-        // session spends two rail edits on four packets.
+        // *Which* kinds the model has no name for, which the two counters above
+        // do not say. Closing this population means naming each kind where it
+        // is *constructed* — a different site per kind, and a fix aimed at the
+        // wrong one buys nothing.
         note_store_route(unnamed_kind_route(opcode));
     }
-    let Some(entry) = crate::runtime::objects::lookup_list_entry(state, host, task_id, object_ref)
-    else {
+    let entry = crate::runtime::objects::lookup_list_entry(state, host, task_id, object_ref);
+    if !named {
+        // **Having no name yet is not the same as being unresolvable, and the
+        // difference is the whole refusal population.** `objects::name_resource`
+        // — which is what the production `RefResolver` answers with — falls
+        // through to the guest's list when the model has no name, so a ref whose
+        // entry is still live gets a name taken from it *at that moment* and the
+        // packet crosses. Only a ref with neither is one the bridge refuses with
+        // `ResolveRefusal::UnknownRef`.
+        //
+        // The census cannot ask `name_resource` itself: naming declares, and a
+        // census that declared would be answering a question it had just
+        // changed. Asking the list read-only is the same first step and is what
+        // separates the two.
+        note_store_route(if entry.is_some() {
+            "delete_unnamed_but_list_still_has_it"
+        } else {
+            "delete_unnamed_and_unresolvable"
+        });
+    }
+    let Some(entry) = entry else {
         note_store_route(retained.route(RefSpaceAnswer::NoListEntry));
         return;
     };
