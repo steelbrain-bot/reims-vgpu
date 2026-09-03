@@ -1216,7 +1216,14 @@ impl ResourcePools {
                 // allocation is unchanged — `reusable_for` matched on it — so
                 // this is the one field a second texture view of one surface
                 // moves.
-                slot.format = format;
+                //
+                // Through the setter, because it is a field the host window's
+                // publish decided presentability on: `slot_present_decline` asks
+                // `scanout_order()`, which reads exactly this. A published BGRA
+                // resident re-declared RGBA under the same allocation would be
+                // blitted in the wrong channel order by a window that had already
+                // been told it could take it.
+                self.set_registry_format(&identity, format);
                 counters
                     .gpu_load_hits
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2283,6 +2290,37 @@ impl ResourcePools {
         self.set_registry_access(identity, access);
     }
 
+    /// The one place a resident's declared format is written, and the place the
+    /// host window's licence is checked against that write.
+    ///
+    /// The sibling of [`Self::set_registry_access`], for the other field of a
+    /// live slot that production mutates in place. `registry_ensure`'s
+    /// framebuffer-only arm re-declares a surface's interpretation while keeping
+    /// its allocation, and `ResidentTargetSlot::scanout_order` — the condition
+    /// `slot_present_decline` refuses a non-BGRA resident on — derives from it.
+    ///
+    /// The failure is quieter than the access one and no less wrong: not an
+    /// invalid barrier but a frame blitted in the wrong channel order, by a
+    /// window that was told at publish that this resident could carry it.
+    ///
+    /// On a change, for the reason the sibling gives.
+    fn set_registry_format(
+        &mut self,
+        identity: &TargetIdentity,
+        format: translate::pixel::ResidentFormat,
+    ) {
+        let Some(slot) = self.registry.get_mut(identity) else {
+            return;
+        };
+        if slot.format == format {
+            return;
+        }
+        slot.format = format;
+        if self.window_published.contains(identity) {
+            self.invalidate_window_sources();
+        }
+    }
+
     /// The one place a resident's access is written, and the place the host
     /// window's licence is checked against that write.
     ///
@@ -3052,6 +3090,42 @@ pub(super) mod pin_count_tests {
         assert_eq!(super::window_source_epoch(), stamped);
     }
 
+    /// The format half: a published resident re-declared under a different
+    /// channel order stops being the resident the window was told it could
+    /// take.
+    ///
+    /// `registry_ensure`'s framebuffer-only arm is where this happens in
+    /// production — same allocation, second texture view, new interpretation —
+    /// and the failure is quieter than the access one: not an invalid barrier
+    /// but a frame blitted in the wrong channel order.
+    #[test]
+    fn re_declaring_a_published_residents_format_moves_the_window_stamp() {
+        let mut pools = ResourcePools::new();
+        let published = surface(55);
+        admit_ready(&mut pools, &published);
+        let held = pools
+            .registry_get(&published)
+            .expect("just admitted")
+            .format;
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        // Re-declaring the interpretation it already carries is not a change,
+        // for the reason the access sibling gives.
+        pools.set_registry_format(&published, held);
+        assert_eq!(super::window_source_epoch(), stamped);
+
+        let other = translate::pixel::ResidentFormat::of(translate::pixel::RESIDENT_RGBA_FORMAT);
+        assert_ne!(other, held, "the two interpretations must actually differ");
+        pools.set_registry_format(&published, other);
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the publish decided presentability on `scanout_order`, which reads \
+             exactly this field"
+        );
+    }
+
     /// Every door that writes a resident's access goes through the one that
     /// checks the window's licence.
     ///
@@ -3075,6 +3149,17 @@ pub(super) mod pin_count_tests {
         // write through `self.registry.get_mut(..).unwrap()` and a
         // receiver-specific needle would not see it. `cargo fmt` normalizes the
         // spacing, so one form is the whole space.
+        let format = concat!(".", "format", " = ");
+        let format_hits: usize = SOURCES.iter().map(|src| src.matches(format).count()).sum();
+        assert_eq!(
+            format_hits, 2,
+            "exactly two writers of a `format` field in `pools/`: \
+             `set_registry_format`, which is the only writer of a *live* slot's \
+             declared interpretation and where the window's stamp is checked \
+             against the write — `scanout_order` is what the publish decided \
+             presentability on — and one test helper building a slot before it \
+             is registered, which no window can be published against"
+        );
         let needle = concat!(".", "access", " = ");
         let hits: usize = SOURCES.iter().map(|src| src.matches(needle).count()).sum();
         assert_eq!(
