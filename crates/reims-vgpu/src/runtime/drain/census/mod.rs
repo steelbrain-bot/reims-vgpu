@@ -872,7 +872,7 @@ impl ExecPhase {
 /// which one costs, which is exactly the shape `RegsOp` was added for after the
 /// same mistake.
 ///
-/// The three sum to `preflight_us`, so the identity is checkable on the line.
+/// The two sum to `preflight_us`, so the identity is checkable on the line.
 /// It reads ~0.95 rather than 1.00 because the `extract_air` calls that sit
 /// between the `Air` and `Cache` spans are outside both.
 ///
@@ -885,9 +885,15 @@ impl ExecPhase {
 /// pipes/s  12 650 / 12 786
 /// ```
 ///
-/// `Refs` — the second full decode of the stream, the part most obviously
-/// redundant since `walk_stream` decodes the same records straight afterwards —
-/// is **8 %**. The cost is `Air`, and *within* `Air` it is the three
+/// A third part, `refs`, used to be charged here: the second full decode of the
+/// stream, the part most obviously redundant since `walk_stream` decodes the
+/// same records straight afterwards. It measured **8 %** and it is now **gone**
+/// rather than zero — both arms of the pre-scan take the walk's own answer, so
+/// there is no second decode to charge. It is not a variant with nothing in it,
+/// because a column that is always zero reads as "this part is free" when what
+/// happened is that the part no longer exists.
+///
+/// The cost that is left is `Air`, and *within* `Air` it is the three
 /// guest-memory resolves rather than the AIR copies: removing both copies moved
 /// `air_us/pipe` by only 4.7 %.
 ///
@@ -910,11 +916,6 @@ impl ExecPhase {
 /// Design the invalidation against the deletion paths before taking the memo.
 #[derive(Clone, Copy)]
 pub enum PreflightPart {
-    /// Collecting the distinct pipeline refs: `iter_segments` and a full
-    /// `render::decode` / `compute::decode` of every record in the stream — the
-    /// *same* walk `walk_stream` is about to make, done a second time because
-    /// the answer has to be complete before any record runs.
-    Refs,
     /// `load_render_air_pair` and its compute counterpart: resolving each
     /// pipeline's AIR out of guest memory.
     Air,
@@ -928,25 +929,19 @@ impl PreflightPart {
     /// How many parts there are. The census arrays are sized from this, so a new
     /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
     /// overflowing an array at report time.
-    pub(crate) const COUNT: usize = 3;
+    pub(crate) const COUNT: usize = 2;
 
-    const ALL: [PreflightPart; Self::COUNT] = [
-        PreflightPart::Refs,
-        PreflightPart::Air,
-        PreflightPart::Cache,
-    ];
+    const ALL: [PreflightPart; Self::COUNT] = [PreflightPart::Air, PreflightPart::Cache];
 
     const fn index(self) -> usize {
         match self {
-            PreflightPart::Refs => 0,
-            PreflightPart::Air => 1,
-            PreflightPart::Cache => 2,
+            PreflightPart::Air => 0,
+            PreflightPart::Cache => 1,
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
-            PreflightPart::Refs => "refs",
             PreflightPart::Air => "air",
             PreflightPart::Cache => "cache",
         }

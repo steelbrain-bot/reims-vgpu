@@ -35,7 +35,7 @@ use crate::access::{
 };
 use crate::bind::{BufferBinding, ObjectBinding};
 use crate::blit::BlitOp;
-use crate::compute::ComputeOp;
+use crate::compute::{ComputeExtent, ComputeOp};
 use crate::encoder::{ComputeEncoderState, RenderEncoderState};
 use crate::icb::IcbOp;
 use crate::identity::{
@@ -353,6 +353,77 @@ impl ExecWork {
             {
                 if !out.contains(&pipeline) {
                     out.push(pipeline);
+                }
+            }
+        }
+        out
+    }
+
+    /// The **compute** pipelines this transaction dispatches, each with the
+    /// threadgroup size the dispatch stated.
+    ///
+    /// The compute half of [`Self::render_pipeline_leases`], and it cannot be
+    /// the same shape: a kernel's translation is keyed by its threadgroup size
+    /// as well as its ref, so the pre-scan needs a pair and a bare lease list
+    /// does not spell one. That extra field is why this reads the dispatches
+    /// rather than the leases --- the size is the *dispatch's* statement, and
+    /// one pipeline dispatched at two sizes is two translations.
+    ///
+    /// Three things the byte scan this replaces could not say, each of which
+    /// leaves a lease readied on an answer that never examined it:
+    ///
+    /// - A dispatch whose selector carries **no** threadgroup size
+    ///   ([`crate::compute::DispatchOp::ThreadsIndirect`]) contributes nothing,
+    ///   because there is nothing for it to contribute. The scan read a zeroed
+    ///   field and rejected it as an out-of-range extent, which is the same
+    ///   word it uses for "the guest asked for a grid of nothing".
+    /// - The bound pipeline **survives an encoder continuation**. A stream is
+    ///   one encoder however many segments carry it, so a dispatch in the
+    ///   continuation runs under the pipeline the first segment bound; a scan
+    ///   that resets at each framed segment loses exactly that one.
+    /// - A pipeline **bound and never dispatched** is not here, and it is in
+    ///   [`Self::pipeline_leases`]. It compiles nothing because nothing runs
+    ///   it, and the ordering plane holds it regardless.
+    ///
+    /// Deduplicated on the pair: a loop dispatching one kernel at one size
+    /// forty times names it once.
+    pub fn compute_dispatch_translations(&self) -> Vec<(ResourceId, ComputeExtent)> {
+        use crate::compute::DispatchOp;
+
+        let mut out: Vec<(ResourceId, ComputeExtent)> = Vec::new();
+        for stream in &self.streams {
+            // Per stream, because a stream is one encoder: the bound pipeline
+            // is encoder state and does not end where a segment does.
+            let mut bound: Option<ResourceId> = None;
+            for record in &stream.records {
+                let ResolvedOperation::Compute(op) = record.op else {
+                    continue;
+                };
+                let threads_per_group = match op {
+                    ComputeOp::SetPipeline { pipeline } => {
+                        bound = Some(pipeline);
+                        continue;
+                    }
+                    ComputeOp::Dispatch(
+                        DispatchOp::Threadgroups {
+                            threads_per_group, ..
+                        }
+                        | DispatchOp::Threads {
+                            threads_per_group, ..
+                        }
+                        | DispatchOp::ThreadgroupsIndirect {
+                            threads_per_group, ..
+                        },
+                    ) => threads_per_group,
+                    // The selector has no such field. Not a zero, and not a
+                    // size this could guess.
+                    ComputeOp::Dispatch(DispatchOp::ThreadsIndirect { .. }) => continue,
+                    _ => continue,
+                };
+                let Some(pipeline) = bound else { continue };
+                let item = (pipeline, threads_per_group);
+                if !out.contains(&item) {
+                    out.push(item);
                 }
             }
         }
@@ -1619,6 +1690,82 @@ mod tests {
             work.render_pipeline_leases(),
             vec![res(3), res(4)],
             "the render pre-scan is asked about two"
+        );
+    }
+
+    /// The compute arm names the pipeline a dispatch ran under, at the size
+    /// that dispatch stated, and keeps the pipeline across a continuation.
+    ///
+    /// Each assertion below is one thing the byte scan this replaced could not
+    /// say. The continuation is the one that costs a frame: a scan resetting
+    /// its bound ref at every framed segment sees a dispatch with no pipeline
+    /// and skips it, while the ordering plane still holds that pipeline's lease
+    /// and readies it on the verdict — a transaction released against a kernel
+    /// that is still translating.
+    #[test]
+    fn the_compute_arm_pairs_each_dispatch_with_the_pipeline_and_size_it_ran_under() {
+        use crate::compute::{ComputeExtent, ComputeOp, DispatchOp};
+
+        const fn extent(width: u64) -> ComputeExtent {
+            ComputeExtent {
+                width,
+                height: 1,
+                depth: 1,
+            }
+        }
+        fn dispatch(threads_per_group: ComputeExtent) -> ResolvedOperation {
+            ResolvedOperation::Compute(ComputeOp::Dispatch(DispatchOp::Threadgroups {
+                groups: extent(1),
+                threads_per_group,
+            }))
+        }
+        fn set(pipeline: ResourceId) -> ResolvedOperation {
+            ResolvedOperation::Compute(ComputeOp::SetPipeline { pipeline })
+        }
+
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Compute.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open");
+        for op in [
+            set(res(3)),
+            // Twice at one size is one translation.
+            dispatch(extent(64)),
+            dispatch(extent(64)),
+            // The same kernel at another size is another.
+            dispatch(extent(32)),
+            // A grid read from a buffer states its threadgroup size.
+            ResolvedOperation::Compute(ComputeOp::Dispatch(DispatchOp::ThreadsIndirect {
+                source: crate::compute::IndirectSource {
+                    buffer: res(5),
+                    offset: 0,
+                },
+            })),
+            // Bound and never dispatched: the ordering plane holds it, the
+            // translator is never asked about it.
+            set(res(4)),
+        ] {
+            b.record(op, &mut StubRegistry(ChannelId(1)))
+                .expect("record");
+        }
+        b.end_segment().expect("end");
+        let work = b.finish().expect("frozen");
+
+        assert_eq!(
+            work.compute_dispatch_translations(),
+            vec![(res(3), extent(64)), (res(3), extent(32))],
+            "one pair per distinct (pipeline, size) a dispatch stated"
+        );
+        assert_eq!(
+            work.pipeline_leases,
+            vec![res(3), res(4)],
+            "the ordering plane holds the pipeline nothing dispatched too"
+        );
+        assert!(
+            work.render_pipeline_leases().is_empty(),
+            "no render bind reaches the render arm"
         );
     }
 

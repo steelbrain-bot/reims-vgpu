@@ -1,7 +1,6 @@
 // Only the compute-preflight test names these opcodes, and that test is
 // Vulkan-only — this device compiles no compute preflight without it.
 #[cfg(feature = "backend-vulkan")]
-use reims_vgpu_wire::ops::compute as wire_compute;
 
 use reims_vgpu_wire::OP_HEADER_LEN;
 
@@ -420,45 +419,6 @@ fn an_unknown_segment_family_ends_the_walk_and_the_envelope_does_not() {
             .iter()
             .any(|l| l.contains("framing_envelope_window_not_payload")),
         "an eight-byte envelope window is the payload and must not refuse: {lines:?}"
-    );
-}
-
-#[cfg(feature = "backend-vulkan")]
-#[test]
-fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
-    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
-
-    let mut records = Vec::new();
-    let mut pipeline = [0u8; 12];
-    st32(&mut pipeline[0..4], wire_compute::OPCODE_SET_PIPELINE_STATE);
-    st32(&mut pipeline[4..8], 12);
-    st32(&mut pipeline[8..12], 20);
-    records.extend_from_slice(&pipeline);
-    for opcode in [
-        wire_compute::OPCODE_DISPATCH_THREADGROUPS,
-        wire_compute::OPCODE_DISPATCH_THREADGROUPS,
-        wire_compute::OPCODE_DISPATCH_THREADS,
-    ] {
-        let mut dispatch = [0u8; 56];
-        st32(&mut dispatch[0..4], opcode);
-        st32(&mut dispatch[4..8], 56);
-        st64(&mut dispatch[8..16], 6);
-        st64(&mut dispatch[16..24], 11);
-        st64(&mut dispatch[24..32], 1);
-        st64(&mut dispatch[32..40], 16);
-        st64(&mut dispatch[40..48], 16);
-        st64(&mut dispatch[48..56], 1);
-        records.extend_from_slice(&dispatch);
-    }
-    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
-    let stream_len = stream.len() + records.len();
-    st32(&mut stream[0..4], stream_len as u32);
-    stream[4] = SegmentKind::Compute.wire_type();
-    stream.extend_from_slice(&records);
-
-    assert_eq!(
-        super::vulkan::compute_translation_inputs(&stream),
-        vec![(20, [16, 16, 1])]
     );
 }
 

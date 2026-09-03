@@ -934,12 +934,32 @@ pub fn preflight_submission<M: HostMemory + HostOps>(
         .iter()
         .map(|lease| lease.slot.0)
         .collect();
+    // The compute half, from the same walk. A kernel is keyed by its
+    // threadgroup size as well as its ref, which is why this is a pair list
+    // and the render half is not; both are the model's answer rather than a
+    // rescan of the packet's bytes.
+    let dispatches: Vec<(u32, [u32; 3])> = resolved
+        .compute_dispatch_translations()
+        .into_iter()
+        .filter_map(|(pipeline, size)| {
+            let extent = [
+                u32::try_from(size.width).ok()?,
+                u32::try_from(size.height).ok()?,
+                u32::try_from(size.depth).ok()?,
+            ];
+            // A grid with a zero edge dispatches nothing, and the translator
+            // has no local size to key on. The model states the extent the
+            // guest stated; deciding it is not a translation input is this
+            // rail's business.
+            (extent.iter().all(|d| *d != 0)).then_some((pipeline.slot.0, extent))
+        })
+        .collect();
     let pending = crate::backend::selected().preflight_translations(
         state,
         host,
         submission.task_id,
-        &submission.streams,
         &refs,
+        &dispatches,
     );
     // Timed unconditionally: the phase is the drain's own accounting of where
     // an exec call's time went, and a rail that preflights nothing has to show

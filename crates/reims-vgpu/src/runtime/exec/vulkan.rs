@@ -11,7 +11,6 @@
 //! never names it.
 
 use super::*;
-use reims_vgpu_protocol::decode::compute::{ComputeRecord, DispatchRecord};
 
 /// `pipelines` is the **model's own lease list** for the packet, not a second
 /// scan of its bytes.
@@ -101,21 +100,26 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
     pending
 }
 
+/// `dispatches` is the **model's own record of what this packet dispatches**,
+/// not a second scan of its bytes.
+///
+/// The same correction the render arm took in the commit before this one, and
+/// for the same reason: admission readies the walk's compute leases on this
+/// function's whole-submission verdict, so a kernel the scan did not reach was
+/// a lease declared ready on an answer that never examined it. The scan had
+/// three ways not to reach one --- a selector carrying no threadgroup size, a
+/// dispatch after an encoder continuation, and a framing refusal it swallowed
+/// --- and [`reims_vgpu_core::exec::ExecWork::compute_dispatch_translations`]
+/// has none of them, because it reads records the walk already resolved.
 pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    stream: &[u8],
+    dispatches: &[(u32, [u32; 3])],
 ) -> bool {
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
-    let refs_started = std::time::Instant::now();
-    let inputs = compute_translation_inputs(stream);
-    note_preflight_part(
-        PreflightPart::Refs,
-        refs_started.elapsed().as_nanos() as u64,
-    );
     let mut pending = false;
-    for (pipeline_ref, local_size) in inputs {
+    for &(pipeline_ref, local_size) in dispatches {
         note_preflight_pipe();
         let air_started = std::time::Instant::now();
         let loaded = compute_exec::load_compute_pipeline(state, host, task_id, pipeline_ref)
@@ -149,69 +153,6 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
     pending
 }
 
-/// Structurally collect compute pipeline + LocalSize pairs in command order.
-/// Threads-indirect carries LocalSize in guest argument memory rather than the
-/// stream record, so it deliberately remains on the synchronous fallback.
-pub(crate) fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
-    // Silent deliberately: a pre-scan whose
-    // framing refusal `walk_stream` will report once, with the task attached.
-    let Ok(segments) = SegmentStream::new(stream) else {
-        return Vec::new();
-    };
-    let mut inputs = Vec::new();
-    for framed in segments {
-        let Ok(framed) = framed else { break };
-        let SegmentBody::Encoder {
-            kind: SegmentKind::Compute,
-            commands,
-        } = framed.body
-        else {
-            continue;
-        };
-        let mut pipeline_ref = 0u32;
-        for op in reims_vgpu_wire::op::OpStream::new(commands) {
-            let Ok(op) = op else { break };
-            let Ok(record) = reims_vgpu_protocol::decode::compute::decode(&op) else {
-                continue;
-            };
-            // The three dispatches that *state* a threadgroup size. The fully
-            // indirect one reads it from a buffer, and the record has no such
-            // field to offer — where the flat command offered a zeroed one,
-            // which this scan then had to reject as an out-of-range extent
-            // rather than as a size the record never carried.
-            let threads_per_group = match record {
-                ComputeRecord::SetPipeline(r) => {
-                    pipeline_ref = r.pipeline_ref;
-                    continue;
-                }
-                ComputeRecord::Dispatch(DispatchRecord::Threadgroups(r)) => r.threads_per_group,
-                ComputeRecord::Dispatch(DispatchRecord::Threads(r)) => r.threads_per_group,
-                ComputeRecord::Dispatch(DispatchRecord::ThreadgroupsIndirect(r)) => {
-                    r.threads_per_group
-                }
-                _ => continue,
-            };
-            {
-                {
-                    let local_size = [
-                        u32::try_from(threads_per_group.width).ok(),
-                        u32::try_from(threads_per_group.height).ok(),
-                        u32::try_from(threads_per_group.depth).ok(),
-                    ];
-                    if pipeline_ref != 0 {
-                        if let [Some(x), Some(y), Some(z)] = local_size {
-                            let item = (pipeline_ref, [x, y, z]);
-                            if x != 0 && y != 0 && z != 0 && !inputs.contains(&item) {
-                                inputs.push(item);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    inputs
-}
 /// [`crate::backend::Backend::preflight_translations`] for this rail.
 ///
 /// Every stream is scanned, not just up to the first pending one: the point is
@@ -221,16 +162,17 @@ pub fn preflight_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    streams: &[Vec<u8>],
     render_pipelines: &[u32],
+    compute_dispatches: &[(u32, [u32; 3])],
 ) -> bool {
-    // The render half is asked once for the whole packet, because its input is
-    // the packet's lease list and not a stream. The compute half still walks
-    // the streams: a kernel's cache key carries its threadgroup size, which is
-    // a dispatch record's field and not a lease's, so the walk's lease list
-    // does not yet spell what that scan needs.
+    // Both halves are asked once for the whole packet, and both are asked
+    // about what the walk resolved. Neither reads a stream: the packet's bytes
+    // were read once, and a second reading is a second answer to "what does
+    // this packet run".
     let render_pending = preflight_render_translations(state, host, task_id, render_pipelines);
-    streams.iter().fold(render_pending, |pending, stream| {
-        preflight_compute_translations(state, host, task_id, stream) || pending
-    })
+    // Not `||`: every cold translation this packet needs must be *started*, so
+    // they proceed in parallel and the packet is retried once rather than once
+    // per kernel.
+    let compute_pending = preflight_compute_translations(state, host, task_id, compute_dispatches);
+    render_pending || compute_pending
 }

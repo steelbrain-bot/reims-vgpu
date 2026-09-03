@@ -956,8 +956,8 @@ pub(crate) trait Backend: Copy {
         _state: &DeviceState,
         _host: &M,
         _task_id: u32,
-        _streams: &[Vec<u8>],
         _render_pipelines: &[u32],
+        _compute_dispatches: &[(u32, [u32; 3])],
     ) -> bool {
         false
     }
@@ -1800,17 +1800,17 @@ impl Backend for SelectedBackend {
         state: &DeviceState,
         host: &M,
         task_id: u32,
-        streams: &[Vec<u8>],
         render_pipelines: &[u32],
+        compute_dispatches: &[(u32, [u32; 3])],
     ) -> bool {
         match self {
             #[cfg(feature = "backend-metal")]
             Self::Metal(b) => {
-                b.preflight_translations(state, host, task_id, streams, render_pipelines)
+                b.preflight_translations(state, host, task_id, render_pipelines, compute_dispatches)
             }
             #[cfg(feature = "backend-vulkan")]
             Self::Vulkan(b) => {
-                b.preflight_translations(state, host, task_id, streams, render_pipelines)
+                b.preflight_translations(state, host, task_id, render_pipelines, compute_dispatches)
             }
         }
     }
