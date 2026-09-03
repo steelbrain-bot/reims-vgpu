@@ -153,6 +153,141 @@ impl crate::observe::Decline for WindowPresentDecline {
     }
 }
 
+/// How a publish-time resolution and the window's own re-resolve of the same
+/// identity disagreed.
+///
+/// The window thread reads the resident registry twice per present — once to
+/// resolve the identity it was published against, once more on the failure path
+/// to name why — and that read is what holds the registry in the process-global
+/// engine. `WindowPresentSource::epoch` was added so the *first* question could
+/// be answered without a registry. This enum is how the answer is checked
+/// against the authority before that authority is removed.
+///
+/// Ordered coarsest to finest and reported as the **first** difference rather
+/// than the only one, the same ladder rule [`super::types::TargetKeyDivergence`]
+/// states: a different image is not one object with a moved layout, so nothing
+/// finer about the pair is worth reporting.
+///
+/// A boot on which none of these appears says the publish-time resolution and
+/// the re-resolve agreed on every frame, which is what removing the re-resolve
+/// needs. A boot on which [`Self::Access`] appears says something else, and it is
+/// the finding this census exists for: the blit names `access` as its barrier's
+/// `oldLayout`, so a layout that moved between publish and present is not a
+/// stale picture but an invalid transition, and the removal would have to move
+/// layout ownership rather than merely carry a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowSourceDivergence {
+    /// The stamp says the promise stands and the registry offers no presentable
+    /// slot under that identity. The stamp is not a complete cover of the ways a
+    /// published resident can leave, and this is the reading that says so.
+    Vanished,
+    /// A different `VkImage` is registered under this identity. The stamp missed
+    /// a replacement, which is the use-after-free case.
+    Image,
+    /// Same image, and its layout moved since publish.
+    Access,
+    /// Same image, different extent.
+    Geometry,
+    /// Same image and extent, and its storage class moved — which decides the
+    /// layout the blit leaves it in.
+    GuestImported,
+}
+
+/// One divergence, with the pair of resolutions that named it.
+///
+/// The values are the reading and not decoration: for
+/// [`WindowSourceDivergence::Access`] specifically, this window's own blit
+/// leaves a resident in `TransferRead`, so a `ColorWrite` -> `TransferRead`
+/// move is this thread re-presenting a source it already blitted — a redraw
+/// with no new frame — while any other pair is the drain having touched the
+/// image between publish and present. Those two have different fixes and the
+/// class alone cannot tell them apart.
+struct WindowSourceDiverged {
+    class: WindowSourceDivergence,
+    published: super::pools::ResolvedResident,
+    now: Option<super::pools::ResolvedResident>,
+}
+
+impl crate::observe::Decline for WindowSourceDiverged {
+    fn slug(&self) -> &'static str {
+        match self.class {
+            WindowSourceDivergence::Vanished => "window_source_vanished",
+            WindowSourceDivergence::Image => "window_source_image_moved",
+            WindowSourceDivergence::Access => "window_source_access_moved",
+            WindowSourceDivergence::Geometry => "window_source_geometry_moved",
+            WindowSourceDivergence::GuestImported => "window_source_storage_moved",
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = vec![
+            ("was_image", format!("{:?}", self.published.image)),
+            ("was_access", format!("{:?}", self.published.access)),
+            (
+                "was_geom",
+                format!("{}x{}", self.published.width, self.published.height),
+            ),
+            ("was_guest", self.published.guest_imported.to_string()),
+        ];
+        if let Some(now) = self.now.as_ref() {
+            fields.extend([
+                ("now_image", format!("{:?}", now.image)),
+                ("now_access", format!("{:?}", now.access)),
+                ("now_geom", format!("{}x{}", now.width, now.height)),
+                ("now_guest", now.guest_imported.to_string()),
+            ]);
+        }
+        fields
+    }
+}
+
+/// The ladder itself, with no logging in it, so it can be tested as the total
+/// function it is rather than through a log line.
+fn divergence_class(
+    published: &super::pools::ResolvedResident,
+    now: Option<&super::pools::ResolvedResident>,
+) -> Option<WindowSourceDivergence> {
+    let Some(now) = now else {
+        return Some(WindowSourceDivergence::Vanished);
+    };
+    if published.image != now.image {
+        Some(WindowSourceDivergence::Image)
+    } else if published.access != now.access {
+        Some(WindowSourceDivergence::Access)
+    } else if published.width != now.width || published.height != now.height {
+        Some(WindowSourceDivergence::Geometry)
+    } else if published.guest_imported != now.guest_imported {
+        Some(WindowSourceDivergence::GuestImported)
+    } else {
+        None
+    }
+}
+
+/// Compare what the publish resolved against what the window's re-resolve found,
+/// and name the first difference on the always-on channel.
+///
+/// Latched per class rather than counted: reachability is the open question, and
+/// a class that recurs every frame would say nothing after its first line.
+/// Magnitude belongs to a counter, and there is no counter yet for the same
+/// reason `resident_retired_while_pinned` has none.
+fn note_source_divergence(
+    published: &super::pools::ResolvedResident,
+    now: Option<&super::pools::ResolvedResident>,
+) {
+    let Some(class) = divergence_class(published, now) else {
+        return;
+    };
+    crate::observe::Emit::decline(
+        "window_source_divergence",
+        &WindowSourceDiverged {
+            class,
+            published: *published,
+            now: now.copied(),
+        },
+    )
+    .fail_once(class as u64);
+}
+
 /// Why a present cleared to slate instead of blitting a guest resident.
 ///
 /// A slate present is the window showing *nothing* — on the arm64 MoltenVK
@@ -1219,14 +1354,16 @@ impl WindowPresenter {
             super::pools::slot_presentable(slot, source.width, source.height).then(|| {
                 (
                     source.identity.clone(),
-                    slot.image,
-                    slot.access,
-                    slot.width,
-                    slot.height,
-                    slot.memory.is_guest_imported(),
+                    super::pools::slot_window_resolution(slot),
                 )
             })
         });
+        // The census that says whether this re-resolve can be removed. It is the
+        // only thing in this function that reads the publish-time resolution, and
+        // it changes no frame: the blit below still uses the re-resolve.
+        if let Some(source) = source.filter(|_| !stale) {
+            note_source_divergence(&source.resolved, selected.as_ref().map(|(_, now)| now));
+        }
         // Only reached when no resident carries this present: upload the CPU
         // bytes instead. `None` here means the window shows slate.
         let staged = if selected.is_some() {
@@ -1258,7 +1395,7 @@ impl WindowPresenter {
             staged
         };
         let mut pinned = Vec::with_capacity(1);
-        if let Some((identity, _, _, _, _, _)) = selected.as_ref() {
+        if let Some((identity, _)) = selected.as_ref() {
             if !pools.pin_resident_target(identity, true) {
                 return Err(DrawError::Facade(
                     EngineFacadeDecline::WindowSourceDisappearedBeforePin {
@@ -1275,17 +1412,13 @@ impl WindowPresenter {
         // rails.
         let blit = selected
             .as_ref()
-            .map(
-                |(_, image, access, base_width, base_height, host_accessible)| {
-                    BlitSource::Resident {
-                        image: *image,
-                        access: *access,
-                        next_access: super::pools::ResidentAccess::transfer_read(*host_accessible),
-                        width: *base_width,
-                        height: *base_height,
-                    }
-                },
-            )
+            .map(|(_, now)| BlitSource::Resident {
+                image: now.image,
+                access: now.access,
+                next_access: super::pools::ResidentAccess::transfer_read(now.guest_imported),
+                width: now.width,
+                height: now.height,
+            })
             .or(staged);
 
         let submit_result = (|| {
@@ -1391,10 +1524,10 @@ impl WindowPresenter {
                     (0, 0, base_width, base_height),
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
-                if let Some((identity, _, _, _, _, host_accessible)) = selected.as_ref() {
+                if let Some((identity, now)) = selected.as_ref() {
                     pools.registry_note_access(
                         identity,
-                        super::pools::ResidentAccess::transfer_read(*host_accessible),
+                        super::pools::ResidentAccess::transfer_read(now.guest_imported),
                     );
                 }
             } else {
@@ -2022,6 +2155,178 @@ unsafe fn blit_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash::vk::Handle as _;
+
+    /// A resolution that agrees with itself, so each test below moves exactly
+    /// one field and the ladder's answer is attributable to that field.
+    fn resolution() -> super::super::pools::ResolvedResident {
+        super::super::pools::ResolvedResident {
+            image: vk::Image::null(),
+            access: super::super::pools::ResidentAccess::ColorWrite(
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            ),
+            width: 1920,
+            height: 1080,
+            guest_imported: false,
+        }
+    }
+
+    #[test]
+    fn a_resolution_that_did_not_move_is_no_divergence() {
+        assert_eq!(divergence_class(&resolution(), Some(&resolution())), None);
+    }
+
+    #[test]
+    fn a_fresh_stamp_over_an_absent_slot_is_the_stamps_own_hole() {
+        // The reading that says the epoch is not a complete cover of the ways a
+        // published resident can leave — which is the whole claim the window's
+        // registry-free check rests on.
+        assert_eq!(
+            divergence_class(&resolution(), None),
+            Some(WindowSourceDivergence::Vanished)
+        );
+    }
+
+    #[test]
+    fn each_field_of_the_resolution_names_its_own_class() {
+        let published = resolution();
+        for (moved, expect) in [
+            (
+                super::super::pools::ResolvedResident {
+                    // A handle value that is merely *different*: the class is
+                    // about inequality, and a valid handle is not needed to
+                    // state it.
+                    image: vk::Image::from_raw(7),
+                    ..published
+                },
+                WindowSourceDivergence::Image,
+            ),
+            (
+                super::super::pools::ResolvedResident {
+                    access: super::super::pools::ResidentAccess::TransferRead(
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    ),
+                    ..published
+                },
+                WindowSourceDivergence::Access,
+            ),
+            (
+                super::super::pools::ResolvedResident {
+                    height: 1200,
+                    ..published
+                },
+                WindowSourceDivergence::Geometry,
+            ),
+            (
+                super::super::pools::ResolvedResident {
+                    guest_imported: true,
+                    ..published
+                },
+                WindowSourceDivergence::GuestImported,
+            ),
+        ] {
+            assert_eq!(divergence_class(&published, Some(&moved)), Some(expect));
+        }
+    }
+
+    #[test]
+    fn the_ladder_answers_the_coarsest_difference_and_not_the_finest() {
+        // Every field moved at once. A different image is not one object whose
+        // layout moved, so nothing finer than `Image` is worth reporting — the
+        // same rule `TargetKeyDivergence` states for the registry's own ladder,
+        // and the reason this is a ladder rather than a set of flags.
+        let published = resolution();
+        let moved = super::super::pools::ResolvedResident {
+            image: vk::Image::from_raw(7),
+            access: super::super::pools::ResidentAccess::Untouched,
+            width: 640,
+            height: 480,
+            guest_imported: true,
+        };
+        assert_eq!(
+            divergence_class(&published, Some(&moved)),
+            Some(WindowSourceDivergence::Image)
+        );
+    }
+
+    #[test]
+    fn every_divergence_class_has_its_own_slug() {
+        use crate::observe::Decline as _;
+        let classes = [
+            WindowSourceDivergence::Vanished,
+            WindowSourceDivergence::Image,
+            WindowSourceDivergence::Access,
+            WindowSourceDivergence::Geometry,
+            WindowSourceDivergence::GuestImported,
+        ];
+        let mut slugs: Vec<&str> = classes
+            .iter()
+            .map(|class| {
+                WindowSourceDiverged {
+                    class: *class,
+                    published: resolution(),
+                    now: None,
+                }
+                .slug()
+            })
+            .collect();
+        slugs.sort_unstable();
+        let count = slugs.len();
+        slugs.dedup();
+        assert_eq!(
+            slugs.len(),
+            count,
+            "two classes sharing a slug is the defect the decline vocabulary \
+             exists to prevent: the log fires and the reader still cannot say \
+             which check refused"
+        );
+    }
+
+    #[test]
+    fn a_divergence_line_carries_both_resolutions_and_no_whitespace_in_a_value() {
+        // The sink is parsed by splitting on spaces, so a value with a space in
+        // it silently becomes two fields.
+        let line = crate::observe::Emit::decline(
+            "window_source_divergence",
+            &WindowSourceDiverged {
+                class: WindowSourceDivergence::Access,
+                published: resolution(),
+                now: Some(super::super::pools::ResolvedResident {
+                    access: super::super::pools::ResidentAccess::TransferRead(
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    ),
+                    ..resolution()
+                }),
+            },
+        )
+        .render();
+        assert!(line.contains("reason=window_source_access_moved"), "{line}");
+        assert!(line.contains("was_access=ColorWrite("), "{line}");
+        assert!(line.contains("now_access=TransferRead("), "{line}");
+        for field in line.split(' ').skip(1) {
+            assert!(
+                field.contains('=') && !field.ends_with('='),
+                "every field is one whitespace-free k=v pair: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vanished_source_names_only_what_was_promised() {
+        // There is no "now" to report, and inventing one — zeros, or the
+        // published values echoed back — would read as a slot that is there.
+        let line = crate::observe::Emit::decline(
+            "window_source_divergence",
+            &WindowSourceDiverged {
+                class: WindowSourceDivergence::Vanished,
+                published: resolution(),
+                now: None,
+            },
+        )
+        .render();
+        assert!(line.contains("was_image="), "{line}");
+        assert!(!line.contains("now_"), "{line}");
+    }
 
     #[test]
     fn swapchain_recreation_line_names_geometry_and_reason() {

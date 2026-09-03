@@ -288,13 +288,14 @@ impl Backend for VulkanBackend {
         // reclaims aged peers, and returns the direct-present decision for this
         // exact identity and geometry — so it runs whether or not the window
         // ends up taking the resident.
-        let epoch = engine::prepare_window_resident_present(&identity, width, height)?;
+        let publication = engine::prepare_window_resident_present(&identity, width, height)?;
         Ok(window::WindowResident::Vulkan(
             engine::WindowPresentSource {
                 width,
                 height,
                 identity,
-                epoch,
+                epoch: publication.epoch,
+                resolved: publication.resolved,
             },
         ))
     }

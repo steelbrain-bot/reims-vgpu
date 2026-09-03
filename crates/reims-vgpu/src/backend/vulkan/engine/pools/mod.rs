@@ -1781,6 +1781,51 @@ pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u3
     slot_present_decline(slot, width, height).is_none()
 }
 
+/// Everything the host window's blit reads off a resident slot, resolved once by
+/// the publish that named it.
+///
+/// The window thread's registry access is not one dependency but two: it
+/// *resolves* an identity to a slot, and it reads and writes that slot's
+/// `access` — the Vulkan layout its blit barrier must name as `oldLayout`. The
+/// stamp on [`super::types::WindowPresentSource`] answers the first without a
+/// registry; nothing yet answers the second, and a barrier from a layout the
+/// image is no longer in is not a stale picture but an invalid transition.
+///
+/// So this is carried beside the stamp and, for now, only *compared* against the
+/// re-resolve the window still performs. `WindowSourceDivergence` names each way
+/// the two can disagree, and a boot where none of them appears is the evidence
+/// that removing the re-resolve changes no frame. A boot where `Access` appears
+/// is the evidence that it cannot be removed until layout ownership moves too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedResident {
+    pub image: vk::Image,
+    pub access: ResidentAccess,
+    /// The slot's own extent, which the blit reads as the source rect. Not the
+    /// presented extent: `slot_present_decline` has already required the two to
+    /// be equal, and carrying the slot's is what makes a later divergence
+    /// visible instead of assumed away.
+    pub width: u32,
+    pub height: u32,
+    /// Whether the pixels live in the guest's own pages. Decides the layout the
+    /// blit leaves the image in, so it is part of the resolution and not a
+    /// property re-derived at present time.
+    pub guest_imported: bool,
+}
+
+/// Resolve a slot into what the window's blit needs from it.
+///
+/// One place, so the publish-time resolution and the present-time re-resolve
+/// cannot read different fields and call the result agreement.
+pub(crate) fn slot_window_resolution(slot: &ResidentTargetSlot) -> ResolvedResident {
+    ResolvedResident {
+        image: slot.image,
+        access: slot.access,
+        width: slot.width,
+        height: slot.height,
+        guest_imported: slot.memory.is_guest_imported(),
+    }
+}
+
 /// The non-pinned resident population, and the attachment bytes it holds.
 ///
 /// One struct rather than two fields because the pair is only ever read

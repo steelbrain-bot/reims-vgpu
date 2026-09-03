@@ -2053,7 +2053,7 @@ fn resident_present_decision(
     identity: &TargetIdentity,
     width: u32,
     height: u32,
-) -> Result<u64, &'static str> {
+) -> Result<WindowPresentResolution, &'static str> {
     let Some(slot) = pools.registry_get(identity) else {
         pools.note_window_published(None);
         return Err("winpub_no_resident");
@@ -2066,6 +2066,10 @@ fn resident_present_decision(
             pools::ResidentPresentDecline::Geometry => "winpub_geometry",
         });
     }
+    // Taken from the slot this transaction just accepted, not re-read after the
+    // recording below: the resolution and the decision must be of one slot, for
+    // the same reason the recording and the decision are one transaction.
+    let resolved = pools::slot_window_resolution(slot);
     pools.note_window_published(Some(identity));
     // Read *after* the recording, so a removal racing this transaction is either
     // ordered before it — and then this stamp is already the post-bump value and
@@ -2073,7 +2077,25 @@ fn resident_present_decision(
     // stamp. Both hold because every removal path and this function are under
     // the same engine lock; the load is an `Acquire` so the window thread, which
     // is not, still sees the bump.
-    Ok(pools::window_source_epoch())
+    Ok(WindowPresentResolution {
+        epoch: pools::window_source_epoch(),
+        resolved,
+    })
+}
+
+/// A window publish's two outputs: when it happened, and what it resolved to.
+///
+/// One value rather than two returns because they are one transaction's answer
+/// and a caller holding only the first would be holding a stamp that vouches for
+/// a slot it cannot name.
+pub struct WindowPresentResolution {
+    pub epoch: u64,
+    // Only the host-window arm reads this: it is the window presenter's
+    // comparison against its own re-resolve, and a build with no window has no
+    // presenter. A `cfg` here answers "what did this build compile", which is
+    // the only question one may answer.
+    #[cfg_attr(not(feature = "host-window"), allow(dead_code))]
+    pub(crate) resolved: pools::ResolvedResident,
 }
 
 /// Maintain the resident working set for one published frame and decide
@@ -2095,7 +2117,7 @@ pub fn prepare_window_resident_present(
     identity: &TargetIdentity,
     width: u32,
     height: u32,
-) -> Result<u64, &'static str> {
+) -> Result<WindowPresentResolution, &'static str> {
     let now_ms = crate::observe::elapsed_ms() as u64;
     let mut guard = lock_engine();
     let EngineState {

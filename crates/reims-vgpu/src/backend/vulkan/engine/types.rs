@@ -1932,6 +1932,25 @@ pub struct WindowPresentSource {
     /// deliberate and temporary: it is how a disagreement between the two gets
     /// found on a live boot before the re-resolve is the thing being removed.
     pub epoch: u64,
+    /// What the publish resolved this identity to — the image, its layout, its
+    /// extent and its storage class.
+    ///
+    /// The stamp above says the *promise* still stands; this says what was
+    /// promised. Carried because the window's registry access is two
+    /// dependencies and the stamp answers only one: the blit also reads and
+    /// writes `slot.access`, and the barrier it builds from that layout is
+    /// invalid — not merely stale — if the image has since moved. See
+    /// [`super::pools::ResolvedResident`].
+    ///
+    /// Compared against the re-resolve rather than used in its place, for the
+    /// same reason the stamp was: a disagreement is a thing to find while there
+    /// is still an authority to disagree with.
+    // Only the host-window arm reads this: it is the window presenter's
+    // comparison against its own re-resolve, and a build with no window has no
+    // presenter. A `cfg` here answers "what did this build compile", which is
+    // the only question one may answer.
+    #[cfg_attr(not(feature = "host-window"), allow(dead_code))]
+    pub(crate) resolved: super::pools::ResolvedResident,
 }
 
 impl Default for TargetIdentity {
