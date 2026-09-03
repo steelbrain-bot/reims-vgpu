@@ -1802,6 +1802,33 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     let mut verdict = StampVerdict::Ready;
     for wait in &packet.stamp_waits {
         let index = stamp_slot_index(wait.index);
+        // Census, deciding nothing: would the ordering plane answer this wait
+        // the same way this drain is about to?
+        //
+        // The two read different things and that is the point. This drain reads
+        // the word out of guest RAM, which is authoritative and includes
+        // anything the *guest* advanced; the model answers from what has been
+        // published to it, which today is only what this device wrote. A wait
+        // guest RAM satisfies and the model does not is a packet the cutover
+        // would park forever — the same hang an unadvanced pipeline was, on the
+        // scheduler's other wait kind — so it is measured before it is relied
+        // on rather than discovered by a guest that stops drawing.
+        let model_satisfies = state
+            .published_completion_stamp(reims_vgpu_core::identity::StampSlot(index))
+            .is_some_and(|v| wait.satisfied_by(v.0));
+        let against_model = |device_satisfies: bool, agree: &'static str| {
+            note_store_route(if device_satisfies == model_satisfies {
+                agree
+            } else if device_satisfies {
+                // The hang: this device runs the packet and the model would
+                // hold it against a value nothing will publish again.
+                "stamp_wait_model_behind"
+            } else {
+                // The other direction, and not the harmless one: the model
+                // would release work this device is still holding back.
+                "stamp_wait_model_ahead"
+            });
+        };
         // Answered from the drain's own latch before guest RAM, because the word
         // in guest RAM is stale by exactly the stamps this drain is holding. The
         // ordering the wait asks about already holds: packets are processed in
@@ -1809,6 +1836,18 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
         // before the packet doing the waiting was decoded.
         if pending.is_some_and(|(slot, held)| held.discharges(slot, *wait)) {
             note_store_route("packet_stamp_wait_met_pending");
+            // The coalescing latch is this drain's alone: the word has not been
+            // through `write_stamp`, so nothing has published it to the model
+            // and the model cannot have it. Named apart from the disagreements
+            // below because it is a *structural* difference and not a
+            // measurement — whatever this count is, the cutover has to answer
+            // it, and the answer is either publishing the latch or not having
+            // one.
+            note_store_route(if model_satisfies {
+                "stamp_wait_model_has_the_latched_word"
+            } else {
+                "stamp_wait_model_lacks_the_latched_word"
+            });
             continue;
         }
         let unresolvable = |reason: &'static str, detail: String| {
@@ -1830,6 +1869,11 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
                 "stamp_slot_out_of_range",
                 format!("slots={}", stamp_slot_count(state.page_size())),
             );
+            note_store_route(if model_satisfies {
+                "stamp_wait_model_decides_the_unevaluable"
+            } else {
+                "stamp_wait_model_also_cannot_decide"
+            });
             verdict = verdict.and(StampVerdict::Unevaluable);
             continue;
         };
@@ -1837,20 +1881,32 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
         // write either — it returns early on the same condition.
         if state.gfx.fifo_base_page == 0 {
             unresolvable("no_stamp_page", String::from("fifo_base_page=0"));
+            note_store_route(if model_satisfies {
+                "stamp_wait_model_decides_the_unevaluable"
+            } else {
+                "stamp_wait_model_also_cannot_decide"
+            });
             verdict = verdict.and(StampVerdict::Unevaluable);
             continue;
         }
         let gpa = state.pfn_gpa(state.gfx.fifo_base_page) + off;
         let Ok(current) = crate::runtime::host::read_u32(host, gpa) else {
             unresolvable("stamp_slot_unreadable", format!("gpa={gpa:#x}"));
+            note_store_route(if model_satisfies {
+                "stamp_wait_model_decides_the_unevaluable"
+            } else {
+                "stamp_wait_model_also_cannot_decide"
+            });
             verdict = verdict.and(StampVerdict::Unevaluable);
             continue;
         };
         if wait.satisfied_by(current) {
             note_store_route("packet_stamp_wait_met");
+            against_model(true, "stamp_wait_model_agrees_met");
             continue;
         }
         note_store_route("packet_stamp_wait_unmet");
+        against_model(false, "stamp_wait_model_agrees_unmet");
         // Census only, and it does not change the verdict below. Says whether
         // this device was holding the awaited word (publishable early, and
         // ordering-safe because publication carries the settle), had already
