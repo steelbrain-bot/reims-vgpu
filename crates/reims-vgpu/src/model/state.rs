@@ -2811,6 +2811,16 @@ pub struct DeviceState {
     /// keep "which state changes, from where" a list a reader can enumerate,
     /// instead of a public field any call site can reach into.
     session: Mutex<reims_vgpu_core::session::SessionModel>,
+    /// The bytes every admitted position is executed from, keyed by the
+    /// ordinal [`Self::admit_packet`] issued.
+    ///
+    /// Beside the ordering plane rather than inside it: the model holds
+    /// ordering and this device holds bytes, and the ordinal is the join. Not
+    /// behind the `Mutex` above, because the drain owns `&mut DeviceState` and
+    /// nothing on a draw rail parks or runs work — see
+    /// [`crate::runtime::parked::ParkedStore`], which owns the identity of a
+    /// parked position and deliberately not its readiness.
+    pub parked: crate::runtime::parked::ParkedStore,
     /// Child channels whose head `EXEC_INDIRECT2` packet is held while an
     /// immutable AIR translation is still loading. The packet head and stamp
     /// remain untouched until retry, so this is scheduler state rather than a
@@ -3333,6 +3343,7 @@ impl DeviceState {
             session: Mutex::new(reims_vgpu_core::session::SessionModel::new(
                 reims_vgpu_core::identity::SessionId(id.0 as u32),
             )),
+            parked: crate::runtime::parked::ParkedStore::new(),
             translation_deferred_mask: 0,
             stamp_deferred_mask: 0,
             translation_order_hold_mask: 0,

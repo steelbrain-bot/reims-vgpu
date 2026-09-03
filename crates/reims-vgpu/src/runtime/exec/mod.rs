@@ -753,6 +753,7 @@ fn load_command_streams<M: HostMemory + HostOps>(
 ///
 /// That is also why there is no separate double-load to remove: the streams are
 /// loaded once, here, and whoever executes them is handed the same `Vec`.
+#[derive(Debug)]
 pub struct ExecSubmission {
     task_id: u32,
     /// Per resource this submission touches, who owns the authoritative bytes
@@ -988,23 +989,79 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     // refused, and closes no phase tiling: there is nothing between the header
     // and the refusal for the leftover to account for.
     let Some(submission) = read_submission(state, host, payload, &mut out, &mut measured_ns) else {
+        note_exec_header(exec_started, measured_ns);
         return out;
     };
+    note_exec_header(exec_started, measured_ns);
+    plan_and_execute(state, host, &submission, out)
+}
+
+/// The plan and execute halves of one submission, from bytes already read.
+///
+/// The door for a caller that read the submission itself — which is what an
+/// admitted-then-parked packet is, since its bytes left the guest's ring at
+/// arrival and the guest may have rewritten them by the time it runs.
+///
+/// # The tiling closes over two clocks now, and it has to
+///
+/// [`ExecPhase::Header`] is a leftover — a span's worth of time minus the
+/// phases that measured themselves — and it used to be derived from one clock
+/// because reading and running were one call. They are not: a parked packet is
+/// read when it arrives and run when the model releases it, and a single clock
+/// spanning both would charge `Header` with the whole of the wait.
+///
+/// So each half closes its own leftover. The four measured phases are still
+/// counted exactly once and `Header` is still everything else, which is the
+/// property that made the tiling worth having; what changed is that it is now
+/// the sum of two leftovers rather than one. `total_us` is this half's, which
+/// is the half `sync_exec_stalled` is about.
+pub fn plan_and_execute<M: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut M,
+    submission: &ExecSubmission,
+    mut out: ExecResult,
+) -> ExecResult {
+    let started = std::time::Instant::now();
+    let mut measured_ns = 0u64;
     // Read, plan, execute. The plan step is separate because it is the only one
     // of the three that a caller may run at a moment of its own choosing: it is
     // pure CPU work over bytes the submission already holds, where the read
     // walks the guest's page tables and the execution consumes the resource
     // table.
-    if preflight_submission(state, host, &submission, &mut measured_ns) {
+    if preflight_submission(state, host, submission, &mut measured_ns) {
         out.deferred = true;
     } else {
-        execute_submission(state, host, &submission, &mut out, &mut measured_ns);
+        execute_submission(state, host, submission, &mut out, &mut measured_ns);
     }
-    note_exec_header(exec_started, measured_ns);
+    note_exec_header(started, measured_ns);
     if !out.deferred {
-        out.total_us = elapsed_us(exec_started);
+        out.total_us = elapsed_us(started);
     }
     out
+}
+
+/// Read one `CmdExecIndirect2` packet's submission and nothing more.
+///
+/// The half a drain performs at *arrival*: the streams live in the task's
+/// address space and the guest may reuse that memory once the ring head has
+/// advanced past the packet, so whoever runs the submission later has to have
+/// been handed these bytes rather than reading them again.
+///
+/// It closes its own `ExecPhase::Header` leftover, because the running half
+/// happens at a different moment and one clock across both would charge the
+/// leftover with the wait — see [`plan_and_execute`].
+#[must_use]
+pub fn read_exec_submission<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    payload: &[u8],
+) -> (Option<ExecSubmission>, ExecResult) {
+    let started = std::time::Instant::now();
+    let mut out = ExecResult::default();
+    let mut measured_ns = 0u64;
+    let submission = read_submission(state, host, payload, &mut out, &mut measured_ns);
+    note_exec_header(started, measured_ns);
+    (submission, out)
 }
 
 /// Close the [`ExecPhase`] tiling of `process_exec_indirect2` at one of its

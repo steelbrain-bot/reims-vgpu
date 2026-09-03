@@ -49,6 +49,7 @@ use crate::runtime::exec::ExecSubmission;
 /// packet: `read_submission` loads the command buffers out of task GVA, and a
 /// device that re-read them at execution would walk whatever the guest put
 /// there after the packet was admitted.
+#[derive(Debug)]
 pub struct ParkedWork {
     /// The ordering domain the packet arrived in, which is the channel its
     /// execution and its completion word belong to. Carried because the ordinal
@@ -167,7 +168,7 @@ impl Release {
 /// model hands back, and the head has moved on by the time it does. That is
 /// also why a held-packet cache keyed on a channel's consumer pointer is not
 /// this and could not become it.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ParkedStore {
     work: BTreeMap<IngressOrdinal, ParkedWork>,
     /// Positions the model has released to run and this device has not run
