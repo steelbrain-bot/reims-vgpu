@@ -1313,6 +1313,35 @@ impl WindowPresenter {
                     (0, 0, base_width, base_height),
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
+                // The window's last contact with the resident registry, and the
+                // one that stays. Two ways out of it were looked for and both
+                // are unsound; recording that here so the third reader does not
+                // spend the afternoon finding out again.
+                //
+                // **Not the publish, recording it eagerly.** The publish would
+                // be promising a transition that a `Busy` present, a failed
+                // acquire or a detached window never makes, and the registry
+                // would then describe an image the device has not moved. The lie
+                // is not the layout — a primary target rests in
+                // `TRANSFER_SRC_OPTIMAL` and `transfer_read(false)` is the same
+                // layout — it is the *access*: the next barrier over the image
+                // would name `TRANSFER_READ` as its source scope and the colour
+                // write that really happened last would never be made available.
+                //
+                // **Not a restore, transitioning back after the blit so the
+                // registry stays true.** The layout would come back and the
+                // dependency would not. A guest colour write barriering from the
+                // restored `ColorWrite` names `COLOR_ATTACHMENT_OUTPUT` as its
+                // source stage, which does not wait for this blit's `TRANSFER`
+                // read — a write-after-read on the pixels the screen is reading.
+                // The write-back exists to make that next barrier say `TRANSFER`,
+                // which is the whole of its job.
+                //
+                // What both attempts have in common is that the barrier and the
+                // record of it have to be one action, taken by whoever holds the
+                // registry, adjacent to the blit. So this write leaves when the
+                // present becomes a transaction against the device that owns the
+                // registry — not before, and not by moving the write alone.
                 if let Some((identity, now)) = selected.as_ref() {
                     pools.registry_note_access(
                         identity,
