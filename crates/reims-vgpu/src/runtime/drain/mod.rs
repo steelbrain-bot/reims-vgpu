@@ -404,6 +404,24 @@ fn apply_delete_object<H: HostMemory + HostOps>(
         _ => None,
     };
     if let Some(object) = retained {
+        // The ordering plane's half, for the kind it holds a lifetime for. A
+        // render pipeline is declared into `SessionModel::pipelines` when the
+        // guest creates it, and this is the guest saying it is over — without
+        // it the table only grows, and a transaction parked on a compilation
+        // the guest has just cancelled would wait for a step that never comes.
+        if object == RetainedObject::RenderPipelineState {
+            if let Some(name) =
+                crate::runtime::objects::name_resource(state, host, task_id, object_ref)
+            {
+                note_store_route_n(
+                    "pipeline_retire_released",
+                    state.retire_pipeline(name).len() as u64,
+                );
+                note_store_route("pipeline_retired");
+            } else {
+                note_store_route("pipeline_retire_unnamed");
+            }
+        }
         let outcome =
             crate::backend::selected().retire_task_object(state, task_id, object, object_ref);
         note_store_route(object.route(outcome));

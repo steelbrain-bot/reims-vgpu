@@ -908,6 +908,27 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
         report.reason(task_id, pipeline_ref, "fragment_func_zero", "");
         return None;
     }
+    // The guest has created this pipeline object, which is the semantic model's
+    // `Declared` and nothing more — no host work has started here, and both
+    // rails reach this same door before any of theirs does.
+    //
+    // After the two zero-stage checks rather than before them: a descriptor
+    // naming no vertex or fragment function is not a pipeline the guest can
+    // ever bind, and declaring one would put a name in the table that nothing
+    // will ever advance or retire.
+    if let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) {
+        crate::runtime::drain::note_store_route(if state.declare_pipeline(name) {
+            "pipeline_declared"
+        } else {
+            "pipeline_declared_already"
+        });
+    } else {
+        // The model cannot name the slot, so it cannot hold a pipeline for it
+        // either. Counted rather than silent: every one of these is an exec
+        // transaction the ordering plane would refuse for a lease it has no
+        // entry for.
+        crate::runtime::drain::note_store_route("pipeline_declared_unnamed");
+    }
     Some(p)
 }
 

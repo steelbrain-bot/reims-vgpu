@@ -4056,6 +4056,62 @@ impl DeviceState {
         self.session.lock().expect("session").apply_control(op)
     }
 
+    /// Tell the ordering plane that the guest has created a pipeline object.
+    ///
+    /// `reims_vgpu_core::pipeline::PipelineState::Declared` is exactly this:
+    /// the object exists and no host work has started on it. The generation is
+    /// the model's own and is read inside the lock rather than handed in — a
+    /// caller that could state it could declare a pipeline into a lifetime that
+    /// has already closed, which is the one thing
+    /// `PipelineTable::generation_closed` exists to make impossible.
+    ///
+    /// Returns whether this call was the declaration. A pipeline already
+    /// declared answers `false`, which is the ordinary case: the guest binds
+    /// the same pipeline on every draw.
+    ///
+    /// # Why the model is told at all before anything reads it
+    ///
+    /// `SessionModel::admit` refuses an exec transaction whose stream binds a
+    /// pipeline the table does not hold — `LeaseRefusal::Absent`, which is
+    /// every exec packet a real guest sends. The table being empty is the
+    /// ordering group's next blocker after the classes, and this is the
+    /// rail-neutral half of filling it: *that* a pipeline exists is the guest's
+    /// fact, while translating and building it are the running rail's and reach
+    /// the model from there.
+    pub fn declare_pipeline(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+        let mut session = self.session.lock().expect("session");
+        let generation = session.generation();
+        session.pipelines().declare(pipeline, generation)
+    }
+
+    /// Tell the ordering plane the guest has ended a pipeline's life.
+    ///
+    /// The other half of [`Self::declare_pipeline`], and the reason the pair
+    /// can land together: a table that only ever grows is a table whose census
+    /// says nothing, and the guest's own destroy is the one event that says a
+    /// pipeline is over. `CmdDeleteObject` names it — measured, and the name is
+    /// the model's own.
+    ///
+    /// The transactions it returns are the ones parked on a compilation that
+    /// will now never finish. Empty today, because nothing is admitted into
+    /// this model yet; counted rather than dropped, so the day it stops being
+    /// empty is a number and not a hang.
+    pub fn retire_pipeline(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
+        self.session
+            .lock()
+            .expect("session")
+            .pipeline_retired(pipeline)
+    }
+
+    /// What the ordering plane holds about the pipelines this session declared.
+    #[must_use]
+    pub fn pipeline_census(&self) -> reims_vgpu_core::pipeline::Census {
+        self.session.lock().expect("session").pipelines().census()
+    }
+
     /// The open child domains as the bit mask this device's registers speak in.
     ///
     /// Derived on each ask rather than mirrored into a field: a mirror is the
@@ -5583,6 +5639,70 @@ mod fail_vocabulary_tests {
             assert_ne!(now, epoch, "a host write into guest RAM went unannounced");
             epoch = now;
         }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_door_tests {
+    use super::*;
+    use crate::model::{DeviceId, PAGE_SHIFT_X86};
+    use reims_vgpu_core::identity::{ObjectListRef, ResourceId, SlotGeneration};
+
+    fn name(slot: u32) -> ResourceId {
+        ResourceId {
+            slot: ObjectListRef(slot),
+            generation: SlotGeneration(1),
+        }
+    }
+
+    /// The guest creating a pipeline declares it once, and the guest deleting
+    /// it is what ends it.
+    ///
+    /// The pair is what makes the census readable. Declaration alone is a table
+    /// that only grows — the guest re-binds the same pipeline on every draw, so
+    /// "how many pipelines does this session have" would be "how many draws has
+    /// it seen" — and the destroy is the one event on this interface that says
+    /// a pipeline is over.
+    #[test]
+    fn a_pipeline_is_declared_once_and_the_guests_destroy_is_what_retires_it() {
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert_eq!(state.pipeline_census().declared, 0);
+
+        assert!(
+            state.declare_pipeline(name(9)),
+            "the first sight of a pipeline is its declaration"
+        );
+        assert!(
+            !state.declare_pipeline(name(9)),
+            "and every re-bind after it is not, which is most of them"
+        );
+        assert_eq!(state.pipeline_census().declared, 1);
+
+        // A different slot is a different pipeline; a different generation of
+        // the same slot is too, which is the whole reason the name carries one.
+        assert!(state.declare_pipeline(name(10)));
+        assert!(state.declare_pipeline(ResourceId {
+            slot: ObjectListRef(9),
+            generation: SlotGeneration(2),
+        }));
+        assert_eq!(state.pipeline_census().declared, 3);
+
+        assert!(
+            state.retire_pipeline(name(9)).is_empty(),
+            "nothing is admitted into this model yet, so nothing was parked on it"
+        );
+        let census = state.pipeline_census();
+        assert_eq!(
+            (census.declared, census.retired),
+            (3, 1),
+            "the census counts events and not occupancy: three declarations \
+             happened and one retirement did, and a retirement does not unsay \
+             the declaration it ends"
+        );
+
+        // Retiring what the guest never created is not an event.
+        assert!(state.retire_pipeline(name(4000)).is_empty());
+        assert_eq!(state.pipeline_census().retired, 1);
     }
 }
 
