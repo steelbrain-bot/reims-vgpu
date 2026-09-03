@@ -598,6 +598,17 @@ pub fn device_drain(id: u64) -> bool {
     post_sweep(PostSweep::SlotRecheck, || {
         crate::runtime::objects::slot_recheck::sweep(&device.state, &host)
     });
+    // The ordering plane's own residue, on the same one-second cadence as the
+    // levels above and for the reason `backing_outstanding_census` is emitted
+    // beside `store_routes`: the routes count what *happened* to a pipeline and
+    // a pipeline that was declared and never advanced is counted once and never
+    // again, so a table accumulating builds nobody is running reads exactly like
+    // a healthy one. `pending` is the pipelines a transaction can be waiting on.
+    post_sweep(PostSweep::PipelineTable, || {
+        if let Some(line) = device.state.pipeline_occupancy_census() {
+            crate::observe::off(line);
+        }
+    });
     // Beside it and on the same cadence: a page the guest released is judged
     // against the write census, which only moves when this device writes. Also
     // returns immediately when nothing is watched.

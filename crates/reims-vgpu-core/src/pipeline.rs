@@ -274,6 +274,38 @@ pub struct Census {
     pub leases_ready: usize,
 }
 
+/// What the table is holding, by state, at one moment.
+///
+/// See [`PipelineTable::resting`] for why this is a separate question from
+/// [`Census`], which counts events.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Resting {
+    pub declared: usize,
+    pub translating: usize,
+    pub compiling: usize,
+    pub ready: usize,
+    pub refused: usize,
+    pub retired: usize,
+}
+
+impl Resting {
+    /// The pipelines a transaction can be waiting on: everything a lease
+    /// answers `Pending` for.
+    ///
+    /// One number rather than three, because "is anything parked on a build"
+    /// is the question a live boot asks, and three columns are three things to
+    /// forget to add up.
+    #[must_use]
+    pub const fn pending(self) -> usize {
+        self.declared + self.translating + self.compiling
+    }
+
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.pending() + self.ready + self.refused + self.retired
+    }
+}
+
 /// What a closed semantic generation left behind.
 ///
 /// Two lists over the same removal, because two callers ask different
@@ -301,6 +333,44 @@ impl PipelineTable {
     #[must_use]
     pub const fn census(&self) -> Census {
         self.census
+    }
+
+    /// How many pipelines the table is **holding** in each state right now.
+    ///
+    /// # Not the same question as [`Self::census`], and the difference is a hang
+    ///
+    /// The census counts *events*: how many declarations happened, how many
+    /// builds finished. A pipeline that was declared and never advanced is
+    /// counted once there and never again, so a table quietly accumulating
+    /// pipelines nothing will ever build reads exactly like a healthy one —
+    /// the two numbers only differ by a subtraction across counters that
+    /// nobody performs while looking at a live boot.
+    ///
+    /// That accumulation is precisely the failure mode this lifetime has.
+    /// `Declared`, `Translating` and `Compiling` are the three states a
+    /// transaction *waits* on, so an occupancy at any of them that does not
+    /// fall is work parked on a build nobody is running — and a rising one is
+    /// a hang forming, visible before the guest stops drawing rather than
+    /// after.
+    ///
+    /// `Refused` and `Retired` are terminal and their occupancy only grows;
+    /// they are here so the six sum to the table's size and a reader can see
+    /// that they do.
+    #[must_use]
+    pub fn resting(&self) -> Resting {
+        let mut out = Resting::default();
+        for p in self.pipelines.values() {
+            let slot = match p.state {
+                PipelineState::Declared => &mut out.declared,
+                PipelineState::Translating => &mut out.translating,
+                PipelineState::Compiling => &mut out.compiling,
+                PipelineState::Ready => &mut out.ready,
+                PipelineState::Refused => &mut out.refused,
+                PipelineState::Retired => &mut out.retired,
+            };
+            *slot += 1;
+        }
+        out
     }
 
     /// Declare a pipeline. Returns whether it was new.
@@ -613,6 +683,84 @@ impl PipelineTable {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pipelines.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod resting_tests {
+    use super::*;
+
+    fn name(slot: u32) -> ResourceId {
+        ResourceId {
+            slot: crate::identity::ObjectListRef(slot),
+            generation: crate::identity::SlotGeneration(1),
+        }
+    }
+
+    /// Occupancy and the census answer different questions, and the difference
+    /// is the shape of a hang.
+    ///
+    /// A pipeline declared and never advanced is one event in the census and
+    /// stays one forever. A table accumulating those reads identically to a
+    /// healthy one there — and every one of them is a transaction that will
+    /// lease `Pending` and never be released. `resting` is where that is a
+    /// number rather than a subtraction nobody performs.
+    #[test]
+    fn occupancy_shows_what_the_census_counts_once_and_never_again() {
+        let mut table = PipelineTable::new();
+        let generation = SessionGeneration::FIRST;
+
+        for slot in 0..3 {
+            assert!(table.declare(name(slot), generation));
+        }
+        assert_eq!(table.census().declared, 3);
+        assert_eq!(table.resting().pending(), 3, "nothing has been built yet");
+
+        // One completes its build. The census gains an event; the occupancy
+        // *moves* — which is the half a count of events cannot express.
+        assert!(table.advance(name(0), PipelineState::Translating));
+        assert!(table.advance(name(0), PipelineState::Compiling));
+        assert!(table.advance(name(0), PipelineState::Ready));
+        let resting = table.resting();
+        assert_eq!((resting.pending(), resting.ready), (2, 1));
+        assert_eq!(
+            table.census().declared,
+            3,
+            "the census still reports three declarations, because three happened"
+        );
+
+        // One is refused: terminal, so it leaves `pending` and never returns.
+        assert!(table.refuse(name(1), RefusalReason::TranslationFailed("t")));
+        let resting = table.resting();
+        assert_eq!((resting.pending(), resting.refused), (1, 1));
+
+        // And the last one is the reading that matters: a pipeline nothing is
+        // building, indistinguishable in the census from the two that finished.
+        assert_eq!(table.resting().declared, 1);
+        assert_eq!(
+            table.resting().total(),
+            3,
+            "the six columns account for every pipeline the table holds"
+        );
+    }
+
+    /// A retired pipeline stays in the occupancy, because it stays in the
+    /// table.
+    ///
+    /// It is terminal and no transaction waits on it, so it cannot be a hang —
+    /// but leaving it out would make the columns stop summing to the table's
+    /// size, and a reader who cannot check that the parts add up cannot trust
+    /// the part they came for.
+    #[test]
+    fn a_retired_pipeline_is_still_something_the_table_holds() {
+        let mut table = PipelineTable::new();
+        assert!(table.declare(name(7), SessionGeneration::FIRST));
+        assert!(table.retire(name(7)));
+        let resting = table.resting();
+        assert_eq!(
+            (resting.pending(), resting.retired, resting.total()),
+            (0, 1, 1)
+        );
     }
 }
 

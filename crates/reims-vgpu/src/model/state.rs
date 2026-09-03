@@ -4230,6 +4230,54 @@ impl DeviceState {
         self.session.lock().expect("session").pipelines().census()
     }
 
+    /// The census line for what the ordering plane's pipeline table is holding
+    /// right now, once a second, or `None` between windows.
+    ///
+    /// # Why occupancy is emitted and not only the event counts
+    ///
+    /// `store_routes` counts what *happened* — declarations, refusals,
+    /// retirements — and a pipeline that was declared and never advanced is
+    /// counted once there and never again. A table quietly accumulating
+    /// pipelines nothing will ever build therefore reads exactly like a
+    /// healthy one, and the difference is a subtraction across counters that
+    /// nobody performs while watching a live boot.
+    ///
+    /// It is the same argument `backing_outstanding_census` and
+    /// `slot_recheck::outstanding_census` are emitted beside `store_routes`
+    /// for, and it matters more here: `pending` is the pipelines a transaction
+    /// can be *waiting* on, so a `pending` that does not fall is work parked on
+    /// a build nobody is running, and a rising one is a hang forming — visible
+    /// before the guest stops drawing rather than after.
+    ///
+    /// Quiet while the table is empty, so a boot that never declares one is
+    /// not a line a second saying so.
+    pub fn pipeline_occupancy_census(&self) -> Option<String> {
+        const WINDOW_MS: u64 = 1000;
+        static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::observe::elapsed_ms() as u64;
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < WINDOW_MS {
+            return None;
+        }
+        let resting = self.session.lock().expect("session").pipelines().resting();
+        if resting.total() == 0 {
+            return None;
+        }
+        LAST_MS.store(now, Ordering::Relaxed);
+        Some(format!(
+            "pipeline_table pending={} declared={} translating={} compiling={} ready={} \
+             refused={} retired={} total={}",
+            resting.pending(),
+            resting.declared,
+            resting.translating,
+            resting.compiling,
+            resting.ready,
+            resting.refused,
+            resting.retired,
+            resting.total(),
+        ))
+    }
+
     /// The open child domains as the bit mask this device's registers speak in.
     ///
     /// Derived on each ask rather than mirrored into a field: a mirror is the
