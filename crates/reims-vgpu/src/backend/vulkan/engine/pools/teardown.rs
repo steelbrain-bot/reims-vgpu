@@ -51,6 +51,17 @@ impl ResourcePools {
         // Every fence above was waited (or failed on a lost device, where the
         // handles die with the device anyway), so no slot can still be reading:
         // release the whole graveyard regardless of what each handle waits on.
+        //
+        // `SlotMask::MAX` also clears `WINDOW_PRESENT_SLOT`, which no fence
+        // above covers — the host window's blits carry the presenter's own
+        // fences. Every caller has already made that safe, and by two different
+        // routes: `flush_device_derived` destroys the presenter first and
+        // `WindowPresenter::destroy` opens with `queue_wait_idle`, while
+        // `reset_guest_state` and the engine-reset path idle the queue
+        // themselves before arriving here. A future caller that does neither
+        // would free an image under a running present, so idling the queue — or
+        // taking the presenter down — is this function's precondition and not an
+        // incidental property of today's three callers.
         self.release_graveyard(device, SlotMask::MAX);
         for list in self.staging_free.values_mut() {
             for s in list.drain(..) {

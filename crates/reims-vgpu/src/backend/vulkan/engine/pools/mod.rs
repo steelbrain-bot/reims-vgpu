@@ -1118,6 +1118,26 @@ pub(crate) const RING_DEPTH: usize = 8;
 /// handle's mask can only name slots that existed when it was disposed, and
 /// every one of those retires within a ring wrap.
 pub(crate) type SlotMask = u32;
+
+/// The [`SlotMask`] bit standing for "a host-window present is submitted and not
+/// yet retired", rather than for one of the engine's command-buffer slots.
+///
+/// The top bit, so it cannot collide with a slot index however `RING_DEPTH`
+/// grows — and the assertion below is what keeps that true rather than the
+/// choice of bit. [`super::window_present::WINDOW_PRESENTS_IN_FLIGHT`] carries
+/// why the window needs a bit at all.
+#[cfg(feature = "host-window")]
+pub(crate) const WINDOW_PRESENT_SLOT: SlotMask = 1 << (SlotMask::BITS - 1);
+
+/// `RING_DEPTH <= SlotMask::BITS` below is what the slot indices need. The
+/// window's bit needs one strictly stronger: a bit left over that no slot index
+/// can reach.
+#[cfg(feature = "host-window")]
+const _: () = assert!(
+    RING_DEPTH < SlotMask::BITS as usize,
+    "WINDOW_PRESENT_SLOT takes the top SlotMask bit; a RING_DEPTH filling the \
+     mask would alias a command-buffer slot onto the host window's"
+);
 const _: () = assert!(
     RING_DEPTH <= SlotMask::BITS as usize,
     "SlotMask must have one bit per ring slot"

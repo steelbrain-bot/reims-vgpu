@@ -623,6 +623,17 @@ impl ResourcePools {
         counters: &EngineCounters,
     ) -> Result<usize, DrawError> {
         unsafe { self.batch_flush(ctx, counters)? };
+        // The window's bit is given back here and not by the presenter, which
+        // is the whole point of spelling it as an atomic the presenter owns and
+        // this side only reads: the presenter must not have to reach into the
+        // registry to say it has finished, because the registry is on its way to
+        // the guest's device and the presenter holds none. Polling it from the
+        // maintenance tick costs one relaxed load and keeps the dependency
+        // one-way.
+        #[cfg(feature = "host-window")]
+        if !super::super::window_present::window_presents_in_flight() {
+            unsafe { self.release_graveyard(&ctx.device, super::WINDOW_PRESENT_SLOT) };
+        }
         unsafe {
             self.retire_signaled_slots(ctx, counters, DeviceLostOp::PoolsFenceStatusMaintenance)
         }
@@ -893,6 +904,14 @@ impl ResourcePools {
             // flush, and every path that retires a slot flushes the batch
             // first, so this bit cannot clear before the batch's work retires.
             mask |= 1 << self.cur;
+        }
+        // The third state the doc above names, now visible rather than assumed
+        // covered. A host-window blit is submitted to this same queue and
+        // retired by a *later* present, so between those two points it is
+        // reading images this device's own slot bookkeeping says nothing about.
+        #[cfg(feature = "host-window")]
+        if super::super::window_present::window_presents_in_flight() {
+            mask |= super::WINDOW_PRESENT_SLOT;
         }
         mask
     }
@@ -6698,6 +6717,82 @@ mod recycle_tests {
             assert!(
                 matches!(pools.batch_fit(&target(0), narrow), BatchFit::Full),
                 "narrow={narrow}"
+            );
+        }
+    }
+
+    /// The defect the window's slot closes, stated as the mask that used to be
+    /// zero.
+    ///
+    /// An idle ring is the common state between tranches, and it is exactly when
+    /// `dispose` takes its immediate-destroy arm. A host-window blit submitted
+    /// and not yet retired is reading images that arm knows nothing about, so a
+    /// resident retired by a `registry_ensure*` recreate arm at that instant was
+    /// destroyed under the running blit.
+    #[cfg(feature = "host-window")]
+    #[test]
+    fn an_idle_ring_with_a_window_present_outstanding_parks_the_handle_anyway() {
+        let mut pools = ResourcePools::new();
+        pools.slots = (0..4).map(|_| pending_slot()).collect();
+        for slot in &mut pools.slots {
+            slot.pending = None;
+        }
+        assert_eq!(
+            pools.open_slot_mask(),
+            0,
+            "an idle ring with no window present is what the immediate-destroy \
+             arm is for"
+        );
+
+        let _present =
+            crate::backend::vulkan::engine::window_present::PresentInFlightForTest::claim();
+        let waiting = pools.open_slot_mask();
+        assert_eq!(
+            waiting,
+            super::WINDOW_PRESENT_SLOT,
+            "the window is the only thing outstanding, so it is the only bit"
+        );
+
+        pools.graveyard.push((
+            waiting,
+            DeferredHandle::Framebuffer(vk::Framebuffer::null()),
+        ));
+
+        // Every engine slot retiring is not what this handle waits on.
+        for index in 0..pools.slots.len() {
+            assert!(
+                pools.take_released_graveyard(1 << index).is_empty(),
+                "slot {index} retiring says nothing about the window's blit"
+            );
+        }
+        assert_eq!(pools.graveyard.len(), 1);
+
+        assert_eq!(
+            pools
+                .take_released_graveyard(super::WINDOW_PRESENT_SLOT)
+                .len(),
+            1,
+            "the window giving its slot back is what frees it"
+        );
+        assert!(pools.graveyard.is_empty());
+    }
+
+    /// The window's bit is not a slot index, at any ring depth the mask admits.
+    ///
+    /// Asserted over the whole index range rather than against `RING_DEPTH`
+    /// alone, because `open_slot_mask` derives its bits from `slots.len()` and a
+    /// test pinned to today's depth would pass while a grown ring aliased the
+    /// window's blit onto a command buffer's. The `const` assertion beside
+    /// `WINDOW_PRESENT_SLOT` is the other half; this one is what a reader of the
+    /// mask sees.
+    #[cfg(feature = "host-window")]
+    #[test]
+    fn the_window_slot_is_not_one_of_the_rings() {
+        for index in 0..RING_DEPTH {
+            assert_eq!(
+                super::WINDOW_PRESENT_SLOT & (1 << index),
+                0,
+                "slot {index} aliases the window's bit"
             );
         }
     }

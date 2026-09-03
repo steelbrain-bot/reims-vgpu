@@ -9,6 +9,7 @@
 
 use ash::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use super::context::DeviceContext;
@@ -18,6 +19,93 @@ use super::pools::ResourcePools;
 use super::types::{DrawError, PresentRect, TargetIdentity, WindowPresentSource};
 use super::vk_call::{VkCall, VkOp};
 use crate::backend::vulkan::translate;
+
+/// Host-window present transactions submitted to the queue and not yet retired.
+///
+/// Read by [`super::pools::ResourcePools::open_slot_mask`], which is what
+/// decides whether `dispose` may destroy a host object on the spot or must park
+/// it in the graveyard. That mask covered the engine's own command-buffer slots
+/// and its open batch, and nothing else — so a resident retired out from under a
+/// window blit that was submitted and still executing was destroyed
+/// immediately, and the blit read freed memory. `open_slot_mask`'s own
+/// documentation names this case and its remedy: a caller whose recording
+/// outlives its bookkeeping "must either do all of its bookkeeping after the
+/// submit, or make its recording slot visible here the way `open_batch` is".
+/// This is that slot.
+///
+/// A count and not a flag: the presenter runs a ring of entries
+/// ([`WindowPresenter::present_depth`]) and several can be in flight at once, so
+/// the last one to retire is what clears the slot.
+///
+/// A `static` rather than a field on either side, because it is a fact about the
+/// process: `backend::select` latches one rail, the engine owns one
+/// `VkInstance`/`VkDevice`, and `window_presenter` hangs off that same owner as
+/// one host window. It is deliberately *not* on `ResourcePools`: the registry is
+/// guest-derived state on its way to the device the guest declared it against,
+/// and a presenter that had to reach into it to say "I am still running" would
+/// be the coupling that move exists to remove.
+static WINDOW_PRESENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// Whether any host-window present is submitted and unretired.
+pub(crate) fn window_presents_in_flight() -> bool {
+    WINDOW_PRESENTS_IN_FLIGHT.load(Ordering::Acquire) != 0
+}
+
+/// Claim the window's graveyard slot for one submitted present.
+///
+/// Called only where `PresentFrame::submitted` is set, and paired with
+/// [`WindowPresenter::end_present_in_flight`] at every place it is cleared.
+fn begin_present_in_flight() {
+    WINDOW_PRESENTS_IN_FLIGHT.fetch_add(1, Ordering::Release);
+}
+
+/// Hold the window's graveyard slot for the body of a test, and give it back on
+/// drop.
+///
+/// A guard rather than a bare pair of calls, because the counter is a `static`
+/// and the suite is serial: a test that asserted its way to a panic between a
+/// claim and its release would leave every later test believing a present is
+/// outstanding, and the failure would land on an innocent test.
+#[cfg(test)]
+pub(crate) struct PresentInFlightForTest;
+
+#[cfg(test)]
+impl PresentInFlightForTest {
+    pub(crate) fn claim() -> Self {
+        begin_present_in_flight();
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PresentInFlightForTest {
+    fn drop(&mut self) {
+        WINDOW_PRESENTS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// Clear `frame`'s `submitted` latch and give back the graveyard slot it
+/// claimed.
+///
+/// The two are one action and are never written apart. The latch says this
+/// entry's blit is outstanding; the slot is what `dispose` consults before
+/// destroying anything that blit may still be reading. Clearing the latch alone
+/// would open the graveyard while the blit runs — the defect the slot exists to
+/// close — and clearing the slot alone would hold it shut forever.
+///
+/// A free function over one frame rather than a method, because two of the four
+/// sites clear latches while iterating `&mut self.frames` and could not call a
+/// `&mut self` method; splitting the rule across a method and two hand-written
+/// copies is how the pair would come apart.
+///
+/// `mem::replace` and not an unconditional decrement: `recreate_swapchain` and
+/// `destroy` both clear latches that may already be clear, so the decrement has
+/// to be per claim rather than per call or it underflows.
+fn end_present_in_flight(frame: &mut PresentFrame) {
+    if std::mem::replace(&mut frame.submitted, false) {
+        WINDOW_PRESENTS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+    }
+}
 
 /// Consecutive suboptimal-flagged presents (each of which arms a swapchain
 /// recreation) before the always-on alarm names the class. Recreation normally
@@ -821,7 +909,7 @@ impl WindowPresenter {
             for identity in pinned {
                 let _ = pools.pin_resident_target(&identity, false);
             }
-            self.frames[ix].submitted = false;
+            end_present_in_flight(&mut self.frames[ix]);
         }
         Ok(!self.frames[self.frame_ix].submitted)
     }
@@ -1001,7 +1089,7 @@ impl WindowPresenter {
             frame.image_available = image_available;
             // The queue idled, so nothing is outstanding regardless of what the
             // latch said before.
-            frame.submitted = false;
+            end_present_in_flight(frame);
         }
         for semaphore in self.render_finished.drain(..) {
             ctx.device.destroy_semaphore(semaphore, None);
@@ -1333,6 +1421,9 @@ impl WindowPresenter {
             }
         };
         self.frames[frame_ix].pinned = pinned;
+        // Claimed before the latch, so the slot is never observed clear while
+        // the latch says an entry is outstanding.
+        begin_present_in_flight();
         self.frames[frame_ix].submitted = true;
         // Only a successful submit advances the ring; a `Busy` return above
         // leaves the slot for the next attempt.
@@ -1694,7 +1785,7 @@ impl WindowPresenter {
             for identity in frame.pinned.drain(..) {
                 let _ = pools.pin_resident_target(&identity, false);
             }
-            frame.submitted = false;
+            end_present_in_flight(frame);
         }
     }
 
@@ -1724,7 +1815,13 @@ impl WindowPresenter {
         // Drained rather than iterated, so a second `destroy` — `create` calls
         // it on a failed `recreate_swapchain`, and the caller may call it again
         // — cannot double-free a handle.
-        for frame in self.frames.drain(..) {
+        for mut frame in self.frames.drain(..) {
+            // `queue_wait_idle` above is what makes this sound: every entry's
+            // blit has completed, so giving the slot back here cannot open the
+            // graveyard under live work. Per entry that actually held a claim,
+            // for the reason `end_present_in_flight` uses `mem::replace` —
+            // `destroy` may run twice and a second pass has no frames left.
+            end_present_in_flight(&mut frame);
             ctx.device.destroy_fence(frame.in_flight, None);
             ctx.device.destroy_semaphore(frame.image_available, None);
         }

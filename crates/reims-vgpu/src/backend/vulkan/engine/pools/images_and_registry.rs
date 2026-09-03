@@ -36,28 +36,45 @@ fn resident_resample_band(idle_ms: u64) -> &'static str {
 /// written down in that field's own documentation.
 ///
 /// The `registry_ensure*` recreate arms are the third, and they cannot defer the
-/// way the other two do: the guest has replaced the resource under this
-/// identity, so the key has to be free for the resident taking its place and the
-/// old slot has nowhere to wait.
+/// way the other two do: the guest replaced the resource under this identity, so
+/// the key has to be free for the resident taking its place. Every identity
+/// namespace carries width, height and generation, so reaching an arm needs a
+/// `sample_count` or a `Texture`-format change at an otherwise identical key —
+/// which is why it is rare rather than impossible.
 ///
-/// What has nowhere to wait is really the *disposal*. `retire_resident` hands
-/// the image to [`ResourcePools::dispose`], whose deferral is keyed on
-/// `open_slot_mask` — the engine's own open command-buffer slots. The host
-/// window's present transaction is not one of them: it carries its own fence,
-/// `WindowPresenter`'s per-frame `in_flight`, submitted inside `begin_present`
-/// and not waited on until some later present's `retire`. A recreate arriving
-/// between those two points can therefore see `open_slot_mask() == 0`, destroy
-/// the image on the spot, and leave the queued blit reading freed memory.
+/// # What this used to mean, and what it means now
 ///
-/// This names the precondition and does not fix it. The fix changes what a pin
-/// *is* — a retention that defers disposal, which in turn needs the pin to carry
-/// the slot it was taken against, so an unpin can never be applied to a
-/// successor registered under the same identity — and that is worth sizing
-/// against evidence that this fires on a live boot rather than against the
-/// reading above. `pins` and `resource_owners` are both reported because their
-/// difference is which holder class is at risk: an excess of `pins` over
-/// `resource_owners` is a transient GPU or window holder, and the window holder
-/// is the one whose fence nothing here waits on.
+/// The removal itself was never the hazard; the *disposal* was.
+/// `retire_resident` hands the image to [`ResourcePools::dispose`], whose
+/// deferral is keyed on `open_slot_mask`, and the host window's present
+/// transaction was not among the slots that mask reported. It carries
+/// `WindowPresenter`'s own per-frame fence, submitted inside `begin_present` and
+/// not waited on until some later present's `retire`, so a recreate arriving
+/// between those two points saw an idle ring, destroyed the image on the spot,
+/// and left the queued blit reading freed memory.
+///
+/// `super::WINDOW_PRESENT_SLOT` closes that: the window's outstanding presents
+/// are a bit in `open_slot_mask` now, exactly as that function's own
+/// documentation prescribes for a caller whose recording outlives its
+/// bookkeeping, so the image is parked in the graveyard until the blit retires.
+///
+/// So this line no longer reports a use-after-free. It reports the condition
+/// underneath it — the guest replaced a resident somebody was still holding —
+/// which is worth a name for the holder classes the window's bit does not speak
+/// for: `pins` in excess of `resource_owners` is the transient GPU and writeback
+/// class, and `open_slot_mask` covers those only while their recording slot is
+/// open. A holder that unpins before its work retires is the third state that
+/// function warns about, and this is where one would first become visible.
+///
+/// # Reading a zero
+///
+/// A zero here is only informative beside a nonzero `evicts` in the census.
+/// `retire_resident` bumps `target_evicts` for every reason but
+/// `ResourceReleased`, so `evicts=0` means no recreate arm and no reclaim ran at
+/// all and this emitter was never reached — which is what a driven macos-15 boot
+/// reported (`evicts=0`, `gen_mismatch=0`, three rounds of five apps opening and
+/// quitting, `direct_frac` up to 1.00, zero `FAIL`). Do not read that boot as
+/// evidence the condition does not arise.
 pub(super) struct ResidentRetiredWhilePinned {
     why: ResidentReclaim,
     pins: u32,
