@@ -4333,6 +4333,49 @@ impl DeviceState {
             .resource(reims_vgpu_core::identity::TaskId(task_id), obj_ref)
     }
 
+    /// This device as the access source for one task's records, in one
+    /// submission domain.
+    ///
+    /// The counterpart of [`Self::object_name`] for the other half of a
+    /// command-stream walk: the resolver says what a reference names, and this
+    /// says what a participation over that name *is*.
+    ///
+    /// # Why it is not [`reims_vgpu_core::lifecycle::Lifecycle::task_access`]
+    ///
+    /// The owner's own door hands out a `TaskAccess<'_>`, which borrows the
+    /// `Lifecycle` mutably for as long as it lives. Reaching it through this
+    /// device would mean holding the lifecycle guard across the whole walk, and
+    /// a walk is exactly where that cannot be held:
+    /// `reims_vgpu_core::walk::segment` resolves a record and then records it,
+    /// resolution is `crate::runtime::objects::TaskNames` → [`Self::object_name`]
+    /// → the same mutex, and `std::sync::Mutex` is not reentrant. Every exec
+    /// packet would hang this device on its first record.
+    ///
+    /// It would also not typecheck: `resolve::TaskNamespaces::resource` takes
+    /// `&self` and `access::AccessSource::access` takes `&mut self`, and
+    /// ingress wants a resolver and an access source alive at the same time.
+    /// One `&mut Lifecycle` cannot back both.
+    ///
+    /// So this locks **per call**, the way [`Self::object_name`] already does,
+    /// and holds nothing between calls. That is not the snapshot
+    /// `TaskAccess`'s own doc argues against: every call reaches the same
+    /// owner, so the content authority's version reservations accumulate across
+    /// a transaction exactly as they do through a held borrow. What is given up
+    /// is nothing; what is bought is that the resolver and the access source
+    /// can never hold the lock at the same moment.
+    #[must_use]
+    pub const fn task_access(
+        &self,
+        task: reims_vgpu_core::identity::TaskId,
+        domain: reims_vgpu_core::identity::ChannelId,
+    ) -> DeviceAccess<'_> {
+        DeviceAccess {
+            state: self,
+            task,
+            domain,
+        }
+    }
+
     /// The resource this device constructed for a guest reference, if it has
     /// one that still resolves.
     ///
@@ -5405,6 +5448,187 @@ impl DeviceState {
         self.fails.push(ev);
         #[cfg(not(test))]
         let _ = ev;
+    }
+}
+
+/// One task's records, in one submission domain, as an
+/// [`reims_vgpu_core::access::AccessSource`] backed by this device.
+///
+/// A `&DeviceState` and two `Copy` fields — the same shape as
+/// `crate::runtime::objects::TaskRefResolver`, and for the same reason: the
+/// task and the domain are properties of the *packet*, so binding them once at
+/// the door is what stops a per-record caller pairing a participation with the
+/// wrong one.
+///
+/// See [`DeviceState::task_access`] for why this locks per call rather than
+/// borrowing the owner for the walk.
+#[derive(Clone, Copy)]
+pub struct DeviceAccess<'a> {
+    state: &'a DeviceState,
+    task: reims_vgpu_core::identity::TaskId,
+    domain: reims_vgpu_core::identity::ChannelId,
+}
+
+impl DeviceAccess<'_> {
+    /// The task whose names this places participations in.
+    #[must_use]
+    pub const fn task(self) -> reims_vgpu_core::identity::TaskId {
+        self.task
+    }
+
+    /// The submission domain the accesses are claimed in.
+    #[must_use]
+    pub const fn domain(self) -> reims_vgpu_core::identity::ChannelId {
+        self.domain
+    }
+}
+
+impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
+    /// The owner's answer, with the owner's own refusal slug.
+    ///
+    /// The mapping from `lifecycle::Refusal` to `access::AccessRefusal` is the
+    /// one `lifecycle::TaskAccess` makes, and it is repeated rather than shared
+    /// because sharing it would mean constructing the `TaskAccess` this exists
+    /// not to construct. It is three lines and one `slug()` call; a helper
+    /// taking `&mut Lifecycle` would be the held borrow again.
+    fn access(
+        &mut self,
+        participation: &reims_vgpu_core::access::Participation,
+    ) -> Result<reims_vgpu_core::access::AccessIntent, reims_vgpu_core::access::AccessRefusal> {
+        self.state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .access(self.task, self.domain, participation)
+            .map_err(|refusal| reims_vgpu_core::access::AccessRefusal {
+                resource: participation.resource,
+                reason: refusal.slug(),
+            })
+    }
+}
+
+#[cfg(test)]
+mod device_access_tests {
+    use super::*;
+    use reims_vgpu_core::access::{
+        AccessMode, AccessSource as _, BackingId, ByteRange, Participation, ParticipationExtent,
+    };
+    use reims_vgpu_core::identity::{ChannelId, TaskId};
+    use reims_vgpu_core::lifecycle::Storage;
+
+    const TASK: u32 = 3;
+    const DOMAIN: ChannelId = ChannelId(1);
+    const BACKING: BackingId = BackingId(0x4000);
+
+    /// A device with one task holding one dedicated resource, and that
+    /// resource's name.
+    fn state_with_one_resource() -> (DeviceState, ResourceId) {
+        let mut state = DeviceState::new(DeviceId(1), 12);
+        state.define_task(TASK, 1 << 20, 0x100);
+        let declared = state
+            .declare_object(
+                TASK,
+                7,
+                Storage::Dedicated {
+                    backing: BACKING,
+                    extent: ByteRange {
+                        offset: 0,
+                        length: 4096,
+                    },
+                },
+            )
+            .expect("the task is open");
+        (state, declared.id)
+    }
+
+    fn participation(resource: ResourceId, mode: AccessMode) -> Participation {
+        Participation {
+            resource,
+            extent: ParticipationExtent::Whole,
+            mode,
+            api_stages: 0,
+        }
+    }
+
+    /// The interleaving a command-stream walk performs, which the owner's own
+    /// `TaskAccess` cannot survive.
+    ///
+    /// `reims_vgpu_core::walk::segment` resolves a record's refs and then
+    /// records it, once per record — so a resolver call sits *between* two
+    /// access calls of the same packet. A source holding the lifecycle guard
+    /// would deadlock on the `object_name` in the middle rather than fail, so
+    /// this test hangs where it does not pass; that is the failure mode being
+    /// ruled out and there is no assertion that could report it instead.
+    #[test]
+    fn a_name_resolves_between_two_accesses_of_one_packet() {
+        let (state, resource) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        access
+            .access(&participation(resource, AccessMode::Read))
+            .expect("declared and resident");
+        assert_eq!(state.object_name(TASK, 7), Some(resource));
+        access
+            .access(&participation(resource, AccessMode::Write))
+            .expect("declared and resident");
+    }
+
+    /// Locking per call is not a snapshot: the content authority's reservations
+    /// accumulate across a transaction exactly as they do through a held borrow.
+    ///
+    /// Two writes over one resource take two reservations. A source that copied
+    /// anything out of the owner would hand both records the same one, which is
+    /// the failure `lifecycle::TaskAccess`'s own doc names.
+    #[test]
+    fn two_writes_through_one_door_take_two_reservations() {
+        let (state, resource) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        let first = access
+            .access(&participation(resource, AccessMode::Write))
+            .expect("declared and resident");
+        let second = access
+            .access(&participation(resource, AccessMode::Write))
+            .expect("declared and resident");
+
+        assert!(first.output_content_version.is_some());
+        assert_ne!(
+            first.output_content_version, second.output_content_version,
+            "a second write reserved the version the first one did"
+        );
+    }
+
+    /// The door carries the packet's task and domain, and the domain reaches
+    /// the access it places.
+    #[test]
+    fn the_domain_is_the_packets_and_not_the_participations() {
+        let (state, resource) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        assert_eq!(access.task(), TaskId(TASK));
+        assert_eq!(access.domain(), DOMAIN);
+        let intent = access
+            .access(&participation(resource, AccessMode::Read))
+            .expect("declared and resident");
+        assert_eq!(intent.domain, DOMAIN);
+    }
+
+    /// A name the task never declared refuses with the owner's own slug, and
+    /// refuses rather than resolving to whatever the slot used to hold.
+    #[test]
+    fn an_undeclared_name_refuses_with_the_owners_reason() {
+        let (state, resource) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+
+        let stranger = ResourceId {
+            slot: reims_vgpu_core::identity::ObjectListRef(9),
+            generation: resource.generation,
+        };
+        let refusal = access
+            .access(&participation(stranger, AccessMode::Read))
+            .expect_err("slot 9 was never declared");
+        assert_eq!(refusal.resource, stranger);
+        assert_eq!(refusal.reason, "lifecycle_namespace");
     }
 }
 
