@@ -147,9 +147,76 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
             PreflightPart::Cache,
             cache_started.elapsed().as_nanos() as u64,
         );
-        if !cached && !pending.contains(&pipeline_ref) {
-            pending.push(pipeline_ref);
+        if !cached {
+            if !pending.contains(&pipeline_ref) {
+                pending.push(pipeline_ref);
+            }
+            continue;
         }
+        publish_kernel_usage(state, host, task_id, pipeline_ref, air, local_size);
+    }
+}
+
+/// Tell the ordering plane what this kernel does with each bound slot.
+///
+/// # Why here, and not where the dispatch runs
+///
+/// The walk asks for a pipeline's reflection **once, at admission**, so a
+/// transaction that leases a kernel before its usage lands carries
+/// [`reims_vgpu_core::access::AccessMode::Unknown`] for every slot it binds for
+/// the life of that transaction. The compute rail's other point of contact with
+/// a reflection is `compute_exec::vulkan`, which runs after the transaction has
+/// been released — too late to be the answer that transaction was admitted on.
+/// This pre-scan is the earliest site that holds the AIR, and it runs before
+/// admission readies the packet's leases.
+///
+/// # Once per build, not once per packet
+///
+/// Enumerating a binding set allocates two vectors, and this loop reaches every
+/// dispatch of every packet. [`DeviceState::pipeline_usage_published`] is the
+/// gate, and it is the model's own record rather than a set kept here: a
+/// withdrawal or a retirement drops the published usage, and a rail-side memo
+/// would go on claiming the pipeline was covered after the answer had been
+/// thrown away.
+///
+/// The translation is already cached — the caller has just established that —
+/// so the call below is a lock and an `Arc` clone, taken only on the pass that
+/// actually publishes.
+fn publish_kernel_usage<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    air: &[u8],
+    local_size: [u32; 3],
+) {
+    let Some(name) = crate::runtime::objects::name_resource(state, host, task_id, pipeline_ref)
+    else {
+        crate::runtime::drain::note_store_route("pipeline_usage_unnamed");
+        return;
+    };
+    if state.pipeline_usage_published(name) {
+        crate::runtime::drain::note_store_route("compute_usage_already_published");
+        return;
+    }
+    let Ok(shader) =
+        crate::runtime::m2v_cache::translate_cached_kernel_reflected(air, local_size, pipeline_ref)
+    else {
+        // The entry the caller found cached is gone or failed between the two
+        // calls. Nothing is owed: the dispatch's own path reports the
+        // translation failure precisely, and an unpublished kernel is a
+        // conservative footprint rather than a wrong one.
+        crate::runtime::drain::note_store_route("compute_usage_translation_lost");
+        return;
+    };
+    match crate::backend::vulkan::binding_usage::compute(&shader.reflection) {
+        Ok(usage) => {
+            crate::runtime::draw::publish_pipeline_usage(state, host, task_id, pipeline_ref, usage)
+        }
+        // A stage that cannot be published leaves the kernel at `Unknown`,
+        // which costs ordering and never correctness. Counted rather than
+        // failed, and the count is what says which reason is worth closing.
+        Err(refusal) => crate::runtime::drain::note_store_route(refusal.slug()),
     }
 }
 

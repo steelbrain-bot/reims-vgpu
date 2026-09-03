@@ -2233,6 +2233,21 @@ fn admit_and_park<H: HostMemory + HostOps>(
     // against a shader that is still translating, which is the
     // `m2v_translation_pending_at_sync_boundary` loss measured on a driven
     // macos-15 desktop.
+    //
+    // **Declared before the rail pre-scans, not after.** The pre-scan is where
+    // a rail first holds a translated shader, and publishing what that shader
+    // reads is refused for a pipeline the table does not yet hold — so
+    // declaring afterwards would make the model's own stated order (publish,
+    // then ready) unreachable on the packet that first builds the kernel. The
+    // step is the guest's fact and the walk's own list; taking it earlier
+    // states the same thing at the first moment it is known.
+    for &lease in leases {
+        note_store_route(if state.declare_pipeline(lease) {
+            "pipeline_declared"
+        } else {
+            "pipeline_declared_already"
+        });
+    }
     let translating = match (arrived.submission.as_ref(), built.payload.exec()) {
         (Some(submission), Some(resolved)) => {
             let mut measured_ns = 0u64;
@@ -2247,11 +2262,6 @@ fn admit_and_park<H: HostMemory + HostOps>(
         _ => Vec::new(),
     };
     for &lease in leases {
-        note_store_route(if state.declare_pipeline(lease) {
-            "pipeline_declared"
-        } else {
-            "pipeline_declared_already"
-        });
         if translating.contains(&lease.slot.0) {
             withdraw_lease(state, lease);
         } else if translating.is_empty() {

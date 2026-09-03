@@ -4402,6 +4402,24 @@ impl DeviceState {
             .publish_usage(pipeline, usage)
     }
 
+    /// Whether an executor has already published this pipeline's reflection.
+    ///
+    /// The question a rail asks before building the answer, so the binding
+    /// tables are enumerated once per build rather than once per packet that
+    /// dispatches the pipeline. See
+    /// [`reims_vgpu_core::pipeline::PipelineTable::usage_published`] for why
+    /// the memo is the model's and not the rail's.
+    pub fn pipeline_usage_published(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .usage_published(pipeline)
+    }
+
     /// The published reflections, for the length of one packet's walk.
     ///
     /// A guard rather than a per-lookup call, because the walk asks once per
