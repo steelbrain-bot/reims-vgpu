@@ -2062,10 +2062,6 @@ fn publish_word<H: HostMemory + HostOps>(
 ///   one, so the incarnation move is arrival work by construction.
 struct Arrived {
     submission: Option<crate::runtime::exec::ExecSubmission>,
-    /// Whether a translation this submission needs is still running. `true`
-    /// means the pipelines it leases are not usable yet and the transaction is
-    /// admitted waiting on them.
-    translating: bool,
     /// The exec result the reading produced, carrying whatever it refused.
     exec: crate::runtime::exec::ExecResult,
     repointed: Result<
@@ -2083,7 +2079,6 @@ fn arrival_work<H: HostMemory + HostOps>(
 ) -> Arrived {
     let mut arrived = Arrived {
         submission: None,
-        translating: false,
         exec: crate::runtime::exec::ExecResult::default(),
         repointed: Err(crate::runtime::objects::RepointStorageRefusal::Unnamed),
     };
@@ -2095,16 +2090,7 @@ fn arrival_work<H: HostMemory + HostOps>(
             let (submission, exec) =
                 crate::runtime::exec::read_exec_submission(state, host, &packet.payload);
             arrived.exec = exec;
-            if let Some(submission) = submission {
-                let mut measured_ns = 0u64;
-                arrived.translating = crate::runtime::exec::preflight_submission(
-                    state,
-                    host,
-                    &submission,
-                    &mut measured_ns,
-                );
-                arrived.submission = Some(submission);
-            }
+            arrived.submission = submission;
         }
         CHILD_OP_REPLACE_PHYSICAL => {
             arrived.repointed = repoint_at_arrival(state, host, &packet.payload);
@@ -2237,13 +2223,35 @@ fn admit_and_park<H: HostMemory + HostOps>(
         .payload
         .exec()
         .map_or(&[], |work| &work.pipeline_leases);
+    // **Asked here and not at arrival, because here is where the leases are.**
+    // Admission readies exactly this list on the rail's answer, so the question
+    // the rail is asked has to be about exactly this list. It used to be asked
+    // before the walk had run, and answered from a second scan of the packet's
+    // bytes for `SetPipeline` records — a set that need not be this one. A lease
+    // readied on an answer that never examined it is a transaction released
+    // against a shader that is still translating, which is the
+    // `m2v_translation_pending_at_sync_boundary` loss measured on a driven
+    // macos-15 desktop.
+    let translating = match (arrived.submission.as_ref(), built.payload.exec()) {
+        (Some(submission), Some(resolved)) => {
+            let mut measured_ns = 0u64;
+            crate::runtime::exec::preflight_submission(
+                state,
+                host,
+                submission,
+                resolved,
+                &mut measured_ns,
+            )
+        }
+        _ => false,
+    };
     for &lease in leases {
         note_store_route(if state.declare_pipeline(lease) {
             "pipeline_declared"
         } else {
             "pipeline_declared_already"
         });
-        if !arrived.translating {
+        if !translating {
             ready_lease(state, lease, "pipeline_lease_ready_admission");
         }
     }
@@ -2443,9 +2451,10 @@ fn observe_awaited_stamps<H: HostMemory + HostOps>(state: &mut DeviceState, host
 /// pipeline is what the model turns into released work.
 fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
     for ingress in state.parked.waiting_in_order() {
-        let Some((submission, leases)) = state.parked.planning(ingress) else {
+        let Some((submission, resolved)) = state.parked.planning(ingress) else {
             continue;
         };
+        let leases = resolved.pipeline_leases.as_slice();
         // A position whose every lease is already `Ready` has had the rail's
         // promise made for it, and this pass cannot make it again: `ready_lease`
         // would find every step illegal and `preflight_submission` would re-walk
@@ -2462,7 +2471,13 @@ fn pump_translations<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             continue;
         }
         let mut measured_ns = 0u64;
-        if crate::runtime::exec::preflight_submission(state, &*host, submission, &mut measured_ns) {
+        if crate::runtime::exec::preflight_submission(
+            state,
+            &*host,
+            submission,
+            resolved,
+            &mut measured_ns,
+        ) {
             continue;
         }
         let leases = leases.to_vec();

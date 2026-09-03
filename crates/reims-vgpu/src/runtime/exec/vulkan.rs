@@ -13,21 +13,27 @@
 use super::*;
 use reims_vgpu_protocol::decode::compute::{ComputeRecord, DispatchRecord};
 
+/// `pipelines` is the **model's own lease list** for the packet, not a second
+/// scan of its bytes.
+///
+/// The two used to be different answers to "which pipelines does this packet
+/// bind": the walk collected `ResolvedOperation::pipeline_lease` and this
+/// re-framed the stream looking for `SetPipeline` records. That difference is
+/// load-bearing rather than cosmetic — admission readies *the walk's* leases on
+/// *this* function's whole-submission verdict, so a pipeline the scan did not
+/// reach was a lease declared ready on an answer that never examined it, which
+/// is the shape of the `m2v_translation_pending_at_sync_boundary` loss measured
+/// on a driven macos-15 desktop. Taking the list makes the two sets the same
+/// set by construction, and there is nothing left to keep in step.
 pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     task_id: u32,
-    stream: &[u8],
+    pipelines: &[u32],
 ) -> bool {
     use crate::runtime::drain::{note_preflight_part, note_preflight_pipe, PreflightPart};
-    let refs_started = std::time::Instant::now();
-    let pipelines = render_pipeline_refs(stream);
-    note_preflight_part(
-        PreflightPart::Refs,
-        refs_started.elapsed().as_nanos() as u64,
-    );
     let mut pending = false;
-    for pipeline_ref in pipelines {
+    for &pipeline_ref in pipelines {
         note_preflight_pipe();
         // The draw path's own memo already knows whether these two shaders are
         // translated, and answers for ~0.6 us against the 4.3 us of guest
@@ -95,48 +101,6 @@ pub(crate) fn preflight_render_translations<M: HostMemory + HostOps>(
     pending
 }
 
-pub(crate) fn render_pipeline_refs(stream: &[u8]) -> Vec<u32> {
-    // Deliberately silent on a framing refusal: this is a speculative pre-scan of
-    // the very stream `walk_stream` is about to frame and report on. Logging here
-    // would double every `stream_frame_fail` line for no added information.
-    let Ok(segments) = SegmentStream::new(stream) else {
-        return Vec::new();
-    };
-    let mut pipelines = Vec::new();
-    for framed in segments {
-        // A framing refusal ends the scan, exactly as it ends `walk_stream`'s.
-        // Continuing past one here would pre-translate pipelines out of
-        // segments the walk is about to refuse to execute.
-        let Ok(framed) = framed else { break };
-        let SegmentBody::Encoder {
-            kind: SegmentKind::Render,
-            commands,
-        } = framed.body
-        else {
-            continue;
-        };
-        for op in reims_vgpu_wire::op::OpStream::new(commands) {
-            let Ok(op) = op else { break };
-            let bytes = &commands[op.offset..op.offset + op.length() as usize];
-            let Ok(framed_op) = reims_vgpu_protocol::decode::op(bytes, 0) else {
-                continue;
-            };
-            // The lift in production, not a second decoder over the same
-            // bytes: a pre-scan that disagreed with the walk about which
-            // records set a pipeline would translate the wrong ones.
-            if let Ok(reims_vgpu_protocol::decode::render::RenderRecord::SetPipeline(r)) =
-                reims_vgpu_protocol::decode::render::decode(&framed_op)
-            {
-                if r.pipeline_ref != 0 && !pipelines.contains(&r.pipeline_ref) {
-                    pipelines.push(r.pipeline_ref);
-                }
-            }
-        }
-    }
-
-    pipelines
-}
-
 pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
@@ -189,7 +153,7 @@ pub(crate) fn preflight_compute_translations<M: HostMemory + HostOps>(
 /// Threads-indirect carries LocalSize in guest argument memory rather than the
 /// stream record, so it deliberately remains on the synchronous fallback.
 pub(crate) fn compute_translation_inputs(stream: &[u8]) -> Vec<(u32, [u32; 3])> {
-    // Silent for the same reason as `render_pipeline_refs`: a pre-scan whose
+    // Silent deliberately: a pre-scan whose
     // framing refusal `walk_stream` will report once, with the task attached.
     let Ok(segments) = SegmentStream::new(stream) else {
         return Vec::new();
@@ -258,10 +222,15 @@ pub fn preflight_translations<M: HostMemory + HostOps>(
     host: &M,
     task_id: u32,
     streams: &[Vec<u8>],
+    render_pipelines: &[u32],
 ) -> bool {
-    streams.iter().fold(false, |pending, stream| {
-        let render_pending = preflight_render_translations(state, host, task_id, stream);
-        let compute_pending = preflight_compute_translations(state, host, task_id, stream);
-        render_pending || compute_pending || pending
+    // The render half is asked once for the whole packet, because its input is
+    // the packet's lease list and not a stream. The compute half still walks
+    // the streams: a kernel's cache key carries its threadgroup size, which is
+    // a dispatch record's field and not a lease's, so the walk's lease list
+    // does not yet spell what that scan needs.
+    let render_pending = preflight_render_translations(state, host, task_id, render_pipelines);
+    streams.iter().fold(render_pending, |pending, stream| {
+        preflight_compute_translations(state, host, task_id, stream) || pending
     })
 }

@@ -332,6 +332,33 @@ impl ExecWork {
         }
     }
 
+    /// The pipelines this transaction's **render** records bind.
+    ///
+    /// Derived from the records rather than kept beside
+    /// [`Self::pipeline_leases`], which is deliberately class-blind: the
+    /// ordering plane holds a compute pipeline for exactly the reasons it holds
+    /// a render one, so splitting *that* list would give the model two lists to
+    /// wait on. A backend asking "which render pipelines must I have translated"
+    /// is asking a different question, and this answers it from the same single
+    /// source — a second stored list could disagree with the records, and this
+    /// cannot.
+    ///
+    /// Deduplicated, like [`Self::pipeline_leases`]: a stream that binds one
+    /// pipeline for forty draws names it once.
+    pub fn render_pipeline_leases(&self) -> Vec<ResourceId> {
+        let mut out: Vec<ResourceId> = Vec::new();
+        for record in self.records() {
+            if let ResolvedOperation::Render(crate::render::RenderOp::SetPipeline { pipeline }) =
+                record.op
+            {
+                if !out.contains(&pipeline) {
+                    out.push(pipeline);
+                }
+            }
+        }
+        out
+    }
+
     /// How many records this packet carries.
     #[must_use]
     pub fn record_count(&self) -> usize {

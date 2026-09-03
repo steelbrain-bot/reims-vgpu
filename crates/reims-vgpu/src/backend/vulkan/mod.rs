@@ -592,8 +592,15 @@ impl Backend for VulkanBackend {
         host: &M,
         task_id: u32,
         streams: &[Vec<u8>],
+        render_pipelines: &[u32],
     ) -> bool {
-        crate::runtime::exec::vulkan::preflight_translations(state, host, task_id, streams)
+        crate::runtime::exec::vulkan::preflight_translations(
+            state,
+            host,
+            task_id,
+            streams,
+            render_pipelines,
+        )
     }
 
     fn gva_load_seed_elidable<M: HostMemory + HostOps>(

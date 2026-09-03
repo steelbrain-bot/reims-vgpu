@@ -910,18 +910,36 @@ fn read_submission<M: HostMemory + HostOps>(
 /// than once per stream. That is the rail's own contract — see
 /// `crate::backend::Backend::preflight_translations` — and it is the property
 /// that makes calling this early worth anything.
+/// `resolved` is the walk's own answer about this packet, and its render
+/// pipeline leases are the same names admission readies on this function's
+/// verdict. Passing it rather than letting the rail rescan the bytes is what
+/// makes "nothing is pending" a statement about exactly the leases it will be
+/// used for — see [`vulkan::preflight_render_translations`].
 pub fn preflight_submission<M: HostMemory + HostOps>(
     state: &DeviceState,
     host: &M,
     submission: &ExecSubmission,
+    resolved: &reims_vgpu_core::exec::ExecWork,
     measured_ns: &mut u64,
 ) -> bool {
     let preflight_started = std::time::Instant::now();
+    // The render half of the packet's leases, and the guest's own ref, which is
+    // the slot half of the name: the generation is the model's business and no
+    // MTLB is keyed by it. Compute leases are held back because the compute
+    // pre-scan takes its own inputs — a compute ref handed to the render arm
+    // would fail to load a render MTLB pair and be counted as an unloadable
+    // one, which is a real reading this would fill with a benign population.
+    let refs: Vec<u32> = resolved
+        .render_pipeline_leases()
+        .iter()
+        .map(|lease| lease.slot.0)
+        .collect();
     let pending = crate::backend::selected().preflight_translations(
         state,
         host,
         submission.task_id,
         &submission.streams,
+        &refs,
     );
     // Timed unconditionally: the phase is the drain's own accounting of where
     // an exec call's time went, and a rail that preflights nothing has to show

@@ -373,9 +373,9 @@ impl ParkedStore {
     /// done, which is a question that has to be asked *before* deciding to take
     /// the bytes out.
     #[must_use]
-    pub fn planning(&self, ingress: IngressOrdinal) -> Option<(&ExecSubmission, &[ResourceId])> {
+    pub fn planning(&self, ingress: IngressOrdinal) -> Option<(&ExecSubmission, &ExecWork)> {
         let work = self.work.get(&ingress)?;
-        Some((work.submission.as_ref()?, work.leases()))
+        Some((work.submission.as_ref()?, work.resolved.as_ref()?))
     }
 
     /// The completion slots a parked position is waiting on.

@@ -425,29 +425,6 @@ fn an_unknown_segment_family_ends_the_walk_and_the_envelope_does_not() {
 
 #[cfg(feature = "backend-vulkan")]
 #[test]
-fn render_preflight_collects_content_pipelines_without_duplicates() {
-    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
-    use wire_render::OPCODE_SET_RENDER_PIPELINE_STATE;
-
-    let mut records = Vec::new();
-    for pipeline in [41u32, 77, 41] {
-        let mut cmd = [0u8; 12];
-        st32(&mut cmd[0..4], OPCODE_SET_RENDER_PIPELINE_STATE);
-        st32(&mut cmd[4..8], 12);
-        st32(&mut cmd[8..12], pipeline);
-        records.extend_from_slice(&cmd);
-    }
-    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
-    let stream_len = stream.len() + records.len();
-    st32(&mut stream[0..4], stream_len as u32);
-    stream[4] = SegmentKind::Render.wire_type();
-    stream.extend_from_slice(&records);
-
-    assert_eq!(super::vulkan::render_pipeline_refs(&stream), vec![41, 77]);
-}
-
-#[cfg(feature = "backend-vulkan")]
-#[test]
 fn compute_preflight_collects_pipeline_and_local_size_without_duplicates() {
     use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
 
@@ -7896,9 +7873,36 @@ fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
     let host = crate::runtime::host::FakeHost::new();
     let submission = super::ExecSubmission::stated(1, vec![stream]);
     let mut measured_ns = 0u64;
+    // The transaction the walk would have built for that record, stated here
+    // because this test drives the rail directly rather than through admission.
+    let mut builder = reims_vgpu_core::exec::ExecBuilder::new();
+    builder
+        .begin_encoder(
+            reims_vgpu_protocol::segment::SegmentKind::Render,
+            reims_vgpu_protocol::segment::SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("a fresh encoder");
+    builder
+        .record(
+            reims_vgpu_core::exec::ResolvedOperation::Render(
+                reims_vgpu_core::render::RenderOp::SetPipeline {
+                    pipeline: reims_vgpu_core::identity::ResourceId {
+                        slot: reims_vgpu_core::identity::ObjectListRef(41),
+                        generation: reims_vgpu_core::identity::SlotGeneration(1),
+                    },
+                },
+            ),
+            &mut |_: &reims_vgpu_core::access::Participation| {
+                unreachable!("setting a pipeline names no memory")
+            },
+        )
+        .expect("the record places");
+    builder.end_segment().expect("the encoder ends");
+    let resolved = builder.finish().expect("the transaction finishes");
+    assert_eq!(resolved.render_pipeline_leases().len(), 1);
 
     assert!(
-        !super::preflight_submission(&state, &host, &submission, &mut measured_ns),
+        !super::preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns),
         "no object list, so pipeline 41 has no AIR to await"
     );
     // And it is a function of its inputs: asked again, the same answer.
@@ -7906,6 +7910,7 @@ fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
         &state,
         &host,
         &submission,
+        &resolved,
         &mut measured_ns
     ));
 }
