@@ -334,10 +334,16 @@ fn every_function_the_register_names_still_exists() {
                 named.extend(backticked_function_paths(column));
             }
         }
-        let Some(marker) = line.find("eplacement coverage") else {
-            continue;
-        };
-        let claimed = declared_coverage_names(&line[marker..]);
+        // Every ``fn `name` `` on the line, wherever it sits. The rule this
+        // gate enforces is stated about the marker and not about a column, and
+        // the file has since grown a fourth place that uses it — the
+        // structural-zero scoreboard, whose "read from" cells name the gates
+        // that establish each zero. Those are promises about functions by
+        // exactly the rule's own definition, and keying the parser to the
+        // "replacement coverage" phrase silently exempted them: the scoreboard
+        // named four gates and this test verified none of them, which is the
+        // shape of the defect the marker was introduced to end.
+        let claimed = declared_coverage_names(line);
         claims += claimed.len();
         named.extend(claimed);
     }
@@ -370,8 +376,8 @@ fn every_function_the_register_names_still_exists() {
     );
 }
 
-/// The names a row *declares* as its replacement coverage, which is the subset
-/// of its backticks written as ``fn `name` ``.
+/// The names a line *declares* as a promise about a function, which is the
+/// subset of its backticks written as ``fn `name` ``.
 ///
 /// Everything else in the sentence is prose and stays prose: `pools/` is a
 /// directory, `winpub_*` is a route family, and a row is allowed to name a slug
