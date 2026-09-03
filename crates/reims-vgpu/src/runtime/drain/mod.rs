@@ -1227,8 +1227,19 @@ impl StampWait {
     /// the wrap as unsatisfied and stalls the channel permanently. The signed
     /// difference is correct for any pair less than 2^31 apart, which is the
     /// same window the rest of this protocol's counters assume.
+    ///
+    /// **Deferred rather than restated.** The rule belongs to
+    /// `reims_vgpu_core::identity::StampValue`, which is the type the ordering
+    /// plane decides every stamp wait with, and this device held a second copy
+    /// of it written in raw `u32`. Two implementations of a wrapping comparison
+    /// are two chances to disagree about which of two numbers is later, and the
+    /// disagreement is silent in both directions: one parks a timeline forever
+    /// on a value already written, the other releases work early. So the answer
+    /// comes from the owner and the paragraph above stays as the reason it is
+    /// written that way.
     pub fn satisfied_by(self, current: u32) -> bool {
-        current.wrapping_sub(self.value) as i32 >= 0
+        reims_vgpu_core::identity::StampValue(current)
+            .reached(reims_vgpu_core::identity::StampValue(self.value))
     }
 }
 
