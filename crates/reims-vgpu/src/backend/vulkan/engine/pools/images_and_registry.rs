@@ -2214,13 +2214,10 @@ impl ResourcePools {
     /// Whether the host window is presenting from this resident, and so no
     /// reclaim path may take it.
     ///
-    /// This replaced a pin the presenter took around its blit. The pin was a
-    /// worse fit in both directions. It was too *narrow* in time — it existed
-    /// only while a blit was in flight, so a resident the window was displaying
-    /// but not currently blitting was an ordinary reclaim victim — and it was
-    /// the presenter's `&mut ResourcePools` write, on a thread that must stop
-    /// touching this registry at all: it holds no device, and the registry is on
-    /// its way to the device the guest declared it against.
+    /// This replaced a pin the presenter took around its blit — a
+    /// `&mut ResourcePools` write from a thread that must stop touching this
+    /// registry at all: it holds no device, and the registry is on its way to
+    /// the device the guest declared it against.
     ///
     /// `window_published` is the set the publish maintains and every removal
     /// path already consults to move [`super::WINDOW_SOURCE_EPOCH`]. Asking it
@@ -2228,14 +2225,30 @@ impl ResourcePools {
     /// not take, and which residents' removal invalidates the window's source —
     /// instead of a pin and a set that could disagree.
     ///
-    /// The set is the publish's, so this holds a resident the window has been
-    /// published against *at any point* since the last epoch bump, not only the
-    /// one on screen now. That is deliberate and it is bounded: at most
-    /// [`super::WINDOW_PUBLISHED_MAX`] identities, and the publish that would
-    /// exceed it bumps the epoch and clears the set, which returns every stale
-    /// one to the reclaim paths in the same call. A narrower set would have to
-    /// know when a present *stopped* reading a source, which is the window
-    /// thread's knowledge and the thing this boundary exists to stop asking for.
+    /// # What the hold actually spans, which is not the whole present
+    ///
+    /// The set is the publish's, so this holds a resident from the publish that
+    /// named it until the next [`Self::invalidate_window_sources`]. In steady
+    /// state that end comes *before* the blit completes and often before it is
+    /// submitted: the present's own `registry_note_access` write-back moves the
+    /// access to `TransferRead`, and [`Self::set_registry_access`] bumps the
+    /// epoch on a change under a published identity — deliberately, since the
+    /// resolution the window is holding really has gone wrong. So the span is
+    /// [publish .. that write-back], and the in-flight blit after it is held by
+    /// `WINDOW_PRESENT_SLOT`'s graveyard bit instead.
+    ///
+    /// That is the division of labour and not a gap. The graveyard covers "a
+    /// blit is outstanding", which is a fact about submitted GPU work and
+    /// belongs to the thread that submitted it. This covers "the drain has
+    /// promised this resident to the window", which is a fact about a publish
+    /// and belongs to the registry. Neither can answer the other's question,
+    /// and the pin that used to try answered the first one badly — it existed
+    /// only while a blit was in flight, so a resident the window was displaying
+    /// but not currently blitting was an ordinary reclaim victim.
+    ///
+    /// Bounded either way: at most [`super::WINDOW_PUBLISHED_MAX`] identities,
+    /// and the publish that would exceed it bumps the epoch and clears the set,
+    /// which returns every stale one to the reclaim paths in the same call.
     ///
     /// It is not a safety mechanism and does not have to be one. A reclaim that
     /// *did* take a published resident would move the epoch, so the window's next
@@ -3966,6 +3979,48 @@ pub(super) mod pin_count_tests {
         pools.invalidate_window_sources();
         assert_eq!(pools.released_resident_keys(1), vec![id.clone()]);
         assert_eq!(pools.recoverable_residents(), vec![id]);
+    }
+
+    /// The hold ends where the window's own blit write-back invalidates the
+    /// source, which is before the blit retires and is not a gap.
+    ///
+    /// Asserted because [`ResourcePools::window_holds`] claims a span, and a
+    /// span no test draws is a span the next reader will assume is the whole
+    /// present. It is not: `registry_note_access(_, TransferRead)` is a change
+    /// under a published identity, so it bumps the epoch and clears the set that
+    /// is doing the holding. What covers the outstanding blit from there is
+    /// `WINDOW_PRESENT_SLOT`, which is not this registry's business.
+    #[test]
+    fn the_window_hold_ends_at_the_blits_own_access_write_back() {
+        let mut pools = ResourcePools::new();
+        let now = 10_000;
+        pools.idle_clock_ms = now;
+        admit(&mut pools, surf(1), now, 0);
+        pools.registry_note_access(
+            &surf(1),
+            super::ResidentAccess::ColorWrite(vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+        );
+
+        pools.note_window_published(Some(&surf(1)));
+        let published_epoch = super::window_source_epoch();
+        assert!(
+            pools.recoverable_residents().is_empty(),
+            "held from the publish that named it"
+        );
+
+        // Exactly the write-back `begin_present` makes after recording its read
+        // barrier, at the same argument.
+        pools.registry_note_access(&surf(1), super::ResidentAccess::transfer_read(false));
+        assert_ne!(
+            super::window_source_epoch(),
+            published_epoch,
+            "the write-back is a change under a published identity, so it bumps"
+        );
+        assert_eq!(
+            pools.recoverable_residents(),
+            vec![surf(1)],
+            "and the bump cleared the set, so the hold is over before the blit is"
+        );
     }
 
     /// Overflowing the publish set returns everything it was holding, so the
