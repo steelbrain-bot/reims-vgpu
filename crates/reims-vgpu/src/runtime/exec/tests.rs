@@ -7838,3 +7838,49 @@ fn a_submission_executes_the_streams_it_was_read_with_and_not_guest_memory_again
          the guest has since written where it came from"
     );
 }
+
+/// The plan step answers `false` for a pipeline whose inputs this device cannot
+/// load, because a missing plan input is deterministic and not asynchronous
+/// work.
+///
+/// **What "plan" means, asserted at the seam.** `preflight_submission` is the
+/// middle of read / plan / execute and it exists as its own step because it is
+/// the only one a caller may run at a moment of its own choosing — it takes a
+/// shared `&DeviceState`, mutates nothing the guest can see, and is a function
+/// of bytes the submission already holds. `true` therefore has exactly one
+/// meaning: *a translation is running and will finish*. A pipeline whose AIR
+/// cannot be loaded at all is not that — normal execution reports it precisely
+/// — and answering `true` for one would defer the packet forever.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn a_pipeline_whose_inputs_cannot_load_is_not_a_pending_translation() {
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    use wire_render::OPCODE_SET_RENDER_PIPELINE_STATE;
+
+    let mut records = [0u8; 12];
+    st32(&mut records[0..4], OPCODE_SET_RENDER_PIPELINE_STATE);
+    st32(&mut records[4..8], 12);
+    st32(&mut records[8..12], 41);
+    let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+    let stream_len = stream.len() + records.len();
+    st32(&mut stream[0..4], stream_len as u32);
+    stream[4] = SegmentKind::Render.wire_type();
+    stream.extend_from_slice(&records);
+
+    let state = DeviceState::new(crate::model::DeviceId(1), 12);
+    let host = crate::runtime::host::FakeHost::new();
+    let submission = super::ExecSubmission::stated(1, vec![stream]);
+    let mut measured_ns = 0u64;
+
+    assert!(
+        !super::preflight_submission(&state, &host, &submission, &mut measured_ns),
+        "no object list, so pipeline 41 has no AIR to await"
+    );
+    // And it is a function of its inputs: asked again, the same answer.
+    assert!(!super::preflight_submission(
+        &state,
+        &host,
+        &submission,
+        &mut measured_ns
+    ));
+}

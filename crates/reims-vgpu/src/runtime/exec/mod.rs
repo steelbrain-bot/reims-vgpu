@@ -890,11 +890,56 @@ fn read_submission<M: HostMemory + HostOps>(
     })
 }
 
-/// Run one read submission's host work.
+/// Start every cold translation this submission needs, and say whether any is
+/// still running.
 ///
-/// Sets `out.deferred` and does nothing else when a referenced render stage is
-/// still translating: the packet stays unconsumed so the guest replays it, and
-/// replay must not duplicate clears, fences, dispatches or writeback.
+/// **The middle of read / plan / execute**, and the reason the three are three.
+/// Cold AIR translation is immutable CPU work over bytes the submission already
+/// holds: it needs no protocol ownership, it mutates no guest state, and it can
+/// therefore run at a moment of the caller's choosing. Execution cannot — it
+/// consumes the resource table and encodes draws.
+///
+/// `true` means a referenced render stage is still translating. The caller must
+/// then run *nothing* of this submission: the packet stays unconsumed so the
+/// guest replays it, and replay must not duplicate clears, fences, dispatches
+/// or guest writeback.
+///
+/// Every stream is scanned, not just up to the first pending one, so the
+/// translations proceed in parallel and the submission is retried once rather
+/// than once per stream. That is the rail's own contract — see
+/// `crate::backend::Backend::preflight_translations` — and it is the property
+/// that makes calling this early worth anything.
+fn preflight_submission<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    submission: &ExecSubmission,
+    measured_ns: &mut u64,
+) -> bool {
+    let preflight_started = std::time::Instant::now();
+    let pending = crate::backend::selected().preflight_translations(
+        state,
+        host,
+        submission.task_id,
+        &submission.streams,
+    );
+    // Timed unconditionally: the phase is the drain's own accounting of where
+    // an exec call's time went, and a rail that preflights nothing has to show
+    // as the zero it costs rather than as an absent column the leftover
+    // `Header` silently absorbs.
+    let preflight_ns = preflight_started.elapsed().as_nanos() as u64;
+    *measured_ns += preflight_ns;
+    crate::runtime::drain::note_exec_phase(
+        crate::runtime::drain::ExecPhase::Preflight,
+        preflight_ns,
+    );
+    pending
+}
+
+/// Run one read and planned submission's host work.
+///
+/// Everything here mutates something the guest can see, which is what makes it
+/// the third step rather than part of the second: the resource table is
+/// consumed before the first record, and the records encode.
 fn execute_submission<M: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut M,
@@ -908,31 +953,6 @@ fn execute_submission<M: HostMemory + HostOps>(
         streams,
     } = submission;
     let task_id = *task_id;
-
-    // Plan before execute: cold AIR translation is immutable CPU work and can
-    // run without protocol ownership. Keep the packet unconsumed until every
-    // referenced render stage is ready, so replay cannot duplicate clears,
-    // fences, compute dispatches, or guest writeback.
-    let translation_pending = {
-        let preflight_started = std::time::Instant::now();
-        let pending =
-            crate::backend::selected().preflight_translations(state, host, task_id, streams);
-        // Timed on this side of the seam, and unconditionally: the phase is the
-        // drain's own accounting of where an exec call's time went, and a rail
-        // that preflights nothing has to show as the zero it costs rather than
-        // as an absent column the leftover `Header` silently absorbs.
-        let preflight_ns = preflight_started.elapsed().as_nanos() as u64;
-        *measured_ns += preflight_ns;
-        crate::runtime::drain::note_exec_phase(
-            crate::runtime::drain::ExecPhase::Preflight,
-            preflight_ns,
-        );
-        pending
-    };
-    if translation_pending {
-        out.deferred = true;
-        return;
-    }
 
     // Before any of this submission's work runs. Each record states what was
     // true of its resource *before* the submission, so a pending window holding
@@ -970,7 +990,16 @@ pub fn process_exec_indirect2<M: HostMemory + HostOps>(
     let Some(submission) = read_submission(state, host, payload, &mut out, &mut measured_ns) else {
         return out;
     };
-    execute_submission(state, host, &submission, &mut out, &mut measured_ns);
+    // Read, plan, execute. The plan step is separate because it is the only one
+    // of the three that a caller may run at a moment of its own choosing: it is
+    // pure CPU work over bytes the submission already holds, where the read
+    // walks the guest's page tables and the execution consumes the resource
+    // table.
+    if preflight_submission(state, host, &submission, &mut measured_ns) {
+        out.deferred = true;
+    } else {
+        execute_submission(state, host, &submission, &mut out, &mut measured_ns);
+    }
     note_exec_header(exec_started, measured_ns);
     if !out.deferred {
         out.total_us = elapsed_us(exec_started);
