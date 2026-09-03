@@ -5065,7 +5065,7 @@ pub(crate) unsafe fn execute_draw_inner(
         );
     }
 
-    let clear = clear_values(req);
+    let clear = clear_values(req)?;
     phase.enter(super::draw_phase::Phase::RecordPass);
     let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(render_pass)
@@ -6147,20 +6147,21 @@ unsafe fn ad_hoc_attachment_views(
 /// pass to LOAD. The clear now travels as
 /// [`super::types::DrawRequest::color_attachment`], already paired with its
 /// format by attachment translation.
-fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
-    let mut clear = vec![vk::ClearValue {
-        // With no declared attachment the clear is transparent black. Every
-        // Vulkan union member represents that value with the same zero bits.
+fn clear_values(req: &DrawRequest) -> Result<ClearValues, DrawError> {
+    let mut clear = ClearValues::default();
+    // With no declared attachment the clear is transparent black. Every Vulkan
+    // union member represents that value with the same zero bits.
+    clear.push(vk::ClearValue {
         color: req
             .color_attachment
             .map(|a| a.clear())
             .unwrap_or_default()
             .vk(),
-    }];
+    })?;
     for sec in &req.secondary_targets {
         clear.push(vk::ClearValue {
             color: sec.attachment.clear().vk(),
-        });
+        })?;
     }
     if let Some(d) = &req.depth {
         clear.push(vk::ClearValue {
@@ -6168,9 +6169,75 @@ fn clear_values(req: &DrawRequest) -> Vec<vk::ClearValue> {
                 depth: d.clear_value,
                 stencil: d.stencil.map(|s| s.clear_value).unwrap_or(0),
             },
-        });
+        })?;
     }
-    clear
+    Ok(clear)
+}
+
+/// The clear values of one draw, held inline.
+///
+/// # Why this is an array and not a `Vec`
+///
+/// "Heap allocations per steady-state draw" is one of the replacement
+/// architecture's structural zeros. `clear_values` returned a `Vec` whose first
+/// `push` allocated, and on the overwhelmingly common draw — one colour target,
+/// no secondaries, no depth — that was **the only trip a warm repeat draw made
+/// into the allocator**: 1 trip, 16 bytes, measured through
+/// `reims_vgpu_testkit::allocations` on the live executor. One `malloc` a draw
+/// is the exact shape that instrument's own doc warns about, because it shows
+/// up as a percent or two of drain duty spread evenly across a profile and no
+/// single line got slower.
+///
+/// The capacity is not a guess. `1 + MAX_SECONDARY_ATTACH` is
+/// `PASS_MAX_COLOR_ATTACHMENTS`, which is the wire's own attachment bound, and
+/// the `+ 1` is depth — so this holds every attachment a render pass this device
+/// builds can have, and one more would be a pass Vulkan could not be given
+/// either.
+///
+/// # Why the overflow is a refusal and not a truncation
+///
+/// Vulkan indexes this array positionally against the pass's attachments, so a
+/// short one silently gives a later attachment an earlier one's colour — a wrong
+/// frame with nothing reported. The cap is already enforced where the pass key
+/// is built, but relying on that is relying on a call order this type cannot
+/// see; refusing here makes the bound the array's own, under the same
+/// `SecondaryAttachmentCap` reason, so the two cannot disagree.
+struct ClearValues {
+    values: [vk::ClearValue; 1 + MAX_SECONDARY_ATTACH + 1],
+    len: usize,
+}
+
+impl Default for ClearValues {
+    fn default() -> Self {
+        Self {
+            values: [vk::ClearValue::default(); 1 + MAX_SECONDARY_ATTACH + 1],
+            len: 0,
+        }
+    }
+}
+
+impl ClearValues {
+    fn push(&mut self, value: vk::ClearValue) -> Result<(), DrawError> {
+        let Some(slot) = self.values.get_mut(self.len) else {
+            return Err(DrawError::Unsupported(
+                super::reason::DrawReason::SecondaryAttachmentCap {
+                    requested: self.len,
+                    cap: MAX_SECONDARY_ATTACH,
+                },
+            ));
+        };
+        *slot = value;
+        self.len += 1;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for ClearValues {
+    type Target = [vk::ClearValue];
+
+    fn deref(&self) -> &Self::Target {
+        &self.values[..self.len]
+    }
 }
 
 /// The access a barrier over *this draw's own colour target* must name as its
@@ -7539,7 +7606,7 @@ mod tests {
             ..DrawRequest::default()
         };
 
-        let clear = clear_values(&req);
+        let clear = clear_values(&req).expect("within the attachment cap");
         assert_eq!(
             clear.len(),
             4,
@@ -7557,11 +7624,69 @@ mod tests {
         }
     }
 
+    /// Past the attachment bound the clear array refuses instead of running
+    /// short, because Vulkan indexes it positionally and a short one gives a
+    /// later attachment an earlier one's colour.
+    ///
+    /// The bound belongs to the array rather than to the pass-key path that also
+    /// enforces it: the array cannot see a call order, and the two answering
+    /// under one reason is what stops them disagreeing.
+    #[test]
+    fn a_clear_array_past_the_attachment_bound_refuses_rather_than_truncating() {
+        use crate::protocol::pixel_format::MTL_FORMAT_BGRA8_UNORM;
+
+        let attachment =
+            crate::backend::vulkan::translate::pixel::color_attachment(MTL_FORMAT_BGRA8_UNORM)
+                .unwrap()
+                .0
+                .with_clear([0.0; 4]);
+
+        // Exactly full: the primary plus every secondary the wire's attachment
+        // bound allows, plus depth.
+        let full = DrawRequest {
+            color_attachment: Some(attachment),
+            secondary_targets: (0..MAX_SECONDARY_ATTACH)
+                .map(|_| secondary_with_attachment(attachment))
+                .collect(),
+            depth: Some(super::super::types::DepthState {
+                identity: None,
+                test_enable: true,
+                write_enable: true,
+                compare: super::super::types::SamplerCompareFunction::Less,
+                clear_value: 0.5,
+                load: false,
+                stencil: None,
+            }),
+            ..DrawRequest::default()
+        };
+        assert_eq!(
+            clear_values(&full).expect("a full pass is a pass").len(),
+            1 + MAX_SECONDARY_ATTACH + 1,
+            "the capacity is every attachment a pass this device builds can have"
+        );
+
+        let over = DrawRequest {
+            secondary_targets: (0..=MAX_SECONDARY_ATTACH)
+                .map(|_| secondary_with_attachment(attachment))
+                .collect(),
+            ..full
+        };
+        assert!(
+            matches!(
+                clear_values(&over),
+                Err(DrawError::Unsupported(
+                    super::super::reason::DrawReason::SecondaryAttachmentCap { .. }
+                ))
+            ),
+            "one attachment past the bound is a refusal, not a short array"
+        );
+    }
+
     /// A default request still clears to transparent black, which is what every
     /// draw that names no colour has always got.
     #[test]
     fn an_unstated_clear_is_transparent_black() {
-        let clear = clear_values(&DrawRequest::default());
+        let clear = clear_values(&DrawRequest::default()).expect("one attachment");
         assert_eq!(clear.len(), 1, "no secondaries and no depth is one entry");
         unsafe { assert_eq!(clear[0].color.float32, [0.0; 4]) };
     }
@@ -7587,7 +7712,7 @@ mod tests {
             ..DrawRequest::default()
         };
 
-        let clear = clear_values(&req);
+        let clear = clear_values(&req).expect("within the attachment cap");
         unsafe {
             assert_eq!(clear[0].color.uint32, [1, 2, 65_535, 0]);
             assert_eq!(clear[1].color.uint32, [5, 6, 7, 8]);

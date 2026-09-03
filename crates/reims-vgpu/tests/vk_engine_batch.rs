@@ -10,6 +10,15 @@
 
 #![cfg(feature = "backend-vulkan")]
 
+/// This binary measures allocator trips on the live warm-draw path, so it owns
+/// the process's allocator. Counting is per thread and off unless
+/// [`reims_vgpu_testkit::allocations::measure`] turns it on, so every other test
+/// in this file pays one relaxed thread-local read per allocation and nothing
+/// else.
+#[global_allocator]
+static ALLOCATOR: reims_vgpu_testkit::allocations::Counting =
+    reims_vgpu_testkit::allocations::Counting::new();
+
 use metal2vulkan::passes::Stage;
 use reims_vgpu::backend::vulkan::engine::{
     self, BufferContent, DepthState, DrawRequest, GuestRun, GuestRunSource, IndexType,
@@ -672,6 +681,85 @@ fn the_window_publish_flushes_the_open_batch_before_it_vouches() {
     assert_eq!(
         after.batch_opens, 1,
         "and opened no batch of its own: {after:?}"
+    );
+}
+
+/// A warm repeat draw enters the heap allocator zero times.
+///
+/// # This is one of the plan's structural zeros, on the live path
+///
+/// "Heap allocations per steady-state draw" is a required value in the
+/// replacement architecture's structural-zero table, not a target.
+/// `reims-vgpu-core` has met it for the semantic model since
+/// `a_warm_path_stops_allocating`; nothing measured the live executor, and the
+/// instrument's own doc says why that matters — a helper returning a `Vec` on a
+/// per-draw path costs one `malloc` a draw and shows up as a percent or two of
+/// drain duty spread evenly across a profile, so no single line got slower and
+/// nobody bisects to it.
+///
+/// When this test was first written the answer was **1 trip, 16 bytes**, every
+/// time: `exec::clear_values` returned a `Vec` whose first `push` allocated, on
+/// the overwhelmingly common draw of one colour target with no secondaries and
+/// no depth. It is an array now, and the answer is zero.
+///
+/// # What is measured, and what is deliberately outside the region
+///
+/// One repeat of an already-warm draw: same pipeline, same target, same
+/// scissor, joining an open batch. The `DrawRequest` is built once outside the
+/// region — it owns two `Arc<Vec<u32>>` of SPIR-V and a `Vec` of scissors, and
+/// measuring its construction would measure the harness. Warm-up runs the same
+/// request enough times that first-use growth in every cache behind it has
+/// happened, and stays far enough below `batch_max_draws` that the measured draw
+/// cannot be the one that flushes — a flush ends and submits a command buffer
+/// and is not a steady-state draw.
+#[test]
+fn a_warm_repeat_draw_does_not_enter_the_allocator() {
+    let _guard = engine_test_lock().lock().unwrap();
+    let (vert, frag) = triangle_spirv();
+    let identity = TargetIdentity::Surface {
+        id: 990_601,
+        width: W,
+        height: H,
+        generation: 1,
+        format: SURFACE_TEST_FORMAT,
+    };
+
+    let opener = batch_req(&vert, &frag, &identity, false, half_scissor(true));
+    match engine::execute_draw_request(engine_device(), &opener) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if skip_if_no_gpu(&msg) {
+                eprintln!("skipping: {msg}");
+                return;
+            }
+            panic!("opener draw: {msg}");
+        }
+    }
+
+    // One request, reused: the joiner the steady state actually repeats.
+    let joiner = batch_req(&vert, &frag, &identity, true, half_scissor(true));
+    let cap = engine::batch_max_draws();
+    assert!(
+        cap > 24,
+        "the warm-up and the measured draw must both fit in one batch, and the \
+         cap is {cap}"
+    );
+    for n in 1..=8 {
+        engine::execute_draw_request(engine_device(), &joiner)
+            .unwrap_or_else(|e| panic!("warm-up draw #{n}: {e}"));
+    }
+
+    let (result, trips) = reims_vgpu_testkit::allocations::measure(|| {
+        engine::execute_draw_request(engine_device(), &joiner)
+    });
+    result.expect("the measured draw is the ninth repeat of one that succeeded");
+
+    assert_eq!(
+        trips, 0,
+        "a warm repeat draw took {trips} trips into the allocator. This is a \
+         structural zero, so the question is not how many are acceptable but \
+         which per-draw path started allocating"
     );
 }
 
