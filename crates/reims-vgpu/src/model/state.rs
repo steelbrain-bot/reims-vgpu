@@ -731,6 +731,49 @@ pub trait RailDeviceState: Any + Send + Sync + std::fmt::Debug {
     /// Drop everything held under one task's reference namespaces, reporting
     /// what went under this rail's own census names.
     fn delete_task(&self, task_id: u32);
+
+    /// The device's own lifetime has ended. Let go of everything held under it,
+    /// reporting what went under this rail's own census names.
+    ///
+    /// # Why this is a told event and not a `Drop`
+    ///
+    /// [`Self::delete_task`] already establishes the division: the model
+    /// decodes *when* a lifetime ends and the rail knows *what letting go
+    /// costs*. A device lifetime ends the same way and had no such telling —
+    /// the slot was simply dropped, at `DeviceState::reset`'s wholesale
+    /// replacement and again when the device leaves the registry.
+    ///
+    /// That was survivable only while the slot held nothing a host has to be
+    /// told about. It holds identities and `Arc`s today, and every module this
+    /// crate still has to move into it — residency, variant families, transfer
+    /// and record state — owns native objects whose destruction goes through a
+    /// device, which `Drop` cannot reach and cannot report. So the ending is
+    /// told, exactly once, at the one place both doors pass through.
+    ///
+    /// Called with `&self` for the same reason `delete_task` is: the rail owns
+    /// whatever synchronization its own tables need, and the model may not name
+    /// them.
+    fn end_device(&self);
+}
+
+/// Both doors out of a device lifetime, joined into one telling.
+///
+/// A device ends two ways and neither used to reach the rail. [`DeviceState::reset`]
+/// replaces the whole struct, and `device::device_destroy` drops it out of the
+/// registry. Both of those drop the [`RailDeviceState`] slot, so `Drop` is the
+/// one place both pass through — which is why the telling lives here rather
+/// than in `reset`, where the destroy door would have missed it.
+///
+/// Read through [`std::sync::OnceLock::get`] and not through
+/// [`DeviceState::rail_state`]: an ending must not *create* a rail state no
+/// rail ever installed, which is what the initializing accessor would do and
+/// what would then report an empty teardown for a device that had no rail.
+impl Drop for DeviceState {
+    fn drop(&mut self) {
+        if let Some(rail) = self.rail.get() {
+            rail.end_device();
+        }
+    }
 }
 
 static NEXT_TASK_RESOURCE_LIFETIME: std::sync::atomic::AtomicU64 =
@@ -1244,6 +1287,19 @@ impl<T> TaskReferenceStates<T> {
         states.retain(|&(task, _), _| task != task_id);
         before - states.len()
     }
+
+    /// Drop every state under every task, returning how many there were.
+    ///
+    /// The device-lifetime counterpart of [`Self::delete_task`], and not
+    /// expressible as a loop over it: the guest's task ids are not enumerable
+    /// from here, and a device ending does not name them one at a time.
+    pub fn clear(&self) -> usize {
+        let mut states = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *states).len()
+    }
 }
 
 /// Per-task sampler objects, keyed by the sampler API's reference space.
@@ -1364,6 +1420,115 @@ mod rail_resource_state_tests {
 }
 
 #[cfg(test)]
+mod rail_device_state_tests {
+    use super::*;
+    use crate::model::PAGE_SHIFT_X86;
+    use std::sync::atomic::AtomicU32;
+
+    static ENDINGS: AtomicU32 = AtomicU32::new(0);
+    static TASK_DELETIONS: AtomicU32 = AtomicU32::new(0);
+
+    /// One rail type means one counter, and one of the tests below asserts the
+    /// counter does **not** move — which a concurrently running sibling would
+    /// break. Held for the body of each test rather than relying on
+    /// `--test-threads=1`, because a gate that only holds under a flag somebody
+    /// has to remember is not a gate.
+    static SERIALIZE: Mutex<()> = Mutex::new(());
+
+    fn alone() -> std::sync::MutexGuard<'static, ()> {
+        SERIALIZE.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A rail that records only that it was told, because "was the rail told"
+    /// is the whole question at this boundary. What the telling costs is the
+    /// rail's own, and is tested where the rail's table is.
+    #[derive(Debug, Default)]
+    struct CountingRail;
+
+    impl RailDeviceState for CountingRail {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn delete_task(&self, _task_id: u32) {
+            TASK_DELETIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        fn end_device(&self) {
+            ENDINGS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The registry door: a device that leaves the registry is dropped, and the
+    /// rail holding native objects under it has to be told before that drop
+    /// finishes.
+    #[test]
+    fn a_device_that_is_dropped_ends_its_rails_device_lifetime_once() {
+        let _alone = alone();
+        let before = ENDINGS.load(Ordering::Relaxed);
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(
+            state.rail_state::<CountingRail>().is_some(),
+            "the rail installs its slot on first ask"
+        );
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before,
+            "installing a slot is not an ending"
+        );
+
+        drop(state);
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before + 1,
+            "the drop tells the rail exactly once"
+        );
+    }
+
+    /// The reset door. `DeviceState::reset` replaces the struct wholesale, so
+    /// the ending has to arrive there too — and it is the same telling, which
+    /// is why it is owned by `Drop` and not written at both sites.
+    #[test]
+    fn a_reset_ends_the_rails_device_lifetime_and_the_next_one_starts_empty() {
+        let _alone = alone();
+        let before = ENDINGS.load(Ordering::Relaxed);
+        let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.rail_state::<CountingRail>().is_some());
+
+        state.reset();
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before + 1,
+            "the reset ended the lifetime the rail had state under"
+        );
+
+        // The replacement is a different device lifetime with its own empty
+        // slot: asking again installs a second one rather than resurrecting the
+        // first, and ending *that* is a second telling.
+        assert!(state.rail_state::<CountingRail>().is_some());
+        drop(state);
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before + 2,
+            "the lifetime after the reset ends on its own terms"
+        );
+    }
+
+    /// The accessor that installs a slot must not be the one an ending uses.
+    /// A device no rail ever asked about has nothing to let go of, and telling
+    /// it would report an empty teardown for a rail that was never there.
+    #[test]
+    fn a_device_no_rail_ever_claimed_ends_without_creating_one() {
+        let _alone = alone();
+        let before = ENDINGS.load(Ordering::Relaxed);
+        drop(DeviceState::new(DeviceId(1), PAGE_SHIFT_X86));
+        assert_eq!(
+            ENDINGS.load(Ordering::Relaxed),
+            before,
+            "no slot, no ending"
+        );
+    }
+}
+
+#[cfg(test)]
 mod task_reference_state_tests {
     use super::TaskReferenceStates;
     use std::sync::Arc;
@@ -1401,6 +1566,33 @@ mod task_reference_state_tests {
         for ref_ in 0..2048 {
             assert_eq!(*states.get(3, ref_).unwrap(), ref_);
         }
+    }
+
+    /// The device's ending takes every task, including the ones the guest never
+    /// deleted — which is the case `delete_task` cannot cover, since nothing
+    /// here can enumerate the guest's task ids.
+    #[test]
+    fn a_device_ending_clears_every_task_and_says_how_many_it_took() {
+        let states = TaskReferenceStates::default();
+        states.register(1, 7, Arc::new(10u32));
+        states.register(1, 8, Arc::new(11u32));
+        states.register(2, 7, Arc::new(12u32));
+        let held = states.get(2, 7).unwrap();
+
+        assert_eq!(states.clear(), 3, "every task's states, counted once");
+        assert!(!states.contains(1, 7));
+        assert!(!states.contains(1, 8));
+        assert!(!states.contains(2, 7));
+        assert_eq!(
+            *held, 12,
+            "a state an encoder still owns outlives the table, exactly as it \
+             does across a reference delete"
+        );
+        assert_eq!(
+            states.clear(),
+            0,
+            "a second ending has nothing left to take"
+        );
     }
 }
 

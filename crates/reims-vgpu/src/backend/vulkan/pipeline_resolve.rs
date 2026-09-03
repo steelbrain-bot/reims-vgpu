@@ -181,6 +181,22 @@ impl RailDeviceState for VulkanDeviceState {
             self.render_pipelines.delete_task(task_id) as u64,
         );
     }
+
+    /// The device's end ends every reference this rail holds under it, whatever
+    /// task declared it — including the tasks the guest never got to delete,
+    /// which is every one of them when the device goes away under a running
+    /// guest.
+    ///
+    /// Reported under its own name rather than folded into
+    /// `pipeline_state_task_deleted`: an orderly per-task teardown and a device
+    /// disappearing with work still declared are different facts about a boot,
+    /// and one counter carrying both cannot say which happened.
+    fn end_device(&self) {
+        note_store_route_n(
+            "pipeline_state_device_ended",
+            self.render_pipelines.clear() as u64,
+        );
+    }
 }
 
 /// This rail's retained pipeline states for `state`'s device.
@@ -641,6 +657,41 @@ mod tests {
         pipelines(&state).register(3, 9, retained_pipeline_for_test());
         assert!(state.delete_task(3));
         assert!(!pipelines(&state).contains(3, 9));
+    }
+
+    /// The device ending takes what no task deletion ever named.
+    ///
+    /// The guest is under no obligation to delete its tasks before the device
+    /// goes away — a reset under a running guest is exactly the case where it
+    /// does not — so the states left behind are the *normal* population at this
+    /// event, not an error path. `delete_task` cannot reach them: it is told one
+    /// id at a time and nothing here enumerates the guest's ids.
+    #[test]
+    fn a_device_ending_releases_every_task_no_deletion_named() {
+        let mut state = DeviceState::new(crate::model::DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        state.define_task(3, 1 << 20, 8);
+        state.define_task(4, 2 << 20, 8);
+        pipelines(&state).register(3, 9, retained_pipeline_for_test());
+        pipelines(&state).register(3, 10, retained_pipeline_for_test());
+        let held = pipelines(&state).register(4, 9, retained_pipeline_for_test());
+
+        let rail = state
+            .rail_state::<VulkanDeviceState>()
+            .expect("this rail holds the slot");
+        rail.end_device();
+
+        assert!(!pipelines(&state).contains(3, 9));
+        assert!(!pipelines(&state).contains(3, 10));
+        assert!(
+            !pipelines(&state).contains(4, 9),
+            "every task, not the one that happened to be asked about"
+        );
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "a state an encoder still owns outlives the table, as it does \
+             across a reference delete"
+        );
     }
 
     /// The two sets [`VertexBindPlan`] carries used to be rebuilt inside the
