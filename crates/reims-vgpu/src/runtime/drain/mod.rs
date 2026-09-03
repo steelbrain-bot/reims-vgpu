@@ -2925,7 +2925,27 @@ fn note_stamp_visible(state: &DeviceState, index: u32, value: u32, site: &'stati
             // smaller value in the page. `note_stamp_direction` sees the same
             // event on the arms that write the word; this sees it on every arm
             // the guest can read from.
-            crate::model::StampPublication::Behind => "stamp_publish_behind",
+            //
+            // **Named, once per slot, because the count is two different
+            // facts.** A boot measures about 14 000 of these, and
+            // `dead/README.md` records the same counter at zero when the
+            // publication point was moved to this site — so either the meaning
+            // drifted or the invariant broke, and a bare count cannot say
+            // which. What separates them is *which slot* and *by how much*: one
+            // slot whose page rewound under a timeline that will not follow it
+            // is a slot to explain, and a timeline running ahead of every word
+            // the guest can read is an ordering defect. The pair is on the line.
+            crate::model::StampPublication::Behind { held } => {
+                if crate::observe::first_sight("stamp_publish_behind", u64::from(index)) {
+                    crate::observe::fail(format!(
+                        "stamp_publish_behind slot={index} site={site} page={value} held={} \
+                         (the ordering plane holds a point later than the word the guest can \
+                         read from this slot)",
+                        held.0
+                    ));
+                }
+                "stamp_publish_behind"
+            }
         },
     );
 }

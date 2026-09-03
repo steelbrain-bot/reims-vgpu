@@ -3310,7 +3310,15 @@ pub enum StampPublication {
     Repeat,
     /// The word is behind what the slot already holds, so the model's timeline
     /// did not move and this device's guest-visible write disagrees with it.
-    Behind,
+    ///
+    /// Carries what the plane holds, because the count alone cannot separate
+    /// the two things this can be: a rewind of one slot, where the page went
+    /// backwards under a timeline that will not follow, and a timeline that has
+    /// run ahead of every word the guest can read. The first is a slot to
+    /// explain and the second is an ordering defect, and they are one number.
+    Behind {
+        held: reims_vgpu_core::identity::StampValue,
+    },
 }
 
 impl DeviceState {
@@ -4365,7 +4373,7 @@ impl DeviceState {
             None => StampPublication::First,
             Some(before) if after == Some(value) && before != value => StampPublication::Advanced,
             Some(before) if before == value => StampPublication::Repeat,
-            Some(_) => StampPublication::Behind,
+            Some(held) => StampPublication::Behind { held },
         }
     }
 
@@ -6599,7 +6607,14 @@ mod stamp_publication_tests {
     fn a_word_behind_the_slot_does_not_move_the_model_and_is_named() {
         let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
         assert_eq!(publish(&state, 0, 100), StampPublication::First);
-        assert_eq!(publish(&state, 0, 99), StampPublication::Behind);
+        assert_eq!(
+            publish(&state, 0, 99),
+            StampPublication::Behind {
+                held: reims_vgpu_core::identity::StampValue(100)
+            },
+            "and it says what the plane holds, so a rewound slot is \
+             distinguishable from a timeline that has run ahead"
+        );
         assert_eq!(
             publish(&state, 0, 100),
             StampPublication::Repeat,
@@ -6621,7 +6636,9 @@ mod stamp_publication_tests {
         assert_eq!(publish(&state, 1, 3), StampPublication::Advanced);
         assert_eq!(
             publish(&state, 1, u32::MAX - 1),
-            StampPublication::Behind,
+            StampPublication::Behind {
+                held: reims_vgpu_core::identity::StampValue(3)
+            },
             "and the point before the wrap is behind the one after it"
         );
     }
