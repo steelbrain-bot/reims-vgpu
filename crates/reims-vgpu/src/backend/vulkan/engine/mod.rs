@@ -1203,6 +1203,33 @@ pub fn window_present_resize(width: u32, height: u32) {
 /// Present the current compositor resident through the engine-owned swapchain,
 /// falling back to `cpu` for presents no resident carries. Acquire is
 /// nonblocking, so a vblank wait never holds `ENGINE`.
+///
+/// # The measurement the next move needs, taken while it was cheap to take
+///
+/// `begin_present` still needs `&mut ResourcePools` for one write — the access
+/// write-back, whose own site says why it cannot move on its own. What can move
+/// is the present: `pools` follows `caches` onto the device once the whole
+/// present is a transaction against the device that owns the registry, run by a
+/// thread that holds one. That thread is the drain, and two readings off the
+/// driven macos-15 boot behind `10696be7` say what it would cost.
+///
+/// **The schedule would not change.** `presents == offered` in all 112 cadence
+/// windows of that boot, with `busy`, `busy_fence`, `busy_acquire` and
+/// `busy_no_area` all zero across every one of them — as they were on the seven
+/// rail boots `window_present::PRESENT_IN_FLIGHT` was measured on. The window
+/// presents exactly once per publish and refuses nothing, so its cadence *is*
+/// the publish's cadence already; moving the work to the publish moves where the
+/// code runs and not when it runs.
+///
+/// **The cost would be small.** The window thread's engine lock on that boot:
+/// median 4 acquisitions per second, median 155 µs held per second, median
+/// longest single hold 68 µs, against a present rate of median 9.7 Hz and p90
+/// 28.8 Hz. A drain that absorbed all of it would take on about 1 ms per second.
+///
+/// Neither reading says the move is easy — the acquire has to happen before the
+/// blit can be recorded, and it is the window's surface that owns the swapchain.
+/// They say it is not gated on throughput, which is the question that would
+/// otherwise be asked first and answered by guessing.
 #[cfg(feature = "host-window")]
 pub fn window_present_frame(
     source: Option<&WindowPresentSource>,
