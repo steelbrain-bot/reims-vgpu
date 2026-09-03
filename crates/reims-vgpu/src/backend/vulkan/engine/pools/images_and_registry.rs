@@ -2036,8 +2036,8 @@ impl ResourcePools {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
             slot.content_epoch = None;
-            slot.access = access;
         }
+        self.set_registry_access(identity, access);
         self.set_sole_copy(identity, !guest_backed);
     }
 
@@ -2064,13 +2064,15 @@ impl ResourcePools {
     pub(crate) fn registry_mark_depth_ready(&mut self, identity: &TargetIdentity) {
         if let Some(slot) = self.registry.get_mut(identity) {
             slot.content_ready = true;
-            // The depth pass declares `final_layout` DEPTH_STENCIL_ATTACHMENT_
-            // OPTIMAL unconditionally, so this is where the image is left and it
-            // is the `initial_layout` the next LOAD pass names. The two agreeing
-            // is what makes a LOAD valid without a barrier between the passes.
-            slot.access =
-                ResidentAccess::ColorWrite(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         }
+        // The depth pass declares `final_layout` DEPTH_STENCIL_ATTACHMENT_
+        // OPTIMAL unconditionally, so this is where the image is left and it
+        // is the `initial_layout` the next LOAD pass names. The two agreeing
+        // is what makes a LOAD valid without a barrier between the passes.
+        self.set_registry_access(
+            identity,
+            ResidentAccess::ColorWrite(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+        );
     }
 
     /// Whether this resident already holds rendered contents — the question a
@@ -2278,8 +2280,53 @@ impl ResourcePools {
         identity: &TargetIdentity,
         access: ResidentAccess,
     ) {
-        if let Some(slot) = self.registry.get_mut(identity) {
-            slot.access = access;
+        self.set_registry_access(identity, access);
+    }
+
+    /// The one place a resident's access is written, and the place the host
+    /// window's licence is checked against that write.
+    ///
+    /// # Why the window cares about a layout at all
+    ///
+    /// `ResidentAccess` is not decoration on a slot. It is the `oldLayout`,
+    /// `srcStageMask` and `srcAccessMask` of the next barrier over that image,
+    /// and the host window builds one: its present blit reads
+    /// [`ResolvedResident::access`] resolved at publish. `WINDOW_SOURCE_EPOCH`
+    /// says the promised *image* still stands; without this, nothing said the
+    /// promised *access* did, and a barrier from an access the image has left is
+    /// an invalid transition rather than a stale picture.
+    ///
+    /// # Why the bump is on a change and not on a write
+    ///
+    /// Most writes here are no-ops for this purpose. A colour target rendered
+    /// again ends in the access it was already in, so bumping per write would
+    /// invalidate the window's source on every frame the drain redraws the
+    /// displayed surface — which is every frame — and send every present through
+    /// host memory. `window_source_access_moved` counted **zero** occurrences
+    /// across two driven boots (264 964 and 278 859 render records, 97 and 89
+    /// census windows at `direct_frac=1.00`), which is the same statement from
+    /// the other side: the value is stable under repeated identical rendering
+    /// and moves only when the resident's *use kind* changes.
+    ///
+    /// So the cost of this rule is exactly what that census measured, and the
+    /// hazard it closes is the case the census exists to find.
+    ///
+    /// The window's own blit write-back is deliberately not exempt. It moves the
+    /// access to `TransferRead`, which genuinely makes the resolution the window
+    /// is holding wrong; a re-present of that same source — reachable through
+    /// `needs_present`'s `redraw_required` on a resize or a suboptimal swapchain
+    /// — must take host memory rather than build a barrier from an access it has
+    /// itself invalidated.
+    fn set_registry_access(&mut self, identity: &TargetIdentity, access: ResidentAccess) {
+        let Some(slot) = self.registry.get_mut(identity) else {
+            return;
+        };
+        if slot.access == access {
+            return;
+        }
+        slot.access = access;
+        if self.window_published.contains(identity) {
+            self.invalidate_window_sources();
         }
     }
 
@@ -2941,6 +2988,103 @@ pub(super) mod pin_count_tests {
     fn admit_ready(pools: &mut ResourcePools, identity: &TargetIdentity) {
         pools.registry.insert(identity.clone(), ready_slot());
         pools.registry_order.push_back(identity.clone());
+    }
+
+    /// The access half of the window's licence: the promised layout and source
+    /// masks, not only the promised image.
+    ///
+    /// Driven through the public door the drain uses, not by writing the field,
+    /// because the claim is that a *use-kind change* invalidates the source.
+    #[test]
+    fn moving_a_published_residents_access_moves_the_window_stamp() {
+        let mut pools = ResourcePools::new();
+        let published = surface(51);
+        admit_ready(&mut pools, &published);
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        pools.registry_note_access(&published, ResidentAccess::transfer_read(false));
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the barrier the window would build names an access the image has left"
+        );
+    }
+
+    /// And re-writing the access it already holds moves nothing.
+    ///
+    /// This is the whole reason the rule is on a *change* and not on a write. A
+    /// colour target rendered again ends in the access it was already in, so a
+    /// per-write bump would invalidate the window's source on every frame the
+    /// drain redraws the displayed surface and send every present through host
+    /// memory — the throughput cliff `direct_frac` measures.
+    #[test]
+    fn rewriting_the_access_a_published_resident_already_holds_moves_nothing() {
+        let mut pools = ResourcePools::new();
+        let published = surface(52);
+        admit_ready(&mut pools, &published);
+        let held = pools
+            .registry_get(&published)
+            .expect("just admitted")
+            .access;
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        for _ in 0..8 {
+            pools.registry_note_access(&published, held);
+        }
+        assert_eq!(super::window_source_epoch(), stamped);
+    }
+
+    /// A resident the window was never published against is not the window's
+    /// business, however its access moves.
+    #[test]
+    fn moving_an_unpublished_residents_access_moves_nothing() {
+        let mut pools = ResourcePools::new();
+        let published = surface(53);
+        let other = surface(54);
+        admit_ready(&mut pools, &published);
+        admit_ready(&mut pools, &other);
+        pools.note_window_published(Some(&published));
+        let stamped = super::window_source_epoch();
+
+        pools.registry_note_access(&other, ResidentAccess::transfer_read(true));
+        assert_eq!(super::window_source_epoch(), stamped);
+    }
+
+    /// Every door that writes a resident's access goes through the one that
+    /// checks the window's licence.
+    ///
+    /// Three public doors exist — `registry_mark_ready_at`,
+    /// `registry_mark_ready_with_access` and `registry_note_access`, plus the
+    /// depth sibling — and the rule is a property of the *field*, not of any one
+    /// of them. A fourth door assigning it directly would be a barrier the window
+    /// builds from an access the image has left, and nothing in the build relates
+    /// a new assignment to this rule.
+    #[test]
+    fn the_registry_writes_a_residents_access_in_exactly_one_place() {
+        const SOURCES: [&str; 6] = [
+            include_str!("images_and_registry.rs"),
+            include_str!("teardown.rs"),
+            include_str!("mod.rs"),
+            include_str!("submission_and_buffers.rs"),
+            include_str!("buffer_gather_working_set.rs"),
+            include_str!("sampled_working_set.rs"),
+        ];
+        // Any receiver, not just a binding called `slot`: a fourth door could
+        // write through `self.registry.get_mut(..).unwrap()` and a
+        // receiver-specific needle would not see it. `cargo fmt` normalizes the
+        // spacing, so one form is the whole space.
+        let needle = concat!(".", "access", " = ");
+        let hits: usize = SOURCES.iter().map(|src| src.matches(needle).count()).sum();
+        assert_eq!(
+            hits, 2,
+            "exactly two writers of an `access` field in `pools/`: \
+             `set_registry_access`, which is where the window's stamp is checked \
+             against the write, and `mark_resident_storage_image`, which writes \
+             the *compute-storage* registry — a different registry the host \
+             window is never published against"
+        );
     }
 
     /// A pools that goes away takes its registry with it, and the stamps

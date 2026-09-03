@@ -1807,17 +1807,24 @@ impl Drop for ResourcePools {
 /// the publish that named it.
 ///
 /// The window thread's registry access is not one dependency but two: it
-/// *resolves* an identity to a slot, and it reads and writes that slot's
-/// `access` — the Vulkan layout its blit barrier must name as `oldLayout`. The
-/// stamp on [`super::types::WindowPresentSource`] answers the first without a
-/// registry; nothing yet answers the second, and a barrier from a layout the
-/// image is no longer in is not a stale picture but an invalid transition.
+/// *resolves* an identity to a slot, and it reads that slot's `access` — the
+/// `oldLayout`, `srcStageMask` and `srcAccessMask` its blit barrier must name.
+/// The stamp on [`super::types::WindowPresentSource`] answers the first without
+/// a registry, and a barrier built from an access the image has left is an
+/// invalid transition rather than a stale picture, so the second needed its own
+/// answer.
 ///
-/// So this is carried beside the stamp and, for now, only *compared* against the
-/// re-resolve the window still performs. `WindowSourceDivergence` names each way
-/// the two can disagree, and a boot where none of them appears is the evidence
-/// that removing the re-resolve changes no frame. A boot where `Access` appears
-/// is the evidence that it cannot be removed until layout ownership moves too.
+/// It has one: `ResourcePools::set_registry_access` is the sole writer of a
+/// resident's access, and it moves the window epoch when the value *changes*
+/// under an identity the window is published against. A fresh stamp therefore
+/// vouches for this whole value and not only for the image in it.
+///
+/// This is still carried beside the re-resolve rather than in place of it, and
+/// [`super::window_present::WindowSourceDivergence`] compares the two on every
+/// present. A boot where no class appears is the evidence that removing the
+/// re-resolve changes no frame; the two boots that have run report exactly that,
+/// and `Access` reporting zero across them is also what says the rule above
+/// costs no frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedResident {
     pub image: vk::Image,
