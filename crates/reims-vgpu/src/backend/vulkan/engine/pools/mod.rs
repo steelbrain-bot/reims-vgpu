@@ -1781,6 +1781,28 @@ pub(crate) fn slot_presentable(slot: &ResidentTargetSlot, width: u32, height: u3
     slot_present_decline(slot, width, height).is_none()
 }
 
+/// The other half of the wholesale cover: a `ResourcePools` that goes away takes
+/// its registry with it, and any window source published against that registry
+/// is void whether or not `destroy_all` ran first.
+///
+/// `destroy_all` is not that cover on its own. `EngineState::flush_device_derived`
+/// reaches `*self.pools = ResourcePools::new()` on a path with no `ctx` to
+/// destroy anything through — the images died with the `VkDevice` — and a stamp
+/// taken before it would otherwise still compare equal against the *new*
+/// registry's untouched epoch.
+///
+/// Guarded on the set being non-empty so a `ResourcePools` that never carried a
+/// window source moves nothing. Every unit test in this crate builds one; a bump
+/// per test would make the counter mean "a pools was dropped" rather than "a
+/// window source died".
+impl Drop for ResourcePools {
+    fn drop(&mut self) {
+        if !self.window_published.is_empty() {
+            self.invalidate_window_sources();
+        }
+    }
+}
+
 /// Everything the host window's blit reads off a resident slot, resolved once by
 /// the publish that named it.
 ///

@@ -2195,29 +2195,32 @@ impl ResidentResourceLease {
     }
 }
 
-/// End every resident holder's licence at once, in both counters that issue one.
+/// End the licence every serialized resource lease holds, because the registry
+/// those leases name is being replaced or destroyed.
 ///
-/// Two counters answer for a resident being gone, and they answer for different
-/// holders. `RESIDENT_RESOURCE_EPOCH` invalidates the leases a serialized
-/// resource holds — `ResidentResourceLease::matches` and its `Drop` both read
-/// it. [`pools::WINDOW_SOURCE_EPOCH`] invalidates the present source the host
-/// window was published against, which is the licence the window has to trust a
-/// resolved image without re-reading the registry.
+/// # Why the window's licence is not bumped here any more
 ///
-/// Every wholesale invalidation is one event for both — the registry those names
-/// referred to is being replaced or destroyed — so they are bumped through one
-/// function. Written apart, the window would keep a stamp that still compares
-/// equal across a `ResourcePools::new()`, and present from an image
-/// `destroy_all` had already freed: the identity is gone from the *new*
-/// registry, but the stamp is the window's only test and nothing had moved it.
+/// It was, and the comment that stood here said the arrangement "cannot be
+/// tested into place — a *new* wholesale-invalidation site that bumps only one
+/// counter is exactly the defect, and no test relates a future site to this
+/// function". That was true of a rule three call sites had to remember, and it
+/// is the reason the rule moved.
 ///
-/// This cannot be tested into place — a *new* wholesale-invalidation site that
-/// bumps only one counter is exactly the defect, and no test relates a future
-/// site to this function. The three that exist call it; that is the whole
-/// guarantee, and it is why they call a function rather than repeat two lines.
+/// [`pools::WINDOW_SOURCE_EPOCH`] is now moved by the type that owns the
+/// registry, at the two points a published resident's promise can actually end:
+/// `ResourcePools::unregister_resident` when one resident leaves — the sole
+/// `remove` this registry has — and `ResourcePools::destroy_all` plus
+/// `Drop for ResourcePools` when the registry itself does, the sole `drain` and
+/// the path that replaces a pools without destroying it. A wholesale site that
+/// forgets to call this function therefore cannot strand a window stamp, because
+/// it cannot invalidate the registry without going through one of those three.
+///
+/// What is left here is the half that has no such owner: a
+/// [`ResidentResourceLease`] is a value held by a serialized resource, its
+/// `matches` and its `Drop` both read this counter, and nothing in
+/// `ResourcePools` sees one.
 fn invalidate_all_resident_holders() {
     RESIDENT_RESOURCE_EPOCH.fetch_add(1, Ordering::Release);
-    pools::WINDOW_SOURCE_EPOCH.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(test)]

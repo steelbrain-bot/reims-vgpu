@@ -186,6 +186,17 @@ impl ResourcePools {
             device.destroy_image_view(t.view, None);
             device.destroy_image(t.image, None);
         }
+        // The wholesale half of the window's licence, in the same statement as
+        // the destruction it answers for.
+        //
+        // `unregister_resident` moves the epoch when *one* resident leaves; this
+        // is every resident leaving at once, and the images the window may be
+        // holding a resolved handle to are freed on the next line. Moving it
+        // here rather than at the callers is the difference between a rule three
+        // sites remember and a rule the type that owns the registry enforces:
+        // the loop below is the only `drain` this registry has, so no wholesale
+        // destruction can reach it without passing this.
+        self.invalidate_window_sources();
         for (_, t) in self.registry.drain() {
             device.destroy_framebuffer(t.framebuffer, None);
             for (_, view) in t.alternate_views {

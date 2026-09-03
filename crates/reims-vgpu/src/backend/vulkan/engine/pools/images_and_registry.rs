@@ -692,7 +692,7 @@ impl ResourcePools {
     /// before it stale, so every identity in the set has been answered for and
     /// keeping them would make a later removal move the epoch again for sources
     /// that are already invalid.
-    fn invalidate_window_sources(&mut self) {
+    pub(super) fn invalidate_window_sources(&mut self) {
         self.window_published.clear();
         super::WINDOW_SOURCE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -2941,6 +2941,141 @@ pub(super) mod pin_count_tests {
     fn admit_ready(pools: &mut ResourcePools, identity: &TargetIdentity) {
         pools.registry.insert(identity.clone(), ready_slot());
         pools.registry_order.push_back(identity.clone());
+    }
+
+    /// A pools that goes away takes its registry with it, and the stamps
+    /// published against it with it.
+    ///
+    /// The path this covers has no `destroy_all` in it:
+    /// `EngineState::flush_device_derived` reaches `*pools = ResourcePools::new()`
+    /// with no `ctx`, the images having died with the `VkDevice`. The old pools
+    /// is dropped there and nothing else moves the epoch.
+    #[test]
+    fn dropping_a_pools_that_carried_a_window_source_moves_the_stamp() {
+        let stamped = {
+            let mut pools = ResourcePools::new();
+            let published = surface(41);
+            admit_ready(&mut pools, &published);
+            pools.note_window_published(Some(&published));
+            super::window_source_epoch()
+        };
+        assert_ne!(
+            super::window_source_epoch(),
+            stamped,
+            "the registry the stamp names no longer exists"
+        );
+    }
+
+    /// And a pools that never carried one moves nothing.
+    ///
+    /// Every test in this crate builds a `ResourcePools`. A bump per drop would
+    /// make the counter mean "a pools was dropped" rather than "a window source
+    /// died", and the window would take a host-memory frame for each.
+    #[test]
+    fn dropping_a_pools_that_carried_no_window_source_moves_nothing() {
+        let stamped = super::window_source_epoch();
+        drop(ResourcePools::new());
+        {
+            let mut pools = ResourcePools::new();
+            admit_ready(&mut pools, &surface(42));
+            // A publish that *declined* records nothing, so this pools carries
+            // no source either.
+            pools.note_window_published(None);
+        }
+        assert_eq!(super::window_source_epoch(), stamped);
+    }
+
+    /// Every way out of the resident registry, counted in the source, because
+    /// the window's stamp is only sound if there are exactly the ones this
+    /// module answers for.
+    ///
+    /// The stamp lets the host window trust a resolved `VkImage` without reading
+    /// the registry. That trust rests on one claim: a published resident's slot
+    /// can stop being valid only by leaving through
+    /// [`ResourcePools::unregister_resident`] — which moves the epoch — or by the
+    /// registry itself going away, which `destroy_all` and `Drop for
+    /// ResourcePools` move it for. A third exit, added later by someone who did
+    /// not know the window existed, is a use-after-free and nothing in the build
+    /// relates it to this rule.
+    ///
+    /// So the rule is a count. `registry` is a private field of `ResourcePools`,
+    /// so `pools/` is the complete search space, and the needles are assembled
+    /// from pieces so this test's own source is not one of the hits.
+    #[test]
+    fn the_resident_registry_has_exactly_one_removal_and_one_drain() {
+        const SOURCES: [(&str, &str); 6] = [
+            (
+                "images_and_registry.rs",
+                include_str!("images_and_registry.rs"),
+            ),
+            ("teardown.rs", include_str!("teardown.rs")),
+            ("mod.rs", include_str!("mod.rs")),
+            (
+                "submission_and_buffers.rs",
+                include_str!("submission_and_buffers.rs"),
+            ),
+            (
+                "buffer_gather_working_set.rs",
+                include_str!("buffer_gather_working_set.rs"),
+            ),
+            (
+                "sampled_working_set.rs",
+                include_str!("sampled_working_set.rs"),
+            ),
+        ];
+        let count = |needle: &str| -> usize {
+            SOURCES
+                .iter()
+                .map(|(_, src)| src.matches(needle).count())
+                .sum()
+        };
+        let registry = concat!("self.", "registry");
+        assert_eq!(
+            count(&format!("{registry}.remove(")),
+            1,
+            "one removal path, and it is `unregister_resident`, which moves the \
+             window epoch when the slot it takes was published"
+        );
+        assert_eq!(
+            count(&format!("{registry}.drain(")),
+            1,
+            "one wholesale path, and it is `destroy_all`, which moves the window \
+             epoch on the line above it"
+        );
+        for other in [
+            ".clear()",
+            ".retain(",
+            ".extract_if(",
+            " = Default::default()",
+        ] {
+            assert_eq!(
+                count(&format!("{registry}{other}")),
+                0,
+                "`{registry}{other}` empties the registry without passing either \
+                 of the two paths the window's stamp is defended by"
+            );
+        }
+    }
+
+    /// The wholesale bump is in the same function as the destruction it answers
+    /// for, and before it.
+    ///
+    /// Ordering matters and the source is where it is visible: the loop frees
+    /// every image, so a bump after it would leave a window of frames in which
+    /// the stamp still compares equal and the handles are already destroyed.
+    #[test]
+    fn the_wholesale_bump_precedes_the_destruction_it_answers_for() {
+        const TEARDOWN: &str = include_str!("teardown.rs");
+        let bump = TEARDOWN
+            .find("invalidate_window_sources()")
+            .expect("`destroy_all` moves the window epoch");
+        let drain = TEARDOWN
+            .find(concat!("self.", "registry", ".drain("))
+            .expect("`destroy_all` is where the registry drains");
+        assert!(
+            bump < drain,
+            "the epoch moves before the images the window may be holding are freed"
+        );
     }
 
     /// The stamp the window checks instead of the registry, at the one removal
