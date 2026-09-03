@@ -2214,6 +2214,7 @@ fn admit_and_park<H: HostMemory + HostOps>(
         }
         false
     });
+    note_access_modes(&built);
     // The pipelines the records bind, told to the model before it is asked
     // whether the packet may run: `PipelineTable::waits_for` refuses a lease it
     // has no entry for, and the entry is this device's to make. The list is the
@@ -2301,6 +2302,35 @@ fn admit_and_park<H: HostMemory + HostOps>(
         _ => crate::runtime::parked::ParkedWork::new(fifo.domain().0, admission.epoch, packet),
     };
     state.parked.park(ingress, work);
+}
+
+/// How much of this packet's ordering is bought by knowing, and how much by not
+/// knowing.
+///
+/// [`reims_vgpu_core::access::AccessMode::Unknown`] is a distinct variant from
+/// `ReadWrite` for one reason, and that reason is a number: the two order
+/// identically, so the only thing the split can buy is the ability to say how
+/// many edges exist because a slot is genuinely read-modify-write and how many
+/// exist because no reflection was published for the pipeline that bound it.
+/// The variant has carried that argument since it was written and nothing
+/// counted it, which made Seam 6's "supported operations reaching an unknown
+/// access-mode fallback" unmeasurable rather than met.
+///
+/// Counted at admission, from the transaction the model is about to be handed,
+/// because that is the list the dependency graph will actually order against —
+/// a count taken at the encoder would include intents a payload never carried.
+///
+/// See fn `an_unknown_mode_access_is_counted_apart_from_a_known_one`.
+pub(crate) fn note_access_modes(built: &reims_vgpu_core::session::Packet) {
+    use reims_vgpu_core::access::AccessMode;
+    for access in built.payload.accesses() {
+        note_store_route(match access.mode {
+            AccessMode::Read => "access_mode_read",
+            AccessMode::Write => "access_mode_write",
+            AccessMode::ReadWrite => "access_mode_read_write",
+            AccessMode::Unknown => "access_mode_unknown",
+        });
+    }
 }
 
 /// Advance what the model is waiting on, then run everything it has released.

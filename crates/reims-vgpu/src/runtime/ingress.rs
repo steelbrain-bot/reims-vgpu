@@ -1981,6 +1981,72 @@ mod tests {
         )
     }
 
+    /// A packet's ordering is priced by mode, and "nobody knows" is priced
+    /// apart from "read-modify-write".
+    ///
+    /// [`reims_vgpu_core::access::AccessMode::Unknown`] orders exactly as
+    /// `ReadWrite` does, so the only thing the split can ever buy is a number:
+    /// how much of a boot's ordering exists because a slot genuinely is
+    /// read-modify-write, and how much exists because no reflection was
+    /// published for the pipeline that bound it. Seam 6 asks for zero supported
+    /// operations reaching that fallback, and until this census the variant
+    /// carried the argument for counting without anything doing the counting —
+    /// which makes the required zero unmeasured rather than met.
+    ///
+    /// Two lifetime commands with the same shape and different modes, so a
+    /// census that bucketed by class rather than by mode would pass with both
+    /// landing in one row: an invalidate declares a write, a discard declares
+    /// that it does not know.
+    #[test]
+    fn an_unknown_mode_access_is_counted_apart_from_a_known_one() {
+        use crate::runtime::drain::{note_access_modes, store_route_count};
+        use reims_vgpu_core::lifecycle::LifecycleKind;
+        use reims_vgpu_protocol::packets::LEDGER;
+
+        let row_of = |want: LifecycleKind| {
+            LEDGER
+                .iter()
+                .find(|row| LifecycleKind::of(row.channel, row.opcode) == Some(want))
+                .expect("the ledger has a row for every settled lifetime kind")
+        };
+        let counted = |want: LifecycleKind| {
+            let row = row_of(want);
+            let fifo = fifo_for(row.channel);
+            let built = packet_of(fifo, &drained_with_list(row.channel, row.opcode))
+                .expect("a named resource's access is answerable");
+            assert_eq!(
+                built.payload.accesses().len(),
+                1,
+                "the fixture's one record owes exactly one access"
+            );
+            let before = [
+                store_route_count("access_mode_read"),
+                store_route_count("access_mode_write"),
+                store_route_count("access_mode_read_write"),
+                store_route_count("access_mode_unknown"),
+            ];
+            note_access_modes(&built);
+            [
+                store_route_count("access_mode_read") - before[0],
+                store_route_count("access_mode_write") - before[1],
+                store_route_count("access_mode_read_write") - before[2],
+                store_route_count("access_mode_unknown") - before[3],
+            ]
+        };
+
+        assert_eq!(
+            counted(LifecycleKind::Invalidate),
+            [0, 1, 0, 0],
+            "an invalidate states the direction, so it costs the known column"
+        );
+        assert_eq!(
+            counted(LifecycleKind::Discard),
+            [0, 0, 0, 1],
+            "a discard does not, and the whole point of the variant is that this \
+             lands somewhere a reader can subtract"
+        );
+    }
+
     /// A present crosses carrying one read of the backing its target resolves
     /// to, and the frame's target is the packet's own word rather than a
     /// default.

@@ -8076,3 +8076,87 @@ fn the_executing_walk_and_the_resolving_walk_reach_the_same_records() {
         "exactly the removed record has no twin; everything after it still finds its own"
     );
 }
+
+/// A submission's bytes are framed once per stream, and the plan step frames
+/// none of them.
+///
+/// Seam 6's "zero re-scans of already resolved EXEC bytes" was unmeasured for
+/// as long as nothing counted the framings. The violation it names had a
+/// specific shape on this rail: two pre-scans walked every stream through the
+/// same framer looking for `SetPipeline` records before execution walked it
+/// again, so a boot's segment census read three times the truth and the
+/// leases the rail was asked about were a different set from the ones
+/// admission readied. `preflight_submission` answers from
+/// `reims_vgpu_core::exec::ExecWork` now — the walk's own answer — so the
+/// measurable statement is that it adds no framing at all.
+///
+/// Two streams rather than one, because a per-*submission* framer would pass a
+/// one-stream fixture and be a re-scan on every real packet.
+#[test]
+fn a_submission_frames_each_stream_once_and_preflight_frames_none() {
+    use crate::runtime::drain::store_route_count;
+    use reims_vgpu_protocol::segment::{SegmentKind, SEGMENT_HEADER_LEN};
+    use reims_vgpu_protocol::sync::OPCODE_SIGNAL_EVENT;
+
+    // One event segment carrying one signal: enough to be walked, and no rail
+    // work at all, so the count is about the framer and not about a backend.
+    let signal_len = core::mem::size_of::<reims_vgpu_wire::ops::event::SignalWait>();
+    let event_stream = |event_ref: u32, value: u64| {
+        let mut records = vec![0u8; OP_HEADER_LEN + signal_len];
+        st32(&mut records[0..4], OPCODE_SIGNAL_EVENT);
+        st32(&mut records[4..8], (OP_HEADER_LEN + signal_len) as u32);
+        st32(&mut records[OP_HEADER_LEN..], event_ref);
+        st64(&mut records[OP_HEADER_LEN + 4..], value);
+        let mut stream = vec![0u8; SEGMENT_HEADER_LEN];
+        st32(
+            &mut stream[0..4],
+            (SEGMENT_HEADER_LEN + records.len()) as u32,
+        );
+        stream[4] = SegmentKind::Event.wire_type();
+        stream.extend_from_slice(&records);
+        stream
+    };
+
+    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut host = FakeHost::new();
+    let submission = ExecSubmission::stated(9, vec![event_stream(11, 7), event_stream(12, 3)]);
+    let resolved = reims_vgpu_core::exec::ExecWork::default();
+
+    let before = store_route_count("exec_stream_framed");
+    let mut measured_ns = 0u64;
+    let pending = preflight_submission(&state, &host, &submission, &resolved, &mut measured_ns);
+    assert!(pending.is_empty(), "the fixture resolves no leases");
+    assert_eq!(
+        store_route_count("exec_stream_framed"),
+        before,
+        "the plan step answers from the resolved work, never from the packet's bytes"
+    );
+
+    // The task id rides `ExecResult` from the *read* half, which this fixture
+    // states rather than performs, so what says the run happened is the two
+    // generations below and not a field nothing here set.
+    let _ = execute_planned(
+        &mut state,
+        &mut host,
+        RetainedInputs {
+            submission: &submission,
+            resolved: &resolved,
+        },
+        ExecResult::default(),
+    );
+    assert_eq!(
+        store_route_count("exec_stream_framed") - before,
+        2,
+        "two streams, framed once each: one more is a re-scan"
+    );
+    // Both signals landed, so the two framings were two executions and not one
+    // execution counted twice.
+    assert_eq!(
+        state.fence_generation(9, crate::model::FENCE_DOMAIN_EVENT, 11),
+        Some(7)
+    );
+    assert_eq!(
+        state.fence_generation(9, crate::model::FENCE_DOMAIN_EVENT, 12),
+        Some(3)
+    );
+}

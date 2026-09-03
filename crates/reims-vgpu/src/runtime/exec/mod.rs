@@ -645,6 +645,11 @@ pub struct ExecResult {
 /// and `walk::command_buffer` is what it walks through. A bucket above `_1`
 /// appearing is the day a caller must use it.
 fn note_command_stream_count(loaded: usize) {
+    // The denominator for `exec_stream_framed`: how many streams this device
+    // was handed, against how many times it framed one. The bands below say
+    // how a submission is shaped; this says how much there was to walk, and a
+    // ratio above one is a re-scan.
+    crate::runtime::drain::note_store_route_n("exec_streams_loaded", loaded as u64);
     crate::runtime::drain::note_store_route(match loaded {
         0 => "exec_cmdbufs_0",
         1 => "exec_cmdbufs_1",
@@ -1664,6 +1669,15 @@ fn walk_stream<M: HostMemory + HostOps>(
     acc: &mut StreamAccum,
     mut resolved: Option<&mut ResolvedCursor<'_>>,
 ) {
+    // **The one place this crate frames an exec stream, counted.** Seam 6 asks
+    // for zero re-scans of already resolved EXEC bytes, and the shape the
+    // violation took here was two rail pre-scans walking the same stream
+    // through the same framer before execution walked it a third time. So the
+    // measurable form of that zero is "one framing per stream per submission",
+    // and this is the number it is read off — on a boot, against
+    // `exec_streams_loaded`; off the VM, by
+    // fn `a_submission_frames_each_stream_once_and_preflight_frames_none`.
+    crate::runtime::drain::note_store_route("exec_stream_framed");
     // The outermost frame in the crate, and it is
     // `reims_vgpu_protocol::segment`'s. This device had its own segment framer
     // whose per-segment index was found by re-walking the stream from zero — a
