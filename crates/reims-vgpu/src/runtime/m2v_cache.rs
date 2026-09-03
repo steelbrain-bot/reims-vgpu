@@ -485,6 +485,18 @@ struct Cache {
     misses: u64,
     async_queue: VecDeque<TranslationTask>,
     async_worker_running: bool,
+    /// The last identity each `(pipeline_ref, stage_tag)` was translated under.
+    ///
+    /// **Not a cache — a detector.** This cache is keyed by AIR content and the
+    /// pre-scan's memo [`crate::backend::vulkan::pipeline_resolve::translations_ready`]
+    /// is keyed by `(task, pipeline_ref)`, so the two answer "is this pipeline
+    /// translated" from different questions. They agree until the guest points
+    /// one ref at different AIR: the content key misses and a fresh translation
+    /// starts, while the name memo still says ready, so the ordering plane
+    /// releases a packet against a shader that is microseconds old. This
+    /// records where the two part company, and nothing reads it to decide
+    /// anything.
+    last_identity: HashMap<(u32, u8), u64>,
 }
 
 #[derive(Clone)]
@@ -937,6 +949,7 @@ fn ensure_cached_async_keyed(
     pipeline_ref: u32,
 ) -> bool {
     let mut start_worker = false;
+    let mut changed: Option<u64> = None;
     {
         let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
         match c.find(id) {
@@ -950,6 +963,15 @@ fn ensure_cached_async_keyed(
             Some(Entry::Ready(_)) | Some(Entry::Failed(_)) => return true,
             Some(Entry::Loading) => return false,
             None => {}
+        }
+        // A miss for a ref this process has already translated something else
+        // under. See `Cache::last_identity`: this is the exact moment the
+        // name-keyed memo becomes a promise about bytes that are no longer
+        // there, and the only moment both identities are in one hand.
+        if let Some(previous) = c.last_identity.insert((pipeline_ref, id.stage), id.digest) {
+            if previous != id.digest {
+                changed = Some(previous);
+            }
         }
         let air: Arc<[u8]> = Arc::from(id.air);
         c.put(id, &air, Entry::Loading);
@@ -975,6 +997,24 @@ fn ensure_cached_async_keyed(
         "linux_m2v_async queued pipe={pipeline_ref} stage={stage:?}{dims} air={}",
         id.air.len()
     ));
+    // Always-on, and once per `(ref, stage)` rather than once per event: the
+    // population this names is the one whose size decides whether the pre-scan's
+    // name-keyed memo can be kept at all, and a boot that shows none of it is
+    // saying something different from a boot that shows it on eight refs.
+    if let Some(previous) = changed {
+        if crate::observe::first_sight(
+            "m2v_pipe_content_changed",
+            u64::from(pipeline_ref) << 8 | u64::from(id.stage),
+        ) {
+            crate::observe::fail(format!(
+                "linux_m2v reason=m2v_pipe_content_changed pipe={pipeline_ref} \
+                 stage={stage:?}{dims} air={} was={previous:#x} now={:#x} (the guest pointed this \
+                 ref at different AIR; the name-keyed pre-scan memo still calls it translated)",
+                id.air.len(),
+                id.digest
+            ));
+        }
+    }
     if start_worker {
         std::thread::spawn(async_worker);
     }
@@ -1256,6 +1296,50 @@ mod tests {
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The detector fires when one ref is translated under two identities, and
+    /// stays silent when the same one is asked for twice.
+    ///
+    /// It is checked at the map rather than through the log line, because the
+    /// line is latched per `(ref, stage)` for a whole process and a unit suite
+    /// is one process — a test that asserted on the line would pass or fail on
+    /// whether some earlier test happened to use the same ref.
+    ///
+    /// The population this names is the one that decides whether
+    /// `pipeline_resolve::translations_ready`'s `(task, ref)` memo can be kept:
+    /// on a driven macos-15 desktop it is the only shape under which a draw
+    /// refuses against a translation that started microseconds earlier while
+    /// the ordering plane holds the pipeline ready.
+    #[test]
+    fn one_ref_translated_under_two_identities_is_the_detectors_whole_population() {
+        let _guard = test_lock();
+        // A ref no other test in this process uses, so the map's own state is
+        // this test's.
+        const REF: u32 = 0xD1FF_0001;
+        let a = ShaderId::render(Stage::Fragment, b"air-one");
+        let b = ShaderId::render(Stage::Fragment, b"air-two-longer");
+        assert_ne!(a.digest, b.digest, "the fixture needs two identities");
+
+        let mut c = global().lock().unwrap_or_else(|e| e.into_inner());
+        c.last_identity.remove(&(REF, a.stage));
+
+        assert_eq!(
+            c.last_identity.insert((REF, a.stage), a.digest),
+            None,
+            "the first translation of a ref has nothing to differ from"
+        );
+        assert_eq!(
+            c.last_identity.insert((REF, a.stage), a.digest),
+            Some(a.digest),
+            "the same AIR asked for twice is not a change"
+        );
+        assert_eq!(
+            c.last_identity.insert((REF, b.stage), b.digest),
+            Some(a.digest),
+            "different AIR under one ref is the change the detector names"
+        );
+        c.last_identity.remove(&(REF, a.stage));
     }
 
     /// A variant's reflected sampler interface must agree with the executable
