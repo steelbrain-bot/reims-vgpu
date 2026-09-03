@@ -1569,6 +1569,59 @@ mod tests {
         }
     }
 
+    /// The render arm of the lease list holds the render binds and nothing
+    /// else, once each.
+    ///
+    /// This is what the render pre-scan is handed to decide which pipelines it
+    /// must have translated before a draw can run. Two things would break it,
+    /// and only a packet carrying both classes can tell them apart: a compute
+    /// lease reaching the render arm sends a compute pipeline down the
+    /// translator's render path, where its inputs are the wrong shape and it
+    /// refuses; and a duplicate turns a forty-draw stream into forty visits to
+    /// the same memo, which is the cost the class-blind
+    /// [`ExecWork::pipeline_leases`] was already deduplicated to avoid.
+    #[test]
+    fn the_render_arm_of_the_leases_is_the_render_binds_deduplicated() {
+        let mut b = builder();
+        b.begin_segment(
+            SegmentKind::Render.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open render");
+        for pipeline in [res(3), res(3), res(4)] {
+            b.record(
+                ResolvedOperation::Render(RenderOp::SetPipeline { pipeline }),
+                &mut StubRegistry(ChannelId(1)),
+            )
+            .expect("render bind");
+        }
+        b.end_segment().expect("end render");
+
+        b.begin_segment(
+            SegmentKind::Compute.wire_type(),
+            SegmentLifetime::SELF_CONTAINED,
+        )
+        .expect("open compute");
+        b.record(
+            ResolvedOperation::Compute(crate::compute::ComputeOp::SetPipeline { pipeline: res(9) }),
+            &mut StubRegistry(ChannelId(1)),
+        )
+        .expect("compute bind");
+        b.end_segment().expect("end compute");
+
+        let work = b.finish().expect("frozen");
+        assert_eq!(
+            work.pipeline_leases,
+            vec![res(3), res(4), res(9)],
+            "the ordering plane waits on all three"
+        );
+        assert_eq!(
+            work.render_pipeline_leases(),
+            vec![res(3), res(4)],
+            "the render pre-scan is asked about two"
+        );
+    }
+
     /// A record the cursor refuses leaves no lease behind claiming it ran.
     ///
     /// The same rollback the accesses get, and it has to be the same one: a
