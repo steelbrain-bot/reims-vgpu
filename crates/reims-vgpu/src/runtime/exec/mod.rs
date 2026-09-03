@@ -1223,46 +1223,72 @@ pub struct RetainedInputs<'a> {
 /// `reims_vgpu_core::walk` frame a command buffer with
 /// `reims_vgpu_protocol::segment::SegmentStream` and its records with
 /// `reims_vgpu_wire::op::OpStream`, step a protection envelope over without
-/// recording it, and visit every framed record of every buffer in table order.
-/// So the *n*th record this executor reaches is the *n*th record the model
-/// resolved, and a flat cursor is the whole of the correspondence — no second
-/// framing pass, and nothing positional to keep in step.
+/// opening an encoder for it, and visit every framed record of every buffer in
+/// table order. So the two agree about *where* a record is, and
+/// [`reims_vgpu_core::stream::StreamPosition`] is that agreement written down:
+/// a segment ordinal that counts encoder segments across the whole packet, and
+/// a record ordinal that restarts at each segment boundary.
 ///
-/// It is a cursor and not an index because the claim is worth checking rather
-/// than assuming: the class the model resolved and the class this opcode
-/// belongs to are compared at every step, and a disagreement is counted by name
-/// instead of being acted on. Until that count is a measured zero on a driven
-/// boot, nothing here decides anything.
+/// **Keyed by position, not by arrival count.** A flat "nth record here is the
+/// nth record there" cursor holds today — measured at 275 782 records with no
+/// disagreement on a driven macos-15 boot, and 182 820 on macos-26 — but it
+/// holds only while the two walks admit exactly the same records. A transaction
+/// that one day omits a record the executor still reaches would put every later
+/// record off by one, and each would be read as the wrong operation rather than
+/// as a gap. A position lookup reads that as one absent twin and nothing else,
+/// which is the difference between a gap and a corruption.
+///
+/// The class the ledger gives the opcode is compared against the class the
+/// model resolved at every step. A disagreement is counted by name rather than
+/// acted on: until that count is a measured zero, nothing here decides
+/// anything.
 struct ResolvedCursor<'a> {
+    /// Ascending by position, which is the order [`ExecWork::records`] yields
+    /// and therefore needs no sort.
     records: Vec<&'a reims_vgpu_core::exec::StreamRecord>,
-    next: usize,
+    at: reims_vgpu_core::stream::StreamPosition,
 }
 
 impl<'a> ResolvedCursor<'a> {
     fn new(work: &'a reims_vgpu_core::exec::ExecWork) -> Self {
         Self {
             records: work.records().collect(),
-            next: 0,
+            at: reims_vgpu_core::stream::StreamPosition {
+                segment: 0,
+                record: 0,
+            },
         }
+    }
+
+    /// A segment's records are over.
+    ///
+    /// The segment ordinal advances and the record ordinal restarts, which is
+    /// `reims_vgpu_core::stream`'s own rule: an encoder spanning three segments
+    /// still gives its records three distinct segment indices, because where a
+    /// record was written is not the same question as which encoder ran it. A
+    /// protection envelope opens no encoder and so is not a segment here — the
+    /// walk steps over it without reaching this.
+    fn end_segment(&mut self) {
+        self.at.segment += 1;
+        self.at.record = 0;
     }
 
     /// The resolved operation standing where this walk is, if the two agree
     /// about what it is.
     ///
-    /// Advances whatever the answer, because the walks advance together: a step
-    /// that held its place on a disagreement would put every later record off
-    /// by one and turn one bad reading into a whole packet of them.
+    /// Advances whatever the answer, because the walks advance together.
     fn step(
         &mut self,
         kind: SegmentKind,
         opcode: u32,
     ) -> Option<&'a reims_vgpu_core::exec::ResolvedOperation> {
-        let record = self.records.get(self.next);
-        self.next += 1;
-        let Some(record) = record else {
-            crate::runtime::drain::note_store_route("resolved_walk_past_end");
+        let at = self.at;
+        self.at.record += 1;
+        let Ok(index) = self.records.binary_search_by_key(&at, |record| record.at) else {
+            crate::runtime::drain::note_store_route("resolved_walk_no_record");
             return None;
         };
+        let record = self.records[index];
         let Some(expected) = stream_class(kind, opcode) else {
             // The ledger has not settled this opcode as a stream record, so
             // this walk has no class to compare against and says so rather than
@@ -1678,6 +1704,9 @@ fn walk_stream<M: HostMemory + HostOps>(
             sink.record(kind, op, cmd);
         });
         sink.end_segment();
+        if let Some(cursor) = resolved.as_deref_mut() {
+            cursor.end_segment();
+        }
     }
 }
 

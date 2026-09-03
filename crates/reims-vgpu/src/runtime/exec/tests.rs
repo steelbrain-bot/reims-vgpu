@@ -8058,6 +8058,7 @@ fn the_executing_walk_and_the_resolving_walk_reach_the_same_records() {
                     .class(),
             );
         }
+        cursor.end_segment();
     }
 
     use reims_vgpu_core::operation::OperationClass;
@@ -8071,6 +8072,42 @@ fn the_executing_walk_and_the_resolving_walk_reach_the_same_records() {
             OperationClass::Event,
             OperationClass::Event,
         ],
-        "the flat order agrees across the continuation and the family boundary"
+        "the order agrees across the continuation and the family boundary"
+    );
+
+    // A transaction missing one record reads as **one** absent twin and not as
+    // a shift. This is the whole reason the cursor is keyed by position: a
+    // count-based cursor would hand every record after the gap its
+    // predecessor's answer, and the last one would fall off the end — six
+    // wrong readings from one omission, each of them plausible.
+    let mut gapped = work.clone();
+    let removed = gapped.streams[0].records.remove(1);
+    assert_eq!(
+        removed.at,
+        reims_vgpu_core::stream::StreamPosition {
+            segment: 0,
+            record: 1,
+        },
+    );
+    let mut cursor = ResolvedCursor::new(&gapped);
+    let mut found = Vec::new();
+    for framed in
+        reims_vgpu_protocol::segment::SegmentStream::new(&stream).expect("the fixture frames")
+    {
+        let framed = framed.expect("the fixture frames");
+        let reims_vgpu_protocol::segment::SegmentBody::Encoder { kind, commands } = framed.body
+        else {
+            continue;
+        };
+        for op in reims_vgpu_wire::op::OpStream::new(commands) {
+            let op = op.expect("the fixture frames");
+            found.push(cursor.step(kind, op.opcode()).is_some());
+        }
+        cursor.end_segment();
+    }
+    assert_eq!(
+        found,
+        vec![true, false, true, true, true, true],
+        "exactly the removed record has no twin; everything after it still finds its own"
     );
 }
