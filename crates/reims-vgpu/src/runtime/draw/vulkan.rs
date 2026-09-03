@@ -732,9 +732,27 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                 )
             })
             .unwrap_or_else(|| ("no_color_target".to_string(), "none".to_string()));
+        // What the ordering plane thought of this pipeline when the draw was
+        // refused.
+        //
+        // `m2v_translation_pending_at_sync_boundary` is the reason this is
+        // here: the model parks an EXEC packet on the pipelines its records
+        // bind and releases it only when their leases are ready, so a draw that
+        // reaches a *still-translating* shader is either binding a pipeline the
+        // walk never leased or being released against a lease that says ready
+        // while the translation is not. The two have different fixes and the
+        // line could not tell them apart. `unnamed` is the third answer —
+        // the ref resolves to no object at all — and it is asked through the
+        // namespace's non-declaring door, because a diagnostic that declared
+        // the name would be answering its own question.
+        let model_pipeline = state
+            .object_name(req.task_id, req.pipeline_ref)
+            .map_or("unnamed", |id| {
+                state.pipeline_state(id).unwrap_or("unleased")
+            });
         crate::observe::fail(format!(
             "linux_clear_store draws_skipped reason=draws_skipped_after_engine_refusal \
-             pipe={} vtx={} refused_by={} {target} clear={clear}",
+             pipe={} model_pipeline={model_pipeline} vtx={} refused_by={} {target} clear={clear}",
             req.pipeline_ref,
             req.vertex_count,
             engine_outcome.slug()

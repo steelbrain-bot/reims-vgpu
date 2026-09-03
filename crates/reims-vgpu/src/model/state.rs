@@ -4184,6 +4184,27 @@ impl DeviceState {
     /// decline to redo work whose answer is already in the table. A pipeline the
     /// table does not hold answers `false`: an undeclared lease is not a
     /// promise, and treating it as one would skip the step that makes it one.
+    /// What the ordering plane's pipeline table says about one pipeline, for a
+    /// caller reporting a failure that should not have been reachable.
+    ///
+    /// `None` is "the table has no entry", which is a different fact from every
+    /// state it could be in and is the one a lease that was never declared
+    /// produces. Read-only on purpose: this is asked on a path that has already
+    /// lost a draw, and a diagnostic that declared what it was asking about
+    /// would answer its own question.
+    #[must_use]
+    pub fn pipeline_state(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+    ) -> Option<&'static str> {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .get(pipeline)
+            .map(|entry| entry.state.name())
+    }
+
     #[must_use]
     pub fn pipeline_is_ready(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
         self.session
