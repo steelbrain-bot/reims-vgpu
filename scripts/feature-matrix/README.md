@@ -44,10 +44,23 @@ Output is one line per arm, then the test census:
 [feature-matrix]   vulkan,host-window / x86_64…       (cross-compiled — cannot run here)
 ```
 
-Which arms a host can build depends on the host. An Apple host builds all three
-(the Linux one by cross check). A Linux host builds only the native Vulkan arm:
-Metal is Apple-only and cannot be cross-checked to a host that has no Metal, so
-it is reported `n/a` rather than skipped silently.
+**Every arm checks from every host.** An Apple host builds the two Apple arms
+natively and cross-checks the Linux one; a Linux host builds the native Vulkan
+arm and cross-checks the two Apple ones. `src/lib.rs` rejects `backend-metal` on
+`not(target_os = "macos")` — a condition on the **target**, not on the host — so
+`--target aarch64-apple-darwin` satisfies it and the real `cfg`s are exercised,
+and `cargo check` needs no Apple SDK to do it.
+
+This paragraph used to say the opposite ("Metal is Apple-only and cannot be
+cross-checked to a host that has no Metal"), which is the theory the script
+itself abandoned after the arm rotted to 11 unnoticed errors — see the block
+under `--help`. The script has cross-checked Metal from any host since; only
+this note lagged, and while it lagged a session read it and concluded the Metal
+arm was unverifiable from Linux. A gate nobody believes in is a gate nobody
+runs.
+
+Only *running* is host-bound, which is why a cross-checked arm reports
+`(cross-compiled — cannot run here)` instead of a test count.
 
 ## Notes
 
