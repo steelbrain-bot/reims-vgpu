@@ -31,6 +31,8 @@ __pycache__/
 !/vm/boot-x86.sh
 !/vm/guest-authorize.sh
 !/vm/rail-debug-posture.sh
+!/vm/rail-sweep.sh
+!/vm/drive-desktop.sh
 vm/debug/
 vm/logs/
 # OVMF firmware blobs (CODE/VARS .fd) — large binary runtime, never commit
