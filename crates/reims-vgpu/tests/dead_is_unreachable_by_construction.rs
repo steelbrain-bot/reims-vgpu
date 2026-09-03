@@ -278,13 +278,31 @@ fn no_cargo_target_points_into_dead() {
 ///
 /// # What counts as a name, and why the rule is that shape
 ///
-/// A backticked path with at least one `::` whose last segment is snake_case
-/// with an underscore in it. That is a function in this workspace — a test, a
-/// door, a helper — and it must exist. Type and variant names end in
-/// CamelCase and are skipped; a bare word with no `::` is a census route or a
-/// counter, which this cannot check and does not claim to.
+/// Two forms, because one of them was not enough.
 ///
-/// Existence, not location: a path in the register is prose written by a
+/// The first is a backticked path with at least one `::` whose last segment is
+/// snake_case with an underscore in it. Type and variant names end in CamelCase
+/// and are skipped.
+///
+/// The second exists because almost no coverage claim is written that way. A
+/// test named in a row is named the way a reader would say it — bare, as
+/// `a_declined_publish_vouches_for_nothing` — and a bare backticked word cannot
+/// be told from a census route, a counter or an observation slug, of which the
+/// rows are full. So this check read nine coverage claims and verified two of
+/// them, while its own doc and the register's rules both said it verified all
+/// nine. A gate that reports on what it did not inspect is worse than no gate:
+/// the rule it was standing in for was being trusted.
+///
+/// The fix is to make the claim say it is one. A coverage name is written
+/// ``fn `name` `` after the `Replacement coverage` marker, and that `fn` is what
+/// separates the claim from the prose around it — which is how a row can go on
+/// naming `pools/`, `winpub_*` or a slug that no longer exists in the same
+/// sentence without either being mistaken for a promise.
+///
+/// The marker is required because the register's other columns name functions
+/// while describing what *moved*, and a moved function is allowed to be gone.
+///
+/// Existence, not location: a name in the register is prose written by a
 /// human, and pinning the module as well would make the check fail on a
 /// correct row whose module was reorganised — a gate that fails on correct
 /// work is a gate that gets weakened.
@@ -300,22 +318,40 @@ fn every_function_the_register_names_still_exists() {
 
     let mut named: Vec<String> = Vec::new();
     let mut rows = 0usize;
+    let mut claims = 0usize;
     for line in text.lines() {
-        // The register's five columns; the live-validation table below it has
-        // three and is not about replacement coverage.
-        if !line.starts_with('|') || line.matches('|').count() < 6 || line.starts_with("|---") {
+        if !line.starts_with('|') || line.starts_with("|---") {
             continue;
         }
-        let Some(column) = line.split('|').nth(5) else {
+        // The register proper has five columns and its fifth is the
+        // replacement-coverage column. The live-validation table below it has
+        // three, and its rows carry coverage claims in prose — seven of the
+        // nine in this file, which is why reading only the five-column table
+        // was reading the smaller half.
+        if line.matches('|').count() >= 6 {
+            if let Some(column) = line.split('|').nth(5) {
+                rows += 1;
+                named.extend(backticked_function_paths(column));
+            }
+        }
+        let Some(marker) = line.find("eplacement coverage") else {
             continue;
         };
-        rows += 1;
-        named.extend(backticked_function_paths(column));
+        let claimed = declared_coverage_names(&line[marker..]);
+        claims += claimed.len();
+        named.extend(claimed);
     }
     assert!(
         rows > 5,
         "only {rows} register rows were parsed, which is too few to have read \
          the table — a check that inspects nothing passes for the wrong reason"
+    );
+    assert!(
+        claims > 10,
+        "only {claims} `fn `name`` coverage claims were found. Either the rows \
+         stopped declaring them in the form this gate reads, or this parser \
+         stopped reading it — and both leave the register's coverage column \
+         unchecked while it still reads as checked"
     );
     assert!(
         named.len() > 10,
@@ -332,6 +368,36 @@ fn every_function_the_register_names_still_exists() {
          the rule exists to catch: either restore the function, or amend the row \
          to name what covers the case now"
     );
+}
+
+/// The names a row *declares* as its replacement coverage, which is the subset
+/// of its backticks written as ``fn `name` ``.
+///
+/// Everything else in the sentence is prose and stays prose: `pools/` is a
+/// directory, `winpub_*` is a route family, and a row is allowed to name a slug
+/// that no longer exists in order to say that it no longer exists. Only what
+/// carries the `fn` is a promise about a function.
+fn declared_coverage_names(tail: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = tail;
+    while let Some(at) = rest.find("fn `") {
+        rest = &rest[at + 4..];
+        let Some(end) = rest.find('`') else { break };
+        let token = &rest[..end];
+        rest = &rest[end + 1..];
+        if token.is_empty()
+            || token
+                .chars()
+                .any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        {
+            continue;
+        }
+        let last = token.rsplit("::").next().unwrap_or_default();
+        if !last.is_empty() {
+            out.push(last.to_string());
+        }
+    }
+    out
 }
 
 /// The snake_case tails of backticked `a::b::c` paths in one register cell.
