@@ -4106,6 +4106,64 @@ impl DeviceState {
             .pipeline_retired(pipeline)
     }
 
+    /// Step a declared pipeline along its build, from the rail that is
+    /// building it.
+    ///
+    /// `Translating` and `Compiling` are the two steps with no consequence
+    /// outside the table — nothing is released and nothing is stranded — so
+    /// they go through `PipelineTable::advance` directly, which is why
+    /// `SessionModel::pipelines` is read-write. The two steps that *do* have a
+    /// consequence have their own doors: [`Self::ready_pipeline`] and
+    /// [`Self::refuse_pipeline`].
+    ///
+    /// Returns whether the step was legal and taken. An illegal step is
+    /// ordinary rather than a defect — a rail with no memo re-walks the same
+    /// pipeline on every draw and finds it already `Ready` — and the caller
+    /// counts them rather than ignoring them, because the same `false` is also
+    /// what a compile finishing after the guest's delete answers.
+    pub fn advance_pipeline(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        next: reims_vgpu_core::pipeline::PipelineState,
+    ) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipelines()
+            .advance(pipeline, next)
+    }
+
+    /// A pipeline finished building and is usable.
+    ///
+    /// The door rather than `advance(.., Ready)`, because becoming ready is
+    /// the event that releases the transactions parked on it — and a rail that
+    /// recorded the state without releasing the work would leave every exec
+    /// that leased this pipeline holding its channel's publication head.
+    pub fn ready_pipeline(&self, pipeline: reims_vgpu_core::identity::ResourceId) -> bool {
+        self.session
+            .lock()
+            .expect("session")
+            .pipeline_ready(pipeline)
+    }
+
+    /// A pipeline will never build, with the reason the rail refused it.
+    ///
+    /// The returned ordinals are the transactions that can therefore never be
+    /// ready. They come back rather than being dropped for the same reason
+    /// [`Self::retire_pipeline`]'s do, and the caller withdraws each and says
+    /// why. Empty today, because nothing is admitted into this model yet.
+    #[must_use = "work stranded by a refusal holds its channel's publication head until it is withdrawn"]
+    pub fn refuse_pipeline(
+        &self,
+        pipeline: reims_vgpu_core::identity::ResourceId,
+        reason: reims_vgpu_core::pipeline::RefusalReason,
+    ) -> Vec<reims_vgpu_core::identity::IngressOrdinal> {
+        self.session
+            .lock()
+            .expect("session")
+            .pipeline_refused(pipeline, reason)
+    }
+
     /// What the ordering plane holds about the pipelines this session declared.
     #[must_use]
     pub fn pipeline_census(&self) -> reims_vgpu_core::pipeline::Census {
@@ -5703,6 +5761,99 @@ mod pipeline_door_tests {
         // Retiring what the guest never created is not an event.
         assert!(state.retire_pipeline(name(4000)).is_empty());
         assert_eq!(state.pipeline_census().retired, 1);
+    }
+
+    /// A declared pipeline reaches `Ready` only through the rail's three steps,
+    /// and a rail with no memo walking them again is declined rather than
+    /// reset.
+    ///
+    /// This is the half that keeps an admitted exec from parking forever. The
+    /// table without it holds every pipeline at `Declared`, `Lease` answers
+    /// `Pending` to every draw that binds one, and the transaction is admitted
+    /// into a wait nothing can ever discharge — strictly worse than the
+    /// `Absent` refusal an empty table gave, because a refusal is visible and
+    /// a hang is not.
+    #[test]
+    fn a_rail_walks_a_declared_pipeline_to_ready_and_a_second_walk_is_declined() {
+        use reims_vgpu_core::pipeline::PipelineState;
+
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.declare_pipeline(name(9)));
+
+        assert!(
+            !state.advance_pipeline(name(9), PipelineState::Compiling),
+            "the steps are a lifetime and not a set: nothing compiles that has \
+             not been translated"
+        );
+        assert!(state.advance_pipeline(name(9), PipelineState::Translating));
+        assert!(state.advance_pipeline(name(9), PipelineState::Compiling));
+        assert_eq!(
+            state.pipeline_census().ready,
+            0,
+            "compiling is not usable, and a draw binding it is not ready"
+        );
+        assert!(state.ready_pipeline(name(9)));
+        assert_eq!(state.pipeline_census().ready, 1);
+
+        // The Metal rail retains no pipeline state, so it walks these same
+        // three steps on every draw that binds the pipeline. The second walk
+        // must not take it back to `Translating` — a `Ready` pipeline that
+        // re-enters the build is a pipeline every parked draw waits on again.
+        for step in [
+            PipelineState::Translating,
+            PipelineState::Compiling,
+            PipelineState::Ready,
+        ] {
+            assert!(
+                !state.advance_pipeline(name(9), step),
+                "{} is not a step from ready",
+                step.name()
+            );
+        }
+        assert_eq!(
+            state.pipeline_census().ready,
+            1,
+            "and the census counts the one time it became usable, not the \
+             draws that found it so"
+        );
+    }
+
+    /// A rail that cannot build a pipeline refuses it with the reason, once.
+    #[test]
+    fn a_refused_pipeline_is_terminal_and_a_later_step_cannot_revive_it() {
+        use reims_vgpu_core::pipeline::{PipelineState, RefusalReason};
+
+        let state = DeviceState::new(DeviceId(1), PAGE_SHIFT_X86);
+        assert!(state.declare_pipeline(name(9)));
+        assert!(state.advance_pipeline(name(9), PipelineState::Translating));
+
+        assert!(
+            state
+                .refuse_pipeline(
+                    name(9),
+                    RefusalReason::TranslationFailed("vertex_translate")
+                )
+                .is_empty(),
+            "nothing is admitted into this model yet, so nothing was parked on it"
+        );
+        assert_eq!(state.pipeline_census().refused, 1);
+
+        // The guest re-binds a pipeline this device cannot build on every
+        // frame, and each of those draws re-walks the rail. One refusal is the
+        // whole point of the state being terminal.
+        assert!(!state.advance_pipeline(name(9), PipelineState::Compiling));
+        assert!(state
+            .refuse_pipeline(name(9), RefusalReason::CompilationFailed("again"))
+            .is_empty());
+        assert_eq!(state.pipeline_census().refused, 1);
+
+        // Refusing what the guest never created is not an event either — which
+        // is why the rails skip the decline that *is* the pipeline being
+        // absent rather than refusing a name the table has no entry for.
+        assert!(state
+            .refuse_pipeline(name(4000), RefusalReason::CompilationFailed("absent"))
+            .is_empty());
+        assert_eq!(state.pipeline_census().refused, 1);
     }
 }
 

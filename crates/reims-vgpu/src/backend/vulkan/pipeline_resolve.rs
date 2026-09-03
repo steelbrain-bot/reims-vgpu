@@ -35,6 +35,7 @@
 //! `preflight_memo_*` route names remain for longitudinal log compatibility;
 //! a hit now means a retained pipeline-state lookup, not a byte comparison.
 
+use reims_vgpu_core::pipeline::{PipelineState, RefusalReason};
 use std::sync::{Arc, OnceLock};
 
 use crate::backend::vulkan::engine::DrawPreparationDecline;
@@ -338,12 +339,16 @@ pub fn resolve<M: HostMemory + HostOps>(
 ) -> Result<Arc<ResolvedRenderPipeline>, DrawPreparationDecline> {
     if !memo_enabled() {
         note_store_route("pipe_memo_off");
-        return resolve_uncached(state, host, task_id, pipeline_ref).map(Arc::new);
+        return resolve_uncached(state, host, task_id, pipeline_ref)
+            .inspect(|_| ready(state, host, task_id, pipeline_ref))
+            .map(Arc::new);
     }
 
     let Some(states) = retained(state) else {
         note_store_route("pipe_memo_off");
-        return resolve_uncached(state, host, task_id, pipeline_ref).map(Arc::new);
+        return resolve_uncached(state, host, task_id, pipeline_ref)
+            .inspect(|_| ready(state, host, task_id, pipeline_ref))
+            .map(Arc::new);
     };
     if let Some(resolved) = states.get(task_id, pipeline_ref) {
         note_store_route("pipe_memo_hit");
@@ -353,7 +358,9 @@ pub fn resolve<M: HostMemory + HostOps>(
 
     let mut resolved = resolve_uncached(state, host, task_id, pipeline_ref)?;
     resolved.pipeline_object = Some(crate::backend::vulkan::engine::PipelineObjectIdentity::new());
-    Ok(states.register(task_id, pipeline_ref, Arc::new(resolved)))
+    let registered = states.register(task_id, pipeline_ref, Arc::new(resolved));
+    ready(state, host, task_id, pipeline_ref);
+    Ok(registered)
 }
 
 /// The sample count an attachment bound with this pipeline must carry.
@@ -392,11 +399,86 @@ fn resolve_uncached<M: HostMemory + HostOps>(
     task_id: u32,
     pipeline_ref: u32,
 ) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
+    resolve_uncached_inner(state, host, task_id, pipeline_ref).inspect_err(|decline| {
+        // A decline here is terminal for the pipeline, not for the draw that
+        // happened to ask: none of the seven inputs below is re-read on a later
+        // draw with a different answer, so retrying costs one guest walk per
+        // frame and produces the same refusal. The one exception is
+        // `PipelineMissing`, which is the *pipeline* not being there — nothing
+        // was declared, so there is nothing to refuse, and refusing it would
+        // name a slot the ordering plane has no entry for.
+        let reason = match decline {
+            DrawPreparationDecline::PipelineMissing { .. } => return,
+            DrawPreparationDecline::VertexMtlbMissing { .. } => {
+                RefusalReason::CompilationFailed("vertex_mtlb_missing")
+            }
+            DrawPreparationDecline::FragmentMtlbMissing { .. } => {
+                RefusalReason::CompilationFailed("fragment_mtlb_missing")
+            }
+            DrawPreparationDecline::VertexAirExtract { .. } => {
+                RefusalReason::CompilationFailed("vertex_air_extract")
+            }
+            DrawPreparationDecline::FragmentAirExtract { .. } => {
+                RefusalReason::CompilationFailed("fragment_air_extract")
+            }
+            DrawPreparationDecline::VertexTranslate { .. } => {
+                RefusalReason::TranslationFailed("vertex_translate")
+            }
+            DrawPreparationDecline::FragmentTranslate { .. } => {
+                RefusalReason::TranslationFailed("fragment_translate")
+            }
+            // `DrawPreparationDecline` is the whole draw rail's decline set,
+            // three dozen variants of which only the seven above can be
+            // returned by `resolve_uncached_inner`. The rest are the encoder's
+            // and say nothing about whether the pipeline can be built, so they
+            // must not refuse it; counted so that "impossible" stays a
+            // measurement rather than an assumption.
+            other => {
+                let _ = other;
+                note_store_route("pipeline_refuse_not_a_build_decline");
+                return;
+            }
+        };
+        crate::runtime::draw::refuse_pipeline(state, host, task_id, pipeline_ref, reason);
+    })
+}
+
+/// Tell the ordering plane this pipeline is usable, which releases the exec
+/// transactions parked on its lease.
+///
+/// Called after the retained state is filed rather than before, so that the
+/// first work released cannot arrive at a registry that does not yet hold what
+/// it will ask for.
+fn ready<M: HostMemory + HostOps>(state: &DeviceState, host: &M, task_id: u32, pipeline_ref: u32) {
+    crate::runtime::draw::advance_pipeline(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        PipelineState::Ready,
+    );
+}
+
+fn resolve_uncached_inner<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+) -> Result<ResolvedRenderPipeline, DrawPreparationDecline> {
     let desc = crate::runtime::draw::load_render_pipeline(state, host, task_id, pipeline_ref)
         .ok_or(DrawPreparationDecline::PipelineMissing {
             task_id,
             pipeline_ref,
         })?;
+    // The descriptor decoded and the pipeline is declared; the guest's shader
+    // form is about to become the host's.
+    crate::runtime::draw::advance_pipeline(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        PipelineState::Translating,
+    );
     // The same three sub-phases the call site used to open around this work,
     // moved in with it. They are inert outside a live `ChainTimer`, so the two
     // non-draw callers of the loaders below are unaffected — and on the draw
@@ -458,6 +540,15 @@ fn resolve_uncached<M: HostMemory + HostOps>(
         pipeline_ref,
         reason,
     })?;
+    // Both stages are SPIR-V now. What is left is this rail building the
+    // pipeline object out of them, which is `Compiling`.
+    crate::runtime::draw::advance_pipeline(
+        state,
+        host,
+        task_id,
+        pipeline_ref,
+        PipelineState::Compiling,
+    );
     let bind_plan = Arc::new(VertexBindPlan::build(&desc));
     Ok(ResolvedRenderPipeline {
         pipeline_object: None,

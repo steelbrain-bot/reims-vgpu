@@ -572,6 +572,18 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
 
     // Pipeline when inheritPipelineState — PSO is not recorded into the slot,
     // so a parent pipeline is required rather than optional.
+    let advance = |next| {
+        crate::runtime::draw::advance_pipeline(state, host, req.task_id, req.pipeline_ref, next);
+    };
+    let refuse = |detail| {
+        crate::runtime::draw::refuse_pipeline(
+            state,
+            host,
+            req.task_id,
+            req.pipeline_ref,
+            reims_vgpu_core::pipeline::RefusalReason::CompilationFailed(detail),
+        );
+    };
     if icb_desc.inherit_pipeline_state() {
         if req.pipeline_ref == 0 {
             return Err(MetalIcbInheritanceDecline::PipelineRefZero);
@@ -581,6 +593,11 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
                 pipeline_ref: req.pipeline_ref,
             },
         )?;
+        // The one place on this rail where a render pipeline object is really
+        // built, so it is the one place `Compiling` and `Ready` mean what the
+        // model says they mean. The plain draw path has no such moment and
+        // says so where it advances.
+        advance(reims_vgpu_core::pipeline::PipelineState::Translating);
         let Some(vert) = load_mtlb(
             state,
             host,
@@ -588,6 +605,7 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
             pipeline.vertex_func_ref,
             AirLoadRail::Draw,
         ) else {
+            refuse("vertex_mtlb_missing");
             return Err(MetalIcbInheritanceDecline::VertexMtlbMissing {
                 function_ref: pipeline.vertex_func_ref,
             });
@@ -599,10 +617,12 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
             pipeline.fragment_func_ref,
             AirLoadRail::Draw,
         ) else {
+            refuse("fragment_mtlb_missing");
             return Err(MetalIcbInheritanceDecline::FragmentMtlbMissing {
                 function_ref: pipeline.fragment_func_ref,
             });
         };
+        advance(reims_vgpu_core::pipeline::PipelineState::Compiling);
         let vlib = device.new_library_with_data(&vert).map_err(|error| {
             MetalIcbInheritanceDecline::VertexLibraryLoad {
                 function_ref: pipeline.vertex_func_ref,
@@ -672,11 +692,13 @@ fn apply_icb_encoder_inheritance<M: HostMemory + HostOps>(
             }
         }
         let pso = device.new_render_pipeline_state(&pdesc).map_err(|error| {
+            refuse("icb_render_pipeline_create");
             MetalIcbInheritanceDecline::RenderPipelineCreate {
                 pipeline_ref: req.pipeline_ref,
                 detail: format!("{error:?}"),
             }
         })?;
+        advance(reims_vgpu_core::pipeline::PipelineState::Ready);
         enc.set_render_pipeline_state(&pso);
         keep.pso = Some(pso);
     }

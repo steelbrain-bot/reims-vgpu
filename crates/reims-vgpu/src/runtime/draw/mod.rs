@@ -932,6 +932,90 @@ pub(crate) fn load_render_pipeline<M: HostMemory + HostOps>(
     Some(p)
 }
 
+/// Step the pipeline `pipeline_ref` names along its build.
+///
+/// # Why the rails call this and not the model's door directly
+///
+/// `load_render_pipeline` tells the ordering plane *that* a pipeline exists —
+/// `PipelineState::Declared`, the guest's own fact, and rail-neutral. Building
+/// it is the running rail's, and until a rail reports the result an admitted
+/// exec that leased the pipeline is parked on a compilation nothing finishes:
+/// a hang, which is worse than the `Absent` refusal an empty table gave. So
+/// every rail reports, and reports through one function so the counters read
+/// the same on both.
+///
+/// The naming is free after the first sighting — `objects::name_resource`
+/// answers from `DeviceState::object_name` and only walks the guest's list when
+/// the ref has never been seen, which by the time a pipeline is being built it
+/// has, in `load_render_pipeline`.
+///
+/// `Ready` goes through the model's own door rather than through `advance`,
+/// because becoming ready is what releases the work parked on it.
+pub(crate) fn advance_pipeline<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    next: reims_vgpu_core::pipeline::PipelineState,
+) {
+    use reims_vgpu_core::pipeline::PipelineState;
+    let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) else {
+        crate::runtime::drain::note_store_route("pipeline_advance_unnamed");
+        return;
+    };
+    let taken = if next == PipelineState::Ready {
+        state.ready_pipeline(name)
+    } else {
+        state.advance_pipeline(name, next)
+    };
+    crate::runtime::drain::note_store_route(if taken {
+        match next {
+            PipelineState::Translating => "pipeline_translating",
+            PipelineState::Compiling => "pipeline_compiling",
+            PipelineState::Ready => "pipeline_ready",
+            _ => "pipeline_advanced_other",
+        }
+    } else {
+        // Not a defect on its own: a rail with no retained pipeline state
+        // re-walks the same pipeline on every draw and finds it already
+        // `Ready`. It is also what a build finishing after the guest's delete
+        // answers, which is why it is counted rather than dropped.
+        "pipeline_advance_declined"
+    });
+}
+
+/// The rail cannot build this pipeline, and will not be asked to try again.
+///
+/// Terminal by contract — see `reims_vgpu_core::pipeline` — so a guest
+/// re-binding a pipeline this device cannot build produces one refusal rather
+/// than one per frame, and the reason survives to whoever reads the failure
+/// channel.
+pub(crate) fn refuse_pipeline<M: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &M,
+    task_id: u32,
+    pipeline_ref: u32,
+    reason: reims_vgpu_core::pipeline::RefusalReason,
+) {
+    let Some(name) = objects::name_resource(state, host, task_id, pipeline_ref) else {
+        crate::runtime::drain::note_store_route("pipeline_refuse_unnamed");
+        return;
+    };
+    let stranded = state.refuse_pipeline(name, reason);
+    if stranded.is_empty() {
+        // Either the refusal was not a legal step — already refused, already
+        // retired — or nothing was parked on it. Both read the same here and
+        // the census tells them apart.
+        crate::runtime::drain::note_store_route("pipeline_refused");
+    } else {
+        crate::runtime::drain::note_store_route_n(
+            "pipeline_refuse_stranded",
+            stranded.len() as u64,
+        );
+    }
+    crate::runtime::drain::note_store_route(reason.slug());
+}
+
 /// Resolve buffer object → guest bytes starting at `offset`.
 /// Where a buffer object's bytes live in the task GVA space. Both the
 /// zero-copy gather and the CPU staging read need identical `(gva, size)`;
