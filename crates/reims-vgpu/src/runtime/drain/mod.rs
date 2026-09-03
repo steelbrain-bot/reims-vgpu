@@ -2540,8 +2540,31 @@ fn run_parked<H: HostMemory + HostOps>(
     match state.complete_transaction(work.epoch(), ingress) {
         Ok(released) => {
             for release in released {
-                if let Some(stamp) = release.stamp {
-                    publish_word(state, host, domain, stamp.slot.0, stamp.value.0);
+                // **Counted here because the model cannot count it, and a
+                // publisher nobody counts reads exactly like one that never
+                // runs.** `SessionModel::complete` has already put this stamp
+                // into the scheduler's published map — that is what a channel
+                // publishing means — so the ordering plane's timeline moves on
+                // this line and on no other. `note_stamp_visible`'s routes
+                // report the *page*, which the queued rail writes later, and a
+                // reading that had only those concluded the plane's timeline
+                // had frozen: `stamp_publish_first = 1` and
+                // `stamp_publish_advanced = 1` for a whole driven boot, because
+                // by the time the page was read the entry was always already
+                // there.
+                //
+                // So the two publishers are counted apart, and the pair is what
+                // makes `stamp_publish_behind` readable: this is the numerator
+                // the page's observations are behind.
+                match release.stamp {
+                    Some(stamp) => {
+                        note_store_route("stamp_published_by_channel");
+                        publish_word(state, host, domain, stamp.slot.0, stamp.value.0);
+                    }
+                    // A position whose channel released it owing no word. It is
+                    // the denominator: without it a channel that published
+                    // nothing and a channel that released nothing read alike.
+                    None => note_store_route("stamp_released_without_a_word"),
                 }
             }
         }
@@ -2919,10 +2942,13 @@ fn note_stamp_no_longer_owed(state: &mut DeviceState, index: u32, value: u32) {
 ///
 /// `reims_vgpu_core::session::SessionModel::complete` publishes the stamp its
 /// channel released, straight into the scheduler, at the moment the channel
-/// publishes it. That call counts no route here, so nothing in a store-route
-/// dump names it — which is why a boot reads `stamp_publish_first = 1` while
-/// three slots have entries: the entries came from completions, and this
-/// function only ever finds them already there.
+/// publishes it. The model cannot count a route, so that publisher used to be
+/// invisible in a store-route dump — which is why a boot read
+/// `stamp_publish_first = 1` while three slots had entries: the entries came
+/// from completions, and this function only ever found them already there. Its
+/// caller counts it now, as `stamp_published_by_channel`, beside
+/// `stamp_released_without_a_word` for a position whose channel released it
+/// owing no word.
 ///
 /// So the two are asking different questions of one slot. The plane holds what
 /// the *channel* published; this reports what the *page* carries. Between them
