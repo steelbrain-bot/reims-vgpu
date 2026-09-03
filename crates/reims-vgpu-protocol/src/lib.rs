@@ -117,6 +117,7 @@ pub mod closure;
 pub mod compute;
 pub mod decode;
 pub mod depth_stencil;
+pub mod destroy;
 pub mod dispatch;
 pub mod draw;
 pub mod endian;
