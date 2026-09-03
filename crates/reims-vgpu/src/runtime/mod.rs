@@ -108,6 +108,9 @@ pub mod mtlb;
 pub mod node_guard;
 /// Object-list lookup and mapper-ref-texture registration.
 pub mod objects;
+/// The bytes an admitted packet is executed from, held while the model decides
+/// when it runs.
+pub mod parked;
 pub mod plan;
 /// Whether a range's page-table entries are in the state the guest's own next
 /// edit of them requires — the direction that is ordered is the map.

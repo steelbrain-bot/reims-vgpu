@@ -753,7 +753,7 @@ fn load_command_streams<M: HostMemory + HostOps>(
 ///
 /// That is also why there is no separate double-load to remove: the streams are
 /// loaded once, here, and whoever executes them is handed the same `Vec`.
-struct ExecSubmission {
+pub struct ExecSubmission {
     task_id: u32,
     /// Per resource this submission touches, who owns the authoritative bytes
     /// afterwards. Applied by [`consume_resource_table`] *before* any of the
@@ -761,6 +761,19 @@ struct ExecSubmission {
     resource_descs: Vec<ExecResourceDesc>,
     /// The command buffers the header declares, in the order it declares them.
     streams: Vec<Vec<u8>>,
+}
+
+impl ExecSubmission {
+    /// Host bytes this submission is holding, for a caller accounting for what
+    /// a parked position retains.
+    ///
+    /// The command buffers, which are the allocation: the resource
+    /// descriptors are bounded by the table the header declares and are one
+    /// small `Vec` beside megabytes of stream.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.streams.iter().map(Vec::len).sum()
+    }
 }
 
 /// Read one `CmdExecIndirect2` packet into the submission it describes.
