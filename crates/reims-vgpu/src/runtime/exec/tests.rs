@@ -1,6 +1,9 @@
-// Only the compute-preflight test names these opcodes, and that test is
-// Vulkan-only — this device compiles no compute preflight without it.
-#[cfg(feature = "backend-vulkan")]
+// A wire constant, and so the same on every rail. It was gated on
+// `backend-vulkan` while the only test naming it was the Vulkan-only compute
+// preflight; the exec-walk suites now name it 103 times outside any such
+// region, and the gate made the Metal arm's test build fail with 103
+// `cannot find value` errors that no `--features backend-vulkan` build could
+// see. A `cfg` on a wire constant has no correct arm.
 use reims_vgpu_wire::OP_HEADER_LEN;
 
 use super::*;
