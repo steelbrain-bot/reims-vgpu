@@ -5622,22 +5622,39 @@ impl reims_vgpu_core::access::AccessSource for DeviceAccess<'_> {
     /// because sharing it would mean constructing the `TaskAccess` this exists
     /// not to construct. It is three lines and one `slug()` call; a helper
     /// taking `&mut Lifecycle` would be the held borrow again.
+    ///
+    /// # The lock is dropped before anything is said about a refusal
+    ///
+    /// **A `map_err` chained onto the locked call runs with the guard still
+    /// alive**, because the guard is a temporary of the whole statement and not
+    /// of the call that produced it. [`note_access_refused`] reads the object
+    /// the slot holds, which reaches `DeviceState::object_name` and takes this
+    /// same lock — so writing it as one chain deadlocks the device on its first
+    /// refused record. It was measured: a driven boot froze with
+    /// `walk_records_render = 42` and a window redrawing stale frames for seven
+    /// minutes. This is the deadlock `DeviceState::task_access`'s own doc is
+    /// about, re-entered from the other side.
+    ///
+    /// So the answer is taken in its own scope and the guard is gone before the
+    /// refusal is described.
     fn access(
         &mut self,
         participation: &reims_vgpu_core::access::Participation,
     ) -> Result<reims_vgpu_core::access::AccessIntent, reims_vgpu_core::access::AccessRefusal> {
-        self.state
-            .lifecycle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .access(self.task, self.domain, participation)
-            .map_err(|refusal| {
-                note_access_refused(self.state, self.task, participation, refusal);
-                reims_vgpu_core::access::AccessRefusal {
-                    resource: participation.resource,
-                    reason: refusal.slug(),
-                }
-            })
+        let answer = {
+            self.state
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .access(self.task, self.domain, participation)
+        };
+        answer.map_err(|refusal| {
+            note_access_refused(self.state, self.task, participation, refusal);
+            reims_vgpu_core::access::AccessRefusal {
+                resource: participation.resource,
+                reason: refusal.slug(),
+            }
+        })
     }
 }
 
@@ -5678,10 +5695,25 @@ fn note_access_refused(
         // ever constructed for the slot, which is itself the answer for a
         // participation over a name with no memo behind it.
         let constructed = state.constructed_object(task.0, participation.resource.slot.0);
+        // The resource's own range in its backing's coordinates, which is the
+        // half `heap::Refusal` does not carry: it reports the *length* the
+        // window was checked against and never the offset the extent starts at.
+        // Those two numbers are what tell a record naming bytes past the end
+        // from a record whose offset is in the allocation's coordinates while
+        // `Resident::window` reads it as the object's — the second is exactly a
+        // window whose offset equals its resource's own.
+        //
+        // Asked after the answer's guard is gone, for the reason this function's
+        // caller documents.
+        let resident = state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resolve(task, participation.resource);
         crate::observe::fail(format!(
             "access_refused task={} ref={} reason={} mode={:?} extent={:?} refusal={refusal:?} \
-             object_type={:?} desc_len={:?} (a record's participation could not become an \
-             access, which refuses the whole packet it belongs to)",
+             object_type={:?} desc_len={:?} resident={resident:?} (a record's participation \
+             could not become an access, which refuses the whole packet it belongs to)",
             task.0,
             participation.resource.slot.0,
             refusal.slug(),
@@ -5734,6 +5766,37 @@ mod device_access_tests {
             mode,
             api_stages: 0,
         }
+    }
+
+    /// A refused access returns, and describing it does not re-enter the lock.
+    ///
+    /// **A hang here is this test failing.** `note_access_refused` reads the
+    /// object the slot holds, which takes `DeviceState::lifecycle` — the same
+    /// lock the answer was produced under. Written as one `map_err` chain the
+    /// guard is still alive when it runs, and the device deadlocks on its first
+    /// refused record: a driven boot froze that way with
+    /// `walk_records_render = 42`. There is no assertion that can catch a
+    /// deadlock from inside the thread it deadlocks, so the assertion is that
+    /// this returns at all, and the refusal it returns is the owner's.
+    #[test]
+    fn a_refused_access_returns_and_its_description_does_not_re_enter_the_lock() {
+        let (state, name) = state_with_one_resource();
+        let mut access = state.task_access(TaskId(TASK), DOMAIN);
+        // A window one byte past the resource's own 4096, which is the shape
+        // `Resident::window` refuses and the shape a driven boot met.
+        let refusal = access
+            .access(&Participation {
+                resource: name,
+                extent: ParticipationExtent::Range(ByteRange {
+                    offset: 0,
+                    length: 4097,
+                }),
+                mode: AccessMode::Read,
+                api_stages: 0,
+            })
+            .expect_err("a window past the extent is not an access");
+        assert_eq!(refusal.resource, name);
+        assert_eq!(refusal.reason, "lifecycle_heap");
     }
 
     /// The interleaving a command-stream walk performs, which the owner's own
