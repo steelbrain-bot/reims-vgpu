@@ -1957,25 +1957,14 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
         // own read of the slot is the first place this device *observes* that
         // it has.
         note_stamp_visible(state, index, current, "stamp_visible_observed");
-        // **The verdict is the plane's, and this drain's arithmetic is now the
-        // check on it.** Whether a published point discharges a wait is one
-        // rule — wrapping, not numeric — and it was written twice: once in
-        // `drain::StampWait::satisfied_by` and once in
-        // `reims_vgpu_core::identity::StampWait::satisfied_by`. Two copies of
-        // a rule the guest's fence can wrap through is two chances to disagree
-        // about which of two numbers is later, and the disagreement is silent:
-        // one of them parks a timeline forever and the other runs work early.
-        //
-        // The plane has just been told what the page holds, so on every
-        // reading so far the two answer identically. The one case where they
-        // *cannot* is a rewind — the plane refuses to move a timeline
-        // backwards and this device's read follows the page — and there
-        // `stamp_publish_behind` is the population, measured at 0.
-        //
-        // `stamp_wait_owner_differs` is the evidence for deleting the copy
-        // below. It is not deleted in this commit because a rule with one
-        // implementation and no witness is a rule nobody can be shown is the
-        // same one.
+        // **The verdict is the plane's.** It has just been told what the page
+        // holds, so it decides on the value this drain read — and the one case
+        // where the two can part is a rewind, where the plane refuses to move
+        // a timeline backwards while a raw read of the page follows it.
+        // `stamp_publish_behind` is that population and it is the witness this
+        // needs; a driven boot measured 0 across 29 852 waits, alongside a
+        // direct comparison of the two answers that read 0 differences and was
+        // removed as a second name for the same event.
         let device_satisfies = state
             .published_completion_stamp(reims_vgpu_core::identity::StampSlot(index))
             .is_some_and(|published| {
@@ -1985,11 +1974,6 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
                 }
                 .satisfied_by(published)
             });
-        note_store_route(if device_satisfies == wait.satisfied_by(current) {
-            "stamp_wait_owner_agrees"
-        } else {
-            "stamp_wait_owner_differs"
-        });
         if device_satisfies {
             note_store_route("packet_stamp_wait_met");
             against_model(true, "stamp_wait_model_agrees_met");
