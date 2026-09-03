@@ -2910,7 +2910,26 @@ fn note_stamp_no_longer_owed(state: &mut DeviceState, index: u32, value: u32) {
 ///
 /// `site` names which of the three, so the split stays readable: a boot where
 /// the observed arm carries everything is a boot where the inline arms have
-/// stopped running.
+/// stopped running. A driven macos-26 desktop is that boot:
+/// `stamp_visible_observed = 1 700 804` against `stamp_visible_inline = 25`,
+/// because `write_stamp` hands almost every word to the GPU-ordered rail.
+///
+/// # This is not the plane's only publisher, and the other one is why `Behind`
+/// exists
+///
+/// `reims_vgpu_core::session::SessionModel::complete` publishes the stamp its
+/// channel released, straight into the scheduler, at the moment the channel
+/// publishes it. That call counts no route here, so nothing in a store-route
+/// dump names it — which is why a boot reads `stamp_publish_first = 1` while
+/// three slots have entries: the entries came from completions, and this
+/// function only ever finds them already there.
+///
+/// So the two are asking different questions of one slot. The plane holds what
+/// the *channel* published; this reports what the *page* carries. Between them
+/// sits the queued rail's write, and a slot read inside that window answers
+/// [`crate::model::StampPublication::Behind`]. It is a latency and not a
+/// rewind: the same boot measured `stamp_write_forward = 2203` against
+/// `stamp_write_backward = 1`.
 fn note_stamp_visible(state: &DeviceState, index: u32, value: u32, site: &'static str) {
     note_store_route(site);
     note_store_route(
@@ -2935,6 +2954,25 @@ fn note_stamp_visible(state: &DeviceState, index: u32, value: u32, site: &'stati
             // slot whose page rewound under a timeline that will not follow it
             // is a slot to explain, and a timeline running ahead of every word
             // the guest can read is an ordering defect. The pair is on the line.
+            //
+            // **The meaning drifted, and a driven macos-26 desktop is the
+            // reading that says so.** Three slots ever answered this, all of
+            // them in the boot's first 24 seconds and none afterwards, by one
+            // to seven: `slot=1 page=1 held=3`, `slot=2 page=19 held=26`,
+            // `slot=4 page=0 held=1`. The zero was taken when this site was the
+            // plane's only publisher; `SessionModel::complete` is the other one
+            // now, and it publishes at the channel's publication while the word
+            // itself is queued on the GPU-ordered rail. The page is behind
+            // because the write has not landed, not because it went back.
+            //
+            // **And nothing is decided inside that window.** The same boot read
+            // `stamp_wait_model_ahead = 0` and `stamp_wait_model_behind = 0`
+            // against 767 waits decided — `stamp_wait_model_agrees_met = 405`,
+            // `stamp_wait_model_agrees_unmet = 362` — so the model and the
+            // legacy evaluation answered every one of them alike. The window
+            // exists and no wait falls in it, which is the whole difference
+            // between this and the `stamp_wait_model_ahead = 12 824` the
+            // publication point was moved to escape.
             crate::model::StampPublication::Behind { held } => {
                 if crate::observe::first_sight("stamp_publish_behind", u64::from(index)) {
                     crate::observe::fail(format!(
@@ -3617,11 +3655,27 @@ fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
 /// `packet_class_control=11` — 36 471 classified — and
 /// `packet_class_unclassified=2166`.**
 ///
-/// The unclassified 2166 are **one opcode**: `CmdDeleteObject`, child `0x28`,
-/// whose ledger row is `Closure::Unresolved` because its ref lives in the
-/// serializer's per-kind space rather than in the object list. That is five and
-/// a half per cent of this guest's packet stream, and it is the whole of what
-/// the ordering group would refuse — every other command it sends has a class.
+/// The unclassified 2166 were **one opcode**: `CmdDeleteObject`, child `0x28`,
+/// whose ledger row was `Closure::Unresolved` because its ref lives in the
+/// serializer's per-kind space rather than in the object list. That was five
+/// and a half per cent of that guest's packet stream, and it was the whole of
+/// what the ordering group would refuse — every other command it sent had a
+/// class.
+///
+/// **That row is settled and the denominator is now zero.** `0x28` reads
+/// `Closure::Implemented`; the four rows [`classify`] still answers `None` for
+/// are `CmdDebug`, `CmdDisplaySleepState`, `CmdDisplaySetProperties` and
+/// `CmdDelay`. A driven macos-26 desktop at x86 Vulkan, three rounds of five
+/// applications, sent none of them: **`packet_class_exec=946`,
+/// `packet_class_lifecycle=1096`, `packet_class_present=172`,
+/// `packet_class_query=3`, `packet_class_control=10` — 2227 classified — and
+/// `packet_class_unclassified=0`**, with no line on the failure channel.
+///
+/// So on this rail the ordering group refuses nothing for want of a class, and
+/// the four remaining rows are a contract question rather than a cutover
+/// blocker. The macos-15 denominator above has not been retaken since the row
+/// settled; the numbers are kept as the measurement that found the blocker,
+/// not as this rail's current reading.
 ///
 /// **And the kind census says the open question is 10 packets wide.** Of the
 /// 2166, `child_delete_object_sampler_state=2148`,
@@ -3633,10 +3687,11 @@ fn note_query_layout_mismatch(question: &'static str, channel_id: Option<u32>) {
 /// functions, 3 compute pipeline states, 2 fences, which is exactly
 /// `cmd_delete_object_unimplemented=10`.
 ///
-/// So the last group's blocker is not a breadth of unknown commands, and it is
-/// not 2166 packets of unrecovered contract either. It is one row whose
-/// unresolved half a driven guest exercises ten times a boot, holding back the
-/// 2156 whose per-kind space this device already resolves.
+/// So the last group's blocker was not a breadth of unknown commands, and it
+/// was not 2166 packets of unrecovered contract either. It was one row whose
+/// unresolved half a driven guest exercised ten times a boot, holding back the
+/// 2156 whose per-kind space this device already resolves — and that row is the
+/// one that has since settled.
 ///
 /// The shape of the classified traffic is the other half of the reading. It is
 /// over half exec, which is why the class whose payload the bridge could not
