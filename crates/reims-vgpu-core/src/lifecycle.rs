@@ -1693,15 +1693,21 @@ impl Lifecycle {
         t.namespace
             .resolve(participation.resource)
             .map_err(|refusal| Refusal::Namespace { task, refusal })?;
-        let resident = *t
-            .resident
-            .get(&participation.resource)
-            .ok_or(Refusal::Namespace {
-                task,
-                refusal: namespace::Refusal::NotDeclared {
-                    slot: participation.resource.slot,
-                },
-            })?;
+        // The name resolved a line above, so an absent residency is not "no
+        // such slot" — it is exactly and only a declaration of
+        // `Storage::NoBytes`, which is the one arm of `create_resource` that
+        // inserts nothing here. This used to answer `NotDeclared` for it, which
+        // was a lie about a live name and refused the whole transaction: an
+        // indirect command buffer is such an object, so one ICB record refused
+        // every draw in its packet.
+        //
+        // What a resource with no bytes participates as is
+        // `AccessKey::DomainOnly` — see `Participation::resolve_no_bytes`. It
+        // over-orders and never under-orders, and it is the same vocabulary an
+        // unresolvable present target already uses.
+        let Some(&resident) = t.resident.get(&participation.resource) else {
+            return Ok(participation.resolve_no_bytes(domain));
+        };
         let key = ResourceKey {
             backing: resident.backing(),
             heap: match resident {
@@ -5635,5 +5641,121 @@ mod tests {
                 knew.remove(&b);
             }
         }
+    }
+    /// A resource the guest declared with no bytes participates, and does not
+    /// refuse.
+    ///
+    /// **The sharpest case is the indirect command buffer.** Its create
+    /// descriptor names no allocation and no window — its commands are
+    /// device-side storage the guest never addresses — so it is declared
+    /// `Storage::NoBytes`, and `IcbOp::participations` claims a participation
+    /// on it. Answering `NotDeclared` refused the whole exec transaction, which
+    /// is every draw in the packet, for a name that resolves perfectly well.
+    #[test]
+    fn a_participation_over_a_resource_with_no_bytes_is_domain_only() {
+        let mut l = Lifecycle::new();
+        apply_inert(
+            &mut l,
+            &LifecycleOp::DefineTask {
+                task: TASK,
+                kernel: false,
+                directory: DirectoryFrame(0x1000),
+            },
+        );
+        apply_inert(
+            &mut l,
+            &LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(0),
+                storage: Storage::NoBytes,
+            },
+        );
+
+        let intent = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name(0),
+                    extent: ParticipationExtent::Whole,
+                    mode: AccessMode::ReadWrite,
+                    api_stages: 0,
+                },
+            )
+            .expect("a live name with no bytes is not an undeclared slot");
+
+        assert_eq!(intent.key, crate::access::AccessKey::DomainOnly);
+        assert_eq!(intent.domain, ChannelId(2));
+        assert_eq!(intent.mode, AccessMode::ReadWrite);
+        // No bytes, so nothing to version on either side. A write here that
+        // reserved a version would be authority over memory that does not
+        // exist.
+        assert_eq!(intent.input_content_version, None);
+        assert_eq!(intent.output_content_version, None);
+    }
+
+    /// It over-orders rather than under-orders: the key meets every other
+    /// access, so nothing the record might really have touched slips past it.
+    #[test]
+    fn a_no_bytes_access_meets_everything_in_its_domain() {
+        let (mut l, dedicated_name) = with_one_resource(0x1000);
+        apply_inert(
+            &mut l,
+            &LifecycleOp::CreateResource {
+                task: TASK,
+                slot: ObjectListRef(1),
+                storage: Storage::NoBytes,
+            },
+        );
+
+        let bytes = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: dedicated_name,
+                    extent: ParticipationExtent::Whole,
+                    mode: AccessMode::Write,
+                    api_stages: 0,
+                },
+            )
+            .expect("a dedicated resource");
+        let none = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name(1),
+                    extent: ParticipationExtent::Whole,
+                    mode: AccessMode::Read,
+                    api_stages: 0,
+                },
+            )
+            .expect("a resource with no bytes");
+
+        assert!(none.key.may_alias(bytes.key));
+        assert!(bytes.key.may_alias(none.key));
+        assert_eq!(none.key.rung(), 3, "and the imprecision is priced");
+    }
+
+    /// A slot nothing declared still refuses, which is what the absent
+    /// residency used to be mistaken for.
+    #[test]
+    fn a_slot_nothing_declared_still_refuses_the_transaction() {
+        let (mut l, _) = with_one_resource(0x1000);
+
+        let refusal = l
+            .access(
+                TASK,
+                ChannelId(2),
+                &Participation {
+                    resource: name(9),
+                    extent: ParticipationExtent::Whole,
+                    mode: AccessMode::Read,
+                    api_stages: 0,
+                },
+            )
+            .expect_err("slot 9 was never declared");
+        assert!(matches!(refusal, Refusal::Namespace { .. }));
     }
 }

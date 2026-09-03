@@ -569,6 +569,37 @@ impl Participation {
             output_content_version,
         }
     }
+
+    /// The participation over a resource that owns no bytes.
+    ///
+    /// A resource declared [`crate::lifecycle::Storage::NoBytes`] resolves to a
+    /// live name with no backing, no extent and no content authority — there
+    /// are no bytes for any of the three to be about. So there is no key to
+    /// compare against another access's key, and the honest answer is
+    /// [`AccessKey::DomainOnly`]: participation is real and incomplete, and
+    /// ordering comes from the submission domain alone.
+    ///
+    /// **Never a missing edge.** `DomainOnly` meets everything in
+    /// [`AccessKey::may_alias`], so this over-orders rather than under-orders,
+    /// and [`AccessKey::rung`] prices exactly that. The alternative — refusing
+    /// the transaction — would drop guest work whose only fault is naming an
+    /// object whose bytes this device cannot address, which is not a fault the
+    /// contract names.
+    ///
+    /// The versions are `None` on both sides for the same reason there is no
+    /// key: a write to bytes that do not exist reserves nothing, and a read of
+    /// them consumes nothing.
+    #[must_use]
+    pub const fn resolve_no_bytes(&self, domain: ChannelId) -> AccessIntent {
+        AccessIntent {
+            domain,
+            key: AccessKey::DomainOnly,
+            mode: self.mode,
+            api_stages: self.api_stages,
+            input_content_version: None,
+            output_content_version: None,
+        }
+    }
 }
 
 /// Up to two participations, without an allocation.

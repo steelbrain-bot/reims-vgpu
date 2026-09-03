@@ -2059,6 +2059,38 @@ mod device_tests {
         out
     }
 
+    /// One `executeCommandsInBuffer:withRange:`, in a render segment.
+    ///
+    /// The ICB is the object whose create descriptor names no allocation and no
+    /// window, so this device declares it `Storage::NoBytes` — which is why it
+    /// is the record this test is about.
+    fn one_icb_stream(icb: u32) -> Vec<u8> {
+        use reims_vgpu_protocol::segment::SegmentKind;
+        use reims_vgpu_wire::ops::segment::SEGMENT_HEADER_LEN;
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&icb.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&4u64.to_le_bytes());
+        let mut record = Vec::new();
+        record.extend_from_slice(
+            &reims_vgpu_wire::ops::render::OPCODE_EXECUTE_COMMANDS_RANGE.to_le_bytes(),
+        );
+        record.extend_from_slice(
+            &((reims_vgpu_protocol::decode::OP_HEADER_LEN + payload.len()) as u32).to_le_bytes(),
+        );
+        record.extend_from_slice(&payload);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&((SEGMENT_HEADER_LEN + record.len()) as u32).to_le_bytes());
+        out.push(SegmentKind::Render.wire_type());
+        out.push(0);
+        out.push(0);
+        out.push(0xaa);
+        out.extend_from_slice(&record);
+        out
+    }
+
     fn exec_packet(payload: Vec<u8>) -> drain::Packet {
         drain::Packet {
             opcode: CHILD_OP_EXEC_INDIRECT2,
@@ -2194,5 +2226,48 @@ mod device_tests {
         )
         .expect_err("the caller read no command buffers for it");
         assert_eq!(blocked.gap(), Some(Gap::ExecStreamsUnread));
+    }
+    /// An indirect command buffer does not refuse the packet it is in.
+    ///
+    /// The ICB owns no bytes this device can address, so it is declared
+    /// `Storage::NoBytes` — and `IcbOp::participations` claims a participation
+    /// on it anyway, which is right: the operation names the object. Before the
+    /// owner learned to answer a no-bytes participation, that claim came back
+    /// as `NotDeclared` and refused the whole exec transaction, which is every
+    /// draw in the packet.
+    ///
+    /// No rail driven so far sends one (`icb_ok = 0` on all five), so this is
+    /// the only place the behaviour is stated.
+    #[test]
+    fn an_indirect_command_buffer_does_not_refuse_its_packet() {
+        let state = device_with_texture();
+        let icb = TEXTURE + 4;
+        let _declared = state
+            .declare_object(TASK, icb, Storage::NoBytes)
+            .expect("the task is open");
+        let host = FakeHost::new();
+        let submission = ExecSubmission::stated(TASK, vec![one_icb_stream(icb)]);
+        let drained = exec_packet(Vec::new());
+
+        let built = device_packet(
+            &state,
+            &host,
+            Fifo::child(1).expect("a child channel"),
+            SESSION,
+            SLOT,
+            &drained,
+            reads(Some(&submission)),
+        )
+        .expect("an ICB execute is work this device does");
+
+        let Payload::Exec(work) = built.payload else {
+            panic!("an exec opcode is the exec class");
+        };
+        assert!(
+            work.accesses
+                .iter()
+                .any(|a| a.key == reims_vgpu_core::access::AccessKey::DomainOnly),
+            "the ICB participates, at the rung a resource with no bytes has"
+        );
     }
 }
